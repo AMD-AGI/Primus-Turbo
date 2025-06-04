@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from primus_turbo.pytorch.kernels.gemm.gemm_triton_impl import gemm_triton_imlp
@@ -22,7 +20,8 @@ class GemmFunction(torch.autograd.Function):
 
 
 # TODO: out
-def gemm(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+# @torch.compile(fullgraph=True, mode="max-autotune")
+def gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """ """
     return GemmFunction.apply(a, b)
 
