@@ -89,9 +89,10 @@ jobs:
             rm -rf "${{ env.UT_LOG_PATH }}"
           fi
           docker exec -e UT_LOG_PATH="${{ env.UT_LOG_PATH }}" \
-                      primus_github_runner bash -c \
+                      primus_turbo_github_runner bash -c \
                       "
-                      cd /workspace &&
+                      cd $GITHUB_WORKSPACE &&
                       pip3 install -r requirements.txt &&
-                      pytest -v tests/ --log-cli-level=INFO | tee \$UT_LOG_PATH/pytest.log
+                      python3 setup.py develop &&
+                      pytest -v tests/ --log-cli-level=INFO
                       "

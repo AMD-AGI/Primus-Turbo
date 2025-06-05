@@ -1,6 +1,5 @@
 import torch
 
-from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_csrc_impl
 from primus_turbo.pytorch.kernels.gemm.gemm_triton_impl import gemm_triton_imlp
 
 __all__ = ["gemm"]

@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from basic_transformer import BasicTransformerModel
 from datasets import load_dataset
 from torch.nn import functional as F

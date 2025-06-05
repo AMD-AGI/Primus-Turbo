@@ -24,6 +24,8 @@ repos:
       - id: autoflake
         args:
           [
+            "--remove-all-unused-imports",
+            "--remove-unused-variables",
             "--expand-star-imports",
             "--ignore-init-module-imports",
             "--recursive",
