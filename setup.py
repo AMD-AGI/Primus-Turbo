@@ -1,7 +1,18 @@
+import os
 import platform
+import re
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+
+def read_version():
+    with open(os.path.join("primus_turbo", "__init__.py")) as f:
+        for line in f:
+            match = re.match(r"^__version__\s*=\s*[\"'](.+?)[\"']", line)
+            if match:
+                return match.group(1)
+    raise RuntimeError("Cannot find version.")
 
 
 def build_torch_extension():
@@ -32,7 +43,7 @@ def build_torch_extension():
 if __name__ == "__main__":
     setup(
         name="primus_turbo",
-        version="0.0.0",
+        version=read_version(),
         packages=find_packages(),
         ext_modules=[build_torch_extension()],
         cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
