@@ -63,4 +63,4 @@ def gemm_triton_meta(a: torch.Tensor, b: torch.Tensor, layout: str = "NN") -> to
         raise ValueError(f"Unsupported layout: {layout}")
     assert k1 == k2, f"Incompatible matmul dims: k1={k1}, k2={k2}"
     out_dtype = torch.result_type(a, b)
-    return torch.empty((m, n), device="meta", dtype=out_dtype)
+    return torch.empty((m, n), device=a.device, dtype=out_dtype)
