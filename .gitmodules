@@ -1,0 +1,3 @@
+[submodule "3rdparty/aiter"]
+	path = 3rdparty/aiter
+	url = https://github.com/ROCm/aiter.git
