@@ -1,6 +1,8 @@
 from pathlib import Path
-import torch
+
 import pandas as pd
+import torch
+
 from .test_special_functions import results
 
 
@@ -37,9 +39,7 @@ def merge_excels(amd_file, nv_file, subdir_path):
 
 def pytest_sessionfinish(session, exitstatus):
     # save to excel
-    file_name = (
-        f"test_function_accuracy_{torch.cuda.get_device_name(0).split()[0]}.xlsx"
-    )
+    file_name = f"test_function_accuracy_{torch.cuda.get_device_name(0).split()[0]}.xlsx"
     current_dir = Path(__file__).resolve().parent
     subdir_path = current_dir / "test_accu_results"
     saved_file = subdir_path / file_name
