@@ -1,7 +1,7 @@
 import torch
 
 from typing import Optional
-from primus_turbo.pytorch.ops import attention
+from primus_turbo.pytorch.ops import attention_ck, attention_triton, attention_triton_fp8
 
 __all__ = ["CoreAttention"]
 
@@ -9,6 +9,7 @@ __all__ = ["CoreAttention"]
 class CoreAttention(torch.nn.Module):
     def __init__(
         self,
+        attention_type: str = 'ck', # 'ck', 'triton', 'triton_fp8'
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
@@ -29,13 +30,22 @@ class CoreAttention(torch.nn.Module):
         self.return_attn_probs = return_attn_probs
         self.deterministic = deterministic
 
+        if attention_type == 'ck':
+            self.attention_fn = attention_ck
+        elif attention_type == 'triton':
+            self.attention_fn = attention_triton
+        elif attention_type == 'triton_fp8':
+            self.attention_fn = attention_triton_fp8
+        else:
+            raise ValueError(f"Unknown attention type: {attention_type}")
+
     def forward(self, 
                 q: torch.Tensor, 
                 k: torch.Tensor, 
                 v: torch.Tensor, 
                 bias: Optional[torch.Tensor] = None):
         
-        return attention(
+        return attention_ck(
             q,
             k,
             v,
