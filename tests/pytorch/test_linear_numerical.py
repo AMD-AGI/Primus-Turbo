@@ -26,20 +26,19 @@ def test_linear_numerical(dtype, shapes):
         ref_linear.weight.copy_(torch_linear.weight.cpu())
 
     x1 = torch.randn(seq_len, in_features, device=device, dtype=dtype, requires_grad=True)
-    x2 = x1.float().detach().clone().requires_grad_().cpu()
+    x2 = x1.float().detach().clone().cpu().requires_grad_()
 
     # === Forward ===
     out = torch_linear(x1)
     ref = ref_linear(x2)
 
     # === Backward ===
-    grad_output = torch.ones_like(out)
-    grad_output_ref = torch.ones_like(ref)
-    out.backward(grad_output)
-    ref.backward(grad_output_ref)
+    out.backward(torch.ones_like(out))
+    ref.backward(torch.ones_like(ref))
 
     out = out.float().cpu()
-    grad_output = grad_output.float().cpu()
+    grad_output = x1.grad.float().cpu()
+    grad_output_ref = x2.grad.float().cpu()
 
     grad_weight = torch_linear.weight.grad.float().detach().clone().cpu()
     grad_weight_ref = ref_linear.weight.grad
