@@ -7,13 +7,12 @@ from triton import Config
 
 fp8_gemm_configs = [
     Config(
-        {"BLOCK_SIZE_M": block_size_m, "BLOCK_SIZE_N": block_size_n},
+        {"BLOCK_SIZE_M": block_size_mn[0], "BLOCK_SIZE_N": block_size_mn[1]},
         num_stages=num_stages,
         num_warps=num_warps,
     )
-    for block_size_m in [64, 128, 256]
-    for block_size_n in [64, 128, 256]
-    for num_stages in [2, 3, 4]
+    for block_size_mn in [(64, 64), (128, 128), (128, 256), (256, 256)]
+    for num_stages in [2]
     for num_warps in [4, 8]
 ]
 
