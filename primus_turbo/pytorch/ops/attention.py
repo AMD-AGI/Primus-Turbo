@@ -58,7 +58,7 @@ class AttentionCKFunction(torch.autograd.Function):
             window_size_right=int(window_size[1]),
             bias=bias,
             alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
+            return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
@@ -297,7 +297,13 @@ class AttentionTritonFunction(torch.autograd.Function):
             ctx.max_seqlens_q = q.shape[1]
             ctx.max_seqlens_k = k.shape[1]
 
-        return output, softmax_lse, exp_scores
+        result = [output]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(exp_scores)
+
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):

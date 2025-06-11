@@ -47,23 +47,7 @@ def test_gemm_ck(q_layout, k_layout, v_layout, causal):
     loss_ref = o_ref.mean()
     loss_ref.backward()
 
-    # o = pt.ops.attention.attention_ck(
-    #     query,
-    #     key,
-    #     value,
-    #     dropout_p=0.0,
-    #     softmax_scale=sm_scale,
-    #     causal=causal,
-    #     window_size=(-1, -1),
-    #     bias=None,
-    #     alibi_slopes=None,
-    #     deterministic=False,
-    #     return_lse=False,
-    #     return_attn_probs=False,
-    #     use_fp8=False,
-    # )
-    
-    o,_,_ = pt.ops.attention.attention_triton(
+    o = pt.ops.attention.attention_ck(
         query,
         key,
         value,
@@ -79,21 +63,37 @@ def test_gemm_ck(q_layout, k_layout, v_layout, causal):
         use_fp8=False,
     )
     
-    o,_,_ = pt.ops.attention.attention_triton(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=(-1, -1),
-        bias=None,
-        alibi_slopes=None,
-        deterministic=False,
-        return_lse=False,
-        return_attn_probs=False,
-        use_fp8=True,
-    )
+    # o = pt.ops.attention.attention_triton(
+    #     query,
+    #     key,
+    #     value,
+    #     dropout_p=0.0,
+    #     softmax_scale=sm_scale,
+    #     causal=causal,
+    #     window_size=(-1, -1),
+    #     bias=None,
+    #     alibi_slopes=None,
+    #     deterministic=False,
+    #     return_lse=False,
+    #     return_attn_probs=False,
+    #     use_fp8=False,
+    # )
+    
+    # o = pt.ops.attention.attention_triton(
+    #     query,
+    #     key,
+    #     value,
+    #     dropout_p=0.0,
+    #     softmax_scale=sm_scale,
+    #     causal=causal,
+    #     window_size=(-1, -1),
+    #     bias=None,
+    #     alibi_slopes=None,
+    #     deterministic=False,
+    #     return_lse=False,
+    #     return_attn_probs=False,
+    #     use_fp8=True,
+    # )
     loss = o.mean()  #loss_fn(fa_output, output_states)
     loss.backward()
     print(compute_snr(query_ref.grad, query.grad))
