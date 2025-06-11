@@ -1,12 +1,25 @@
 import torch
 from typing import Optional
-from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import attention_aiter_csrc_forward_impl, attention_aiter_csrc_backward_impl
-from primus_turbo.pytorch.kernels.attention.attention_triton_impl import attention_triton_forward_impl, attention_triton_backward_impl, cast_to_fp8
+from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
+    attention_aiter_csrc_forward_impl,
+    attention_aiter_csrc_backward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    attention_triton_forward_impl,
+    attention_triton_backward_impl,
+)
+from primus_turbo.triton.attention.attention_kernel import (
+    get_f8_fwd_dtype,
+    block_scaling_node,
+    FIXED_BLOCK_M,
+    FIXED_BLOCK_N,
+)
 
 
 class AttentionCKFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,
+    def forward(
+        ctx,
         q,
         k,
         v,
@@ -21,7 +34,8 @@ class AttentionCKFunction(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
         is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1,):
+        how_v3_bf16_cvt: Optional[int] = 1,
+    ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -124,6 +138,7 @@ def attention_ck(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    use_fp8=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -174,6 +189,7 @@ def attention_ck(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    assert use_fp8 is False, "attention_ck does not support fp8"
     return AttentionCKFunction.apply(
         q,
         k,
@@ -206,14 +222,46 @@ class AttentionTritonFunction(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        use_fp8
+        use_fp8,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        output, softmax_lse, exp_scores, q_scale, k_scale, v_scale, p_scale = (
+
+        (q_scale, k_scale, v_scale) = None
+        if use_fp8:
+            # online quant
+            range_v = torch.max(torch.abs(v))
+            float8_fw = get_f8_fwd_dtype()
+            dtype_max = torch.finfo(float8_fw).max
+            v_scale = dtype_max / range_v
+            p_scale = dtype_max
+
+            def check_and_convert(t, scale):
+                finfo = torch.finfo(float8_fw)
+                return (
+                    (t * scale).clamp(min=finfo.min, max=finfo.max).to(dtype=float8_fw)
+                    if t.dtype != float8_fw
+                    else t
+                )
+
+            q, q_scale = block_scaling_node(q, FIXED_BLOCK_M)
+            k, k_scale = block_scaling_node(k, FIXED_BLOCK_N)
+            v = check_and_convert(v, v_scale)
+        else:
+            use_fp8 = False
+            q_scale = torch.tensor([1.0], device=q.device)
+            k_scale = torch.tensor([1.0], device=q.device)
+            v_scale = torch.tensor([1.0], device=q.device)
+            p_scale = 1.0
+
+        output, softmax_lse, exp_scores = (
             attention_triton_forward_impl(
                 q,
                 k,
                 v,
+                p_scale,
+                q_scale,
+                k_scale,
+                v_scale,
                 dropout_p,
                 softmax_scale,
                 causal,
@@ -228,8 +276,20 @@ class AttentionTritonFunction(torch.autograd.Function):
         )
 
         if is_grad:
-            ctx.save_for_backward(q, k, v, output, softmax_lse, alibi_slopes, bias,
-                              q_scale, k_scale, v_scale, p_scale)
+            # q, k, v should be fp8 when set use_fp8 to True
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                output,
+                softmax_lse,
+                alibi_slopes,
+                bias,
+                q_scale,
+                k_scale,
+                v_scale,
+                p_scale,
+            )
 
             ctx.sm_scale = softmax_scale
             ctx.causal = causal
@@ -244,12 +304,22 @@ class AttentionTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, o, softmax_lse, alibi_slopes, bias, q_scale, k_scale, v_scale, p_scale = (
-            ctx.saved_tensors
-        )
+        (
+            q,
+            k,
+            v,
+            o,
+            softmax_lse,
+            alibi_slopes,
+            bias,
+            q_scale,
+            k_scale,
+            v_scale,
+            p_scale,
+        ) = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
-        
+
         dq, dk, dv = attention_triton_backward_impl(
             do,
             q,
@@ -279,6 +349,7 @@ class AttentionTritonFunction(torch.autograd.Function):
 
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
+
 def attention_triton(
     q,
     k,
@@ -289,11 +360,12 @@ def attention_triton(
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
     alibi_slopes=None,
+    deterministic=True,
     return_lse=False,
     return_attn_probs=False,
-    use_fp8=True
+    use_fp8=True,
 ):
-   
+
     return AttentionTritonFunction.apply(
         q,
         k,
@@ -307,5 +379,5 @@ def attention_triton(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        use_fp8
+        use_fp8,
     )
