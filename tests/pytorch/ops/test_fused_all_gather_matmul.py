@@ -114,7 +114,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
             comm_method="pipeline",
         )
 
-        torch.testing.assert_close(ag_output_0, ag_output_1, **get_tolerances(dtype))
+        torch.testing.assert_close(ag_output_0, ag_output_1, atol=0.0, rtol=0.0)
         assert ag_output_0.stride() == ag_output_1.stride()
         for mm_output_0, mm_output_1 in zip(mm_outputs_0, mm_outputs_1):
             torch.testing.assert_close(mm_output_0, mm_output_1, **get_tolerances(dtype))
@@ -129,7 +129,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
         rank = self.rank
 
         torch.manual_seed(42 + rank)
-        A_shard = torch.rand(batch_size, M // self.world_size, K, dtype=dtype, device="cuda")
+        A_shard = torch.rand(batch_size * M // self.world_size, K, dtype=dtype, device="cuda")
         Bs = [torch.rand(K, N, dtype=dtype, device="cuda")]
 
         ag_output_0, mm_outputs_0 = native_torch_all_gather_matmul(A_shard, Bs, gather_dim=0, group=group)
@@ -146,7 +146,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
             num_splits=4,
         )
 
-        torch.testing.assert_close(ag_output_0, ag_output_1, **get_tolerances(dtype))
+        torch.testing.assert_close(ag_output_0, ag_output_1, atol=0.0, rtol=0.0)
         for mm_output_0, mm_output_1 in zip(mm_outputs_0, mm_outputs_1):
             torch.testing.assert_close(mm_output_0, mm_output_1, **get_tolerances(dtype))
 

@@ -17,10 +17,9 @@ from .amd_symmetric_memory import get_amd_symm_mem_workspace
 def batch_wait_eq_sys(rank, barrier_ptr, n_elements: tl.constexpr, value):
     barrier_ptr = barrier_ptr.to(tl.pointer_type(tl.int32))
     tid = thread_idx(axis=0)
-    if tid == 0:
-        for i in tl.static_range(n_elements):
-            while i != rank and load_acquire_system(barrier_ptr + i) != value:
-                pass
+    if tid < n_elements and tid != rank:
+        while load_acquire_system(barrier_ptr + tid) != value:
+            pass
 
     tl.debug_barrier()
 
@@ -126,6 +125,7 @@ def _pipeline_fused_all_gather_matmul_impl(
     symm_mem.barrier()
 
     comm_event = get_comm_event()
+    saved_chunk_outputs = []
 
     for st in stream_pool:
         st.wait_stream(current_stream)
@@ -170,6 +170,7 @@ def _pipeline_fused_all_gather_matmul_impl(
             input_buf_ptrs[dst_rank] += input_buf_stride
             barrier_ptrs[dst_rank] += barrier_stride
 
+        gemm_stream.wait_event(comm_event)
         with gemm_stream:
             wait_all_gather(rank, num_ranks, barrier_ptrs[rank], 1)
             if return_A:
@@ -189,6 +190,7 @@ def _pipeline_fused_all_gather_matmul_impl(
 
             for w, o_ptr, o_stride in zip(weight, output_ptrs, output_strides):
                 chunk_out = mm_op(local_input_buf_chunk[step], w)
+                saved_chunk_outputs.append(chunk_out)
                 chunk_out_stride = chunk_out.nbytes // (num_ranks - 1)
 
                 copy_stream.wait_stream(gemm_stream)
