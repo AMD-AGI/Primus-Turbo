@@ -268,7 +268,6 @@ class AttentionTritonFunction(torch.autograd.Function):
                 window_size[1],
                 bias,
                 alibi_slopes,
-                return_lse,
                 return_softmax,
                 use_fp8,
             )
@@ -286,14 +285,13 @@ class AttentionTritonFunction(torch.autograd.Function):
                 bias,
                 q_scale,
                 k_scale,
-                v_scale,
-                p_scale,
+                v_scale                
             )
 
             ctx.sm_scale = softmax_scale
+            ctx.p_scale = p_scale
             ctx.causal = causal
-            ctx.dropout_p = dropout_p
-            ctx.use_exp2 = True
+            ctx.use_fp8 = use_fp8
             ctx.cu_seqlens_q = 0
             ctx.cu_seqlens_k = 0
             ctx.max_seqlens_q = q.shape[1]
@@ -313,8 +311,7 @@ class AttentionTritonFunction(torch.autograd.Function):
             bias,
             q_scale,
             k_scale,
-            v_scale,
-            p_scale,
+            v_scale
         ) = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
@@ -328,22 +325,21 @@ class AttentionTritonFunction(torch.autograd.Function):
             q_scale,
             k_scale,
             v_scale,
-            p_scale,
+            ctx.p_scale,
             softmax_lse,
             None,
             None,
             None,
-            ctx.sm_scale,
-            alibi_slopes,
-            ctx.causal,
-            ctx.layout,
             ctx.cu_seqlens_q,
             ctx.cu_seqlens_k,
             ctx.max_seqlens_q,
             ctx.max_seqlens_k,
-            ctx.use_exp2,
-            ctx.use_fp8,
-            sequence_parallel=True,
+            ctx.sm_scale,
+            ctx.causal,
+            -1,
+            -1,
+            alibi_slopes,
+            ctx.use_fp8
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None

@@ -1,5 +1,4 @@
 import torch
-from aiter.ops.triton.mha import _flash_attn_forward, _flash_attn_backward, cast_to_fp8
 from typing import Optional
 from primus_turbo.triton.attention.attention_kernel import (
     attention_block_forward_triton_impl,
@@ -22,7 +21,6 @@ def attention_triton_forward_impl(
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
     return_softmax: bool,
     use_fp8,
 ):
@@ -51,7 +49,6 @@ def attention_triton_forward_impl(
         q.shape[1],
         k.shape[1],
         return_softmax,
-        return_lse,
         True,
         use_fp8,
     )
@@ -84,7 +81,7 @@ def attention_triton_backward_impl(
     window_size_right: int,
     alibi_slopes: Optional[torch.Tensor],
     use_fp8,
-) -> torch.Tensor:
+):
     assert (
         window_size_left == -1 and window_size_right == -1
     ), "in triton attn kernel, window_size_left and window_size_right must be -1."
@@ -114,3 +111,4 @@ def attention_triton_backward_impl(
         True,
         use_fp8,
     )
+    return dq, dk, dv

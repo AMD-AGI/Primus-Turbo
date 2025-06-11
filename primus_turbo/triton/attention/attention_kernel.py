@@ -943,7 +943,6 @@ def attention_block_forward_triton_impl(
     max_seqlens_q: Optional[int],
     max_seqlens_k: Optional[int],
     return_scores: bool,
-    return_lse: bool,
     use_exp2: bool,
     use_fp8: bool,
 ) -> List[torch.Tensor]:
@@ -1116,9 +1115,7 @@ def attention_block_forward_triton_impl(
         RETURN_SCORES=return_scores,
         BLOCK_M=FIXED_BLOCK_M,
         BLOCK_N=FIXED_BLOCK_N,
-    )
-    if(return_lse == False):
-        softmax_lse = torch.empty([], device=q.device, dtype=torch.float32)
+    )    
     return [o, softmax_lse, exp_scores]
 
 
@@ -2430,7 +2427,6 @@ class _triton_attention_block(torch.autograd.Function):
             max_seqlens_q,
             max_seqlens_k,
             return_scores,
-            True,
             use_exp2,
             use_fp8,
         )
