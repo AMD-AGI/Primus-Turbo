@@ -226,7 +226,6 @@ class AttentionTritonFunction(torch.autograd.Function):
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
-        (q_scale, k_scale, v_scale) = None
         if use_fp8:
             # online quant
             range_v = torch.max(torch.abs(v))
