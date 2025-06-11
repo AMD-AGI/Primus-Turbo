@@ -22,7 +22,7 @@ def quant_fp8_blockwise_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    AIXS: tl.constexpr,
+    AXIS: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -35,14 +35,14 @@ def quant_fp8_blockwise_kernel(
     x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     x_tile_abs = tl.abs(x_tile)
 
-    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AIXS, FP8_MAX)
+    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX)
 
     # Store
     x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_ptrs, x_fp8_tile.to(x_fp8_ptr.dtype.element_ty), mask=mask)
 
     # Store scale
-    if AIXS == 1:
+    if AXIS == 1:
         scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
         scale_mask = offs_m < M
     else:
