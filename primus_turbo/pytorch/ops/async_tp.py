@@ -17,15 +17,15 @@ def fused_all_gather_matmul(
     gemm_streams: List[torch.cuda.Stream],
     comm_streams: List[torch.cuda.Stream],
     copy_streams: List[torch.cuda.Stream],
-    comm_method: str,
     *,
+    comm_method: str = "pipeline",
     num_splits: int = 2,
     skip_copy_local_A: bool = False,  # only needed for te
     enable_sdma: bool = False,
     return_A: bool = True,
     A_out: Optional[torch.Tensor] = None,
     outputs: Optional[List[torch.Tensor]] = None,
-    out_dtypes: Optional[List[torch.dtype]] = None
+    out_dtypes: Optional[List[torch.dtype]] = None,
 ) -> Tuple[Optional[torch.Tensor], List[torch.Tensor]]:
     # check input
     if A_shard.dim() < 2:
@@ -38,6 +38,9 @@ def fused_all_gather_matmul(
 
     if gather_dim < 0 or gather_dim >= A_shard.dim():
         raise ValueError("Invalid gather_dim")
+
+    if comm_method not in ["auto", "ring_exchange", "pipeline"]:
+        raise ValueError(f"Invalid comm_method: {comm_method}")
 
     group = c10d._resolve_process_group(group_name)
     A_shard_flat = A_shard.movedim(gather_dim, 0)
@@ -62,7 +65,7 @@ def fused_all_gather_matmul(
         for B, out_dtype in zip(Bs, out_dtypes)
     ]
 
-    if comm_method == "ring_exchange":
+    if comm_method in ["ring_exchange", "auto"]:
         raise NotImplementedError()
     else:
         with torch.profiler.record_function("pipeline_fused_all_gather_matmul"):
