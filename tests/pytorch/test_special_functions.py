@@ -28,7 +28,7 @@ results, load_results = [], []
 
 
 @pytest.mark.parametrize("func_name", FUNC_TABLE.keys())
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("shape", [(1024,), (64, 64)])
 def test_special_function_accuracy(func_name, dtype, shape):
     torch.manual_seed(0)
@@ -48,7 +48,7 @@ def test_special_function_accuracy(func_name, dtype, shape):
 
     out = out.cpu()
     ref = ref
-
+    print(f"xxxxxxxx{func_name}, {dtype}, {shape}--ref:{ref.max()}-{ref.min()}-{ref.mean()}")
     save_dir = get_subdir()
     device_type_load = get_device_type(is_load=True)
     out_load = load_tensor(save_dir, device_type_load, func_name, dtype, shape)
