@@ -31,11 +31,11 @@ def test_gemm_numerical(dtype, shapes):
     m, n, k = shapes
     device = "cuda"
 
-    a = torch.randn(m, k, device=device, dtype=dtype, requires_grad=True)
-    a_cpu = a.cpu().requires_grad_()
+    a_cpu = torch.randn(m, k, dtype=dtype, requires_grad=True)
+    a = a_cpu.detach().to(device).requires_grad_()
 
-    b = torch.randn(n, k, device=device, dtype=dtype, requires_grad=True)
-    b_cpu = b.cpu().requires_grad_()
+    b_cpu = torch.randn(n, k, dtype=dtype, requires_grad=True)
+    b = b_cpu.detach().to(device).requires_grad_()
 
     out = torch.matmul(a, b.T)
     out = out.cpu()
