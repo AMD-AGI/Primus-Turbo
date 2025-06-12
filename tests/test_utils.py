@@ -60,10 +60,16 @@ def compute_snr(x: torch.Tensor, y: torch.Tensor):
 
 def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     assert x.shape == y.shape
-    assert x.dtype == y.dtype == torch.float32
+    assert x.dtype == y.dtype
 
-    x_bits = x.view(torch.int32)
-    y_bits = y.view(torch.int32)
+    if x.dtype in [ torch.float16, torch.bfloat16 ]:
+        x_bits = x.view(torch.int16)
+        y_bits = y.view(torch.int16)
+    elif x.dtype in [torch.float32]:
+        x_bits = x.view(torch.int32)
+        y_bits = y.view(torch.int32)
+    else:
+        raise ValueError("Not support dtype.")
 
     def to_ordered(bits):
         return torch.where(bits < 0, 0x80000000 - bits, bits)
