@@ -54,18 +54,28 @@ def test_special_function_accuracy(func_name, dtype, shape):
     out_load = load_tensor(save_dir, device_type_load, func_name, dtype, shape)
 
     dump_tensor(out, save_dir, device_type, func_name, dtype, shape)
-
+    print(f"{out_load=}")
     if out_load is not None:
         post_process(
+            "CPU",
             get_device_name(is_load=True),
-            device_name,
             func_name,
             dtype,
             shape,
-            out,
             out_load,
+            ref,
             load_results,
         )
+        # post_process(
+        #     get_device_name(is_load=True),
+        #     device_name,
+        #     func_name,
+        #     dtype,
+        #     shape,
+        #     out,
+        #     out_load,
+        #     load_results,
+        # )
 
     post_process("CPU", device_name, func_name, dtype, shape, out, ref, results)
 
@@ -74,9 +84,9 @@ def test_special_function_accuracy(func_name, dtype, shape):
 def finalize_results_on_exit(request):
     def finalizer():
         save_dir = get_subdir()
+        print(f"{load_results=}")
         if load_results:
-            load_device_type = get_device_type(is_load=True)
-            load_file_path = get_file_path(save_dir, get_format_name(load_device_type))
+            load_file_path = get_file_path(save_dir, get_format_name())
             save_result_to_excel(load_results, load_file_path)
 
         if results:
@@ -87,12 +97,13 @@ def finalize_results_on_exit(request):
         amd_file = save_dir / "AMD_special_func.xlsx"
         nv_file = save_dir / "NVIDIA_special_func.xlsx"
         comp_file = save_dir / "GPU_special_func.xlsx"
+        numerical_file = save_dir / "numerical_special_func.xlsx"
 
         merge_files = []
         for file in [amd_file, nv_file, comp_file]:
             if file.exists():
                 merge_files.append(file)
         if len(merge_files) > 1:
-            merge_excels(merge_files, save_dir)
+            merge_excels(merge_files, numerical_file)
 
     request.addfinalizer(finalizer)

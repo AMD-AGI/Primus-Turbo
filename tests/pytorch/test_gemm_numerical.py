@@ -1,14 +1,20 @@
 import pytest
 import torch
 
-from tests.test_utils import (
-    cosine_similarity,
-    ulp_error,
-    max_abs_error,
-    mean_squared_error,
-    relative_error,
+from tests.utils.numerical_utils import (
+    get_device_name,
+    get_device_type,
+    get_file_path,
+    get_format_name,
+    get_subdir,
+    post_process,
+    merge_excels,
+    save_result_to_excel,
+    load_tensor,
+    dump_tensor,
 )
 
+results, load_results = [], []
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shapes", [(512, 128, 256),
@@ -18,6 +24,8 @@ def test_gemm_numerical(dtype, shapes):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     torch.manual_seed(42)
+    device_name = get_device_name()
+    device_type = get_device_type()
 
     m, n, k = shapes
     device = "cuda"
@@ -32,14 +40,53 @@ def test_gemm_numerical(dtype, shapes):
     out = out.cpu()
     ref = torch.matmul(a_cpu, b_cpu.T)
 
-    ulp = ulp_error(out, ref)
+    save_dir = get_subdir()
+    device_type_load = get_device_type(is_load=True)
+    out_load = load_tensor(save_dir, device_type_load, "gemm", dtype, shapes)
 
-    print(f"\n[GEMM] dtype={dtype}, shape={shapes}, result:")
-    print(f"RelError:   {relative_error(ref, out):.3e}")
-    print(f"MAE:        {max_abs_error(ref, out):.3e}")
-    print(f"MSE:        {mean_squared_error(ref, out):.3e}")
-    print(f"CosSim:     {cosine_similarity(ref, out):.6f}")
-    print(f"ULP(max):   {ulp.max().item()}, ULP(mean): {ulp.float().mean().item():.2f}")
+    dump_tensor(out, save_dir, device_type, "gemm", dtype, shapes)
+    if out_load is not None:
+        post_process(
+            get_device_name(is_load=True),
+            device_name,
+            "gemm",
+            dtype,
+            shapes,
+            out,
+            out_load,
+            load_results,
+        )
+
+    post_process("CPU", device_name, "gemm", dtype, shapes, out, ref, results)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def finalize_results_on_exit(request):
+    def finalizer():
+        save_dir = get_subdir()
+        print(f"{load_results=}")
+        if load_results:
+            load_file_path = get_file_path(save_dir, get_format_name())
+            save_result_to_excel(load_results, load_file_path)
+
+        if results:
+            device_type = get_device_type()
+            file_path = get_file_path(save_dir, get_format_name(device_type))
+            save_result_to_excel(results, file_path)
+
+        amd_file = save_dir / "AMD_gemm.xlsx"
+        nv_file = save_dir / "NVIDIA_gemm.xlsx"
+        comp_file = save_dir / "GPU_gemm.xlsx"
+        numerical_file = save_dir / "numerical_gemm.xlsx"
+
+        merge_files = []
+        for file in [amd_file, nv_file, comp_file]:
+            if file.exists():
+                merge_files.append(file)
+        if len(merge_files) > 1:
+            merge_excels(merge_files, numerical_file)
+
+    request.addfinalizer(finalizer)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz])
