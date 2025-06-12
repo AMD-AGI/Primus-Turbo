@@ -76,7 +76,7 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal):
 @pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("is_fp8", [True, False])
-def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8=True):
+def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
     device = "cuda"
     dtype = torch.bfloat16
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
