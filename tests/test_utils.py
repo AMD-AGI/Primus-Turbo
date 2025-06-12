@@ -83,9 +83,3 @@ def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.where(bits < 0, magic_number - bits, bits)
 
     return (to_ordered(x_bits) - to_ordered(y_bits)).abs()
-
-
-def l2_norm(x: torch.Tensor, y: torch.Tensor):
-    x, y = x.float(), y.float()
-
-    return torch.sqrt(torch.sum((x - y) * (x - y)))
