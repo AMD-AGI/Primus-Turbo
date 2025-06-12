@@ -43,6 +43,16 @@ def fused_all_gather_matmul(
         raise ValueError(f"Invalid comm_method: {comm_method}")
 
     group = c10d._resolve_process_group(group_name)
+
+    if return_A and A_out is not None:
+        if A_out.dtype != A_shard.dtype:
+            raise ValueError(
+                f"Invalid dtype: A_out ({A_out.dtype}) difference with A_shard ({A_shard.dtype})!"
+            )
+
+        if A_out.numel() != A_shard.numel() * group.size():
+            raise ValueError(f"A_out size must equal group size * A_shard size.")
+
     A_shard_flat = A_shard.movedim(gather_dim, 0)
     leading_dims = [group.size()] + list(A_shard_flat.shape[:-1])
     A_shard_flat = A_shard_flat.flatten(0, -2)
@@ -53,17 +63,19 @@ def fused_all_gather_matmul(
     def unflatten(t: torch.Tensor) -> torch.Tensor:
         return t.view(*leading_dims, -1).flatten(0, 1).movedim(0, gather_dim)
 
-    if return_A:
-        A_out = A_out or A_shard_flat.new_empty(
+    if return_A and A_out is None:
+        A_out = A_shard_flat.new_empty(
             A_shard_flat.shape[0] * group.size(),
             A_shard_flat.shape[1],
         )
 
     out_dtypes = out_dtypes or [B.dtype for B in Bs]
-    outputs = outputs or [
-        A_shard.new_empty(A_shard_flat.shape[0] * group.size(), B.shape[1], dtype=out_dtype or B.dtype)
-        for B, out_dtype in zip(Bs, out_dtypes)
-    ]
+
+    if outputs is None:
+        outputs = [
+            A_shard.new_empty(A_shard_flat.shape[0] * group.size(), B.shape[1], dtype=out_dtype or B.dtype)
+            for B, out_dtype in zip(Bs, out_dtypes)
+        ]
 
     if comm_method in ["ring_exchange", "auto"]:
         raise NotImplementedError()
