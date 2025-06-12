@@ -38,7 +38,8 @@ def mean_squared_error(x: torch.Tensor, y: torch.Tensor):
 # Cosine Similarity
 def cosine_similarity(x: torch.Tensor, y: torch.Tensor):
     x, y = x.flatten().float(), y.flatten().float()
-    return torch.nn.functional.cosine_similarity(x, y, dim=0).item()
+    cosim = torch.nn.functional.cosine_similarity(x, y, dim=0).item()
+    return 1 if cosim > 1 else cosim
 
 
 # Symmetric Similarity
@@ -71,8 +72,15 @@ def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError("Not support dtype.")
 
-    def to_ordered(bits):
-        return torch.where(bits < 0, 0x80000000 - bits, bits)
+    def to_ordered(bits : torch.Tensor):
+        if bits.element_size() == 4:
+            magic_number = 0x80000000
+        elif bits.element_size() == 2:
+            magic_number = 0x8000
+        else:
+            raise ValueError("Not support bits.")
+
+        return torch.where(bits < 0, magic_number - bits, bits)
 
     return (to_ordered(x_bits) - to_ordered(y_bits)).abs()
 
