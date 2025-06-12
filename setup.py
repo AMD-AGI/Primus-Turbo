@@ -1,6 +1,7 @@
 import os
 import platform
 import re
+import subprocess
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -61,7 +62,15 @@ def build_torch_extension():
     )
 
 
+def compile_aiter():
+    aiter_dir = os.path.join("3rdparty", "aiter")
+    subprocess.run(["python3", "setup.py", "develop"], cwd=aiter_dir, check=True)
+
+
 if __name__ == "__main__":
+    # Compile aiter before setting up the main package
+    compile_aiter()
+
     setup(
         name="primus_turbo",
         version=read_version(),
