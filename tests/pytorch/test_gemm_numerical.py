@@ -3,7 +3,7 @@ import torch
 
 from tests.test_utils import (
     cosine_similarity,
-    l2_norm,
+    ulp_error,
     max_abs_error,
     mean_squared_error,
     relative_error,
@@ -29,15 +29,17 @@ def test_gemm_numerical(dtype, shapes):
     b_cpu = b.float().detach().clone().cpu().requires_grad_()
 
     out = torch.matmul(a, b.T)
-    out = out.cpu()
+    out = out.float().cpu()
     ref = torch.matmul(a_cpu, b_cpu.T)
+
+    ulp = ulp_error(out, ref)
 
     print(f"\n[GEMM] dtype={dtype}, shape={shapes}, result:")
     print(f"RelError:   {relative_error(ref, out):.3e}")
     print(f"MAE:        {max_abs_error(ref, out):.3e}")
     print(f"MSE:        {mean_squared_error(ref, out):.3e}")
     print(f"CosSim:     {cosine_similarity(ref, out):.6f}")
-    print(f"L2 Norm:    {l2_norm(ref, out):.3e}")
+    print(f"ULP(max):   {ulp.max().item()}, ULP(mean): {ulp.float().mean().item():.2f}")
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz])
@@ -63,13 +65,15 @@ def test_fp8_gemm_numerical(dtype, shapes):
     b = b.to(dtype)
 
     out = torch._scaled_mm(a, b.T, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float32)
-    out = out.cpu()
+    out = out.float().cpu()
     ref = torch.matmul(a_cpu, b_cpu.T)
+
+    ulp = ulp_error(out, ref)
 
     print(f"\n[GEMM] dtype={dtype}, shape={shapes}, result:")
     print(f"RelError:   {relative_error(ref, out):.3e}")
     print(f"MAE:        {max_abs_error(ref, out):.3e}")
     print(f"MSE:        {mean_squared_error(ref, out):.3e}")
     print(f"CosSim:     {cosine_similarity(ref, out):.6f}")
-    print(f"L2 Norm:    {l2_norm(ref, out):.3e}")
+    print(f"ULP(max):   {ulp.max().item()}, ULP(mean): {ulp.float().mean().item():.2f}")
  
