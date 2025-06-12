@@ -53,30 +53,19 @@ def test_special_function_accuracy(func_name, dtype, shape):
     device_type_load = get_device_type(is_load=True)
     out_load = load_tensor(save_dir, device_type_load, func_name, dtype, shape)
 
-    # dump_tensor(out, save_dir, device_type, func_name, dtype, shape)
-    dump_tensor(ref, save_dir, "CPU", func_name, dtype, shape)
+    dump_tensor(out, save_dir, device_type, func_name, dtype, shape)
     print(f"{out_load=}")
     if out_load is not None:
         post_process(
-            "CPU",
             get_device_name(is_load=True),
+            device_name,
             func_name,
             dtype,
             shape,
+            out,
             out_load,
-            ref,
             load_results,
         )
-        # post_process(
-        #     get_device_name(is_load=True),
-        #     device_name,
-        #     func_name,
-        #     dtype,
-        #     shape,
-        #     out,
-        #     out_load,
-        #     load_results,
-        # )
 
     post_process("CPU", device_name, func_name, dtype, shape, out, ref, results)
 

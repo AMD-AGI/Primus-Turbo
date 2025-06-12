@@ -132,5 +132,5 @@ def post_process(ref_device, device_name, func_name, dtype, shape, out, ref, dat
         }
     )
 
-    if func_name == "pow":
+    if func_name == "pow" or (shape[0] == 1):
         data.append({k: "" for k in data[-1].keys()})

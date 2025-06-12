@@ -16,10 +16,11 @@ from tests.utils.numerical_utils import (
 
 results, load_results = [], []
 
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shapes", [(512, 128, 256),
-                                    (8192, 8192, 8192),
-                                    (1, 2048, 128)])
+@pytest.mark.parametrize(
+    "shapes", [(512, 128, 256), (8192, 8192, 8192), (1, 2048, 128)]
+)
 def test_gemm_numerical(dtype, shapes):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
