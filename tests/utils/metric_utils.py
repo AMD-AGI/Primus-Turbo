@@ -1,3 +1,4 @@
+import pandas as pd
 import torch
 
 
@@ -63,7 +64,7 @@ def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     assert x.shape == y.shape
     assert x.dtype == y.dtype
 
-    if x.dtype in [ torch.float16, torch.bfloat16 ]:
+    if x.dtype in [torch.float16, torch.bfloat16]:
         x_bits = x.view(torch.int16)
         y_bits = y.view(torch.int16)
     elif x.dtype in [torch.float32]:
@@ -72,14 +73,14 @@ def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError("Not support dtype.")
 
-    def to_ordered(bits : torch.Tensor):
+    def to_ordered(bits: torch.Tensor):
         if bits.element_size() == 4:
-            magic_number = 0x80000000
+            sign_mask = 0x80000000
         elif bits.element_size() == 2:
-            magic_number = 0x8000
+            sign_mask = 0x8000
         else:
             raise ValueError("Not support bits.")
 
-        return torch.where(bits < 0, magic_number - bits, bits)
+        return torch.where(bits < 0, sign_mask - bits, bits)
 
     return (to_ordered(x_bits) - to_ordered(y_bits)).abs()
