@@ -36,14 +36,15 @@ def test_special_function_accuracy(func_name, dtype, shape):
     device_name = get_device_name()
     device_type = get_device_type()
 
-    x = torch.randn(*shape, device=device).to(dtype)
+    x_cpu = torch.randn(*shape).to(dtype)
+    x = x_cpu.to(device)
 
     if func_name == "pow":
-        y = torch.randn(*shape, device=device).to(dtype)
-        ref = FUNC_TABLE[func_name](x.cpu(), y.cpu())
-        out = FUNC_TABLE[func_name](x, y)
+        y_cpu = torch.randn(*shape).to(dtype)
+        ref = FUNC_TABLE[func_name](x_cpu, y_cpu)
+        out = FUNC_TABLE[func_name](x, y_cpu.to(device))
     else:
-        ref = FUNC_TABLE[func_name](x.cpu())
+        ref = FUNC_TABLE[func_name](x_cpu)
         out = FUNC_TABLE[func_name](x)
 
     out = out.cpu()
