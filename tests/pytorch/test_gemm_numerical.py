@@ -67,12 +67,12 @@ def finalize_results_on_exit(request):
         save_dir = get_subdir()
         print(f"{load_results=}")
         if load_results:
-            load_file_path = get_file_path(save_dir, get_format_name())
+            load_file_path = get_file_path(save_dir, get_format_name("gemm"))
             save_result_to_excel(load_results, load_file_path)
 
         if results:
             device_type = get_device_type()
-            file_path = get_file_path(save_dir, get_format_name(device_type))
+            file_path = get_file_path(save_dir, get_format_name(device_type, "gemm"))
             save_result_to_excel(results, file_path)
 
         amd_file = save_dir / "AMD_gemm.xlsx"
