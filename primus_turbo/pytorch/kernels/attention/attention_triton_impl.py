@@ -1,8 +1,10 @@
-import torch
 from typing import Optional
+
+import torch
+
 from primus_turbo.triton.attention.attention_kernel import (
-    attention_block_forward_triton_impl,
     attention_block_backward_triton_impl,
+    attention_block_forward_triton_impl,
 )
 
 
@@ -29,7 +31,6 @@ def attention_triton_forward_impl(
         window_size_left == -1 and window_size_right == -1
     ), "in triton attn kernel, window_size_left and window_size_right must be -1."
 
-    
     output, softmax_lse, exp_scores = attention_block_forward_triton_impl(
         q,
         k,

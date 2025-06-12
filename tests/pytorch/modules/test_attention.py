@@ -1,12 +1,11 @@
 import pytest
 import torch
+
 from primus_turbo.pytorch.modules import CoreAttention
-import primus_turbo.pytorch as pt
 from tests.test_utils import compute_snr
 
-def attention_vanilla_forward_pytorch_ref_impl(
-    q, k, v, sm_scale, causal, layout="bshd"
-):
+
+def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout="bshd"):
     """Compute reference output and softmax_lse using PyTorch's built-in function"""
 
     if layout == "bshd":
@@ -32,12 +31,12 @@ class CoreAttentionRef(torch.nn.Module):
     def __init__(
         self,
         softmax_scale=None,
-        causal=False,       
+        causal=False,
     ):
         super().__init__()
-        
+
         self.softmax_scale = softmax_scale
-        self.causal = causal        
+        self.causal = causal
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
@@ -49,10 +48,11 @@ class CoreAttentionRef(torch.nn.Module):
             causal=self.causal,
         )
 
-@pytest.mark.parametrize("q_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("k_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("v_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("causal", [True,False])
+
+@pytest.mark.parametrize("q_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("k_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("causal", [True, False])
 def test_attention_ck(q_layout, k_layout, v_layout, causal):
 
     device = "cuda"
@@ -65,35 +65,38 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal):
     value_ref = value.clone().detach().requires_grad_()
 
     sm_scale = query.shape[-1] ** (-0.5)
-    
-    primus_attention_ck = CoreAttention(attention_type='ck',
-                                        dropout_p=0.0,
-                                        softmax_scale=sm_scale,
-                                        causal=causal,
-                                        window_size=(-1, -1),
-                                        alibi_slopes=None,
-                                        deterministic=False,
-                                        return_lse=False,
-                                        return_attn_probs=False,
-                                        use_fp8=False)
-    attention_ref = CoreAttentionRef(softmax_scale=sm_scale,causal=causal)
+
+    primus_attention_ck = CoreAttention(
+        attention_type="ck",
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=False,
+        return_lse=False,
+        return_attn_probs=False,
+        use_fp8=False,
+    )
+    attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
     # primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
     # attention_ref = torch.compile(attention_ref, fullgraph=True, mode="max-autotune")
-    out = primus_attention_ck(query,key,value)
-    out_ref = attention_ref(query_ref,key_ref,value_ref)
-    print(compute_snr(out_ref,out))
+    out = primus_attention_ck(query, key, value)
+    out_ref = attention_ref(query_ref, key_ref, value_ref)
+    print(compute_snr(out_ref, out))
     grad_output = torch.randn_like(out)
     out.backward(grad_output)
     out_ref.backward(grad_output)
-    print(compute_snr(query.grad,query_ref.grad))
-    print(compute_snr(key.grad,key_ref.grad))
-    print(compute_snr(value.grad,value_ref.grad))
+    print(compute_snr(query.grad, query_ref.grad))
+    print(compute_snr(key.grad, key_ref.grad))
+    print(compute_snr(value.grad, value_ref.grad))
 
-@pytest.mark.parametrize("q_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("k_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("v_layout", [(4,1024,32,128)])
-@pytest.mark.parametrize("causal", [True,False])
-@pytest.mark.parametrize("is_fp8", [True,False])
+
+@pytest.mark.parametrize("q_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("k_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("is_fp8", [True, False])
 def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
 
     device = "cuda"
@@ -106,29 +109,32 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
     value_ref = value.clone().detach().requires_grad_()
 
     sm_scale = query.shape[-1] ** (-0.5)
-    
-    primus_attention_ck = CoreAttention(attention_type='triton',
-                                        dropout_p=0.0,
-                                        softmax_scale=sm_scale,
-                                        causal=causal,
-                                        window_size=(-1, -1),
-                                        alibi_slopes=None,
-                                        deterministic=True,
-                                        return_lse=False,
-                                        return_attn_probs=False,
-                                        use_fp8=is_fp8)
-    attention_ref = CoreAttentionRef(softmax_scale=sm_scale,causal=causal)
+
+    primus_attention_ck = CoreAttention(
+        attention_type="triton",
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=True,
+        return_lse=False,
+        return_attn_probs=False,
+        use_fp8=is_fp8,
+    )
+    attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
     # primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
     # attention_ref = torch.compile(attention_ref, fullgraph=True, mode="max-autotune")
-    out = primus_attention_ck(query,key,value)
-    out_ref = attention_ref(query_ref,key_ref,value_ref)
-    print(compute_snr(out_ref,out))
+    out = primus_attention_ck(query, key, value)
+    out_ref = attention_ref(query_ref, key_ref, value_ref)
+    print(compute_snr(out_ref, out))
     grad_output = torch.randn_like(out)
     out.backward(grad_output)
     out_ref.backward(grad_output)
-    print(compute_snr(query.grad,query_ref.grad))
-    print(compute_snr(key.grad,key_ref.grad))
-    print(compute_snr(value.grad,value_ref.grad))
+    print(compute_snr(query.grad, query_ref.grad))
+    print(compute_snr(key.grad, key_ref.grad))
+    print(compute_snr(value.grad, value_ref.grad))
+
 
 if __name__ == "__main__":
     torch.manual_seed(123)

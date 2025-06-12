@@ -1,6 +1,7 @@
+from typing import Optional
+
 import torch
 
-from typing import Optional
 from primus_turbo.pytorch.ops.attention import attention_ck, attention_triton
 
 __all__ = ["CoreAttention"]

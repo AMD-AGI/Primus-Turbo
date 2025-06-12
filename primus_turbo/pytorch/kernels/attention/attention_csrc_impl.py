@@ -1,6 +1,8 @@
-import torch
-from aiter.ops.mha import _flash_attn_forward, _flash_attn_backward
 from typing import Optional, Tuple
+
+import torch
+from aiter.ops.mha import _flash_attn_backward, _flash_attn_forward
+
 
 def attention_aiter_csrc_forward_impl(
     q: torch.Tensor,
@@ -14,23 +16,25 @@ def attention_aiter_csrc_forward_impl(
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
-    return_softmax: bool,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_softmax: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            bias,
-            alibi_slopes,
-            return_lse,
-            return_softmax,
-        )
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        bias,
+        alibi_slopes,
+        return_lse,
+        return_softmax,
+    )
     return out_padded, softmax_lse, S_dmask, rng_state
+
 
 def attention_aiter_csrc_backward_impl(
     dout: torch.Tensor,

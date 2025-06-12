@@ -1,2 +1,2 @@
-from .linear import *
 from .attention import *
+from .linear import *
