@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import pandas as pd
 import torch
-from metric_utils import (
+from .metric_utils import (
     cosine_similarity,
     max_abs_error,
     mean_squared_error,
@@ -38,7 +38,7 @@ def get_format_name(device_type="GPU", func_type="special_func"):
 
 
 def get_tensor_name(device_name, func_name, dtype, shape):
-    return f"{device_name}_{func_name}_{dtype.name}_{'_'.join(map(str, shape))}.pt"
+    return f"{device_name}_{func_name}_{str(dtype).split('.')[-1]}_{'_'.join(map(str, shape))}.pt"
 
 
 def get_subdir(save_name="numerical_results"):
