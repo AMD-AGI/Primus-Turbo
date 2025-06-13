@@ -11,52 +11,11 @@ from primus_turbo.triton.gemm.gemm_fp8_kernel import (
 from primus_turbo.triton.quantize.quant_blockwise import (
     quant_fp8_blockwise_for_act_grad_kernel,
     quant_fp8_blockwise_for_weight_kernel,
-    quant_fp8_blockwise_kernel,
 )
 
 
 def ceil_div(a, b):
     return (a + b - 1) // b
-
-
-def quant_fp8_blockwise_impl(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    axis: int,
-    block_size: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantization for fp8 blockwise.
-
-    Quantizes a 2D tensor using blockwise scale along the specified axis.
-    Assumes `x` is contiguous and 2D.
-
-    Returns:
-        x_fp8: FP8-quantized tensor.
-        x_scales: Per-block scale tensor in float32.
-    """
-
-    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
-    assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
-    axis = axis % 2  # Convert negative axis to positive
-
-    M, N = x.shape
-    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
-
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    quant_fp8_blockwise_kernel[grid](
-        x,
-        x_fp8,
-        x_scales,
-        M,
-        N,
-        block_size,
-        torch.finfo(dtype).max,
-        axis,
-    )
-    return x_fp8, x_scales
 
 
 def quant_fp8_blockwise_for_weight_impl(
@@ -67,24 +26,31 @@ def quant_fp8_blockwise_for_weight_impl(
     """
     Quantization for fp8 blockwise (weight).
 
-    Quantizes a 2D weight tensor using blockwise scales along both axes.
-    Assumes `w` is contiguous and 2D.
+    Quantizes a 2D or 3D weight tensor using blockwise scales along both axes.
+    Assumes `w` is contiguous and 2D or 3D.
 
     Returns:
         w_fp8: FP8-quantized weight tensor.
         w_scales: Per-block scale tensor in float32.
     """
 
-    assert w.is_contiguous()
-    M, N = w.shape
-    w_fp8 = torch.empty(M, N, dtype=dtype, device=w.device)
+    assert w.dim() in (2, 3)
+    if not w.is_contiguous():
+        w = w.contiguous()
+
+    ori_dims = w.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w.shape
+        w = w.unsqueeze(0)
+    else:
+        B, M, N = w.shape
+    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
     w_scales = torch.empty(
-        ceil_div(M, block_size),
-        ceil_div(N, block_size),
+        (B, ceil_div(M, block_size), ceil_div(N, block_size)),
         dtype=torch.float32,
         device=w.device,
     )
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    grid = (B, triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     quant_fp8_blockwise_for_weight_kernel[grid](
         w,
         w_fp8,
@@ -94,6 +60,10 @@ def quant_fp8_blockwise_for_weight_impl(
         block_size,
         torch.finfo(dtype).max,
     )
+
+    if ori_dims == 2:
+        w_fp8 = w_fp8.squeeze(0)
+        w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
 
 

@@ -6,8 +6,8 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_blockwise_tn_impl,
     quant_fp8_blockwise_for_act_grad_impl,
     quant_fp8_blockwise_for_weight_impl,
-    quant_fp8_blockwise_impl,
 )
+from primus_turbo.pytorch.kernels.quantize import quant_fp8_blockwise_impl
 
 __all__ = ["gemm_fp8_blockwise"]
 
