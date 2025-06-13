@@ -74,7 +74,7 @@ def dump_tensor(tensor, subdir, device_type, func_name, dtype, shape):
 
 
 def save_result_to_excel(data, file_path):
-    if data:
+    if os.getenv("NUMERICAL_SAVE") and data:
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False)
         print(f"✅ Saved: {file_path}")
