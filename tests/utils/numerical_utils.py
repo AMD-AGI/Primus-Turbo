@@ -57,13 +57,13 @@ def get_file_path(file_dir, file_name):
 
 def load_tensor(subdir, device_type, func_name, dtype, shape):
     if os.getenv("NUMERICAL_LOAD_DEVICE"):
-        device = os.getenv("NUMERICAL_LOAD_DEVICE").split("_")[0]
         file_name = get_tensor_name(device_type, func_name, dtype, shape)
         file_path = get_file_path(subdir, file_name)
         if file_path.exists():
             return torch.load(file_path)
     os.environ.pop("NUMERICAL_LOAD_DEVICE", None)
     return None
+
 
 def dump_tensor(tensor, subdir, device_type, func_name, dtype, shape):
     if os.getenv("NUMERICAL_DUMP", "0") != "0":
@@ -132,5 +132,5 @@ def post_process(ref_device, device_name, func_name, dtype, shape, out, ref, dat
         }
     )
 
-    if func_name == "pow" or (shape[0] == 1):
+    if func_name == "pow" or ((func_name == "gemm") and (dtype == torch.bfloat16)):
         data.append({k: "" for k in data[-1].keys()})

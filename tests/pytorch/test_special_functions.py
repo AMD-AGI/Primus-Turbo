@@ -2,6 +2,8 @@ import pytest
 import torch
 
 from tests.utils.numerical_utils import (
+    load_tensor,
+    dump_tensor,
     get_device_name,
     get_device_type,
     get_file_path,
@@ -10,8 +12,6 @@ from tests.utils.numerical_utils import (
     post_process,
     merge_excels,
     save_result_to_excel,
-    load_tensor,
-    dump_tensor,
 )
 
 
@@ -35,6 +35,7 @@ def test_special_function_accuracy(func_name, dtype, shape):
     device = torch.device("cuda")
     device_name = get_device_name()
     device_type = get_device_type()
+    save_dir = get_subdir()
 
     x_cpu = torch.randn(*shape).to(dtype)
     x = x_cpu.to(device)
@@ -49,13 +50,11 @@ def test_special_function_accuracy(func_name, dtype, shape):
 
     out = out.cpu()
     ref = ref
-    # print(f"xxxxxxxx{func_name}, {dtype}, {shape}--ref:{ref.max()}-{ref.min()}-{ref.mean()}")
-    save_dir = get_subdir()
+
     device_type_load = get_device_type(is_load=True)
     out_load = load_tensor(save_dir, device_type_load, func_name, dtype, shape)
 
     dump_tensor(out, save_dir, device_type, func_name, dtype, shape)
-    print(f"{out_load=}")
     if out_load is not None:
         post_process(
             get_device_name(is_load=True),
@@ -75,7 +74,6 @@ def test_special_function_accuracy(func_name, dtype, shape):
 def finalize_results_on_exit(request):
     def finalizer():
         save_dir = get_subdir()
-        print(f"{load_results=}")
         if load_results:
             load_file_path = get_file_path(save_dir, get_format_name())
             save_result_to_excel(load_results, load_file_path)

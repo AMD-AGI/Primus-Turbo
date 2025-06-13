@@ -63,9 +63,8 @@ def test_gemm_numerical(dtype, shapes):
 def finalize_results_on_exit(request):
     def finalizer():
         save_dir = get_subdir()
-        print(f"{load_results=}")
         if load_results:
-            load_file_path = get_file_path(save_dir, get_format_name("gemm"))
+            load_file_path = get_file_path(save_dir, get_format_name(func_type="gemm"))
             save_result_to_excel(load_results, load_file_path)
 
         if results:
