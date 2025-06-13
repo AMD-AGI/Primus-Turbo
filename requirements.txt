@@ -1,1 +1,4 @@
 pre-commit
+triton_dist @ git+https://github.com/ByteDance-Seed/Triton-distributed.git@b10fa2e7a7e561431687a2d71bfaa09f882fa122#subdirectory=python
+--extra-index-url https://test.pypi.org/simple
+hip-python
