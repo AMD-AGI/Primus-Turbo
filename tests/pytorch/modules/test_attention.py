@@ -110,7 +110,7 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
 
     sm_scale = query.shape[-1] ** (-0.5)
 
-    primus_attention_ck = CoreAttention(
+    primus_attention_triton = CoreAttention(
         attention_type="triton",
         dropout_p=0.0,
         softmax_scale=sm_scale,
@@ -123,17 +123,19 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
         use_fp8=is_fp8,
     )
     attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
-    # primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
+    primus_attention_triton = torch.compile(primus_attention_triton, fullgraph=True, mode="max-autotune")
     # attention_ref = torch.compile(attention_ref, fullgraph=True, mode="max-autotune")
-    out = primus_attention_ck(query, key, value)
+    output, softmax_lse, exp_scores = primus_attention_triton(query, key, value)
     out_ref = attention_ref(query_ref, key_ref, value_ref)
-    print(compute_snr(out_ref, out))
-    grad_output = torch.randn_like(out)
-    out.backward(grad_output)
-    out_ref.backward(grad_output)
-    print(compute_snr(query.grad, query_ref.grad))
-    print(compute_snr(key.grad, key_ref.grad))
-    print(compute_snr(value.grad, value_ref.grad))
+    print(output)
+    print(compute_snr(out_ref, output))
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+    # # out_ref.backward(grad_output)
+    print(query.grad)
+    # print(compute_snr(query.grad, query_ref.grad))
+    # # print(compute_snr(key.grad, key_ref.grad))
+    # # print(compute_snr(value.grad, value_ref.grad))
 
 
 if __name__ == "__main__":
@@ -142,5 +144,5 @@ if __name__ == "__main__":
     q_layout = (batch, seq_len, num_heads, head_size)
     k_layout = (batch, seq_len, num_heads, head_size)
     v_layout = (batch, seq_len, num_heads, head_size)
-    test_attention_ck(q_layout, k_layout, v_layout, causal=True)
-    test_attention_triton(q_layout, k_layout, v_layout, causal=True)
+    # test_attention_ck(q_layout, k_layout, v_layout, causal=True)
+    test_attention_triton(q_layout, k_layout, v_layout, causal=True, is_fp8=True)

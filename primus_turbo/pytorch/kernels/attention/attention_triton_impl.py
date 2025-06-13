@@ -1,6 +1,7 @@
-from typing import Optional
+from typing import List, Optional
 
 import torch
+from torch._library import triton_op
 
 from primus_turbo.triton.attention.attention_kernel import (
     attention_block_backward_triton_impl,
@@ -8,6 +9,7 @@ from primus_turbo.triton.attention.attention_kernel import (
 )
 
 
+@triton_op("amd::attention_triton_forward_impl", mutates_args=())
 def attention_triton_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -24,8 +26,8 @@ def attention_triton_forward_impl(
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
-    use_fp8,
-):
+    use_fp8: bool,
+) -> List[torch.Tensor]:
 
     assert (
         window_size_left == -1 and window_size_right == -1
@@ -54,10 +56,11 @@ def attention_triton_forward_impl(
         use_fp8,
     )
 
-    return output, softmax_lse, exp_scores
+    return [output, softmax_lse, exp_scores]
 
 
 # q k v should be dtype=torch.bf16
+@triton_op("amd::attention_triton_backward_impl", mutates_args=())
 def attention_triton_backward_impl(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -81,12 +84,14 @@ def attention_triton_backward_impl(
     window_size_left: int,
     window_size_right: int,
     alibi_slopes: Optional[torch.Tensor],
-    use_fp8,
-):
+    use_fp8: bool,
+) -> List[torch.Tensor]:
+
     assert (
         window_size_left == -1 and window_size_right == -1
     ), "in triton attn kernel, window_size_left and window_size_right must be -1."
 
+    # 调用attention_block_backward_triton_impl函数，计算dq、dk、dv
     dq, dk, dv = attention_block_backward_triton_impl(
         dout,
         q,
@@ -112,4 +117,5 @@ def attention_triton_backward_impl(
         True,
         use_fp8,
     )
-    return dq, dk, dv
+    # 返回dq、dk、dv
+    return [dq, dk, dv]
