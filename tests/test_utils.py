@@ -61,29 +61,3 @@ def compute_snr(x: torch.Tensor, y: torch.Tensor):
     signal_power = torch.norm(x).pow(2)
     noise_power = torch.norm(x - y).pow(2)
     return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
-
-
-def ulp_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.shape == y.shape
-    assert x.dtype == y.dtype
-
-    if x.dtype in [torch.float16, torch.bfloat16]:
-        x_bits = x.view(torch.int16)
-        y_bits = y.view(torch.int16)
-    elif x.dtype in [torch.float32]:
-        x_bits = x.view(torch.int32)
-        y_bits = y.view(torch.int32)
-    else:
-        raise ValueError("Not support dtype.")
-
-    def to_ordered(bits: torch.Tensor):
-        if bits.element_size() == 4:
-            sign_mask = 0x80000000
-        elif bits.element_size() == 2:
-            sign_mask = 0x8000
-        else:
-            raise ValueError("Not support bits.")
-
-        return torch.where(bits < 0, sign_mask - bits, bits)
-
-    return (to_ordered(x_bits) - to_ordered(y_bits)).abs()
