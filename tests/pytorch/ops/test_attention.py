@@ -31,8 +31,9 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
 @pytest.mark.parametrize("k_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend_type", ["ck", "triton"])
 # batch, seq_len, num_heads, head_size -> layout = bshd
-def test_attention_ck(q_layout, k_layout, v_layout, causal):
+def test_attention_bf16(q_layout, k_layout, v_layout, causal, backend_type):
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -48,7 +49,7 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal):
     loss_ref = o_ref.mean()
     loss_ref.backward()
 
-    o = pt.ops.attention.attention_ck(
+    o = pt.ops.attention(
         query,
         key,
         value,
@@ -61,22 +62,29 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal):
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
-        use_fp8=False,
+        backend_type=backend_type,
     )
 
     loss = o.mean()
     loss.backward()
-    print(compute_snr(query_ref.grad, query.grad))
-    print(compute_snr(key_ref.grad, key.grad))
-    print(compute_snr(value_ref.grad, value.grad))
+
+    out_snr = compute_snr(o_ref, o)
+    query_grad_snr = compute_snr(query_ref.grad, query.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+
+    assert out_snr > 20, "out_snr too low"
+    assert query_grad_snr > 20, "query_grad_snr too low"
+    assert key_grad_snr > 20, "key_grad_snr too low"
+    assert value_grad_snr > 20, "value_grad_snr too low"
 
 
 @pytest.mark.parametrize("q_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("k_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("is_fp8", [True, False])
-def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
+@pytest.mark.parametrize("backend_type", ["triton"])
+def test_attention_fp8(q_layout, k_layout, v_layout, causal, backend_type):
     device = "cuda"
     dtype = torch.bfloat16
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
@@ -91,7 +99,7 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
     loss_ref = o_ref.mean()
     loss_ref.backward()
 
-    o = pt.ops.attention.attention_triton(
+    o = pt.ops.attention_fp8_blockwise(
         query,
         key,
         value,
@@ -104,13 +112,19 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8):
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
-        use_fp8=is_fp8,
+        backend_type=backend_type,
     )
     loss = o.mean()
     loss.backward()
-    print(compute_snr(query_ref.grad, query.grad))
-    print(compute_snr(key_ref.grad, key.grad))
-    print(compute_snr(value_ref.grad, value.grad))
+    out_snr = compute_snr(o_ref, o)
+    query_grad_snr = compute_snr(query_ref.grad, query.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+
+    assert out_snr > 20, "out_snr too low"
+    assert query_grad_snr > 18, "query_grad_snr too low"
+    assert key_grad_snr > 18, "key_grad_snr too low"
+    assert value_grad_snr > 18, "value_grad_snr too low"
 
 
 if __name__ == "__main__":
@@ -119,5 +133,5 @@ if __name__ == "__main__":
     q_layout = (batch, seq_len, num_heads, head_size)
     k_layout = (batch, seq_len, num_heads, head_size)
     v_layout = (batch, seq_len, num_heads, head_size)
-    test_attention_ck(q_layout, k_layout, v_layout, causal=True)
-    test_attention_triton(q_layout, k_layout, v_layout, causal=True, is_fp8=True)
+    test_attention_bf16(q_layout, k_layout, v_layout, causal=True, backend_type="ck")
+    test_attention_fp8(q_layout, k_layout, v_layout, causal=True, backend_type="triton")

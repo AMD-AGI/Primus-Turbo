@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.ops.attention import attention_ck, attention_triton
+from primus_turbo.pytorch.ops.attention import attention, attention_fp8_blockwise
 
 __all__ = ["CoreAttention"]
 
@@ -10,7 +10,6 @@ __all__ = ["CoreAttention"]
 class CoreAttention(torch.nn.Module):
     def __init__(
         self,
-        attention_type: str = "ck",  # 'ck', 'triton'
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
@@ -20,12 +19,11 @@ class CoreAttention(torch.nn.Module):
         return_lse=False,
         return_attn_probs=False,
         use_fp8=False,
+        backend_type: str = "ck",  # 'ck', 'triton'
     ):
         super().__init__()
 
-        assert not (
-            use_fp8 and attention_type == "ck"
-        ), "When use_fp8 is True, attention_type cannot be 'ck'."
+        assert not (use_fp8 and backend_type == "ck"), "When use_fp8 is True, attention_type cannot be 'ck'."
 
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
@@ -35,14 +33,14 @@ class CoreAttention(torch.nn.Module):
         self.return_lse = return_lse
         self.return_attn_probs = return_attn_probs
         self.deterministic = deterministic
-        self.use_fp8 = use_fp8
+        self.backend_type = backend_type
 
-        if attention_type == "ck":
-            self.attention_fn = attention_ck
-        elif attention_type == "triton":
-            self.attention_fn = attention_triton
+        if backend_type == "ck" and use_fp8 == False:
+            self.attention_fn = attention
+        elif backend_type == "triton":
+            self.attention_fn = attention_fp8_blockwise
         else:
-            raise ValueError(f"Unknown attention type: {attention_type}")
+            raise ValueError(f"Unknown attention type: {backend_type}")
 
     def forward(
         self,
@@ -65,5 +63,5 @@ class CoreAttention(torch.nn.Module):
             deterministic=self.deterministic,
             return_lse=self.return_lse,
             return_attn_probs=self.return_attn_probs,
-            use_fp8=self.use_fp8,
+            backend_type=self.backend_type,
         )

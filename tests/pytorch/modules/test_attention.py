@@ -54,7 +54,8 @@ class CoreAttentionRef(torch.nn.Module):
 @pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
-def test_attention_ck(q_layout, k_layout, v_layout, causal, enable_torch_compile):
+@pytest.mark.parametrize("backend_type", ["ck", "triton"])
+def test_attention_fp16(q_layout, k_layout, v_layout, causal, enable_torch_compile, backend_type):
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -68,7 +69,6 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal, enable_torch_compile
     sm_scale = query.shape[-1] ** (-0.5)
 
     primus_attention_ck = CoreAttention(
-        attention_type="ck",
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
@@ -78,6 +78,7 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal, enable_torch_compile
         return_lse=False,
         return_attn_probs=False,
         use_fp8=False,
+        backend_type=backend_type,
     )
     attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
@@ -86,7 +87,7 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal, enable_torch_compile
     out = primus_attention_ck(query, key, value)
     out_ref = attention_ref(query_ref, key_ref, value_ref)
     out_snr = compute_snr(out_ref, out)
-    assert out_snr > 20, "xgrad_snr too low"
+    assert out_snr > 20, "out_snr too low"
 
     grad_output = torch.randn_like(out)
     out.backward(grad_output)
@@ -103,10 +104,8 @@ def test_attention_ck(q_layout, k_layout, v_layout, causal, enable_torch_compile
 @pytest.mark.parametrize("k_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("v_layout", [(4, 1024, 32, 128)])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("is_fp8", [True, False])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
-def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8, enable_torch_compile):
-
+def test_attention_fp8(q_layout, k_layout, v_layout, causal, enable_torch_compile):
     device = "cuda"
     dtype = torch.bfloat16
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
@@ -119,7 +118,6 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8, enable_t
     sm_scale = query.shape[-1] ** (-0.5)
 
     primus_attention_triton = CoreAttention(
-        attention_type="triton",
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
@@ -128,7 +126,8 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8, enable_t
         deterministic=True,
         return_lse=False,
         return_attn_probs=False,
-        use_fp8=is_fp8,
+        use_fp8=True,
+        backend_type="triton",
     )
     attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
@@ -137,7 +136,7 @@ def test_attention_triton(q_layout, k_layout, v_layout, causal, is_fp8, enable_t
     output = primus_attention_triton(query, key, value)
     out_ref = attention_ref(query_ref, key_ref, value_ref)
     out_snr = compute_snr(out_ref, output)
-    assert out_snr > 20, "xgrad_snr too low"
+    assert out_snr > 20, "out_snr too low"
 
     grad_output = torch.randn_like(output)
     output.backward(grad_output)
@@ -156,5 +155,7 @@ if __name__ == "__main__":
     q_layout = (batch, seq_len, num_heads, head_size)
     k_layout = (batch, seq_len, num_heads, head_size)
     v_layout = (batch, seq_len, num_heads, head_size)
-    test_attention_ck(q_layout, k_layout, v_layout, causal=True, enable_torch_compile=True)
-    test_attention_triton(q_layout, k_layout, v_layout, causal=True, is_fp8=True, enable_torch_compile=True)
+    test_attention_fp16(
+        q_layout, k_layout, v_layout, causal=True, enable_torch_compile=True, backend_type="ck"
+    )
+    test_attention_fp8(q_layout, k_layout, v_layout, causal=True, enable_torch_compile=True)
