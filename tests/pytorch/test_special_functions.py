@@ -2,18 +2,17 @@ import pytest
 import torch
 
 from tests.utils.numerical_utils import (
-    load_tensor,
     dump_tensor,
     get_device_name,
     get_device_type,
     get_file_path,
     get_format_name,
     get_subdir,
-    post_process,
+    load_tensor,
     merge_excels,
+    post_process,
     save_result_to_excel,
 )
-
 
 FUNC_TABLE = {
     "exp": lambda x: torch.exp(x),

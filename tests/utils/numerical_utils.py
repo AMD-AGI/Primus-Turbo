@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
+
 import pandas as pd
 import torch
+
 from .metric_utils import (
     cosine_similarity,
     max_abs_error,
@@ -109,9 +111,7 @@ def post_process(ref_device, device_name, func_name, dtype, shape, out, ref, dat
     def item(metric):
         return f"{metric:.3e}" if isinstance(metric, float) else str(metric)
 
-    print(
-        f"\n[{func_name.upper()}][{device_name} vs {ref_device}] dtype={dtype}, shape={shape}"
-    )
+    print(f"\n[{func_name.upper()}][{device_name} vs {ref_device}] dtype={dtype}, shape={shape}")
     print(f"RelError:   {relative_error(ref, out):.3e}")
     print(f"MaxAbsErr:  {max_abs_error(ref, out):.3e}")
     print(f"MSE:        {mean_squared_error(ref, out):.3e}")
