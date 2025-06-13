@@ -60,6 +60,15 @@ def fused_all_gather_matmul(
 
     Returns:
         Tuple[Optional[torch.Tensor], List[torch.Tensor]]: all-gathered A_shard and output tensors of matmul.
+
+    Example:
+        >>> A_shard = torch.randn(2, 3)
+        >>> B = torch.randn(3, 3)
+        >>> tp_group = torch.distributed.new_group(...)
+        >>> gemm_streams = [torch.cuda.current_stream()]
+        >>> comm_streams = [torch.cuda.Stream() for i in range(tp_group.size() - 1)]
+        >>> copy_streams = [torch.cuda.Stream()]
+        >>> A_out, outputs = primus_turbo.pytorch.ops.fused_all_gather_matmul(A_shard, [B], ['NN'], 0, tp_group.group_name, gemm_streams, comm_streams, copy_streams)
     """
 
     # check input
