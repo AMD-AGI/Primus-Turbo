@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -207,7 +207,6 @@ def attention_ck(
     )
 
 
-@torch._dynamo.allow_in_graph
 class AttentionTritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -281,19 +280,17 @@ class AttentionTritonFunction(torch.autograd.Function):
             ctx.p_scale = p_scale
             ctx.causal = causal
             ctx.use_fp8 = use_fp8
-            ctx.cu_seqlens_q = torch.tensor(0)
-            ctx.cu_seqlens_k = torch.tensor(0)
+            ctx.cu_seqlens_q = torch.tensor(0, device="cuda")
+            ctx.cu_seqlens_k = torch.tensor(0, device="cuda")
             ctx.max_seqlens_q = q.shape[1]
             ctx.max_seqlens_k = k.shape[1]
 
-        # return outputs
-        # result = [output]
-        # if return_lse:
-        #     result.append(softmax_lse)
-        # if return_softmax:
-        #     result.append(exp_scores)
-
-        return output, softmax_lse, exp_scores
+        result = [output]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(exp_scores)
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -328,82 +325,6 @@ class AttentionTritonFunction(torch.autograd.Function):
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
-
-
-@attention_triton_backward_impl.register_fake
-def _fake_attention_triton_backward_impl(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    p_scale: float,
-    softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    alibi_slopes: Optional[torch.Tensor],
-    use_fp8: bool,
-) -> List[torch.Tensor]:
-    return [
-        torch.empty_like(q, dtype=torch.bfloat16),
-        torch.empty_like(k, dtype=torch.bfloat16),
-        torch.empty_like(v, dtype=torch.bfloat16),
-    ]
-
-
-@attention_triton_forward_impl.register_fake
-def _fake_attention_triton_forward_impl(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    p_scale: float,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool,
-    use_fp8: bool,
-) -> List[torch.Tensor]:
-    o_shape = list(q.shape)
-    o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
-    o = torch.empty(
-        o_shape,
-        device=q.device,
-        dtype=torch.bfloat16 if use_fp8 else q.dtype,
-        requires_grad=True,
-    )
-
-    batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
-    batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
-
-    if return_softmax:
-        exp_scores = torch.zeros(
-            (batch_q, nheads_q, max_seqlen_q, max_seqlen_k), device=q.device, dtype=torch.float32
-        )
-    else:
-        exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
-
-    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q * 2), device=q.device, dtype=torch.float32)
-
-    return [o, softmax_lse, exp_scores]
 
 
 def attention_triton(

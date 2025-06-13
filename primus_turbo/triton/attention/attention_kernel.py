@@ -18,12 +18,12 @@ Not currently supported:
 
 import math
 import os
-from typing import List, Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-from torch._library import triton_op, wrap_triton
+from torch._library import wrap_triton
 
 fwd_torch_dtype: tl.constexpr = torch.bfloat16
 bwd_torch_dtype: tl.constexpr = torch.float32
@@ -912,7 +912,7 @@ def get_padded_head_dim(head_size: int):
     return padded_d_model
 
 
-@triton_op("amd::attention_block_forward_triton_impl", mutates_args=())
+# @triton_op("amd::attention_block_forward_triton_impl", mutates_args=())
 def attention_block_forward_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -934,7 +934,7 @@ def attention_block_forward_triton_impl(
     return_scores: bool,
     use_exp2: bool,
     use_fp8: bool,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print()
         print("attention_forward_triton_impl")
@@ -1103,7 +1103,7 @@ def attention_block_forward_triton_impl(
         BLOCK_M=FIXED_BLOCK_M,
         BLOCK_N=FIXED_BLOCK_N,
     )
-    return [o, softmax_lse, exp_scores]
+    return o, softmax_lse, exp_scores
 
 
 @triton.jit
@@ -1958,7 +1958,7 @@ def _attn_bwd_dq(
     return dq
 
 
-@triton_op("amd::attention_block_backward_triton_impl", mutates_args=())
+# @triton_op("amd::attention_block_backward_triton_impl", mutates_args=())
 def attention_block_backward_triton_impl(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -1984,7 +1984,7 @@ def attention_block_backward_triton_impl(
     use_exp2: bool,
     use_fp8: bool,
     sequence_parallel: bool = True,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print("####################################################")
         print("attention_backward_triton_new_impl")
@@ -2358,7 +2358,7 @@ def attention_block_backward_triton_impl(
         dv_og.copy_(dv)
         dv = dv_og
 
-    return [dq.to(fwd_torch_dtype), dk.to(fwd_torch_dtype), dv.to(fwd_torch_dtype)]
+    return dq.to(fwd_torch_dtype), dk.to(fwd_torch_dtype), dv.to(fwd_torch_dtype)
 
 
 def block_scaling_node(tensor, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):
