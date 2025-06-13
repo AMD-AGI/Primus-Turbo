@@ -14,7 +14,6 @@ from primus_turbo.triton.attention.attention_kernel import (
     FIXED_BLOCK_M,
     FIXED_BLOCK_N,
     block_scaling_node,
-    get_f8_fwd_dtype,
 )
 
 
@@ -230,7 +229,7 @@ class AttentionTritonFunction(torch.autograd.Function):
         if use_fp8:
             # online quant
             range_v = torch.max(torch.abs(v))
-            float8_fw = get_f8_fwd_dtype()
+            float8_fw = torch.float8_e4m3fnuz
             dtype_max = torch.finfo(float8_fw).max
             v_scale = dtype_max / range_v
             p_scale = dtype_max

@@ -120,4 +120,4 @@ if __name__ == "__main__":
     k_layout = (batch, seq_len, num_heads, head_size)
     v_layout = (batch, seq_len, num_heads, head_size)
     test_attention_ck(q_layout, k_layout, v_layout, causal=True)
-    test_attention_triton(q_layout, k_layout, v_layout, causal=True)
+    test_attention_triton(q_layout, k_layout, v_layout, causal=True, is_fp8=True)
