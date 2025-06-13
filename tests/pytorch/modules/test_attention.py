@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.modules import CoreAttention
-from tests.test_utils import compute_snr
+from tests.utils.metric_utils import compute_snr
 
 
 def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout="bshd"):
