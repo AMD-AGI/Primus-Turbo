@@ -1,6 +1,5 @@
 #include <torch/extension.h>
 
-
 namespace primus_turbo::pytorch {
 
 /********************************************/
@@ -17,7 +16,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("gemm", gemm);
 }
 
-TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m){
+TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("gemm", gemm);
 }
 
@@ -26,5 +25,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 /********************************************/
 
-
-} // primus_turbo::pytorch
+} // namespace primus_turbo::pytorch

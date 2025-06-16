@@ -7,4 +7,4 @@ torch::Tensor gemm(torch::Tensor a, torch::Tensor b) {
     return torch::matmul(a, b);
 }
 
-} // primus_turbo::pytorch
+} // namespace primus_turbo::pytorch
