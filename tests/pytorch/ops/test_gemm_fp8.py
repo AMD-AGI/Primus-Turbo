@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise
-from tests.utils.metric_utils import compute_snr
+from tests.test_utils import compute_snr
 
 
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])

@@ -1,26 +1,6 @@
 import torch
 
 
-def is_ROCM():
-    return torch.cuda.is_available() and torch.version.hip
-
-
-# TODO: Need to check again whether these values are reasonable.
-# TODO: fp8
-def get_tolerances(dtype):
-    if dtype == torch.float32:
-        return dict(rtol=1e-5, atol=1e-5)
-    elif dtype == torch.float16:
-        return dict(rtol=1e-2, atol=1e-2)
-    elif dtype == torch.bfloat16:
-        return dict(rtol=1e-2, atol=1e-2)
-    else:
-        raise ValueError(f"Unsupported dtype: {dtype}")
-
-
-###################################################################
-
-
 # Relative Error
 # Note: x is ref
 def relative_error(x: torch.Tensor, y: torch.Tensor):
@@ -31,19 +11,19 @@ def relative_error(x: torch.Tensor, y: torch.Tensor):
 # MSE Error
 def mean_squared_error(x: torch.Tensor, y: torch.Tensor):
     x, y = x.float(), y.float()
-    return torch.mean((x - y) ** 2).item()
+    return torch.mean((x - y) ** 2).detach().item()
 
 
 # Max Abs Error
 def max_abs_error(x: torch.Tensor, y: torch.Tensor):
     x, y = x.float(), y.float()
-    return torch.max(torch.abs(x - y)).item()
+    return torch.max(torch.abs(x - y)).detach().item()
 
 
 # Cosine Similarity
 def cosine_similarity(x: torch.Tensor, y: torch.Tensor):
     x, y = x.flatten().float(), y.flatten().float()
-    return torch.nn.functional.cosine_similarity(x, y, dim=0).item()
+    return torch.nn.functional.cosine_similarity(x, y, dim=0).detach().item()
 
 
 # Symmetric Similarity

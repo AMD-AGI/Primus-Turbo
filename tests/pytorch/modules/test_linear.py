@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.modules import Linear
-from tests.utils.metric_utils import get_tolerances
+from tests.test_utils import get_tolerances
 
 
 @pytest.mark.parametrize("bias", [True, False])
