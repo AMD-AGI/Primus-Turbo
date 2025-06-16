@@ -9,12 +9,30 @@ from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
+    get_f8_fwd_dtype,
 )
-from primus_turbo.triton.attention.attention_kernel import (
-    FIXED_BLOCK_M,
-    FIXED_BLOCK_N,
-    block_scaling_node,
-)
+from primus_turbo.triton.attention.attention_kernel import FIXED_BLOCK_M, FIXED_BLOCK_N
+
+
+def block_scaling_node(tensor, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):
+    # this funciton help scale tensor in per-block mode
+    # block size: [BLOCK_M, D]
+    # [B, L, H, D]
+    # scale should be [B, H, L//BLOCK_M]
+    tensor = tensor.permute(0, 2, 1, 3)  # [B, H, L, D]
+    B, H, L, D = tensor.shape
+    tensor = tensor.reshape(B, H, L // BLOCK_M, BLOCK_M, D).reshape(B, H, L // BLOCK_M, BLOCK_M * D)
+    MAX_E4M3 = torch.finfo(float8_dtype).max
+    scale = MAX_E4M3 / tensor.abs().max(dim=-1)[0]
+    tensor = tensor * scale.reshape(scale.shape + (1,))
+    tensor = tensor.clamp(-MAX_E4M3, MAX_E4M3)
+    tensor = tensor.to(float8_dtype)
+    tensor = tensor.reshape(B, H, L, D).permute(0, 2, 1, 3).contiguous()
+    # [B, L, H, D]
+    return tensor, 1.0 / scale.to(torch.float32).contiguous()
+
+
+__all__ = ["attention", "attention_fp8_blockwise"]
 
 
 class AttentionCKFunction(torch.autograd.Function):
@@ -40,6 +58,7 @@ class AttentionCKFunction(torch.autograd.Function):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = softmax_scale
         head_size_q_og = q.size(3)
         head_size_v_og = v.size(3)
         if head_size_q_og % 8 != 0:
@@ -139,6 +158,11 @@ def attention(
     return_attn_probs=False,
     backend_type: str = "ck",  # 'ck', 'triton'
 ):
+    head_dim_qk = q.shape[-1]
+    head_dim_v = v.shape[-1]
+    if head_dim_qk != head_dim_v:
+        if backend_type == "ck":
+            backend_type = "triton"  # ck backend do not support head_dim_qk! = head_dim_v
     if backend_type == "ck":
         return AttentionCKFunction.apply(
             q,
