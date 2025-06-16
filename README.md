@@ -3,10 +3,15 @@
 
 ## Docker Image
 ```
-rocm/megatron-lm:latest
+rocm/megatron-lm:v25.5_py310
 ```
 
 ## Install
+```
+git clone https://github.com/AMD-AIG-AIMA/Primus-Turbo.git
+git submodule update --init --recursive
+```
+
 ### Develop
 ```
 pip3 install -r requirements.txt
