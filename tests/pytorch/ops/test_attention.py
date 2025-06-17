@@ -2,50 +2,23 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as pt
+from tests.pytorch.ref.attention_ref import (
+    AttnConfig,
+    attention_vanilla_forward_pytorch_ref_impl,
+)
 from tests.test_utils import compute_snr
 
-
-class Config:
-    def __init__(self, seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v):
-        self.seqlen_q = seqlen_q
-        self.seqlen_kv = seqlen_kv
-        self.num_head_q = num_head_q
-        self.num_head_kv = num_head_kv
-        self.head_dim_qk = head_dim_qk
-        self.head_dim_v = head_dim_v
-
-
-def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout="bshd"):
-    """Compute reference output and softmax_lse using PyTorch's built-in function"""
-
-    if layout == "bshd":
-        num_heads = q.shape[2]
-        n_kv_heads = k.shape[2]
-        n_rep = num_heads // n_kv_heads
-
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-    else:
-        raise ValueError(f"Unknown layout {layout}")
-
-    o_ref = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
-    )
-    if layout == "bshd":
-        o_ref = o_ref.transpose(1, 2)
-    return o_ref
-
-
 test_cases = [
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    Config(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
+    AttnConfig(
+        seqlen_q=1024, seqlen_kv=1024, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128
+    ),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 

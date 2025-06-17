@@ -25,9 +25,9 @@ import triton.language as tl
 philox_seed: tl.constexpr = 0x1BF52
 philox_offset: tl.constexpr = 0x1D4B42
 
-AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in ("1", "true", "yes")
-DEBUG = os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in ("1", "true", "yes")
-PERF = os.environ.get("FLASH_ATTENTION_TRITON_AMD_PERF", "0").lower() in ("1", "true", "yes")
+AUTOTUNE = os.environ.get("PRIMUS_TURBO_TRITON_AMD_AUTOTUNE", "0").lower() in ("1", "true", "yes")
+DEBUG = os.environ.get("PRIMUS_TURBO_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in ("1", "true", "yes")
+PERF = os.environ.get("PRIMUS_TURBO_ATTENTION_TRITON_AMD_PERF", "0").lower() in ("1", "true", "yes")
 
 FIXED_BLOCK_M = 64
 FIXED_BLOCK_N = 64
