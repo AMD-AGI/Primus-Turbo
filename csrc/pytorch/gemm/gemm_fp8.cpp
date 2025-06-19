@@ -15,13 +15,13 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
     TORCH_CHECK(b.is_cuda(), "b must be CUDA tensor");
     TORCH_CHECK(c.is_cuda(), "c must be CUDA tensor");
 
-    print_tensor_info(a, "a");
-    print_tensor_info(a_scales, "a_scales");
-    print_tensor_info(b, "b");
-    print_tensor_info(b_scales, "b_scales");
-    print_tensor_info(c, "c");
-    std::cout << "transA=" << transA << ", transB=" << transB << ", block_size=" << block_size
-              << std::endl;
+    // print_tensor_info(a, "a");
+    // print_tensor_info(a_scales, "a_scales");
+    // print_tensor_info(b, "b");
+    // print_tensor_info(b_scales, "b_scales");
+    // print_tensor_info(c, "c");
+    // std::cout << "transA=" << transA << ", transB=" << transB << ", block_size=" << block_size
+    //           << std::endl;
 
     const int32_t M = transA ? a.size(1) : a.size(0);
     const int32_t K = transA ? a.size(0) : a.size(1);
