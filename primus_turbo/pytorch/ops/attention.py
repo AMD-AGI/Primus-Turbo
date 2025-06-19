@@ -61,6 +61,9 @@ class AttentionCKFunction(torch.autograd.Function):
         softmax_scale = softmax_scale
         head_size_q_og = q.size(3)
         head_size_v_og = v.size(3)
+        # todo fix if head_size_v_og!=head_size_q_og, no padding
+        if head_size_q_og != head_size_v_og:
+            v = torch.nn.functional.pad(v, [0, head_size_q_og - head_size_v_og])
         if head_size_q_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
@@ -114,6 +117,8 @@ class AttentionCKFunction(torch.autograd.Function):
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
+        if head_size_q_og != head_size_v_og:
+            dout_padded = torch.nn.functional.pad(dout, [0, head_size_q_og - head_size_v_og])
         attention_aiter_csrc_backward_impl(
             dout_padded,
             q,
@@ -158,11 +163,6 @@ def attention(
     return_attn_probs=False,
     backend_type: str = "ck",  # 'ck', 'triton'
 ):
-    head_dim_qk = q.shape[-1]
-    head_dim_v = v.shape[-1]
-    if head_dim_qk != head_dim_v:
-        if backend_type == "ck":
-            backend_type = "triton"  # ck backend do not support head_dim_qk! = head_dim_v
     if backend_type == "ck":
         return AttentionCKFunction.apply(
             q,
