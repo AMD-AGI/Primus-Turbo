@@ -9,6 +9,22 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
+DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
+
+
+def setup_cxx_env():
+    user_cxx = os.environ.get("CXX")
+    if user_cxx:
+        print(f"[Primus-Turbo Setup] Using user-provided CXX: {user_cxx}")
+    else:
+        os.environ["CXX"] = DEFAULT_HIPCC
+        print(f"[Primus-Turbo Setup] No CXX provided. Defaulting to: {DEFAULT_HIPCC}")
+
+    os.environ.setdefault("CMAKE_CXX_COMPILER", os.environ["CXX"])
+    os.environ.setdefault("CMAKE_HIP_COMPILER", os.environ["CXX"])
+    print(f"[Primus-Turbo Setup] CMAKE_CXX_COMPILER set to: {os.environ['CMAKE_CXX_COMPILER']}")
+    print(f"[Primus-Turbo Setup] CMAKE_HIP_COMPILER set to: {os.environ['CMAKE_HIP_COMPILER']}")
+
 
 def read_version():
     with open(os.path.join("primus_turbo", "__init__.py")) as f:
@@ -35,6 +51,7 @@ def build_torch_extension():
         "-fvisibility=hidden",
     ]
 
+    # TODO: consider rocm version
     nvcc_flags = [
         "-O3",
         "-U__HIP_NO_HALF_OPERATORS__",
@@ -43,6 +60,17 @@ def build_torch_extension():
         "-U__HIP_NO_BFLOAT16_CONVERSIONS__",
         "-U__HIP_NO_BFLOAT162_OPERATORS__",
         "-U__HIP_NO_BFLOAT162_CONVERSIONS__",
+        "-fno-offload-uniform-block",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-enable-post-misched=0",
+        "-mllvm",
+        "-amdgpu-coerce-illegal-types=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
     ]
 
     max_jobs = int(os.getenv("MAX_JOBS", "4"))
@@ -79,6 +107,8 @@ def compile_aiter():
 
 
 if __name__ == "__main__":
+    # set cxx
+    setup_cxx_env()
     # Compile aiter before setting up the main package
     compile_aiter()
 
