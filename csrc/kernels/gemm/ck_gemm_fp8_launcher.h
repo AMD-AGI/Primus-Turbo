@@ -29,9 +29,9 @@ template <typename OperatorDesc, typename BlockConfig> struct CKGemmFP8Blockwise
 
         BlockConfig::BlockSize,
 
-        OperatorDesc::Scale_Block_M,
-        OperatorDesc::Scale_Block_N,
-        OperatorDesc::Scale_Block_K,
+        OperatorDesc::ScaleBlockM,
+        OperatorDesc::ScaleBlockN,
+        OperatorDesc::ScaleBlockK,
 
         BlockConfig::MPerBlock,
         BlockConfig::NPerBlock,

@@ -6,12 +6,12 @@ from tests.test_utils import compute_snr
 
 
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
 @pytest.mark.parametrize("block_size", [128, 256])
 @pytest.mark.parametrize("M", [257, 4096])
 @pytest.mark.parametrize("NK", [(255, 129), (2048, 7168)])
-def test_gemm_fp8_blockwise_func(ori_dtype, block_size, M, NK):
+def test_gemm_fp8_blockwise_func(ori_dtype, dtype, block_size, M, NK):
     N, K = NK
-    dtype = torch.float8_e4m3fnuz
     device = "cuda:0"
 
     print(f"\nM={M}, N={N}, K={K}, ori_dtype={ori_dtype}, dtype={dtype}, block_size={block_size}")

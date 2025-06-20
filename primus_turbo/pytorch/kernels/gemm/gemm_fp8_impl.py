@@ -154,12 +154,16 @@ def gemm_fp8_blockwise_nt_impl(
     assert K == K1, f"Incompatible K dims: {K} vs {K1}"
 
     out = torch.empty(M, N, dtype=out_dtype, device=a.device)
-
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-    gemm_fp8_blockwise_nt_kernel[grid](a, b, out, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=block_size)
+    if block_size == 128 and N % 128 == 0 and K % 128 == 0:
+        out = torch.ops.primus_turbo_cpp_extension.gemm_fp8_blockwise(
+            a, a_scales, b, b_scales, out, False, True, block_size
+        )
+    else:
+        grid = lambda META: (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+        gemm_fp8_blockwise_nt_kernel[grid](a, b, out, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=block_size)
     return out
 
 

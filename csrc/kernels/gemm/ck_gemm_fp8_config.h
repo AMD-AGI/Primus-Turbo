@@ -49,10 +49,10 @@ struct CKGemmFP8OperatorDescriptor {
     using AElementOp   = PassThrough;
     using BElementOp   = PassThrough;
     using CDEElementOp = PassThrough;
-    // TODO: Change name
-    static constexpr ck::index_t Scale_Block_M = ScaleBlockM_;
-    static constexpr ck::index_t Scale_Block_N = ScaleBlockN_;
-    static constexpr ck::index_t Scale_Block_K = ScaleBlockK_;
+
+    static constexpr ck::index_t ScaleBlockM = ScaleBlockM_;
+    static constexpr ck::index_t ScaleBlockN = ScaleBlockN_;
+    static constexpr ck::index_t ScaleBlockK = ScaleBlockK_;
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
 };
