@@ -57,11 +57,11 @@ template <typename OperatorDesc, typename BlockConfig> struct CKGemmFP8Blockwise
     >;
     // clang-format on
 
-    static typename Kernel::Argument MakeArgument(void *a_ptr, void *a_scales_ptr, void *b_ptr,
-                                                  void *b_scales_ptr, void *c_ptr, const int32_t M,
-                                                  const int32_t N, const int32_t K,
-                                                  ck::index_t StrideA, ck::index_t StrideB,
-                                                  ck::index_t StrideE) {
+    static typename Kernel::Argument
+    MakeArgument(const typename OperatorDesc::A0DataType *a_ptr, const float *a_scales_ptr,
+                 const typename OperatorDesc::B0DataType *b_ptr, const float *b_scales_ptr,
+                 typename OperatorDesc::EDataType *c_ptr, const int32_t M, const int32_t N,
+                 const int32_t K, ck::index_t StrideA, ck::index_t StrideB, ck::index_t StrideE) {
         // TODO:
         using PassThrough                    = ck::tensor_operation::element_wise::PassThrough;
         auto                  a_element_op   = PassThrough{};

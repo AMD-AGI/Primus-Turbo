@@ -80,8 +80,11 @@ def build_torch_extension():
     ck_include_dir = os.path.join(PROJECT_ROOT, "3rdparty", "composable_kernel", "include")
 
     # CPP
-    cu_sources = glob.glob("csrc/kernels/**/*.cu", recursive=True)
-    cpp_sources = glob.glob("csrc/pytorch/**/*.cpp", recursive=True)
+    cu_sources = []
+    cpp_sources = []
+    cu_sources += glob.glob("csrc/kernels/**/*.cu", recursive=True)
+    cu_sources += glob.glob("csrc/pytorch/**/*.cu", recursive=True)
+    cpp_sources += glob.glob("csrc/pytorch/**/*.cpp", recursive=True)
     sources = ["csrc/pytorch/bindings_pytorch.cpp"] + cu_sources + cpp_sources
 
     return CUDAExtension(
