@@ -59,7 +59,8 @@ struct CKGemmFP8OperatorDescriptor {
 
 //===================== SelectCKGemmFP8OperatorDescriptor ======================
 // TODO: TransA and TransB
-template <typename AType, typename BType, typename CType> struct SelectCKGemmFP8OperatorDescriptor;
+template <typename AType, typename BType, typename CType, bool transA, bool transB>
+struct SelectCKGemmFP8OperatorDescriptor;
 
 //================================ Block Config ===========-====================
 template <ck::index_t BlockSize_, ck::index_t MPerBlock_, ck::index_t NPerBlock_,
@@ -94,17 +95,17 @@ struct CKGemmFP8BlockConfig {
 
 //====================== Gemm Desc Specialization ==================
 
-using CKGemmFP8Blockwise_E4M3_BF16_NT_ScaleBlkM1N128K128_Desc =
-    CKGemmFP8OperatorDescriptor<FP8, BF16, RowMajor, ColMajor, 1, 128, 128>;
+// using CKGemmFP8Blockwise_E4M3_BF16_NT_ScaleBlkM1N128K128_Desc =
+//     CKGemmFP8OperatorDescriptor<FP8, BF16, RowMajor, ColMajor, 1, 128, 128>;
 
-using CKGemmFP8Blockwise_E4M3_FP16_NT_ScaleBlkM1N128K128_Desc =
-    CKGemmFP8OperatorDescriptor<FP8, FP16, RowMajor, ColMajor, 1, 128, 128>;
+// using CKGemmFP8Blockwise_E4M3_FP16_NT_ScaleBlkM1N128K128_Desc =
+//     CKGemmFP8OperatorDescriptor<FP8, FP16, RowMajor, ColMajor, 1, 128, 128>;
 
-using CKGemmFP8Blockwise_E5M2_BF16_NT_ScaleBlkM1N128K128_Desc =
-    CKGemmFP8OperatorDescriptor<BF8, BF16, RowMajor, ColMajor, 1, 128, 128>;
+// using CKGemmFP8Blockwise_E5M2_BF16_NT_ScaleBlkM1N128K128_Desc =
+//     CKGemmFP8OperatorDescriptor<BF8, BF16, RowMajor, ColMajor, 1, 128, 128>;
 
-using CKGemmFP8Blockwise_E5M2_FP16_NT_ScaleBlkM1N128K128_Desc =
-    CKGemmFP8OperatorDescriptor<BF8, FP16, RowMajor, ColMajor, 1, 128, 128>;
+// using CKGemmFP8Blockwise_E5M2_FP16_NT_ScaleBlkM1N128K128_Desc =
+//     CKGemmFP8OperatorDescriptor<BF8, FP16, RowMajor, ColMajor, 1, 128, 128>;
 
 // ** Currently CK dont support
 // using CKGemmFP8Blockwise_E4M3_BF16_NN_ScaleBlkM1N128K128_Desc =
@@ -118,23 +119,28 @@ using CKGemmFP8Blockwise_M128N128K128_BlockConfig =
 
 // ======= SelectCKGemmFP8OperatorDescriptor Specialization =======
 
-// E4M3 + FP16
-template <> struct SelectCKGemmFP8OperatorDescriptor<ck::f8_t, ck::f8_t, ck::half_t> {
-    using type = CKGemmFP8Blockwise_E4M3_FP16_NT_ScaleBlkM1N128K128_Desc;
+template <typename AType, typename BType, typename CType>
+struct SelectCKGemmFP8OperatorDescriptor<AType, BType, CType, false, true> {
+    using type = CKGemmFP8OperatorDescriptor<AType, CType, RowMajor, ColMajor, 1, 128, 128>;
 };
 
-// E4M3 + BF16
-template <> struct SelectCKGemmFP8OperatorDescriptor<ck::f8_t, ck::f8_t, ck::bhalf_t> {
-    using type = CKGemmFP8Blockwise_E4M3_BF16_NT_ScaleBlkM1N128K128_Desc;
-};
+// // E4M3 + FP16
+// template <> struct SelectCKGemmFP8OperatorDescriptor<ck::f8_t, ck::f8_t, ck::half_t> {
+//     using type = CKGemmFP8Blockwise_E4M3_FP16_NT_ScaleBlkM1N128K128_Desc;
+// };
 
-// E5M2 + FP16
-template <> struct SelectCKGemmFP8OperatorDescriptor<ck::bf8_t, ck::bf8_t, ck::half_t> {
-    using type = CKGemmFP8Blockwise_E5M2_FP16_NT_ScaleBlkM1N128K128_Desc;
-};
-// E5M2 + BF16
-template <> struct SelectCKGemmFP8OperatorDescriptor<ck::bf8_t, ck::bf8_t, ck::bhalf_t> {
-    using type = CKGemmFP8Blockwise_E5M2_BF16_NT_ScaleBlkM1N128K128_Desc;
-};
+// // E4M3 + BF16
+// template <> struct SelectCKGemmFP8OperatorDescriptor<ck::f8_t, ck::f8_t, ck::bhalf_t> {
+//     using type = CKGemmFP8Blockwise_E4M3_BF16_NT_ScaleBlkM1N128K128_Desc;
+// };
+
+// // E5M2 + FP16
+// template <> struct SelectCKGemmFP8OperatorDescriptor<ck::bf8_t, ck::bf8_t, ck::half_t> {
+//     using type = CKGemmFP8Blockwise_E5M2_FP16_NT_ScaleBlkM1N128K128_Desc;
+// };
+// // E5M2 + BF16
+// template <> struct SelectCKGemmFP8OperatorDescriptor<ck::bf8_t, ck::bf8_t, ck::bhalf_t> {
+//     using type = CKGemmFP8Blockwise_E5M2_BF16_NT_ScaleBlkM1N128K128_Desc;
+// };
 
 } // namespace primus_turbo
