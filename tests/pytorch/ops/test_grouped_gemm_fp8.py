@@ -1,10 +1,8 @@
+import pytest
 import torch
 
 from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
 from tests.test_utils import compute_snr
-
-# def seg_lens_to_seg_indptr(seg_lens: torch.Tensor) -> torch.Tensor:
-#     return torch.cat([torch.tensor([0], device=seg_lens.device), seg_lens.cumsum(0)])
 
 
 def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
@@ -18,36 +16,27 @@ def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
     return torch.cat(out)
 
 
-def test_blockwise_fp8_grouped_gemm_func():
-    ori_dtype = torch.bfloat16
+@pytest.mark.parametrize("B", [1, 2, 3, 32])
+@pytest.mark.parametrize("M", [32, 256, 2048])
+@pytest.mark.parametrize("NK", [(4096, 7168)])
+@pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_blockwise_fp8_grouped_gemm_func(B, M, NK, ori_dtype, dtype, block_size):
+    N, K = NK
     device = "cuda:0"
-    trans_b = True
-    block_size = 128
-    dtype = torch.float8_e4m3fnuz
 
-    # DeepSeek-V3
-    # E = 32
-    # M = 256
-    # N = 4096
-    # K = 7168
+    print(f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, dtype={dtype}, block_size={block_size}")
 
-    # Simply
-    E = 2
-    M = 256
-    N = 1024
-    K = 2048
-
-    dist = 0.2 + 0.8 * torch.rand(E)
+    #
+    dist = 0.2 + 0.8 * torch.rand(B)
     dist /= dist.sum()
-    seg_lens = (dist * M * E).to(torch.long).to(device)
-    error = M * E - seg_lens.sum()
+    seg_lens = (dist * M * B).to(torch.long).to(device)
+    error = M * B - seg_lens.sum()
     seg_lens[-1] += error
-
-    x = torch.randn((E * M, K), dtype=ori_dtype, device=device, requires_grad=True)
-    if trans_b:
-        w = torch.randn((E, N, K), dtype=ori_dtype, device=device, requires_grad=True)
-    else:
-        w = torch.randn((E, K, N), dtype=ori_dtype, device=device, requires_grad=True)
+    #
+    x = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    w = torch.randn((B, N, K), dtype=ori_dtype, device=device, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
     w_ref = w.detach().clone().requires_grad_(True)
 
@@ -57,7 +46,7 @@ def test_blockwise_fp8_grouped_gemm_func():
     # print(seg_indptr)
 
     # Ref
-    out_ref = grouped_gemm_ref(x_ref, w_ref, seg_lens, trans_b)
+    out_ref = grouped_gemm_ref(x_ref, w_ref, seg_lens, True)
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out)
     x_grad_ref = x_ref.grad
@@ -71,23 +60,23 @@ def test_blockwise_fp8_grouped_gemm_func():
 
     out_snr = compute_snr(out_ref, out)
 
-    print("\nfwd")
-    print(out, out.shape)
-    print(out_ref, out.shape)
+    print("fwd")
+    # print(out, out.shape)
+    # print(out_ref, out.shape)
     out_snr = compute_snr(out_ref, out)
     print(f"Out-SNR: {out_snr:.2f} dB")
     assert out_snr > 20, "out_snr too low"
 
     print("dgrad")
-    print(x_grad, x_grad.shape)
-    print(x_grad_ref, x_grad_ref.shape)
+    # print(x_grad, x_grad.shape)
+    # print(x_grad_ref, x_grad_ref.shape)
     xgrad_snr = compute_snr(x_grad_ref, x_grad)
     print(f"XGrad-SNR: {xgrad_snr:.2f} dB")
     assert xgrad_snr > 20, "xgrad_snr too low"
 
     print("wgrad")
-    print(w_grad, w_grad.shape)
-    print(w_grad_ref, w_grad_ref.shape)
+    # print(w_grad, w_grad.shape)
+    # print(w_grad_ref, w_grad_ref.shape)
     wgrad_snr = compute_snr(w_grad_ref, w_grad)
     print(f"WGrad-SNR: {wgrad_snr:.2f} dB")
     assert wgrad_snr > 20, "wgrad_snr too low"

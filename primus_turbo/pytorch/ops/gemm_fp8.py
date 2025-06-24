@@ -12,7 +12,7 @@ from primus_turbo.pytorch.kernels.quantize import quant_fp8_blockwise_impl
 __all__ = ["gemm_fp8_blockwise"]
 
 
-class BlockwiseFP8LinearFunction(torch.autograd.Function):
+class BlockwiseFP8GemmFunction(torch.autograd.Function):
     """
     Autograd function for FP8 blockwise GEMM.
 
@@ -137,4 +137,4 @@ def gemm_fp8_blockwise(x, weight, block_size=128, dtype=torch.float8_e4m3fnuz):
         >>> w = torch.randn(768, 1024, dtype=torch.bfloat16).cuda()
         >>> y = gemm_fp8_blockwise(x, w)
     """
-    return BlockwiseFP8LinearFunction.apply(x, weight, block_size, dtype)
+    return BlockwiseFP8GemmFunction.apply(x, weight, block_size, dtype)

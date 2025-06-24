@@ -1,8 +1,6 @@
 import triton
 import triton.language as tl
 
-# os.environ["TRITON_INTERPRET"] = "1"
-
 
 @triton.jit
 def compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX):
@@ -58,9 +56,6 @@ def quant_fp8_blockwise_kernel(
     )
 
 
-# Blockwise for Segment M
-
-
 @triton.jit
 def compute_m_range(pid, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE: tl.constexpr):
     bid = 0
@@ -75,6 +70,7 @@ def compute_m_range(pid, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SI
     return m_range_start, m_range_end, bid
 
 
+# Blockwise for Segment M
 @triton.jit
 def quant_fp8_blockwise_segment_m_kernel(
     x_ptr,
