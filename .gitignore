@@ -5,3 +5,5 @@ build
 .vscode
 .gitmodules
 test-reports/
+*_hip.h
+*.hip

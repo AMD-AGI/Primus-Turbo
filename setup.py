@@ -97,7 +97,7 @@ def build_torch_extension():
 
     # CPP
     sources = [csrc_source_files / "bindings_pytorch.cpp"] + all_files_in_dir(
-        csrc_source_files, name_extensions=["hip", "cpp", "cc", "cu"]
+        csrc_source_files, name_extensions=["cpp", "cc", "cu"]
     )
 
     return CUDAExtension(

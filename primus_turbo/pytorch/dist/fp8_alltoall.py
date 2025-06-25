@@ -9,6 +9,30 @@ __all__ = ["FP8AllToAll"]
 
 
 class FP8AllToAll(torch.autograd.Function):
+    """
+    Split input tensor and then scatter the split list to all processes in a group.
+
+    Later the received tensors are concatenated from all the processes in the group
+    and returned as a single output tensor.
+
+    Support fp8 precision.
+
+    Args:
+        group (ProcessGroup, optional): The process group to work on. If None,
+            the default process group will be used.
+        input_ (Tensor): Input tensor to scatter.
+        output_split_sizes (Union[List, None]): Output split sizes for dim 0
+            if specified None or empty, dim 0 of ``output`` tensor must divide
+            equally by ``world_size``.
+        input_split_sizes (Union[List, None]): Input split sizes for dim 0
+            if specified None or empty, dim 0 of ``input`` tensor must divide
+            equally by ``world_size``.
+        fp8_format (Format): Format of fp8 quantize.
+        allreduce_amax (bool): Applying allreduce-max of input_'s amax.
+
+    Returns:
+        output (Tensor): Gathered concatenated output tensor.
+    """
 
     @staticmethod
     def forward(

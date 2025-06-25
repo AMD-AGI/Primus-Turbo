@@ -1,7 +1,5 @@
 #pragma once
 
-#include <hip/hip_runtime.h>
-
 #include <type_traits>
 
 #include "common.h"
@@ -252,19 +250,17 @@ void VectorizedUnaryKernelLauncher(const InputType *input, OutputType *output, c
 
         switch (align) {
         case Alignment::SAME_ALIGNED:
-            hipLaunchKernelGGL((unary_kernel<nvec, true, fp32, Param, OP>), dim3(num_blocks),
-                               dim3(threads), 0, stream, input, output, scale, params, N,
-                               num_aligned_elements);
+            unary_kernel<nvec, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
+                input, output, scale, params, N, num_aligned_elements);
             break;
         case Alignment::SAME_UNALIGNED:
-            hipLaunchKernelGGL((unary_kernel<nvec, false, fp32, Param, OP>), dim3(num_blocks),
-                               dim3(threads), 0, stream, input, output, scale, params, N,
-                               num_aligned_elements);
+            unary_kernel<nvec, false, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
+                input, output, scale, params, N, num_aligned_elements);
             break;
         case Alignment::DIFFERENT: {
             // If the pointers are aligned differently we cannot vectorize
-            hipLaunchKernelGGL((unary_kernel<1, true, fp32, Param, OP>), dim3(num_blocks),
-                               dim3(threads), 0, stream, input, output, scale, params, N, N);
+            unary_kernel<1, true, fp32, Param, OP>
+                <<<num_blocks, threads, 0, stream>>>(input, output, scale, params, N, N);
             break;
         }
         }
