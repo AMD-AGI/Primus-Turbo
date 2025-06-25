@@ -14,7 +14,7 @@ from tests.test_utils import get_tolerances
         else [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz]
     ),
 )
-@pytest.mark.parametrize("numel", [(6 * 1 * 7168 * 8192)])
+@pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
 def test_fp8_quant_dequant(orig_dtype, dest_dtype, numel):
     torch.manual_seed(42)
     x_ref = torch.rand(numel, device="cuda", dtype=orig_dtype)
