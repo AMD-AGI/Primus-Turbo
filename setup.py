@@ -1,15 +1,30 @@
-import glob
 import os
 import platform
 import re
 import subprocess
+from pathlib import Path
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
-
+PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
+
+
+def all_files_in_dir(path, name_extensions=[]):
+    all_files = []
+    for dirname, _, names in os.walk(path):
+        for name in names:
+            skip = True
+            for name_extension in name_extensions:
+                if name_extension in name:
+                    skip = False
+                    break
+            if skip:
+                continue
+            all_files.append(Path(dirname, name))
+
+    return all_files
 
 
 def setup_cxx_env():
@@ -77,22 +92,19 @@ def build_torch_extension():
     nvcc_flags.append(f"-parallel-jobs={max_jobs}")
 
     # Include
-    ck_include_dir = os.path.join(PROJECT_ROOT, "3rdparty", "composable_kernel", "include")
+    ck_include_dir = Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include")
+    csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
 
     # CPP
-    cu_sources = []
-    cpp_sources = []
-    cu_sources += glob.glob("csrc/kernels/**/*.cu", recursive=True)
-    cu_sources += glob.glob("csrc/pytorch/**/*.cu", recursive=True)
-    cpp_sources += glob.glob("csrc/pytorch/**/*.cpp", recursive=True)
-    sources = ["csrc/pytorch/bindings_pytorch.cpp"] + cu_sources + cpp_sources
+    sources = [csrc_source_files / "bindings_pytorch.cpp"] + all_files_in_dir(
+        csrc_source_files, name_extensions=["hip", "cpp", "cc", "cu"]
+    )
 
     return CUDAExtension(
         name="primus_turbo.pytorch._C",
         sources=sources,
         include_dirs=[
-            "csrc/include",
-            os.path.abspath("csrc/include"),
+            Path(PROJECT_ROOT / "csrc" / "include"),
             ck_include_dir,
         ],
         libraries=libraries,

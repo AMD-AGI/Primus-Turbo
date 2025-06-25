@@ -1,5 +1,7 @@
 import torch
 
+from primus_turbo.pytorch.core.fp8 import is_fp8_dtype
+
 
 def is_ROCM():
     return torch.cuda.is_available() and torch.version.hip
@@ -14,6 +16,8 @@ def get_tolerances(dtype):
         return dict(rtol=1e-2, atol=1e-2)
     elif dtype == torch.bfloat16:
         return dict(rtol=1e-2, atol=1e-2)
+    elif is_fp8_dtype(dtype):
+        return dict(rtol=1e-1, atol=1e-1)
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
 

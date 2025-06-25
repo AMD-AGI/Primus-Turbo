@@ -1,20 +1,10 @@
 #include <torch/extension.h>
 
+#include "extensions.h"
+
 namespace primus_turbo::pytorch {
 
 /********************************************/
-
-// This is a demo for testing csrc lib
-torch::Tensor gemm(torch::Tensor a, torch::Tensor b);
-torch::Tensor gemm_meta(torch::Tensor a, torch::Tensor b);
-
-torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torch::Tensor &b,
-                                 torch::Tensor &b_scales, torch::Tensor &c, const bool transA,
-                                 const bool transB, const int64_t block_size);
-
-torch::Tensor gemm_fp8_blockwise_meta(torch::Tensor &a, torch::Tensor &a_scales, torch::Tensor &b,
-                                      torch::Tensor &b_scales, torch::Tensor &c, const bool transA,
-                                      const bool transB, const int64_t block_size);
 
 TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("gemm(Tensor a, Tensor b) -> Tensor");
@@ -25,21 +15,26 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool transA, bool transB, "
           "int block_size"
           ") -> Tensor");
+    m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");
+    m.def("fp8_dequantize(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("gemm", gemm);
     m.impl("gemm_fp8_blockwise", gemm_fp8_blockwise);
+    m.impl("fp8_quantize", fp8_quantize);
+    m.impl("fp8_dequantize", fp8_dequantize);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("gemm", gemm_meta);
     m.impl("gemm_fp8_blockwise", gemm_fp8_blockwise_meta);
+    m.impl("fp8_quantize", fp8_quantize_meta);
+    m.impl("fp8_dequantize", fp8_dequantize_meta);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // m.def("gemm", &gemm_forward, "GEMM kernel for ROCm");
-}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+
 /********************************************/
 
 } // namespace primus_turbo::pytorch
