@@ -146,11 +146,3 @@ template <typename... Ts> inline std::string concat_strings(const Ts &...args) {
 template <typename T> constexpr T DIVUP(const T &x, const T &y) {
     return (((x) + ((y) -1)) / (y));
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T> struct is_fp8 : std::false_type {};
-
-template <> struct is_fp8<fp8e4m3> : std::true_type {};
-
-template <> struct is_fp8<fp8e5m2> : std::true_type {};

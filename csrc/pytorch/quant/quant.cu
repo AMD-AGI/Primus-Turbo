@@ -46,8 +46,7 @@ at::Tensor fp8_quantize(const at::Tensor input, const at::Tensor scale,
             p.scale = reinterpret_cast<const fp32 *>(scale.data_ptr());
             VectorizedUnaryKernelLauncher<nvec, QuantizeParam, quantize_func>(
                 reinterpret_cast<const IType *>(input.data_ptr()),
-                reinterpret_cast<OType *>(output.data_ptr()),
-                reinterpret_cast<const fp32 *>(scale.data_ptr()), input.numel(), p,
+                reinterpret_cast<OType *>(output.data_ptr()), input.numel(), p,
                 stream);); // NOLINT(*)
     );
 
@@ -74,8 +73,7 @@ at::Tensor fp8_dequantize(const at::Tensor input, const at::Tensor scale_inv,
             p.scale_inv = reinterpret_cast<const fp32 *>(scale_inv.data_ptr());
             VectorizedUnaryKernelLauncher<nvec, DequantizeParam, dequantize_func>(
                 reinterpret_cast<const IType *>(input.data_ptr()),
-                reinterpret_cast<OType *>(output.data_ptr()),
-                reinterpret_cast<const fp32 *>(scale_inv.data_ptr()), input.numel(), p,
+                reinterpret_cast<OType *>(output.data_ptr()), input.numel(), p,
                 stream);); // NOLINT(*)
     );
 
