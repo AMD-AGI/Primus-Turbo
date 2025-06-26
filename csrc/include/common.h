@@ -31,16 +31,14 @@ using fp8e5m2 = hip_fp8_e5m2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct uint16 {
+struct uint64x8_t {
     uint4 u;
     uint4 v;
     uint4 s;
     uint4 t;
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct uint8 {
+struct uint64x4_t {
     uint4 u;
     uint4 v;
 };
@@ -50,12 +48,12 @@ struct uint8 {
 template <int BYTES> struct BytesToType {};
 
 template <> struct BytesToType<64> {
-    using Type = uint16;
+    using Type = uint64x8_t;
     static_assert(sizeof(Type) == 64);
 };
 
 template <> struct BytesToType<32> {
-    using Type = uint8;
+    using Type = uint64x4_t;
     static_assert(sizeof(Type) == 32);
 };
 
