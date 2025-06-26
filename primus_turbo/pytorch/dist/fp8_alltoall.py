@@ -3,7 +3,7 @@ from typing import List, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from primus_turbo.pytorch.core import fp8
+from primus_turbo.pytorch.core import float8
 
 __all__ = ["FP8AllToAll"]
 
@@ -41,7 +41,7 @@ class FP8AllToAll(torch.autograd.Function):
         input_: torch.Tensor,
         output_split_sizes: Union[List, None],
         input_split_sizes: Union[List, None],
-        fp8_format: fp8.Format,
+        fp8_format: float8.Format,
         allreduce_amax: bool,
     ) -> torch.Tensor:
         assert group is not None, "group should not be None."

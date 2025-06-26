@@ -1,6 +1,6 @@
 import torch
 
-from primus_turbo.pytorch.core.fp8 import is_fp8_dtype
+from primus_turbo.pytorch.core.float8 import is_fp8_dtype
 
 
 def is_ROCM():
@@ -8,7 +8,6 @@ def is_ROCM():
 
 
 # TODO: Need to check again whether these values are reasonable.
-# TODO: fp8
 def get_tolerances(dtype):
     if dtype == torch.float32:
         return dict(rtol=1e-5, atol=1e-5)

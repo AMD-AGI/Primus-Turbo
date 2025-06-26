@@ -12,7 +12,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
-from primus_turbo.pytorch.core.fp8 import Format
+from primus_turbo.pytorch.core.float8 import Format
 from primus_turbo.pytorch.dist import FP8AllToAll
 from tests.test_utils import get_tolerances
 

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.fp8 import check_fp8_ocp_support
+from primus_turbo.pytorch.core.float8 import check_fp8_ocp_support
 from tests.test_utils import get_tolerances
 
 
