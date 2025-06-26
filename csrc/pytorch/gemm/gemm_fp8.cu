@@ -1,5 +1,5 @@
 #include "../type_traits.h"
-#include "gemm_fp8.h"
+#include "primus_turbo/gemm_fp8.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
@@ -65,8 +65,8 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
         using BType = AType;
         DISPATCH_OUT_DTYPE(c.scalar_type(), {
             ck_gemm_fp8_blockwise_kernel<AType, BType, CType>(
-                reinterpret_cast<const AType *>(a.data_ptr()), a_scales.data_ptr<float>(),
-                reinterpret_cast<const BType *>(b.data_ptr()), b_scales.data_ptr<float>(),
+                reinterpret_cast<const AType *>(a.data_ptr()), a_scales.data_ptr<dtype::float32>(),
+                reinterpret_cast<const BType *>(b.data_ptr()), b_scales.data_ptr<dtype::float32>(),
                 reinterpret_cast<CType *>(c.data_ptr()), M, N, K, transA, transB, stream);
         });
     } else if (a.scalar_type() == torch::kFloat8_e5m2fnuz &&
@@ -75,8 +75,8 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
         using BType = AType;
         DISPATCH_OUT_DTYPE(c.scalar_type(), {
             ck_gemm_fp8_blockwise_kernel<AType, BType, CType>(
-                reinterpret_cast<const AType *>(a.data_ptr()), a_scales.data_ptr<float>(),
-                reinterpret_cast<const BType *>(b.data_ptr()), b_scales.data_ptr<float>(),
+                reinterpret_cast<const AType *>(a.data_ptr()), a_scales.data_ptr<dtype::float32>(),
+                reinterpret_cast<const BType *>(b.data_ptr()), b_scales.data_ptr<dtype::float32>(),
                 reinterpret_cast<CType *>(c.data_ptr()), M, N, K, transA, transB, stream);
         });
     } else {

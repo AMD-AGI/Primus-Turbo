@@ -9,15 +9,13 @@
 #include "ck/library/utility/literals.hpp"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 
+#include "primus_turbo/dtype.h"
+
 namespace primus_turbo {
 
-template <ck::index_t... Is> using Seq = ck::Sequence<Is...>;
+using namespace primus_turbo::dtype;
 
-using FP16 = ck::half_t;
-using BF16 = ck::bhalf_t;
-using FP8  = ck::f8_t;
-using BF8  = ck::bf8_t;
-using FP32 = float;
+template <ck::index_t... Is> using Seq = ck::Sequence<Is...>;
 
 using RowMajor = ck::tensor_layout::gemm::RowMajor;
 using ColMajor = ck::tensor_layout::gemm::ColumnMajor;
@@ -31,11 +29,11 @@ template <typename FP8Type_, typename EType_, typename ALayout_, typename BLayou
           ck::index_t ScaleBlockM_, ck::index_t ScaleBlockN_, ck::index_t ScaleBlockK_>
 struct CKGemmFP8OperatorDescriptor {
     using A0DataType       = FP8Type_;
-    using A1DataType       = FP32;
+    using A1DataType       = float32;
     using B0DataType       = FP8Type_;
-    using B1DataType       = FP32;
-    using AccDataType      = FP32;
-    using CShuffleDataType = FP32;
+    using B1DataType       = float32;
+    using AccDataType      = float32;
+    using CShuffleDataType = float32;
     using DsDataType       = ck::Tuple<>;
     using EDataType        = EType_;
     using ComputeTypeA     = FP8Type_;

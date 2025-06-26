@@ -2,9 +2,11 @@
 
 #include <type_traits>
 
-#include "common.h"
+#include "primus_turbo/common.h"
 
 namespace primus_turbo {
+
+using namespace dtype;
 
 /* \brief Helper class that enables storing multiple values of type DType
           as 1 value of type LType.
@@ -229,7 +231,7 @@ Alignment CheckAlignment(const size_t lead_dim, const int nvec, const T... ptrs)
 
 } // namespace
 
-template <int nvec, typename Param, fp32 (*OP)(const fp32, const Param &), typename InputType,
+template <int nvec, typename Param, float32 (*OP)(const float32, const Param &), typename InputType,
           typename OutputType>
 void VectorizedUnaryKernelLauncher(const InputType *input, OutputType *output, const size_t N,
                                    const Param params, hipStream_t stream) {
@@ -244,16 +246,16 @@ void VectorizedUnaryKernelLauncher(const InputType *input, OutputType *output, c
 
         switch (align) {
         case Alignment::SAME_ALIGNED:
-            unary_kernel<nvec, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
+            unary_kernel<nvec, true, float32, Param, OP><<<num_blocks, threads, 0, stream>>>(
                 input, output, params, N, num_aligned_elements);
             break;
         case Alignment::SAME_UNALIGNED:
-            unary_kernel<nvec, false, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
+            unary_kernel<nvec, false, float32, Param, OP><<<num_blocks, threads, 0, stream>>>(
                 input, output, params, N, num_aligned_elements);
             break;
         case Alignment::DIFFERENT: {
             // If the pointers are aligned differently we cannot vectorize
-            unary_kernel<1, true, fp32, Param, OP>
+            unary_kernel<1, true, float32, Param, OP>
                 <<<num_blocks, threads, 0, stream>>>(input, output, params, N, N);
             break;
         }

@@ -3,6 +3,8 @@
 
 namespace primus_turbo {
 
+using namespace primus_turbo::dtype;
+
 template <typename OperatorDesc, typename BlockConfig> struct CKGemmFP8BlockwiseLauncher {
     // clang-format off
     using Kernel = ck::tensor_operation::device::DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3
@@ -58,8 +60,8 @@ template <typename OperatorDesc, typename BlockConfig> struct CKGemmFP8Blockwise
     // clang-format on
 
     static typename Kernel::Argument
-    MakeArgument(const typename OperatorDesc::A0DataType *a_ptr, const float *a_scales_ptr,
-                 const typename OperatorDesc::B0DataType *b_ptr, const float *b_scales_ptr,
+    MakeArgument(const typename OperatorDesc::A0DataType *a_ptr, const float32 *a_scales_ptr,
+                 const typename OperatorDesc::B0DataType *b_ptr, const float32 *b_scales_ptr,
                  typename OperatorDesc::EDataType *c_ptr, const int32_t M, const int32_t N,
                  const int32_t K, ck::index_t StrideA, ck::index_t StrideB, ck::index_t StrideE) {
         // TODO:

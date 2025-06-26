@@ -3,7 +3,11 @@
 #include "ck/utility/data_type.hpp"
 #include <torch/extension.h>
 
+#include "primus_turbo/dtype.h"
+
 namespace primus_turbo::pytorch {
+
+using namespace primus_turbo::dtype;
 
 // ************************************************ //
 
@@ -31,7 +35,7 @@ template <> struct TorchToCKType<torch::kBFloat16> {
 };
 
 template <> struct TorchToCKType<torch::kFloat> {
-    using type = float;
+    using type = float32;
 };
 // ************************************************ //
 

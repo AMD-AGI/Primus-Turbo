@@ -12,7 +12,7 @@
 
 #include <ATen/hip/HIPGraphsUtils.cuh>
 
-#include "common.h"
+#include "primus_turbo/common.h"
 
 namespace primus_turbo::pytorch {
 

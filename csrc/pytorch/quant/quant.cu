@@ -5,19 +5,21 @@
 
 namespace primus_turbo::pytorch {
 
+using namespace primus_turbo::dtype;
+
 struct QuantizeParam {
-    const fp32 *scale;
+    const float32 *scale;
 };
 
-__device__ inline fp32 quantize_func(fp32 value, const QuantizeParam &param) {
+__device__ inline float32 quantize_func(float32 value, const QuantizeParam &param) {
     return value * (*(param.scale));
 }
 
 struct DequantizeParam {
-    const fp32 *scale_inv;
+    const float32 *scale_inv;
 };
 
-__device__ inline fp32 dequantize_func(fp32 value, const DequantizeParam &param) {
+__device__ inline float32 dequantize_func(float32 value, const DequantizeParam &param) {
     return value * (*(param.scale_inv));
 }
 
@@ -43,7 +45,7 @@ at::Tensor fp8_quantize(const at::Tensor input, const at::Tensor scale,
         input.scalar_type(), IType,
         TORCH_TYPE_SWITCH_FP8ONLY(
             output.scalar_type(), OType, constexpr int nvec = 32 / sizeof(IType); QuantizeParam p;
-            p.scale = reinterpret_cast<const fp32 *>(scale.data_ptr());
+            p.scale = reinterpret_cast<const float32 *>(scale.data_ptr());
             VectorizedUnaryKernelLauncher<nvec, QuantizeParam, quantize_func>(
                 reinterpret_cast<const IType *>(input.data_ptr()),
                 reinterpret_cast<OType *>(output.data_ptr()), input.numel(), p,
@@ -70,7 +72,7 @@ at::Tensor fp8_dequantize(const at::Tensor input, const at::Tensor scale_inv,
         input.scalar_type(), IType,
         TORCH_TYPE_SWITCH_INPUT(
             output.scalar_type(), OType, constexpr int nvec = 32 / sizeof(OType); DequantizeParam p;
-            p.scale_inv = reinterpret_cast<const fp32 *>(scale_inv.data_ptr());
+            p.scale_inv = reinterpret_cast<const float32 *>(scale_inv.data_ptr());
             VectorizedUnaryKernelLauncher<nvec, DequantizeParam, dequantize_func>(
                 reinterpret_cast<const IType *>(input.data_ptr()),
                 reinterpret_cast<OType *>(output.data_ptr()), input.numel(), p,
