@@ -17,8 +17,10 @@
 #include "float8.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace primus_turbo {
 
 using byte    = uint8_t;
+using int8    = int8_t;
 using int32   = int32_t;
 using int64   = int64_t;
 using fp32    = float;
@@ -26,8 +28,6 @@ using fp16    = half;
 using bf16    = hip_bfloat16;
 using fp8e4m3 = hip_fp8_e4m3;
 using fp8e5m2 = hip_fp8_e5m2;
-
-namespace primus_turbo {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

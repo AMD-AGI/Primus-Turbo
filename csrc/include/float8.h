@@ -1,5 +1,7 @@
 #pragma once
 
+namespace primus_turbo {
+
 #ifdef __HIPCC__
 
 #include <hip/hip_fp8.h>
@@ -16,3 +18,5 @@ typedef struct {
     char storage;
 } hip_fp8_e5m2;
 #endif //__HIPCC__
+
+} // namespace primus_turbo
