@@ -59,8 +59,14 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
 
     // std::cout << "M: " << M << " N: " << N << " K: " << K << "\n";
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    if (a.scalar_type() == torch::kFloat8_e4m3fnuz && b.scalar_type() == torch::kFloat8_e4m3fnuz) {
+    auto       stream    = at::cuda::getCurrentCUDAStream().stream();
+    const auto fp8_dtype = a.scalar_type();
+    // TOOD: Hybird?
+    TORCH_CHECK(a.scalar_type() == b.scalar_type(),
+                "FP8 GEMM requires A and B to have the same dtype, but got A = ", a.scalar_type(),
+                ", B = ", b.scalar_type());
+
+    if (fp8_dtype == torch::kFloat8_e4m3fnuz || fp8_dtype == torch::kFloat8_e4m3fn) {
         using AType = typename TorchToCKType<torch::kFloat8_e4m3fnuz>::type;
         using BType = AType;
         DISPATCH_OUT_DTYPE(c.scalar_type(), {
@@ -69,8 +75,7 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
                 reinterpret_cast<const BType *>(b.data_ptr()), b_scales.data_ptr<dtype::float32>(),
                 reinterpret_cast<CType *>(c.data_ptr()), M, N, K, transA, transB, stream);
         });
-    } else if (a.scalar_type() == torch::kFloat8_e5m2fnuz &&
-               b.scalar_type() == torch::kFloat8_e5m2fnuz) {
+    } else if (fp8_dtype == torch::kFloat8_e5m2fnuz || fp8_dtype == torch::kFloat8_e5m2) {
         using AType = typename TorchToCKType<torch::kFloat8_e5m2fnuz>::type;
         using BType = AType;
         DISPATCH_OUT_DTYPE(c.scalar_type(), {
@@ -80,7 +85,7 @@ torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torc
                 reinterpret_cast<CType *>(c.data_ptr()), M, N, K, transA, transB, stream);
         });
     } else {
-        TORCH_CHECK(false, "Unsupported combination: A dtype = ", a.scalar_type(),
+        TORCH_CHECK(false, "Unsupported: A dtype = ", a.scalar_type(),
                     ", B dtype = ", b.scalar_type());
     }
 

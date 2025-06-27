@@ -17,12 +17,19 @@ using namespace primus_turbo::dtype;
 // Map torch::ScalarType -> CK type
 template <torch::ScalarType scalar_type> struct TorchToCKType;
 
-// TODO: FP8 Type. OCP
 template <> struct TorchToCKType<torch::kFloat8_e4m3fnuz> {
     using type = ck::f8_t;
 };
 
+template <> struct TorchToCKType<torch::kFloat8_e4m3fn> {
+    using type = ck::f8_t;
+};
+
 template <> struct TorchToCKType<torch::kFloat8_e5m2fnuz> {
+    using type = ck::bf8_t;
+};
+
+template <> struct TorchToCKType<torch::kFloat8_e5m2> {
     using type = ck::bf8_t;
 };
 

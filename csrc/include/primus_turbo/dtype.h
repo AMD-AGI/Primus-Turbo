@@ -19,6 +19,8 @@ using bfloat16 = hip_bfloat16;
 // using float8_e5m2 = __float8_e5m2;
 using float8_e4m3 = __hip_fp8_e4m3_fnuz;
 using float8_e5m2 = __hip_fp8_e5m2_fnuz;
+// using float8_e4m3 = __hip_fp8_e4m3;
+// using float8_e5m2 = __hip_fp8_e5m2;
 
 using int64 = int64_t;
 using int32 = int32_t;
