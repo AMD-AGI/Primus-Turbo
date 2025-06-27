@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
 from tests.test_utils import compute_snr
 
@@ -20,7 +21,7 @@ def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
 @pytest.mark.parametrize("M", [32, 256, 2048])
 @pytest.mark.parametrize("NK", [(4096, 7168)])
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+@pytest.mark.parametrize("dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("block_size", [128, 256])
 def test_blockwise_fp8_grouped_gemm_func(B, M, NK, ori_dtype, dtype, block_size):
     N, K = NK

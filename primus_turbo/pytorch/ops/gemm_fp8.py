@@ -1,5 +1,6 @@
 import torch
 
+from primus_turbo.pytorch.core.float8 import float8_e4m3
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_blockwise_nn_impl,
     gemm_fp8_blockwise_nt_impl,
@@ -37,7 +38,7 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         x (Tensor): Input tensor of shape [M, K], typically bf16/fp16.
         weight (Tensor): Weight tensor of shape [N, K], typically bf16/fp16.
         block_size (int): Block size for quantization. Default: 128.
-        dtype (torch.dtype): FP8 quantization dtype. Default: float8_e4m3fnuz.
+        dtype (torch.dtype): FP8 quantization dtype. Default: turbo.float8_e4m3.
 
     Returns:
         out (Tensor): Output tensor of shape [M, N], same dtype as `x`.
@@ -49,7 +50,7 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         x: torch.Tensor,
         weight: torch.Tensor,
         block_size: int = 128,
-        dtype=torch.float8_e4m3fnuz,
+        dtype=float8_e4m3,
     ):
         # Quantize input activation (row): shape [M, K] → FP8
         x_fp8_row, x_scales_row = quant_fp8_blockwise_impl(x, dtype, axis=1, block_size=block_size)
@@ -115,7 +116,7 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         return grad_x, grad_w, None, None
 
 
-def gemm_fp8_blockwise(x, weight, block_size=128, dtype=torch.float8_e4m3fnuz):
+def gemm_fp8_blockwise(x, weight, block_size=128, dtype=float8_e4m3):
     """
     Blockwise GEMM using FP8 quantization.
 
@@ -127,7 +128,7 @@ def gemm_fp8_blockwise(x, weight, block_size=128, dtype=torch.float8_e4m3fnuz):
         x (torch.Tensor): Input tensor of shape [M, K], typically in bf16 or fp16.
         weight (torch.Tensor): Weight tensor of shape [N, K], typically in bf16 or fp16.
         block_size (int): Block size used for quantization. Default: 128.
-        dtype (torch.dtype): FP8 dtype to use for quantization. Default: torch.float8_e4m3fnuz.
+        dtype (torch.dtype): FP8 dtype to use for quantization. Default: turbo.float8_e4m3.
 
     Returns:
         torch.Tensor: Result tensor of shape [M, N], in the same dtype as input.

@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.float8 import float8_e4m3
 from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_backward_impl,
     attention_aiter_csrc_forward_impl,
@@ -222,7 +223,7 @@ class AttentionTritonFunction(torch.autograd.Function):
         if use_fp8:
             # online quant
             range_v = torch.max(torch.abs(v))
-            float8_fw = torch.float8_e4m3fnuz
+            float8_fw = float8_e4m3
             dtype_max = torch.finfo(float8_fw).max
             v_scale = dtype_max / range_v
             p_scale = dtype_max

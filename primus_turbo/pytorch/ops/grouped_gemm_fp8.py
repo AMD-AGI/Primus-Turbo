@@ -1,5 +1,6 @@
 import torch
 
+from primus_turbo.pytorch.core.float8 import float8_e4m3
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     quant_fp8_blockwise_for_weight_impl,
 )
@@ -23,7 +24,7 @@ class BlockwiseFP8GroupedGemmFunc(torch.autograd.Function):
         weight: torch.Tensor,
         seg_lens: torch.Tensor,
         block_size: int = 128,
-        dtype=torch.float8_e4m3fnuz,
+        dtype=float8_e4m3,
     ):
         batch_size = seg_lens.size(0)
         assert batch_size == weight.size(0)
@@ -149,7 +150,7 @@ def grouped_gemm_fp8_blockwise(
     weight: torch.Tensor,
     seg_lens: torch.Tensor,
     block_size: int = 128,
-    dtype=torch.float8_e4m3fnuz,
+    dtype=float8_e4m3,
 ):
     """
     Grouped GEMM with FP8 blockwise quantization.
@@ -159,7 +160,7 @@ def grouped_gemm_fp8_blockwise(
         weight (torch.Tensor): Weight tensor of shape [B, N, K], float16/bfloat16.
         seg_lens (torch.Tensor): Segment lengths of shape [B], int64. Sum should equal M.
         block_size (int): Block size for quantization. Default: 128.
-        dtype (torch.dtype): FP8 type. Default: torch.float8_e4m3fnuz.
+        dtype (torch.dtype): FP8 type. Default: turbo.float8_e4m3.
 
     Returns:
         torch.Tensor: Output tensor of shape [M, N], same dtype as x.

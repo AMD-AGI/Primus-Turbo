@@ -1,19 +1,12 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.float8 import check_fp8_ocp_support
+import primus_turbo.pytorch as turbo
 from tests.test_utils import get_tolerances
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    "dest_dtype",
-    (
-        [torch.float8_e4m3fn, torch.float8_e5m2]
-        if check_fp8_ocp_support()[0]
-        else [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz]
-    ),
-)
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
 def test_fp8_quant_dequant(orig_dtype, dest_dtype, numel):
     torch.manual_seed(42)

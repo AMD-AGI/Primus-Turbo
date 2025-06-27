@@ -1,3 +1,5 @@
+#ifdef 0
+
 #pragma once
 #include <optional>
 #include <stdexcept>
@@ -99,3 +101,5 @@ static_assert(sizeof(__float8_e5m2) == 1, "FP8 type must be 1 byte");
 #endif // end host
 
 } // namespace primus_turbo
+
+#endif // 0

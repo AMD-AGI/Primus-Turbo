@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 
 from torch._library import wrap_triton
 
+from primus_turbo.pytorch.core.float8 import float8_e4m3, float8_e5m2
 from primus_turbo.triton.attention.attention_kernel import (
     DEBUG,
     FIXED_BLOCK_M,
@@ -21,7 +22,6 @@ from primus_turbo.triton.attention.attention_kernel import (
     get_shape_from_layout,
     get_strides_from_layout,
     get_tl_f8_bwd_dtype,
-    is_hip,
     philox_offset,
     philox_seed,
 )
@@ -31,17 +31,11 @@ bwd_torch_dtype: tl.constexpr = torch.float32
 
 
 def get_f8_fwd_dtype():
-    if is_hip():
-        return torch.float8_e4m3fnuz
-    else:
-        return torch.float8_e4m3fn
+    return float8_e4m3
 
 
 def get_f8_bwd_dtype():
-    if is_hip():
-        return torch.float8_e5m2fnuz
-    else:
-        return torch.float8_e5m2
+    return float8_e5m2
 
 
 F8_FWD_MAX: tl.constexpr = torch.finfo(get_f8_fwd_dtype()).max

@@ -1,4 +1,8 @@
 import torch
 
+from primus_turbo.pytorch.core import float8
+
 from . import _C, ops
-from .core.float8 import float8_e4m3, float8_e5m2
+
+float8_e4m3 = float8.float8_e4m3
+float8_e5m2 = float8.float8_e5m2

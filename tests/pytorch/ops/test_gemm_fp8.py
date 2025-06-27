@@ -1,12 +1,13 @@
 import pytest
 import torch
 
+import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise
 from tests.test_utils import compute_snr
 
 
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+@pytest.mark.parametrize("dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("block_size", [128, 256])
 @pytest.mark.parametrize("M", [257, 4096])
 @pytest.mark.parametrize("NK", [(255, 129), (2048, 7168)])
