@@ -49,8 +49,6 @@ class TurboAttention(torch.nn.Module):
         v: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if self.softmax_scale is None:
-            self.softmax_scale = q.shape[-1] ** (-0.5)
         return self.attention_fn(
             q,
             k,

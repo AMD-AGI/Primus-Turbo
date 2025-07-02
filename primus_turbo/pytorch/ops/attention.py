@@ -220,6 +220,8 @@ class AttentionTritonFunction(torch.autograd.Function):
         use_fp8,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
 
         if use_fp8:
             # online quant
