@@ -59,7 +59,6 @@ class AttentionCKFunction(torch.autograd.Function):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        softmax_scale = softmax_scale
         head_size_q_og = q.size(3)
         head_size_v_og = v.size(3)
         # todo fix if head_size_v_og!=head_size_q_og, no padding
@@ -159,11 +158,13 @@ def attention(
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
     alibi_slopes=None,
-    deterministic=True,
+    deterministic=False,
     return_lse=False,
     return_attn_probs=False,
     backend_type: str = "ck",  # 'ck', 'triton'
 ):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
     if backend_type == "ck":
         return AttentionCKFunction.apply(
             q,
@@ -330,12 +331,14 @@ def attention_fp8_blockwise(
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
     alibi_slopes=None,
-    deterministic=True,
+    deterministic=False,
     return_lse=False,
     return_attn_probs=False,
     backend_type: str = "triton",  # for now 'triton' only
 ):
     assert backend_type == "triton", "attention_fp8_blockwise only support triton backend"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
     return AttentionTritonFunction.apply(
         q,
         k,

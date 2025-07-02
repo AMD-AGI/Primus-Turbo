@@ -4,10 +4,10 @@ import torch
 
 from primus_turbo.pytorch.ops.attention import attention, attention_fp8_blockwise
 
-__all__ = ["CoreAttention"]
+__all__ = ["TurboAttention"]
 
 
-class CoreAttention(torch.nn.Module):
+class TurboAttention(torch.nn.Module):
     def __init__(
         self,
         dropout_p=0.0,
@@ -15,7 +15,7 @@ class CoreAttention(torch.nn.Module):
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         alibi_slopes=None,
-        deterministic=True,
+        deterministic=False,
         return_lse=False,
         return_attn_probs=False,
         use_fp8=False,
@@ -49,7 +49,8 @@ class CoreAttention(torch.nn.Module):
         v: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-
+        if self.softmax_scale is None:
+            self.softmax_scale = q.shape[-1] ** (-0.5)
         return self.attention_fn(
             q,
             k,

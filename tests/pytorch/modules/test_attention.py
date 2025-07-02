@@ -2,8 +2,8 @@ import pytest
 import torch
 import torch._dynamo.config
 
-from primus_turbo.pytorch.modules import CoreAttention
-from tests.pytorch.ref.attention_ref import AttnConfig, CoreAttentionRef
+from primus_turbo.pytorch.modules import TurboAttention
+from tests.pytorch.ref.attention_ref import AttnConfig, TurboAttentionRef
 from tests.test_utils import compute_snr
 
 torch._dynamo.config.cache_size_limit = 100
@@ -54,7 +54,7 @@ def test_attention_fp16(batch, config, causal, backend_type, enable_torch_compil
 
     sm_scale = query.shape[-1] ** (-0.5)
 
-    primus_attention_ck = CoreAttention(
+    primus_attention_ck = TurboAttention(
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
@@ -66,7 +66,7 @@ def test_attention_fp16(batch, config, causal, backend_type, enable_torch_compil
         use_fp8=False,
         backend_type=backend_type,
     )
-    attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
+    attention_ref = TurboAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
         primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
     out = primus_attention_ck(query, key, value)
@@ -115,19 +115,19 @@ def test_attention_fp8(batch, config, causal, backend_type, enable_torch_compile
 
     sm_scale = query.shape[-1] ** (-0.5)
 
-    primus_attention_triton = CoreAttention(
+    primus_attention_triton = TurboAttention(
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
         window_size=(-1, -1),
         alibi_slopes=None,
-        deterministic=True,
+        deterministic=False,
         return_lse=False,
         return_attn_probs=False,
         use_fp8=True,
         backend_type="triton",
     )
-    attention_ref = CoreAttentionRef(softmax_scale=sm_scale, causal=causal)
+    attention_ref = TurboAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
         primus_attention_triton = torch.compile(primus_attention_triton, fullgraph=True, mode="max-autotune")
     output = primus_attention_triton(query, key, value)

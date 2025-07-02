@@ -33,7 +33,7 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
     return o_ref
 
 
-class CoreAttentionRef(torch.nn.Module):
+class TurboAttentionRef(torch.nn.Module):
     def __init__(
         self,
         softmax_scale=None,
