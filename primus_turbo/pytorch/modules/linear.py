@@ -1,5 +1,4 @@
 import math
-from typing import Union
 
 import torch
 import torch.nn as nn
@@ -7,47 +6,6 @@ import torch.nn as nn
 from primus_turbo.pytorch.ops import gemm
 
 __all__ = ["Linear"]
-
-
-class _Linear(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Union[torch.Tensor, None],
-        dtype: torch.dtype,
-    ):
-        # [M, K] * [N, K] -> [M, N]
-        out = gemm(x, weight, dtype, "NT")
-
-        # TODO(ruibzhan): Move bias into gemm.
-        if bias is not None:
-            out += bias
-
-        ctx.save_for_backward(x, weight, bias)
-        ctx.dtype = dtype
-
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        (x, weight, bias) = ctx.saved_tensors
-
-        dgrad = torch.empty_like(x)
-        # [M, N] * [N, K] -> [M, K]
-        dgrad = gemm(grad_out, weight, ctx.dtype, "NN")
-
-        # [M, N] * [M, K] -> [N, K]
-        wgrad = torch.empty_like(weight)
-        wgrad = gemm(grad_out, x, ctx.dtype, "TN")
-
-        bgrad = None
-        if bias is not None:
-            bgrad = grad_out.sum(dim=0)
-
-        return (dgrad, wgrad, bgrad, None)
 
 
 class Linear(torch.nn.Module):
@@ -81,14 +39,12 @@ class Linear(torch.nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        args = (
-            x,
-            self.weight,
-            self.bias,
-            self.dtype,
-        )
-
-        return _Linear.apply(*args)
+        flatten_shapes = x.shape[:-1]
+        x_2d = x.reshape(-1, self.in_features)
+        out_2d = gemm(x_2d, self.weight, False, True, self.dtype)
+        if self.bias is not None:
+            out_2d = out_2d + self.bias
+        return out_2d.view(*flatten_shapes, self.out_features)
 
     def extra_repr(self) -> str:
         return (

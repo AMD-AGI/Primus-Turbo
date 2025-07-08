@@ -25,18 +25,14 @@ static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
     }
 }
 
-static inline bool is_16bit_floating_point_dtype(at::ScalarType dtype) {
-    return dtype == at::kHalf || dtype == at::kBFloat16;
-}
-
 static inline bool is_floating_point_dtype(at::ScalarType dtype) {
     return dtype == at::kHalf || dtype == at::kBFloat16 || dtype == at::kFloat;
 }
 
-at::Tensor hipblaslt_gemm(const at::Tensor A, const at::Tensor B, const at::ScalarType out_dtype,
-                          const bool transA, const bool transB) {
-    PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(A.scalar_type()));
-    PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(B.scalar_type()));
+at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
+                          bool transB, bool transC) {
+    PRIMUS_TURBO_CHECK(is_floating_point_dtype(A.scalar_type()));
+    PRIMUS_TURBO_CHECK(is_floating_point_dtype(B.scalar_type()));
     PRIMUS_TURBO_CHECK(A.scalar_type() == B.scalar_type(), "A and B dtype mismatch");
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(out_dtype));
 
@@ -44,6 +40,11 @@ at::Tensor hipblaslt_gemm(const at::Tensor A, const at::Tensor B, const at::Scal
     PRIMUS_TURBO_CHECK(B.is_contiguous(), "B must be contiguous");
 
     PRIMUS_TURBO_CHECK(A.dim() == 2 && B.dim() == 2, "A, B must be 2D tensors");
+
+    if (transC) {
+        std::swap(A, B);
+        std::tie(transA, transB) = std::make_tuple(!transB, !transA);
+    }
 
     const int64_t m = transA ? A.size(1) : A.size(0);
     const int64_t k = transA ? A.size(0) : A.size(1);
@@ -65,6 +66,11 @@ at::Tensor hipblaslt_gemm(const at::Tensor A, const at::Tensor B, const at::Scal
         PRIMUS_TURBO_CHECK(A.size(0) == B.size(0), "tensor size mismatch");
         lda = m;
         ldb = n;
+        ldd = n;
+    } else if (transA && transB) { // TT
+        PRIMUS_TURBO_CHECK(A.size(0) == B.size(1), "tensor size mismatch");
+        lda = m;
+        ldb = k;
         ldd = n;
     } else {
         PRIMUS_TURBO_ERROR("Not support layout.");

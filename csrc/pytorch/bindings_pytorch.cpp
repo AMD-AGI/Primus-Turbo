@@ -7,7 +7,8 @@ namespace primus_turbo::pytorch {
 /********************************************/
 
 TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
-    m.def("hipblaslt_gemm(Tensor A, Tensor B, ScalarType out_dtype, bool transA, bool transB) -> "
+    m.def("hipblaslt_gemm(Tensor A, Tensor B, ScalarType out_dtype, bool transA, bool transB, bool "
+          "transC) -> "
           "Tensor");
     m.def("gemm_fp8_blockwise("
           "Tensor a, Tensor a_scales, "

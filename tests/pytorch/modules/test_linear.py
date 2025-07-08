@@ -5,18 +5,21 @@ from primus_turbo.pytorch.modules import Linear
 from tests.test_utils import get_tolerances
 
 
+@pytest.mark.parametrize("bs", [[], [1], [2], [3, 2]])
+@pytest.mark.parametrize("seq_len", [128])
+@pytest.mark.parametrize("in_features", [256])
+@pytest.mark.parametrize("out_features", [512])
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
-def test_linear_accuracy(bias, dtype, enable_torch_compile):
+def test_linear_accuracy(bs, seq_len, in_features, out_features, bias, dtype, enable_torch_compile):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     torch.manual_seed(42)
-
-    seq_len = 512
-    in_features = 128
-    out_features = 256
     device = "cuda"
+
+    # Clean compile cache, avoid cache limit.
+    torch._dynamo.reset()
 
     primus_linear = Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     torch_linear = torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
@@ -29,7 +32,7 @@ def test_linear_accuracy(bias, dtype, enable_torch_compile):
         primus_linear = torch.compile(primus_linear, fullgraph=True, mode="max-autotune")
         torch_linear = torch.compile(torch_linear, fullgraph=True, mode="max-autotune")
 
-    x1 = torch.randn(seq_len, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = torch.randn(*bs, seq_len, in_features, device=device, dtype=dtype, requires_grad=True)
     x2 = x1.detach().clone().requires_grad_()
 
     # === Forward ===

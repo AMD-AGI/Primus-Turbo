@@ -1,45 +1,58 @@
 import pytest
 import torch
 
-import primus_turbo.pytorch as pt
+import primus_turbo.pytorch as turbo
 from tests.test_utils import get_tolerances
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
-def test_gemm(dtype, layout):
+@pytest.mark.parametrize("m", [1, 16, 128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("n", [1, 16, 129, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("k", [1, 16, 127, 255, 512, 1024, 2048])
+@pytest.mark.parametrize("transA", [False, True])
+@pytest.mark.parametrize("transB", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gemm(m, n, k, transA, transB, dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
+    device = "cuda"
     torch.manual_seed(42)
 
-    device = "cuda"
-    m, n, k = 512, 2048, 1024
+    print(f"\nM={m}, N={n}, K={k}, TransA={transA}, TransB={transB}, dtype={dtype}")
 
-    if layout == "NN":
-        a = torch.randn((m, k), dtype=dtype, device=device)
-        b = torch.randn((k, n), dtype=dtype, device=device)
-        a_ref = a.detach().clone()
-        b_ref = b.detach().clone()
+    a_shape = (m, k) if not transA else (k, m)
+    b_shape = (k, n) if not transB else (n, k)
 
-        c_ref = torch.matmul(a_ref, b_ref)
-    elif layout == "TN":
-        a = torch.randn((k, m), dtype=dtype, device=device)
-        b = torch.randn((k, n), dtype=dtype, device=device)
-        a_ref = a.detach().clone()
-        b_ref = b.detach().clone()
+    a = torch.randn(a_shape, dtype=dtype, device=device)
+    b = torch.randn(b_shape, dtype=dtype, device=device)
+    a = a / a.abs().max()
+    b = b / b.abs().max()
+    a.requires_grad_()
+    b.requires_grad_()
+    a.grad = None
+    b.grad = None
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+    torch.cuda.synchronize()
 
-        c_ref = torch.matmul(a_ref.T, b_ref)
-    else:
-        a = torch.randn((m, k), dtype=dtype, device=device)
-        b = torch.randn((n, k), dtype=dtype, device=device)
-        a_ref = a.detach().clone()
-        b_ref = b.detach().clone()
+    # Reference output
+    a_mat = a_ref.T if transA else a_ref
+    b_mat = b_ref.T if transB else b_ref
+    c_ref = a_mat @ b_mat
 
-        c_ref = torch.matmul(a_ref, b_ref.T)
+    # Turbo
+    c = turbo.ops.gemm(a, b, transA, transB, dtype)
 
-    # primus_turbo GEMM
-    c = pt.ops.gemm(a, b, dtype, layout)
+    # print("a:", a.shape)
+    # print("b:", b.shape)
+    # print("c: ", c, c.shape)
+    # print("c_ref: ", c_ref, c_ref.shape)
 
-    # Check close
+    # Check fwd
     torch.testing.assert_close(c, c_ref, **get_tolerances(dtype))
+
+    # Backward
+    grad_c = torch.randn_like(c)
+    c_ref.backward(grad_c)
+    c.backward(grad_c)
+    torch.testing.assert_close(a.grad, a_ref.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(b.grad, b_ref.grad, **get_tolerances(dtype))

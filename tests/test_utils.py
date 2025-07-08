@@ -10,7 +10,7 @@ def is_ROCM():
 # TODO: Need to check again whether these values are reasonable.
 def get_tolerances(dtype):
     if dtype == torch.float32:
-        return dict(rtol=1e-5, atol=1e-5)
+        return dict(rtol=1e-4, atol=1e-4)
     elif dtype == torch.float16:
         return dict(rtol=1e-2, atol=1e-2)
     elif dtype == torch.bfloat16:

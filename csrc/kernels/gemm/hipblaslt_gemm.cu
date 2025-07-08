@@ -55,7 +55,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                                               &workspace_size, sizeof(workspace_size)));
 
     PRIMUS_TURBO_CHECK_HIPBLAS(
-        hipblasLtMatmulAlgoGetHeuristic(handle, operation_desc, B_desc, A_desc, D_desc, D_desc,
+        hipblasLtMatmulAlgoGetHeuristic(handle, operation_desc, A_desc, B_desc, D_desc, D_desc,
                                         preference, algo_count, algos.data(), &algo_count));
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
