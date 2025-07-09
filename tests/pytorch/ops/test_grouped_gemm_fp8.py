@@ -4,18 +4,7 @@ import torch
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
 from tests.test_utils import compute_snr
-
-
-def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
-    seg_lens = seg_lens.cpu().numpy()
-    out = []
-    start = 0
-    for i, size in enumerate(seg_lens):
-        rhs = b[i, :, :].t() if trans_b else b[i, :, :]
-        out.append(a[start : start + size, :] @ rhs)
-        start += size
-    return torch.cat(out)
-
+from tests.pytorch.ref.gemm_ref import grouped_gemm_ref
 
 @pytest.mark.parametrize("B", [1, 2, 3, 32])
 @pytest.mark.parametrize("M", [32, 256, 2048])

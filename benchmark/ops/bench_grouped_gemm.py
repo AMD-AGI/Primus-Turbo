@@ -1,37 +1,42 @@
 import torch
 import torch.utils.benchmark as benchmark
 
-from primus_turbo.pytorch.core.float8 import Format, MXQuantConfig
-from primus_turbo.pytorch.ops import gemm_fp8_blockwise
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
 from tests.test_utils import compute_snr
-
+from tests.pytorch.ref.gemm_ref import grouped_gemm_ref
 
 test_configs = [
-    {"B": [4], "M": 4096, "N": 2048, "K": 7168, "ori_dtype": torch.float16, "dtype": Format.E4M3, "block_size": 128},
-    {"B": [2], "M": 2048, "N": 4096, "K": 2048, "ori_dtype": torch.float16, "dtype": Format.E5M2, "block_size": 128},
+    {"B": 4, "M": 32, "N": 4096, "K": 7168, "ori_dtype": torch.bfloat16, "dtype": turbo.float8_e4m3, "block_size": 128},
+    {"B": 8, "M": 256, "N": 4096, "K": 7168, "ori_dtype": torch.float16, "dtype": turbo.float8_e5m2, "block_size": 256},
 ]
 
-
-def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
+def bench_grouped_gemm(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     device = "cuda"
-    config = MXQuantConfig(dtype=dtype, block_size=block_size)
 
     # Prepare inputs
-    x = torch.randn((*B, M, K), dtype=ori_dtype, device=device, requires_grad=True)
-    w = torch.randn((N, K), dtype=ori_dtype, device=device, requires_grad=True)
+    x = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    w = torch.randn((B, N, K), dtype=ori_dtype, device=device, requires_grad=True)
+    seg_lens = torch.randint(1, M + 1, (B,), dtype=torch.long, device=device)
+    seg_lens = seg_lens / seg_lens.sum() * B * M
+    seg_lens = seg_lens.to(torch.long)
+    error = B * M - seg_lens.sum()
+    seg_lens[-1] += error
+
     x_ref = x.clone().detach().requires_grad_()
     w_ref = w.clone().detach().requires_grad_()
 
-    fn_forward = lambda: gemm_fp8_blockwise(x, w, config)
-
     # Reference forward pass
-    out_ref = x_ref @ w_ref.T
+    
+    out_ref = grouped_gemm_ref(x_ref, w_ref, seg_lens, True)
 
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out, retain_graph=True)
 
     # Forward pass for implementation
+    fn_forward = lambda: grouped_gemm_fp8_blockwise(x, w, seg_lens, block_size, dtype)
     out = fn_forward()
+
     out.backward(grad_out, retain_graph=True)
 
     # Compute SNRs
@@ -40,11 +45,11 @@ def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
 
     x_grad_snr = compute_snr(x_ref.grad, x.grad)
     w_grad_snr = compute_snr(w_ref.grad, w.grad)
-    assert x_grad_snr > 20, "x_grad_snr too low"
-    assert w_grad_snr > 20, "w_grad_snr too low"
+    assert x_grad_snr > 15, "x_grad_snr too low"
+    assert w_grad_snr > 15, "w_grad_snr too low"
 
     # Calculate FLOPs
-    total_flops = 2 * M * N * K
+    total_flops = 2 * B * M * N * K
 
     if test_backward:
         # Re-run forward pass to get fresh output
@@ -58,7 +63,7 @@ def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     # Warmup
     warmup = 5
     for _ in range(warmup):
-        _ = fn()
+        _ = fn_forward()
     torch.cuda.synchronize()
 
     # Benchmark
@@ -110,7 +115,7 @@ if __name__ == "__main__":
             test_id += 1
             try:
                 # Run benchmark
-                time_ms, tflops, _ = bench_fp8_linear(
+                time_ms, tflops, _ = bench_grouped_gemm(
                     B=B,
                     M=M,
                     N=N,
@@ -159,5 +164,5 @@ if __name__ == "__main__":
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
     # Save to CSV
-    results.to_csv("fp8_linear_benchmark_results.csv", index=False)
-    print("Results saved to fp8_linear_benchmark_results.csv")
+    results.to_csv("grouped_gemm_benchmark_results.csv", index=False)
+    print("Results saved to grouped_gemm_benchmark_results.csv")
