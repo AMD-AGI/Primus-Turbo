@@ -9,7 +9,7 @@ from tests.test_utils import compute_snr
 test_configs = [
     {
         "B": 4,
-        "M": 32,
+        "M": 2048,
         "N": 4096,
         "K": 7168,
         "ori_dtype": torch.bfloat16,
@@ -18,9 +18,9 @@ test_configs = [
     },
     {
         "B": 8,
-        "M": 256,
+        "M": 4096,
         "N": 4096,
-        "K": 7168,
+        "K": 2048,
         "ori_dtype": torch.float16,
         "dtype": turbo.float8_e5m2,
         "block_size": 256,
