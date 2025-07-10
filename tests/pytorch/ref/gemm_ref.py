@@ -1,5 +1,6 @@
 import torch
 
+
 def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
     seg_lens = seg_lens.cpu().numpy()
     out = []

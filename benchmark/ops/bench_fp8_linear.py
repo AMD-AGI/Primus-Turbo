@@ -5,10 +5,25 @@ from primus_turbo.pytorch.core.float8 import Format, MXQuantConfig
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise
 from tests.test_utils import compute_snr
 
-
 test_configs = [
-    {"B": [4], "M": 4096, "N": 2048, "K": 7168, "ori_dtype": torch.float16, "dtype": Format.E4M3, "block_size": 128},
-    {"B": [2], "M": 2048, "N": 4096, "K": 2048, "ori_dtype": torch.float16, "dtype": Format.E5M2, "block_size": 128},
+    {
+        "B": [4],
+        "M": 4096,
+        "N": 2048,
+        "K": 7168,
+        "ori_dtype": torch.float16,
+        "dtype": Format.E4M3,
+        "block_size": 128,
+    },
+    {
+        "B": [2],
+        "M": 2048,
+        "N": 4096,
+        "K": 2048,
+        "ori_dtype": torch.float16,
+        "dtype": Format.E5M2,
+        "block_size": 128,
+    },
 ]
 
 

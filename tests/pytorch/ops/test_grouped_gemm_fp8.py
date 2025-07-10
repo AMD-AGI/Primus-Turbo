@@ -3,8 +3,9 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
-from tests.test_utils import compute_snr
 from tests.pytorch.ref.gemm_ref import grouped_gemm_ref
+from tests.test_utils import compute_snr
+
 
 @pytest.mark.parametrize("B", [1, 2, 3, 32])
 @pytest.mark.parametrize("M", [32, 256, 2048])

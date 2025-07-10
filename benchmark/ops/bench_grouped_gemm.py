@@ -3,13 +3,30 @@ import torch.utils.benchmark as benchmark
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.ops import grouped_gemm_fp8_blockwise
-from tests.test_utils import compute_snr
 from tests.pytorch.ref.gemm_ref import grouped_gemm_ref
+from tests.test_utils import compute_snr
 
 test_configs = [
-    {"B": 4, "M": 32, "N": 4096, "K": 7168, "ori_dtype": torch.bfloat16, "dtype": turbo.float8_e4m3, "block_size": 128},
-    {"B": 8, "M": 256, "N": 4096, "K": 7168, "ori_dtype": torch.float16, "dtype": turbo.float8_e5m2, "block_size": 256},
+    {
+        "B": 4,
+        "M": 32,
+        "N": 4096,
+        "K": 7168,
+        "ori_dtype": torch.bfloat16,
+        "dtype": turbo.float8_e4m3,
+        "block_size": 128,
+    },
+    {
+        "B": 8,
+        "M": 256,
+        "N": 4096,
+        "K": 7168,
+        "ori_dtype": torch.float16,
+        "dtype": turbo.float8_e5m2,
+        "block_size": 256,
+    },
 ]
+
 
 def bench_grouped_gemm(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     device = "cuda"
@@ -27,7 +44,7 @@ def bench_grouped_gemm(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     w_ref = w.clone().detach().requires_grad_()
 
     # Reference forward pass
-    
+
     out_ref = grouped_gemm_ref(x_ref, w_ref, seg_lens, True)
 
     grad_out = torch.randn_like(out_ref)
