@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import float8_e4m3
 from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_backward_impl,
     attention_aiter_csrc_forward_impl,
@@ -10,28 +9,11 @@ from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
-    get_f8_fwd_dtype,
 )
-from primus_turbo.triton.attention.attention_kernel import FIXED_BLOCK_M, FIXED_BLOCK_N
-
-
-def block_scaling_node(tensor, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):
-    # this funciton help scale tensor in per-block mode
-    # block size: [BLOCK_M, D]
-    # [B, L, H, D]
-    # scale should be [B, H, L//BLOCK_M]
-    tensor = tensor.permute(0, 2, 1, 3)  # [B, H, L, D]
-    B, H, L, D = tensor.shape
-    tensor = tensor.reshape(B, H, L // BLOCK_M, BLOCK_M, D).reshape(B, H, L // BLOCK_M, BLOCK_M * D)
-    MAX_E4M3 = torch.finfo(float8_dtype).max
-    scale = MAX_E4M3 / tensor.abs().max(dim=-1)[0]
-    tensor = tensor * scale.reshape(scale.shape + (1,))
-    tensor = tensor.clamp(-MAX_E4M3, MAX_E4M3)
-    tensor = tensor.to(float8_dtype)
-    tensor = tensor.reshape(B, H, L, D).permute(0, 2, 1, 3).contiguous()
-    # [B, L, H, D]
-    return tensor, 1.0 / scale.to(torch.float32).contiguous()
-
+from primus_turbo.pytorch.ops.attention_with_cp import (
+    dispatch_attention_triton_functions,
+)
+from primus_turbo.pytorch.ops.utils.attention_utils import blockwise_scaling_qkv_to_fp8
 
 __all__ = ["attention", "attention_fp8_blockwise"]
 
@@ -148,59 +130,6 @@ class AttentionCKFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
 
 
-def attention(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    bias=None,
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    backend_type: str = "ck",  # 'ck', 'triton'
-):
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    if backend_type == "ck":
-        return AttentionCKFunction.apply(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-        )
-    elif backend_type == "triton":
-        return AttentionTritonFunction.apply(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-            False,
-        )
-    else:
-        raise NotImplementedError(f"backend_type {backend_type} not supported")
-
-
 class AttentionTritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -223,31 +152,7 @@ class AttentionTritonFunction(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        if use_fp8:
-            # online quant
-            range_v = torch.max(torch.abs(v))
-            float8_fw = float8_e4m3
-            dtype_max = torch.finfo(float8_fw).max
-            v_scale = dtype_max / range_v
-            p_scale = dtype_max
-
-            def check_and_convert(t, scale):
-                finfo = torch.finfo(float8_fw)
-                return (
-                    (t * scale).clamp(min=finfo.min, max=finfo.max).to(dtype=float8_fw)
-                    if t.dtype != float8_fw
-                    else t
-                )
-
-            q, q_scale = block_scaling_node(q, FIXED_BLOCK_M)
-            k, k_scale = block_scaling_node(k, FIXED_BLOCK_N)
-            v = check_and_convert(v, v_scale)
-        else:
-            use_fp8 = False
-            q_scale = torch.tensor([1.0], device=q.device)
-            k_scale = torch.tensor([1.0], device=q.device)
-            v_scale = torch.tensor([1.0], device=q.device)
-            p_scale = 1.0
+        q, k, v, p_scale, q_scale, k_scale, v_scale = blockwise_scaling_qkv_to_fp8(q, k, v, use_fp8)
 
         output, softmax_lse, exp_scores = attention_triton_forward_impl(
             q,
@@ -323,6 +228,81 @@ class AttentionTritonFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
+def attention(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
+    alibi_slopes=None,
+    deterministic=True,
+    return_lse=False,
+    return_attn_probs=False,
+    backend_type: str = "ck",  # 'ck', 'triton'
+    cp_param_bundle=None,
+):
+    if cp_param_bundle is not None:  # CP
+        assert "cp_group" in cp_param_bundle
+        assert "cp_stream" in cp_param_bundle
+        assert "cp_comm_type" in cp_param_bundle
+        return dispatch_attention_triton_functions(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            False,
+            cp_param_bundle["cp_group"],
+            cp_param_bundle["cp_stream"],
+            cp_param_bundle["cp_comm_type"],
+        )
+
+    if backend_type == "ck":
+        return AttentionCKFunction.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+        )
+    elif backend_type == "triton":
+        return AttentionTritonFunction.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            False,
+        )
+    else:
+        raise NotImplementedError(f"backend_type {backend_type} not supported")
+
+
 def attention_fp8_blockwise(
     q,
     k,
@@ -337,10 +317,32 @@ def attention_fp8_blockwise(
     return_lse=False,
     return_attn_probs=False,
     backend_type: str = "triton",  # for now 'triton' only
+    cp_param_bundle=None,
 ):
     assert backend_type == "triton", "attention_fp8_blockwise only support triton backend"
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+    if cp_param_bundle is not None:  # CP
+        assert "cp_group" in cp_param_bundle
+        assert "cp_stream" in cp_param_bundle
+        assert "cp_comm_type" in cp_param_bundle
+        return dispatch_attention_triton_functions(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            True,
+            cp_param_bundle["cp_group"],
+            cp_param_bundle["cp_stream"],
+            cp_param_bundle["cp_comm_type"],
+        )
+
     return AttentionTritonFunction.apply(
         q,
         k,
