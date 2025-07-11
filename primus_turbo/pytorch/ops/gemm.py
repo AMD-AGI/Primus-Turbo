@@ -48,7 +48,7 @@ def gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     transA: bool = False,
-    transB: bool = False,
+    transB: bool = True,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
