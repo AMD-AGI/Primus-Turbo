@@ -1,4 +1,10 @@
-from .async_tp import *
+import warnings
+
+try:
+    from .async_tp import fused_all_gather_matmul, fused_all_gather_scaled_matmul
+except ImportError as e:
+    warnings.warn(f"Primus-Turbo can't support Async-TP - {e}")
+
 from .attention import *
 from .fused_moe_router import *
 from .gemm import *

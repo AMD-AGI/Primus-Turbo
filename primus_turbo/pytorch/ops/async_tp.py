@@ -7,7 +7,7 @@ import torch.distributed.distributed_c10d as c10d
 
 from primus_turbo.pytorch.kernels.async_tp import ag_gemm_impl, gemm_rs_impl
 
-__all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter"]
+__all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter", "fused_all_gather_scaled_matmul"]
 
 
 def fused_all_gather_matmul(
@@ -22,7 +22,7 @@ def fused_all_gather_matmul(
     *,
     comm_method: str = "pipeline",
     num_splits: int = 2,
-    skip_copy_local_A: bool = False,  # only needed for te
+    skip_copy_local_ag_out: bool = False,  # only needed for te
     enable_sdma: bool = False,
     return_A: bool = True,
     A_out: Optional[torch.Tensor] = None,
@@ -54,7 +54,7 @@ def fused_all_gather_matmul(
     Keyword Arguments:
         comm_method (str, optional): specify internal algorithm of the implementation, 'ring_exchange' or 'pipeline' or 'auto'. Defaults to "pipeline".
         num_splits (int, optional): number of chunk splits by pipeline method. Defaults to 2.
-        skip_copy_local_A (bool, optional): skip copy A_shard to A_out, only used for transformer engine. Defaults to False.
+        skip_copy_local_ag_out (bool, optional): skip copy A_shard to A_out, only used for transformer engine. Defaults to False.
         return_A (bool, optional): if return_A is True, return the result of all-gathered A_shard. Defaults to True.
         A_out (Optional[torch.Tensor], optional): the output of all-gathered A_shard, Defaults to None.
         outputs (Optional[List[torch.Tensor]], optional): the output tensors of matmul, Defaults to None.
@@ -73,82 +73,89 @@ def fused_all_gather_matmul(
         >>> A_out, outputs = primus_turbo.pytorch.ops.fused_all_gather_matmul(A_shard, [B], ['NN'], 0, tp_group.group_name, gemm_streams, comm_streams, copy_streams)
     """
 
-    # check input
-    if A_shard.dim() < 2:
-        raise ValueError("A_shard must be a matrix")
-    for B in Bs:
-        if B.dim() != 2:
-            raise ValueError("B must be a matrix")
-    if len(layouts) != len(Bs):
-        raise ValueError("len(layouts) must be the same as len(Bs)")
-
-    if gather_dim < 0 or gather_dim >= A_shard.dim():
-        raise ValueError("Invalid gather_dim")
-
-    if comm_method not in ["auto", "ring_exchange", "pipeline"]:
-        raise ValueError(f"Invalid comm_method: {comm_method}")
-
-    group = c10d._resolve_process_group(group_name)
-
-    if return_A and A_out is not None:
-        if A_out.dtype != A_shard.dtype:
-            raise ValueError(
-                f"Invalid dtype: A_out ({A_out.dtype}) difference with A_shard ({A_shard.dtype})!"
-            )
-
-        if A_out.numel() != A_shard.numel() * group.size():
-            raise ValueError(f"A_out size must equal group size * A_shard size.")
-
-    A_shard_flat = A_shard.movedim(gather_dim, 0)
-    leading_dims = [group.size()] + list(A_shard_flat.shape[:-1])
-    A_shard_flat = A_shard_flat.flatten(0, -2)
-    A_shard_flat = A_shard_flat if layouts[0][0] == "N" else A_shard_flat.T
-    for i, (layout, B) in enumerate(zip(layouts, Bs)):
-        Bs[i] = B if layout[1] == "N" else B.T
-
-    def unflatten(t: torch.Tensor) -> torch.Tensor:
-        return t.view(*leading_dims, -1).flatten(0, 1).movedim(0, gather_dim)
-
-    if return_A and A_out is None:
-        A_out = A_shard_flat.new_empty(
-            A_shard_flat.shape[0] * group.size(),
-            A_shard_flat.shape[1],
+    with torch.profiler.record_function(f"{comm_method}_fused_all_gather_matmul"):
+        return ag_gemm_impl._fused_all_gather_matmul_impl(
+            torch.ops.aten.mm.out,
+            A_shard,
+            Bs,
+            layouts,
+            None,
+            [{} for _ in Bs],
+            [None for _ in Bs] if out_dtypes is None else out_dtypes,
+            gather_dim,
+            group_name,
+            return_A=return_A,
+            comm_method=comm_method,
+            num_splits=num_splits,
+            enable_sdma=enable_sdma,
+            comm_stream_pool=comm_streams,
+            copy_stream_pool=copy_streams,
+            gemm_stream_pool=gemm_streams,
+            skip_copy_local_ag_out=skip_copy_local_ag_out,
+            A_out=A_out,
+            mm_out=outputs,
         )
 
-    out_dtypes = out_dtypes or [B.dtype for B in Bs]
 
-    if outputs is None:
-        outputs = [
-            A_shard.new_empty(
-                A_shard_flat.shape[0] * group.size(),
-                B.shape[1],
-                dtype=out_dtype or B.dtype,
-            )
-            for B, out_dtype in zip(Bs, out_dtypes)
-        ]
+def fused_all_gather_scaled_matmul(
+    A_shard: torch.Tensor,
+    Bs: list[torch.Tensor],
+    layouts: list[str],
+    A_scale: torch.Tensor,
+    B_scales: list[torch.Tensor],
+    gather_dim: int,
+    group_name: str,
+    biases: list[Optional[torch.Tensor]],
+    result_scales: list[Optional[torch.Tensor]],
+    out_dtypes: list[Optional[torch.dtype]],
+    use_fast_accum: list[bool],
+    gemm_streams: List[torch.cuda.Stream],
+    comm_streams: List[torch.cuda.Stream],
+    copy_streams: List[torch.cuda.Stream],
+    *,
+    comm_method: str = "pipeline",
+    num_splits=2,
+    skip_copy_local_ag_out: bool = False,  # only needed for te
+    enable_sdma=False,
+    A_out: Optional[torch.Tensor] = None,
+    mm_out: Optional[List[torch.Tensor]] = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
 
-    if comm_method in ["ring_exchange", "auto"]:
-        raise NotImplementedError()
-    else:
-        with torch.profiler.record_function("pipeline_fused_all_gather_matmul"):
-            ag_gemm_impl._pipeline_fused_all_gather_matmul_impl(
-                A_shard_flat,
-                Bs,
-                torch.ops.aten.mm,
-                group_name,
-                comm_streams,
-                copy_streams,
-                gemm_streams,
-                num_splits=num_splits,
-                enable_sdma=enable_sdma,
-                skip_copy_local_A=skip_copy_local_A,
-                return_A=return_A,
-                A_out=A_out,
-                outputs=outputs,
-            )
-
-    A = unflatten(A_out) if return_A else None
-    return A, [unflatten(output) for output in outputs]
+    with torch.profiler.record_function(f"{comm_method}_fused_all_gather_scaled_matmul"):
+        A, res = ag_gemm_impl._fused_all_gather_matmul_impl(
+            torch.ops.aten._scaled_mm.out,
+            A_shard,
+            Bs,
+            layouts,
+            A_scale,
+            [
+                {
+                    "scale_b": B_scale,
+                    "bias": bias,
+                    "scale_result": result_scale,
+                    "out_dtype": out_dtype,
+                    "use_fast_accum": fast_accum,
+                }
+                for B_scale, bias, result_scale, out_dtype, fast_accum in zip(
+                    B_scales, biases, result_scales, out_dtypes, use_fast_accum
+                )
+            ],
+            out_dtypes,
+            gather_dim,
+            group_name,
+            comm_method=comm_method,
+            num_splits=num_splits,
+            enable_sdma=enable_sdma,
+            comm_stream_pool=comm_streams,
+            copy_stream_pool=copy_streams,
+            gemm_stream_pool=gemm_streams,
+            return_A=True,
+            skip_copy_local_ag_out=skip_copy_local_ag_out,
+            A_out=A_out,
+            mm_out=mm_out,
+        )
+        assert A is not None
+        return A, res
 
 
 def fused_matmul_reduce_scatter(
