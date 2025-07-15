@@ -30,66 +30,71 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
 
     This class implements the forward and backward pass for a GEMM using blockwise FP8 quantization.
 
+    Quantization granularity:
+        - Input `a` is quantized with shape [1, blocksize]
+        - Input `b` is quantized with shape [blocksize, blocksize]
+
     Forward:
-        - Quantize input `x` row-wise into FP8 blockwise.
-        - Quantize weight `weight` blockwise.
-        - Perform matrix multiplication: Y = x @ weight.T (NT layout).
-        - Output result in high precision (same dtype as `x`).
+        - Quantize input `a`.
+        - Quantize input `b`.
+        - Perform matrix multiplication: Y = a @ b.
+        - Output in high-precision dtype (same as `a` or explicitly set via `out_dtype`).
 
     Backward:
         - Quantize `grad_out` both row-wise and column-wise for dgrad/wgrad respectively.
-        - Re-quantize input `x` column-wise for use in wgrad.
+        - Re-quantize input `a` column-wise for use in wgrad.
         - Compute:
-            * grad_x = grad_out @ weight      (NN layout)
-            * grad_w = grad_out.T @ x         (TN layout)
+            * grad_a = grad_out @ b
+            * grad_b = grad_out.T @ x
         - Both gradients are returned in high precision.
 
-    Inputs:
-        x (Tensor): Input tensor of shape [B0,...,Bn, M, K], typically bf16/fp16.
-        weight (Tensor): Weight tensor of shape [N, K], typically bf16/fp16.
-        config (MXQuantConfig): Quantization configuration, specifying dtype, block size,
-            scaling strategy, and granularity.
-
     Returns:
-        out (Tensor): Output tensor of shape [M, N], same dtype as `x`.
+        out (Tensor): Output tensor of shape [..., M, N], same dtype as `a` or `out_dtype`.
     """
 
     @staticmethod
     def forward(
         ctx,
-        x: torch.Tensor,
-        weight: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        transA: bool,
+        transB: bool,
+        out_dtype: torch.dtype,
         config: MXQuantConfig,
     ):
         # Check
         assert config != None
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size != None
-        assert x.ndim >= 2, "Input tensor x must have at least 2 dimensions."
-        assert weight.ndim == 2, "Weight tensor must be 2-dimensional."
+        assert a.ndim >= 2, "Input tensor a must have at least 2 dimensions."
+        assert b.ndim == 2, "Weight tensor must be 2-dimensional."
+
+        # TODO: more layout
+        assert transA == False and transB == True, "Currently only support NT layout"
+        # TODO: more format
         assert config.format == Format.E4M3
 
-        x_dtype = float8_e4m3
-        w_dtype = float8_e4m3
+        a_dtype = float8_e4m3
+        b_dtype = float8_e4m3
 
         block_size = config.block_size
 
-        *batch_shape, M, K = x.shape
-        x = x.view(-1, K)  # flatten shape [BM, K]
+        *batch_shape, M, K = a.shape
+        a = a.view(-1, K)  # flatten shape [BM, K]
 
         # Quantize input activation (row): shape [M, K] → FP8
-        x_fp8_row, x_scales_row = quant_fp8_blockwise_impl(x, x_dtype, axis=1, block_size=block_size)
+        a_fp8_row, a_scales_row = quant_fp8_blockwise_impl(a, a_dtype, axis=1, block_size=block_size)
         # Quantize weight blockwise: shape [N, K] → FP8
-        w_fp8, w_scales = quant_fp8_blockwise_for_weight_impl(weight, w_dtype, block_size)
+        b_fp8, b_scales = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size)
 
         # Perform NT GEMM in quantized domain:
-        # out = x_fp8_row @ w_fp8.T → shape [M, N]
+        # out = a_fp8_row @ w_fp8.T → shape [M, N]
         out = gemm_fp8_blockwise_impl(
-            x_fp8_row,
-            w_fp8,
-            x_scales_row,
-            w_scales,
-            out_dtype=x.dtype,
+            a_fp8_row,
+            b_fp8,
+            a_scales_row,
+            b_scales,
+            out_dtype=out_dtype,
             scale_group_size_m=1,
             scale_group_size_n=block_size,
             scale_group_size_k=block_size,
@@ -99,7 +104,7 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         out = out.view(*batch_shape, M, -1)  # restore shape
 
         # Save tensors for backward
-        ctx.save_for_backward(x, w_fp8, w_scales)
+        ctx.save_for_backward(a, b_fp8, b_scales)
         ctx.config = config
         return out
 
@@ -108,12 +113,12 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        x, w_fp8, w_scales = ctx.saved_tensors
+        a, b_fp8, b_scales = ctx.saved_tensors
         config = ctx.config
         block_size = config.block_size
 
         out_dtype = float8_e4m3
-        x_dtype = float8_e4m3
+        a_dtype = float8_e4m3
 
         *batch_shape, M, N = grad_out.shape
         grad_out = grad_out.view(-1, N)
@@ -124,16 +129,16 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         grad_out_fp8_row, grad_out_scales_row = quant_fp8_blockwise_impl(grad_out, out_dtype, -1, block_size)
         grad_out_fp8_col, grad_out_scales_col = quant_fp8_blockwise_impl(grad_out, out_dtype, -2, block_size)
         # TODO: dequant + quant kernel
-        x_fp8_col, x_scales_col = quant_fp8_blockwise_impl(x, x_dtype, axis=0, block_size=block_size)
+        a_fp8_col, a_scales_col = quant_fp8_blockwise_impl(a, a_dtype, axis=0, block_size=block_size)
 
         # DGrad NN:
         # grad_x = grad_out @ weight
         # [m, k] = [m, n] * [n, k]
-        grad_x = gemm_fp8_blockwise_impl(
+        grad_a = gemm_fp8_blockwise_impl(
             grad_out_fp8_row,
-            w_fp8,
+            b_fp8,
             grad_out_scales_row,
-            w_scales,
+            b_scales,
             out_dtype=grad_out.dtype,
             scale_group_size_m=1,
             scale_group_size_n=block_size,
@@ -145,11 +150,11 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         # WGrad TN:
         # grad_w = grad_out.T @ x
         # [n,k] = [m, n] * [m, k]
-        grad_w = gemm_fp8_blockwise_impl(
+        grad_b = gemm_fp8_blockwise_impl(
             grad_out_fp8_col,
-            x_fp8_col,
+            a_fp8_col,
             grad_out_scales_col,
-            x_scales_col,
+            a_scales_col,
             out_dtype=grad_out.dtype,
             scale_group_size_m=1,
             scale_group_size_n=1,
@@ -158,40 +163,54 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
             transB=False,
         )
 
-        grad_x = grad_x.view(*batch_shape, M, -1)
-        return grad_x, grad_w, None, None
+        grad_a = grad_a.view(*batch_shape, M, -1)
+        return grad_a, grad_b, None, None, None, None
 
 
 # TODO: weight support Float8Tensor
 def gemm_fp8_blockwise(
-    x,
-    weight,
+    a,
+    b,
+    transA: bool = False,
+    transB: bool = False,
+    out_dtype: Union[torch.dtype, None] = None,
     config: Optional[MXQuantConfig] = None,
 ):
     """
     Blockwise GEMM using FP8 quantization.
 
-    This function applies blockwise FP8 quantization to both the input `x` and the `weight`,
+    This function applies blockwise FP8 quantization to both the input `a` and the `b`,
     performs matrix multiplication in the FP8 domain, and returns the result in the original
     input precision (e.g., bf16 or fp16).
 
     Args:
-        x (torch.Tensor): Input tensor of shape [M, K], typically in bf16 or fp16.
-        weight (torch.Tensor): Weight tensor of shape [N, K], typically in bf16 or fp16.
-        config (MXQuantConfig, optional): Quantization configuration that controls FP8 dtype,
-            scaling strategy, granularity, and block size. If None, uses default MXQuantConfig.
+        a (torch.Tensor): Input tensor of shape [M, K] (if transA=False), typically in bf16 or fp16.
+            Blockwise quantized with shape [1, blocksize].
+        b (torch.Tensor): Weight tensor of shape [K, N] (if transB=False), typically in bf16 or fp16.
+            Blockwise quantized with shape [blocksize, blocksize].
+        transA (bool): Default: False.
+        transB (bool): Default: False.
+        out_dtype (torch.dtype, optional): Output dtype. If None, inferred via `torch.result_type(a, b)`.
+        config (MXQuantConfig, optional): Quantization configuration controlling FP8 dtype,
+            scaling strategy, granularity, and block size. If None, a default config is used.
 
     Returns:
-        torch.Tensor: Output tensor of shape [M, N], in the same dtype as `x`.
+        torch.Tensor: Output tensor of shape [M, N] (assuming transA=False and transB=False),
+        in the same dtype as `a` unless `out_dtype` is explicitly set.
 
     Example:
-        >>> x = torch.randn(512, 1024, dtype=torch.bfloat16).cuda()
-        >>> w = torch.randn(768, 1024, dtype=torch.bfloat16).cuda()
-        >>> y = gemm_fp8_blockwise(x, w)
+        >>> a = torch.randn(512, 1024, dtype=torch.bfloat16).cuda()
+        >>> b = torch.randn(768, 1024, dtype=torch.bfloat16).cuda()
+        >>> y = gemm_fp8_blockwise(a, b, transA=False, transB=True)
     """
+
+    if out_dtype is None:
+        out_dtype = torch.result_type(a, b)
+
     if config is None:
         config = MXQuantConfig()
-    return BlockwiseFP8GemmFunction.apply(x, weight, config)
+
+    return BlockwiseFP8GemmFunction.apply(a, b, transA, transB, out_dtype, config)
 
 
 @torch.compile

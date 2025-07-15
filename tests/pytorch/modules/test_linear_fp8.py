@@ -9,7 +9,7 @@ from tests.test_utils import compute_snr, get_tolerances
 
 # TODO: ori_dtype torch.float32
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("dtype", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("dtype", [Format.E4M3])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("M", [4096])
 @pytest.mark.parametrize("NK", [(4096, 4096)])

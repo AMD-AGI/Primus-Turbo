@@ -3,9 +3,7 @@ from functools import lru_cache
 import torch
 import torch.distributed.distributed_c10d as c10d
 import triton
-from triton_dist.kernels.amd.gemm_reduce_scatter import (
-    matmul_fuse_scatter,
-)
+from triton_dist.kernels.amd.gemm_reduce_scatter import matmul_fuse_scatter
 
 from primus_turbo.triton.reduce.reduce_kernel import kernel_consumer_reduce_async_tp
 

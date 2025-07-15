@@ -37,7 +37,7 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 
     # Config + FWD + BWD
     config = MXQuantConfig(block_size=block_size)
-    out = gemm_fp8_blockwise(x, w, config)
+    out = gemm_fp8_blockwise(x, w, transA=False, transB=True, out_dtype=dtype, config=config)
     out.backward(grad_out)
     x_grad = x.grad
     w_grad = w.grad

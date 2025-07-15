@@ -11,9 +11,9 @@ fp8_gemm_configs = [
         num_stages=num_stages,
         num_warps=num_warps,
     )
-    for block_size_mn in [(64, 64), (128, 128), (128, 256), (256, 256)]
+    for block_size_mn in [(128, 128), (128, 256)]
     for num_stages in [2]
-    for num_warps in [4, 8]
+    for num_warps in [4]
 ]
 
 

@@ -28,7 +28,10 @@ class MXLinear(torch.nn.Linear):
         out = gemm_fp8_blockwise(
             x,
             self.weight,
-            self.config,
+            transA=False,
+            transB=True,
+            out_dtype=x.dtype,
+            config=self.config,
         )
         if self.bias is not None:
             out = out + self.bias
