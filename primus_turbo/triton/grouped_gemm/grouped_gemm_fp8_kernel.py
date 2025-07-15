@@ -42,22 +42,13 @@ def grouped_gemm_fp8_blockwise_kernel(
     a_s_ptr,
     b_s_ptr,
     batch_size,
-    N,
-    K,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
     seg_indptr,
     m_num_tiles_indptr,
-    stride_am,
-    stride_ak,
-    stride_bb,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_asm,
-    stride_ask,
-    stride_bsb,
-    stride_bsk,
-    stride_bsn,
+    transA: tl.constexpr,
+    transB: tl.constexpr,
     SCALE_GROUP_SIZE_M: tl.constexpr,
     SCALE_GROUP_SIZE_N: tl.constexpr,
     SCALE_GROUP_SIZE_K: tl.constexpr,
@@ -90,62 +81,83 @@ def grouped_gemm_fp8_blockwise_kernel(
     offs_bsn = (n_range_start + offs_bn) // SCALE_GROUP_SIZE_N
 
     #
-    a_ptr = a_ptr + m_range_start * stride_am
-    b_ptr = b_ptr + group_id * stride_bb + n_range_start * stride_bn
-    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if not transA:
+        a_ptr = a_ptr + m_range_start * K
+        a_ptrs = a_ptr + offs_am[:, None] * K + offs_k[None, :]
+        a_ptrs_stride = BLOCK_SIZE_K
 
-    a_s_ptr = a_s_ptr + m_range_start * stride_asm
-    b_s_ptr = b_s_ptr + group_id * stride_bsb
-    a_s_ptrs = a_s_ptr + offs_am[:, None] * stride_asm
-    b_s_ptrs = b_s_ptr + offs_bsn[None, :] * stride_bsn
+        a_s_ptr = a_s_ptr + m_range_start * tl.cdiv(K, SCALE_GROUP_SIZE_K)
+        a_s_ptrs = a_s_ptr + offs_am[:, None] * tl.cdiv(K, SCALE_GROUP_SIZE_K)
+        a_s_ptrs_stride = 1
+    else:
+        a_ptr = a_ptr + m_range_start
+        a_ptrs = a_ptr + offs_k[:, None] * M + offs_am[None, :]
+        a_ptrs_stride = BLOCK_SIZE_K * M
+
+        a_s_ptr = a_s_ptr + m_range_start
+        a_s_ptrs = a_s_ptr + offs_am[None, :]
+        a_s_ptrs_stride = M
+
+    if not transB:
+        b_ptr = b_ptr + group_id * N * K + n_range_start
+        b_ptrs = b_ptr + offs_k[:, None] * N + offs_bn[None, :]
+        b_ptrs_stride = BLOCK_SIZE_K * N
+
+        b_s_ptr = b_s_ptr + group_id * tl.cdiv(N, SCALE_GROUP_SIZE_N) * tl.cdiv(K, SCALE_GROUP_SIZE_K)
+        b_s_ptrs = b_s_ptr + offs_bsn[None, :]
+        b_s_ptrs_stride = tl.cdiv(N, SCALE_GROUP_SIZE_N)
+    else:
+        b_ptr = b_ptr + group_id * N * K + n_range_start * K
+        b_ptrs = b_ptr + offs_bn[:, None] * K + offs_k[None, :]
+        b_ptrs_stride = BLOCK_SIZE_K
+
+        b_s_ptr = b_s_ptr + group_id * tl.cdiv(N, SCALE_GROUP_SIZE_N) * tl.cdiv(K, SCALE_GROUP_SIZE_K)
+        b_s_ptrs = b_s_ptr + offs_bsn[:, None] * tl.cdiv(K, SCALE_GROUP_SIZE_K)
+        b_s_ptrs_stride = 1
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for kid in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_tile = tl.load(a_ptrs, mask=offs_k[None, :] < (K - kid * BLOCK_SIZE_K), other=0.0)
-        b_tile = tl.load(b_ptrs, mask=offs_k[:, None] < (K - kid * BLOCK_SIZE_K), other=0.0)
+        mask_k = offs_k < K
+        a_tile = tl.load(a_ptrs, mask_k[None, :] if not transA else mask_k[:, None], other=0.0)
+        b_tile = tl.load(b_ptrs, mask_k[:, None] if not transB else mask_k[None, :], other=0.0)
         a_s_tile = tl.load(a_s_ptrs)
         b_s_tile = tl.load(b_s_ptrs)
 
+        if transA:
+            a_tile = a_tile.T
+
+        if transB:
+            b_tile = b_tile.T
+
         accumulator += tl.dot(a_tile, b_tile) * a_s_tile * b_s_tile
 
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        a_s_ptrs += stride_ask
-        b_s_ptrs += stride_bsk
+        a_ptrs += a_ptrs_stride
+        b_ptrs += b_ptrs_stride
+        a_s_ptrs += a_s_ptrs_stride
+        b_s_ptrs += b_s_ptrs_stride
+        offs_k += BLOCK_SIZE_K
 
     c_tile = accumulator.to(c_dtype)
     offs_cm = m_range_start + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = n_range_start + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_ptrs = c_ptr + offs_cm[:, None] * N + offs_cn[None, :]
     c_mask = (offs_cm[:, None] < m_range_end) & (offs_cn[None, :] < n_range_end)
     tl.store(c_ptrs, c_tile, mask=c_mask)
 
 
 @triton.jit
-def grouped_gemm_variable_k_fp8_blockwise_kernel(
+def grouped_gemm_variable_k_fp8_blockwise_tn_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
     a_s_ptr,
     b_s_ptr,
     batch_size,
-    M,
-    N,
+    M: tl.constexpr,
+    N: tl.constexpr,
     K,
     seg_indptr,
     scales_seg_indptr,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cb,
-    stride_cm,
-    stride_cn,
-    stride_asm,
-    stride_ask,
-    stride_bsk,
-    stride_bsn,
     SCALE_GROUP_SIZE_M: tl.constexpr,
     SCALE_GROUP_SIZE_N: tl.constexpr,
     SCALE_GROUP_SIZE_K: tl.constexpr,
@@ -163,7 +175,6 @@ def grouped_gemm_variable_k_fp8_blockwise_kernel(
     if k_local == 0:
         return
     scales_k_range_start = tl.load(scales_seg_indptr + pid_b)
-    # scales_k_range_end = tl.load(scales_seg_indptr + pid_b + 1)
 
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -171,32 +182,38 @@ def grouped_gemm_variable_k_fp8_blockwise_kernel(
     offs_bn = tl.where(offs_bn < N, offs_bn, 0)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptr = a_ptr + k_range_start * stride_ak
-    b_ptr = b_ptr + k_range_start * stride_bk
-    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    a_ptr = a_ptr + k_range_start * M
+    a_ptrs = a_ptr + offs_k[:, None] * M + offs_am[None, :]
+    a_ptrs_stride = BLOCK_SIZE_K * M
+    
+    b_ptr = b_ptr + k_range_start * N
+    b_ptrs = b_ptr + offs_k[:, None] * N + offs_bn[None, :]
+    b_ptrs_stride = BLOCK_SIZE_K * N
 
-    a_s_ptr = a_s_ptr + scales_k_range_start * stride_ask
-    b_s_ptr = b_s_ptr + scales_k_range_start * stride_bsk
-    a_s_ptrs = a_s_ptr + offs_am[:, None] * stride_asm
-    b_s_ptrs = b_s_ptr + offs_bn[None, :] * stride_bsn
+    a_s_ptr = a_s_ptr + scales_k_range_start * tl.cdiv(M, SCALE_GROUP_SIZE_M)
+    b_s_ptr = b_s_ptr + scales_k_range_start * tl.cdiv(N, SCALE_GROUP_SIZE_N)
+    a_s_ptrs = a_s_ptr + offs_am[None, :]
+    b_s_ptrs = b_s_ptr + offs_bn[None, :]
+    a_s_ptrs_stride = tl.cdiv(M, SCALE_GROUP_SIZE_M)
+    b_s_ptrs_stride = tl.cdiv(N, SCALE_GROUP_SIZE_N)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for kid in range(0, tl.cdiv(k_local, BLOCK_SIZE_K)):
-        a_tile = tl.load(a_ptrs, mask=offs_k[None, :] < (k_local - kid * BLOCK_SIZE_K), other=0.0)
-        b_tile = tl.load(b_ptrs, mask=offs_k[:, None] < (k_local - kid * BLOCK_SIZE_K), other=0.0)
+        a_tile = tl.load(a_ptrs, mask=offs_k[:, None] < k_local, other=0.0)
+        b_tile = tl.load(b_ptrs, mask=offs_k[:, None] < k_local, other=0.0)
         a_s_tile = tl.load(a_s_ptrs)
         b_s_tile = tl.load(b_s_ptrs)
 
-        accumulator += tl.dot(a_tile, b_tile) * a_s_tile * b_s_tile
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        a_s_ptrs += stride_ask
-        b_s_ptrs += stride_bsk
+        accumulator += tl.dot(a_tile.T, b_tile) * a_s_tile.T * b_s_tile
+        a_ptrs += a_ptrs_stride
+        b_ptrs += b_ptrs_stride
+        a_s_ptrs += a_s_ptrs_stride
+        b_s_ptrs += b_s_ptrs_stride
+        offs_k += BLOCK_SIZE_K
 
     c_tile = accumulator.to(c_ptr.dtype.element_ty)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + pid_b * stride_cb + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_ptrs = c_ptr + pid_b * M * N + offs_cm[:, None] * N + offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c_tile, mask=c_mask)

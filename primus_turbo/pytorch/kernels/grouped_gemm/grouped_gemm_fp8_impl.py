@@ -4,7 +4,7 @@ import triton
 from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     compute_m_num_tiles_indptr,
     grouped_gemm_fp8_blockwise_kernel,
-    grouped_gemm_variable_k_fp8_blockwise_kernel,
+    grouped_gemm_variable_k_fp8_blockwise_tn_kernel,
 )
 
 
@@ -27,20 +27,21 @@ def grouped_gemm_fp8_blockwise_impl(
     assert a_scales.dim() == 2, f"a scales must be 2D, got {a_scales.shape}"
     assert b_scales.dim() == 3, f"b scales must be 3D, got {b_scales.shape}"
 
-    a_view = a.transpose(-1, -2) if transA else a
-    a_scales_view = a_scales.transpose(-1, -2) if transA else a_scales
-    b_view = b.transpose(-1, -2) if transB else b
-    b_scales_view = b_scales.transpose(-1, -2) if transB else b_scales
+    M = a.shape[1] if transA else a.shape[0]
+    Ka = a.shape[0] if transA else a.shape[1]
+    Kb = b.shape[-1] if transB else b.shape[-2]
+    N = b.shape[-2] if transB else b.shape[-1]
+    B = b.shape[0]
 
-    M, K = a_view.shape
-    B, KB, N = b_view.shape
-    assert K == KB, f"K mismatch: K={K}, KB={KB}"
+    assert Ka == Kb, f"K mismatch: Ka={Ka}, Kb={Kb}"
     assert B == batch_size
 
     config = {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": scale_group_size_k,
+        "num_stages": 2,
+        "num_warps": 4,
     }
 
     c = torch.empty(M, N, dtype=out_dtype, device=a.device)
@@ -54,28 +55,19 @@ def grouped_gemm_fp8_blockwise_impl(
     )
 
     grouped_gemm_fp8_blockwise_kernel[grid](
-        a_view,
-        b_view,
+        a,
+        b,
         c,
-        a_scales_view,
-        b_scales_view,
+        a_scales,
+        b_scales,
         batch_size,
+        M,
         N,
-        K,
+        Ka,
         seg_indptr,
         m_num_tiles_indptr,
-        a_view.stride(0),
-        a_view.stride(1),
-        b_view.stride(0),
-        b_view.stride(1),
-        b_view.stride(2),
-        c.stride(0),
-        c.stride(1),
-        a_scales_view.stride(0),
-        a_scales_view.stride(1),
-        b_scales_view.stride(0),
-        b_scales_view.stride(1),
-        b_scales_view.stride(2),
+        transA,
+        transB,
         scale_group_size_m,
         scale_group_size_n,
         scale_group_size_k,
@@ -111,19 +103,23 @@ def grouped_gemm_variable_k_fp8_blockwise_impl(
         scale_group_size_m == 1 and scale_group_size_n == 1
     ), f"Only scale_group_size_m == 1 and scale_group_size_n == 1 are supported, got {scale_group_size_m}, {scale_group_size_n}"
 
-    a_view = a.transpose(-1, -2) if transA else a
-    a_scales_view = a_scales.transpose(-1, -2) if transA else a_scales
-    b_view = b.transpose(-1, -2) if transB else b
-    b_scales_view = b_scales.transpose(-1, -2) if transB else b_scales
+    # a_view = a.transpose(-1, -2) if transA else a
+    # a_scales_view = a_scales.transpose(-1, -2) if transA else a_scales
+    # b_view = b.transpose(-1, -2) if transB else b
+    # b_scales_view = b_scales.transpose(-1, -2) if transB else b_scales
 
-    M, K = a_view.shape
-    KB, N = b_view.shape
-    assert K == KB, f"K mismatch: KA={K}, KB={KB}"
+    M = a.shape[1] if transA else a.shape[0]
+    Ka = a.shape[0] if transA else a.shape[1]
+    Kb = b.shape[-1] if transB else b.shape[-2]
+    N = b.shape[-2] if transB else b.shape[-1]
+    assert Ka == Kb, f"K mismatch: KA={Ka}, KB={Kb}"
 
     config = {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": scale_group_size_k,
+        "num_stages": 2,
+        "num_warps": 4,
     }
 
     c = torch.empty(batch_size, M, N, dtype=out_dtype, device=a.device)
@@ -134,29 +130,18 @@ def grouped_gemm_variable_k_fp8_blockwise_impl(
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    grouped_gemm_variable_k_fp8_blockwise_kernel[grid](
-        a_view,
-        b_view,
+    grouped_gemm_variable_k_fp8_blockwise_tn_kernel[grid](
+        a,
+        b,
         c,
-        a_scales_view,
-        b_scales_view,
+        a_scales,
+        b_scales,
         batch_size,
         M,
         N,
-        K,
+        Ka,
         seg_indptr,
         scales_seg_indptr,
-        a_view.stride(0),
-        a_view.stride(1),
-        b_view.stride(0),
-        b_view.stride(1),
-        c.stride(0),
-        c.stride(1),
-        c.stride(2),
-        a_scales_view.stride(0),
-        a_scales_view.stride(1),
-        b_scales_view.stride(0),
-        b_scales_view.stride(1),
         scale_group_size_m,
         scale_group_size_n,
         scale_group_size_k,
