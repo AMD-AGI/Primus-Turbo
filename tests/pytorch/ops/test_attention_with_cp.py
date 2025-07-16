@@ -63,14 +63,14 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
     @parametrize("config", test_cases)
     @parametrize("causal", [True])
     @parametrize("backend_type", ["triton"])
-    @parametrize("cp_comm_type", ["all2all"])
+    @parametrize("cp_comm_type", ["a2a"])
     def test_attention_with_cp_fp8(self, batch, config, causal, backend_type, cp_comm_type):
         self._init_process()
         cp_group = dist.group.WORLD
 
         device = "cuda"
         dtype = torch.bfloat16
-        if cp_comm_type == "all2all":
+        if cp_comm_type == "a2a":
             input_sharder = All2AllAttentionSharder()
         else:
             raise NotImplementedError()

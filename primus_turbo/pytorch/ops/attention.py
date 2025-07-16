@@ -10,10 +10,11 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
-from primus_turbo.pytorch.ops.attention_with_cp import (
-    dispatch_attention_triton_functions,
+from primus_turbo.pytorch.ops.attention_with_cp import dispatch_attention_cp_functions
+from primus_turbo.pytorch.ops.utils.attention_utils import (
+    block_scaling_node,
+    quant_v_get_p_scale,
 )
-from primus_turbo.pytorch.ops.utils.attention_utils import blockwise_scaling_qkv_to_fp8
 
 __all__ = ["attention", "attention_fp8_blockwise"]
 
@@ -152,7 +153,9 @@ class AttentionTritonFunction(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        q, k, v, p_scale, q_scale, k_scale, v_scale = blockwise_scaling_qkv_to_fp8(q, k, v, use_fp8)
+        q, q_scale = block_scaling_node(q, use_fp8)
+        k, k_scale = block_scaling_node(k, use_fp8)
+        v, v_scale, p_scale = quant_v_get_p_scale(v, use_fp8)
 
         output, softmax_lse, exp_scores = attention_triton_forward_impl(
             q,
@@ -244,11 +247,13 @@ def attention(
     backend_type: str = "ck",  # 'ck', 'triton'
     cp_param_bundle=None,
 ):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
     if cp_param_bundle is not None:  # CP
         assert "cp_group" in cp_param_bundle
-        assert "cp_stream" in cp_param_bundle
         assert "cp_comm_type" in cp_param_bundle
-        return dispatch_attention_triton_functions(
+        return dispatch_attention_cp_functions(
             q,
             k,
             v,
@@ -261,9 +266,9 @@ def attention(
             return_lse,
             return_attn_probs,
             torch.is_grad_enabled(),
+            backend_type,
             False,
             cp_param_bundle["cp_group"],
-            cp_param_bundle["cp_stream"],
             cp_param_bundle["cp_comm_type"],
         )
 
@@ -320,11 +325,14 @@ def attention_fp8_blockwise(
     cp_param_bundle=None,
 ):
     assert backend_type == "triton", "attention_fp8_blockwise only support triton backend"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
     if cp_param_bundle is not None:  # CP
+
         assert "cp_group" in cp_param_bundle
-        assert "cp_stream" in cp_param_bundle
         assert "cp_comm_type" in cp_param_bundle
-        return dispatch_attention_triton_functions(
+        return dispatch_attention_cp_functions(
             q,
             k,
             v,
@@ -337,9 +345,9 @@ def attention_fp8_blockwise(
             return_lse,
             return_attn_probs,
             torch.is_grad_enabled(),
+            backend_type,
             True,
             cp_param_bundle["cp_group"],
-            cp_param_bundle["cp_stream"],
             cp_param_bundle["cp_comm_type"],
         )
 
