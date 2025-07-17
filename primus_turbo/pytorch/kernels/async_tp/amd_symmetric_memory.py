@@ -2,19 +2,19 @@ import operator
 from functools import reduce
 from typing import Tuple
 
-import pyrocshmem
 import torch
 import torch.distributed.distributed_c10d as c10d
-from triton_dist.kernels.amd.common_ops import barrier_all_on_stream
+
+from .common_ops import barrier_all_on_stream, ipc_create_tensor_lists
 
 
 class AMDSymmetricMemory:
     def __init__(self, group_name: str, mem_bytes: int):
         group = c10d._resolve_process_group(group_name)
 
-        self._buffers = pyrocshmem.hipipc_create_tensor_list(group, [mem_bytes], torch.uint8)
+        self._buffers = ipc_create_tensor_lists(group, [mem_bytes], torch.uint8)
 
-        self._comm_bufs = pyrocshmem.hipipc_create_tensor_list(group, [group.size()], torch.int32)
+        self._comm_bufs = ipc_create_tensor_lists(group, [group.size()], torch.int32)
         self._comm_bufs[group.rank()].fill_(0)
         self._comm_buf_ptr = torch.tensor(
             [t.data_ptr() for t in self._comm_bufs], device=torch.cuda.current_device(), requires_grad=False

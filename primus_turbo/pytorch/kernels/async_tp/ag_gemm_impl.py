@@ -2,35 +2,30 @@ from functools import lru_cache
 from itertools import cycle
 from typing import Any, Callable, List, Optional, Tuple
 
-import pyrocshmem
 import torch
 import torch.distributed.distributed_c10d as c10d
-import triton
-import triton.language as tl
 from hip import hip
 from torch.distributed._symmetric_memory import (
     _check_and_verify_fp8_all_gather_scale_mode,
     _ScaleMode,
 )
-from triton_dist.kernels.amd.common_ops import load_acquire_system, thread_idx
-from triton_dist.utils import HIP_CHECK
 
 from .amd_symmetric_memory import get_amd_symm_mem_workspace
+from .common_ops import batch_wait_eq_sys, ipc_create_tensor_lists
 
 
-@triton.jit
-def batch_wait_eq_sys(rank, barrier_ptr, n_elements: tl.constexpr, value):
-    barrier_ptr = barrier_ptr.to(tl.pointer_type(tl.int32))
-    tid = thread_idx(axis=0)
-    if tid < n_elements and tid != rank:
-        while load_acquire_system(barrier_ptr + tid) != value:
-            pass
+def hip_check(call_result):
+    err = call_result[0]
+    result = call_result[1:]
+    if len(result) == 1:
+        result = result[0]
+    if isinstance(err, hip.hipError_t) and err != hip.hipError_t.hipSuccess:
+        raise RuntimeError(str(err))
+    return result
 
-    tl.debug_barrier()
 
-
-def wait_all_gather(rank, num_ranks, barrier_ptr: int, value):
-    batch_wait_eq_sys[(1,)](rank, barrier_ptr, num_ranks, value)
+def wait_all_gather(rank, num_ranks, barrier_ptr: int):
+    batch_wait_eq_sys[(1,)](rank, barrier_ptr, num_ranks)
 
 
 @lru_cache
@@ -78,7 +73,7 @@ def get_comm_event():
 def get_barriers_tensors(group_name: str, num_splits: int) -> List[torch.Tensor]:
     group = c10d._resolve_process_group(group_name)
     m_chunk_num = group.size() * num_splits
-    barriers = pyrocshmem.hipipc_create_tensor_list(group, [m_chunk_num], torch.int32)
+    barriers = ipc_create_tensor_lists(group, [m_chunk_num], torch.int32)
     barriers[group.rank()].fill_(0)
     return barriers
 
@@ -107,7 +102,7 @@ def pipelined_all_gather_copy_send(
         ag_stream = next(stream_generator)
 
         for i in range(num_ag):
-            HIP_CHECK(
+            hip_check(
                 hip.hipMemcpyAsync(
                     dst_ptrs[dst_rank][i] + dst_offset * send_n_bytes[i],
                     src_ptrs[i],
@@ -119,7 +114,7 @@ def pipelined_all_gather_copy_send(
 
             dst_ptrs[dst_rank][i] += send_n_bytes[i] * (num_ranks - 1)
 
-        HIP_CHECK(
+        hip_check(
             hip.hipMemcpyAsync(
                 barrier_ptrs[dst_rank] + rank * 4,
                 one.data_ptr(),
@@ -136,7 +131,7 @@ def pipelined_all_gather_copy_send(
         @staticmethod
         def wait():
             torch.cuda.current_stream().wait_event(comm_event)
-            wait_all_gather(rank, num_ranks, barrier_ptrs[rank], 1)
+            wait_all_gather(rank, num_ranks, barrier_ptrs[rank])
 
     return _CustomHandle
 
@@ -198,7 +193,7 @@ def _pipelined_multi_all_gather_and_consume(
 
     shard_info = (None if s is None else (s.shape, s.dtype) for s in shard)
 
-    symm_mem, shard_buf, local_shard_buf_chunk = get_symm_shard_buf_and_chunk(
+    _, shard_buf, local_shard_buf_chunk = get_symm_shard_buf_and_chunk(
         shard_info, group_name, p2p_workspace_size_req, num_splits
     )
     shard_buf_ptrs = [[buf.data_ptr() for buf in bufs] for bufs in shard_buf]
@@ -217,9 +212,6 @@ def _pipelined_multi_all_gather_and_consume(
     ag_out_cp_info = [(ag_o.data_ptr(), ag_o.nbytes // num_splits // num_ranks) for ag_o in ag_out]
 
     current_stream = torch.cuda.current_stream()
-
-    barrier_tensors[rank].fill_(0)
-    symm_mem.barrier()
 
     for st in stream_pool:
         st.wait_stream(current_stream)
@@ -258,7 +250,7 @@ def _pipelined_multi_all_gather_and_consume(
                         dst_ptr = ag_ptr + idx * ag_stride
                         src_ptr = ptr + i * chunk_size
 
-                        HIP_CHECK(
+                        hip_check(
                             hip.hipMemcpyAsync(
                                 dst_ptr,
                                 src_ptr,
@@ -277,7 +269,7 @@ def _pipelined_multi_all_gather_and_consume(
                 for i, idx in enumerate(cpu_indices[step]):
                     dst_ptr = o_ptr + idx * o_stride
                     src_ptr = t_o.data_ptr() + i * chunk_out_stride
-                    HIP_CHECK(
+                    hip_check(
                         hip.hipMemcpyAsync(
                             dst_ptr,
                             src_ptr,
@@ -297,7 +289,7 @@ def _pipelined_multi_all_gather_and_consume(
                     idx = rank * num_splits + i
                     dst_ptr = ag_ptr + ag_stride * idx
                     src_ptr = s.data_ptr() + i * shard_stride[j]
-                    HIP_CHECK(
+                    hip_check(
                         hip.hipMemcpyAsync(
                             dst_ptr,
                             src_ptr,

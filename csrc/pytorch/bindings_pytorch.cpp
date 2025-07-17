@@ -20,6 +20,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           ") -> Tensor");
     m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");
     m.def("fp8_dequantize(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> Tensor");
+    m.def("rendezvous_shmem(str group_name, Tensor a, int[] shape, ScalarType dtype) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -27,6 +28,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("gemm_fp8_blockwise", gemm_fp8_blockwise);
     m.impl("fp8_quantize", fp8_quantize);
     m.impl("fp8_dequantize", fp8_dequantize);
+    m.impl("rendezvous_shmem", rendezvous_shmem);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -34,6 +36,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("gemm_fp8_blockwise", gemm_fp8_blockwise_meta);
     m.impl("fp8_quantize", fp8_quantize_meta);
     m.impl("fp8_dequantize", fp8_dequantize_meta);
+    m.impl("rendezvous_shmem", rendezvous_shmem_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
