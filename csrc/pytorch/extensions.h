@@ -47,12 +47,8 @@ torch::Tensor gemm_fp8_blockwise_meta(torch::Tensor &a, torch::Tensor &a_scales,
                                       torch::Tensor &b_scales, torch::Tensor &c, const bool transA,
                                       const bool transB, const int64_t block_size);
 
-std::vector<torch::Tensor> rendezvous_shmem(const std::string &group_name, torch::Tensor UNSUED,
+std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
                                             const std::vector<int64_t> &shape,
                                             c10::ScalarType             dtype);
 
-std::vector<torch::Tensor> rendezvous_shmem_meta(const std::string          &group_name,
-                                                 torch::Tensor               UNSUED,
-                                                 const std::vector<int64_t> &shape,
-                                                 c10::ScalarType             dtype);
 } // namespace primus_turbo::pytorch

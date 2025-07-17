@@ -19,14 +19,7 @@ static void all_gather_helper(c10d::ProcessGroup *pg, const void *src, void *dst
     dst_tensor.copy_(dst_tensor_gpu.to(option_cpu));
 }
 
-std::vector<torch::Tensor> rendezvous_shmem_meta(const std::string          &group_name,
-                                                 torch::Tensor               UNSUED,
-                                                 const std::vector<int64_t> &shape,
-                                                 c10::ScalarType             dtype) {
-    return {torch::empty_like(UNSUED, torch::dtype(dtype).device(at::kMeta))};
-}
-
-std::vector<torch::Tensor> rendezvous_shmem(const std::string &group_name, torch::Tensor UNSUED,
+std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
                                             const std::vector<int64_t> &shape,
                                             c10::ScalarType             dtype) {
     auto group = c10d::resolve_process_group(group_name);

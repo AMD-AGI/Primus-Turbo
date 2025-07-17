@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+import primus_turbo
+
 
 @triton.jit
 def batch_wait_eq_sys(rank, barrier_ptr, n_elements: tl.constexpr):
@@ -39,5 +41,4 @@ def barrier_all_on_stream(
 
 
 def ipc_create_tensor_lists(group: torch.distributed.ProcessGroup, shape: list[int], dtype: torch.dtype):
-    tensor = torch.empty((1,), device="cuda")
-    return torch.ops.primus_turbo_cpp_extension.rendezvous_shmem(group.group_name, tensor, shape, dtype)
+    return primus_turbo.pytorch._C.rendezvous_shmem(group.group_name, shape, dtype)
