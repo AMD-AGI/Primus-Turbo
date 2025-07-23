@@ -185,7 +185,7 @@ def grouped_gemm_variable_k_fp8_blockwise_tn_kernel(
     a_ptr = a_ptr + k_range_start * M
     a_ptrs = a_ptr + offs_k[:, None] * M + offs_am[None, :]
     a_ptrs_stride = BLOCK_SIZE_K * M
-    
+
     b_ptr = b_ptr + k_range_start * N
     b_ptrs = b_ptr + offs_k[:, None] * N + offs_bn[None, :]
     b_ptrs_stride = BLOCK_SIZE_K * N

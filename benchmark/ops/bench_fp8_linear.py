@@ -29,7 +29,7 @@ test_configs = [
 
 def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     device = "cuda"
-    config = MXQuantConfig(dtype=dtype, block_size=block_size)
+    config = MXQuantConfig(format=dtype, block_size=block_size)
 
     # Prepare inputs
     x = torch.randn((*B, M, K), dtype=ori_dtype, device=device, requires_grad=True)
@@ -37,7 +37,9 @@ def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     x_ref = x.clone().detach().requires_grad_()
     w_ref = w.clone().detach().requires_grad_()
 
-    fn_forward = lambda: gemm_fp8_blockwise(x, w, config)
+    fn_forward = lambda: gemm_fp8_blockwise(
+        x, w, transA=False, transB=True, out_dtype=ori_dtype, config=config
+    )
 
     # Reference forward pass
     out_ref = x_ref @ w_ref.T
