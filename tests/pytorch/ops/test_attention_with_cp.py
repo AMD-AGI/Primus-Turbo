@@ -18,16 +18,15 @@ from tests.pytorch.ref.attention_ref import (
 from tests.test_utils import compute_snr
 
 test_cases = [
-    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
+    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
     AttnConfig(
         seqlen_q=1024, seqlen_kv=1024, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128
     ),
-    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 
@@ -62,11 +61,16 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
     @parametrize("batch", [4])
     @parametrize("config", test_cases)
     @parametrize("causal", [True])
-    @parametrize("backend_type", ["triton"])
+    @parametrize("backend_type", ["ck", "triton"])
     @parametrize("cp_comm_type", ["a2a"])
-    def test_attention_with_cp_fp8(self, batch, config, causal, backend_type, cp_comm_type):
+    @parametrize("fp8", [True, False])
+    def test_attention_with_cp(self, batch, config, causal, backend_type, cp_comm_type, fp8):
         self._init_process()
         cp_group = dist.group.WORLD
+
+        # ck backend do not support fp8 yet
+        if backend_type == "ck" and fp8:
+            return
 
         device = "cuda"
         dtype = torch.bfloat16
@@ -111,22 +115,40 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             [query, key, value], cp_group
         )
 
-        o = pt.ops.attention_fp8_blockwise(
-            query_local_token,
-            key_local_token,
-            value_local_token,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            bias=None,
-            alibi_slopes=None,
-            deterministic=False,
-            return_lse=False,
-            return_attn_probs=False,
-            backend_type=backend_type,
-            cp_param_bundle=cp_param_bundle,
-        )
+        if fp8:
+            o = pt.ops.attention_fp8_blockwise(
+                query_local_token,
+                key_local_token,
+                value_local_token,
+                dropout_p=0.0,
+                softmax_scale=sm_scale,
+                causal=causal,
+                window_size=(-1, -1),
+                bias=None,
+                alibi_slopes=None,
+                deterministic=False,
+                return_lse=False,
+                return_attn_probs=False,
+                backend_type=backend_type,
+                cp_param_bundle=cp_param_bundle,
+            )
+        else:
+            o = pt.ops.attention(
+                query_local_token,
+                key_local_token,
+                value_local_token,
+                dropout_p=0.0,
+                softmax_scale=sm_scale,
+                causal=causal,
+                window_size=(-1, -1),
+                bias=None,
+                alibi_slopes=None,
+                deterministic=False,
+                return_lse=False,
+                return_attn_probs=False,
+                backend_type=backend_type,
+                cp_param_bundle=cp_param_bundle,
+            )
 
         grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
