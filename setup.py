@@ -95,6 +95,7 @@ def get_common_flags():
 
     nvcc_flags = [
         "-O3",
+        "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1",
         "-U__HIP_NO_HALF_OPERATORS__",
         "-U__HIP_NO_HALF_CONVERSIONS__",
         "-U__HIP_NO_BFLOAT16_OPERATORS__",

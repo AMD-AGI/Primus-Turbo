@@ -12,7 +12,7 @@ using namespace dtype;
           as 1 value of type LType.
 */
 template <typename DType, int n> class VectorizedStorage {
-  public:
+public:
     using LType               = typename primus_turbo::BytesToType<sizeof(DType) * n>::Type;
     constexpr static int nvec = n;
     union vectorized_storage {
@@ -54,7 +54,7 @@ template <typename DType, typename LType> struct select_const<const DType, LType
           the allocation is aligned to sizeof(LType) / sizeof(DType) elements.
 */
 template <typename DType, int nvec, bool aligned = false> class VectorizedAccessor {
-  public:
+public:
     using StorageType = VectorizedStorage<typename std::remove_const<DType>::type, nvec>;
     using LType       = typename select_const<DType, typename StorageType::LType>::type;
     StorageType storage_;
@@ -117,7 +117,7 @@ template <typename DType, int nvec, bool aligned = false> class VectorizedAccess
 /* \brief Class used for vectorized read-only access. */
 template <typename DType, int nvec, bool aligned = false>
 class VectorizedLoader : public VectorizedAccessor<const DType, nvec, aligned> {
-  public:
+public:
     inline __device__ VectorizedLoader(const DType *ptr, const size_t N)
         : VectorizedAccessor<const DType, nvec, aligned>(ptr, N) {}
 };
@@ -125,7 +125,7 @@ class VectorizedLoader : public VectorizedAccessor<const DType, nvec, aligned> {
 /* \brief Class used for vectorized writable access. */
 template <typename DType, int nvec, bool aligned = false>
 class VectorizedStorer : public VectorizedAccessor<DType, nvec, aligned> {
-  public:
+public:
     inline __device__ VectorizedStorer(DType *ptr, const size_t N)
         : VectorizedAccessor<DType, nvec, aligned>(ptr, N) {}
 

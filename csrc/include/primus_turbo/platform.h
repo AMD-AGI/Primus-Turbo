@@ -37,5 +37,6 @@
 // Universal warp size constant (AMD = 64)
 //
 namespace primus_turbo {
-constexpr int THREADS_PER_WARP = 64;
+constexpr int THREADS_PER_WARP      = 64;
+constexpr int MAX_THREADS_PER_BLOCK = 1024; // TODO: ?
 } // namespace primus_turbo

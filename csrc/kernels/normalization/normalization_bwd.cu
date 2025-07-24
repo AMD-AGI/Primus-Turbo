@@ -1,8 +1,8 @@
-#include "primus_turbo/common.h"
 #include "primus_turbo/normalization.h"
-#include "primus_turbo/reduce.cuh"
 
 namespace primus_turbo {
+
+using namespace primus_turbo::dtype;
 
 // https://github.com/gashon/rms-norm-triton-kernel/blob/main/triton_util.py
 
@@ -33,11 +33,11 @@ __global__ void rmsnorm_bwd_kernel(const T *input, const T *gamma, const T *outp
         local_dot_sum += x * dy * g;
     }
 
-    float mean_square    = warpReduceSum<float>(local_squares_sum) / static_cast<float>(inner_len);
+    float mean_square = WarpReduce<SumOp, float>(local_squares_sum) / static_cast<float>(inner_len);
     const float inv_std  = rsqrtf(mean_square + epsilon);
     const float inv_std3 = inv_std * inv_std * inv_std;
 
-    const float dot_sum = warpReduceSum<float>(local_dot_sum) / static_cast<float>(inner_len);
+    const float dot_sum = WarpReduce<SumOp, float>(local_dot_sum) / static_cast<float>(inner_len);
     const float coeff   = dot_sum * inv_std3;
 
     //
@@ -68,5 +68,17 @@ template void rmsnorm_bwd_impl<float>(const float *input, const float *gamma,
                                       float *gamma_grad, const int64_t inner_len,
                                       const int64_t outer_len, const float epsilon,
                                       hipStream_t stream);
+
+template void rmsnorm_bwd_impl<float16>(const float16 *input, const float16 *gamma,
+                                        const float16 *output_grad, float16 *input_grad,
+                                        float16 *gamma_grad, const int64_t inner_len,
+                                        const int64_t outer_len, const float epsilon,
+                                        hipStream_t stream);
+
+template void rmsnorm_bwd_impl<bfloat16>(const bfloat16 *input, const bfloat16 *gamma,
+                                         const bfloat16 *output_grad, bfloat16 *input_grad,
+                                         bfloat16 *gamma_grad, const int64_t inner_len,
+                                         const int64_t outer_len, const float epsilon,
+                                         hipStream_t stream);
 
 } // namespace primus_turbo
