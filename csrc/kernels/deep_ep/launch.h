@@ -3,10 +3,6 @@
 #include "configs.h"
 #include "primus_turbo/macros.h"
 
-#define GPU_R_16BF HIP_R_16BF
-#define GPU_R_32F HIP_R_32F
-using gpu_bfloat16_t = hip_bfloat16;
-
 // ROCm helper functions and structures
 namespace rocm::experimental {
 typedef struct {
@@ -105,9 +101,9 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel, Args &&...a
 
 #define SWITCH_TYPES(case_macro)                                                                   \
     switch (type) {                                                                                \
-    case GPU_R_16BF:                                                                               \
-        case_macro(gpu_bfloat16_t);                                                                \
-    case GPU_R_32F:                                                                                \
+    case HIP_R_16BF:                                                                               \
+        case_macro(hip_bfloat16);                                                                  \
+    case HIP_R_32F:                                                                                \
         case_macro(float);                                                                         \
     default:                                                                                       \
         PRIMUS_TURBO_CHECK(false, "Unsupported type");                                             \

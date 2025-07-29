@@ -51,8 +51,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         return;
     }
 
-    // if (num_tokens_per_rdma_rank != nullptr)
-    //     EP_DEVICE_ASSERT(num_ranks % NUM_MAX_XGMI_PEERS == 0 and num_ranks > NUM_MAX_XGMI_PEERS);
+    if (num_tokens_per_rdma_rank != nullptr)
+        PRIMUS_TURBO_DEVICE_CHECK(num_ranks % NUM_MAX_XGMI_PEERS == 0 and
+                                  num_ranks > NUM_MAX_XGMI_PEERS);
 
     // Count rank statistics
     constexpr int  kNumRDMARanksPerSM = kNumRanksPerSM / NUM_MAX_XGMI_PEERS;
