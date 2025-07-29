@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) 2025 DeepSeek. All rights reserved.
+ *
+ * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ */
+
 #pragma once
 
 #include "../kernels/deep_ep/api.h"
