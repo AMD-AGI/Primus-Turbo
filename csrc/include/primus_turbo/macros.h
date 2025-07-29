@@ -46,6 +46,14 @@ template <typename... Ts> inline std::string concat_strings(const Ts &...args) {
         }                                                                                          \
     } while (false)
 
+#define PRIMUS_TURBO_DEVICE_CHECK(expr)                                                            \
+    do {                                                                                           \
+        if (!(expr)) {                                                                             \
+            printf("Assertion failed: %s:%d, expression: %s\n", __FILE__, __LINE__, #expr);        \
+            abort();                                                                               \
+        }                                                                                          \
+    } while (false)
+
 #define PRIMUS_TURBO_CHECK_HIP(expr)                                                               \
     do {                                                                                           \
         const hipError_t status_PRIMUS_TURBO_CHECK_HIP = (expr);                                   \
@@ -62,3 +70,5 @@ template <typename... Ts> inline std::string concat_strings(const Ts &...args) {
                                std::to_string((int) status_PRIMUS_CHECK_HIPBLAS));                 \
         }                                                                                          \
     } while (false)
+
+#define PRIMUS_TURBO_STATIC_CHECK(cond, reason) static_assert(cond, reason)

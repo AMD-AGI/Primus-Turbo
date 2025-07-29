@@ -7,3 +7,5 @@ build
 test-reports/
 *_hip.h
 *.hip
+*_hip.cpp
+*_hip.cuh

@@ -14,6 +14,8 @@
 
 #include "primus_turbo/common.h"
 
+#include "deep_ep/deep_ep.hpp"
+
 namespace primus_turbo::pytorch {
 
 /* Quantize */
