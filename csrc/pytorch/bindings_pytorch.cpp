@@ -49,7 +49,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
         py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
 
-    pybind11::class_<deep_ep::Config>(m, "Config")
+    auto deep_ep_module =
+        m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");
+    pybind11::class_<deep_ep::Config>(deep_ep_module, "Config")
         .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = DEFAULT_NUM_CU,
              py::arg("num_max_nvl_chunked_send_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
@@ -57,11 +59,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
-    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+
+    deep_ep_module.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
+    pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
-    pybind11::class_<deep_ep::Buffer>(m, "Buffer")
+    pybind11::class_<deep_ep::Buffer>(deep_ep_module, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("is_low_latency_optimize", &deep_ep::Buffer::is_low_latency_optimize)
@@ -79,7 +83,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
-        .def("internode_combine", &deep_ep::Buffer::internode_combine);
+        .def("internode_combine", &deep_ep::Buffer::internode_combine)
+        .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
+        .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
+        .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
+        .def("get_next_low_latency_combine_buffer",
+             &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 }
 
 /********************************************/

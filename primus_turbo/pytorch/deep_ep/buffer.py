@@ -4,8 +4,8 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-import primus_turbo.pytorch._C as pt_C
-from primus_turbo.pytorch._C import Buffer, Config, EventHandle
+import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
+from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
 
 from .utils import EventOverlap
 
@@ -56,7 +56,7 @@ class Buffer:
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
-        self.runtime = pt_C.Buffer(
+        self.runtime = deep_ep_cpp.Buffer(
             self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode
         )
 
@@ -158,7 +158,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return pt_C.get_low_latency_rdma_size_hint(
+        return deep_ep_cpp.get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 

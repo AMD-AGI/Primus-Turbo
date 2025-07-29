@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
 
-from primus_turbo.pytorch import deep_ep
+import primus_turbo.pytorch as pt
 
 
 def get_dispatch_layout_ref(
@@ -56,7 +56,7 @@ def tune_and_verify_intranode(
     local_rank: int,
     num_ranks: int,
     rank: int,
-    buffer: deep_ep.Buffer,
+    buffer: pt.deep_ep.Buffer,
     group: dist.ProcessGroup,
     verbose=False,
 ):
@@ -96,7 +96,7 @@ def tune_and_verify_intranode(
 
     # Config
     nvl_buffer_size = 256
-    config = deep_ep.Config(num_sms, 8, nvl_buffer_size)
+    config = pt.deep_ep.Config(num_sms, 8, nvl_buffer_size)
 
     # Test dispatch
     def check_data(check_x, rank_prefix_matrix):

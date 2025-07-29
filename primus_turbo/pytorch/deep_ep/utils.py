@@ -2,7 +2,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from primus_turbo.pytorch._C import EventHandle
+from primus_turbo.pytorch._C.deep_ep import EventHandle
 
 
 class EventOverlap:
