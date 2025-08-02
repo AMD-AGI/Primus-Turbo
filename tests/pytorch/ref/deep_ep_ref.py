@@ -74,9 +74,7 @@ def tune_and_verify_intranode(
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
 
-    invalid_index = -1
-    num_experts_per_rank = num_experts // num_ranks
-    invalid_index = num_experts_per_rank
+    num_experts // num_ranks
 
     num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = buffer.get_dispatch_layout(
         topk_idx, num_experts
@@ -109,8 +107,14 @@ def tune_and_verify_intranode(
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_e4m3):
+            for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x, x_e4m3)):
                 for with_topk in (False, True):
+                    if local_rank == 0:
+                        print(
+                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            flush=True,
+                            end="",
+                        )
                     dispatch_args = {
                         "x": current_x,
                         "num_tokens_per_rank": num_tokens_per_rank,
@@ -119,12 +123,6 @@ def tune_and_verify_intranode(
                         "config": config,
                         "async_finish": async_mode,
                     }
-                    if local_rank == 0 and verbose:
-                        print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
-                            flush=True,
-                            end="",
-                        )
                     if with_topk:
                         dispatch_args.update(
                             {
@@ -161,7 +159,7 @@ def tune_and_verify_intranode(
                     if with_topk:
                         # Check `topk_idx`
                         assert (
-                            recv_topk_idx.eq(invalid_index)
+                            recv_topk_idx.eq(-1)
                             | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))
                         ).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
@@ -169,13 +167,12 @@ def tune_and_verify_intranode(
 
                         # Check `topk_weights`
                         if current_x is not x_pure_rand:
-                            recv_topk_weights[recv_topk_idx.eq(invalid_index)] = recv_topk_weights.amax(
+                            recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(
                                 dim=1, keepdim=True
-                            ).expand_as(recv_topk_weights)[recv_topk_idx.eq(invalid_index)]
+                            ).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
                             check_data(recv_topk_weights, rank_prefix_matrix)
 
                     # Test cached dispatch (must without top-k staffs)
-                    # NOTES: handle must be refreshed
                     if not with_topk:
                         dispatch_args = {
                             "x": current_x,
@@ -201,7 +198,7 @@ def tune_and_verify_intranode(
                     if with_topk:
                         combine_args.update({"topk_weights": recv_topk_weights})
                     if previous_mode:
-                        dispatch_args.update({"previous_event": buffer.capture()})
+                        combine_args.update({"previous_event": buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
                     check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
@@ -222,8 +219,10 @@ def tune_and_verify_intranode(
                     dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
 
-                    if local_rank == 0 and verbose:
+                    if local_rank == 0:
                         print(" passed", flush=True)
+    if local_rank == 0:
+        print("", flush=True)
 
     return (
         x,

@@ -144,8 +144,8 @@ void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mappe
     break
 
     constexpr int kNumThreads = 128;
-    // EP_HOST_ASSERT(num_experts % num_ranks == 0);
-    // EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
+    PRIMUS_TURBO_CHECK(num_experts % num_ranks == 0);
+    PRIMUS_TURBO_CHECK(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
 
     SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
     SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
@@ -360,14 +360,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + send_lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end)
                                         ? idx_value - recv_expert_begin
-                                        : num_experts_per_rank;
+                                        : -1;
                         channel_topk_idx_buffers[dst_slot_idx * num_topk + send_lane_id] =
                             idx_value;
 
                         // Top-k weights
                         auto weight_value =
                             __ldg(topk_weights + token_idx * num_topk + send_lane_id);
-                        weight_value = (idx_value < num_experts_per_rank) ? weight_value : 0.0f;
+                        weight_value = (idx_value >= 0) ? weight_value : 0.0f;
                         channel_topk_weights_buffers[dst_slot_idx * num_topk + send_lane_id] =
                             weight_value;
                     }
@@ -552,7 +552,7 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
     break
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
-    // EP_HOST_ASSERT(num_sms % 2 == 0);
+    PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
@@ -625,10 +625,10 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
                                   head, rank);                                                     \
     break
 
-    const int num_threads = ::max(128, 64 * num_ranks);
-    // EP_HOST_ASSERT(num_ranks <= num_threads);
-    // EP_HOST_ASSERT(num_threads <= 1024);
-    // EP_HOST_ASSERT(1 + num_channels <= num_channels * 2);
+    const int num_threads = std::max(128, 64 * num_ranks);
+    PRIMUS_TURBO_CHECK(num_ranks <= num_threads);
+    PRIMUS_TURBO_CHECK(num_threads <= 1024);
+    PRIMUS_TURBO_CHECK(1 + num_channels <= num_channels * 2);
     SETUP_LAUNCH_CONFIG(1 + num_channels, num_threads, stream);
     SWITCH_RANKS(CACHED_NOTIFY_COMBINE);
 #undef CACHED_NOTIFY_COMBINE
@@ -934,7 +934,8 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              const float *topk_weights, const int *src_idx, const int *rank_prefix_matrix,
              const int *channel_prefix_matrix, int *send_head, int num_tokens, int num_recv_tokens,
              int hidden, int num_topk, void **buffer_ptrs, int rank, int num_ranks,
-             hipStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
+             cudaStream_t stream, int num_sms, int num_max_send_tokens,
+             int num_recv_buffer_tokens) {
     constexpr int kNumThreads = kWarpSize == 64 ? 1024 : 768;
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
@@ -949,8 +950,8 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
     break
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
-    // EP_HOST_ASSERT(num_sms % 2 == 0);
-    // EP_HOST_ASSERT(kNumThreads >= num_ranks * kWarpSize);
+    PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
+    PRIMUS_TURBO_CHECK(kNumThreads >= num_ranks * kWarpSize);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
