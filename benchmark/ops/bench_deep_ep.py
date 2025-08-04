@@ -38,10 +38,13 @@ g_model_cfg = [
         model_name="deepseekv3", hidden_size=7168, num_experts=256, num_topk=8, seqlen=4096, batch_size=1
     ),
     DeepEPModelCfg(
-        model_name="deepseekv2", hidden_size=5120, num_experts=160, num_topk=8, seqlen=4096, batch_size=1
+        model_name="deepseekv2", hidden_size=5120, num_experts=160, num_topk=6, seqlen=4096, batch_size=1
     ),
     DeepEPModelCfg(
-        model_name="qwen3_235b", hidden_size=4096, num_experts=128, num_topk=8, seqlen=4096, batch_size=1
+        model_name="qwen3_235b", hidden_size=4096, num_experts=128, num_topk=6, seqlen=4096, batch_size=1
+    ),
+    DeepEPModelCfg(
+        model_name="poolside-515B", hidden_size=8192, num_experts=112, num_topk=8, seqlen=4096, batch_size=1
     ),
 ]
 
@@ -235,11 +238,11 @@ def record_perf(local_rank: int, num_local_ranks: int):
     # DataFrame to store results
     best_result = []
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    buffer = deep_ep.Buffer(group, int(1e9))
+    buffer = deep_ep.Buffer(group, int(2e9), 0, False, 1, explicitly_destroy=True)
     torch.manual_seed(rank)
 
     for cfg in g_model_cfg:
-        for num_sms in (8, 16, 24, 32, 64):
+        for num_sms in (24, 32, 64, 80):
             dispatch_result, combine_result = bench_intranode(
                 cfg, num_sms, local_rank, num_ranks, rank, buffer, group
             )
@@ -256,6 +259,7 @@ def record_perf(local_rank: int, num_local_ranks: int):
         df_result.to_csv("deep_ep_benchmark_results.csv", index=False)
         print("Results saved to deep_ep_benchmark_result.csv")
 
+    buffer.destroy()
     dist.barrier()
     dist.destroy_process_group(group)
 

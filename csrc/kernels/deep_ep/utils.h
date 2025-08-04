@@ -27,38 +27,11 @@
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                            \
     }
 
-// HELPER FUNCTIONS
-// #####################################################################################
-#define DEVICE_INLINE __device__ inline __attribute__((always_inline))
-
-template <typename T>
-DEVICE_INLINE T shfl_xor(const T val, int laneMask, int width = kWarpSize,
-                         uint64_t shfl_sync_mask = kFullWarpMask) {
-    return __shfl_xor(val, laneMask, width);
-}
-
-DEVICE_INLINE int shfl_sync(const int val, int srcLane = 0, int width = kWarpSize,
-                            uint64_t shfl_sync_mask = kFullWarpMask) { // Let compiler deduce type
-    return __shfl(val, srcLane, width);
-}
-
-DEVICE_INLINE int __any_sync(uint64_t mask, int predicate) {
-    uint64_t predicate_bit_pattern = __ballot(predicate);
-    return (predicate_bit_pattern & mask) > 0;
-}
-
-DEVICE_INLINE int __all_sync(uint64_t mask, int predicate) {
-    uint64_t predicate_bit_pattern = __ballot(predicate);
-    return (~predicate_bit_pattern & mask) == 0;
-}
-
-DEVICE_INLINE void syncwarp() {
+__device__ inline void syncwarp() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
-// ######################################################################################################
-
 namespace primus_turbo {
 
 template <int kBytes> struct VecInt {};
@@ -326,27 +299,58 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
     int  recv_int_values[sizeof(dtype_t) / sizeof(int)];
 #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
-        recv_int_values[i] = shfl_sync(send_int_values[i], src_lane_idx);
+        recv_int_values[i] = __shfl_sync(kFullWarpMask, send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t *>(recv_int_values);
 }
 
-__forceinline__ __device__ int warp_reduce_sum(int value) {
-    if constexpr (kWarpSize == 64)
-        value += shfl_xor<int>(value, 32);
-    value += shfl_xor<int>(value, 16);
-    value += shfl_xor<int>(value, 8);
-    value += shfl_xor<int>(value, 4);
-    value += shfl_xor<int>(value, 2);
-    value += shfl_xor<int>(value, 1);
+// Operation functors
+template <typename T> struct ReduceSum {
+    __device__ T operator()(T a, T b) const { return a + b; }
+};
+template <typename T> struct ReduceMax {
+    __device__ T operator()(T a, T b) const { return a > b ? a : b; }
+};
+template <typename T> struct ReduceMin {
+    __device__ T operator()(T a, T b) const { return a < b ? a : b; }
+};
+
+// Unified reduction function
+template <uint32_t kNumLanes, typename T, typename Op>
+__forceinline__ __device__ T warp_reduce(T value, Op op) {
+    PRIMUS_TURBO_STATIC_CHECK(kNumLanes == 64 or kNumLanes == 32 or kNumLanes == 16 or
+                                  kNumLanes == 8 or kNumLanes == 4 or kNumLanes == 2 or
+                                  kNumLanes == 1,
+                              "Invalid number of lanes");
+
+    if constexpr (kNumLanes >= 64)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 32));
+    if constexpr (kNumLanes >= 32)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 16));
+    if constexpr (kNumLanes >= 16)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 8));
+    if constexpr (kNumLanes >= 8)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 4));
+    if constexpr (kNumLanes >= 4)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 2));
+    if constexpr (kNumLanes >= 2)
+        value = op(value, __shfl_xor_sync(kFullWarpMask, value, 1));
     return value;
 }
 
-__forceinline__ __device__ float quarter_warp_reduce_max(float value) {
-    value = max(value, shfl_xor<float>(value, 8));
-    value = max(value, shfl_xor<float>(value, 4));
-    value = max(value, shfl_xor<float>(value, 2));
-    value = max(value, shfl_xor<float>(value, 1));
-    return value;
+// Convenience aliases
+template <uint32_t kNumLanes = 64, typename T>
+__forceinline__ __device__ T warp_reduce_sum(T value) {
+    return warp_reduce<kNumLanes, T>(value, ReduceSum<T>{});
+}
+
+template <uint32_t kNumLanes = 64, typename T>
+__forceinline__ __device__ T warp_reduce_max(T value) {
+    return warp_reduce<kNumLanes, T>(value, ReduceMax<T>{});
+}
+
+template <uint32_t kNumLanes = 64, typename T>
+__forceinline__ __device__ T warp_reduce_min(T value) {
+    return warp_reduce<kNumLanes, T>(value, ReduceMin<T>{});
 }
 
 __forceinline__ __device__ int get_lane_id() {
@@ -378,6 +382,41 @@ __forceinline__ __device__ void timeout_check(int **task_fifo_ptrs, int head, in
             trap();
         }
     }
+}
+
+template <int kNumRanks, bool kSyncOnly = false>
+__forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int rank) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+
+    // For non-sync-only cases, the memory operations by other threads in the block must be visible
+    // to the `sys` scope
+    if constexpr (not kSyncOnly) {
+        memory_fence();
+        __syncthreads();
+    }
+
+    // Add self-ranks, sub other ranks
+    if (thread_id < kNumRanks) {
+        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
+        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    }
+    PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= blockDim.x);
+
+    // Check timeout
+    auto start_time = clock64();
+    while (true) {
+        auto value =
+            thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        if (__all_sync(kFullWarpMask, value <= 0))
+            break;
+
+        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
+            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank,
+                   thread_id, value);
+            trap();
+        }
+    }
+    __syncthreads();
 }
 
 template <int kNumRanks>

@@ -61,24 +61,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
 
     deep_ep_module.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
+
     pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(deep_ep_module, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
-        .def("is_low_latency_optimize", &deep_ep::Buffer::is_low_latency_optimize)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
         .def("get_local_device_id", &deep_ep::Buffer::get_local_device_id)
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
-        .def("get_local_pxn_ipc_handle", &deep_ep::Buffer::get_local_pxn_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
-        .def("sync_pxn_handles", &deep_ep::Buffer::sync_pxn_handles)
+        .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)

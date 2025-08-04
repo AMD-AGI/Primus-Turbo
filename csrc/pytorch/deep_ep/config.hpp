@@ -49,10 +49,10 @@ struct Config {
         // TODO: add assertions
         constexpr int kNumMaxTopK   = 128;
         constexpr int kNumMaxScales = 128;
-        PRIMUS_TURBO_CHECK(num_ranks < NUM_MAX_XGMI_PEERS or num_ranks % NUM_MAX_XGMI_PEERS == 0);
-        PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_XGMI_PEERS or num_sms % 2 == 0);
-        const auto num_rdma_ranks = std::max(num_ranks / NUM_MAX_XGMI_PEERS, 1);
-        const auto num_nvl_ranks  = std::min(num_ranks, NUM_MAX_XGMI_PEERS);
+        PRIMUS_TURBO_CHECK(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
+        PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS or num_sms % 2 == 0);
+        const auto num_rdma_ranks = std::max(num_ranks / NUM_MAX_NVL_PEERS, 1);
+        const auto num_nvl_ranks  = std::min(num_ranks, NUM_MAX_NVL_PEERS);
         const int  num_channels   = num_sms / 2;
 
         size_t num_bytes = 0;
@@ -71,35 +71,8 @@ struct Config {
     }
 
     size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
-        // Legacy mode
-        if (num_ranks <= NUM_MAX_XGMI_PEERS)
-            return 0;
-
-        // Below are some assumptions
-        // TODO: add assertions
-        constexpr int kNumMaxTopK   = 128;
-        constexpr int kNumMaxScales = 128;
-        PRIMUS_TURBO_CHECK(num_ranks % NUM_MAX_XGMI_PEERS == 0);
-        PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
-        const int num_rdma_ranks = num_ranks / NUM_MAX_XGMI_PEERS;
-        const int num_channels   = num_sms / 2;
-
-        size_t num_bytes = 0;
-        num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_XGMI_PEERS * 2 + 2) * 2 * sizeof(int);
-        num_bytes +=
-            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     primus_turbo::deep_ep::internode::get_source_meta_bytes() * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxTopK * sizeof(int64_t) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxTopK * sizeof(float) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxScales * sizeof(float) * 2;
-        num_bytes +=
-            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2;
-        num_bytes = ((num_bytes + 127) / 128) * 128;
-        return num_bytes;
+        // TODO support internode
+        return 0;
     }
 };
 
@@ -116,9 +89,6 @@ struct LowLatencyBuffer {
 
     void  *combine_rdma_send_buffer_data_start = nullptr;
     size_t num_bytes_per_combine_msg           = 0;
-
-    size_t nvl_recv_data_buffer_offset  = 0;
-    size_t nvl_recv_count_buffer_offset = 0;
 
     std::pair<int *, int> clean_meta() {
         PRIMUS_TURBO_CHECK(dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer);
@@ -146,11 +116,13 @@ struct LowLatencyLayout {
         //  - 2 symmetric odd/even signaling buffers
 
         // Message sizes
+        // NOTES: you should add a control `int4` for combine messages if you want to do data
+        // transformation
         PRIMUS_TURBO_CHECK(num_scales * sizeof(float) <= hidden);
         size_t num_bytes_per_dispatch_msg =
             sizeof(int4) +
             std::max(hidden * sizeof(hip_bfloat16), hidden + num_scales * sizeof(float));
-        size_t num_bytes_per_combine_msg = sizeof(int4) + hidden * sizeof(hip_bfloat16);
+        size_t num_bytes_per_combine_msg = hidden * sizeof(hip_bfloat16);
 
         // Send buffer
         size_t dispatch_send_buffer_bytes =
@@ -177,7 +149,8 @@ struct LowLatencyLayout {
         size_t combine_recv_flag_buffer_bytes   = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes =
             std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
-        total_bytes += signaling_buffer_bytes * 2;
+        size_t signaling_buffer_bytes_aligned = ALIGN<size_t>(signaling_buffer_bytes, 128);
+        total_bytes += signaling_buffer_bytes_aligned * 2;
 
         // Assign pointers
         // NOTES: we still leave some space for distinguishing dispatch/combine buffer,
@@ -185,18 +158,16 @@ struct LowLatencyLayout {
         for (int i = 0; i < 2; ++i) {
             buffers[i] = {
                 static_cast<int>(signaling_buffer_bytes / sizeof(int)),
-                advance(rdma_buffer, send_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int *>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 +
-                                                signaling_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int *>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 +
-                                                signaling_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * i + sizeof(int4)),
-                num_bytes_per_combine_msg,
-                send_buffer_bytes * 2 + recv_buffer_bytes * i,
-                send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i};
+                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
+                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 +
+                                         recv_buffer_bytes * i),
+                advance<int *>(rdma_buffer, signaling_buffer_bytes_aligned * i),
+                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
+                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 +
+                                         recv_buffer_bytes * i),
+                advance<int *>(rdma_buffer, signaling_buffer_bytes_aligned * i),
+                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
+                num_bytes_per_combine_msg};
         }
     }
 };

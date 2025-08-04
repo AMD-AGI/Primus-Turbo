@@ -10,10 +10,10 @@
 
 ###############################################################################
 
-
 from typing import Any, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from primus_turbo.pytorch._C.deep_ep import EventHandle
 
@@ -72,3 +72,13 @@ class EventOverlap:
         """
         if self.event is not None:
             self.event.current_stream_wait()
+
+
+def check_nvlink_connections(group: dist.ProcessGroup):
+    """
+    Check NVLink connection between every pair of GPUs.
+
+    Arguments:
+        group: the communication group.
+    """
+    # TODO
