@@ -1,6 +1,9 @@
 import torch
 
-from primus_turbo.pytorch.kernels.moe.fused_moe_router_impl import fused_moe_router_fwd
+from primus_turbo.pytorch.kernels.moe.fused_moe_router_impl import (
+    fused_moe_router_bkwd,
+    fused_moe_router_fwd,
+)
 
 
 class FusedGroupTopkRoutingWithAuxScoreFunction(torch.autograd.Function):
@@ -27,6 +30,8 @@ class FusedGroupTopkRoutingWithAuxScoreFunction(torch.autograd.Function):
         if groups > 1:
             assert (topk & (topk - 1)) == 0
         assert selected_groups <= groups
+        if scaling_factor is None:
+            scaling_factor = 1.0
 
         output_scores, output_topk_logits, output_topk_indices, raw_topk_logits = fused_moe_router_fwd(
             logits, s, e, groups, topk, selected_groups, score_function, scaling_factor
@@ -42,6 +47,26 @@ class FusedGroupTopkRoutingWithAuxScoreFunction(torch.autograd.Function):
     def backward(ctx, g_score, g_probs, g_idxs):
         logits, out_scores, topk_indices, topk_logits, raw_topk_logits = ctx.saved_tensors
         logits_grad = torch.zeros(ctx.logit_shape, dtype=topk_logits.dtype, device="cuda")
+
+        if g_score is not None and g_probs is not None:
+            g_probs_out, g_score_out = fused_moe_router_bkwd(
+                g_probs,
+                g_score,
+                logits,
+                topk_logits,
+                raw_topk_logits,
+                out_scores,
+                ctx.score_function,
+                ctx.scaling_factor,
+            )
+
+            logits_grad.scatter_(1, topk_indices, g_probs_out)
+            if ctx.score_function == "softmax":
+                sum_t = torch.sum(logits_grad * out_scores, dim=-1).unsqueeze(-1)
+                logits_grad = out_scores * (logits_grad - sum_t)
+
+            logits_grad = logits_grad + g_score_out
+            return logits_grad, None, None, None, None, None
 
         if g_probs is not None:
             if ctx.score_function == "softmax":
