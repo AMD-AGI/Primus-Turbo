@@ -29,9 +29,11 @@ def fused_moe_router_bkwd(
     g_probs: torch.Tensor,
     g_scores: torch.Tensor,
     logits: torch.Tensor,
-    topk_logits: torch.Tensor,
+    output_probs: torch.Tensor,
+    topk_indices: torch.Tensor,
     raw_topk_logits: torch.Tensor,
     out_scores: torch.Tensor,
+    routing_map: torch.Tensor,
     score_function: str,
     scaling_factor: float,
 ):
@@ -39,9 +41,11 @@ def fused_moe_router_bkwd(
         g_probs,
         g_scores,
         logits,
-        topk_logits,
+        output_probs,
+        topk_indices,
         raw_topk_logits,
         out_scores,
+        routing_map,
         score_function,
         scaling_factor,
     )
@@ -57,7 +61,7 @@ def fused_moe_router_fwd_triton(
     selected_groups: int,
     score_function: str,
     scaling_factor: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     # todo add warmup
     num_stages = 2
@@ -66,17 +70,22 @@ def fused_moe_router_fwd_triton(
     BLOCK_SIZE = e
     K_ALIGNED = triton.next_power_of_2(topk)
 
-    output_topk_logits = torch.empty((s, topk), device="cuda", dtype=logits.dtype)
-    raw_topk_logits = torch.empty_like(output_topk_logits)
+    # output_topk_logits = torch.empty((s, topk), device="cuda", dtype=logits.dtype)
+    raw_topk_logits = torch.empty((s, topk), device="cuda", dtype=logits.dtype)
     output_topk_indices = torch.ones((s, topk), device="cuda", dtype=torch.int64)
     output_scores = torch.empty((s, e), device="cuda", dtype=logits.dtype)
+
+    output_probs = torch.zeros((s, e), device="cuda", dtype=logits.dtype)
+    output_routing_map = torch.zeros((s, e), device="cuda", dtype=torch.int32)
 
     wrap_triton(fused_scaling_group_sum_routing_kernel)[(num_programs,)](
         logits,
         output_scores,
-        output_topk_logits,
+        # output_topk_logits,
         output_topk_indices,
         raw_topk_logits,
+        output_probs,
+        output_routing_map,
         s,
         e,
         groups,
@@ -89,7 +98,7 @@ def fused_moe_router_fwd_triton(
         scaling_factor,
     )
 
-    return output_scores, output_topk_logits, output_topk_indices, raw_topk_logits
+    return output_scores, output_topk_indices, raw_topk_logits, output_probs, output_routing_map
 
 
 @triton_op("primus_turbo::fused_moe_router_bkwd_triton", mutates_args={})
@@ -97,14 +106,16 @@ def fused_moe_router_bkwd_triton(
     g_probs: torch.Tensor,
     g_scores: torch.Tensor,
     logits: torch.Tensor,
-    topk_logits: torch.Tensor,
+    output_probs: torch.Tensor,
+    topk_indices: torch.Tensor,
     raw_topk_logits: torch.Tensor,
     out_scores: torch.Tensor,
+    routing_map: torch.Tensor,
     score_function: str,
     scaling_factor: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     s, e = out_scores.shape
-    k = g_probs.shape[1]
+    k = topk_indices.shape[1]
 
     num_stages = 2
     num_programs = s
@@ -122,9 +133,11 @@ def fused_moe_router_bkwd_triton(
         g_probs,
         g_scores,
         logits,
-        topk_logits,
+        output_probs,
+        topk_indices,
         raw_topk_logits,
         out_scores,
+        routing_map,
         output_g_probs,
         output_g_scores,
         s,
@@ -137,4 +150,6 @@ def fused_moe_router_bkwd_triton(
         scaling_factor,
     )
 
-    return output_g_probs, output_g_scores
+    output_g_logits = output_g_probs + output_g_scores
+
+    return output_g_logits

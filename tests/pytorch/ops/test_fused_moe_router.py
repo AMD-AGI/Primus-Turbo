@@ -30,26 +30,26 @@ def test_moe_router(batch, config, score_function, scaling_factor):
     )
     logits_2 = logits_1.clone().detach().requires_grad_(True)
 
-    output_scores, output_topk_logits, output_topk_indices = pt.ops.fused_group_topk_routing_with_aux_score(
+    output_scores, output_probs, output_routing_map = pt.ops.fused_group_topk_routing_with_aux_score(
         logits_1, config.topk, config.groups, config.selected_groups, score_function, scaling_factor
     )
 
-    ref_scores, ref_topk_logits, refs_topk_indices = group_topk_routing_with_aux_score_ref(
+    ref_scores, ref_probs, refs_routing_map = group_topk_routing_with_aux_score_ref(
         logits_2, config.topk, config.groups, config.selected_groups, score_function, scaling_factor
     )
     # forward
     torch.testing.assert_close(output_scores, ref_scores)
-    assert torch.equal(output_topk_indices, refs_topk_indices)
-    torch.testing.assert_close(output_topk_logits, ref_topk_logits)
+    assert torch.equal(output_routing_map, refs_routing_map)
+    torch.testing.assert_close(output_probs, ref_probs)
 
     # backward
     g_score = torch.randn(batch * config.seqlen, config.experts, dtype=torch.float, device="cuda")
-    g_probs = torch.randn(batch * config.seqlen, config.topk, dtype=torch.float, device="cuda")
+    g_probs = torch.randn(batch * config.seqlen, config.experts, dtype=torch.float, device="cuda")
 
     output_scores.backward(g_score, retain_graph=True)
-    output_topk_logits.backward(g_probs)
+    output_probs.backward(g_probs)
 
     ref_scores.backward(g_score, retain_graph=True)
-    ref_topk_logits.backward(g_probs)
+    ref_probs.backward(g_probs)
 
     torch.testing.assert_close(logits_1.grad, logits_2.grad)

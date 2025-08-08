@@ -8,9 +8,10 @@ from primus_turbo.triton.utils.argsort import argsort
 def fused_scaling_group_sum_routing_kernel(
     input_logit_ptr,  # [s, e]
     output_scores_ptr,  # [s, e]
-    output_topk_probs_ptr,  # [s, k]
     output_topk_idx_ptr,  # [s, k]
     output_raw_topk_logits_ptr,  # [s, k]
+    output_probs_ptr,  # [s, e]
+    output_routing_map_ptr,  # [s, e]
     s: tl.constexpr,  # seq len
     e: tl.constexpr,  # how many experts
     g: tl.constexpr,  # how many groups
@@ -31,6 +32,7 @@ def fused_scaling_group_sum_routing_kernel(
     k_mask = col_offsets < k
     sort_mask = col_offsets < selected_groups * (e // g)
 
+    ones = tl.full((e,), 1, tl.int32)
     for row_idx in tl.range(row_start, s, row_step, num_stages=num_stages):
         # load row
         input_logit_row_ptr = input_logit_ptr + row_idx * e + col_offsets
@@ -89,23 +91,28 @@ def fused_scaling_group_sum_routing_kernel(
         sorted_topk_logits = scaling_factor * sorted_topk_logits
 
         # save results
-        row_output_sorted_groups_logits = output_topk_probs_ptr + row_idx * k + col_offsets
         row_output_sorted_inner_groups_idx = output_topk_idx_ptr + row_idx * k + col_offsets
-        row_output_raw_topk_logits = output_raw_topk_logits_ptr + row_idx * k + col_offsets
-        tl.store(row_output_sorted_groups_logits, sorted_topk_logits, mask=k_mask)
         tl.store(row_output_sorted_inner_groups_idx, sorted_topk_idxs, mask=k_mask)
+
+        # scatter to the routing map
+        row_scattered_probs = output_probs_ptr + row_idx * e + sorted_topk_idxs
+        row_scattered_routing_map = output_routing_map_ptr + row_idx * e + sorted_topk_idxs
+        tl.store(row_scattered_probs, sorted_topk_logits, mask=k_mask)
+        tl.store(row_scattered_routing_map, ones, mask=k_mask)
 
 
 @triton.jit
 def fused_scaling_group_sum_routing_backward_kernel(
-    input_g_probs,
-    input_g_score,
+    input_g_probs,  # [s, e]
+    input_g_score,  # [s, e]
     input_logits,  # [s, e]
-    input_topk_logits,  # [s, k]
-    input_raw_topk_logits,
-    input_out_scores,
-    output_g_probs,
-    output_g_scores,
+    input_probs,  # [s, e]
+    input_topk_indices,  # [s, k]
+    input_raw_topk_logits,  # [s, k]
+    input_out_scores,  # [s, e]
+    input_routing_map,  # [s, e]
+    output_g_probs,  # [s, e]
+    output_g_scores,  # [s, e]
     s: tl.constexpr,  # seq len
     e: tl.constexpr,  # how many experts
     k: tl.constexpr,  # topk
@@ -125,46 +132,70 @@ def fused_scaling_group_sum_routing_backward_kernel(
     k_mask = k_offsets < k
 
     for row_idx in tl.range(row_start, s, row_step, num_stages=num_stages):
-        input_g_probs_ptr = input_g_probs + row_idx * k + k_offsets
-        input_g_probs_row = tl.load(input_g_probs_ptr, mask=k_mask, other=float(0.0))
+        # topk indices
+        input_topk_indices_ptr = input_topk_indices + row_idx * k + k_offsets
+        input_topk_indices_offset = tl.load(input_topk_indices_ptr, mask=k_mask, other=0)
 
-        # handle g_probs
-        input_g_probs_row = scaling_factor * input_g_probs_row
+        ## handle g_probs
+        input_g_probs_ptr = input_g_probs + row_idx * e + input_topk_indices_offset
+        input_topk_g_probs_row = tl.load(input_g_probs_ptr, mask=k_mask, other=float(0.0))
+        input_topk_g_probs_row = scaling_factor * input_topk_g_probs_row
+
+        input_topk_probs_ptr = input_probs + row_idx * e + input_topk_indices_offset
+        input_topk_probs_row = tl.load(input_topk_probs_ptr, mask=k_mask, other=-float(0.0))
+
+        # out scores
+        input_out_score_ptr = input_out_scores + row_idx * e + col_offsets
+        input_out_score_row = tl.load(input_out_score_ptr, mask=col_mask, other=float(0.0))
+
         if score_function == 0:  # sigmoid
-            input_topk_logits_ptr = input_topk_logits + row_idx * k + k_offsets
-            input_topk_logits_row = tl.load(input_topk_logits_ptr, mask=k_mask, other=-float(0.0))
-
+            # topk raw logits
             input_raw_topk_logits_ptr = input_raw_topk_logits + row_idx * k + k_offsets
             input_raw_topk_logits_row = tl.load(input_raw_topk_logits_ptr, mask=k_mask, other=float(1.0))
 
-            unscaled_topk_logits_row = input_topk_logits_row / scaling_factor
+            unscaled_topk_logits_row = input_topk_probs_row / scaling_factor
 
             sum_t = (
                 (-1)
-                * input_g_probs_row
+                * input_topk_g_probs_row
                 * unscaled_topk_logits_row
                 * unscaled_topk_logits_row
                 / input_raw_topk_logits_row
             )
             sum_t = tl.sum(sum_t).broadcast_to(K_ALIGNED)
 
-            g_probs_row = input_g_probs_row * unscaled_topk_logits_row / input_raw_topk_logits_row + sum_t
+            g_probs_row = (
+                input_topk_g_probs_row * unscaled_topk_logits_row / input_raw_topk_logits_row + sum_t
+            )
             g_probs_row = g_probs_row * input_raw_topk_logits_row * (1 - input_raw_topk_logits_row)
+
+            output_g_probs_ptr = output_g_probs + row_idx * e + input_topk_indices_offset
+            tl.store(output_g_probs_ptr, g_probs_row, mask=k_mask)
         else:
-            g_probs_row = input_g_probs_row
+            input_topk_score_ptr = input_out_scores + row_idx * e + input_topk_indices_offset
+            input_topk_score_raw = tl.load(input_topk_score_ptr, mask=k_mask, other=float(0.0))
+            sum_t = tl.sum(input_topk_g_probs_row * input_topk_score_raw).broadcast_to(e)
 
-        output_g_probs_ptr = output_g_probs + row_idx * k + k_offsets
-        tl.store(output_g_probs_ptr, g_probs_row, mask=k_mask)
+            input_routing_map_ptr = input_routing_map + row_idx * e + col_offsets
+            input_routing_map_row = tl.load(input_routing_map_ptr, mask=col_mask, other=0).to(
+                input_topk_g_probs_row.dtype
+            )
 
-        # handle g_score
+            input_g_probs_ptr = input_g_probs + row_idx * e + col_offsets
+            input_g_probs_row = tl.load(input_g_probs_ptr, mask=col_mask, other=float(0.0))
+            input_g_probs_row = scaling_factor * input_g_probs_row * input_routing_map_row
+
+            g_probs_row = input_out_score_row * (input_g_probs_row - sum_t)
+
+            output_g_probs_ptr = output_g_probs + row_idx * e + col_offsets
+            tl.store(output_g_probs_ptr, g_probs_row, mask=col_mask)
+
+        ## handle g_score
         input_g_score_ptr = input_g_score + row_idx * e + col_offsets
         input_g_score_row = tl.load(input_g_score_ptr, mask=col_mask, other=float(0.0))
 
         input_logits_ptr = input_logits + row_idx * e + col_offsets
         input_logits_row = tl.load(input_logits_ptr, mask=col_mask, other=float(0.0))
-
-        input_out_score_ptr = input_out_scores + row_idx * e + col_offsets
-        input_out_score_row = tl.load(input_out_score_ptr, mask=col_mask, other=float(0.0))
 
         if score_function == 0:  # sigmoid
             sigmoid_logit_row = tl.sigmoid(input_logits_row.to(tl.float32))

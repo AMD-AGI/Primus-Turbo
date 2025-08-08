@@ -33,72 +33,69 @@ class FusedGroupTopkRoutingWithAuxScoreFunction(torch.autograd.Function):
         if scaling_factor is None:
             scaling_factor = 1.0
 
-        output_scores, output_topk_logits, output_topk_indices, raw_topk_logits = fused_moe_router_fwd(
-            logits, s, e, groups, topk, selected_groups, score_function, scaling_factor
+        output_scores, output_topk_indices, raw_topk_logits, output_probs, output_routing_map = (
+            fused_moe_router_fwd(logits, s, e, groups, topk, selected_groups, score_function, scaling_factor)
         )
 
-        ctx.save_for_backward(logits, output_scores, output_topk_indices, output_topk_logits, raw_topk_logits)
+        ctx.save_for_backward(
+            logits, output_scores, output_topk_indices, output_probs, raw_topk_logits, output_routing_map
+        )
         ctx.logit_shape = logits.shape
         ctx.scaling_factor = scaling_factor
         ctx.score_function = score_function
-        return output_scores, output_topk_logits, output_topk_indices
+        return output_scores, output_probs, output_routing_map.bool()
 
     @staticmethod
-    def backward(ctx, g_score, g_probs, g_idxs):
-        logits, out_scores, topk_indices, topk_logits, raw_topk_logits = ctx.saved_tensors
-        logits_grad = torch.zeros(ctx.logit_shape, dtype=topk_logits.dtype, device="cuda")
-
+    def backward(ctx, g_score, g_probs, g_routing_map):
+        logits, output_scores, output_topk_indices, output_probs, raw_topk_logits, output_routing_map = (
+            ctx.saved_tensors
+        )
         if g_score is not None and g_probs is not None:
-            g_probs_out, g_score_out = fused_moe_router_bkwd(
+            logits_grad = fused_moe_router_bkwd(
                 g_probs,
                 g_score,
                 logits,
-                topk_logits,
+                output_probs,
+                output_topk_indices,
                 raw_topk_logits,
-                out_scores,
+                output_scores,
+                output_routing_map,
                 ctx.score_function,
                 ctx.scaling_factor,
             )
-
-            logits_grad.scatter_(1, topk_indices, g_probs_out)
-            if ctx.score_function == "softmax":
-                sum_t = torch.sum(logits_grad * out_scores, dim=-1).unsqueeze(-1)
-                logits_grad = out_scores * (logits_grad - sum_t)
-
-            logits_grad = logits_grad + g_score_out
             return logits_grad, None, None, None, None, None
 
+        g_probs = output_routing_map.to(torch.bfloat16) * g_probs
+        logits_grad = torch.zeros(ctx.logit_shape, dtype=logits.dtype, device="cuda")
         if g_probs is not None:
+            raw_topk_logits_t = torch.ones_like(g_probs)
+            raw_topk_logits_t.scatter_(1, output_topk_indices, raw_topk_logits)
             if ctx.score_function == "softmax":
                 g_probs = ctx.scaling_factor * g_probs
-                logits_grad.scatter_(1, topk_indices, g_probs)
-                sum_t = torch.sum(logits_grad * out_scores, dim=-1).unsqueeze(-1)
-                logits_grad = out_scores * (logits_grad - sum_t)
+                sum_t = torch.sum(g_probs * output_scores, dim=-1).unsqueeze(-1)
+                logits_grad = output_scores * (g_probs - sum_t)
             else:
                 # score / sum(score) grad
                 g_probs = ctx.scaling_factor * g_probs
-                unscaled_topk_logits = topk_logits / ctx.scaling_factor
-                sum_t = (-1) * (g_probs * unscaled_topk_logits * unscaled_topk_logits / raw_topk_logits)
+                unscaled_topk_logits = output_probs / ctx.scaling_factor
+                sum_t = (-1) * (g_probs * unscaled_topk_logits * unscaled_topk_logits / raw_topk_logits_t)
                 sum_t = torch.sum(sum_t, dim=-1).unsqueeze(-1)
-                g_logits = g_probs * unscaled_topk_logits / raw_topk_logits + sum_t
+                g_logits = g_probs * unscaled_topk_logits / raw_topk_logits_t + sum_t
 
-                # sigmoid grad
-                g_logits = g_logits * raw_topk_logits * (1 - raw_topk_logits)
-
-                # scatter_by_idx
-                logits_grad.scatter_(1, topk_indices, g_logits)
+                # sigmoid
+                logits_grad = g_logits * raw_topk_logits_t * (1 - raw_topk_logits_t)
 
         if g_score is not None:
             # cal grads of g_score
             if ctx.score_function == "softmax":
-                sum_t = torch.sum(g_score * out_scores, dim=-1).unsqueeze(-1)
-                grad_x = out_scores * (g_score - sum_t)
+                sum_t = torch.sum(g_score * output_scores, dim=-1).unsqueeze(-1)
+                grad_x = output_scores * (g_score - sum_t)
             else:
                 # score / sum(score) grad (todo-maybe: save the sigmoid logits)
                 sigmoid_logits = torch.sigmoid(logits)
-                sum_t = (-1) * (g_score * out_scores * out_scores / sigmoid_logits)
+                sum_t = (-1) * (g_score * output_scores * output_scores / sigmoid_logits)
                 sum_t = torch.sum(sum_t, dim=-1).unsqueeze(-1)
-                g_score = g_score * out_scores / sigmoid_logits + sum_t
+                g_score = g_score * output_scores / sigmoid_logits + sum_t
                 # sigmoid grad
                 grad_x = g_score * sigmoid_logits * (1 - sigmoid_logits)
 
