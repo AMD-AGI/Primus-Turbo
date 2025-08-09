@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
+#include "primus_turbo/common.h"
+
 namespace primus_turbo {
 
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);

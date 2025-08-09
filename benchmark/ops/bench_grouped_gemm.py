@@ -2,20 +2,28 @@ import torch
 import torch.utils.benchmark as benchmark
 
 from primus_turbo.pytorch.ops import grouped_gemm
-from tests.pytorch.ref.gemm_ref import generate_uniform_seq_len, grouped_gemm_ref
-from tests.test_utils import compute_snr
+from tests.pytorch.ref.gemm_ref import (
+    generate_grouped_gemm_group_lens,
+    grouped_gemm_ref,
+)
+from tests.test_utils import get_tolerances
+
+M_SIZE_LIST = [512, 1024, 2048, 4096, 8192]
+EP_SIZE_LIST = [8, 16, 32]
 
 
 def generate_deepseekv3_test_cases():
     test_cases = []
-    EP = [8, 16, 32]
     n_routed_experts = 256
     moe_intermediate_size = 2048
     hidden_size = 7168
-    for ep in EP:
+    for ep in EP_SIZE_LIST:
         B = n_routed_experts // ep
-        for M in [512, 2048, 4096]:
-            for N, K in [(2 * moe_intermediate_size, hidden_size), (hidden_size, moe_intermediate_size)]:
+        for M in M_SIZE_LIST:
+            for N, K in [
+                (2 * moe_intermediate_size, hidden_size),
+                (hidden_size, moe_intermediate_size),
+            ]:
                 for dtype in [torch.bfloat16]:
                     test_cases.append(
                         {
@@ -31,15 +39,16 @@ def generate_deepseekv3_test_cases():
 
 def generate_deepseekv2_test_cases():
     test_cases = []
-    EP = [8, 16, 32]
     n_routed_experts = 160
     moe_intermediate_size = 1536
     hidden_size = 5120
-    for ep in EP:
+    for ep in EP_SIZE_LIST:
         B = n_routed_experts // ep
-
-        for M in [512, 2048, 4096]:
-            for N, K in [(2 * moe_intermediate_size, hidden_size), (hidden_size, moe_intermediate_size)]:
+        for M in M_SIZE_LIST:
+            for N, K in [
+                (2 * moe_intermediate_size, hidden_size),
+                (hidden_size, moe_intermediate_size),
+            ]:
                 for dtype in [torch.bfloat16]:
                     test_cases.append(
                         {
@@ -53,114 +62,85 @@ def generate_deepseekv2_test_cases():
     return test_cases
 
 
-def generate_poolside_test_cases():
-    test_cases = []
-    EP = [8, 16, 32]
-    n_routed_experts = 128
-    moe_intermediate_size = 2048
-    hidden_size = 8192
-    for ep in EP:
-        B = n_routed_experts // ep
-
-        for M in [512, 2048, 4096]:
-            for N, K in [(2 * moe_intermediate_size, hidden_size), (hidden_size, moe_intermediate_size)]:
-                for dtype in [torch.bfloat16]:
-                    test_cases.append(
-                        {
-                            "B": B,
-                            "M": M,
-                            "N": N,
-                            "K": K,
-                            "dtype": dtype,
-                        }
-                    )
-    return test_cases
-
-
-def bench_grouped_gemm(B, M, N, K, dtype, test_backward):
+def bench_grouped_gemm(B, M, N, K, dtype):
     device = "cuda"
-
     # Prepare inputs
     x = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
     w = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
-    seg_lens = generate_uniform_seq_len(B, B * M).to(device)  # int64
-    print("seg_lens: ", seg_lens)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)  # int64
+    print("group_lens: ", group_lens)
     x_ref = x.clone().detach().requires_grad_()
     w_ref = w.clone().detach().requires_grad_()
 
     # Reference forward pass
-
-    out_ref = grouped_gemm_ref(x_ref, w_ref, seg_lens, True)
-
+    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens, True)
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out, retain_graph=True)
+
     # Forward pass for implementation
-    fn_forward = lambda: grouped_gemm(x, w, seg_lens)
-    out = fn_forward()
+    fwd_func = lambda: grouped_gemm(x, w, group_lens, trans_b=True)
+    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
+    out = fwd_func()
+    bwd_func()
 
-    out.backward(grad_out, retain_graph=True)
-
-    # Compute SNRs
-    out_snr = compute_snr(out_ref, out)
-    assert out_snr > 20, "out_snr too low"
-
-    x_grad_snr = compute_snr(x_ref.grad, x.grad)
-    w_grad_snr = compute_snr(w_ref.grad, w.grad)
-    assert x_grad_snr > 15, "x_grad_snr too low"
-    assert w_grad_snr > 15, "w_grad_snr too low"
+    # Check
+    torch.testing.assert_close(out_ref, out, **get_tolerances(dtype))
+    torch.testing.assert_close(x_ref.grad, x.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(w_ref.grad, w.grad, **get_tolerances(dtype))
 
     # Calculate FLOPs
-    total_flops = 2 * B * M * N * K
-
-    if test_backward:
-        # Re-run forward pass to get fresh output
-        o = fn_forward()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        total_flops *= 2  # Approximate factor for backward pass
-    else:
-        fn = fn_forward
+    fwd_total_flops = 2 * B * M * N * K
+    bwd_total_flops = 2 * fwd_total_flops
 
     # Warmup
     warmup = 20
     for _ in range(warmup):
-        _ = fn_forward()
+        fwd_func()
+        bwd_func()
     torch.cuda.synchronize()
 
     # Benchmark
-    timer = benchmark.Timer(
+    fwd_timer = benchmark.Timer(
         stmt="fn()",
-        globals={"fn": fn},
+        globals={"fn": fwd_func},
     )
-    measurement = timer.timeit(100)
-    mean_time_ms = measurement.mean * 1e3
-    flops_per_sec = total_flops / (mean_time_ms * 1e-3) / 1e12  # TFLOPs/s
+    bwd_timer = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": bwd_func},
+    )
+    fwd_measurement = fwd_timer.timeit(100)
+    bwd_measurement = bwd_timer.timeit(100)
 
-    print(f"Mean time: {mean_time_ms:.3f} ms | TFLOPS: {flops_per_sec:.2f}")
-    return mean_time_ms, flops_per_sec, total_flops
+    fwd_mean_time_ms = fwd_measurement.mean * 1e3
+    bwd_mean_time_ms = bwd_measurement.mean * 1e3
+    fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
+    bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
+    print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+    print(f"Backward Mean time: {bwd_mean_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
+    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops
 
 
 if __name__ == "__main__":
     dpv2_test_cases = generate_deepseekv2_test_cases()
     dpv3_test_cases = generate_deepseekv3_test_cases()
-    ps_test_cases = generate_poolside_test_cases()
-    test_configs = dpv3_test_cases + dpv3_test_cases + ps_test_cases
-    # print(test_configs)
+    test_configs = dpv3_test_cases + dpv3_test_cases
+
     import pandas as pd
     from tabulate import tabulate
 
     # DataFrame to store results
     results = pd.DataFrame(
         columns=[
-            "Test id",
+            "TestID",
             "B",
             "M",
             "N",
             "K",
             "dtype",
-            "Test Backward",
-            "Time (ms)",
-            "TFLOPS",
+            "Forward Time (ms)",
+            "Forward TFLOPS",
+            "Backward Time (ms)",
+            "Backward TFLOPS",
         ]
     )
     test_id = 0
@@ -173,47 +153,47 @@ if __name__ == "__main__":
         print(f"\n{'='*50}")
         print(f"Testing config: {config}")
         print(f"{'='*50}")
-        for test_backward in [False, True]:
-            test_id += 1
-            try:
-                # Run benchmark
-                time_ms, tflops, _ = bench_grouped_gemm(
-                    B=B,
-                    M=M,
-                    N=N,
-                    K=K,
-                    dtype=dtype,
-                    test_backward=test_backward,
-                )
+        test_id += 1
+        try:
+            # Run benchmark
+            fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = bench_grouped_gemm(
+                B=B,
+                M=M,
+                N=N,
+                K=K,
+                dtype=dtype,
+            )
 
-                # Add to results table
-                new_row = {
-                    "Test id": test_id,
-                    "B": B,
-                    "M": M,
-                    "N": N,
-                    "K": K,
-                    "dtype": dtype,
-                    "Test Backward": test_backward,
-                    "Time (ms)": f"{time_ms:.2f}",
-                    "TFLOPS": f"{tflops:.2f}",
-                }
-                results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
+            # Add to results table
+            new_row = {
+                "TestID": test_id,
+                "B": B,
+                "M": M,
+                "N": N,
+                "K": K,
+                "dtype": dtype,
+                "Forward Time (ms)": f"{fwd_time_ms:.2f}",
+                "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                "Backward Time (ms)": f"{bwd_time_ms:.2f}",
+                "Backward TFLOPS": f"{bwd_tflops:.2f}",
+            }
+            results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 
-            except Exception as e:
-                print(f"Failed to run {config}: {str(e)}")
-                new_row = {
-                    "Test id": test_id,
-                    "B": B,
-                    "M": M,
-                    "N": N,
-                    "K": K,
-                    "dtype": dtype,
-                    "Test Backward": test_backward,
-                    "Time (ms)": "Failed",
-                    "TFLOPS": "N/A",
-                }
-                results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
+        except Exception as e:
+            print(f"Failed to run {config}: {str(e)}")
+            new_row = {
+                "TestID": test_id,
+                "B": B,
+                "M": M,
+                "N": N,
+                "K": K,
+                "dtype": dtype,
+                "Forward Time (ms)": "Failed",
+                "Forward TFLOPS": "N/A",
+                "Backward Time (ms)": "Failed",
+                "Backward TFLOPS": "N/A",
+            }
+            results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 
     # Print results
     print("\nFinal Results:")

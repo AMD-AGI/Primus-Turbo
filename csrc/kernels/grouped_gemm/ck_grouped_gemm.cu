@@ -33,17 +33,14 @@ compute_grouped_gemm_args(ck_tile::GemmTransKernelArg *args_ptr, const ADataType
     args_ptr[group_id].group_karg.k_batch  = k_batch;
 }
 
-// TODO: Refactor
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
 void ck_grouped_gemm(void *args_ptr, const ADataType *a_ptr, const BDataType *b_ptr,
                      CDataType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
                      const bool transA, const bool transB, const ck_tile::index_t group_num,
                      const ck_tile::index_t m, const ck_tile::index_t n, const ck_tile::index_t k,
                      hipStream_t stream) {
-    // TODO: k_batch control splitk
     const ck_tile::index_t k_batch = 1;
     const bool             splitk  = k_batch > 1;
-    // TODO: check splitk must be false!
 
     const ck_tile::index_t strideA = transA ? m : k;
     const ck_tile::index_t strideB = transB ? k : n;
@@ -51,7 +48,7 @@ void ck_grouped_gemm(void *args_ptr, const ADataType *a_ptr, const BDataType *b_
 
     // Setting args
     {
-        const int threads = std::min(1024, group_num);
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, group_num);
         const int blocks  = (group_num + threads - 1) / threads;
         compute_grouped_gemm_args<ADataType, BDataType, CDataType><<<blocks, threads, 0, stream>>>(
             reinterpret_cast<ck_tile::GemmTransKernelArg *>(args_ptr), a_ptr, b_ptr, c_ptr,
@@ -72,7 +69,7 @@ void ck_grouped_gemm(void *args_ptr, const ADataType *a_ptr, const BDataType *b_
         runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                               BLayout, CLayout>(group_num, m, n, k);
     } else {
-        // TODO: more layout
+        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm only support NN and NT");
     }
     runner->run(stream_cfg, group_num, args_ptr);
 }
@@ -103,6 +100,29 @@ __global__ void compute_grouped_gemm_variable_k_args(
     args_ptr[group_id].group_karg.k_batch  = k_batch;
 }
 
+/**
+ * PostProcess: Set the non-computed parts in C to zero.
+ */
+template <typename T>
+__global__ void
+grouped_gemm_variable_k_postprocess(T *c_ptr, const int64_t *group_lens_ptr,
+                                    const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
+                                    const ck_tile::index_t m, const ck_tile::index_t n) {
+
+    const int group_id  = blockIdx.y;
+    const int group_len = group_lens_ptr[group_id];
+    const int group_off = group_offs_ptr[group_id];
+    if (group_len > 0)
+        return;
+
+    c_ptr               = c_ptr + group_id * m * n;
+    const int BLOCKSIZE = blockDim.x;
+    const int tid       = blockIdx.x * BLOCKSIZE + threadIdx.x;
+    if (tid < m * n) {
+        c_ptr[tid] = T(0.0f);
+    }
+}
+
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
 void ck_grouped_gemm_variable_k(void *args_ptr, const ADataType *a_ptr, const BDataType *b_ptr,
                                 CDataType *c_ptr, const int64_t *group_lens_ptr,
@@ -119,7 +139,7 @@ void ck_grouped_gemm_variable_k(void *args_ptr, const ADataType *a_ptr, const BD
 
     // Setting args
     {
-        const int threads = std::min(1024, group_num);
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, group_num);
         const int blocks  = (group_num + threads - 1) / threads;
         compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
             <<<blocks, threads, 0, stream>>>(
@@ -137,11 +157,17 @@ void ck_grouped_gemm_variable_k(void *args_ptr, const ADataType *a_ptr, const BD
         runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                               BLayout, CLayout>(group_num, m, n, k);
     } else {
-        // TOOD:
+        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
     }
     runner->run(stream_cfg, group_num, args_ptr);
 
-    // TODO: process zero case
+    // Postprocess
+    {
+        const int  threads = MAX_THREADS_PER_BLOCK;
+        const dim3 grids(DIVUP(m * n, MAX_THREADS_PER_BLOCK), group_num, 1);
+        grouped_gemm_variable_k_postprocess<CDataType>
+            <<<grids, threads, 0, stream>>>(c_ptr, group_lens_ptr, group_offs_ptr, group_num, m, n);
+    }
 }
 
 template void ck_grouped_gemm<ck_tile::half_t, ck_tile::half_t, ck_tile::half_t>(

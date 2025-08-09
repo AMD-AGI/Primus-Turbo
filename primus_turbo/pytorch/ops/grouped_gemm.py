@@ -69,7 +69,29 @@ def grouped_gemm(
     group_offs: torch.Tensor | None = None,
     trans_b: bool = False,
 ) -> torch.Tensor:
-    """ """
+    """
+    Grouped GEMM.
+
+    Args:
+        a (torch.Tensor): Shape [sum(group_lens), K], DType float16/bfloat16.
+        b (torch.Tensor): Shape [G, K, N] (or [G, N, K] if trans_b=True), DType float16/bfloat16.
+        group_lens (torch.Tensor): Rows per expert of shape [G], int64. sum(group_lens) == a.size(0).
+        group_offs (torch.Tensor | None): Exclusive prefix-sum of group_lens, shape [G+1].
+                                          If None, it will be computed internally.
+        trans_b (bool): If True, treat each b[g] as transposed.
+
+    Returns:
+        torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
+
+    Example:
+        >>> G, K, N = 3, 128, 64
+        >>> group_lens = torch.tensor([32, 16, 48], dtype=torch.long, device="cuda")
+        >>> a = torch.randn(group_lens.sum().item(), K, device="cuda", dtype=torch.bfloat16)
+        >>> b = torch.randn(G, K, N, device="cuda", dtype=torch.bfloat16)  # or [G, N, K] with trans_b=True
+        >>> out = grouped_gemm(a, b, group_lens)  # [96, 64]
+        >>> out.shape
+        torch.Size([96, 64])
+    """
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)
 
