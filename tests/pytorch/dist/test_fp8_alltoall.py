@@ -12,7 +12,12 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
-from primus_turbo.pytorch.core.float8 import Format
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    float8_e4m3,
+    float8_e5m2,
+)
 from primus_turbo.pytorch.dist import FP8AllToAll
 from tests.test_utils import get_tolerances
 
@@ -72,13 +77,29 @@ def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
     return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
 
 
-def fp8_all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None, **kwargs):
+def fp8_all_to_all(
+    group,
+    input_,
+    output_split_sizes_=None,
+    input_split_sizes=None,
+    fwd_quant=True,
+    bwd_quant=True,
+    config=None,
+):
     """Wrapper for autograd function"""
 
-    fp8_format = kwargs.get("fp8_format", None)
-    allreduce_amax = kwargs.get("allreduce_amax", None)
+    if config is None:
+        config = Float8QuantConfig()
 
-    args = (group, input_, output_split_sizes_, input_split_sizes, fp8_format, allreduce_amax)
+    args = (
+        group,
+        input_,
+        output_split_sizes_,
+        input_split_sizes,
+        fwd_quant,
+        bwd_quant,
+        config,
+    )
 
     return FP8AllToAll.apply(*args)
 
@@ -111,26 +132,39 @@ class FP8AlltoAllTestCase(MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     @parametrize("shape", shapes)
-    @parametrize("fp8_format", [Format.E4M3, Format.HYBRID])
-    @parametrize("allreduce_amax", [True, False])
+    @parametrize("fwd_bwd_quant", [(True, True)])
     def test_fp8_alltoall(
         self,
         dtype: torch.dtype,
         shape: Tuple[int, int, int, int, int],
-        fp8_format: Format,
-        allreduce_amax: bool,
+        fwd_bwd_quant: bool,
     ) -> None:
         self._init_process()
 
         group = dist.group.WORLD
+        fwd_quant, bwd_quant = fwd_bwd_quant
 
         # check forward pass
         inp = torch.rand(shape, dtype=dtype, device=self.device, requires_grad=True)
         inp_ref = inp.detach().clone().requires_grad_()
-        out = fp8_all_to_all(group, inp, fp8_format=fp8_format, allreduce_amax=allreduce_amax)
+
+        config = Float8QuantConfig()
+        out = fp8_all_to_all(
+            group,
+            inp,
+            fwd_quant=fwd_quant,
+            bwd_quant=bwd_quant,
+            config=config,
+        )
         out_ref = all_to_all(group, inp_ref)
 
-        torch.testing.assert_close(out, out_ref, **get_tolerances(fp8_format.value.fwd_dtype))
+        fwd_fp8_dtype = float8_e4m3
+        if config.format == Format.HYBRID:
+            bwd_fp8_dtype = float8_e5m2
+        elif config.format == Format.E4M3:
+            bwd_fp8_dtype = float8_e4m3
+
+        torch.testing.assert_close(out, out_ref, **get_tolerances(fwd_fp8_dtype))
 
         grad_out = torch.ones_like(out)
         out.backward(grad_out)
@@ -138,7 +172,7 @@ class FP8AlltoAllTestCase(MultiProcessTestCase):
         grad_out_ref = torch.ones_like(out_ref)
         out_ref.backward(grad_out_ref)
 
-        torch.testing.assert_close(inp.grad, inp_ref.grad, **get_tolerances(fp8_format.value.bwd_dtype))
+        torch.testing.assert_close(inp.grad, inp_ref.grad, **get_tolerances(bwd_fp8_dtype))
 
 
 if __name__ == "__main__":
