@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from .attention_with_cp_a2a import (
     AttentionCKFunctionCPA2A,
     AttentionTritonFunctionCPA2A,

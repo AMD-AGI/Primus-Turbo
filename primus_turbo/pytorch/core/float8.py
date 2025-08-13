@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Tuple

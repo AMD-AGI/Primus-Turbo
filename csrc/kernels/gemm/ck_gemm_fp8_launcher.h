@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #pragma once
 #include "ck_gemm_fp8_config.h"
 

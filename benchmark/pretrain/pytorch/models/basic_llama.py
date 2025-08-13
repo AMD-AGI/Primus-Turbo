@@ -1,3 +1,12 @@
+###############################################################################
+# Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #include "primus_turbo/macros.h"
 #include <hip/hip_runtime.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>

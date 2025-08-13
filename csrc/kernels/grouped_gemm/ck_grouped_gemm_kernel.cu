@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #include "ck_grouped_gemm_kernel.h"
 
 namespace primus_turbo {

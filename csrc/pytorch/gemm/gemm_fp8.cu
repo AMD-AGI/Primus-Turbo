@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #include "../type_traits.h"
 #include "primus_turbo/gemm_fp8.h"
 #include <ATen/cuda/CUDAContext.h>

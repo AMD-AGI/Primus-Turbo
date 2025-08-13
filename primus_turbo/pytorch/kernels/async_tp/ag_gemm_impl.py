@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from functools import lru_cache
 from itertools import cycle
 from typing import Any, Callable, List, Optional, Tuple

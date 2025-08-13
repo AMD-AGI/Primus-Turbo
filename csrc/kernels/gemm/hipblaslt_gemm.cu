@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #include "primus_turbo/common.h"
 
 #include "primus_turbo/hipblaslt_gemm.h"
