@@ -30,8 +30,8 @@ pip3 install .
 
 #### Developer Install (editable mode)
 ```
-pip install -r requirements.txt
-pip install -e .
+pip3 install -r requirements.txt
+pip3 install -e . -v
 ```
 
 ### 3. Build & Deploy Wheel

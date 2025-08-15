@@ -112,19 +112,17 @@ __global__ void
 grouped_gemm_variable_k_postprocess(T *c_ptr, const int64_t *group_lens_ptr,
                                     const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
                                     const ck_tile::index_t m, const ck_tile::index_t n) {
+    const int group_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group_id >= group_num)
+        return;
 
-    const int group_id  = blockIdx.y;
     const int group_len = group_lens_ptr[group_id];
     const int group_off = group_offs_ptr[group_id];
     if (group_len > 0)
         return;
 
-    c_ptr               = c_ptr + group_id * m * n;
-    const int BLOCKSIZE = blockDim.x;
-    const int tid       = blockIdx.x * BLOCKSIZE + threadIdx.x;
-    if (tid < m * n) {
-        c_ptr[tid] = T(0.0f);
-    }
+    c_ptr = c_ptr + group_id * m * n;
+    memset(c_ptr, 0, sizeof(T) * m * n);
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
@@ -144,9 +142,9 @@ void ck_grouped_gemm_variable_k(void *args_ptr, const ADataType *a_ptr, const BD
     // Setting args
     {
         const int threads = std::min(MAX_THREADS_PER_BLOCK, group_num);
-        const int blocks  = (group_num + threads - 1) / threads;
+        const int grids   = (group_num + threads - 1) / threads;
         compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
-            <<<blocks, threads, 0, stream>>>(
+            <<<grids, threads, 0, stream>>>(
                 reinterpret_cast<ck_tile::GemmTransKernelArg *>(args_ptr), a_ptr, b_ptr, c_ptr,
                 group_lens_ptr, group_offs_ptr, transA, transB, group_num, m, n, strideA, strideB,
                 strideC, k_batch);
@@ -167,8 +165,8 @@ void ck_grouped_gemm_variable_k(void *args_ptr, const ADataType *a_ptr, const BD
 
     // Postprocess
     {
-        const int  threads = MAX_THREADS_PER_BLOCK;
-        const dim3 grids(DIVUP(m * n, MAX_THREADS_PER_BLOCK), group_num, 1);
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, group_num);
+        const int grids   = (group_num + threads - 1) / threads;
         grouped_gemm_variable_k_postprocess<CDataType>
             <<<grids, threads, 0, stream>>>(c_ptr, group_lens_ptr, group_offs_ptr, group_num, m, n);
     }
