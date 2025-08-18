@@ -25,16 +25,18 @@ compute_grouped_gemm_args(ck_tile::GemmTransKernelArg *args_ptr, const ADataType
     if (group_id >= group_num)
         return;
 
-    args_ptr[group_id].group_karg.a_ptr    = a_ptr + group_offs_ptr[group_id] * k;
-    args_ptr[group_id].group_karg.b_ptr    = b_ptr + group_id * n * k;
-    args_ptr[group_id].group_karg.e_ptr    = c_ptr + group_offs_ptr[group_id] * n;
-    args_ptr[group_id].group_karg.M        = group_lens_ptr[group_id];
-    args_ptr[group_id].group_karg.N        = n;
-    args_ptr[group_id].group_karg.K        = k;
-    args_ptr[group_id].group_karg.stride_A = strideA;
-    args_ptr[group_id].group_karg.stride_B = strideB;
-    args_ptr[group_id].group_karg.stride_E = strideC;
-    args_ptr[group_id].group_karg.k_batch  = k_batch;
+    const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.as_ptr)[0] =
+        static_cast<const void *>(a_ptr + group_offs_ptr[group_id] * k);
+    const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.bs_ptr)[0] =
+        static_cast<const void *>(b_ptr + group_id * n * k);
+    args_ptr[group_id].group_karg.e_ptr        = c_ptr + group_offs_ptr[group_id] * n;
+    args_ptr[group_id].group_karg.M            = group_lens_ptr[group_id];
+    args_ptr[group_id].group_karg.N            = n;
+    args_ptr[group_id].group_karg.K            = k;
+    args_ptr[group_id].group_karg.stride_As[0] = strideA;
+    args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
+    args_ptr[group_id].group_karg.stride_E     = strideC;
+    args_ptr[group_id].group_karg.k_batch      = k_batch;
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
@@ -90,18 +92,20 @@ __global__ void compute_grouped_gemm_variable_k_args(
     if (group_id >= group_num)
         return;
 
-    const int64_t strideAK                 = transA ? m : 1;
-    const int64_t strideBK                 = transB ? 1 : n;
-    args_ptr[group_id].group_karg.a_ptr    = a_ptr + group_offs_ptr[group_id] * strideAK;
-    args_ptr[group_id].group_karg.b_ptr    = b_ptr + group_offs_ptr[group_id] * strideBK;
-    args_ptr[group_id].group_karg.e_ptr    = c_ptr + group_id * m * n;
-    args_ptr[group_id].group_karg.M        = m;
-    args_ptr[group_id].group_karg.N        = n;
-    args_ptr[group_id].group_karg.K        = group_lens_ptr[group_id];
-    args_ptr[group_id].group_karg.stride_A = strideA;
-    args_ptr[group_id].group_karg.stride_B = strideB;
-    args_ptr[group_id].group_karg.stride_E = strideC;
-    args_ptr[group_id].group_karg.k_batch  = k_batch;
+    const int64_t strideAK = transA ? m : 1;
+    const int64_t strideBK = transB ? 1 : n;
+    const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.as_ptr)[0] =
+        static_cast<const void *>(a_ptr + group_offs_ptr[group_id] * strideAK);
+    const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.bs_ptr)[0] =
+        static_cast<const void *>(b_ptr + group_offs_ptr[group_id] * strideBK);
+    args_ptr[group_id].group_karg.e_ptr        = c_ptr + group_id * m * n;
+    args_ptr[group_id].group_karg.M            = m;
+    args_ptr[group_id].group_karg.N            = n;
+    args_ptr[group_id].group_karg.K            = group_lens_ptr[group_id];
+    args_ptr[group_id].group_karg.stride_As[0] = strideA;
+    args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
+    args_ptr[group_id].group_karg.stride_E     = strideC;
+    args_ptr[group_id].group_karg.k_batch      = k_batch;
 }
 
 /**

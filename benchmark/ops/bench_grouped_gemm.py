@@ -14,8 +14,8 @@ from tests.pytorch.ref.gemm_ref import (
 )
 from tests.test_utils import get_tolerances
 
-M_SIZE_LIST = [512, 1024, 2048, 4096, 8192]
-EP_SIZE_LIST = [8, 16, 32]
+M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
+EP_SIZE_LIST = [32, 16, 8]
 
 
 def generate_deepseekv3_test_cases():
@@ -23,16 +23,19 @@ def generate_deepseekv3_test_cases():
     n_routed_experts = 256
     moe_intermediate_size = 2048
     hidden_size = 7168
+
+    shapes_dict = {
+        "DSV3-GateUP": (2 * moe_intermediate_size, hidden_size),
+        "DSV3-Down": (hidden_size, moe_intermediate_size),
+    }
     for ep in EP_SIZE_LIST:
         B = n_routed_experts // ep
         for M in M_SIZE_LIST:
-            for N, K in [
-                (2 * moe_intermediate_size, hidden_size),
-                (hidden_size, moe_intermediate_size),
-            ]:
+            for name, (N, K) in shapes_dict.items():
                 for dtype in [torch.bfloat16]:
                     test_cases.append(
                         {
+                            "Case": name,
                             "B": B,
                             "M": M,
                             "N": N,
@@ -48,16 +51,47 @@ def generate_deepseekv2_test_cases():
     n_routed_experts = 160
     moe_intermediate_size = 1536
     hidden_size = 5120
+
+    shapes_dict = {
+        "DSV2-GateUP": (2 * moe_intermediate_size, hidden_size),
+        "DSV2-Down": (hidden_size, moe_intermediate_size),
+    }
     for ep in EP_SIZE_LIST:
         B = n_routed_experts // ep
         for M in M_SIZE_LIST:
-            for N, K in [
-                (2 * moe_intermediate_size, hidden_size),
-                (hidden_size, moe_intermediate_size),
-            ]:
+            for name, (N, K) in shapes_dict.items():
                 for dtype in [torch.bfloat16]:
                     test_cases.append(
                         {
+                            "Case": name,
+                            "B": B,
+                            "M": M,
+                            "N": N,
+                            "K": K,
+                            "dtype": dtype,
+                        }
+                    )
+    return test_cases
+
+
+def generate_deepseekv2_lite_test_cases():
+    test_cases = []
+    n_routed_experts = 64
+    moe_intermediate_size = 1408
+    hidden_size = 2048
+
+    shapes_dict = {
+        "DSV2-Lite-GateUP": (2 * moe_intermediate_size, hidden_size),
+        "DSV2-Lite-Down": (hidden_size, moe_intermediate_size),
+    }
+    for ep in EP_SIZE_LIST:
+        B = n_routed_experts // ep
+        for M in M_SIZE_LIST:
+            for name, (N, K) in shapes_dict.items():
+                for dtype in [torch.bfloat16]:
+                    test_cases.append(
+                        {
+                            "Case": name,
                             "B": B,
                             "M": M,
                             "N": N,
@@ -127,9 +161,10 @@ def bench_grouped_gemm(B, M, N, K, dtype):
 
 
 if __name__ == "__main__":
-    dpv2_test_cases = generate_deepseekv2_test_cases()
-    dpv3_test_cases = generate_deepseekv3_test_cases()
-    test_configs = dpv3_test_cases + dpv3_test_cases
+    dsv2_lite_test_cases = generate_deepseekv2_lite_test_cases()
+    dsv2_test_cases = generate_deepseekv2_test_cases()
+    dsv3_test_cases = generate_deepseekv3_test_cases()
+    test_configs = dsv2_lite_test_cases + dsv2_test_cases + dsv3_test_cases
 
     import pandas as pd
     from tabulate import tabulate
@@ -138,6 +173,7 @@ if __name__ == "__main__":
     results = pd.DataFrame(
         columns=[
             "TestID",
+            "Case",
             "B",
             "M",
             "N",
@@ -173,6 +209,7 @@ if __name__ == "__main__":
             # Add to results table
             new_row = {
                 "TestID": test_id,
+                "Case": config["Case"],
                 "B": B,
                 "M": M,
                 "N": N,
@@ -189,6 +226,7 @@ if __name__ == "__main__":
             print(f"Failed to run {config}: {str(e)}")
             new_row = {
                 "TestID": test_id,
+                "Case": config["Case"],
                 "B": B,
                 "M": M,
                 "N": N,
