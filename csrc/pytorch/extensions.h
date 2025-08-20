@@ -79,4 +79,25 @@ at::Tensor grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor
                                         at::Tensor &group_offs, const bool transA,
                                         const bool transB);
 
+// Attention
+std::vector<at::Tensor> mha_fwd(
+    at::Tensor       &q, // batch_size x seqlen_q x num_heads x round_multiple(head_size_qk, 8)
+    const at::Tensor &k, // batch_size x seqlen_k x num_heads_k x round_multiple(head_size_qk, 8)
+    const at::Tensor &v, // batch_size x seqlen_k x num_heads_k x round_multiple(head_size_v, 8)
+    std::optional<at::Tensor>
+        &out_, // batch_size x seqlen_q x num_heads x round_multiple(head_size_v, 8)
+    std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+    const float p_dropout, const float softmax_scale, bool is_causal, int window_size_left,
+    int window_size_right, const bool return_dropout_randval, std::optional<at::Generator> gen_);
+
+std::vector<at::Tensor> mha_fwd_meta(
+    at::Tensor       &q, // batch_size x seqlen_q x num_heads x round_multiple(head_size_qk, 8)
+    const at::Tensor &k, // batch_size x seqlen_k x num_heads_k x round_multiple(head_size_qk, 8)
+    const at::Tensor &v, // batch_size x seqlen_k x num_heads_k x round_multiple(head_size_v, 8)
+    std::optional<at::Tensor>
+        &out_, // batch_size x seqlen_q x num_heads x round_multiple(head_size_v, 8)
+    std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+    const float p_dropout, const float softmax_scale, bool is_causal, int window_size_left,
+    int window_size_right, const bool return_dropout_randval, std::optional<at::Generator> gen_);
+
 } // namespace primus_turbo::pytorch

@@ -30,6 +30,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool transB) -> Tensor");
     m.def("grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
           "bool transA, bool transB) -> Tensor");
+    m.def("mha_fwd(Tensor q, Tensor k, Tensor v, Tensor out, Tensor alibi_slopes, float p_dropout,"
+          "float softmax_scale, bool is_casual, int window_size_left, int window_size_right, "
+          "bool return_dropout_randval) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -41,6 +44,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("rmsnorm_bwd", rmsnorm_bwd);
     m.impl("grouped_gemm", grouped_gemm);
     m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k);
+    m.impl("mha_fwd", mha_fwd);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -52,6 +56,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("rmsnorm_bwd", rmsnorm_bwd_meta);
     m.impl("grouped_gemm", grouped_gemm_meta);
     m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k_meta);
+    m.impl("mha_fwd", mha_fwd_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
