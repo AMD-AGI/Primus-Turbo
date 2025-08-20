@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_backward_impl,
     attention_aiter_csrc_forward_impl,
@@ -136,7 +137,7 @@ class AttentionCKFunction(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None
 
 
 class AttentionTritonFunction(torch.autograd.Function):
@@ -282,6 +283,11 @@ def attention(
         )
 
     if backend_type == "ck":
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        how_v3_bf16_cvt = 1
+        if get_device_compute_capability() >= (9, 5):
+            how_v3_bf16_cvt = 0
+
         return AttentionCKFunction.apply(
             q,
             k,
@@ -296,6 +302,8 @@ def attention(
             return_lse,
             return_attn_probs,
             torch.is_grad_enabled(),
+            True,
+            how_v3_bf16_cvt,
         )
     elif backend_type == "triton":
         return AttentionTritonFunction.apply(
