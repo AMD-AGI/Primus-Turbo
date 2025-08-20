@@ -2,6 +2,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -71,13 +72,22 @@ def setup_cxx_env():
     print(f"[Primus-Turbo Setup] CMAKE_HIP_COMPILER set to: {os.environ['CMAKE_HIP_COMPILER']}")
 
 
-def read_version():
+def get_version():
+    base_version = None
     with open(os.path.join("primus_turbo", "__init__.py")) as f:
         for line in f:
             match = re.match(r"^__version__\s*=\s*[\"'](.+?)[\"']", line)
             if match:
-                return match.group(1)
-    raise RuntimeError("Cannot find version.")
+                base_version = match.group(1)
+                break
+    if base_version is None:
+        raise RuntimeError("Cannot find version.")
+
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode("ascii").strip()
+        return f"{base_version}+{commit}"  # PEP440
+    except Exception:
+        return base_version
 
 
 def get_common_flags():
@@ -225,7 +235,7 @@ if __name__ == "__main__":
 
     setup(
         name="primus_turbo",
-        version=read_version(),
+        version=get_version(),
         packages=find_packages(exclude=["tests", "tests.*"]),
         package_data={"primus_turbo": ["lib/*.so"]},
         ext_modules=[kernels_ext, torch_ext, jax_ext],
