@@ -82,46 +82,53 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 @pytest.mark.parametrize("m", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [255, 512, 1024, 2048])
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_tensorwise(m, n, k, dtype):
+def test_gemm_fp8_tensorwise(m, n, k, layout, dtype):
     device = "cuda:0"
 
-    x = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
-    w = torch.randn((k, n), dtype=dtype, device=device, requires_grad=True)
-    x_ref = x.detach().clone().requires_grad_()
-    w_ref = w.detach().clone().requires_grad_()
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+
+    a_shape = (m, k) if not trans_a else (k, m)
+    b_shape = (k, n) if not trans_b else (n, k)
+
+    a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+    torch.cuda.synchronize()
 
     # Ref
-    out_ref = x_ref @ w_ref
-    grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out)
-    x_grad_ref = x_ref.grad
-    w_grad_ref = w_ref.grad
+    a_mat = a_ref.T if trans_a else a_ref
+    b_mat = b_ref.T if trans_b else b_ref
+    c_ref = a_mat @ b_mat
+    grad_c = torch.randn_like(c_ref)
+    c_ref.backward(grad_c)
+    torch.cuda.synchronize()
 
     # Config + FWD + BWD
     config = Float8QuantConfig()
-    out = gemm_fp8_tensorwise(x, w, False, False, dtype, config)
-    out.backward(grad_out)
-    x_grad = x.grad
-    w_grad = w.grad
+    c = gemm_fp8_tensorwise(a, b, trans_a, trans_b, dtype, config)
+    c.backward(grad_c)
 
     # Check Shape
-    print("out shape: ", out.shape, out_ref.shape)
-    print("x_grad shape: ", x_grad.shape, x_grad_ref.shape)
-    print("w_grad shape: ", w_grad.shape, w_grad_ref.shape)
-    assert out.shape == out_ref.shape
-    assert x_grad.shape == x_grad_ref.shape
-    assert w_grad.shape == w_grad_ref.shape
+    # print("out shape: ", out.shape, out_ref.shape)
+    # print("x_grad shape: ", x_grad.shape, x_grad_ref.shape)
+    # print("w_grad shape: ", w_grad.shape, w_grad_ref.shape)
+    assert c.shape == c_ref.shape
+    assert a.grad.shape == a_ref.grad.shape
+    assert b.grad.shape == b_ref.grad.shape
 
     # Check Results
-    out_snr = compute_snr(out_ref, out)
-    print(f"Out-SNR: {out_snr:.2f} dB")
-    assert out_snr > 20, "out_snr too low"
+    c_snr = compute_snr(c_ref, c)
+    print(f"C-SNR: {c_snr:.2f} dB")
+    assert c_snr > 20, "c_snr too low"
 
-    xgrad_snr = compute_snr(x_grad_ref, x_grad)
-    print(f"XGrad-SNR: {xgrad_snr:.2f} dB")
-    assert xgrad_snr > 20, "xgrad_snr too low"
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > 20, "a_grad_snr too low"
 
-    wgrad_snr = compute_snr(w_grad_ref, w_grad)
-    print(f"WGrad-SNR: {wgrad_snr:.2f} dB")
-    assert wgrad_snr > 20, "wgrad_snr too low"
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > 20, "b_grad_snr too low"
