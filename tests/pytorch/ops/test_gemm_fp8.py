@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.float8 import Float8QuantConfig, MXQuantConfig
+from primus_turbo.pytorch.core.float8 import Float8QuantConfig, Format, MXQuantConfig
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise, gemm_fp8_tensorwise
 from tests.test_utils import compute_snr
 
@@ -83,8 +83,11 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [255, 512, 1024, 2048])
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_tensorwise(m, n, k, layout, dtype):
+def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
+    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
+
     device = "cuda:0"
 
     trans_a = layout[0] == "T"
@@ -108,7 +111,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, dtype):
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
-    config = Float8QuantConfig()
+    config = Float8QuantConfig(format=format)
     c = gemm_fp8_tensorwise(a, b, trans_a, trans_b, dtype, config)
     c.backward(grad_c)
 
@@ -120,15 +123,16 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, dtype):
     assert a.grad.shape == a_ref.grad.shape
     assert b.grad.shape == b_ref.grad.shape
 
+    snr_threshold = 25 if format == Format.E4M3 else 20
     # Check Results
     c_snr = compute_snr(c_ref, c)
     print(f"C-SNR: {c_snr:.2f} dB")
-    assert c_snr > 20, "c_snr too low"
+    assert c_snr > snr_threshold, "c_snr too low"
 
     a_grad_snr = compute_snr(a_ref.grad, a.grad)
     print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
-    assert a_grad_snr > 20, "a_grad_snr too low"
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
 
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
-    assert b_grad_snr > 20, "b_grad_snr too low"
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"

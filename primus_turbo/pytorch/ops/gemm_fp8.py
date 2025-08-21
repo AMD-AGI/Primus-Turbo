@@ -231,6 +231,17 @@ def calc_scale_and_scale_inv(x: torch.Tensor, fp8_max: float):
 class TensorwiseFP8GemmFunction(torch.autograd.Function):
 
     @staticmethod
+    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
+        if format == Format.E4M3:
+            return float8_e4m3
+        elif format == Format.E5M2:
+            return float8_e5m2
+        elif format == Format.HYBRID:
+            return float8_e4m3 if is_fwd_stage else float8_e5m2
+        else:
+            raise ValueError(f"Unsupported FP8 format: {format}")
+
+    @staticmethod
     def forward(
         ctx,
         a: torch.Tensor,
@@ -241,10 +252,9 @@ class TensorwiseFP8GemmFunction(torch.autograd.Function):
         config: Float8QuantConfig,
     ):
         assert config.granularity == ScalingGranularity.TENSORWISE
-        assert config.format == Format.E4M3 or config.format == Format.HYBRID
 
-        a_dtype = float8_e4m3
-        b_dtype = float8_e4m3
+        a_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(config.format, True)
+        b_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(config.format, True)
 
         a_scale, a_scale_inv = calc_scale_and_scale_inv(a, torch.finfo(a_dtype).max)
         b_scale, b_scale_inv = calc_scale_and_scale_inv(b, torch.finfo(b_dtype).max)
@@ -268,10 +278,8 @@ class TensorwiseFP8GemmFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         (a_fp8, a_scale_inv, b_fp8, b_scale_inv) = ctx.saved_tensors
-        config = ctx.config
-
         # For HYBRID format. data type of grad_out is e5m2.
-        grad_out_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
+        grad_out_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out_scale, grad_out_scale_inv = calc_scale_and_scale_inv(
             grad_out, torch.finfo(grad_out_dtype).max
