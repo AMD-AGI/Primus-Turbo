@@ -34,8 +34,8 @@ class MXLinear(torch.nn.Linear):
         out = gemm_fp8_blockwise(
             x,
             self.weight,
-            transA=False,
-            transB=True,
+            trans_a=False,
+            trans_b=True,
             out_dtype=x.dtype,
             config=self.config,
         )

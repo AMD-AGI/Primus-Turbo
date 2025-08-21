@@ -26,16 +26,16 @@ def ceil_div(a, b):
 
 
 def get_gemm_logical_shape(
-    a: torch.Tensor, b: torch.Tensor, transA: bool, transB: bool
+    a: torch.Tensor, b: torch.Tensor, trans_a: bool, trans_b: bool
 ) -> Tuple[int, int, int]:
     assert (
         a.ndim == 2 and b.ndim == 2
     ), f"Expected both a and b to be 2D tensors, but got a.ndim={a.ndim}, b.ndim={b.ndim}"
-    M = a.shape[1] if transA else a.shape[0]
-    Ka = a.shape[0] if transA else a.shape[1]
-    Kb = b.shape[1] if transB else b.shape[0]
-    N = b.shape[0] if transB else b.shape[1]
-    assert Ka == Kb, f"GEMM K mismatch: A has K={Ka}, B has K={Kb}"
+    M = a.shape[1] if trans_a else a.shape[0]
+    Ka = a.shape[0] if trans_a else a.shape[1]
+    Kb = b.shape[1] if trans_b else b.shape[0]
+    N = b.shape[0] if trans_b else b.shape[1]
+    assert Ka == Kb, f"GEMM K mismatch: a has K={Ka}, b has K={Kb}"
     return M, N, Ka
 
 
@@ -177,8 +177,8 @@ def gemm_fp8_blockwise_impl(
     scale_group_size_m: int,
     scale_group_size_n: int,
     scale_group_size_k: int,
-    transA: bool,
-    transB: bool,
+    trans_a: bool,
+    trans_b: bool,
 ) -> torch.Tensor:
     """
     Blockwise FP8 GEMM.
@@ -186,14 +186,14 @@ def gemm_fp8_blockwise_impl(
     assert a.is_contiguous() and b.is_contiguous(), "Inputs must be contiguous"
     assert a_scales.is_contiguous() and b_scales.is_contiguous(), "Scales must be contiguous"
 
-    M, N, K = get_gemm_logical_shape(a, b, transA, transB)
+    M, N, K = get_gemm_logical_shape(a, b, trans_a, trans_b)
     c = torch.empty(M, N, dtype=out_dtype, device=a.device)
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    if transA == False and transB == True:
+    if trans_a == False and trans_b == True:
         # NT
         if (N % 128 == 0 and K % 128 == 0) and (
             scale_group_size_m == 1 and scale_group_size_n == 128 and scale_group_size_k == 128
@@ -205,18 +205,18 @@ def gemm_fp8_blockwise_impl(
             wrap_triton(gemm_fp8_blockwise_nt_kernel)[grid](
                 a, b, c, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=scale_group_size_k
             )
-    elif transA == False and transB == False:
+    elif trans_a == False and trans_b == False:
         # NN
         wrap_triton(gemm_fp8_blockwise_nn_kernel)[grid](
             a, b, c, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=scale_group_size_k
         )
-    elif transA == True and transB == False:
+    elif trans_a == True and trans_b == False:
         # TN
         wrap_triton(gemm_fp8_blockwise_tn_kernel)[grid](
             a, b, c, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=scale_group_size_k
         )
     else:
-        raise NotImplementedError(f"Unsupported transA={transA}, transB={transB}")
+        raise NotImplementedError(f"Unsupported trans_a={trans_a}, trans_b={trans_b}")
 
     return c
 
@@ -231,36 +231,36 @@ def gemm_fp8_blockwise_impl_meta(
     scale_group_size_m: int,
     scale_group_size_n: int,
     scale_group_size_k: int,
-    transA: bool,
-    transB: bool,
+    trans_a: bool,
+    trans_b: bool,
 ) -> torch.Tensor:
-    M, N, _ = get_gemm_logical_shape(a, b, transA, transB)
+    M, N, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
     c = torch.empty(M, N, dtype=out_dtype, device=a.device)
     return c
 
 
 def gemm_fp8_tensorwise_impl(
-    A: torch.Tensor,
-    A_scale_inv: torch.Tensor,
-    transA: bool,
-    B: torch.Tensor,
-    B_scale_inv: torch.Tensor,
-    transB: bool,
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
     out_dtype: torch.dtype,
-    transC: bool,
+    trans_c: bool,
     backend="hipblaslt",
 ) -> torch.Tensor:
     assert backend in ("hipblaslt")
 
     args = (
-        A,
-        A_scale_inv,
-        B,
-        B_scale_inv,
+        a,
+        a_scale_inv,
+        b,
+        b_scale_inv,
         out_dtype,
-        transA,
-        transB,
-        transC,
+        trans_a,
+        trans_b,
+        trans_c,
     )
 
     if backend == "hipblaslt":

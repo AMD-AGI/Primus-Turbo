@@ -17,18 +17,18 @@ from tests.test_utils import get_tolerances
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_gemm(m, n, k, layout, dtype):
-    transA = layout[0] == "T"
-    transB = layout[1] == "T"
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     device = "cuda"
     torch.manual_seed(42)
 
-    print(f"\nM={m}, N={n}, K={k}, TransA={transA}, TransB={transB}, dtype={dtype}")
+    print(f"\nM={m}, N={n}, K={k}, trans_a={trans_a}, trans_b={trans_b}, dtype={dtype}")
 
-    a_shape = (m, k) if not transA else (k, m)
-    b_shape = (k, n) if not transB else (n, k)
+    a_shape = (m, k) if not trans_a else (k, m)
+    b_shape = (k, n) if not trans_b else (n, k)
 
     a = torch.randn(a_shape, dtype=dtype, device=device)
     b = torch.randn(b_shape, dtype=dtype, device=device)
@@ -43,12 +43,12 @@ def test_gemm(m, n, k, layout, dtype):
     torch.cuda.synchronize()
 
     # Reference output
-    a_mat = a_ref.T if transA else a_ref
-    b_mat = b_ref.T if transB else b_ref
+    a_mat = a_ref.T if trans_a else a_ref
+    b_mat = b_ref.T if trans_b else b_ref
     c_ref = a_mat @ b_mat
 
     # Turbo
-    c = turbo.ops.gemm(a, b, transA, transB, dtype)
+    c = turbo.ops.gemm(a, b, trans_a, trans_b, dtype)
 
     # print("a:", a.shape)
     # print("b:", b.shape)

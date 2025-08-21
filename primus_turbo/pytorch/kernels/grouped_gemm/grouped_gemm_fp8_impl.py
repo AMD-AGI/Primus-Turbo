@@ -25,18 +25,18 @@ def grouped_gemm_fp8_blockwise_impl(
     scale_group_size_m: int,
     scale_group_size_n: int,
     scale_group_size_k: int,
-    transA: bool,
-    transB: bool,
+    trans_a: bool,
+    trans_b: bool,
 ):
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
     assert a_scales.dim() == 2, f"a scales must be 2D, got {a_scales.shape}"
     assert b_scales.dim() == 3, f"b scales must be 3D, got {b_scales.shape}"
 
-    M = a.shape[1] if transA else a.shape[0]
-    Ka = a.shape[0] if transA else a.shape[1]
-    Kb = b.shape[-1] if transB else b.shape[-2]
-    N = b.shape[-2] if transB else b.shape[-1]
+    M = a.shape[1] if trans_a else a.shape[0]
+    Ka = a.shape[0] if trans_a else a.shape[1]
+    Kb = b.shape[-1] if trans_b else b.shape[-2]
+    N = b.shape[-2] if trans_b else b.shape[-1]
     B = b.shape[0]
 
     assert Ka == Kb, f"K mismatch: Ka={Ka}, Kb={Kb}"
@@ -72,8 +72,8 @@ def grouped_gemm_fp8_blockwise_impl(
         Ka,
         seg_indptr,
         m_num_tiles_indptr,
-        transA,
-        transB,
+        trans_a,
+        trans_b,
         scale_group_size_m,
         scale_group_size_n,
         scale_group_size_k,
@@ -94,10 +94,10 @@ def grouped_gemm_variable_k_fp8_blockwise_impl(
     scale_group_size_m: int,
     scale_group_size_n: int,
     scale_group_size_k: int,
-    transA: bool,
-    transB: bool,
+    trans_a: bool,
+    trans_b: bool,
 ):
-    assert transA == True and transB == False, "Only transA=True and transB=False are supported."
+    assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
     assert (
         seg_indptr.shape[0] == batch_size + 1
     ), f"Expected seg_indptr shape [{batch_size + 1}], got {seg_indptr.shape}"
@@ -109,15 +109,15 @@ def grouped_gemm_variable_k_fp8_blockwise_impl(
         scale_group_size_m == 1 and scale_group_size_n == 1
     ), f"Only scale_group_size_m == 1 and scale_group_size_n == 1 are supported, got {scale_group_size_m}, {scale_group_size_n}"
 
-    # a_view = a.transpose(-1, -2) if transA else a
-    # a_scales_view = a_scales.transpose(-1, -2) if transA else a_scales
-    # b_view = b.transpose(-1, -2) if transB else b
-    # b_scales_view = b_scales.transpose(-1, -2) if transB else b_scales
+    # a_view = a.transpose(-1, -2) if trans_a else a
+    # a_scales_view = a_scales.transpose(-1, -2) if trans_a else a_scales
+    # b_view = b.transpose(-1, -2) if trans_b else b
+    # b_scales_view = b_scales.transpose(-1, -2) if trans_b else b_scales
 
-    M = a.shape[1] if transA else a.shape[0]
-    Ka = a.shape[0] if transA else a.shape[1]
-    Kb = b.shape[-1] if transB else b.shape[-2]
-    N = b.shape[-2] if transB else b.shape[-1]
+    M = a.shape[1] if trans_a else a.shape[0]
+    Ka = a.shape[0] if trans_a else a.shape[1]
+    Kb = b.shape[-1] if trans_b else b.shape[-2]
+    N = b.shape[-2] if trans_b else b.shape[-1]
     assert Ka == Kb, f"K mismatch: KA={Ka}, KB={Kb}"
 
     config = {

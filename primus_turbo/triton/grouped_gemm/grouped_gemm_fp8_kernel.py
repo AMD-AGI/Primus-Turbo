@@ -53,8 +53,8 @@ def grouped_gemm_fp8_blockwise_kernel(
     K: tl.constexpr,
     seg_indptr,
     m_num_tiles_indptr,
-    transA: tl.constexpr,
-    transB: tl.constexpr,
+    trans_a: tl.constexpr,
+    trans_b: tl.constexpr,
     SCALE_GROUP_SIZE_M: tl.constexpr,
     SCALE_GROUP_SIZE_N: tl.constexpr,
     SCALE_GROUP_SIZE_K: tl.constexpr,
@@ -87,7 +87,7 @@ def grouped_gemm_fp8_blockwise_kernel(
     offs_bsn = (n_range_start + offs_bn) // SCALE_GROUP_SIZE_N
 
     #
-    if not transA:
+    if not trans_a:
         a_ptr = a_ptr + m_range_start * K
         a_ptrs = a_ptr + offs_am[:, None] * K + offs_k[None, :]
         a_ptrs_stride = BLOCK_SIZE_K
@@ -104,7 +104,7 @@ def grouped_gemm_fp8_blockwise_kernel(
         a_s_ptrs = a_s_ptr + offs_am[None, :]
         a_s_ptrs_stride = M
 
-    if not transB:
+    if not trans_b:
         b_ptr = b_ptr + group_id * N * K + n_range_start
         b_ptrs = b_ptr + offs_k[:, None] * N + offs_bn[None, :]
         b_ptrs_stride = BLOCK_SIZE_K * N
@@ -124,15 +124,15 @@ def grouped_gemm_fp8_blockwise_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for kid in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         mask_k = offs_k < K
-        a_tile = tl.load(a_ptrs, mask_k[None, :] if not transA else mask_k[:, None], other=0.0)
-        b_tile = tl.load(b_ptrs, mask_k[:, None] if not transB else mask_k[None, :], other=0.0)
+        a_tile = tl.load(a_ptrs, mask_k[None, :] if not trans_a else mask_k[:, None], other=0.0)
+        b_tile = tl.load(b_ptrs, mask_k[:, None] if not trans_b else mask_k[None, :], other=0.0)
         a_s_tile = tl.load(a_s_ptrs)
         b_s_tile = tl.load(b_s_ptrs)
 
-        if transA:
+        if trans_a:
             a_tile = a_tile.T
 
-        if transB:
+        if trans_b:
             b_tile = b_tile.T
 
         accumulator += tl.dot(a_tile, b_tile) * a_s_tile * b_s_tile

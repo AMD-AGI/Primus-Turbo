@@ -12,25 +12,25 @@ def _empty_tensor(device):
 
 
 def gemm_impl(
-    A: torch.Tensor,
-    transA: bool,
-    B: torch.Tensor,
-    transB: bool,
+    a: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    trans_b: bool,
     out_dtype: torch.dtype,
-    transC: bool,
+    trans_c: bool,
     backend="hipblaslt",
 ) -> torch.Tensor:
     assert backend in ("hipblaslt")
 
     args = (
-        A,
-        _empty_tensor(device=A.device),
-        B,
-        _empty_tensor(device=B.device),
+        a,
+        _empty_tensor(device=a.device),
+        b,
+        _empty_tensor(device=b.device),
         out_dtype,
-        transA,
-        transB,
-        transC,
+        trans_a,
+        trans_b,
+        trans_c,
     )
 
     if backend == "hipblaslt":

@@ -17,20 +17,20 @@ class GemmFunction(torch.autograd.Function):
         ctx,
         a: torch.Tensor,
         b: torch.Tensor,
-        transA: bool,
-        transB: bool,
+        trans_a: bool,
+        trans_b: bool,
         out_dtype: torch.dtype,
     ):
         assert a.dim() == 2 and b.dim() == 2, "Only 2D GEMM is supported"
         # FWD
         # out    = a * b
         # [M, N] = [M, K] * [K, N]
-        out = gemm_impl(a, transA, b, transB, out_dtype, False)
+        out = gemm_impl(a, trans_a, b, trans_b, out_dtype, False)
         # Save for bwd
         if a.requires_grad or b.requires_grad:
             ctx.save_for_backward(a, b)
-            ctx.transA = transA
-            ctx.transB = transB
+            ctx.trans_a = trans_a
+            ctx.trans_b = trans_b
         return out
 
     @staticmethod
@@ -39,11 +39,11 @@ class GemmFunction(torch.autograd.Function):
 
         # AGrad
         # grad_a = grad_out * b^T
-        grad_a = gemm_impl(grad_out, False, b, not ctx.transB, a.dtype, ctx.transA)
+        grad_a = gemm_impl(grad_out, False, b, not ctx.trans_b, a.dtype, ctx.trans_a)
 
         # BGrad
         # grad_b = a^T * grad_out
-        grad_b = gemm_impl(a, not ctx.transA, grad_out, False, b.dtype, ctx.transB)
+        grad_b = gemm_impl(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
 
         return grad_a, grad_b, None, None, None
 
@@ -51,11 +51,11 @@ class GemmFunction(torch.autograd.Function):
 def gemm(
     a: torch.Tensor,
     b: torch.Tensor,
-    transA: bool = False,
-    transB: bool = False,
+    trans_a: bool = False,
+    trans_b: bool = False,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
         out_dtype = torch.result_type(a, b)
-    return GemmFunction.apply(a, b, transA, transB, out_dtype)
+    return GemmFunction.apply(a, b, trans_a, trans_b, out_dtype)

@@ -63,8 +63,8 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         ctx,
         a: torch.Tensor,
         b: torch.Tensor,
-        transA: bool,
-        transB: bool,
+        trans_a: bool,
+        trans_b: bool,
         out_dtype: torch.dtype,
         config: MXQuantConfig,
     ):
@@ -76,7 +76,7 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
         assert b.ndim == 2, "Weight tensor must be 2-dimensional."
 
         # TODO: more layout
-        assert transA == False and transB == True, "Currently only support NT layout"
+        assert trans_a == False and trans_b == True, "Currently only support NT layout"
         # TODO: more format
         assert config.format == Format.E4M3
 
@@ -104,8 +104,8 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
             scale_group_size_m=1,
             scale_group_size_n=block_size,
             scale_group_size_k=block_size,
-            transA=False,
-            transB=True,
+            trans_a=False,
+            trans_b=True,
         )
         out = out.view(*batch_shape, M, -1)  # restore shape
 
@@ -149,8 +149,8 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
             scale_group_size_m=1,
             scale_group_size_n=block_size,
             scale_group_size_k=block_size,
-            transA=False,
-            transB=False,
+            trans_a=False,
+            trans_b=False,
         )
 
         # WGrad TN:
@@ -165,8 +165,8 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
             scale_group_size_m=1,
             scale_group_size_n=1,
             scale_group_size_k=block_size,
-            transA=True,
-            transB=False,
+            trans_a=True,
+            trans_b=False,
         )
 
         grad_a = grad_a.view(*batch_shape, M, -1)
@@ -177,8 +177,8 @@ class BlockwiseFP8GemmFunction(torch.autograd.Function):
 def gemm_fp8_blockwise(
     a,
     b,
-    transA: bool = False,
-    transB: bool = False,
+    trans_a: bool = False,
+    trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
     config: Optional[MXQuantConfig] = None,
 ):
@@ -190,24 +190,24 @@ def gemm_fp8_blockwise(
     input precision (e.g., bf16 or fp16).
 
     Args:
-        a (torch.Tensor): Input tensor of shape [M, K] (if transA=False), typically in bf16 or fp16.
+        a (torch.Tensor): Input tensor of shape [M, K] (if trans_a=False), typically in bf16 or fp16.
             Blockwise quantized with shape [1, blocksize].
-        b (torch.Tensor): Weight tensor of shape [K, N] (if transB=False), typically in bf16 or fp16.
+        b (torch.Tensor): Weight tensor of shape [K, N] (if trans_b=False), typically in bf16 or fp16.
             Blockwise quantized with shape [blocksize, blocksize].
-        transA (bool): Default: False.
-        transB (bool): Default: False.
+        trans_a (bool): Default: False.
+        trans_b (bool): Default: False.
         out_dtype (torch.dtype, optional): Output dtype. If None, inferred via `torch.result_type(a, b)`.
         config (MXQuantConfig, optional): Quantization configuration controlling FP8 dtype,
             scaling strategy, granularity, and block size. If None, a default config is used.
 
     Returns:
-        torch.Tensor: Output tensor of shape [M, N] (assuming transA=False and transB=False),
+        torch.Tensor: Output tensor of shape [M, N] (assuming trans_a=False and trans_b=False),
         in the same dtype as `a` unless `out_dtype` is explicitly set.
 
     Example:
         >>> a = torch.randn(512, 1024, dtype=torch.bfloat16).cuda()
         >>> b = torch.randn(768, 1024, dtype=torch.bfloat16).cuda()
-        >>> y = gemm_fp8_blockwise(a, b, transA=False, transB=True)
+        >>> y = gemm_fp8_blockwise(a, b, trans_a=False, trans_b=True)
     """
 
     if out_dtype is None:
@@ -216,7 +216,7 @@ def gemm_fp8_blockwise(
     if config is None:
         config = MXQuantConfig()
 
-    return BlockwiseFP8GemmFunction.apply(a, b, transA, transB, out_dtype, config)
+    return BlockwiseFP8GemmFunction.apply(a, b, trans_a, trans_b, out_dtype, config)
 
 
 @torch.compile
@@ -304,23 +304,23 @@ class TensorwiseFP8GemmFunction(torch.autograd.Function):
 
 
 def gemm_fp8_tensorwise(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    transA: bool = False,
-    transB: bool = False,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float8QuantConfig, None] = None,
 ) -> torch.Tensor:
-    assert A.ndim == 2 and B.ndim == 2, "Only 2D tensors are supported"
+    assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     # TODO(ruibzhan): We only support NN layout on gfx942.
-    assert not transA and not transB, f"Only support NN layout on FP8 tensorwise GEMM."
+    assert not trans_a and not trans_b, f"Only support NN layout on FP8 tensorwise GEMM."
 
     if out_dtype is None:
-        out_dtype = torch.result_type(A, B)
+        out_dtype = torch.result_type(a, b)
 
     if config is None:
         config = Float8QuantConfig()
 
-    args = (A, B, out_dtype, config)
+    args = (a, b, out_dtype, config)
 
     return TensorwiseFP8GemmFunction.apply(*args)
