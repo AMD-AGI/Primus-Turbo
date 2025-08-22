@@ -7,7 +7,12 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.float8 import Float8QuantConfig, Format, MXQuantConfig
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    MXQuantConfig,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise, gemm_fp8_tensorwise
 from tests.test_utils import compute_snr
 
@@ -136,3 +141,50 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+# TODO: This is tmp test code.
+def test_gemm_fp8_rowwise():
+    dtype = torch.bfloat16
+    m = 1024
+    n = 1024
+    k = 1024
+    format = Format.E4M3
+
+    layout = "NT"
+    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
+
+    device = "cuda:0"
+
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+
+    a_shape = (m, k) if not trans_a else (k, m)
+    b_shape = (k, n) if not trans_b else (n, k)
+
+    a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+    torch.cuda.synchronize()
+
+    # Ref
+    a_mat = a_ref.T if trans_a else a_ref
+    b_mat = b_ref.T if trans_b else b_ref
+    c_ref = a_mat @ b_mat
+    # grad_c = torch.randn_like(c_ref)
+    # c_ref.backward(grad_c)
+    torch.cuda.synchronize()
+
+    # Config + FWD + BWD
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.ROWWISE)
+    c = gemm_fp8_tensorwise(a, b, trans_a, trans_b, dtype, config)
+    # c.backward(grad_c)
+
+    print(c)
+    print(c_ref)
+
+    snr_threshold = 25 if format == Format.E4M3 else 20
+    c_snr = compute_snr(c_ref, c)
+    print(f"C-SNR: {c_snr:.2f} dB")
+    assert c_snr > snr_threshold, "c_snr too low"
