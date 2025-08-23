@@ -164,7 +164,7 @@ def build_kernels_extension():
             Path(PROJECT_ROOT / "csrc"),
         ],
         sources=kernels_sources,
-        libraries=["hipblas"],
+        libraries=["hipblaslt"],
         **extra_flags,
     )
 

@@ -147,8 +147,8 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
 def test_gemm_fp8_rowwise():
     dtype = torch.bfloat16
     m = 1024
-    n = 1024
-    k = 1024
+    n = 2048
+    k = 4096
     format = Format.E4M3
 
     layout = "NT"
