@@ -18,7 +18,7 @@ from primus_turbo.pytorch.core.float8 import (
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_blockwise_impl,
-    gemm_fp8_tensorwise_impl,
+    gemm_fp8_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
 from primus_turbo.pytorch.kernels.quantize import (
@@ -26,7 +26,7 @@ from primus_turbo.pytorch.kernels.quantize import (
     quant_fp8_tensorwise_impl,
 )
 
-__all__ = ["gemm_fp8_blockwise", "gemm_fp8_tensorwise"]
+__all__ = ["gemm_fp8_blockwise", "gemm_fp8"]
 
 
 # TODO: opt and refact
@@ -238,7 +238,7 @@ def quantize_fp8_rowwise(x: torch.Tensor, dtype: torch.dtype, dim: int = -1, eps
     return x_fp8.to(dtype), scale_inv.view(-1).to(torch.float)
 
 
-class TensorwiseFP8GemmFunction(torch.autograd.Function):
+class FP8GemmFunction(torch.autograd.Function):
 
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -261,28 +261,39 @@ class TensorwiseFP8GemmFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
-        # assert config.granularity == ScalingGranularity.TENSORWISE
+        a_dtype = FP8GemmFunction.get_fp8_dtype(config.format, True)
+        b_dtype = FP8GemmFunction.get_fp8_dtype(config.format, True)
 
-        a_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(config.format, True)
-        b_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(config.format, True)
-
+        a_t_fp8, b_t_fp8 = None, None
+        a_t_scale_inv, b_t_scale_inv = None, None
         if config.granularity == ScalingGranularity.TENSORWISE:
             a_scale, a_scale_inv = calc_scale_and_scale_inv(a, torch.finfo(a_dtype).max)
             b_scale, b_scale_inv = calc_scale_and_scale_inv(b, torch.finfo(b_dtype).max)
             a_fp8 = quant_fp8_tensorwise_impl(a, a_scale, a_dtype)
             b_fp8 = quant_fp8_tensorwise_impl(b, b_scale, b_dtype)
         elif config.granularity == ScalingGranularity.ROWWISE:
-            a_fp8, a_scale_inv = quantize_fp8_rowwise(a, a_dtype, dim=(-2 if trans_a else -1))
-            b_fp8, b_scale_inv = quantize_fp8_rowwise(b, b_dtype, dim=(-1 if trans_b else -2))
+            assert (
+                trans_a == False and trans_b == True
+            ), f"{ScalingGranularity.ROWWISE} only support NT layout."
+            assert config.format == Format.E4M3, f"{ScalingGranularity.ROWWISE} only support E4M3 format."
+            assert (
+                out_dtype == torch.bfloat16
+            ), f"{ScalingGranularity.ROWWISE} only support bfloat16 as out_dtype."
+
+            a_fp8, a_scale_inv = quantize_fp8_rowwise(a, a_dtype, dim=(-1))
+            b_fp8, b_scale_inv = quantize_fp8_rowwise(b, b_dtype, dim=(-1))
+
+            a_t_fp8, a_t_scale_inv = quantize_fp8_rowwise(a.transpose(0, 1).contiguous(), a_dtype, dim=(-1))
+            b_t_fp8, b_t_scale_inv = quantize_fp8_rowwise(b.transpose(0, 1).contiguous(), b_dtype, dim=(-1))
         else:
             raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
 
         # NN
-        out = gemm_fp8_tensorwise_impl(
-            a_fp8, a_scale_inv, trans_a, b_fp8, b_scale_inv, trans_b, out_dtype, False
-        )
+        out = gemm_fp8_impl(a_fp8, a_scale_inv, trans_a, b_fp8, b_scale_inv, trans_b, out_dtype, False)
 
-        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
+        ctx.save_for_backward(
+            a_fp8, a_scale_inv, b_fp8, b_scale_inv, a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv
+        )
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -292,48 +303,63 @@ class TensorwiseFP8GemmFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        (a_fp8, a_scale_inv, b_fp8, b_scale_inv) = ctx.saved_tensors
-        # For HYBRID format. data type of grad_out is e5m2.
-        grad_out_dtype = TensorwiseFP8GemmFunction.get_fp8_dtype(ctx.config.format, False)
+        (a_fp8, a_scale_inv, b_fp8, b_scale_inv, a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv) = (
+            ctx.saved_tensors
+        )
+        grad_out_dtype = FP8GemmFunction.get_fp8_dtype(ctx.config.format, False)
 
         if ctx.config.granularity == ScalingGranularity.TENSORWISE:
             grad_out_scale, grad_out_scale_inv = calc_scale_and_scale_inv(
                 grad_out, torch.finfo(grad_out_dtype).max
             )
             grad_out_fp8 = quant_fp8_tensorwise_impl(grad_out, grad_out_scale, grad_out_dtype)
+
+            # NT
+            a_grad = gemm_fp8_impl(
+                grad_out_fp8,
+                grad_out_scale_inv,
+                False,
+                b_fp8,
+                b_scale_inv,
+                not ctx.trans_b,
+                ctx.out_dtype,
+                ctx.trans_a,
+            )
+
+            # TN
+            b_grad = gemm_fp8_impl(
+                a_fp8,
+                a_scale_inv,
+                not ctx.trans_a,
+                grad_out_fp8,
+                grad_out_scale_inv,
+                False,
+                ctx.out_dtype,
+                ctx.trans_b,
+            )
         elif ctx.config.granularity == ScalingGranularity.ROWWISE:
-            assert False
+            # NOTE: rowwise only support NT layout.
+            grad_out_fp8, grad_out_scale_inv = quantize_fp8_rowwise(grad_out, grad_out_dtype, dim=(-1))
+            grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_rowwise(
+                grad_out.transpose(0, 1).contiguous(), grad_out_dtype, dim=(-1)
+            )
+
+            # NT
+            a_grad = gemm_fp8_impl(
+                grad_out_fp8, grad_out_scale_inv, False, b_t_fp8, b_t_scale_inv, True, ctx.out_dtype, False
+            )
+
+            # TN
+            b_grad = gemm_fp8_impl(
+                a_t_fp8, a_t_scale_inv, False, grad_out_t_fp8, grad_out_t_scale_inv, True, ctx.out_dtype, True
+            )
         else:
             raise ValueError(f"Unsupported FP8 ScalingGranularity: {ctx.config.granularity}")
-
-        # NT
-        a_grad = gemm_fp8_tensorwise_impl(
-            grad_out_fp8,
-            grad_out_scale_inv,
-            False,
-            b_fp8,
-            b_scale_inv,
-            not ctx.trans_b,
-            ctx.out_dtype,
-            ctx.trans_a,
-        )
-
-        # TN
-        b_grad = gemm_fp8_tensorwise_impl(
-            a_fp8,
-            a_scale_inv,
-            not ctx.trans_a,
-            grad_out_fp8,
-            grad_out_scale_inv,
-            False,
-            ctx.out_dtype,
-            ctx.trans_b,
-        )
 
         return (a_grad, b_grad, None, None, None, None)
 
 
-def gemm_fp8_tensorwise(
+def gemm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
     trans_a: bool = False,
@@ -351,4 +377,4 @@ def gemm_fp8_tensorwise(
 
     args = (a, b, trans_a, trans_b, out_dtype, config)
 
-    return TensorwiseFP8GemmFunction.apply(*args)
+    return FP8GemmFunction.apply(*args)

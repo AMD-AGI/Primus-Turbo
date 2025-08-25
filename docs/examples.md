@@ -118,6 +118,37 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
+### 1.4 Gemm with FP8 precision
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    ScalingGranularity,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+M = 128
+N = 256
+K = 512
+
+# a [M, K]
+a = torch.randn((M, K), dtype=dtype, device=device)
+# b [N, K]
+b = torch.randn((N, K), dtype=dtype, device=device)
+# c [M, N]
+
+# Set quant config through Float8QuantConfig class.
+quant_config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE)
+
+c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=quant_config)
+
+print(c)
+print(c.shape)
+```
+
 ## 2. Modules
 
 ### 2.1 Linear
