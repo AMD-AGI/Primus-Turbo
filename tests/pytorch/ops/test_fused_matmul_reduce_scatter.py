@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import itertools
 from typing import Dict, List
 
 import torch
@@ -15,7 +16,6 @@ from torch.testing._internal.common_distributed import (
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
-    parametrize,
     run_tests,
 )
 
@@ -23,6 +23,32 @@ import primus_turbo.pytorch as pt
 from tests.test_utils import get_tolerances
 
 _backend_streams: Dict[int, List[torch.cuda.Stream]] = {}
+
+
+def get_llama3_70b_cfg():
+    Ms = [8192]
+    Ns = [8192]
+    Ks = [8192, 28672]
+    Bs = [1, 4]
+    dtypes = [torch.bfloat16]
+    comm_methods = ["tile", "pipeline"]
+    for m, n, k, batch_size, dtype, comm_method in itertools.product(Ms, Ns, Ks, Bs, dtypes, comm_methods):
+        yield m, n, k, batch_size, dtype, comm_method
+
+
+def get_llama3_70b_fp8_cfg():
+    Ms = [8192]
+    Ns = [10240, 57344, 8192, 28672]
+    Ks = [8192]
+    Bs = [1]
+    dtypes = [torch.bfloat16]
+    scale_dtypes = [pt.float8_e4m3]
+    out_dtypes = [torch.bfloat16]
+    scale_modes = ["tensor-wise", "row-wise-sharded", "row-wise-replicated"]
+    for m, n, k, batch_size, dtype, scale_dtype, out_dtype, scale_mode in itertools.product(
+        Ms, Ns, Ks, Bs, dtypes, scale_dtypes, out_dtypes, scale_modes
+    ):
+        yield m, n, k, batch_size, dtype, scale_dtype, out_dtype, scale_mode
 
 
 def get_backend_stream(size=1, priority=0, prefix=""):
@@ -109,7 +135,9 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
-    def _init_process(self, comm_method):
+    def _init_process(
+        self,
+    ):
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -120,6 +148,7 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
+    def init_streams(self, comm_method):
         if comm_method == "pipeline":
             self.gemm_streams = [torch.cuda.current_stream()]
             self.comm_streams = get_backend_stream(size=self.world_size, priority=0, prefix="comm")
@@ -128,109 +157,107 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
             self.comm_streams = []
 
     @skip_if_lt_x_gpu(2)
-    @parametrize("scatter_dim", [0, 1])
-    @parametrize("reduce_op", ["sum", "avg"])
-    @parametrize("dtype", [torch.bfloat16, torch.float16])
-    @parametrize("comm_method", ["pipeline"])
-    def test_fused_matmul_reduce_scatter(
-        self, comm_method: str, scatter_dim: int, reduce_op: str, dtype: torch.dtype
-    ) -> None:
-        self._init_process(comm_method)
+    def test_fused_matmul_reduce_scatter(self) -> None:
+        self._init_process()
+        for comm_method, dtype, reduce_op, scatter_dim in itertools.product(
+            ["pipeline"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1]
+        ):
+            self.init_streams(comm_method)
 
-        BATCH = 8
-        M = 256
-        N = 256
-        K = 512
-        group = dist.group.WORLD
-        rank = self.rank
+            BATCH = 8
+            M = 256
+            N = 256
+            K = 512
+            group = dist.group.WORLD
+            rank = self.rank
 
-        A = generate_data(
-            shape=(BATCH, M, K),
-            dtype=dtype,
-            device="cuda",
-            scale=0.01 * (rank + 1),
-        )
-        B = generate_data(
-            shape=(K, N),
-            dtype=dtype,
-            device="cuda",
-            scale=0.01 * (rank + 1),
-        )
+            A = generate_data(
+                shape=(BATCH, M, K),
+                dtype=dtype,
+                device="cuda",
+                scale=0.01 * (rank + 1),
+            )
+            B = generate_data(
+                shape=(K, N),
+                dtype=dtype,
+                device="cuda",
+                scale=0.01 * (rank + 1),
+            )
 
-        rs_output_a2a = native_torch_matmul_reduce_scatter_a2a(A, B, scatter_dim, reduce_op, group)
-        rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
-        rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
-            A,
-            B,
-            layout="NN",
-            reduce_op=reduce_op,
-            scatter_dim=scatter_dim,
-            group_name=group.group_name,
-            gemm_streams=self.gemm_streams,
-            comm_streams=self.comm_streams,
-            comm_method=comm_method,
-        )
+            rs_output_a2a = native_torch_matmul_reduce_scatter_a2a(A, B, scatter_dim, reduce_op, group)
+            rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
+            rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+                A,
+                B,
+                layout="NN",
+                reduce_op=reduce_op,
+                scatter_dim=scatter_dim,
+                group_name=group.group_name,
+                gemm_streams=self.gemm_streams,
+                comm_streams=self.comm_streams,
+                comm_method=comm_method,
+            )
 
-        assert (
-            rs_output_native.stride() == rs_output_turbo.stride()
-        ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
-        diff = (rs_output_native - rs_output_turbo).abs().max()
-        diff_mask = rs_output_native != rs_output_turbo
-        print(
-            f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
-        )
-        diff = (rs_output_turbo - rs_output_a2a).abs().max()
-        diff_mask = rs_output_turbo != rs_output_a2a
-        print(
-            f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
-        )
-        torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
+            assert (
+                rs_output_native.stride() == rs_output_turbo.stride()
+            ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
+            diff = (rs_output_native - rs_output_turbo).abs().max()
+            diff_mask = rs_output_native != rs_output_turbo
+            print(
+                f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
+            )
+            diff = (rs_output_turbo - rs_output_a2a).abs().max()
+            diff_mask = rs_output_turbo != rs_output_a2a
+            print(
+                f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
+            )
+            torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
 
     @skip_if_lt_x_gpu(2)
-    @parametrize("M,K,N", [(8192, 8192, 8192), (8192, 28672, 8192)])
-    @parametrize("batch_size", [1, 4])
-    @parametrize("dtype", [torch.bfloat16])
-    @parametrize("comm_method", ["tile", "pipeline"])
-    def test_llama3_70b_fused_matmul_reduce_scatter(self, comm_method, dtype, batch_size, M, K, N) -> None:
-        self._init_process(comm_method)
+    def test_llama3_70b_fused_matmul_reduce_scatter(self) -> None:
+        self._init_process()
         group = dist.group.WORLD
         rank = self.rank
         scatter_dim = 0
         reduce_op = "sum"
 
-        A = generate_data(
-            shape=(batch_size * M, K // group.size()),
-            dtype=dtype,
-            device="cuda",
-            scale=0.01 * (rank + 1),
-        )
-        B = generate_data(
-            shape=(K // group.size(), N),
-            dtype=dtype,
-            device="cuda",
-            scale=0.01 * (rank + 1),
-        )
+        for M, N, K, batch_size, dtype, comm_method in get_llama3_70b_cfg():
+            self.init_streams(comm_method)
+            A = generate_data(
+                shape=(batch_size * M, K // group.size()),
+                dtype=dtype,
+                device="cuda",
+                scale=0.01 * (rank + 1),
+            )
+            B = generate_data(
+                shape=(K // group.size(), N),
+                dtype=dtype,
+                device="cuda",
+                scale=0.01 * (rank + 1),
+            )
 
-        rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
-        rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
-            A,
-            B,
-            layout="NN",
-            reduce_op=reduce_op,
-            scatter_dim=scatter_dim,
-            group_name=group.group_name,
-            gemm_streams=self.gemm_streams,
-            comm_streams=self.comm_streams,
-            comm_method=comm_method,
-        )
+            rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
+            rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+                A,
+                B,
+                layout="NN",
+                reduce_op=reduce_op,
+                scatter_dim=scatter_dim,
+                group_name=group.group_name,
+                gemm_streams=self.gemm_streams,
+                comm_streams=self.comm_streams,
+                comm_method=comm_method,
+            )
 
-        assert rs_output_native.stride() == rs_output_turbo.stride()
-        diff = (rs_output_native - rs_output_turbo).abs().max()
-        diff_mask = rs_output_native != rs_output_turbo
-        print(
-            f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_turbo.min()}, {rs_output_turbo.max()})"
-        )
-        torch.testing.assert_close(rs_output_native.float(), rs_output_turbo.float(), **get_tolerances(dtype))
+            assert rs_output_native.stride() == rs_output_turbo.stride()
+            diff = (rs_output_native - rs_output_turbo).abs().max()
+            diff_mask = rs_output_native != rs_output_turbo
+            print(
+                f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_turbo.min()}, {rs_output_turbo.max()})"
+            )
+            torch.testing.assert_close(
+                rs_output_native.float(), rs_output_turbo.float(), **get_tolerances(dtype)
+            )
 
 
 if __name__ == "__main__":

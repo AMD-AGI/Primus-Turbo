@@ -22,6 +22,7 @@ class AMDSymmetricMemory:
 
         self._comm_bufs = ipc_create_tensor_lists(group, [group.size()], torch.int32)
         self._comm_bufs[group.rank()].fill_(0)
+        torch.distributed.barrier(group)
         self._comm_buf_ptr = torch.tensor(
             [t.data_ptr() for t in self._comm_bufs], device=torch.cuda.current_device(), requires_grad=False
         )
