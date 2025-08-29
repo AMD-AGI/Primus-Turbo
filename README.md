@@ -1,7 +1,7 @@
 # Primus-Turbo
 **Primus-Turbo** is a high-performance core library for accelerating large-scale model training, inference, and reinforcement learning on AMD GPUs. Built and optimized for the AMD ROCm platform, it targets the full performance stack in Transformer-based models — covering core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision (FP8), and compute-communication overlap kernels.
 
-Primus-Turbo is designed to unlock the full potential of AMD GPUs for large-model workloads, providing a comprehensive acceleration foundation for next-generation AI systems.
+With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its core principles, Primus-Turbo unleashes the full potential of AMD GPUs for large-model workloads, providing a robust and comprehensive acceleration foundation for next-generation AI systems.
 
 
 ## 🚀 What's New
@@ -13,7 +13,7 @@ Primus-Turbo is designed to unlock the full potential of AMD GPUs for large-mode
 ### 1. Docker (Recommended)
 Use the pre-built AMD ROCm image:
 ```
-rocm/megatron-lm:v25.5_py310
+rocm/megatron-lm:v25.7_py310
 ```
 
 ### 2. Install from Source
