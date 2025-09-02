@@ -46,19 +46,14 @@ class TurboBuildExt(BuildExtension):
             print(f"  - {build_dst_dir}")
 
 
-def all_files_in_dir(path, name_extensions=[]):
+def all_files_in_dir(path, name_extensions=None):
     all_files = []
     for dirname, _, names in os.walk(path):
         for name in names:
-            skip = True
-            for name_extension in name_extensions:
-                if name_extension in name:
-                    skip = False
-                    break
-            if skip:
+            suffix = Path(name).suffix.lstrip(".")
+            if name_extensions and suffix not in name_extensions:
                 continue
             all_files.append(Path(dirname, name))
-
     return all_files
 
 
@@ -156,7 +151,8 @@ def build_kernels_extension():
     ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
-    kernels_source = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
+    kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
+
     return HIPExtension(
         name="libprimus_turbo_kernels",
         include_dirs=[
@@ -164,7 +160,7 @@ def build_kernels_extension():
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
             Path(PROJECT_ROOT / "csrc"),
         ],
-        sources=kernels_source,
+        sources=kernels_sources,
         libraries=["hipblas"],
         **extra_flags,
     )

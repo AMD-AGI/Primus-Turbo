@@ -13,10 +13,10 @@
 namespace primus_turbo::deep_ep {
 
 template <typename dtype_t> struct Buffer {
-  private:
+private:
     uint8_t *ptr;
 
-  public:
+public:
     int total_bytes;
 
     __device__ __forceinline__ Buffer() : ptr(nullptr), total_bytes(0) {}
@@ -38,11 +38,11 @@ template <typename dtype_t> struct Buffer {
 };
 
 template <typename dtype_t, int kNumRanks = 1> struct AsymBuffer {
-  private:
+private:
     uint8_t *ptrs[kNumRanks];
     int      num_bytes;
 
-  public:
+public:
     int total_bytes;
 
     __device__ __forceinline__ AsymBuffer(void *&gbl_ptr, int num_elems, int num_ranks,
