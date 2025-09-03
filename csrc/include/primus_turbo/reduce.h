@@ -18,7 +18,7 @@ enum class PrimusTurboReduceOp {
 template <typename ComputeType>
 int64_t get_reduce_row_workspace_sizes(const int64_t &outer_len, const int64_t &inner_len) {
     const int     BLOCK  = 256;
-    const int     UNROLL = 16;
+    const int     UNROLL = 32;
     const int64_t cnt = DIVUP<int64_t>(inner_len, BLOCK * UNROLL) * 2; // For multi rounds ping-pong
     return (cnt == 1 ? 0 : sizeof(ComputeType) * cnt * outer_len);
 }

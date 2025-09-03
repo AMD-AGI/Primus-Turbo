@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "../extensions.h"
+#include "../utils.h"
 #include "primus_turbo/reduce.h"
 
 namespace primus_turbo::pytorch {
@@ -42,11 +43,12 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
     auto          input_max = torch::empty({}, input.options().dtype(at::kFloat));
     const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
     auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
-    reduce_row<bfloat16, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
-                                       reinterpret_cast<bfloat16 *>(input.data_ptr()),
-                                       reinterpret_cast<float *>(input_max.data_ptr()), 1,
-                                       input.numel(), ws_size, workspace.data_ptr(), stream);
-    // auto        input_max = input.abs().max().to(at::kFloat);
+    TORCH_TYPE_SWITCH_FLOAT(input.scalar_type(), InT, {
+        reduce_row<InT, float, float>(
+            PrimusTurboReduceOp::REDUCE_ABS_MAX, reinterpret_cast<InT *>(input.data_ptr()),
+            input_max.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
+    });
+
     input_max = input_max.clamp_min(1e-12f);
     // Compute Scale
     const float fp8_max   = get_float8_max(dest_dtype);

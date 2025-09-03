@@ -71,6 +71,24 @@
     }
 */
 
+#define TORCH_TYPE_SWITCH_FLOAT(scalar_type, TYPE, ...)                           \
+    switch (scalar_type) {                                                        \
+    case at::kFloat: {                                                            \
+        using TYPE = dtype::float32;                                              \
+        { __VA_ARGS__ }                                                           \
+    } break;                                                                      \
+    case at::kHalf: {                                                             \
+        using TYPE = dtype::float16;                                              \
+        { __VA_ARGS__ }                                                           \
+    } break;                                                                      \
+    case at::kBFloat16: {                                                         \
+        using TYPE = dtype::bfloat16;                                             \
+        { __VA_ARGS__ }                                                           \
+    } break;                                                                      \
+    default:                                                                      \
+        TORCH_CHECK(false, "Invalid dtype (only fp32/fp16/bf16).");               \
+    }
+
 #define TORCH_TYPE_SWITCH_OUTPUT(scalar_type, type, ...)                          \
     [&] {                                                                         \
         using namespace primus_turbo;                                             \

@@ -11,14 +11,14 @@
 namespace primus_turbo {
 
 template <template <class> class ReduceOp, typename InType, typename OutType, typename ComputeType,
-          int UNROLL>
-__global__ void reduce_row_kernel(const InType *input, OutType *output, const int64_t outer_len,
-                                  const int64_t inner_len) {
+          int BLOCK_SIZE, int UNROLL>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void reduce_row_kernel(const InType *__restrict__ input, OutType *__restrict__ output,
+                           const int64_t outer_len, const int64_t inner_len) {
     static constexpr int UNROLL_N = 16 / sizeof(InType);
     static constexpr int UNROLL_M = UNROLL / UNROLL_N;
     static_assert(UNROLL_N * UNROLL_M == UNROLL, "UNROLL_N * UNROLL_M must equal UNROLL");
 
-    const int BLOCKSIZE = blockDim.x;
     const int blockid_x = blockIdx.x;
     const int blockid_y = blockIdx.y;
     const int tid       = threadIdx.x;
@@ -26,11 +26,11 @@ __global__ void reduce_row_kernel(const InType *input, OutType *output, const in
     const InType init_intype = ReduceOp<InType>::init();
     InType       ld_regs[UNROLL_M][UNROLL_N];
 
-    const int64_t tile_elems  = static_cast<int64_t>(BLOCKSIZE) * UNROLL_N;
-    const int64_t block_start = static_cast<int64_t>(blockid_x) * BLOCKSIZE * UNROLL;
+    const int64_t tile_elems  = static_cast<int64_t>(BLOCK_SIZE) * UNROLL_N;
+    const int64_t block_start = static_cast<int64_t>(blockid_x) * BLOCK_SIZE * UNROLL;
     const InType *input_ptr   = input + blockid_y * inner_len + block_start;
 
-    const bool full_tile = block_start + BLOCKSIZE * UNROLL <= inner_len;
+    const bool full_tile = block_start + BLOCK_SIZE * UNROLL <= inner_len;
     if (full_tile) {
 #pragma unroll
         for (int mi = 0; mi < UNROLL_M; ++mi) {
@@ -39,35 +39,43 @@ __global__ void reduce_row_kernel(const InType *input, OutType *output, const in
         }
     } else {
         for (int mi = 0; mi < UNROLL_M; ++mi) {
-            const int64_t offset = mi * tile_elems + tid * UNROLL_N;
-            #pragma unroll
+            const int64_t offset = mi * BLOCK_SIZE;
+#pragma unroll
             for (int ni = 0; ni < UNROLL_N; ++ni) {
-                const int64_t g = block_start + offset + ni;
+                const int64_t g = block_start + offset + ni * BLOCK_SIZE;
                 ld_regs[mi][ni] = (g < inner_len) ? input_ptr[offset + ni] : init_intype;
             }
         }
     }
 
-    const ComputeType init_ctype = ReduceOp<ComputeType>::init();
-    ComputeType       reduce_regs[UNROLL_N];
+    ComputeType reduce_regs[UNROLL_M];
+    for (int mi = 0; mi < UNROLL_M; ++mi) {
+        ComputeType regs[UNROLL_N];
 #pragma unroll
-    for (int j = 0; j < UNROLL_N; ++j) {
-        ComputeType reg = init_ctype;
-#pragma unroll
-        for (int i = 0; i < UNROLL_M; ++i) {
-            reg = ReduceOp<ComputeType>::op(reg, static_cast<ComputeType>(ld_regs[i][j]));
+        for (int ni = 0; ni < UNROLL_N; ++ni) {
+            regs[ni] = static_cast<ComputeType>(ld_regs[mi][ni]);
         }
-        reduce_regs[j] = reg;
-    }
 
-    ComputeType ret = init_ctype;
-// TODO: Opt
 #pragma unroll
-    for (int ni = 0; ni < UNROLL_N; ++ni) {
-        ret = ReduceOp<ComputeType>::op(reduce_regs[ni], ret);
+        for (int stride = UNROLL_N / 2; stride > 0; stride >>= 1) {
+#pragma unroll
+            for (int i = 0; i < stride; ++i) {
+                regs[i] = ReduceOp<ComputeType>::op(regs[i], regs[i + stride]);
+            }
+        }
+        reduce_regs[mi] = regs[0];
     }
 
-    ret = BlockReduce<ReduceOp, ComputeType>(ret);
+#pragma unroll
+    for (int stride = UNROLL_M / 2; stride > 0; stride >>= 1) {
+#pragma unroll
+        for (int i = 0; i < stride; ++i) {
+            reduce_regs[i] = ReduceOp<ComputeType>::op(reduce_regs[i], reduce_regs[i + stride]);
+        }
+    }
+
+    ComputeType ret = reduce_regs[0];
+    ret             = BlockReduce<ReduceOp, ComputeType>(ret);
 
     OutType *output_ptr = output + blockid_y * gridDim.x + blockid_x;
     // Save

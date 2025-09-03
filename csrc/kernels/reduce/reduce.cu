@@ -14,15 +14,15 @@ template <template <class> class ReduceOp, typename InType, typename OutType, ty
 void reduce_row_impl(const InType *input, OutType *output, const int64_t &outer_len,
                      const int64_t &inner_len, const int64_t workspace_sizes, void *workspace,
                      hipStream_t stream) {
-    const int     BLOCK      = 256;
-    const int     UNROLL     = 16;
-    const int64_t TILE_ELEMS = BLOCK * UNROLL;
+    constexpr int     BLOCK_SIZE = 256;
+    constexpr int     UNROLL     = 32;
+    constexpr int64_t TILE_ELEMS = BLOCK_SIZE * UNROLL;
     if (inner_len <= TILE_ELEMS) {
-        const int64_t grid_i = DIVUP<int64_t>(inner_len, BLOCK * UNROLL);
+        const int64_t grid_i = DIVUP<int64_t>(inner_len, BLOCK_SIZE * UNROLL);
         const int64_t grid_o = outer_len;
         const dim3    grid(grid_i, grid_o, 1);
-        reduce_row_kernel<ReduceOp, InType, OutType, ComputeType, UNROLL>
-            <<<grid, BLOCK, 0, stream>>>(input, output, outer_len, inner_len);
+        reduce_row_kernel<ReduceOp, InType, OutType, ComputeType, BLOCK_SIZE, UNROLL>
+            <<<grid, BLOCK_SIZE, 0, stream>>>(input, output, outer_len, inner_len);
         return;
     }
 
@@ -38,16 +38,16 @@ void reduce_row_impl(const InType *input, OutType *output, const int64_t &outer_
     // Frist round
     {
         const dim3 grid(tiles, outer_len, 1);
-        reduce_row_kernel<ReduceOp, InType, ComputeType, ComputeType, UNROLL>
-            <<<grid, BLOCK, 0, stream>>>(input, ping, outer_len, inner_len);
+        reduce_row_kernel<ReduceOp, InType, ComputeType, ComputeType, BLOCK_SIZE, UNROLL>
+            <<<grid, BLOCK_SIZE, 0, stream>>>(input, ping, outer_len, inner_len);
     }
 
     int64_t cur_inner = tiles;
     while (cur_inner > TILE_ELEMS) {
         const int64_t next_tiles = DIVUP<int64_t>(cur_inner, TILE_ELEMS);
         const dim3    grid(next_tiles, outer_len, 1);
-        reduce_row_kernel<ReduceOp, ComputeType, ComputeType, ComputeType, UNROLL>
-            <<<grid, BLOCK, 0, stream>>>(ping, pong, outer_len, cur_inner);
+        reduce_row_kernel<ReduceOp, ComputeType, ComputeType, ComputeType, BLOCK_SIZE, UNROLL>
+            <<<grid, BLOCK_SIZE, 0, stream>>>(ping, pong, outer_len, cur_inner);
         std::swap(ping, pong);
         cur_inner = next_tiles;
     }
@@ -55,12 +55,11 @@ void reduce_row_impl(const InType *input, OutType *output, const int64_t &outer_
     // Last round
     {
         const dim3 grid(DIVUP<int64_t>(cur_inner, TILE_ELEMS), outer_len, 1);
-        reduce_row_kernel<ReduceOp, ComputeType, OutType, ComputeType, UNROLL>
-            <<<grid, BLOCK, 0, stream>>>(ping, output, outer_len, cur_inner);
+        reduce_row_kernel<ReduceOp, ComputeType, OutType, ComputeType, BLOCK_SIZE, UNROLL>
+            <<<grid, BLOCK_SIZE, 0, stream>>>(ping, output, outer_len, cur_inner);
     }
 }
 
-// TODO: Refactor
 template <typename InType, typename OutType, typename ComputeType>
 void reduce_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,
                 const int64_t &outer_len, const int64_t &inner_len, const int64_t workspace_sizes,
@@ -77,6 +76,18 @@ void reduce_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *out
     }
     PRIMUS_TURBO_CHECK(false, "Unsupported reduce op");
 }
+
+template void reduce_row<float, float, float>(PrimusTurboReduceOp reduce_op, const float *input,
+                                              float *output, const int64_t &outer_len,
+                                              const int64_t &inner_len,
+                                              const int64_t workspace_sizes, void *workspace,
+                                              hipStream_t stream);
+
+template void reduce_row<float16, float, float>(PrimusTurboReduceOp reduce_op, const float16 *input,
+                                                float *output, const int64_t &outer_len,
+                                                const int64_t &inner_len,
+                                                const int64_t workspace_sizes, void *workspace,
+                                                hipStream_t stream);
 
 template void reduce_row<bfloat16, float, float>(PrimusTurboReduceOp reduce_op,
                                                  const bfloat16 *input, float *output,

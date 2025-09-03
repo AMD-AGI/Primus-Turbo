@@ -23,6 +23,13 @@ public:
     PRIMUS_TURBO_HOST_DEVICE static T op(const T &x, const T &y) { return x > y ? x : y; }
 };
 
+template <> struct MaxOp<float> {
+public:
+    PRIMUS_TURBO_HOST_DEVICE static float init() { return -std::numeric_limits<float>::infinity(); }
+
+    PRIMUS_TURBO_HOST_DEVICE static float op(const float &x, const float &y) { return fmaxf(x, y); }
+};
+
 template <> struct MaxOp<float16> {
 public:
     PRIMUS_TURBO_HOST_DEVICE static float16 init() {
@@ -53,6 +60,12 @@ public:
                                                     : std::numeric_limits<T>::max();
     }
     PRIMUS_TURBO_HOST_DEVICE static T op(const T &x, const T &y) { return x < y ? x : y; }
+};
+
+template <> struct MinOp<float> {
+public:
+    PRIMUS_TURBO_HOST_DEVICE static float init() { return std::numeric_limits<float>::infinity(); }
+    PRIMUS_TURBO_HOST_DEVICE static float op(const float &x, const float &y) { return fminf(x, y); }
 };
 
 template <> struct MinOp<float16> {
@@ -92,15 +105,13 @@ public:
     }
 };
 
-template <> 
-struct AbsMaxOp<float> {
+template <> struct AbsMaxOp<float> {
 public:
     PRIMUS_TURBO_HOST_DEVICE static float init() { return 0.0f; }
     PRIMUS_TURBO_HOST_DEVICE static float op(const float &x, const float &y) {
         return fmaxf(fabsf(x), fabsf(y));
     }
 };
-
 
 /**
  * Warp Reduce and Block Reduce
