@@ -93,7 +93,6 @@ o = turbo.ops.flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True,
 
 torch.distributed.destroy_process_group()
 # run with torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12355 this_code.py
-
 ```
 
 
@@ -147,3 +146,53 @@ print(model)
 print(output)
 print(output.shape)
 ```
+
+
+## 3. FP8
+
+### 3.1 FP8 GEMM
+```python
+
+```
+
+### 3.2 FP8 GroupedGEMM
+
+Grouped GEMM supports multiple sub-matrices with different row sizes in a single call. The workflow is below:
+
+FP16/BF16 -> Quantize -> FP8 -> GroupedGEMM(FP8 × FP8) -> FP16/BF16
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+
+# 4 groups, total rows M = 128
+G, M, N, K = 4, 128, 256, 512
+group_lens = torch.tensor([32, 16, 48, 32], device=device)
+
+a = torch.randn(M, K, device=device, dtype=dtype)
+b = torch.randn(G, N, K, device=device, dtype=dtype)  # shape [G, N, K] if trans_b=True
+
+fp8_cfg = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.TENSORWISE,  # or ROWWISE
+)
+
+c = turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=fp8_cfg)
+print(c.shape)  # [128, 256]
+```
+
+**Quantization Config (Float8QuantConfig)**
+* format
+    * Format.E4M3 (default)
+    * Format.E5M2
+* granularity
+    * ScalingGranularity.TENSORWISE (default)
+    * ScalingGranularity.ROWWISE
