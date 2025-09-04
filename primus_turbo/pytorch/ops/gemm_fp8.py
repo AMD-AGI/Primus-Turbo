@@ -21,12 +21,10 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
-from primus_turbo.pytorch.kernels.quantize import (
-    quant_fp8_blockwise_impl,
-    quant_fp8_tensorwise_impl,
-)
+from primus_turbo.pytorch.kernels.quantize import quant_fp8_blockwise_impl
+from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
-__all__ = ["gemm_fp8_blockwise", "gemm_fp8"]
+__all__ = ["gemm_fp8", "gemm_fp8_blockwise"]
 
 
 # TODO: opt and refact
@@ -267,10 +265,9 @@ class FP8GemmFunction(torch.autograd.Function):
         a_t_fp8, b_t_fp8 = None, None
         a_t_scale_inv, b_t_scale_inv = None, None
         if config.granularity == ScalingGranularity.TENSORWISE:
-            a_scale, a_scale_inv = calc_scale_and_scale_inv(a, torch.finfo(a_dtype).max)
-            b_scale, b_scale_inv = calc_scale_and_scale_inv(b, torch.finfo(b_dtype).max)
-            a_fp8 = quant_fp8_tensorwise_impl(a, a_scale, a_dtype)
-            b_fp8 = quant_fp8_tensorwise_impl(b, b_scale, b_dtype)
+            a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
+            b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
+
         elif config.granularity == ScalingGranularity.ROWWISE:
             assert (
                 trans_a == False and trans_b == True
@@ -309,10 +306,7 @@ class FP8GemmFunction(torch.autograd.Function):
         grad_out_dtype = FP8GemmFunction.get_fp8_dtype(ctx.config.format, False)
 
         if ctx.config.granularity == ScalingGranularity.TENSORWISE:
-            grad_out_scale, grad_out_scale_inv = calc_scale_and_scale_inv(
-                grad_out, torch.finfo(grad_out_dtype).max
-            )
-            grad_out_fp8 = quant_fp8_tensorwise_impl(grad_out, grad_out_scale, grad_out_dtype)
+            grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
 
             # NT
             a_grad = gemm_fp8_impl(

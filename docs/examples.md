@@ -118,37 +118,6 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
-### 1.4 Gemm with FP8 precision
-
-```python
-import torch
-import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.float8 import (
-    Float8QuantConfig,
-    ScalingGranularity,
-)
-
-device = "cuda:0"
-dtype = torch.bfloat16
-M = 128
-N = 256
-K = 512
-
-# a [M, K]
-a = torch.randn((M, K), dtype=dtype, device=device)
-# b [N, K]
-b = torch.randn((N, K), dtype=dtype, device=device)
-# c [M, N]
-
-# Set quant config through Float8QuantConfig class.
-quant_config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE)
-
-c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=quant_config)
-
-print(c)
-print(c.shape)
-```
-
 ## 2. Modules
 
 ### 2.1 Linear
@@ -178,19 +147,67 @@ print(output)
 print(output.shape)
 ```
 
-
 ## 3. FP8
 
-### 3.1 FP8 GEMM
-```python
+This section introduces the **FP8 quantization config** and usage of **FP8 GEMM** and **FP8 GroupedGEMM** in Primus-Turbo.
 
+
+### 3.1 Quantization Config (Float8QuantConfig)
+
+FP8 quantization is configured through `Float8QuantConfig`:
+
+- **format**
+  - `Format.E4M3` (default)
+  - `Format.E5M2`
+- **granularity**
+  - `ScalingGranularity.TENSORWISE` (default)
+  - `ScalingGranularity.ROWWISE`
+
+### 3.2 FP8 GEMM
+
+Computation flow:
+
+`FP16/BF16 → Quantize → FP8 → GEMM(FP8 × FP8) → FP16/BF16`
+
+Example:
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+
+M, N, K = 128, 256, 512
+# a [M, K]
+a = torch.randn((M, K), dtype=dtype, device=device)
+# b [N, K]
+b = torch.randn((N, K), dtype=dtype, device=device)
+# c [M, N]
+
+# Set quant config through Float8QuantConfig class.
+fp8_cfg = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.TENSORWISE,  # or ROWWISE
+)
+
+c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=quant_config)
+print(c)
+print(c.shape) # [128, 256]
 ```
 
-### 3.2 FP8 GroupedGEMM
+### 3.3 FP8 GroupedGEMM
 
 Grouped GEMM supports multiple sub-matrices with different row sizes in a single call. The workflow is below:
 
-FP16/BF16 -> Quantize -> FP8 -> GroupedGEMM(FP8 × FP8) -> FP16/BF16
+`FP16/BF16 -> Quantize -> FP8 -> GroupedGEMM(FP8 × FP8) -> FP16/BF16`
+
+Example:
 
 ```python
 import torch
@@ -217,13 +234,6 @@ fp8_cfg = Float8QuantConfig(
 )
 
 c = turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=fp8_cfg)
+print(c)
 print(c.shape)  # [128, 256]
 ```
-
-**Quantization Config (Float8QuantConfig)**
-* format
-    * Format.E4M3 (default)
-    * Format.E5M2
-* granularity
-    * ScalingGranularity.TENSORWISE (default)
-    * ScalingGranularity.ROWWISE
