@@ -916,10 +916,13 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
     }
 
     // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+    if (not use_default_stream_as_comm_stream) {
+        // Wait previous tasks to be finished
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
     }
 
     // Create handles (only return for non-cached mode)
@@ -1091,7 +1094,9 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        stream_wait(compute_stream, comm_stream);
+        if (not use_default_stream_as_comm_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
     }
 
     // Switch back compute stream
@@ -1182,10 +1187,12 @@ Buffer::internode_combine(
     }
 
     // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+    if (not use_default_stream_as_comm_stream) {
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
     }
 
     // Top-k checks
@@ -1263,7 +1270,9 @@ Buffer::internode_combine(
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        stream_wait(compute_stream, comm_stream);
+        if (not use_default_stream_as_comm_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
     }
 
     // Switch back compute stream
