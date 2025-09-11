@@ -5,7 +5,7 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 
 
 ## 🚀 What's New
-...
+- **[2025/9/11]** Primus-Turbo initial release, version v0.1.0.
 
 
 ## 📦 Quick Start
