@@ -786,9 +786,9 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
            std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
-           std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
-           std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<EventHandle>>
+           torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>,
+           torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>, std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                            const std::optional<torch::Tensor> &topk_idx,
                            const std::optional<torch::Tensor> &topk_weights,
@@ -801,7 +801,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                            const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
                            const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-                           int expert_alignment, const Config &config,
+                           int expert_alignment, int num_worst_tokens, const Config &config,
                            std::optional<EventHandle> &previous_event, bool async,
                            bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
@@ -932,6 +932,8 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
     auto             gbl_channel_prefix_matrix  = torch::Tensor();
     auto             recv_gbl_rank_prefix_sum   = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
+    torch::Tensor    num_recv_tokens_per_expert = torch::empty(
+        {num_local_experts}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
 
     // Barrier or send sizes
     if (cached_mode) {
@@ -968,7 +970,8 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         primus_turbo::deep_ep::internode::notify_dispatch(
             num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
             num_tokens_per_rdma_rank->data_ptr<int>(), moe_recv_rdma_counter_mapped,
-            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped, num_experts,
+            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped,
+            num_recv_tokens_per_expert.data_ptr<int64_t>(), num_experts,
             is_token_in_rank.data_ptr<bool>(), num_tokens, num_channels, hidden_int4, num_scales,
             num_topk, expert_alignment, rdma_channel_prefix_matrix.data_ptr<int>(),
             recv_rdma_rank_prefix_sum.data_ptr<int>(), gbl_channel_prefix_matrix.data_ptr<int>(),
@@ -978,34 +981,43 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
             low_latency_mode);
 
-        // Synchronize total received tokens and tokens per expert
-        auto start_time = std::chrono::high_resolution_clock::now();
-        while (true) {
-            // Read total count
-            num_recv_tokens      = static_cast<int>(*moe_recv_counter);
-            num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
+        if (num_worst_tokens > 0) {
+            // No CPU sync, just allocate the worst case
+            num_recv_tokens      = num_worst_tokens;
+            num_rdma_recv_tokens = num_worst_tokens;
+            // Must be forward with top-k stuffs
+            PRIMUS_TURBO_CHECK(topk_idx.has_value());
+            PRIMUS_TURBO_CHECK(topk_weights.has_value());
+        } else {
+            // Synchronize total received tokens and tokens per expert
+            auto start_time = std::chrono::high_resolution_clock::now();
+            while (true) {
+                // Read total count
+                num_recv_tokens      = static_cast<int>(*moe_recv_counter);
+                num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
 
-            // Read per-expert count
-            bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
-            for (int i = 0; i < num_local_experts and ready; ++i)
-                ready &= moe_recv_expert_counter[i] >= 0;
+                // Read per-expert count
+                bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
+                for (int i = 0; i < num_local_experts and ready; ++i)
+                    ready &= moe_recv_expert_counter[i] >= 0;
 
-            if (ready)
-                break;
+                if (ready)
+                    break;
 
-            // Timeout check
-            if (std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::high_resolution_clock::now() - start_time)
-                    .count() > NUM_CPU_TIMEOUT_SECS) {
-                printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank,
-                       num_recv_tokens, num_rdma_recv_tokens);
-                for (int i = 0; i < num_local_experts; ++i)
-                    printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
-                throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                // Timeout check
+                if (std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::high_resolution_clock::now() - start_time)
+                        .count() > NUM_CPU_TIMEOUT_SECS) {
+                    printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank,
+                           num_recv_tokens, num_rdma_recv_tokens);
+                    for (int i = 0; i < num_local_experts; ++i)
+                        printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
+                    throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                }
             }
+            num_recv_tokens_per_expert_list = std::vector<int>(
+                moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
-        num_recv_tokens_per_expert_list =
-            std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     }
 
     // Allocate new tensors
@@ -1064,8 +1076,8 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
         rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
         gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
-        is_token_in_rank.data_ptr<bool>(), num_tokens, hidden_int4, num_scales, num_topk,
-        num_experts, scale_token_stride, scale_hidden_stride, rdma_buffer_ptr,
+        is_token_in_rank.data_ptr<bool>(), num_tokens, num_worst_tokens, hidden_int4, num_scales,
+        num_topk, num_experts, scale_token_stride, scale_hidden_stride, rdma_buffer_ptr,
         config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode, comm_stream,
@@ -1109,6 +1121,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             recv_topk_idx,
             recv_topk_weights,
             num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert,
             rdma_channel_prefix_matrix,
             gbl_channel_prefix_matrix,
             recv_rdma_channel_prefix_matrix,
