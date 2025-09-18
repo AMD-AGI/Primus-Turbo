@@ -53,6 +53,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
         hipblasLtMatmulDescAttributes_t scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
         hipblasLtMatmulDescAttributes_t scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
+#if 0
         if (use_rowwise) {
 #if 1
             // New hipblaslt
@@ -69,6 +70,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER_VEC_EXT;
 #endif
         }
+#endif
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
             operation_desc, scaleA_inv_ptr_desc, &scaleA_inv, sizeof(scaleA_inv)));
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(

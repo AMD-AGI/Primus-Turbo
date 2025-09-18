@@ -267,21 +267,20 @@ class FP8GemmFunction(torch.autograd.Function):
         if config.granularity == ScalingGranularity.TENSORWISE:
             a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
             b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
+        # elif config.granularity == ScalingGranularity.ROWWISE:
+        #     assert (
+        #         trans_a == False and trans_b == True
+        #     ), f"{ScalingGranularity.ROWWISE} only support NT layout."
+        #     assert config.format == Format.E4M3, f"{ScalingGranularity.ROWWISE} only support E4M3 format."
+        #     assert (
+        #         out_dtype == torch.bfloat16
+        #     ), f"{ScalingGranularity.ROWWISE} only support bfloat16 as out_dtype."
 
-        elif config.granularity == ScalingGranularity.ROWWISE:
-            assert (
-                trans_a == False and trans_b == True
-            ), f"{ScalingGranularity.ROWWISE} only support NT layout."
-            assert config.format == Format.E4M3, f"{ScalingGranularity.ROWWISE} only support E4M3 format."
-            assert (
-                out_dtype == torch.bfloat16
-            ), f"{ScalingGranularity.ROWWISE} only support bfloat16 as out_dtype."
+        #     a_fp8, a_scale_inv = quantize_fp8_rowwise(a, a_dtype, dim=(-1))
+        #     b_fp8, b_scale_inv = quantize_fp8_rowwise(b, b_dtype, dim=(-1))
 
-            a_fp8, a_scale_inv = quantize_fp8_rowwise(a, a_dtype, dim=(-1))
-            b_fp8, b_scale_inv = quantize_fp8_rowwise(b, b_dtype, dim=(-1))
-
-            a_t_fp8, a_t_scale_inv = quantize_fp8_rowwise(a.transpose(0, 1).contiguous(), a_dtype, dim=(-1))
-            b_t_fp8, b_t_scale_inv = quantize_fp8_rowwise(b.transpose(0, 1).contiguous(), b_dtype, dim=(-1))
+        #     a_t_fp8, a_t_scale_inv = quantize_fp8_rowwise(a.transpose(0, 1).contiguous(), a_dtype, dim=(-1))
+        #     b_t_fp8, b_t_scale_inv = quantize_fp8_rowwise(b.transpose(0, 1).contiguous(), b_dtype, dim=(-1))
         else:
             raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
 
@@ -331,22 +330,22 @@ class FP8GemmFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_b,
             )
-        elif ctx.config.granularity == ScalingGranularity.ROWWISE:
-            # NOTE: rowwise only support NT layout.
-            grad_out_fp8, grad_out_scale_inv = quantize_fp8_rowwise(grad_out, grad_out_dtype, dim=(-1))
-            grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_rowwise(
-                grad_out.transpose(0, 1).contiguous(), grad_out_dtype, dim=(-1)
-            )
+        # elif ctx.config.granularity == ScalingGranularity.ROWWISE:
+        #     # NOTE: rowwise only support NT layout.
+        #     grad_out_fp8, grad_out_scale_inv = quantize_fp8_rowwise(grad_out, grad_out_dtype, dim=(-1))
+        #     grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_rowwise(
+        #         grad_out.transpose(0, 1).contiguous(), grad_out_dtype, dim=(-1)
+        #     )
 
-            # NT
-            a_grad = gemm_fp8_impl(
-                grad_out_fp8, grad_out_scale_inv, False, b_t_fp8, b_t_scale_inv, True, ctx.out_dtype, False
-            )
+        #     # NT
+        #     a_grad = gemm_fp8_impl(
+        #         grad_out_fp8, grad_out_scale_inv, False, b_t_fp8, b_t_scale_inv, True, ctx.out_dtype, False
+        #     )
 
-            # TN
-            b_grad = gemm_fp8_impl(
-                a_t_fp8, a_t_scale_inv, False, grad_out_t_fp8, grad_out_t_scale_inv, True, ctx.out_dtype, True
-            )
+        #     # TN
+        #     b_grad = gemm_fp8_impl(
+        #         a_t_fp8, a_t_scale_inv, False, grad_out_t_fp8, grad_out_t_scale_inv, True, ctx.out_dtype, True
+        #     )
         else:
             raise ValueError(f"Unsupported FP8 ScalingGranularity: {ctx.config.granularity}")
 
