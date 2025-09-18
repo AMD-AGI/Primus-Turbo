@@ -13,7 +13,7 @@
 namespace primus_turbo {
 
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);
-
+std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
 template <typename AType, typename BType, typename CType> struct CKGroupedGemmParams {
     void *args_ptr = nullptr;
 

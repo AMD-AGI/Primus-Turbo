@@ -19,6 +19,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
+from tests.test_utils import compute_snr
 
 M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 EP_SIZE_LIST = [32, 16, 8]
@@ -95,6 +96,21 @@ def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, format, granularity, trans_b, 
     out = fwd_func()
     bwd_func()
 
+    # Compute SNRs
+    out_snr = compute_snr(out_ref, out)
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+
+    if out_snr <= 20:
+        print(f"out_snr too low: {out_snr}")
+    if a_grad_snr <= 20:
+        print(f"x_grad_snr too low: {a_grad_snr}")
+    if b_grad_snr <= 20:
+        print(f"w_grad_snr too low: {b_grad_snr}")
+
+    assert out_snr > 20, "out_snr too low"
+    assert a_grad_snr > 20, "x_grad_snr too low"
+    assert b_grad_snr > 20, "w_grad_snr too low"
     # Calculate FLOPs
     fwd_total_flops = 2 * B * M * N * K
     bwd_total_flops = 2 * fwd_total_flops

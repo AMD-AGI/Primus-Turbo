@@ -1,4 +1,3 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
-	url = https://github.com/kyle-256/composable_kernel.git
-	branch = quant_grouped_gemm
+	url = https://github.com/ROCm/composable_kernel.git

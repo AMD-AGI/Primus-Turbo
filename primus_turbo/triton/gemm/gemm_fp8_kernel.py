@@ -1,5 +1,25 @@
-# This file is based on code from https://github.com/pytorch/ao/tree/main/torchao/prototype/blockwise_fp8
-# Modified by Primus-Turbo for FP8 blockwise quantization
+###############################################################################
+# This file is based on code from the TorchAO prototype for Blockwise FP8:
+#   https://github.com/pytorch/ao/blob/main/torchao/prototype/blockwise_fp8_training/kernels.py
+#
+# Reference:
+#   @software{torchao,
+#     title   = {TorchAO: PyTorch-Native Training-to-Serving Model Optimization},
+#     author  = {torchao},
+#     url     = {https://github.com/pytorch/ao},
+#     license = {BSD-3-Clause},
+#     month   = {oct},
+#     year    = {2024}
+#   }
+#
+# License:
+#   BSD 3-Clause License
+#   https://github.com/pytorch/ao/blob/main/LICENSE
+#
+# Modifications:
+#   Modified by Primus-Turbo team for FP8 blockwise and
+#   integration into primus_turbo/triton/gemm.
+###############################################################################
 
 import triton
 import triton.language as tl

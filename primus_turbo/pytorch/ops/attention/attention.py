@@ -22,7 +22,7 @@ from primus_turbo.pytorch.ops.attention.attention_cp_dispatcher import (
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     block_scaling_node,
-    quant_v_get_p_scale,
+    get_p_scale,
 )
 
 __all__ = ["flash_attn_func", "attention_fp8_blockwise"]
@@ -168,7 +168,8 @@ class AttentionTritonFunction(torch.autograd.Function):
 
         q, q_descale = block_scaling_node(q, use_fp8)
         k, k_descale = block_scaling_node(k, use_fp8)
-        v, v_scale, p_scale = quant_v_get_p_scale(v, use_fp8)
+        v, v_descale = block_scaling_node(v, use_fp8)
+        p_scale = get_p_scale(use_fp8)
 
         output, softmax_lse, exp_scores = attention_triton_forward_impl(
             q,
@@ -177,7 +178,7 @@ class AttentionTritonFunction(torch.autograd.Function):
             p_scale,
             q_descale,
             k_descale,
-            v_scale,
+            v_descale,
             dropout_p,
             softmax_scale,
             causal,
@@ -192,7 +193,7 @@ class AttentionTritonFunction(torch.autograd.Function):
         if is_grad:
             # q, k, v should be fp8 when set use_fp8 to True
             ctx.save_for_backward(
-                q, k, v, output, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_scale
+                q, k, v, output, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_descale
             )
 
             ctx.sm_scale = softmax_scale
@@ -213,7 +214,7 @@ class AttentionTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        (q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_scale) = ctx.saved_tensors
+        (q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_descale) = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
 
@@ -225,7 +226,7 @@ class AttentionTritonFunction(torch.autograd.Function):
             o,
             q_descale,
             k_descale,
-            v_scale,
+            v_descale,
             ctx.p_scale,
             softmax_lse,
             None,

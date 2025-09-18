@@ -8,10 +8,13 @@ from pathlib import Path
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-from primus_turbo.utils.hip_extension import HIPExtension
+from tools.build_utils import HIPExtension, find_rocshmem_library
 
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
+
+# try to found rocshmem in default path or enviorment
+ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # -------- env switches --------
 BUILD_TORCH = os.environ.get("PRIMUS_TURBO_BUILD_TORCH", "1") == "1"
@@ -156,14 +159,32 @@ def build_kernels_extension():
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
     kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
 
+    include_dirs = [
+        Path(PROJECT_ROOT / "csrc" / "include"),
+        Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
+        Path(PROJECT_ROOT / "csrc"),
+    ]
+    library_dirs = []
+
+    if ROCSHMEM_LIBRARY is None:
+        extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
+        extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
+    else:
+        include_dirs.extend(ROCSHMEM_LIBRARY.include_dirs)
+        library_dirs.extend(ROCSHMEM_LIBRARY.library_dirs)
+        extra_flags["extra_link_args"].extend(ROCSHMEM_LIBRARY.extra_link_args)
+
+        if (
+            "-fgpu-rdc" in ROCSHMEM_LIBRARY.extra_link_args
+            or "--hip-link" in ROCSHMEM_LIBRARY.extra_link_args
+        ):
+            extra_flags["extra_compile_args"]["nvcc"] += ["-fgpu-rdc"]
+
     return HIPExtension(
         name="libprimus_turbo_kernels",
-        include_dirs=[
-            Path(PROJECT_ROOT / "csrc" / "include"),
-            Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
-            Path(PROJECT_ROOT / "csrc"),
-        ],
+        include_dirs=include_dirs,
         sources=kernels_sources,
+        library_dirs=library_dirs,
         libraries=["hipblaslt"],
         **extra_flags,
     )
@@ -181,6 +202,10 @@ def build_torch_extension():
         "-lprimus_turbo_kernels",
         *extra_flags.get("extra_link_args", []),
     ]
+
+    if ROCSHMEM_LIBRARY is None:
+        extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
+        extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
 
     # CPP
     pytorch_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
@@ -233,11 +258,13 @@ def build_jax_extension():
 
 
 if __name__ == "__main__":
+
     # set cxx
     setup_cxx_env()
 
     # Extensions
     kernels_ext = build_kernels_extension()
+
     torch_ext = build_torch_extension()
     jax_ext = build_jax_extension()
     ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]

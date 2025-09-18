@@ -83,10 +83,10 @@ template <> struct BytesToType<1> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T> constexpr T DIVUP(const T &x, const T &y) {
+template <typename T> constexpr PRIMUS_TURBO_HOST_DEVICE T DIVUP(const T &x, const T &y) {
     return (((x) + ((y) -1)) / (y));
 }
 
-template <typename T> T ALIGN(T a, T b) {
+template <typename T> PRIMUS_TURBO_HOST_DEVICE T ALIGN(T a, T b) {
     return DIVUP<T>(a, b) * b;
 }

@@ -12,13 +12,14 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.test_utils import get_tolerances
+from tests.test_utils import compute_snr, get_tolerances
 
 
-# TODO: "N_K" = [2048, 1408] is bad case
-@pytest.mark.parametrize("B", [1, 2, 3, 4, 8, 16])
+@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
 @pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize("N_K", [(2048, 1536), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168)])
+@pytest.mark.parametrize(
+    "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
@@ -48,5 +49,17 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out)
     out.backward(grad_out)
+
+    out_snr = compute_snr(out_ref, out)
+    print(f"Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > 20, "out_snr too low"
+
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > 20, "a_grad_snr too low"
+
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > 20, "b_grad_snr too low"
     torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))

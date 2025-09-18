@@ -13,10 +13,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
-from primus_turbo.pytorch.ops.attention.attention_utils import (
-    block_scaling_node,
-    quant_v_get_p_scale,
-)
+from primus_turbo.pytorch.ops.attention.attention_utils import block_scaling_node
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
@@ -217,7 +214,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
 
     q_fp8, q_descale = block_scaling_node(q, True)
     k_fp8, k_descale = block_scaling_node(k, True)
-    v_fp8, v_scale, _ = quant_v_get_p_scale(v, True)
+    v_fp8, v_descale = block_scaling_node(v, True)
 
     o, softmax_lse, _ = attention_triton_forward_impl(
         q_fp8,
@@ -226,7 +223,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         F8_FWD_MAX,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         0,
         sm_scale,
         causal,
@@ -272,7 +269,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         o,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         F8_FWD_MAX,
         softmax_lse,
         None,

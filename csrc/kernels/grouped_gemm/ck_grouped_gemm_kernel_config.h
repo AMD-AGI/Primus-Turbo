@@ -19,7 +19,8 @@ template<
     ck_tile::index_t M_Warp_,
     ck_tile::index_t N_Warp_,
     ck_tile::index_t K_Warp_,
-    bool DoubleSmemBuffer_
+    bool DoubleSmemBuffer_,
+    bool kPadN_
 >
 struct CKGroupedGemmTileConfig {
     static constexpr ck_tile::index_t M_Tile = M_Tile_;
@@ -37,7 +38,7 @@ struct CKGroupedGemmTileConfig {
     static constexpr bool DoubleSmemBuffer = DoubleSmemBuffer_;
 
     static constexpr bool kPadM = false;
-    static constexpr bool kPadN = false;
+    static constexpr bool kPadN = kPadN_;
     static constexpr bool kPadK = false;
 
     // static constexpr int              kBlockPerCu            = 1;
@@ -47,13 +48,30 @@ struct CKGroupedGemmTileConfig {
 
 
 // Tile Config Specialization
+//fp16
+
 using CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
-    256, 256, 64, 32, 32, 16, 2, 2, 1, false
+    256, 256, 64, 32, 32, 16, 2, 2, 1, false, false
 >;
 
+using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
+    256, 128, 64, 32, 32, 16, 2, 2, 1, false, false
+>;
+
+using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
+    256, 128, 64, 32, 32, 16, 2, 2, 1, false, true
+>;
+
+
+// fp8
 using CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1 = CKGroupedGemmTileConfig<
-    256, 256, 128, 32, 32, 32, 2, 2, 1, false
+    256, 256, 128, 32, 32, 32, 2, 2, 1, false, false
 >;
-
+using CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1 = CKGroupedGemmTileConfig<
+    256, 128, 128, 32, 32, 32, 2, 2, 1, false, false
+>;
+using CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKGroupedGemmTileConfig<
+    256, 128, 128, 32, 32, 32, 2, 2, 1, false, true
+>;
 // clang-format on
 } // namespace primus_turbo

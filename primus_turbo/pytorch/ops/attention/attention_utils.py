@@ -52,25 +52,18 @@ def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_
         return tensor, scale
 
 
-def quant_v_get_p_scale(v, use_fp8: bool):
+def get_p_scale(use_fp8: bool):
     """
-    Get p_scale for quant_v_getp_scale
+    Get p_scale for FA internal quantization
     """
     if use_fp8:
-        range_v = torch.max(torch.abs(v))
-
         float8_fw = get_f8_fwd_dtype()
         dtype_max = torch.finfo(float8_fw).max
-
-        v_scale = dtype_max / range_v
         p_scale = dtype_max
-        v = _check_and_convert(v, v_scale, float8_fw)
-
     else:
-        v_scale = torch.tensor([1.0], device=v.device)
         p_scale = 1.0
 
-    return v, v_scale, p_scale
+    return p_scale
 
 
 class AttentionSharder(ABC):
