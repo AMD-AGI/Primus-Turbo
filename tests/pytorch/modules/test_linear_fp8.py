@@ -8,7 +8,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from primus_turbo.pytorch.core.float8 import Format, MXQuantConfig
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.modules import MXLinear
 from tests.test_utils import compute_snr, get_tolerances
 
@@ -50,7 +54,7 @@ def test_mxlinear(ori_dtype, dtype, block_size, M, NK, bias, enable_torch_compil
     x2.grad = None
 
     # MX
-    config = MXQuantConfig(block_size=block_size)
+    config = Float8QuantConfig(granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
     MXLinear.from_float(model, config)
     assert isinstance(model, MXLinear)
     if enable_torch_compile:

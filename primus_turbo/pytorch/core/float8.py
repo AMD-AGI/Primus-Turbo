@@ -35,6 +35,16 @@ def check_fp8_support() -> Tuple[bool, str]:
     )
 
 
+def check_mxfp8_support() -> Tuple[bool, str]:
+    """Return if fp8 support is available"""
+    if get_device_compute_capability() >= (9, 5):
+        return True, ""
+    return (
+        False,
+        "Device compute capability gfx950 or higher required for FP8 execution.",
+    )
+
+
 def check_fp8_ocp_support() -> Tuple[bool, str]:
     """Return if fp8 ocp support is available"""
     if get_device_compute_capability() >= (9, 5):
@@ -74,6 +84,7 @@ class ScalingGranularity(Enum):
     TENSORWISE = auto()
     ROWWISE = auto()
     BLOCKWISE = auto()
+    MX_BLOCKWISE = auto()
 
 
 class ScalingStrategy(Enum):
@@ -88,16 +99,27 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
 
+    def mxfp8(self):
+        return self.granularity == ScalingGranularity.MX_BLOCKWISE
+
+    def block_scaling(self):
+        return self.granularity == ScalingGranularity.BLOCKWISE
+
+    def row_scaling(self):
+        return self.granularity == ScalingGranularity.ROWWISE
+
+    def current_scaling(self):
+        return self.granularity == ScalingGranularity.TENSORWISE and self.strategy == ScalingStrategy.DYNAMIC
+
+    def delayed_scaling(self):
+        return self.granularity == ScalingGranularity.TENSORWISE and self.strategy != ScalingStrategy.DYNAMIC
+
     def __post_init__(self):
-        if self.granularity == ScalingGranularity.BLOCKWISE and self.block_size is None:
-            raise ValueError("block_size must be set when granularity is BLOCKWISE")
+        if self.granularity == ScalingGranularity.BLOCKWISE:
+            assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
 
-
-@dataclass
-class MXQuantConfig(Float8QuantConfig):
-    format: Format = Format.E4M3
-    granularity: ScalingGranularity = ScalingGranularity.BLOCKWISE
-    block_size: int = 128  # Override: block_size required for blockwise
-
-    def __post_init__(self):
-        super().__post_init__()
+        if self.granularity == ScalingGranularity.MX_BLOCKWISE:
+            mx_support_block_size = [32]
+            assert (
+                self.block_size in mx_support_block_size
+            ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
