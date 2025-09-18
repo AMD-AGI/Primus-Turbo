@@ -23,6 +23,21 @@ using RowMajor = ck_tile::tensor_layout::gemm::RowMajor;
 using ColMajor = ck_tile::tensor_layout::gemm::ColumnMajor;
 
 
+template <typename Kernel>
+inline void _launch_ck_grouped_kernel(const ck_tile::stream_config& stream_cfg,
+                                      ck_tile::index_t group_num,
+                                      void* args_ptr,
+                                      uint32_t num_cu) {
+    constexpr int kBlockPerCu = 1;
+    const dim3 blocks = Kernel::BlockSize();
+    dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
+    grids.x           = std::min(grids.x, num_cu);
+    ck_tile::launch_kernel(
+        stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
+                        Kernel{}, grids, blocks, 0,
+                        ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num));
+}
+
 class CKGroupedGemmRunnerInterFace {
 public:
     virtual ~CKGroupedGemmRunnerInterFace() = default;
@@ -115,7 +130,9 @@ public:
 public:
     void run(const ck_tile::stream_config &stream_cfg,
              const ck_tile::index_t group_num,
-             void *args_ptr, const uint32_t num_cu) override;
+             void *args_ptr, const uint32_t num_cu) override {
+        _launch_ck_grouped_kernel<Kernel>(stream_cfg, group_num, args_ptr, num_cu);
+    }
 };
 
 template <
@@ -212,7 +229,9 @@ public:
 public:
     void run(const ck_tile::stream_config &stream_cfg,
              const ck_tile::index_t group_num,
-             void *args_ptr, const uint32_t num_cu) override;
+             void *args_ptr, const uint32_t num_cu) override {
+        _launch_ck_grouped_kernel<Kernel>(stream_cfg, group_num, args_ptr, num_cu);
+    }
 };
 
 

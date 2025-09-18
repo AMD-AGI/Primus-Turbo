@@ -6,43 +6,6 @@
 
 namespace primus_turbo {
 
-template <typename ADataType, typename BDataType, typename CDataType, typename ALayout,
-          typename BLayout, typename CLayout, typename TileConfig, typename AccDataType>
-void CKQuantGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout, CLayout,
-                              TileConfig, AccDataType>::run(const ck_tile::stream_config
-                                                                                  &stream_cfg,
-                                                            const ck_tile::index_t group_num,
-                                                            void *args_ptr, const uint32_t num_cu) {
-
-    constexpr int kBlockPerCu = 1;
-
-    const dim3 blocks = Kernel::BlockSize();
-    dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
-    grids.x           = std::min(grids.x, num_cu);
-    ck_tile::launch_kernel(
-        stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
-                        Kernel{}, grids, blocks, 0,
-                        ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num));
-}
-
-template <typename ADataType, typename BDataType, typename CDataType, typename ALayout,
-          typename BLayout, typename CLayout, typename TileConfig, typename AccDataType>
-void CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout, CLayout, TileConfig,
-                         AccDataType>::run(const ck_tile::stream_config &stream_cfg,
-                                           const ck_tile::index_t group_num, void *args_ptr,
-                                           const uint32_t num_cu) {
-
-    constexpr int kBlockPerCu = 1;
-
-    const dim3 blocks = Kernel::BlockSize();
-    dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
-    grids.x           = std::min(grids.x, num_cu);
-    ck_tile::launch_kernel(
-        stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
-                        Kernel{}, grids, blocks, 0,
-                        ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num));
-}
-
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           typename ALayout, typename BLayout, typename CLayout>
 std::unique_ptr<CKGroupedGemmRunnerInterFace>
