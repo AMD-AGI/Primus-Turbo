@@ -245,8 +245,50 @@ template <
     typename CLayout
 >
 std::unique_ptr<CKGroupedGemmRunnerInterFace>
-get_ck_grouped_gemm_instance(const ck_tile::index_t group_num, const ck_tile::index_t m,
+get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_tile::index_t m,
                              const ck_tile::index_t n, const ck_tile::index_t k);
+
+
+// **************** Extern Instantiation ****************
+#define DECL_CK_GG_GFX942_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)   \
+extern template std::unique_ptr<CKGroupedGemmRunnerInterFace>                               \
+get_ck_grouped_gemm_instance_gfx942<                                                        \
+    AType, BType, CType, float,                                                             \
+    ALayout, BLayout, CLayout>(                                                             \
+        const ck_tile::index_t, const ck_tile::index_t,                                     \
+        const ck_tile::index_t, const ck_tile::index_t);
+
+// FP16 * FP16 = FP16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+
+// BF16 * BF16 = BF16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+
+// FP8 * FP8 = FP16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+
+// FP8 * FP8 = BF16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+
+// BF8 * BF8 = FP16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+
+// BF8 * BF8 = BF16
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+
+#undef DECL_CK_GG_GFX942_EXTERN_INSTANCE
 
 // clang-format on
 } // namespace primus_turbo

@@ -153,19 +153,11 @@ def get_common_flags():
     nvcc_flags += get_offload_archs()
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
-    # Device Arch
-    # TODO: Add ENV Setting
-    # TODO: ROCM Version support
-    nvcc_flags += [
-        # "--offload-arch=native",
-        # "--offload-arch=gfx942",
-        "--offload-arch=gfx950",
-    ]
-    if "--offload-arch=gfx950" in nvcc_flags:
-        nvcc_flags.append("-DCK_TILE_USE_OCP_FP8")
-    
-
     nvcc_flags.append(f"-parallel-jobs={max_jobs}")
+
+    if "--offload-arch=gfx950" in nvcc_flags:
+        cxx_flags.append("-DCK_TILE_USE_OCP_FP8")
+        nvcc_flags.append("-DCK_TILE_USE_OCP_FP8")
 
     return {
         "extra_link_args": extra_link_args,

@@ -128,15 +128,15 @@ void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> 
     if (!params.transA && !params.transB) { // NN
         using ALayout = RowMajor;
         using BLayout = RowMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else if (!params.transA && params.transB) { // NT
         using ALayout = RowMajor;
         using BLayout = ColMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm only support NN and NT");
     }
@@ -172,15 +172,15 @@ void ck_grouped_gemm_fp8(
     if (!params.transA && !params.transB) { // NN
         using ALayout = RowMajor;
         using BLayout = RowMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else if (!params.transA && params.transB) { // NT
         using ALayout = RowMajor;
         using BLayout = ColMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm only support NN and NT");
     }
@@ -294,9 +294,9 @@ void ck_grouped_gemm_variable_k(
     if (params.transA && !params.transB) { // TN
         using ALayout = ColMajor;
         using BLayout = RowMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
     }
@@ -341,9 +341,9 @@ void ck_grouped_gemm_fp8_variable_k(
     if (params.transA && !params.transB) { // TN
         using ALayout = ColMajor;
         using BLayout = RowMajor;
-        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                              BLayout, CLayout>(params.group_num, params.m,
-                                                                params.n, params.k);
+        runner = get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
+                                                     ALayout, BLayout, CLayout>(
+            params.group_num, params.m, params.n, params.k);
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
     }
