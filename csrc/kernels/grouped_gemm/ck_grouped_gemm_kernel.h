@@ -237,7 +237,7 @@ public:
     }
 };
 
-
+#ifdef PRIMUS_TURBO_GFX942
 template <
     typename ADataType,
     typename BDataType,
@@ -299,6 +299,7 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
     }
     return runner;
 }
+#endif
 
 template <
     typename ADataType,
@@ -312,16 +313,28 @@ template <
 std::unique_ptr<CKGroupedGemmRunnerInterFace>
 get_ck_grouped_gemm_instance(const ck_tile::index_t group_num, const ck_tile::index_t m,
                              const ck_tile::index_t n, const ck_tile::index_t k){
-    GPUArch arch = get_current_arch();
-    if (arch == GPUArch::GFX942){
-        return get_ck_grouped_gemm_instance_gfx942<
-            ADataType, BDataType, CDataType, AccDataType,
-            ALayout, BLayout, CLayout>(group_num, m, n, k);
+    const GPUArch arch = get_current_arch();
+    switch (arch) {
+#ifdef PRIMUS_TURBO_GFX942
+        case GPUArch::GFX942: {
+            return get_ck_grouped_gemm_instance_gfx942<
+                ADataType, BDataType, CDataType, AccDataType,
+                ALayout, BLayout, CLayout>(group_num, m, n, k);
+        }
+#endif
+#ifdef PRIMUS_TURBO_GFX950
+        case GPUArch::GFX950: {
+            // TODO:
+        }
+#endif
+        default:
+            PRIMUS_TURBO_ERROR("Unsupported arch in get_ck_grouped_gemm_instance()");
     }
 }
 
 
 // **************** GFX942 Extern Instantiation ****************
+#ifdef PRIMUS_TURBO_GFX942
 #define DECL_CK_GG_GFX942_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)           \
 extern template std::unique_ptr<CKGroupedGemmRunnerInterFace>                                       \
 get_ck_grouped_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
@@ -363,7 +376,7 @@ DECL_CK_GG_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloa
 template std::unique_ptr<CKGroupedGemmRunnerInterFace>                                              \
 get_ck_grouped_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
     const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
-
+#endif
 // *************************************************************
 
 // clang-format on
