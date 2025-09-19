@@ -99,21 +99,6 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
 
-    def mxfp8(self):
-        return self.granularity == ScalingGranularity.MX_BLOCKWISE
-
-    def block_scaling(self):
-        return self.granularity == ScalingGranularity.BLOCKWISE
-
-    def row_scaling(self):
-        return self.granularity == ScalingGranularity.ROWWISE
-
-    def current_scaling(self):
-        return self.granularity == ScalingGranularity.TENSORWISE and self.strategy == ScalingStrategy.DYNAMIC
-
-    def delayed_scaling(self):
-        return self.granularity == ScalingGranularity.TENSORWISE and self.strategy != ScalingStrategy.DYNAMIC
-
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
