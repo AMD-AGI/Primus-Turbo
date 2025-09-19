@@ -13,7 +13,7 @@ import torch.distributed.distributed_c10d as c10d
 
 from primus_turbo.pytorch.kernels.async_tp import ag_gemm_impl, gemm_rs_impl
 
-__all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter", "fused_all_gather_scaled_matmul"]
+__all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter", "fused_all_gather_scaled_matmul", "fused_scaled_matmul_reduce_scatter"]
 
 
 def fused_all_gather_matmul(
@@ -299,3 +299,57 @@ def fused_matmul_reduce_scatter(
             )
 
     return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim)
+
+
+def fused_scaled_matmul_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    layout: str,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    reduce_op: str,
+    orig_scatter_dim: int,
+    scatter_dim_after_maybe_reshape: int,
+    group_name: str,
+    output_shape: list[int],
+    bias: Optional[torch.Tensor],
+    result_scale: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    use_fast_accum: bool,
+    gemm_streams: List[torch.cuda.Stream],
+    comm_streams: List[torch.cuda.Stream],
+    *,
+    comm_method: str = "pipeline",
+    num_splits: int = 2,
+    enable_sdma: bool = False,
+    output: Optional[torch.Tensor] = None,
+    rs_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    with torch.profiler.record_function(f"{comm_method}_fused_scaled_matmul_scatter_out"):
+        return gemm_rs_impl._fused_scaled_matmul_reduce_scatter_impl(
+            mm_out_op=torch.ops.aten._scaled_mm.out,
+            A=A,
+            B=B,
+            layout=layout,
+            A_scale=A_scale,
+            kwargs={
+                "scale_b": B_scale,
+                "bias": bias,
+                "scale_result": result_scale,
+                "out_dtype": out_dtype,
+                "use_fast_accum": use_fast_accum,
+            },
+            out_dtype=out_dtype,
+            reduce_op=reduce_op,
+            orig_scatter_dim=orig_scatter_dim,
+            scatter_dim_after_maybe_reshape=scatter_dim_after_maybe_reshape,
+            group_name=group_name,
+            output_shape=output_shape,
+            comm_method=comm_method,
+            num_splits=num_splits,
+            enable_sdma=enable_sdma,
+            gemm_stream_pool=gemm_streams,
+            comm_stream_pool=comm_streams,
+            output=output,
+            rs_output=rs_out,
+        )
