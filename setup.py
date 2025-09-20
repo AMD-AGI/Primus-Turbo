@@ -100,8 +100,8 @@ def get_offload_archs():
 
     cur_device_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()
 
-    # gpu_archs = os.environ.get("GPU_ARCHS", None)
-    gpu_archs = None
+    gpu_archs = os.environ.get("GPU_ARCHS", None)
+    # gpu_archs = None
 
     arch_list = []
     if gpu_archs is None or gpu_archs.strip() == "":
