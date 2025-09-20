@@ -292,7 +292,7 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
             runner = std::make_unique<Runner>();
         }
     } else {
-        RIMUS_TURBO_ERROR("Grouped Gemm only support fp16/bf16/fp8/bf8");
+        PRIMUS_TURBO_ERROR("Grouped Gemm only support fp16/bf16/fp8/bf8");
     }
     return runner;
 }
@@ -342,7 +342,7 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
                                                CLayout, TileConfig, AccDataType>;
         runner = std::make_unique<Runner>();
     } else {
-        RIMUS_TURBO_ERROR("Grouped Gemm only support fp16/bf16/fp8/bf8");
+        PRIMUS_TURBO_ERROR("Grouped Gemm only support fp16/bf16/fp8/bf8");
     }
     return runner;
 }
