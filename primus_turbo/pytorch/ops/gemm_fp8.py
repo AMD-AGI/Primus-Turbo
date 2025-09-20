@@ -306,28 +306,28 @@ class FP8GemmFunction(torch.autograd.Function):
         if ctx.config.granularity == ScalingGranularity.TENSORWISE:
             grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
 
-            # NT
+            # NT, Use NT layout for high performance in hipblaslt gemm
             a_grad = gemm_fp8_impl(
                 grad_out_fp8,
                 grad_out_scale_inv,
                 False,
-                b_fp8,
+                b_fp8.transpose(0, 1).contiguous(),
                 b_scale_inv,
-                not ctx.trans_b,
+                True,
                 ctx.out_dtype,
                 ctx.trans_a,
             )
 
-            # TN
+            # NT, Use NT layout for high performance in hipblaslt gemm
             b_grad = gemm_fp8_impl(
-                a_fp8,
-                a_scale_inv,
-                not ctx.trans_a,
-                grad_out_fp8,
+                grad_out_fp8.transpose(0, 1).contiguous(),
                 grad_out_scale_inv,
-                False,
+                False, # False
+                a_fp8.transpose(0, 1).contiguous(),
+                a_scale_inv,
+                True, # True
                 ctx.out_dtype,
-                ctx.trans_b,
+                False
             )
         # elif ctx.config.granularity == ScalingGranularity.ROWWISE:
         #     # NOTE: rowwise only support NT layout.
