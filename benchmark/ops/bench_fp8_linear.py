@@ -7,7 +7,11 @@
 import torch
 import torch.utils.benchmark as benchmark
 
-from primus_turbo.pytorch.core.float8 import Format, MXQuantConfig
+from primus_turbo.pytorch.core.float8 import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.ops import gemm_fp8_blockwise
 from tests.test_utils import compute_snr
 
@@ -35,7 +39,7 @@ test_configs = [
 
 def bench_fp8_linear(B, M, N, K, ori_dtype, dtype, block_size, test_backward):
     device = "cuda"
-    config = MXQuantConfig(format=dtype, block_size=block_size)
+    config = Float8QuantConfig(granularity=ScalingGranularity.BLOCKWISE, format=dtype, block_size=block_size)
 
     # Prepare inputs
     x = torch.randn((*B, M, K), dtype=ori_dtype, device=device, requires_grad=True)
