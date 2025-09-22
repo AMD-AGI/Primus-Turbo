@@ -265,7 +265,7 @@ def _pipeline_matmul_scatter_out_impl(
     return rs_output
 
 
-def _pipeline_matmul_scatter_out_impl(
+def _pipeline_matmul_scatter_out_fp8_impl(
     mm_out_op: torch._ops.OpOverload,
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -409,6 +409,8 @@ def _fused_scaled_matmul_reduce_scatter_impl(
     # Move scatter to first dim, then shard the tensor along the first dim, so the chunk producer
     # can perform matmuls along the first dim.
     A_with_scatter_dim_0 = A.movedim(scatter_dim_after_maybe_reshape, 0)
+    leading_dims = list(A_with_scatter_dim_0.shape[:-1])
+    leading_dims[0] //= group.size()
 
     # To handle case where A is 3D+, reshape to 2D to prepare for mm which requires 2D inputs.
     A_2D_with_scatter_dim_0 = A_with_scatter_dim_0.flatten(0, -2)
@@ -442,6 +444,7 @@ def _fused_scaled_matmul_reduce_scatter_impl(
                 return False
         return True
 
+    output_shape[orig_scatter_dim] //= group.size()
     if rs_output is not None:
         if rs_output.dtype != out_dtype:
             raise ValueError(f"Invalid dtype: rs_output ({rs_output.dtype}) is different with out_dtype ({out_dtype})!")
@@ -450,7 +453,7 @@ def _fused_scaled_matmul_reduce_scatter_impl(
                 f"Invalid shape: rs_out ({rs_output.shape}) is not unexpected as ({output_shape})!"
             )
     else:
-        rs_output = torch.empty(output_shape, dtype=out_dtype, device=A.device)
+        rs_output = torch.empty((A_2D_with_scatter_dim_0.shape[0], B.shape[-1]), dtype=out_dtype, device=A.device)
 
     if output is not None:
         if output.dtype != out_dtype:
@@ -458,10 +461,24 @@ def _fused_scaled_matmul_reduce_scatter_impl(
 
         if output.numel() != rs_output.numel() * group.size():
             raise ValueError(f"output size must equal group size * rs_out size.")
-        output = output.view(-1, B.shape[1])
+        output = output.view(-1, B.shape[-1])
 
-    
-
+    rs_output = _pipeline_matmul_scatter_out_fp8_impl(
+        mm_out_op,
+        A,
+        B,
+        A_scale,
+        kwargs,
+        group_name,
+        reduce_op,
+        num_splits,
+        enable_sdma,
+        gemm_stream_pool,
+        comm_stream_pool,
+        output,
+        rs_output,
+        out_dtype,
+    )
    
-    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim)
+    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim_after_maybe_reshape).view(output_shape)
     
