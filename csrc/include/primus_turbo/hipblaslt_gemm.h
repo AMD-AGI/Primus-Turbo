@@ -16,6 +16,6 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          hipblasOperation_t transB, void *D, const hipDataType D_type,
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
                          void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         hipblasLtHandle_t handle, hipStream_t stream);
+                         const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
 
 } // namespace primus_turbo

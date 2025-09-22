@@ -9,7 +9,7 @@ namespace primus_turbo::pytorch {
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor     input,
                                                      const at::ScalarType dest_dtype) {
     auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
-    auto scale_inv = at::empty({1}, input.options().dtype(at::kFloat).device(at::kMeta));
+    auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
     return {input_fp8, scale_inv};
 }
 

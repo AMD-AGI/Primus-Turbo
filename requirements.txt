@@ -3,6 +3,5 @@ pre-commit
 hip-python
 clang-format==18.1.6
 hipify_torch @ git+https://github.com/ROCm/hipify_torch.git
-jax[rocm]
 build
-triton==3.3.0
+triton>=3.3.0

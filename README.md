@@ -5,23 +5,35 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 
 
 ## 🚀 What's New
-...
+- **[2025/9/11]** Primus-Turbo initial release, version v0.1.0.
 
 
 ## 📦 Quick Start
 
-### 1. Docker (Recommended)
+### 1. Dependencies
+#### Software
+- ROCm >= 6.4
+- Python >= 3.10
+- PyTorch >= 2.6.0 (with ROCm support)
+- rocSHMEM (optional, required for DeepEP). Please refer to our [rocSHMEM Installation Guide](docs/install_dependencies.md) for instructions.
+
+#### Hardware
+- AMD Instinct GPUs
+- Supported MI300 (gfx942), MI350 (gfx950) series
+
+### 2. Docker (Recommended)
 Use the pre-built AMD ROCm image:
 ```
 rocm/megatron-lm:v25.7_py310
 ```
 
-### 2. Install from Source
+### 3. Install from Source
 #### Clone Repository
 ```
-git clone https://github.com/AMD-AIG-AIMA/Primus-Turbo.git --recursive
+git clone https://github.com/AMD-AGI/Primus-Turbo.git --recursive
 cd Primus-Turbo
 ```
+
 #### User Install
 ```
 pip3 install -r requirements.txt
@@ -34,14 +46,14 @@ pip3 install -r requirements.txt
 pip3 install --no-build-isolation -e . -v
 ```
 
-### 3. Build & Deploy Wheel
+### 4. Build & Deploy Wheel
 ```
 pip3 install -r requirements.txt
 python3 -m build --wheel --no-isolation
 pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl
 ```
 
-### 4. Minimal Example
+### 5. Minimal Example
 ```python
 import torch
 import primus_turbo.pytorch as turbo

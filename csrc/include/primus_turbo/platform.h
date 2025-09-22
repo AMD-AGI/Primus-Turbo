@@ -4,10 +4,6 @@
 
 #pragma once
 
-/**
- *
- */
-
 #include <cstdint>
 
 //
@@ -31,7 +27,7 @@
 #endif
 
 // Compile-time device-side flag
-#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
 #define PRIMUS_TURBO_DEVICE_COMPILE 1
 #else
 #define PRIMUS_TURBO_DEVICE_COMPILE 0

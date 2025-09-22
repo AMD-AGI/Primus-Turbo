@@ -133,4 +133,8 @@ at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Te
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 
+// Runtime
+int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint32_t> &cu_masks);
+void    destroy_stream(const int device_id, const int64_t stream_ptr);
+
 } // namespace primus_turbo::pytorch

@@ -21,11 +21,12 @@ from tests.test_utils import get_tolerances
 def test_linear_accuracy(bs, seq_len, in_features, out_features, bias, dtype, enable_torch_compile):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+    if enable_torch_compile and dtype == torch.float32:
+        pytest.skip()  # latest rocm 7 env will meet err.
+
     torch.manual_seed(42)
     device = "cuda"
-
-    # Clean compile cache, avoid cache limit.
-    torch._dynamo.reset()
 
     primus_linear = Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     torch_linear = torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
@@ -35,6 +36,7 @@ def test_linear_accuracy(bs, seq_len, in_features, out_features, bias, dtype, en
             torch_linear.bias.copy_(primus_linear.bias)
 
     if enable_torch_compile:
+        torch._dynamo.reset()  # Clean compile cache, avoid cache limit.
         primus_linear = torch.compile(primus_linear, fullgraph=True, mode="max-autotune")
         torch_linear = torch.compile(torch_linear, fullgraph=True, mode="max-autotune")
 

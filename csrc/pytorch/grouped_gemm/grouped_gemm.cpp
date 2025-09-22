@@ -151,12 +151,12 @@ at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                        "out_dtype must be kBFloat16 or kHalf");
 
     // Determine output tensor size based on transA and transB
-    const int32_t bs = b.size(0);
-    const int32_t m  = transA ? a.size(1) : a.size(0);
-    const int32_t n  = transB ? b.size(1) : b.size(2);
-    const int32_t k  = transA ? a.size(0) : a.size(1);
+    const int64_t bs = b.size(0);
+    const int64_t m  = transA ? a.size(1) : a.size(0);
+    const int64_t n  = transB ? b.size(1) : b.size(2);
+    const int64_t k  = transA ? a.size(0) : a.size(1);
     // Alloc args workspace
-    const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
+    const int64_t args_sizes = get_ck_grouped_gemm_fp8_args_sizes(group_lens.numel());
     at::Tensor    args_tensor =
         at::empty({args_sizes}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
 
@@ -240,10 +240,10 @@ at::Tensor grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &gro
         at::empty({args_sizes}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
 
     // Determine output tensor size based on transA and transB
-    const int32_t bs = group_lens.numel();
+    const int64_t bs = group_lens.numel();
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(0) : b.size(1);
-    const int32_t k  = transA ? a.size(0) : a.size(1);
+    const int64_t k  = transA ? a.size(0) : a.size(1);
     at::Tensor    c  = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kCUDA));
 
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -285,26 +285,26 @@ at::Tensor grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor 
                        "out_dtype must be kBFloat16 or kHalf");
 
     // Alloc args workspace
-    const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
+    const int64_t args_sizes = get_ck_grouped_gemm_fp8_args_sizes(group_lens.numel());
     at::Tensor    args_tensor =
         at::empty({args_sizes}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
 
     // Determine output tensor size based on transA and transB
-    const int32_t bs = group_lens.numel();
+    const int64_t bs = group_lens.numel();
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(0) : b.size(1);
-    const int32_t k  = transA ? a.size(0) : a.size(1);
+    const int64_t k  = transA ? a.size(0) : a.size(1);
     at::Tensor    c  = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kCUDA));
 
     // Process Scale
     at::Tensor aq_tensor;
     at::Tensor bq_tensor;
     if (granularity == "TENSORWISE") {
-        aq_tensor = a_scales.reshape({1, 1}).expand({m, 1});
-        bq_tensor = b_scales.reshape({1, 1, 1}).expand({bs, 1, n});
+        aq_tensor = a_scales.reshape({1, 1}).expand({bs, m});
+        bq_tensor = b_scales.reshape({1, 1}).expand({bs, n});
     } else {
-        aq_tensor = a_scales.clone();
-        bq_tensor = b_scales.clone();
+        aq_tensor = a_scales.reshape({1, m}).expand({bs, m});
+        bq_tensor = b_scales.reshape({1, n}).expand({bs, n});
     }
     aq_tensor = aq_tensor.contiguous();
     bq_tensor = bq_tensor.contiguous();

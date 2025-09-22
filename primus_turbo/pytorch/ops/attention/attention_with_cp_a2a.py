@@ -19,7 +19,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     block_scaling_node,
-    quant_v_get_p_scale,
+    get_p_scale,
 )
 
 
@@ -223,7 +223,8 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
 
         q_local_heads, q_descale = block_scaling_node(q_local_heads, use_fp8=use_fp8)
         k_local_heads, k_descale = block_scaling_node(k_local_heads, use_fp8=use_fp8)
-        v_local_heads, v_scale, p_scale = quant_v_get_p_scale(v_local_heads, use_fp8)
+        v_local_heads, v_descale = block_scaling_node(v_local_heads, use_fp8=use_fp8)
+        p_scale = get_p_scale(use_fp8)
 
         output_local_heads, softmax_lse, exp_scores = attention_triton_forward_impl(
             q_local_heads,
@@ -232,7 +233,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             p_scale,
             q_descale,
             k_descale,
-            v_scale,
+            v_descale,
             dropout_p,
             softmax_scale,
             causal,
@@ -257,7 +258,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
                 bias,
                 q_descale,
                 k_descale,
-                v_scale,
+                v_descale,
             )
             ctx.sm_scale = softmax_scale
             ctx.p_scale = p_scale
@@ -297,7 +298,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             bias,
             q_descale,
             k_descale,
-            v_scale,
+            v_descale,
         ) = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert dout.dtype is torch.bfloat16, f"dout should be bfloat16 but get {dout.dtype}"
@@ -316,7 +317,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             output_local_heads,
             q_descale,
             k_descale,
-            v_scale,
+            v_descale,
             ctx.p_scale,
             softmax_lse,
             None,

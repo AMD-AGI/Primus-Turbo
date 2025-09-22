@@ -12,7 +12,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.test_utils import get_tolerances
+from tests.test_utils import compute_snr, get_tolerances
 
 M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 EP_SIZE_LIST = [32, 16, 8]
@@ -91,6 +91,21 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     torch.testing.assert_close(out_ref, out, **get_tolerances(dtype))
     torch.testing.assert_close(x_ref.grad, x.grad, **get_tolerances(dtype))
     torch.testing.assert_close(w_ref.grad, w.grad, **get_tolerances(dtype))
+
+    # Compute SNRs
+    out_snr = compute_snr(out_ref, out)
+    if out_snr <= 20:
+        print(f"out_snr too low: {out_snr}")
+
+    a_grad_snr = compute_snr(x.grad, x.grad)
+    b_grad_snr = compute_snr(w.grad, w.grad)
+    if a_grad_snr <= 20:
+        print(f"x_grad_snr too low: {a_grad_snr}")
+    if b_grad_snr <= 20:
+        print(f"w_grad_snr too low: {b_grad_snr}")
+    assert out_snr > 20, "out_snr too low"
+    assert a_grad_snr > 20, "x_grad_snr too low"
+    assert b_grad_snr > 20, "w_grad_snr too low"
 
     # Calculate FLOPs
     fwd_total_flops = 2 * B * M * N * K

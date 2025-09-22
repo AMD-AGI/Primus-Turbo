@@ -57,7 +57,7 @@ def attention_triton_forward_impl(
     p_scale: float,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
-    v_scale: torch.Tensor,
+    v_descale: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -189,12 +189,19 @@ def attention_triton_forward_impl(
             k_descale.stride(1),
             k_descale.stride(2),
         )
+        stride_vdescale_z, stride_vdescale_h, stride_vdescale_m = (
+            v_descale.stride(0),
+            v_descale.stride(1),
+            v_descale.stride(2),
+        )
         padded_kscale_block_num = 1 << (stride_kdescale_h - 1).bit_length()
-
+        padded_vscale_block_num = 1 << (stride_vdescale_h - 1).bit_length()
     else:
         stride_qdescale_z, stride_qdescale_h, stride_qdescale_m = None, None, None
         stride_kdescale_z, stride_kdescale_h, stride_kdescale_m = None, None, None
+        stride_vdescale_z, stride_vdescale_h, stride_vdescale_m = None, None, None
         padded_kscale_block_num = None
+        padded_vscale_block_num = None
 
     wrap_triton(attn_fwd)[grid](
         q,
@@ -204,7 +211,7 @@ def attention_triton_forward_impl(
         p_scale,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         use_fp8,
         softmax_scale,
         softmax_lse,
@@ -225,7 +232,11 @@ def attention_triton_forward_impl(
         stride_kdescale_z,
         stride_kdescale_h,
         stride_kdescale_m,
+        stride_vdescale_z,
+        stride_vdescale_h,
+        stride_vdescale_m,
         padded_kscale_block_num,
+        padded_vscale_block_num,
         cu_seqlens_q,
         cu_seqlens_k,
         dropout_p=dropout_p,
@@ -265,7 +276,7 @@ def _attention_triton_forward_impl_fake(
     p_scale: float,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
-    v_scale: torch.Tensor,
+    v_descale: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -311,7 +322,7 @@ def attention_triton_backward_impl(
     o: torch.Tensor,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
-    v_scale: torch.Tensor,
+    v_descale: torch.Tensor,
     p_scale: float,
     softmax_lse_delta: torch.Tensor,
     dq: Optional[torch.Tensor],
@@ -442,18 +453,25 @@ def attention_triton_backward_impl(
         stride_descalez, stride_descaleh, stride_descalem = do_descale.stride()
         stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
         stride_kscalez, stride_kscaleh, stride_kscalem = k_descale.stride()
+        stride_vscalez, stride_vscaleh, stride_vscalem = v_descale.stride()
 
         padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
         padded_qscale_block_num = 1 << (stride_qscaleh - 1).bit_length()
         padded_kscale_block_num = 1 << (stride_kscaleh - 1).bit_length()
-
+        padded_vscale_block_num = 1 << (stride_vscaleh - 1).bit_length()
     else:
         do_fp8 = None
         do_descale = None
         stride_descalez, stride_descaleh, stride_descalem = None, None, None
         stride_qscalez, stride_qscaleh, stride_qscalem = None, None, None
         stride_kscalez, stride_kscaleh, stride_kscalem = None, None, None
-        padded_doscale_block_num, padded_qscale_block_num, padded_kscale_block_num = None, None, None
+        stride_vscalez, stride_vscaleh, stride_vscalem = None, None, None
+        (
+            padded_doscale_block_num,
+            padded_qscale_block_num,
+            padded_kscale_block_num,
+            padded_vscale_block_num,
+        ) = (None, None, None, None)
 
     grid_prebwd = (triton.cdiv(max_seqlen_q, FIXED_BLOCK_M), batch_headsize_q)
     wrap_triton(_bwd_preprocess_use_o)[grid_prebwd](
@@ -530,7 +548,7 @@ def attention_triton_backward_impl(
         softmax_scale,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         p_scale,
         do_descale,
         o,
@@ -568,9 +586,13 @@ def attention_triton_backward_impl(
         stride_kscalez,
         stride_kscaleh,
         stride_kscalem,
+        stride_vscalez,
+        stride_vscaleh,
+        stride_vscalem,
         padded_doscale_block_num,
         padded_qscale_block_num,
         padded_kscale_block_num,
+        padded_vscale_block_num,
         batch,
         nheads_q,
         nheads_k,
@@ -594,16 +616,6 @@ def attention_triton_backward_impl(
         F8_FWD_MAX=F8_FWD_MAX,
     )
 
-    if use_fp8:
-        n_groups = nheads_q // nheads_k
-        padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
-        padded_qscale_block_num = 1 << (stride_qscaleh * n_groups - 1).bit_length()
-        padded_kscale_block_num = 1 << (stride_kscaleh * n_groups - 1).bit_length()
-    else:
-        padded_doscale_block_num = None
-        padded_qscale_block_num = None
-        padded_kscale_block_num = None
-
     grid_bwd_dkdv = (
         batch_headsize_k,
         triton.cdiv(max_seqlen_k, FIXED_BLOCK_N) if sequence_parallel else 1,
@@ -615,7 +627,7 @@ def attention_triton_backward_impl(
         softmax_scale,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         p_scale,
         do_descale,
         o,
@@ -653,9 +665,9 @@ def attention_triton_backward_impl(
         stride_kscalez,
         stride_kscaleh,
         stride_kscalem,
-        padded_doscale_block_num,
-        padded_qscale_block_num,
-        padded_kscale_block_num,
+        stride_vscalez,
+        stride_vscaleh,
+        stride_vscalem,
         batch,
         nheads_q,
         nheads_k,
@@ -718,7 +730,7 @@ def _attention_triton_backward_impl_fake(
     out: torch.Tensor,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
-    v_scale: torch.Tensor,
+    v_descale: torch.Tensor,
     p_scale: float,
     softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],

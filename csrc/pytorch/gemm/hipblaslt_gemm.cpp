@@ -54,11 +54,6 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
 
     // shape check
     PRIMUS_TURBO_CHECK(A.dim() == 2 && B.dim() == 2, "A, B must be 2D tensors");
-    if (use_fp8) {
-        // NOTE: only support tensorwise
-        PRIMUS_TURBO_CHECK(scaleA_inv.ndimension() == 1);
-        PRIMUS_TURBO_CHECK(scaleB_inv.ndimension() == 1);
-    }
 
     if (transC) {
         std::swap(A, B);
@@ -69,6 +64,19 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
     const int64_t m = transA ? A.size(1) : A.size(0);
     const int64_t k = transA ? A.size(0) : A.size(1);
     const int64_t n = transB ? B.size(0) : B.size(1);
+
+    bool use_rowwise = false;
+    if (use_fp8) {
+        auto as_numel = scaleA_inv.numel();
+        auto bs_numel = scaleB_inv.numel();
+        if (as_numel == 1 && bs_numel == 1) {
+            use_rowwise = false;
+        } else if (as_numel == m && bs_numel == n) {
+            use_rowwise = true;
+        } else {
+            PRIMUS_TURBO_ERROR("Invalid FP8 scales numel");
+        }
+    }
 
     // NOTE: The leading dimension is col-major.
     int64_t lda, ldb, ldd;
@@ -119,6 +127,7 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
         n, m, k,
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         use_fp8,
+        use_rowwise,
         handle, stream);
     // clang-format on
 

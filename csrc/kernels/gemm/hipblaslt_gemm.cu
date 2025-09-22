@@ -25,14 +25,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          hipblasOperation_t transB, void *D, const hipDataType D_type,
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
                          void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         hipblasLtHandle_t handle, hipStream_t stream) {
-    if (use_fp8) {
-        PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
-        PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
-    }
-
-    const hipDataType C_type = D_type;
-
+                         const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
@@ -40,7 +33,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     hipblasComputeType_t        gemm_compute_type = HIPBLAS_COMPUTE_32F;
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(
-        &A_desc, A_type, transA == HIPBLAS_OP_N ? m : k, transA == HIPBLAS_OP_N ? k : n, lda));
+        &A_desc, A_type, transA == HIPBLAS_OP_N ? m : k, transA == HIPBLAS_OP_N ? k : m, lda));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(
         &B_desc, B_type, transB == HIPBLAS_OP_N ? k : n, transB == HIPBLAS_OP_N ? n : k, ldb));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, m, n, ldd));
@@ -55,40 +48,60 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         operation_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 
     if (use_fp8) {
-        PRIMUS_TURBO_CHECK_HIPBLAS(
-            hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                                            &scaleA_inv, sizeof(scaleA_inv)));
-        PRIMUS_TURBO_CHECK_HIPBLAS(
-            hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                                            &scaleB_inv, sizeof(scaleB_inv)));
+        PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
+        PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
+
+        hipblasLtMatmulDescAttributes_t scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
+        hipblasLtMatmulDescAttributes_t scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
+#if 0
+        if (use_rowwise) {
+#if 1
+            // New hipblaslt
+            hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+            PRIMUS_TURBO_CHECK_HIPBLAS(
+                hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                                &scale_mode, sizeof(scale_mode)));
+            PRIMUS_TURBO_CHECK_HIPBLAS(
+                hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                                &scale_mode, sizeof(scale_mode)));
+#else
+            // New hipblaslt will deprecated HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT
+            scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT;
+            scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER_VEC_EXT;
+#endif
+        }
+#endif
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, scaleA_inv_ptr_desc, &scaleA_inv, sizeof(scaleA_inv)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    int                                           algo_count = 1;
-    std::vector<hipblasLtMatmulHeuristicResult_t> algos;
-    algos.resize(algo_count);
+    const int                                     request_solutions = 1;
+    std::vector<hipblasLtMatmulHeuristicResult_t> algos(request_solutions);
+    int                                           returnedAlgoCount = 0;
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceCreate(&preference));
     PRIMUS_TURBO_CHECK_HIPBLAS(
         hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                               &workspace_size, sizeof(workspace_size)));
 
-    PRIMUS_TURBO_CHECK_HIPBLAS(
-        hipblasLtMatmulAlgoGetHeuristic(handle, operation_desc, A_desc, B_desc, D_desc, D_desc,
-                                        preference, algo_count, algos.data(), &algo_count));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulAlgoGetHeuristic(
+        handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference, request_solutions,
+        algos.data(), &returnedAlgoCount));
+    PRIMUS_TURBO_CHECK(returnedAlgoCount > 0,
+                       "hipBLASLt: no valid algorithm found for current matmul config");
 
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
-
-    const float one  = 1.0;
-    const float zero = 0.0;
-
+    const float alpha = 1.0;
+    const float beta  = 0.0;
     // clang-format off
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmul(
         handle,
         operation_desc,
-        static_cast<const void *>(&one),
+        &alpha,
         A, A_desc,
         B, B_desc,
-        static_cast<const void *>(&zero),
+        &beta,
         D, D_desc,
         D, D_desc,
         &algos[0].algo,
@@ -100,6 +113,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(B_desc));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(A_desc));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescDestroy(operation_desc));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
 }
 
 } // namespace primus_turbo

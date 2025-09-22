@@ -14,23 +14,40 @@ from primus_turbo.pytorch.core.float8 import (
     Format,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.ops import gemm_fp8_tensorwise
+from primus_turbo.pytorch.ops import gemm_fp8
 
 ModelConfigs = {
     "llama2-7b": {
         "seqlen": 4096,
         "hidden_size": 4096,
         "intermediate_size": 11008,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 128,
     },
     "llama2-70b": {
         "seqlen": 4096,
         "hidden_size": 8192,
         "intermediate_size": 28672,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
     },
     "llama3.1-8b": {
         "seqlen": 8192,
         "hidden_size": 4096,
         "intermediate_size": 14336,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    },
+    "llama3.1-405B": {
+        "seqlen": 8192,
+        "hidden_size": 16384,
+        "intermediate_size": 53248,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
     },
 }
 
@@ -39,10 +56,20 @@ def gen_gemm_test_cases(model_config):
     seq = model_config["seqlen"]
     hidden_size = model_config["hidden_size"]
     intermediate_size = model_config["intermediate_size"]
+    num_attention_heads = model_config["num_attention_heads"]
+    num_key_value_heads = model_config["num_key_value_heads"]
+    head_dim = model_config["head_dim"]
 
     # [[m, n, k]...]
     gemm_shape_list = []
     # attn qkv pass
+    gemm_shape_list.append(
+        [
+            seq,
+            int((num_attention_heads + 2 * num_key_value_heads) * head_dim),
+            hidden_size,
+        ]
+    )
     # attn out
     gemm_shape_list.append([seq, hidden_size, hidden_size])
     # mlp gate+up
@@ -59,10 +86,10 @@ def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
     b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
     config = Float8QuantConfig(format=format, granularity=granularity)
 
-    out = gemm_fp8_tensorwise(a, b, trans_b=trans_b, config=config)
+    out = gemm_fp8(a, b, trans_b=trans_b, config=config)
     grad_out = torch.randn_like(out)
     # Forward pass for implementation
-    fwd_func = lambda: gemm_fp8_tensorwise(a, b, trans_b=trans_b, config=config)
+    fwd_func = lambda: gemm_fp8(a, b, trans_b=trans_b, config=config)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -145,6 +172,7 @@ def benchmark_gemm_fp8():
                 new_row = {
                     "TestID": test_id,
                     "Case": model_name,
+                    "MBS": MBS,
                     "M": M,
                     "N": N,
                     "K": K,

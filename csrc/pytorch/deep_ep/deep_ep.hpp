@@ -72,9 +72,11 @@ private:
     volatile int *moe_recv_rdma_counter        = nullptr;
     int          *moe_recv_rdma_counter_mapped = nullptr;
 
+    bool use_default_stream_as_comm_stream = false;
+
 public:
     Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
-           bool low_latency_mode, bool explicitly_destroy);
+           bool low_latency_mode, bool explicitly_destroy, bool use_default_stream_as_comm_stream);
 
     ~Buffer() noexcept(false);
 

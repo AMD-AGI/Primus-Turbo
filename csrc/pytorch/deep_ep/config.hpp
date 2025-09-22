@@ -58,8 +58,10 @@ struct Config {
         size_t num_bytes = 0;
         num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes;
+#ifndef DISABLE_ROCSHMEM
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens *
                      primus_turbo::deep_ep::internode::get_source_meta_bytes();
+#endif
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK *
                      sizeof(int64_t);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK *
@@ -71,8 +73,40 @@ struct Config {
     }
 
     size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
-        // TODO support internode
-        return 0;
+#ifndef DISABLE_ROCSHMEM
+        // Legacy mode
+        if (num_ranks <= NUM_MAX_NVL_PEERS)
+            return 0;
+
+        // Below are some assumptions
+        // TODO: add assertions
+        constexpr int kNumMaxTopK   = 128;
+        constexpr int kNumMaxScales = 128;
+        PRIMUS_TURBO_CHECK(num_ranks % NUM_MAX_NVL_PEERS == 0);
+        PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
+        const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+        const int num_channels   = num_sms / 2;
+
+        size_t num_bytes = 0;
+        num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS * 2 + 2) * 2 * sizeof(int);
+        num_bytes +=
+            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
+                     primus_turbo::deep_ep::internode::get_source_meta_bytes() * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
+                     kNumMaxTopK * sizeof(int64_t) * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
+                     kNumMaxTopK * sizeof(float) * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
+                     kNumMaxScales * sizeof(float) * 2;
+        num_bytes +=
+            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2;
+        num_bytes = ((num_bytes + 127) / 128) * 128;
+        return num_bytes;
+#else
+        PRIMUS_TURBO_CHECK(false, "rocSHMEM is disabled during compilation, please install "
+                                  "rocSHMEM by following docs/install_dependencies.md");
+#endif
     }
 };
 

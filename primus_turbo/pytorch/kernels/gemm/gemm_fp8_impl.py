@@ -239,7 +239,7 @@ def gemm_fp8_blockwise_impl_meta(
     return c
 
 
-def gemm_fp8_tensorwise_impl(
+def gemm_fp8_impl(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
     trans_a: bool,
