@@ -14,6 +14,7 @@ namespace primus_turbo {
 
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);
 std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
+
 template <typename AType, typename BType, typename CType> struct CKGroupedGemmParams {
     void *args_ptr = nullptr;
 
@@ -77,6 +78,6 @@ void ck_grouped_gemm_fp8_variable_k(
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
-                        const ck_tile::index_t group_num, hipStream_t stream);
+                        const int64_t group_num, hipStream_t stream);
 
 } // namespace primus_turbo

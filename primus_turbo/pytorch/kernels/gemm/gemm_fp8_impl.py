@@ -195,16 +195,9 @@ def gemm_fp8_blockwise_impl(
     )
     if trans_a == False and trans_b == True:
         # NT
-        if (N % 128 == 0 and K % 128 == 0) and (
-            scale_group_size_m == 1 and scale_group_size_n == 128 and scale_group_size_k == 128
-        ):
-            c = torch.ops.primus_turbo_cpp_extension.gemm_fp8_blockwise(
-                a, a_scales, b, b_scales, c, False, True, scale_group_size_k
-            )
-        else:
-            wrap_triton(gemm_fp8_blockwise_nt_kernel)[grid](
-                a, b, c, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=scale_group_size_k
-            )
+        wrap_triton(gemm_fp8_blockwise_nt_kernel)[grid](
+            a, b, c, a_scales, b_scales, M, N, K, BLOCK_SIZE_K=scale_group_size_k
+        )
     elif trans_a == False and trans_b == False:
         # NN
         wrap_triton(gemm_fp8_blockwise_nn_kernel)[grid](

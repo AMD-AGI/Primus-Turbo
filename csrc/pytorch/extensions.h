@@ -69,14 +69,6 @@ at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
                                at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
                                bool transB, bool transC);
 
-torch::Tensor gemm_fp8_blockwise(torch::Tensor &a, torch::Tensor &a_scales, torch::Tensor &b,
-                                 torch::Tensor &b_scales, torch::Tensor &c, const bool transA,
-                                 const bool transB, const int64_t block_size);
-
-torch::Tensor gemm_fp8_blockwise_meta(torch::Tensor &a, torch::Tensor &a_scales, torch::Tensor &b,
-                                      torch::Tensor &b_scales, torch::Tensor &c, const bool transA,
-                                      const bool transB, const int64_t block_size);
-
 std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
                                             const std::vector<int64_t> &shape,
                                             c10::ScalarType             dtype);

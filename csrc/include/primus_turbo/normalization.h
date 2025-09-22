@@ -5,8 +5,6 @@
 #pragma once
 
 #include "primus_turbo/common.h"
-#include "primus_turbo/device/reduce.cuh"
-#include "primus_turbo/device/utils.cuh"
 
 namespace primus_turbo {
 

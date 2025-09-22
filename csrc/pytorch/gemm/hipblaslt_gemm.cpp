@@ -2,7 +2,7 @@
 //
 // See LICENSE for license information.
 
-#include "primus_turbo/hipblaslt_gemm.h"
+#include "primus_turbo/gemm.h"
 
 #include "../extensions.h"
 #include "../type_traits.h"
