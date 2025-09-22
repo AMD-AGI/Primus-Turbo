@@ -190,15 +190,19 @@ def native_torch_scaled_matmul_reduce_scatter_a2a(
                 "must match the leading dims of A "
                 f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
             )
-        A_scale = A_scale.flatten(0, -2).contiguous()
+        A_scale = A_scale.movedim(scatter_dim_after_maybe_reshape, 0).flatten(0, -2).contiguous()
     elif A_scale.numel() != 1:
         raise ValueError(
             "Invalid A_scale shape "
             f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
         )
+    A_flat = A.movedim(scatter_dim_after_maybe_reshape, 0)
+    leading_dims = [group.size()] + list(A_flat.shape[:-1])
+    leading_dims[1] //= group.size()
+    output_shape[orig_scatter_dim] //= group.size()
 
     output = torch._scaled_mm(
-        A.flatten(0, -2).contiguous(),
+        A_flat.flatten(0, -2).contiguous(),
         B,
         A_scale,
         B_scale,
@@ -210,12 +214,16 @@ def native_torch_scaled_matmul_reduce_scatter_a2a(
 
     output_a2a = torch.empty_like(output)
     torch.distributed.all_to_all_single(output_a2a, output)
-    output_a2a.view(*output_shape[:-1], B.shape[1])
+ 
+    output_a2a = output_a2a.view(*leading_dims, -1)
 
     if reduce_op == "avg":
-        rs_output = torch.mean(output_a2a.float(), dim=orig_scatter_dim).to(out_dtype)
+        rs_output = torch.mean(output_a2a.float(), dim=0).to(out_dtype)
     else:
-        rs_output = torch.sum(output_a2a.float(), dim=orig_scatter_dim).to(out_dtype)
+        rs_output = torch.sum(output_a2a.float(), dim=0).to(out_dtype)
+    print(f"xxxxxxxxxxxxrs_output:{rs_output.shape}, {output_shape=}, {scatter_dim_after_maybe_reshape=}")
+    rs_output = rs_output.movedim(0, scatter_dim_after_maybe_reshape).view(output_shape).contiguous()
+
     return rs_output
 
 
@@ -258,11 +266,114 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
             self.gemm_streams = []
             self.comm_streams = []
 
+    # @skip_if_lt_x_gpu(2)
+    # def test_fused_matmul_reduce_scatter(self) -> None:
+    #     self._init_process()
+    #     for comm_method, dtype, reduce_op, scatter_dim in itertools.product(
+    #         ["pipeline"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1]
+    #     ):
+    #         self.init_streams(comm_method)
+
+    #         BATCH = 8
+    #         M = 256
+    #         N = 256
+    #         K = 512
+    #         group = dist.group.WORLD
+    #         rank = self.rank
+
+    #         A = generate_data(
+    #             shape=(BATCH, M, K),
+    #             dtype=dtype,
+    #             device="cuda",
+    #             scale=0.01 * (rank + 1),
+    #         )
+    #         B = generate_data(
+    #             shape=(K, N),
+    #             dtype=dtype,
+    #             device="cuda",
+    #             scale=0.01 * (rank + 1),
+    #         )
+
+    #         rs_output_a2a = native_torch_matmul_reduce_scatter_a2a(A, B, scatter_dim, reduce_op, group)
+    #         rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
+    #         rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+    #             A,
+    #             B,
+    #             layout="NN",
+    #             reduce_op=reduce_op,
+    #             scatter_dim=scatter_dim,
+    #             group_name=group.group_name,
+    #             gemm_streams=self.gemm_streams,
+    #             comm_streams=self.comm_streams,
+    #             comm_method=comm_method,
+    #         )
+
+    #         assert (
+    #             rs_output_native.stride() == rs_output_turbo.stride()
+    #         ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
+    #         diff = (rs_output_native - rs_output_turbo).abs().max()
+    #         diff_mask = rs_output_native != rs_output_turbo
+    #         print(
+    #             f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
+    #         )
+    #         diff = (rs_output_turbo - rs_output_a2a).abs().max()
+    #         diff_mask = rs_output_turbo != rs_output_a2a
+    #         print(
+    #             f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
+    #         )
+    #         torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
+
+    # @skip_if_lt_x_gpu(2)
+    # def test_llama3_70b_fused_matmul_reduce_scatter(self) -> None:
+    #     self._init_process()
+    #     group = dist.group.WORLD
+    #     rank = self.rank
+    #     scatter_dim = 0
+    #     reduce_op = "sum"
+
+    #     for M, N, K, batch_size, dtype, comm_method in get_llama3_70b_cfg():
+    #         self.init_streams(comm_method)
+    #         A = generate_data(
+    #             shape=(batch_size * M, K // group.size()),
+    #             dtype=dtype,
+    #             device="cuda",
+    #             scale=0.01 * (rank + 1),
+    #         )
+    #         B = generate_data(
+    #             shape=(K // group.size(), N),
+    #             dtype=dtype,
+    #             device="cuda",
+    #             scale=0.01 * (rank + 1),
+    #         )
+
+    #         rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
+    #         rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+    #             A,
+    #             B,
+    #             layout="NN",
+    #             reduce_op=reduce_op,
+    #             scatter_dim=scatter_dim,
+    #             group_name=group.group_name,
+    #             gemm_streams=self.gemm_streams,
+    #             comm_streams=self.comm_streams,
+    #             comm_method=comm_method,
+    #         )
+
+    #         assert rs_output_native.stride() == rs_output_turbo.stride()
+    #         diff = (rs_output_native - rs_output_turbo).abs().max()
+    #         diff_mask = rs_output_native != rs_output_turbo
+    #         print(
+    #             f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_turbo.min()}, {rs_output_turbo.max()})"
+    #         )
+    #         torch.testing.assert_close(
+    #             rs_output_native.float(), rs_output_turbo.float(), **get_tolerances(dtype)
+    #         )
+
     @skip_if_lt_x_gpu(2)
-    def test_fused_matmul_reduce_scatter(self) -> None:
+    def test_fused_scaled_matmul_reduce_scatter(self) -> None:
         self._init_process()
-        for comm_method, dtype, reduce_op, scatter_dim in itertools.product(
-            ["pipeline"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1]
+        for comm_method, dtype, reduce_op, scatter_dim, rowwise in itertools.product(
+            ["pipeline"], [torch.bfloat16], ["sum", "avg"], [0, 1], [True, False]
         ):
             self.init_streams(comm_method)
 
@@ -277,24 +388,64 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
                 shape=(BATCH, M, K),
                 dtype=dtype,
                 device="cuda",
-                scale=0.01 * (rank + 1),
-            )
+                scale=(rank + 1),
+            ).to(pt.float8_e4m3)
             B = generate_data(
                 shape=(K, N),
                 dtype=dtype,
                 device="cuda",
-                scale=0.01 * (rank + 1),
+                scale=(rank + 1),
+            ).to(pt.float8_e4m3).t().contiguous().t()
+
+            if rowwise:
+                A_scale = torch.full((BATCH, M, 1), 0.1, device="cuda")
+                B_scale = torch.full((1, N), 0.1, device="cuda")
+            else:
+                A_scale = torch.tensor(0.1, device="cuda")
+                B_scale = torch.tensor(0.1, device="cuda")
+            output_shape = [*A.shape[:-1], B.shape[1]]
+           
+            rs_output_native = native_torch_scaled_matmul_reduce_scatter(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                reduce_op,
+                scatter_dim,
+                scatter_dim,
+                group.group_name,
+                output_shape.copy(),
+                out_dtype=dtype,
             )
 
-            rs_output_a2a = native_torch_matmul_reduce_scatter_a2a(A, B, scatter_dim, reduce_op, group)
-            rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
-            rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+            rs_output_a2a = native_torch_scaled_matmul_reduce_scatter_a2a(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                reduce_op,
+                scatter_dim,
+                scatter_dim,
+                group,
+                output_shape.copy(),
+                out_dtype=dtype,
+            )
+
+            rs_output_turbo = pt.ops.fused_scaled_matmul_reduce_scatter(
                 A,
                 B,
                 layout="NN",
+                A_scale=A_scale,
+                B_scale=B_scale,
                 reduce_op=reduce_op,
-                scatter_dim=scatter_dim,
+                orig_scatter_dim=scatter_dim,
+                scatter_dim_after_maybe_reshape=scatter_dim,
                 group_name=group.group_name,
+                output_shape=output_shape.copy(),
+                bias=None,
+                result_scale=None,
+                out_dtype=dtype,
+                use_fast_accum=False,
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 comm_method=comm_method,
@@ -316,238 +467,99 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
             torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
 
     @skip_if_lt_x_gpu(2)
-    def test_llama3_70b_fused_matmul_reduce_scatter(self) -> None:
+    def test_llama3_70b_fused_scaled_matmul_reduce_scatter(
+        self,
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         rank = self.rank
         scatter_dim = 0
         reduce_op = "sum"
+        comm_method = "pipeline"
 
-        for M, N, K, batch_size, dtype, comm_method in get_llama3_70b_cfg():
+        for M, N, K, batch_size, dtype, scale_dtype, out_dtype, rowwise in get_llama3_70b_fp8_cfg():
             self.init_streams(comm_method)
             A = generate_data(
                 shape=(batch_size * M, K // group.size()),
                 dtype=dtype,
                 device="cuda",
                 scale=0.01 * (rank + 1),
-            )
+            ).to(scale_dtype)
             B = generate_data(
                 shape=(K // group.size(), N),
                 dtype=dtype,
                 device="cuda",
                 scale=0.01 * (rank + 1),
+            ).to(scale_dtype).t().contiguous().t()
+
+            if rowwise:
+                A_scale = torch.full((batch_size * M, 1), 0.1, device="cuda")
+                B_scale = torch.full((1, N), 0.1, device="cuda")
+            else:
+                A_scale = torch.tensor(0.1, device="cuda")
+                B_scale = torch.tensor(0.1, device="cuda")
+            output_shape = [*A.shape[:-1], B.shape[1]]
+
+            rs_output_native = native_torch_scaled_matmul_reduce_scatter(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                reduce_op,
+                scatter_dim,
+                scatter_dim,
+                group.group_name,
+                output_shape.copy(),
+                out_dtype=out_dtype,
             )
 
-            rs_output_native = native_torch_matmul_reduce_scatter(A, B, scatter_dim, reduce_op, group)
-            rs_output_turbo = pt.ops.fused_matmul_reduce_scatter(
+            rs_output_a2a = native_torch_scaled_matmul_reduce_scatter_a2a(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                reduce_op,
+                scatter_dim,
+                scatter_dim,
+                group,
+                output_shape.copy(),
+                out_dtype=out_dtype,
+            )
+
+            rs_output_turbo = pt.ops.fused_scaled_matmul_reduce_scatter(
                 A,
                 B,
                 layout="NN",
+                A_scale=A_scale,
+                B_scale=B_scale,
                 reduce_op=reduce_op,
-                scatter_dim=scatter_dim,
+                orig_scatter_dim=scatter_dim,
+                scatter_dim_after_maybe_reshape=scatter_dim,
                 group_name=group.group_name,
+                output_shape=output_shape.copy(),
+                bias=None,
+                result_scale=None,
+                out_dtype=out_dtype,
+                use_fast_accum=False,
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 comm_method=comm_method,
             )
 
-            assert rs_output_native.stride() == rs_output_turbo.stride()
+            assert (
+                rs_output_native.stride() == rs_output_turbo.stride()
+            ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
             diff = (rs_output_native - rs_output_turbo).abs().max()
             diff_mask = rs_output_native != rs_output_turbo
             print(
-                f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_turbo.min()}, {rs_output_turbo.max()})"
+                f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
             )
-            torch.testing.assert_close(
-                rs_output_native.float(), rs_output_turbo.float(), **get_tolerances(dtype)
+            diff = (rs_output_turbo - rs_output_a2a).abs().max()
+            diff_mask = rs_output_turbo != rs_output_a2a
+            print(
+                f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
             )
-
-    # @skip_if_lt_x_gpu(2)
-    # def test_fused_scaled_matmul_reduce_scatter(self) -> None:
-    #     self._init_process()
-    #     for comm_method, dtype, reduce_op, scatter_dim, rowwise in itertools.product(
-    #         ["pipeline"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1], [True, False]
-    #     ):
-    #         self.init_streams(comm_method)
-
-    #         BATCH = 8
-    #         M = 256
-    #         N = 256
-    #         K = 512
-    #         group = dist.group.WORLD
-    #         rank = self.rank
-
-    #         A = generate_data(
-    #             shape=(BATCH, M, K),
-    #             dtype=dtype,
-    #             device="cuda",
-    #             scale=(rank + 1),
-    #         ).to(pt.float8_e4m3)
-    #         B = generate_data(
-    #             shape=(K, N),
-    #             dtype=dtype,
-    #             device="cuda",
-    #             scale=(rank + 1),
-    #         ).to(pt.float8_e4m3)
-
-    #         if rowwise:
-    #             A_scale = torch.full((BATCH, M, 1), 0.1, device="cuda")
-    #             B_scale = torch.full((1, N), 0.1, device="cuda")
-    #         else:
-    #             A_scale = torch.tensor(0.1, device="cuda")
-    #             B_scale = torch.tensor(0.1, device="cuda")
-    #         output_shape = [*A.shape[:-1], B.shape[1]]
-           
-    #         rs_output_native = native_torch_scaled_matmul_reduce_scatter(
-    #             A,
-    #             B,
-    #             A_scale,
-    #             B_scale,
-    #             reduce_op,
-    #             scatter_dim,
-    #             scatter_dim,
-    #             group.group_name,
-    #             output_shape,
-    #             out_dtype=dtype,
-    #         )
-
-    #         rs_output_a2a = native_torch_scaled_matmul_reduce_scatter_a2a(
-    #             A,
-    #             B,
-    #             A_scale,
-    #             B_scale,
-    #             reduce_op,
-    #             scatter_dim,
-    #             scatter_dim,
-    #             group,
-    #             output_shape,
-    #             out_dtype=dtype,
-    #         )
-
-    #         rs_output_turbo = pt.ops.fused_scaled_matmul_reduce_scatter(
-    #             A,
-    #             B,
-    #             layout="NN",
-    #             A_scale=A_scale,
-    #             B_scale=B_scale,
-    #             reduce_op=reduce_op,
-    #             orig_scatter_dim=scatter_dim,
-    #             scatter_dim_after_maybe_reshape=scatter_dim,
-    #             group_name=group.group_name,
-    #             output_shape=output_shape,
-    #             out_dtype=dtype,
-    #             use_fast_accum=False,
-    #             gemm_streams=self.gemm_streams,
-    #             comm_streams=self.comm_streams,
-    #             comm_method=comm_method,
-    #         )
-
-    #         assert (
-    #             rs_output_native.stride() == rs_output_turbo.stride()
-    #         ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
-    #         diff = (rs_output_native - rs_output_turbo).abs().max()
-    #         diff_mask = rs_output_native != rs_output_turbo
-    #         print(
-    #             f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
-    #         )
-    #         diff = (rs_output_turbo - rs_output_a2a).abs().max()
-    #         diff_mask = rs_output_turbo != rs_output_a2a
-    #         print(
-    #             f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
-    #         )
-    #         torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
-
-    # @skip_if_lt_x_gpu(2)
-    # def test_llama3_70b_fused_scaled_matmul_reduce_scatter(
-    #     self,
-    # ) -> None:
-    #     self._init_process()
-    #     group = dist.group.WORLD
-    #     rank = self.rank
-    #     scatter_dim = 0
-    #     reduce_op = "sum"
-    #     comm_method = "pipeline"
-
-    #     for M, N, K, batch_size, dtype, scale_dtype, out_dtype, rowwise in get_llama3_70b_fp8_cfg():
-    #         self.init_streams(comm_method)
-    #         A = generate_data(
-    #             shape=(batch_size * M, K // group.size()),
-    #             dtype=dtype,
-    #             device="cuda",
-    #             scale=0.01 * (rank + 1),
-    #         ).to(scale_dtype)
-    #         B = generate_data(
-    #             shape=(K // group.size(), N),
-    #             dtype=dtype,
-    #             device="cuda",
-    #             scale=0.01 * (rank + 1),
-    #         ).to(scale_dtype)
-
-    #         if rowwise:
-    #             A_scale = torch.full((batch_size, M, 1), 0.1, device="cuda")
-    #             B_scale = torch.full((1, N), 0.1, device="cuda")
-    #         else:
-    #             A_scale = torch.tensor(0.1, device="cuda")
-    #             B_scale = torch.tensor(0.1, device="cuda")
-    #         output_shape = [*A.shape[:-1], B.shape[1]]
-
-    #         rs_output_native = native_torch_scaled_matmul_reduce_scatter(
-    #             A,
-    #             B,
-    #             A_scale,
-    #             B_scale,
-    #             reduce_op,
-    #             scatter_dim,
-    #             scatter_dim,
-    #             group.group_name,
-    #             output_shape,
-    #             out_dtype=dtype,
-    #         )
-
-    #         rs_output_a2a = native_torch_scaled_matmul_reduce_scatter_a2a(
-    #             A,
-    #             B,
-    #             A_scale,
-    #             B_scale,
-    #             reduce_op,
-    #             scatter_dim,
-    #             scatter_dim,
-    #             group,
-    #             output_shape,
-    #             out_dtype=dtype,
-    #         )
-
-    #         rs_output_turbo = pt.ops.fused_scaled_matmul_reduce_scatter(
-    #             A,
-    #             B,
-    #             layout="NN",
-    #             A_scale=A_scale,
-    #             B_scale=B_scale,
-    #             reduce_op=reduce_op,
-    #             orig_scatter_dim=scatter_dim,
-    #             scatter_dim_after_maybe_reshape=scatter_dim,
-    #             group_name=group.group_name,
-    #             output_shape=output_shape,
-    #             out_dtype=dtype,
-    #             use_fast_accum=False,
-    #             gemm_streams=self.gemm_streams,
-    #             comm_streams=self.comm_streams,
-    #             comm_method=comm_method,
-    #         )
-
-    #         assert (
-    #             rs_output_native.stride() == rs_output_turbo.stride()
-    #         ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
-    #         diff = (rs_output_native - rs_output_turbo).abs().max()
-    #         diff_mask = rs_output_native != rs_output_turbo
-    #         print(
-    #             f"[rank {torch.distributed.get_rank()}]native vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_native.min()}, {rs_output_native.max()})"
-    #         )
-    #         diff = (rs_output_turbo - rs_output_a2a).abs().max()
-    #         diff_mask = rs_output_turbo != rs_output_a2a
-    #         print(
-    #             f"[rank {torch.distributed.get_rank()}]a2a vs turbo: diff_mask-{diff_mask.sum()}, diff_max-{diff}, value_range-({rs_output_a2a.min()}, {rs_output_a2a.max()})"
-    #         )
-    #         torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(dtype))
+            torch.testing.assert_close(rs_output_turbo, rs_output_a2a, **get_tolerances(out_dtype))
 
 if __name__ == "__main__":
     run_tests()

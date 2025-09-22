@@ -292,7 +292,7 @@ def _pipeline_matmul_scatter_out_fp8_impl(
     else:
         hip_memcpy_kind = hip.hipMemcpyKind.hipMemcpyDeviceToDevice
 
-    p2p_workspace_size_req = M * N * input.element_size()
+    p2p_workspace_size_req = M * N * out_dtype.itemsize
     symm_mem = get_amd_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
     scatter_bufs = [symm_mem.get_buffer(i, [M, N], out_dtype) for i in range(num_ranks)]
 
@@ -318,6 +318,7 @@ def _pipeline_matmul_scatter_out_fp8_impl(
                 chunk_input_scale = chunk_input_scale if chunk_input_scale.data_ptr() % 16 == 0 else chunk_input_scale.clone()
             else:
                 chunk_input_scale = A_scale
+            print(f"xxxxxxxxxxxxxxxxxxxxxxxxx{chunk_input=}, {weight=}, {chunk_input_scale=}, {kwargs=}, {chunk_idx=}, local_tensor_buffers={local_tensor_buffers[chunk_idx]}")
             mm_out_op(chunk_input, weight, scale_a=chunk_input_scale, **kwargs, out=local_tensor_buffers[chunk_idx])
             gemm_events[chunk_idx].record(gemm_stream)
 
@@ -385,6 +386,7 @@ def _fused_scaled_matmul_reduce_scatter_impl(
     output: torch.Tensor,
     rs_output: torch.Tensor,
 ):
+    print(f"---------------389:{output_shape=}--------------------------")
     if A.dim() < 2:
         raise ValueError("A_shard must be a matrix")
     if (
@@ -444,6 +446,7 @@ def _fused_scaled_matmul_reduce_scatter_impl(
                 return False
         return True
 
+    print(f"---------------449:{output_shape=}--------------------------")
     output_shape[orig_scatter_dim] //= group.size()
     if rs_output is not None:
         if rs_output.dtype != out_dtype:
@@ -453,7 +456,8 @@ def _fused_scaled_matmul_reduce_scatter_impl(
                 f"Invalid shape: rs_out ({rs_output.shape}) is not unexpected as ({output_shape})!"
             )
     else:
-        rs_output = torch.empty((A_2D_with_scatter_dim_0.shape[0], B.shape[-1]), dtype=out_dtype, device=A.device)
+        rs_output = torch.empty((A_2D_with_scatter_dim_0.shape[0] // group.size(), B.shape[-1]), dtype=out_dtype, device=A.device)
+    print(f"---------------460:{output_shape=}--------------------------")
 
     if output is not None:
         if output.dtype != out_dtype:
@@ -465,7 +469,7 @@ def _fused_scaled_matmul_reduce_scatter_impl(
 
     rs_output = _pipeline_matmul_scatter_out_fp8_impl(
         mm_out_op,
-        A,
+        A_2D_with_scatter_dim_0,
         B,
         A_scale,
         kwargs,
@@ -479,6 +483,6 @@ def _fused_scaled_matmul_reduce_scatter_impl(
         rs_output,
         out_dtype,
     )
-   
-    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim_after_maybe_reshape).view(output_shape)
+    print(f"xxxxxxxxxxxx486::rs_output:{rs_output.shape}, {leading_dims=}, {output_shape=}, {scatter_dim_after_maybe_reshape=}")
+    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim_after_maybe_reshape).view(output_shape).contiguous()
     

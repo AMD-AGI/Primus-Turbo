@@ -5,6 +5,7 @@ try:
         fused_all_gather_matmul,
         fused_all_gather_scaled_matmul,
         fused_matmul_reduce_scatter,
+        fused_scaled_matmul_reduce_scatter
     )
 except ImportError as e:
     warnings.warn(f"Primus-Turbo can't support Async-TP - {e}")
