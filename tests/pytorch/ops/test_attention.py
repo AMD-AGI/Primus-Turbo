@@ -41,13 +41,13 @@ test_cases = [
 ]
 
 
-@pytest.mark.parametrize("batch", [4])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("backend_type", ["triton", "ck"])
-def test_attention_bf16(batch, config, causal, backend_type):
+def test_attention_16bit(batch, dtype, config, causal, backend_type):
     device = "cuda"
-    dtype = torch.bfloat16
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
         config.seqlen_kv,
@@ -57,9 +57,12 @@ def test_attention_bf16(batch, config, causal, backend_type):
         config.head_dim_v,
     )
 
-    if head_dim_qk == 192 and head_dim_v == 128 and not causal:
-        # DQ snr a little bit low, skip
-        return
+    if head_dim_qk == 192 and causal is False:
+        pytest.skip()
+
+    print(
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Backend={backend_type}"
+    )
 
     q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
     k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
@@ -99,15 +102,16 @@ def test_attention_bf16(batch, config, causal, backend_type):
     query_grad_snr = compute_snr(query_ref.grad, query.grad)
     key_grad_snr = compute_snr(key_ref.grad, key.grad)
     value_grad_snr = compute_snr(value_ref.grad, value.grad)
-    print(out_snr, query_grad_snr, key_grad_snr, value_grad_snr)
-    assert out_snr > 20, "out_snr too low"
+    print(f"{out_snr:.2f}", f"{query_grad_snr:.2f}", f"{key_grad_snr:.2f}", f"{value_grad_snr:.2f}")
+
+    assert out_snr > 40, "out_snr too low"
     if config == test_cases[9]:
         # lower the SNR threshold for this specific case
         assert query_grad_snr > 12, "query_grad_snr too low"
     else:
         assert query_grad_snr > 15, "query_grad_snr too low"
-    assert key_grad_snr > 15, "key_grad_snr too low"
-    assert value_grad_snr > 15, "value_grad_snr too low"
+    assert key_grad_snr > 20, "key_grad_snr too low"
+    assert value_grad_snr > 40, "value_grad_snr too low"
 
 
 @pytest.mark.parametrize("batch", [4])
