@@ -1,0 +1,246 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+
+from typing import Optional, Tuple
+
+import torch
+import torch.distributed as dist
+
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.deep_ep import Config
+
+
+class TurboTokenPermuter(torch.nn.Module):
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        token_probs: Optional[torch.Tensor] = None,
+        routing_map: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        num_out_tokens: int = -1,
+        permute_fusion: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if routing_map is None and topk_indices is None:
+            raise ValueError("routing_map or topk_indices must be set")
+        if permute_fusion:
+            return turbo.ops.token_permute(
+                tokens,
+                probs=token_probs,
+                routing_map=routing_map,
+                topk_indices=topk_indices,
+                num_out_tokens=num_out_tokens,
+            )
+        num_tokens, _ = tokens.shape
+        num_experts = routing_map.shape[1]
+
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.bool().T.contiguous()
+
+        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
+        token_indices = (
+            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+        )
+        sorted_indices = token_indices.masked_select(routing_map)
+
+        permuted_probs = None
+        if token_probs is not None:
+            permuted_probs = token_probs.T.contiguous().masked_select(routing_map)
+
+        # use the mapping to permute the tokens
+        permuted_input = tokens.index_select(0, sorted_indices)
+
+        return permuted_input, permuted_probs, sorted_indices
+
+
+class TurboTokenUnpermuter(torch.nn.Module):
+
+    def forward(
+        self,
+        permuted_tokens: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        restore_shape: torch.Size,
+        probs: torch.Tensor = None,
+        routing_map: torch.Tensor = None,
+        drop_and_pad: bool = False,
+        permute_fusion: bool = True,
+    ):
+
+        if permute_fusion:
+            return turbo.ops.token_unpermute(
+                permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+            )
+
+        _, hidden = restore_shape
+        input_dtype = permuted_tokens.dtype
+
+        if probs is not None:
+            assert routing_map is not None, "Mask must be provided to permute the probs."
+            if drop_and_pad:
+                num_experts = routing_map.size(1)
+                num_permuted_tokens = sorted_indices.size(0)
+                capacity = num_permuted_tokens // num_experts
+                num_unpermuted_tokens = probs.size(0)
+
+                # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
+                probs_T_1D = probs.T.contiguous().view(-1)
+
+                # get 1D indices of the probs selected by routing_map
+                indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+                indices_dim1 = sorted_indices.view(num_experts, capacity)
+                indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
+
+                # get probs from indices
+                permuted_probs = probs_T_1D.index_select(0, indices_1D)
+            else:
+                permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+            # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
+            # higher precision due to moe_router_dtype being enabled. This can lead to
+            # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
+            # allocation.
+            permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
+
+        # Create an output tensor filled with zeros
+        output_tokens = torch.zeros(restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device)
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+        return output_tokens.to(dtype=input_dtype)
+
+
+class TurboDeepEPTokenDispatcher(torch.nn.Module):
+    def __init__(
+        self,
+        ep_group: dist.ProcessGroup,
+        router_topk: int,
+        num_experts: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        use_default_stream_as_comm_stream: Optional[bool] = True,
+        num_use_cu: int = 32,
+        use_cuda_num_tokens_per_expert: Optional[bool] = False,
+        autotune_config: Optional[Config] = None,
+        permute_fusion: bool = True,
+    ):
+        super().__init__()
+        assert num_experts % ep_group.size() == 0
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.num_local_experts = num_experts // ep_group.size()
+        self.use_cuda_num_tokens_per_expert = use_cuda_num_tokens_per_expert
+        self.permute_fusion = permute_fusion
+        hidden_bytes = hidden_size * dtype.itemsize
+
+        turbo.ops.init_deepep_buffer(
+            group=ep_group,
+            hidden_bytes=hidden_bytes,
+            use_default_stream_as_comm_stream=use_default_stream_as_comm_stream,
+            num_use_cu=num_use_cu,
+            autotune_config=autotune_config,
+        )
+
+        self.token_permuter = TurboTokenPermuter()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        token_probs: torch.Tensor,
+        routing_map: Optional[torch.Tensor] = None,
+        token_indices: Optional[torch.Tensor] = None,
+        num_worst_tokens: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+
+        # check hidden_states, token_probs shape or dtype
+        tokens = hidden_states.view(-1, self.hidden_size)
+        num_tokens = tokens.shape[0]
+
+        # the shape of token_probs maybe [num_tokens, topk] or [num_tokens, num_experts]
+        token_probs = token_probs.reshape(num_tokens, -1)
+        probs_sorted = token_probs.shape[-1] == self.router_topk
+
+        # 1. token_indices is None
+        # call topk to get token_idx and token_probs, ensure token_probs unsorted
+        if token_indices is None:
+            assert (
+                not probs_sorted
+            ), "token_probs is sorted by topk, need unsorted token_probs when token_indices is None"
+            token_probs, token_indices = torch.topk(token_probs, self.router_topk, dim=-1)
+
+            probs_sorted = True
+
+        # 2. token_indices is not None
+        # call gather to get token_probs if token_probs unsorted, otherwise skip
+        if not probs_sorted:
+            token_probs = token_probs.gather(1, token_indices)
+
+        if token_probs.dtype != torch.float32 and token_probs.dtype in [torch.bfloat16, torch.float16]:
+            if dist.get_rank() == 0:
+                print("DeepEP only supports float32 token_probs!")
+            token_probs = token_probs.float()  # downcast or upcast
+
+        (dispatched_tokens, dispatched_indices, dispatched_probs, num_tokens_per_expert, dispatch_handle) = (
+            turbo.ops.deepep_dispatch(
+                tokens,
+                token_indices=token_indices,
+                token_weights=token_probs,
+                num_experts=self.num_experts,
+                num_worst_tokens=num_worst_tokens,
+                use_cuda_num_token_per_expert=self.use_cuda_num_tokens_per_expert,
+            )
+        )
+
+        # TODO: try use topk_indices instead of routing_map can eliminate indices_to_multihot
+        dispatched_routing_map, dispatched_probs = turbo.ops.fused_indices_to_multihot(
+            dispatched_indices, dispatched_probs, self.num_local_experts
+        )
+        permuted_tokens, permuted_probs, reversed_mapping_for_combine = self.token_permuter(
+            dispatched_tokens,
+            token_probs=dispatched_probs,
+            routing_map=dispatched_routing_map,
+            num_out_tokens=torch.sum(num_tokens_per_expert),
+            permute_fusion=self.permute_fusion,
+        )
+        handle = (
+            reversed_mapping_for_combine,
+            dispatched_tokens.shape,
+            dispatched_routing_map,
+            dispatch_handle,
+            self.permute_fusion,
+        )
+        return permuted_tokens, num_tokens_per_expert, permuted_probs, handle
+
+
+class TurboDeepEPTokenCombiner(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_unpermuter = TurboTokenUnpermuter()
+
+    def forward(
+        self, hidden_states: torch.Tensor, handle: Tuple, bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert bias is None
+
+        # unpack deepep and permute handle
+        (
+            reversed_mapping_for_combine,
+            hidden_shape_before_permute,
+            dispatched_routing_map,
+            dispatch_handle,
+            permute_fusion,
+        ) = handle
+
+        unpermuted_tokens = self.token_unpermuter(
+            hidden_states,
+            reversed_mapping_for_combine,
+            restore_shape=hidden_shape_before_permute,
+            routing_map=dispatched_routing_map,
+            permute_fusion=permute_fusion,
+        )
+        combined_token = turbo.ops.deepep_combine(unpermuted_tokens, handle=dispatch_handle)
+
+        return combined_token, None
