@@ -96,16 +96,13 @@ def get_version():
 
 
 def get_offload_archs():
-    import torch
-
-    cur_device_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()
-
     gpu_archs = os.environ.get("GPU_ARCHS", None)
-    # gpu_archs = None
 
     arch_list = []
     if gpu_archs is None or gpu_archs.strip() == "":
-        arch_list = [cur_device_arch]
+        import torch
+
+        arch_list = [torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()]
     else:
         arch_list = [arch.strip().lower() for arch in gpu_archs.split(";")]
 
