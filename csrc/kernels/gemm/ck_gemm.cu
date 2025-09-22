@@ -2,6 +2,4 @@
 //
 // See LICENSE for license information.
 
-namespace primus_turbo {
-
-} // namespace primus_turbo
+namespace primus_turbo {} // namespace primus_turbo

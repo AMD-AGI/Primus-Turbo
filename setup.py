@@ -129,6 +129,8 @@ def get_common_flags():
     extra_link_args = [
         "-Wl,-rpath,/opt/rocm/lib",
         f"-L/usr/lib/{arch}-linux-gnu",
+        "-fgpu-rdc",
+        "--hip-link",
     ]
 
     cxx_flags = [
@@ -158,6 +160,7 @@ def get_common_flags():
         "-mllvm",
         "-amdgpu-function-calls=false",
         "-std=c++20",
+        "-fgpu-rdc",
     ]
 
     # Device Archs
@@ -173,9 +176,6 @@ def get_common_flags():
     if "--offload-arch=gfx950" in nvcc_flags:
         cxx_flags.append("-DCK_TILE_USE_OCP_FP8")
         nvcc_flags.append("-DCK_TILE_USE_OCP_FP8")
-
-    print("********", cxx_flags)
-    print("********", nvcc_flags)
 
     return {
         "extra_link_args": extra_link_args,

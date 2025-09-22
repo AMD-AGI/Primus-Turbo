@@ -2,7 +2,6 @@
 //
 // See LICENSE for license information.
 
-
 namespace primus_turbo::pytorch {
 
 // TODO: CK

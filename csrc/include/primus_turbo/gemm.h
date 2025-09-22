@@ -4,9 +4,9 @@
 
 #pragma once
 #include <cstdint>
-#include <stdexcept>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
+#include <stdexcept>
 
 namespace primus_turbo {
 
@@ -23,6 +23,5 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 // *****************************************
 
 // TODO: CK
-
 
 } // namespace primus_turbo

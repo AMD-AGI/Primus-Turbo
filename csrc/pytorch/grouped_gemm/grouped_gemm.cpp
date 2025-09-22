@@ -13,9 +13,8 @@ template <typename AType, typename BType, typename CType>
 inline CKGroupedGemmParams<AType, BType, CType>
 make_ck_groued_gemm_params(void *args_ptr, const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
                            const at::Tensor &group_lens, const at::Tensor &group_offs, bool transA,
-                           bool transB, ck_tile::index_t group_num, ck_tile::index_t m,
-                           ck_tile::index_t n, ck_tile::index_t k, hipStream_t stream,
-                           uint32_t num_cu) {
+                           bool transB, int32_t group_num, int32_t m, int32_t n, int32_t k,
+                           hipStream_t stream, uint32_t num_cu) {
     CKGroupedGemmParams<AType, BType, CType> params;
     params.args_ptr       = args_ptr;
     params.a_ptr          = reinterpret_cast<const AType *>(a.data_ptr());
@@ -35,13 +34,11 @@ make_ck_groued_gemm_params(void *args_ptr, const at::Tensor &a, const at::Tensor
 }
 
 template <typename AType, typename BType, typename CType, typename ACCType>
-inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType>
-make_ck_groued_gemm_fp8_params(void *args_ptr, const at::Tensor &a, const at::Tensor &b,
-                               at::Tensor &c, const at::Tensor &a_scales,
-                               const at::Tensor &b_scales, const at::Tensor &group_lens,
-                               const at::Tensor &group_offs, bool transA, bool transB,
-                               ck_tile::index_t group_num, ck_tile::index_t m, ck_tile::index_t n,
-                               ck_tile::index_t k, hipStream_t stream, uint32_t num_cu) {
+inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_groued_gemm_fp8_params(
+    void *args_ptr, const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
+    const at::Tensor &a_scales, const at::Tensor &b_scales, const at::Tensor &group_lens,
+    const at::Tensor &group_offs, bool transA, bool transB, int32_t group_num, int32_t m, int32_t n,
+    int32_t k, hipStream_t stream, uint32_t num_cu) {
     CKGroupedGemmFP8Params<AType, BType, CType, ACCType> params;
     params.args_ptr       = args_ptr;
     params.a_ptr          = reinterpret_cast<const AType *>(a.data_ptr());
@@ -177,17 +174,17 @@ at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
     auto       stream = at::cuda::getCurrentCUDAStream();
 
     if (a.dtype() == at::kFloat8_e4m3fnuz || a.dtype() == at::kFloat8_e4m3fn) {
-        using AType = ck_tile::fp8_t;
+        using AType = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;
         using BType = AType;
 
         if (out_dtype == at::kBFloat16) {
-            using CType = ck_tile::bfloat16_t;
+            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
-            using CType = ck_tile::half_t;
+            using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
@@ -196,17 +193,17 @@ at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
         }
     } else if (a.dtype() == at::kFloat8_e5m2fnuz || a.dtype() == at::kFloat8_e5m2) {
-        using AType = ck_tile::bf8_t;
+        using AType = typename TorchToCKTileType<at::kFloat8_e5m2fnuz>::type;
         using BType = AType;
 
         if (out_dtype == at::kBFloat16) {
-            using CType = ck_tile::bfloat16_t;
+            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
-            using CType = ck_tile::half_t;
+            using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
@@ -312,16 +309,16 @@ at::Tensor grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor 
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (a.dtype() == at::kFloat8_e4m3fnuz || a.dtype() == at::kFloat8_e4m3fn) {
-        using AType = ck_tile::fp8_t;
+        using AType = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;
         using BType = AType;
         if (out_dtype == at::kBFloat16) {
-            using CType = ck_tile::bfloat16_t;
+            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
-            using CType = ck_tile::half_t;
+            using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
@@ -330,16 +327,16 @@ at::Tensor grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor 
             PRIMUS_TURBO_CHECK(false, "GroupedGemmFp8: out dtype only support fp16 and bf16");
         }
     } else if (a.dtype() == at::kFloat8_e5m2fnuz || a.dtype() == at::kFloat8_e5m2) {
-        using AType = ck_tile::bf8_t;
+        using AType = typename TorchToCKTileType<at::kFloat8_e5m2fnuz>::type;
         using BType = AType;
         if (out_dtype == at::kBFloat16) {
-            using CType = ck_tile::bfloat16_t;
+            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
-            using CType = ck_tile::half_t;
+            using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));

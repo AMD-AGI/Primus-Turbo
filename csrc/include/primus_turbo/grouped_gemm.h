@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include "ck_tile/core.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -28,10 +27,10 @@ template <typename AType, typename BType, typename CType> struct CKGroupedGemmPa
     bool transA = false;
     bool transB = false;
 
-    ck_tile::index_t group_num = 0;
-    ck_tile::index_t m         = 0;
-    ck_tile::index_t n         = 0;
-    ck_tile::index_t k         = 0;
+    int32_t group_num = 0;
+    int32_t m         = 0;
+    int32_t n         = 0;
+    int32_t k         = 0;
 
     hipStream_t stream = nullptr;
     uint32_t    num_cu = 0;
@@ -53,10 +52,10 @@ struct CKGroupedGemmFP8Params {
     bool transA = false;
     bool transB = false;
 
-    ck_tile::index_t group_num = 0;
-    ck_tile::index_t m         = 0;
-    ck_tile::index_t n         = 0;
-    ck_tile::index_t k         = 0;
+    int32_t group_num = 0;
+    int32_t m         = 0;
+    int32_t n         = 0;
+    int32_t k         = 0;
 
     hipStream_t stream = nullptr;
     uint32_t    num_cu = 0;
