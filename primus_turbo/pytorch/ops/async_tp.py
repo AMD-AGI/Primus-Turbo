@@ -13,7 +13,12 @@ import torch.distributed.distributed_c10d as c10d
 
 from primus_turbo.pytorch.kernels.async_tp import ag_gemm_impl, gemm_rs_impl
 
-__all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter", "fused_all_gather_scaled_matmul", "fused_scaled_matmul_reduce_scatter"]
+__all__ = [
+    "fused_all_gather_matmul",
+    "fused_matmul_reduce_scatter",
+    "fused_all_gather_scaled_matmul",
+    "fused_scaled_matmul_reduce_scatter",
+]
 
 
 def fused_all_gather_matmul(
@@ -283,10 +288,12 @@ def fused_matmul_reduce_scatter(
                 stream=torch.cuda.current_stream(),
             )
         else:
-            rs_output = gemm_rs_impl._pipeline_matmul_scatter_out_impl(
-                torch.ops.aten.mm.out,
-                input=x,
-                weight=B,
+            rs_output = gemm_rs_impl._pipeline_scaled_matmul_scatter_out_impl(
+                mm_out_op=torch.ops.aten.mm.out,
+                A=x,
+                B=B,
+                A_scale=None,
+                kwargs={},
                 group_name=group_name,
                 reduce_op=reduce_op,
                 num_splits=num_splits,
@@ -297,8 +304,7 @@ def fused_matmul_reduce_scatter(
                 rs_output=rs_out,
                 out_dtype=out_dtype,
             )
-
-    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim)
+        return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim).contiguous()
 
 
 def fused_scaled_matmul_reduce_scatter(
@@ -325,12 +331,86 @@ def fused_scaled_matmul_reduce_scatter(
     output: Optional[torch.Tensor] = None,
     rs_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if A.dim() < 2:
+        raise ValueError("A_shard must be a matrix")
+    if scatter_dim_after_maybe_reshape < 0 or scatter_dim_after_maybe_reshape >= A.dim():
+        raise ValueError("Invalid scatter dim for 2D tensor input to scaled_mm")
+    if orig_scatter_dim < 0 or orig_scatter_dim >= len(output_shape):
+        raise ValueError("Invalid scatter dim for 3D+ output tensor")
+    if B.dim() != 2:
+        raise ValueError("B must be a matrix")
+
+    if reduce_op not in ["sum", "avg"]:
+        raise ValueError("reduce_op must be sum or avg")
+    if layout != "NN":
+        raise ValueError(f"layout must be NN, otherwise scale should be processed, but {layout}")
+    if comm_method != "pipeline":
+        raise ValueError(f"{comm_method} not supported yet, please use pipeline")
+
+    group = c10d._resolve_process_group(group_name)
+
+    # Move scatter to first dim, then shard the tensor along the first dim, so the chunk producer
+    # can perform matmuls along the first dim.
+    A_with_scatter_dim_0 = A.movedim(scatter_dim_after_maybe_reshape, 0)
+    leading_dims = list(A_with_scatter_dim_0.shape[:-1])
+    leading_dims[0] //= group.size()
+
+    # To handle case where A is 3D+, reshape to 2D to prepare for mm which requires 2D inputs.
+    A_2D_with_scatter_dim_0 = A_with_scatter_dim_0.flatten(0, -2)
+
+    # Now that 'A' is sharded along the first dim, we need to update its scale(s) accordingly.
+    # How we do this depends on if we are using tensorwise scaling, rowwise scaling, or no scaling.
+    tensorwise_scaling = A_scale is not None and A_scale.numel() == 1
+    rowwise_scaling = A_scale is not None and A_scale.numel() > 1
+
+    if not tensorwise_scaling and not rowwise_scaling:
+        raise ValueError("A_scale cannot be none for scaled_mm")
+
+    if rowwise_scaling:
+        if A_scale.shape[:-1] != A.shape[:-1]:
+            raise ValueError(
+                "For row-wise scaling, the leading dims of A_scale "
+                "must match the leading dims of A "
+                f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
+            )
+        A_scale = A_scale.movedim(scatter_dim_after_maybe_reshape, 0).contiguous().flatten(0, -2)
+
+    def check_shape(shape_0, shape_1):
+        if len(shape_0) != len(shape_1):
+            return False
+        for i in range(len(shape_0)):
+            if shape_0[i] != shape_1[i]:
+                return False
+        return True
+
+    output_shape[orig_scatter_dim] //= group.size()
+    if rs_out is not None:
+        if rs_out.dtype != out_dtype:
+            raise ValueError(
+                f"Invalid dtype: rs_output ({rs_out.dtype}) is different with out_dtype ({out_dtype})!"
+            )
+        if not check_shape(output_shape, list(rs_out.shape)):
+            raise ValueError(f"Invalid shape: rs_out ({rs_out.shape}) is not unexpected as ({output_shape})!")
+    else:
+        rs_out = torch.empty(
+            (A_2D_with_scatter_dim_0.shape[0] // group.size(), B.shape[-1]), dtype=out_dtype, device=A.device
+        )
+
+    if output is not None:
+        if output.dtype != out_dtype:
+            raise ValueError(
+                f"Invalid dtype: output ({output.dtype}) is different with out_dtype ({out_dtype})!"
+            )
+
+        if output.numel() != rs_out.numel() * group.size():
+            raise ValueError(f"output size must equal group size * rs_out size.")
+        output = output.view(-1, B.shape[-1])
+
     with torch.profiler.record_function(f"{comm_method}_fused_scaled_matmul_scatter_out"):
-        return gemm_rs_impl._fused_scaled_matmul_reduce_scatter_impl(
+        rs_output = gemm_rs_impl._pipeline_scaled_matmul_scatter_out_impl(
             mm_out_op=torch.ops.aten._scaled_mm.out,
-            A=A,
+            A=A_2D_with_scatter_dim_0,
             B=B,
-            layout=layout,
             A_scale=A_scale,
             kwargs={
                 "scale_b": B_scale,
@@ -339,17 +419,19 @@ def fused_scaled_matmul_reduce_scatter(
                 "out_dtype": out_dtype,
                 "use_fast_accum": use_fast_accum,
             },
-            out_dtype=out_dtype,
-            reduce_op=reduce_op,
-            orig_scatter_dim=orig_scatter_dim,
-            scatter_dim_after_maybe_reshape=scatter_dim_after_maybe_reshape,
             group_name=group_name,
-            output_shape=output_shape,
-            comm_method=comm_method,
+            reduce_op=reduce_op,
             num_splits=num_splits,
             enable_sdma=enable_sdma,
             gemm_stream_pool=gemm_streams,
             comm_stream_pool=comm_streams,
             output=output,
             rs_output=rs_out,
+            out_dtype=out_dtype,
+        )
+        return (
+            rs_output.view(*leading_dims, -1)
+            .movedim(0, scatter_dim_after_maybe_reshape)
+            .view(output_shape)
+            .contiguous()
         )

@@ -265,10 +265,10 @@ def _pipeline_matmul_scatter_out_impl(
     return rs_output
 
 
-def _pipeline_matmul_scatter_out_fp8_impl(
+def _pipeline_scaled_matmul_scatter_out_impl(
     mm_out_op: torch._ops.OpOverload,
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
     A_scale: torch.Tensor,
     kwargs: dict[str, Any],
     group_name: str,
@@ -281,8 +281,8 @@ def _pipeline_matmul_scatter_out_fp8_impl(
     rs_output: torch.Tensor,
     out_dtype: torch.dtype,
 ):
-    M = input.shape[0]
-    N = weight.shape[1]
+    M = A.shape[0]
+    N = B.shape[1]
 
     group = c10d._resolve_process_group(group_name)
     rank = group.rank()
@@ -298,7 +298,7 @@ def _pipeline_matmul_scatter_out_fp8_impl(
 
     m_per_rank = M // num_ranks
     m_per_chunk = m_per_rank // num_splits
-    local_tensor_buffers = get_local_mm_out_bufs(M, N, num_splits, out_dtype, input.device)
+    local_tensor_buffers = get_local_mm_out_bufs(M, N, num_splits, out_dtype, A.device)
 
     gemm_events = get_events(num_splits)
     current_stream = torch.cuda.current_stream()
@@ -312,14 +312,18 @@ def _pipeline_matmul_scatter_out_fp8_impl(
         gemm_stream = gemm_stream_pool[chunk_idx % len(gemm_stream_pool)]
         with gemm_stream:
             row_indices = extract_indices(chunk_idx, num_ranks, m_per_rank, m_per_chunk)
-            chunk_input = input.index_select(0, row_indices)
-            if A_scale.numel() > 1:
-                chunk_input_scale = A_scale.index_select(0, row_indices)
-                chunk_input_scale = chunk_input_scale if chunk_input_scale.data_ptr() % 16 == 0 else chunk_input_scale.clone()
+            A_shard = A.index_select(0, row_indices)
+            if A_scale is None:
+                mm_out_op(A_shard, B, out=local_tensor_buffers[chunk_idx])
             else:
-                chunk_input_scale = A_scale
-            print(f"xxxxxxxxxxxxxxxxxxxxxxxxx{chunk_input=}, {weight=}, {chunk_input_scale=}, {kwargs=}, {chunk_idx=}, local_tensor_buffers={local_tensor_buffers[chunk_idx]}")
-            mm_out_op(chunk_input, weight, scale_a=chunk_input_scale, **kwargs, out=local_tensor_buffers[chunk_idx])
+                if A_scale.numel() > 1:
+                    A_shard_scale = A_scale.index_select(0, row_indices)
+                    A_shard_scale = (
+                        A_shard_scale if A_shard_scale.data_ptr() % 16 == 0 else A_shard_scale.clone()
+                    )
+                else:
+                    A_shard_scale = A_scale
+                mm_out_op(A_shard, B, scale_a=A_shard_scale, **kwargs, out=local_tensor_buffers[chunk_idx])
             gemm_events[chunk_idx].record(gemm_stream)
 
         rank_orders = [(i + chunk_idx) % num_ranks for i in range(num_ranks)]
@@ -363,126 +367,3 @@ def _pipeline_matmul_scatter_out_fp8_impl(
     if output is not None:
         output.copy_(scatter_out)
     return rs_output
-
-
-def _fused_scaled_matmul_reduce_scatter_impl(
-    mm_out_op: torch._ops.OpOverload,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    layout: str,
-    A_scale: torch.Tensor,
-    kwargs: dict[str, Any],
-    out_dtype: torch.dtype | None,
-    reduce_op: str,
-    orig_scatter_dim: int,
-    scatter_dim_after_maybe_reshape: int,
-    group_name: str,
-    output_shape: list[int],
-    comm_method: str,
-    num_splits: int,
-    enable_sdma: bool,
-    gemm_stream_pool: List[torch.cuda.Stream],
-    comm_stream_pool: List[torch.cuda.Stream],
-    output: torch.Tensor,
-    rs_output: torch.Tensor,
-):
-    print(f"---------------389:{output_shape=}--------------------------")
-    if A.dim() < 2:
-        raise ValueError("A_shard must be a matrix")
-    if (
-        scatter_dim_after_maybe_reshape < 0
-        or scatter_dim_after_maybe_reshape >= A.dim()
-    ):
-        raise ValueError("Invalid scatter dim for 2D tensor input to scaled_mm")
-    if orig_scatter_dim < 0 or orig_scatter_dim >= len(output_shape):
-        raise ValueError("Invalid scatter dim for 3D+ output tensor")
-    if B.dim() != 2:
-        raise ValueError("B must be a matrix")
-
-    if reduce_op not in ["sum", "avg"]:
-        raise ValueError("reduce_op must be sum or avg")
-    if layout != "NN":
-        raise ValueError(f"layout must be NN, otherwise scale should be processed, but {layout}")
-    if comm_method != "pipeline":
-        raise ValueError(f"{comm_method} not supported yet, please use pipeline")
-
-    group = c10d._resolve_process_group(group_name)
-
-    # Move scatter to first dim, then shard the tensor along the first dim, so the chunk producer
-    # can perform matmuls along the first dim.
-    A_with_scatter_dim_0 = A.movedim(scatter_dim_after_maybe_reshape, 0)
-    leading_dims = list(A_with_scatter_dim_0.shape[:-1])
-    leading_dims[0] //= group.size()
-
-    # To handle case where A is 3D+, reshape to 2D to prepare for mm which requires 2D inputs.
-    A_2D_with_scatter_dim_0 = A_with_scatter_dim_0.flatten(0, -2)
-
-    # Now that 'A' is sharded along the first dim, we need to update its scale(s) accordingly.
-    # How we do this depends on if we are using tensorwise scaling, rowwise scaling, or no scaling.
-    tensorwise_scaling = A_scale is not None and A_scale.numel() == 1
-    rowwise_scaling = A_scale is not None and A_scale.numel() > 1
-
-    if not tensorwise_scaling and not rowwise_scaling:
-        raise ValueError("A_scale cannot be none for scaled_mm")
-
-    if rowwise_scaling:
-        if A_scale.shape[:-1] != A.shape[:-1]:
-            raise ValueError(
-                "For row-wise scaling, the leading dims of A_scale "
-                "must match the leading dims of A "
-                f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
-            )
-        A_scale = (
-            A_scale.movedim(scatter_dim_after_maybe_reshape, 0)
-            .contiguous()
-            .flatten(0, -2)
-        )
-
-    def check_shape(shape_0, shape_1):
-        if len(shape_0) != len(shape_1):
-            return False
-        for i in range(len(shape_0)):
-            if shape_0[i] != shape_1[i]:
-                return False
-        return True
-
-    print(f"---------------449:{output_shape=}--------------------------")
-    output_shape[orig_scatter_dim] //= group.size()
-    if rs_output is not None:
-        if rs_output.dtype != out_dtype:
-            raise ValueError(f"Invalid dtype: rs_output ({rs_output.dtype}) is different with out_dtype ({out_dtype})!")
-        if not check_shape(output_shape, list(rs_output.shape)):
-            raise ValueError(
-                f"Invalid shape: rs_out ({rs_output.shape}) is not unexpected as ({output_shape})!"
-            )
-    else:
-        rs_output = torch.empty((A_2D_with_scatter_dim_0.shape[0] // group.size(), B.shape[-1]), dtype=out_dtype, device=A.device)
-    print(f"---------------460:{output_shape=}--------------------------")
-
-    if output is not None:
-        if output.dtype != out_dtype:
-            raise ValueError(f"Invalid dtype: output ({output.dtype}) is different with out_dtype ({out_dtype})!")
-
-        if output.numel() != rs_output.numel() * group.size():
-            raise ValueError(f"output size must equal group size * rs_out size.")
-        output = output.view(-1, B.shape[-1])
-
-    rs_output = _pipeline_matmul_scatter_out_fp8_impl(
-        mm_out_op,
-        A_2D_with_scatter_dim_0,
-        B,
-        A_scale,
-        kwargs,
-        group_name,
-        reduce_op,
-        num_splits,
-        enable_sdma,
-        gemm_stream_pool,
-        comm_stream_pool,
-        output,
-        rs_output,
-        out_dtype,
-    )
-    print(f"xxxxxxxxxxxx486::rs_output:{rs_output.shape}, {leading_dims=}, {output_shape=}, {scatter_dim_after_maybe_reshape=}")
-    return rs_output.view(*leading_dims, -1).movedim(0, scatter_dim_after_maybe_reshape).view(output_shape).contiguous()
-    
