@@ -46,15 +46,27 @@ struct CKTileGemmTileConfig {
     static constexpr ck_tile::index_t TileParitionerM01      = 4;
 };
 
-// fp8
-using CKTileGemmTileConfig_256x256x128_32x32x32_2x2x1 = CKTileGemmTileConfig<
+// ****** GFX942 Tile Config Specialization ******
+// FP8
+using CKGemmTileCfg_256x256x128_32x32x32_2x2x1 = CKTileGemmTileConfig<
     256, 256, 128, 32, 32, 32, 2, 2, 1, false, false
 >;
-using CKTileGemmTileConfig_256x128x128_32x32x32_2x2x1 = CKTileGemmTileConfig<
+using CKGemmTileCfg_256x128x128_32x32x32_2x2x1 = CKTileGemmTileConfig<
     256, 128, 128, 32, 32, 32, 2, 2, 1, false, false
 >;
-using CKTileGemmTileConfig_256x128x128_32x32x32_2x2x1_padding = CKTileGemmTileConfig<
+using CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKTileGemmTileConfig<
     256, 128, 128, 32, 32, 32, 2, 2, 1, false, true
 >;
+// ***********************************************
+
+// ****** GFX950 Tile Config Specialization ******
+// FP8
+using CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding = CKTileGemmTileConfig<
+    128, 128, 128, 32, 32, 64, 2, 2, 1, false, true
+>;
+using CKGemmTileCfg_256x256x128_16x16x128_2x2x1 = CKTileGemmTileConfig<
+    256, 256, 128, 16, 16, 128, 2, 2, 1, false, false
+>;
+// ***********************************************
 // clang-format on
 } // namespace primus_turbo
