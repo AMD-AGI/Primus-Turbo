@@ -98,7 +98,7 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
 @pytest.mark.parametrize("NK", [(4096, 7168)])
 @pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
-@pytest.mark.parametrize("block_size", [128])  # TODO: 256 error
+@pytest.mark.parametrize("block_size", [128, 256])
 def test_blockwise_fp8_grouped_gemm_func(B, M, NK, ori_dtype, dtype, block_size):
     N, K = NK
     device = "cuda:0"

@@ -2,6 +2,8 @@
 //
 // See LICENSE for license information.
 
+#include "primus_turbo/device/reduce.cuh"
+#include "primus_turbo/device/utils.cuh"
 #include "primus_turbo/normalization.h"
 
 namespace primus_turbo {

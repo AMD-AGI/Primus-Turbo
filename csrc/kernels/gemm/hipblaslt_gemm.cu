@@ -3,8 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/common.h"
-
-#include "primus_turbo/hipblaslt_gemm.h"
+#include "primus_turbo/gemm.h"
 
 namespace primus_turbo {
 

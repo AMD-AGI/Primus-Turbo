@@ -3,11 +3,14 @@
 // See LICENSE for license information.
 
 #pragma once
-
+#include <cstdint>
+#include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
+#include <stdexcept>
 
 namespace primus_turbo {
 
+// *************** HipBlasLt ***************
 int64_t get_hipblaslt_workspace_size_in_byte();
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t lda,
@@ -17,5 +20,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
                          void *workspace, const int64_t workspace_size, const bool use_fp8,
                          const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
+// *****************************************
+
+// TODO: CK
 
 } // namespace primus_turbo

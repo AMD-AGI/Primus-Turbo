@@ -92,7 +92,7 @@ __global__ void compute_group_offs_device(const IndexType       *group_lens_ptr,
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
-                        const ck_tile::index_t group_num, hipStream_t stream) {
+                        const int64_t group_num, hipStream_t stream) {
     const ck_tile::index_t total_elements    = group_num;
     const int              threads_per_block = 256;
     const int              blocks =
@@ -418,5 +418,5 @@ ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16
         &params);
 
 template void compute_group_offs<int64_t>(const int64_t *group_lens_ptr, int64_t *group_offs_ptr,
-                                          const ck_tile::index_t group_num, hipStream_t stream);
+                                          const int64_t group_num, hipStream_t stream);
 } // namespace primus_turbo
