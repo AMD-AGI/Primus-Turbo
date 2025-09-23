@@ -16,25 +16,4 @@ at::Tensor fp8_dequantize_meta(const at::Tensor input, const at::Tensor scale_in
     return torch::empty_like(input, torch::dtype(dest_dtype).device(at::kMeta));
 }
 
-at::Tensor fp8_quantize_row_col_meta(at::Tensor &input, at::Tensor &scale,
-                                     const at::ScalarType dest_dtype, const bool is_row_major) {
-    int64_t    b = 1, m = 0, k = 0;
-    at::Tensor output;
-    int64_t    dims = input.ndimension();
-    if (dims == 2) {
-        m = input.size(0);
-        k = input.size(1);
-
-        output = at::empty({m, k}, at::dtype(dest_dtype).device(at::kCUDA));
-    }
-
-    else if (dims == 3) {
-        b      = input.size(0);
-        m      = input.size(1);
-        k      = input.size(2);
-        output = at::empty({b, m, k}, at::dtype(dest_dtype).device(at::kCUDA));
-    }
-    return output;
-}
-
 } // namespace primus_turbo::pytorch

@@ -80,7 +80,7 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
     auto scale     = fp8_max / x_max;
     auto scale_inv = 1.0f / scale;
 
-    // Quantize
+    // TODO: Opt Quantize
     auto x_scaled  = input * scale;
     auto x_clamped = at::clamp(x_scaled, -fp8_max, fp8_max);
     auto x_fp8     = x_clamped.to(dest_dtype);
