@@ -20,7 +20,9 @@ Note: JAX and Optim support are planned but not yet available.
 - ROCm >= 6.4
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
-- rocSHMEM (optional, required for DeepEP). Please refer to our [rocSHMEM Installation Guide](docs/install_dependencies.md) for instructions.
+- rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
+
+
 
 #### Hardware
 - AMD Instinct GPUs
