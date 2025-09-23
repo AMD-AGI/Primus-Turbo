@@ -6,7 +6,7 @@
 
 import operator
 from functools import reduce
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.distributed.distributed_c10d as c10d
@@ -113,13 +113,10 @@ def fused_all_gather_scaled_matmul(
     Bs: list[torch.Tensor],
     layouts: list[str],
     A_scale: torch.Tensor,
-    B_scales: list[torch.Tensor],
+    kwargs_list: list[dict[str, Any]],
     gather_dim: int,
     group_name: str,
-    biases: list[Optional[torch.Tensor]],
-    result_scales: list[Optional[torch.Tensor]],
     out_dtypes: list[Optional[torch.dtype]],
-    use_fast_accum: list[bool],
     gemm_streams: List[torch.cuda.Stream],
     comm_streams: List[torch.cuda.Stream],
     copy_streams: List[torch.cuda.Stream],
@@ -139,18 +136,7 @@ def fused_all_gather_scaled_matmul(
             Bs,
             layouts,
             A_scale,
-            [
-                {
-                    "scale_b": B_scale,
-                    "bias": bias,
-                    "scale_result": result_scale,
-                    "out_dtype": out_dtype,
-                    "use_fast_accum": fast_accum,
-                }
-                for B_scale, bias, result_scale, out_dtype, fast_accum in zip(
-                    B_scales, biases, result_scales, out_dtypes, use_fast_accum
-                )
-            ],
+            kwargs_list,
             out_dtypes,
             gather_dim,
             group_name,
@@ -312,16 +298,13 @@ def fused_scaled_matmul_reduce_scatter(
     B: torch.Tensor,
     layout: str,
     A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
+    kwargs: dict[str, Any],
     reduce_op: str,
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: str,
     output_shape: list[int],
-    bias: Optional[torch.Tensor],
-    result_scale: Optional[torch.Tensor],
     out_dtype: Optional[torch.dtype],
-    use_fast_accum: bool,
     gemm_streams: List[torch.cuda.Stream],
     comm_streams: List[torch.cuda.Stream],
     *,
@@ -412,13 +395,7 @@ def fused_scaled_matmul_reduce_scatter(
             A=A_2D_with_scatter_dim_0,
             B=B,
             A_scale=A_scale,
-            kwargs={
-                "scale_b": B_scale,
-                "bias": bias,
-                "scale_result": result_scale,
-                "out_dtype": out_dtype,
-                "use_fast_accum": use_fast_accum,
-            },
+            kwargs=kwargs,
             group_name=group_name,
             reduce_op=reduce_op,
             num_splits=num_splits,

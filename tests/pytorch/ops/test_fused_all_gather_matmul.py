@@ -288,12 +288,18 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 [B.T for B in Bs],
                 ["NN" for _ in Bs],
                 A_scale,
-                B_scales,
+                [
+                    {
+                        "scale_b": B_scale,
+                        "bias": None,
+                        "scale_result": None,
+                        "out_dtype": out_dtype,
+                        "use_fast_accum": None,
+                    }
+                    for B_scale in B_scales
+                ],
                 gather_dim=gather_dim,
                 group_name=group.group_name,
-                biases=[None] * len(Bs),
-                result_scales=[None] * len(Bs),
-                use_fast_accum=[None] * len(Bs),
                 out_dtypes=[out_dtype for B in Bs],
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
@@ -354,12 +360,18 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 [B.T for B in Bs],
                 ["NN" for _ in Bs],
                 A_scale,
-                B_scales,
+                [
+                    {
+                        "scale_b": B_scale,
+                        "bias": None,
+                        "scale_result": None,
+                        "out_dtype": out_dtype,
+                        "use_fast_accum": None,
+                    }
+                    for B_scale in B_scales
+                ],
                 gather_dim=0,
                 group_name=group.group_name,
-                biases=[None] * len(Bs),
-                result_scales=[None] * len(Bs),
-                use_fast_accum=[None] * len(Bs),
                 out_dtypes=[out_dtype for B in Bs],
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
