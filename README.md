@@ -1,10 +1,15 @@
 # Primus-Turbo
-**Primus-Turbo** is a high-performance core library for accelerating large-scale model training, inference, and reinforcement learning on AMD GPUs. Built and optimized for the AMD ROCm platform, it targets the full performance stack in Transformer-based models — covering core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision (FP8), and compute-communication overlap kernels.
+**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision computation (FP8), and compute–communication overlap kernels.
 
-With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its core principles, Primus-Turbo unleashes the full potential of AMD GPUs for large-model workloads, providing a robust and comprehensive acceleration foundation for next-generation AI systems.
+With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
+<p align="center">
+  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
+</p>
+Note: JAX and Optim support are planned but not yet available.
 
 ## 🚀 What's New
+- **[2025/9/19]** [Primus-Turbo introduction blog.](https://rocm.blogs.amd.com/software-tools-optimization/primus-large-models/README.html)
 - **[2025/9/11]** Primus-Turbo initial release, version v0.1.0.
 
 
@@ -19,7 +24,8 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 
 #### Hardware
 - AMD Instinct GPUs
-- Supported MI300 (gfx942), MI350 (gfx950) series
+- GFX942: MI300X, MI325X
+- GFX950: MI350X, MI355X
 
 ### 2. Docker (Recommended)
 Use the pre-built AMD ROCm image:
@@ -76,7 +82,8 @@ See [Examples](./docs/examples.md) for usage examples.
 ## 📊 Performance
 See [Benchmarks](./benchmark/README.md) for detailed performance results and comparisons.
 
-
+## 📍Roadmap
+[Roadmap: Primus-Turbo Roadmap H2 2025](https://github.com/AMD-AGI/Primus-Turbo/issues/101)
 
 ## 📜 License
 
