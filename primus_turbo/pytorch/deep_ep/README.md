@@ -14,7 +14,7 @@ Hardware
 
 Use AMD ROCm image:
 ```
-rocm/megatron-lm:v25.5_py310
+docker.io/rocm/megatron-lm:v25.5_py310
 ```
 
 #### 3. Install rocSHMEM (optional)
@@ -24,12 +24,12 @@ rocSHMEM is required for internode api of experimental DeepEP. Please refer to [
 > **Please Note: rocSHMEM is under development, no guarantee of full compatibility and performance for bnxt,mlx5 and ionic NIC driver.**
 
 #### 4. Install from source
-Please following [Primus-Turbo Install from Source](../../../README.md) instructions to install.
+Please following [Primus-Turbo Install from Source](../../../README.md#3-install-from-source) instructions to install.
 
 ### Example
 
-See [DeepEP Example](../../../docs/examples.md)
+See [DeepEP example](../../../docs/examples.md#4-deepep)
 
 ### Benchmark Usage
 
- See [DeepEP benchmark](../../../benchmark/README.md)
+ See [DeepEP benchmark](../../../benchmark/README.md#deepep)
