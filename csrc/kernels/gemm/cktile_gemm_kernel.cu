@@ -10,18 +10,16 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           typename BLayout, typename CLayout, typename TileConfig, typename AccDataType>
 void CKTileQuantGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout, CLayout, TileConfig,
                            AccDataType>::run(const ck_tile::stream_config &stream_cfg,
-                                             const ck_tile::index_t group_num, void *args_ptr,
-                                             const uint32_t num_cu) {
+                                             const ck_tile::index_t        group_num,
+                                             QuantGemmKernelArgs &kargs, const uint32_t num_cu) {
 
     constexpr int kBlockPerCu = 1;
 
     const dim3 blocks = Kernel::BlockSize();
     dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
     grids.x           = std::min(grids.x, num_cu);
-    ck_tile::launch_kernel(
-        stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
-                        Kernel{}, grids, blocks, 0,
-                        ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num));
+    ck_tile::launch_kernel(stream_cfg,
+                           ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
@@ -34,18 +32,18 @@ get_cktile_gemm_instance(const ck_tile::index_t group_num, const ck_tile::index_
                   std::is_same_v<ADataType, ck_tile::fp8_t>) {
         if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1;
-            using Runner     = CKQuantGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout,
-                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            using Runner = CKTileQuantGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                 CLayout, TileConfig, AccDataType>;
             return std::make_unique<Runner>();
         } else if (n % 128 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1;
-            using Runner     = CKQuantGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout,
-                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            using Runner = CKTileQuantGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                 CLayout, TileConfig, AccDataType>;
             return std::make_unique<Runner>();
         } else {
             using TileConfig = CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding;
-            using Runner     = CKQuantGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout,
-                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            using Runner = CKTileQuantGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                 CLayout, TileConfig, AccDataType>;
             return std::make_unique<Runner>();
         }
     } else {
