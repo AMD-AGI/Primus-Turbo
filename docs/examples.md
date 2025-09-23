@@ -248,7 +248,8 @@ print(c.shape)  # [128, 256]
 
 ## 4. DeepEP
 
-The normal kernels can be used in model training or the inference prefilling phase (without the backward part) as the below example code shows.
+We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows:
+
 ```python
 import torch
 import torch.distributed as dist
@@ -265,7 +266,7 @@ Buffer.set_num_sms(24)
 
 
 # You may call this function at the framework initialization
-def get_buffer(group: dist.ProcessGroup, hidden_bytes: int) -> Buffer:
+def get_buffer(group: dist.ProcessGroup, hidden_bytes: int, use_default_stream_as_comm_stream: bool = True) -> Buffer:
     global _buffer
 
     # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
@@ -276,7 +277,7 @@ def get_buffer(group: dist.ProcessGroup, hidden_bytes: int) -> Buffer:
 
     # Allocate a buffer if not existed or not enough buffer size
     if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, use_default_stream_as_comm_stream=use_default_stream_as_comm_stream)
     return _buffer
 
 
@@ -287,7 +288,8 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 
 def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                     num_experts: int, previous_event: Optional[EventOverlap] = None) -> \
+                     num_experts: int, previous_event: Optional[EventOverlap] = None,
+                     num_recv_tokens_per_expert_as_cuda: bool=False,) -> \
         Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple, EventOverlap]:
     # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
     # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -308,7 +310,8 @@ def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                          num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                          is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
                          previous_event=previous_event, async_finish=True,
-                         allocate_on_comm_stream=True)
+                         allocate_on_comm_stream=True,
+                         num_recv_tokens_per_expert_as_cuda = False,)
     # For event management, please refer to the docs of the `EventOverlap` class
     return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
 
