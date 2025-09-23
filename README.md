@@ -15,7 +15,10 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 - ROCm >= 6.4
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
-- rocSHMEM (optional, required for DeepEP). Please refer to our [rocSHMEM Installation Guide](docs/install_dependencies.md) for instructions.
+- rocSHMEM (optional, required for experimental DeepEP). Please refer to our [rocSHMEM Installation Guide](docs/install_dependencies.md) for instructions.
+
+**Note: DeepEP of Primus-Turbo is in the experimental stage. Please refer to [DeepEP](primus_turbo/pytorch/deep_ep/README.md)**
+
 
 #### Hardware
 - AMD Instinct GPUs

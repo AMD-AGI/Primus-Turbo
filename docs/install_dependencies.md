@@ -10,6 +10,8 @@ rocSHMEM IBGDA now is only available at develop branch, installation package wil
 
 rocSHMEM supports three types of NIC drivers: `bnxt`,`mlx5` and `ionic`. You should check cluster network card configuration and build rocSHMEM with corresponding compile script.
 
+> **Note: rocSHMEM is under development, no guarantee of full compatibility and performance for bnxt,mlx5 and ionic NIC driver.**
+
 For example, the following shows that NIC used by the cluster is ConnectX-7.
 ```bash
 useocpm2m-401-028:~> lspci | grep Mellanox
