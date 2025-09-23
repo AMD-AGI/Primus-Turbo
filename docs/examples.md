@@ -266,7 +266,9 @@ Buffer.set_num_sms(24)
 
 
 # You may call this function at the framework initialization
-def get_buffer(group: dist.ProcessGroup, hidden_bytes: int, use_default_stream_as_comm_stream: bool = True) -> Buffer:
+def get_buffer(group: dist.ProcessGroup,
+               hidden_bytes: int,
+               use_comm_stream: bool = False) -> Buffer:
     global _buffer
 
     # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
@@ -277,7 +279,10 @@ def get_buffer(group: dist.ProcessGroup, hidden_bytes: int, use_default_stream_a
 
     # Allocate a buffer if not existed or not enough buffer size
     if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, use_default_stream_as_comm_stream=use_default_stream_as_comm_stream)
+        _buffer = Buffer(group,
+                         num_nvl_bytes,
+                         num_rdma_bytes,
+                         use_default_stream_as_comm_stream=not use_comm_stream)
     return _buffer
 
 
@@ -311,7 +316,7 @@ def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                          is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
                          previous_event=previous_event, async_finish=True,
                          allocate_on_comm_stream=True,
-                         num_recv_tokens_per_expert_as_cuda = False,)
+                         num_recv_tokens_per_expert_as_cuda=num_recv_tokens_per_expert_as_cuda,)
     # For event management, please refer to the docs of the `EventOverlap` class
     return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
 
