@@ -6,7 +6,7 @@ The internode api of Primus-Turbo DeepEP depends on rocSHMEM with IBGDA support.
 
 ### Install procedure
 
-rocSHMEM IBGDA now is only available at develop branch, installation package will be released in the future. Now you need to follow the [rocSHMEM-building-and-installation](https://github.com/ROCm/rocSHMEM?tab=readme-ov-file#building-and-installation) document to build and install rocSHMEM.
+rocSHMEM IBGDA now is only available at develop branch (recommended commit e856fbb0ebe519f8743e483a0c7a39548ab74e93), installation package will be released in the future. Now you need to follow the [rocSHMEM-building-and-installation](https://github.com/ROCm/rocSHMEM?tab=readme-ov-file#building-and-installation) document to build and install rocSHMEM.
 
 rocSHMEM supports three types of NIC drivers: `bnxt`,`mlx5` and `ionic`. You should check cluster network card configuration and build rocSHMEM with corresponding compile script.
 
