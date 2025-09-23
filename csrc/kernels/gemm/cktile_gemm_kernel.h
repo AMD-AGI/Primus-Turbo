@@ -42,7 +42,7 @@ template <
     typename TileConfig,
     typename AccDataType=float
 >
-class CKQuantGroupedGemmRunner : public CKTileGemmRunnerInterFace {
+class CKTileQuantGemmRunner : public CKTileGemmRunnerInterFace {
 public:
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<
@@ -61,14 +61,8 @@ public:
             TileConfig::K_Warp_Tile
         >
     >;
-
-    using TilePartitioner = ck_tile::GemmSpatiallyLocalTilePartitioner<
-        GemmShape,
-        TileConfig::TileParitionerGroupNum,
-        TileConfig::TileParitionerM01
-    >;
-
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
+    using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
     using AQLayout = ck_tile::tensor_layout::gemm::RowMajor;
     using BQLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
 
@@ -83,16 +77,35 @@ public:
         QuantMode,
         AQLayout,
         BQLayout,
-        TileConfig::DoubleSmemBuffer,
+        false,
         true
     >;
+
+    using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<typename TypeConfig::ADataType,
+                                                                 typename TypeConfig::BDataType,
+                                                                 typename TypeConfig::AccDataType,
+                                                                 GemmShape,
+                                                                 GemmUniversalTraits,
+                                                                 ComputeDataType>;
+
+    using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
+
+    const ck_tile::index_t K_split = 1;
+    const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
+    const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
+    const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
+
+
+
 
     using QuantGemmProblem = ck_tile::GemmRowColQuantPipelineProblem<ADataType,
                                                                      BDataType,
                                                                      AccDataType,
                                                                      AccDataType,
                                                                      GemmShape,
-                                                                     GemmUniversalTraits>;
+                                                                     GemmUniversalTraits,
+                                                                     false,
+                                                                     >;
 
     // V3
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;
