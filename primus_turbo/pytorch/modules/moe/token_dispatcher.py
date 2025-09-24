@@ -15,6 +15,9 @@ from primus_turbo.pytorch.deep_ep import Config
 
 
 class TurboTokenPermuter(torch.nn.Module):
+    """
+    This module permute dispatched tokens to match the order of experts.
+    """
 
     def forward(
         self,
@@ -24,7 +27,26 @@ class TurboTokenPermuter(torch.nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
         num_out_tokens: int = -1,
         permute_fusion: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        sort tokens to match the order of experts for MoE routing.
+
+        Args:
+            tokens (torch.Tensor): dispatched tokens by DeepEP
+            token_probs (torch.Tensor): dispatched token_probs by DeepEP
+            routing_map(torch.Tensor): The token to expert mapping tensor. shape [num_tokens, num_experts]
+            topk_indices(torch.Tensor): The token to expert mapping tensor. shape [num_tokens, topK]
+            num_out_tokens(int): the number output tokens of permutation for permute fusion kernel
+            permute_fusion(bool): use permute fusion kernel when permute_fusion is True
+
+            See primus_turbo/pytorch/ops/permutation.py::token_permute for more details
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - permuted_kens: the permuted tokens
+                - permuted_probs: the permuted token_probs
+                - row_id_map: The tensor of a mapping table for sorted indices used to unpermute the tokens,
+        """
+
         if routing_map is None and topk_indices is None:
             raise ValueError("routing_map or topk_indices must be set")
         if permute_fusion:
@@ -58,6 +80,9 @@ class TurboTokenPermuter(torch.nn.Module):
 
 
 class TurboTokenUnpermuter(torch.nn.Module):
+    """
+    This module unpermute tokens to for DeepEP combine.
+    """
 
     def forward(
         self,
@@ -69,6 +94,14 @@ class TurboTokenUnpermuter(torch.nn.Module):
         drop_and_pad: bool = False,
         permute_fusion: bool = True,
     ):
+        """
+        unpermute tokens according to the given sorted_indices
+
+        Args:
+            permute_fusion(bool): use permute fusion kernel when permute_fusion is True
+
+            See primus_turbo/pytorch/ops/permutation.py::token_unpermute for more details
+        """
 
         if permute_fusion:
             return turbo.ops.token_unpermute(
@@ -112,6 +145,19 @@ class TurboTokenUnpermuter(torch.nn.Module):
 
 
 class TurboDeepEPTokenDispatcher(torch.nn.Module):
+    """
+    Dispatch tokens to different experts, with backward pass to combine gradients back to the input.
+    Args:
+        `ep_group`: the group to use for expert parallism.
+        `router_topk`: the number of experts to route to for each token.
+        `num_experts`: the number of moe experts
+        `hidden_size`: transformer hidden size.
+        `dtype`: dtype of tokens which mainly used for DeepEP to initialize DeepEP buffer.
+        `deepep_use_comm_stream`: DeepEP will use current stream as communication stream when deepep_use_comm_stream is False
+        `deepep_use_cuda_num_tokens_per_expert`: TurboDeepEPTokenDispatcher will return num_tokens_per_expert by cuda tensor instead of cpu tensor, this may elimate groumlp cpu sync when use turbo's groupgemm.
+        `deepep_autotune_config`: use autotuned DeepEP config to initialize DeepEP buffer for better performance.
+        `permute_fusion`: use permuate fusion kernel when permute_fusion is True
+    """
 
     cuda_dtoh_stream = None
 
@@ -166,11 +212,23 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
         deepep_num_worst_tokens: int = 0,
         permute_max_token_num: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+        """
+        Args:
+            `hidden_states`: Input hidden states to be processed
+            `token_probs`: Routing probabilities for each token-expert pair
+            `routing_map`: shape [num_tokens, num_experts], map indicating which expert each token should be routed to
+            `token_indices`: shape [num_tokens, router_topk], which are the routed expert indices.
+            `deepep_num_worst_tokens`: the worst number of tokens to receive, see 'deep_ep/buffer.py::dispatch' for more details.
+            `permute_max_token_num`: the max tokens of permute fusion kernel.
+        """
 
         if deepep_num_worst_tokens > 0 and not self.deepep_use_cuda_num_tokens_per_expert:
             raise ValueError(
                 "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
             )
+
+        if permute_max_token_num > 0 and not self.permute_fusion:
+            raise ValueError("Please set permute_fusion=True when use permute_max_token_num")
 
         # check hidden_states, token_probs shape or dtype
         tokens = hidden_states.view(-1, self.hidden_size)
@@ -248,6 +306,11 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
 
 
 class TurboDeepEPTokenCombiner(torch.nn.Module):
+    """
+    Combine tokens from different experts, with backward pass to dispatch gradients back to the input.
+    Note: the initialization of DeepEP buffer is finised in TurboDeepEPTokenDispatcher, we don't need init agin in Combiner
+    """
+
     def __init__(self):
         super().__init__()
         self.token_unpermuter = TurboTokenUnpermuter()
@@ -255,6 +318,12 @@ class TurboDeepEPTokenCombiner(torch.nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, handle: Tuple, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """
+        Args:
+            `hidden_states`: Input hidden states to be processed
+            `handle`: the handle of dispatch and permute, which is the last output of TurboDeepEPTokenDispatcher
+        """
+
         assert bias is None
 
         # unpack deepep and permute handle
