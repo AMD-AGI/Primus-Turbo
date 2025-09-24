@@ -9,10 +9,8 @@
 
 namespace primus_turbo {
 
-template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
-          typename KernelArgsType>
-void ck_gemm_fp8(
-    const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType, KernelArgsType> &params) {
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
+void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params) {
     const ck_tile::index_t k_batch = 1;
     const bool             splitk  = k_batch > 1;
 
@@ -33,6 +31,11 @@ void ck_gemm_fp8(
     } else if (!params.transA && params.transB) { // NT
         using ALayout = RowMajor;
         using BLayout = ColMajor;
+        runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
+                                             BLayout, CLayout>(params.m, params.n, params.k);
+    } else if (params.transA && !params.transB) { // TN
+        using ALayout = ColMajor;
+        using BLayout = RowMajor;
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                              BLayout, CLayout>(params.m, params.n, params.k);
     } else {
