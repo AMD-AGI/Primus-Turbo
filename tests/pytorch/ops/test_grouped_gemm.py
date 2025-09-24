@@ -63,3 +63,6 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     assert b_grad_snr > 20, "b_grad_snr too low"
     torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
+
+if __name__ == "__main__":
+    test_grouped_gemm_func(B = 1, M = 128, N_K = (2048, 1408), dtype = torch.float16, balance = True,trans_b = True, reduce_num_cu = 0)

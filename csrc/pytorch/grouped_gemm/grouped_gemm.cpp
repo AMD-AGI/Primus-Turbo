@@ -88,6 +88,7 @@ uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
 at::Tensor grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                         at::Tensor &group_offs, const bool transA, const bool transB,
                         c10::optional<int64_t> num_cu) {
+    printf("Using Primus-Turbo GroupedGemm6\n");
     // TODO:
     auto out_dtype = a.scalar_type();
 

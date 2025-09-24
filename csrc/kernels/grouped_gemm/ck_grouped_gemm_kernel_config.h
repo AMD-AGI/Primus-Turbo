@@ -60,6 +60,9 @@ using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
 using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
     256, 128, 64, 32, 32, 16, 2, 2, 1, false, true
 >;
+using CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
+    128, 128, 64, 32, 32, 16, 2, 2, 1, false, true
+>;
 // ***********************************************
 
 // ****** GFX942 Tile Config Specialization ******
@@ -77,8 +80,8 @@ using CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKGroupedGemmTil
 
 // ****** GFX950 Tile Config Specialization ******
 // FP8
-using CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1_padding = CKGroupedGemmTileConfig<
-    128, 128, 128, 32, 32, 64, 2, 2, 1, false, true
+using CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1 = CKGroupedGemmTileConfig<
+    128, 128, 128, 32, 32, 64, 2, 2, 1, false, false
 >;
 using CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding = CKGroupedGemmTileConfig<
     256, 256, 128, 16, 16, 128, 2, 2, 1, false, true
