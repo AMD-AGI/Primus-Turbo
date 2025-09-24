@@ -1,14 +1,15 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
 
-import warnings
 from typing import Optional, Tuple, Union
 
 import torch
 
+import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.float8_tensor import Float8Tensor
 from primus_turbo.triton.moe import permutation
 
@@ -25,6 +26,10 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         num_out_tokens: int,
         probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # store inp shape for boundary case
+        ctx.inp_shape = inp.shape
+
         if not inp.numel():
             ctx.probs = probs
             return inp, torch.tensor([], device=inp.device), torch.tensor([], device=inp.device)
@@ -52,6 +57,8 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             fp8_dtype = None
             scale_hidden_dim = None
 
+        turbo.modules.TurboDeepEPTokenDispatcher.maybe_cpu_sync()
+
         output, permuted_scale, permuted_probs = permutation.permute_with_mask_map(
             inp,
             row_id_map,
@@ -73,6 +80,10 @@ class TokenPermuteMaskMap(torch.autograd.Function):
                 config=inp._config,
             )
 
+        # For Backward, grad index 0 must be empty, but should return the shape like input
+        if not output.numel():
+            ctx.probs = probs
+
         ctx.save_for_backward(row_id_map)
         ctx.num_experts = num_experts
         ctx.num_tokens = num_tokens
@@ -87,7 +98,12 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         permuted_probs_grad: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         if not permuted_act_grad.numel():
-            return permuted_act_grad, None, None, ctx.probs
+            return (
+                torch.empty(ctx.inp_shape, dtype=permuted_act_grad.dtype, device=permuted_act_grad.device),
+                None,
+                None,
+                ctx.probs,
+            )
 
         act_grad = None
         probs_grad = None
@@ -121,8 +137,15 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
         restore_shape: Optional[torch.Size],
     ) -> torch.Tensor:
 
-        if not inp.numel():
+        ctx.input_is_empty = inp.numel() == 0
+
+        if ctx.input_is_empty:
+            ctx.inp_shape = inp.shape
             ctx.merging_probs = merging_probs
+            # NOTE(huangzhen): should return restore_shape when restore_shape is not None, due to deepep combine accept restore_shape like tensor
+            if restore_shape is not None:
+                inp = torch.empty(restore_shape, dtype=inp.dtype, device=inp.device)
+
             return inp
 
         if restore_shape is None:
@@ -162,8 +185,11 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, unpermuted_act_grad):
-        if not unpermuted_act_grad.numel():
-            return unpermuted_act_grad, None, ctx.merging_probs, None
+        if ctx.input_is_empty:
+            empty_grad = torch.empty(
+                ctx.inp_shape, dtype=unpermuted_act_grad.dtype, device=unpermuted_act_grad.device
+            )
+            return empty_grad, None, ctx.merging_probs, None
 
         act_grad = None
         probs_grad = None
@@ -227,10 +253,10 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
 
 def token_permute(
     inp: torch.Tensor,
+    num_out_tokens: int,
     probs: Optional[torch.Tensor] = None,
     routing_map: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
-    num_out_tokens: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Permute the tokens based on the routing_map. Token with the same index will be grouped together.
@@ -241,6 +267,9 @@ def token_permute(
     ----------
     inp: torch.Tensor
         Input tensor of shape `[num_tokens, hidden_size]`, on which permutation will be applied.
+    num_out_tokens: int
+        The effective output token count, representing the number of tokens not dropped.
+        By default, set to '-1', meaning no tokens are dropped.
     routing_map: torch.Tensor
         The token to expert mapping tensor.
         routing_map is of shape [num_tokens, num_experts] and dtype 'int32'.
@@ -249,10 +278,6 @@ def token_permute(
         The token to expert mapping tensor.
         topk_indices is of shape [num_tokens, topK] and dtype 'int32'.
         The values in it are the routed expert indices.
-    max_token_num: int, default = -1
-        The maximum number of tokens, used for workspace allocation.
-        By default, set to '-1', meaning the calculation of the size of workspace is
-        automatically taken over by the operator.
     """
     if topk_indices != None:
         raise NotImplementedError("not support topk_indices")
@@ -269,8 +294,6 @@ def token_unpermute(
     row_id_map: torch.Tensor,
     merging_probs: Optional[torch.Tensor] = None,
     restore_shape: Optional[torch.Size] = None,
-    map_type: str = "mask",
-    probs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Unpermute a tensor with permuted tokens, and optionally merge the tokens with their
@@ -289,20 +312,5 @@ def token_unpermute(
         By default, set to an empty tensor, which means that the tokens are directly merged by accumulation.
     restore_shape: torch.Size, default = None
         The output shape after the unpermute operation.
-    map_type: str, default = 'mask'
-        Type of the routing map tensor. Should be the same as the value passed to moe_permute.
-        Options are: 'mask', 'index'.
-    probs: torch.Tensor, default = None
-        Renamed to merging_probs. Keep for backward compatibility.
     """
-    if probs is not None:
-        if merging_probs is not None:
-            raise ValueError("Both merging_probs and probs kwarg are provided. probs is deprecated.")
-        warnings.warn("probs kwarg is deprecated. Use merging_probs kwarg instead.")
-        merging_probs = probs
-    if map_type == "index":
-        if map_type == "index":
-            raise NotImplementedError("map_type not support 'index'")
-    if map_type == "mask":
-        return TokenUnpermuteMaskMap.apply(inp, row_id_map, merging_probs, restore_shape)
-    raise ValueError("map_type should be one of 'mask' or 'index'")
+    return TokenUnpermuteMaskMap.apply(inp, row_id_map, merging_probs, restore_shape)

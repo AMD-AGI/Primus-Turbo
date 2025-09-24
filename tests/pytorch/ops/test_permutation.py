@@ -1,5 +1,6 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -106,7 +107,7 @@ def _test_permutation_mask_map(
     turbo_unpermute_bwd_input = pytorch_unpermute_bwd_input.detach()
 
     turbo_unpermute_output = turbo.ops.token_unpermute(
-        turbo_unpermute_fwd_input, row_id_map, turbo_probs, restore_shape, map_type="mask"
+        turbo_unpermute_fwd_input, row_id_map, turbo_probs, restore_shape
     )
     turbo_unpermute_output.backward(turbo_unpermute_bwd_input, retain_graph=True)
 
@@ -115,12 +116,6 @@ def _test_permutation_mask_map(
     # Results Check
     #
     ###################################################################################################################################
-
-    # turbo_permute_output_float = turbo_permute_output.float()
-    # turbo_permute_fwd_input_grad = turbo_permute_fwd_input.grad.float()
-    # turbo_unpermute_output_float = turbo_unpermute_output.float()
-    # turbo_unpermute_fwd_input_grad = turbo_unpermute_fwd_input.grad.float()
-
     # TODO: can't pass turbo tolerances
     tol = get_tolerances(dtype)
     torch.testing.assert_close(
@@ -155,7 +150,7 @@ def _test_permutation_mask_map(
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_expert", [7, 16])
 @pytest.mark.parametrize("hidden_size", [4096])
@@ -182,7 +177,7 @@ def test_permutation_mask_map(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_permutation_mask_map_empty_input(dtype):
     with_probs = True
     _test_permutation_mask_map(

@@ -112,6 +112,9 @@ class TurboTokenUnpermuter(torch.nn.Module):
 
 
 class TurboDeepEPTokenDispatcher(torch.nn.Module):
+
+    cuda_dtoh_stream = None
+
     def __init__(
         self,
         ep_group: dist.ProcessGroup,
@@ -119,10 +122,10 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
         num_experts: int,
         hidden_size: int,
         dtype: torch.dtype,
-        use_default_stream_as_comm_stream: Optional[bool] = True,
-        num_use_cu: int = 32,
-        use_cuda_num_tokens_per_expert: Optional[bool] = False,
-        autotune_config: Optional[Config] = None,
+        deepep_use_comm_stream: Optional[bool] = False,
+        deepep_num_use_cu: int = 32,
+        deepep_use_cuda_num_tokens_per_expert: Optional[bool] = False,
+        deepep_autotune_config: Optional[Config] = None,
         permute_fusion: bool = True,
     ):
         super().__init__()
@@ -132,19 +135,27 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.num_local_experts = num_experts // ep_group.size()
-        self.use_cuda_num_tokens_per_expert = use_cuda_num_tokens_per_expert
+        self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.permute_fusion = permute_fusion
         hidden_bytes = hidden_size * dtype.itemsize
 
         turbo.ops.init_deepep_buffer(
             group=ep_group,
             hidden_bytes=hidden_bytes,
-            use_default_stream_as_comm_stream=use_default_stream_as_comm_stream,
-            num_use_cu=num_use_cu,
-            autotune_config=autotune_config,
+            use_default_stream_as_comm_stream=not deepep_use_comm_stream,
+            num_use_cu=deepep_num_use_cu,
+            autotune_config=deepep_autotune_config,
         )
 
         self.token_permuter = TurboTokenPermuter()
+
+        if deepep_use_cuda_num_tokens_per_expert and TurboDeepEPTokenDispatcher.cuda_dtoh_stream is None:
+            TurboDeepEPTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
+
+    @classmethod
+    def maybe_cpu_sync(cls):
+        if cls.cuda_dtoh_stream is not None:
+            cls.cuda_dtoh_stream.synchronize()
 
     def forward(
         self,
@@ -152,8 +163,14 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
         token_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
         token_indices: Optional[torch.Tensor] = None,
-        num_worst_tokens: int = 0,
+        deepep_num_worst_tokens: int = 0,
+        permute_max_token_num: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+
+        if deepep_num_worst_tokens > 0 and not self.deepep_use_cuda_num_tokens_per_expert:
+            raise ValueError(
+                "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
+            )
 
         # check hidden_states, token_probs shape or dtype
         tokens = hidden_states.view(-1, self.hidden_size)
@@ -189,8 +206,8 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
                 token_indices=token_indices,
                 token_weights=token_probs,
                 num_experts=self.num_experts,
-                num_worst_tokens=num_worst_tokens,
-                use_cuda_num_token_per_expert=self.use_cuda_num_tokens_per_expert,
+                num_worst_tokens=deepep_num_worst_tokens,
+                use_cuda_num_token_per_expert=self.deepep_use_cuda_num_tokens_per_expert,
             )
         )
 
@@ -198,11 +215,26 @@ class TurboDeepEPTokenDispatcher(torch.nn.Module):
         dispatched_routing_map, dispatched_probs = turbo.ops.fused_indices_to_multihot(
             dispatched_indices, dispatched_probs, self.num_local_experts
         )
+        if permute_max_token_num > 0:
+            num_out_tokens = permute_max_token_num
+        else:
+            num_out_tokens = torch.sum(num_tokens_per_expert)
+            if num_out_tokens.device.type == "cuda":
+                self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+                num_out_tokens.record_stream(self.cuda_dtoh_stream)
+                with self.cuda_dtoh_stream:
+                    num_out_tokens_cpu = torch.empty_like(
+                        num_out_tokens, dtype=num_out_tokens.dtype, device="cpu", pin_memory=True
+                    )
+                    num_out_tokens_cpu.copy_(num_out_tokens, non_blocking=True)
+
+                num_out_tokens = num_out_tokens_cpu
+
         permuted_tokens, permuted_probs, reversed_mapping_for_combine = self.token_permuter(
             dispatched_tokens,
             token_probs=dispatched_probs,
             routing_map=dispatched_routing_map,
-            num_out_tokens=torch.sum(num_tokens_per_expert),
+            num_out_tokens=num_out_tokens,
             permute_fusion=self.permute_fusion,
         )
         handle = (
