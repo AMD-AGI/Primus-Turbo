@@ -9,6 +9,35 @@
 
 namespace primus_turbo::pytorch {
 
+template <typename AType, typename BType, typename CType, typename ACCType>
+inline CKGemmFP8Params<AType, BType, CType, ACCType>
+make_ck_gemm_fp8_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
+                        const at::Tensor &a_scales, const at::Tensor &b_scales, bool transA,
+                        bool transB, int32_t m, int32_t n, int32_t k, hipStream_t stream,
+                        uint32_t num_cu) {
+    CKGemmFP8Params<AType, BType, CType, ACCType> params;
+    params.a_ptr  = reinterpret_cast<const AType *>(a.data_ptr());
+    params.b_ptr  = reinterpret_cast<const BType *>(b.data_ptr());
+    params.c_ptr  = reinterpret_cast<CType *>(c.data_ptr());
+    params.aq_ptr = reinterpret_cast<const ACCType *>(a_scales.data_ptr());
+    params.bq_ptr = reinterpret_cast<const ACCType *>(b_scales.data_ptr());
+    params.transA = transA;
+    params.transB = transB;
+    params.m      = m;
+    params.n      = n;
+    params.k      = k;
+    params.stream = stream;
+    params.num_cu = num_cu;
+    return params;
+}
+
+uint32_t get_gemm_num_cu(c10::optional<int64_t> num_cu) {
+    auto    stream     = at::cuda::getCurrentCUDAStream();
+    int32_t cus        = get_multi_processor_count(stream.device_index());
+    int32_t num_cu_val = num_cu.has_value() ? num_cu.value() : -1;
+    return num_cu_val <= 0 ? uint32_t(cus) : uint32_t(std::min(num_cu_val, cus));
+}
+
 at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                             at::Tensor &b_scales, const bool transA, const bool transB,
                             at::ScalarType out_dtype, const std::string &granularity,
@@ -49,16 +78,16 @@ at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
 
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
-            auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
-                args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
-                transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
-            ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
+            auto params = CKGemmFP8Params<AType, BType, CType, float>(
+                a, b, c, aq_tensor, bq_tensor, transA, transB, bs, m, n, k, stream,
+                get_gemm_num_cu(num_cu));
+            ck_gemm_fp8<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
-            auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
-                args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
-                transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
-            ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
+            auto params = CKGemmFP8Params<AType, BType, CType, float>(
+                a, b, c, aq_tensor, bq_tensor, transA, transB, bs, m, n, k, stream,
+                get_gemm_num_cu(num_cu));
+            ck_gemm_fp8<AType, BType, CType, float>(params);
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
         }
@@ -68,16 +97,14 @@ at::Tensor grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
 
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
-            auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
-                args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
-                transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
-            ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
+            auto params = CKGemmFP8Params<AType, BType, CType, float>(
+                a, b, c, aq_tensor, bq_tensor, transA, transB, bs, m, n, k, stream,
+                get_gemm_num_cu(num_cu));
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
-            auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
-                args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
-                transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
-            ck_grouped_gemm_fp8<AType, BType, CType, float>(params);
+            auto params = CKGemmFP8Params<AType, BType, CType, float>(
+                a, b, c, aq_tensor, bq_tensor, transA, transB, bs, m, n, k, stream,
+                get_gemm_num_cu(num_cu));
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e5m2");
         }

@@ -8,6 +8,8 @@
 #include <hipblaslt/hipblaslt.h>
 #include <stdexcept>
 
+#include "ck_tile/ops/gemm_group_quant/kernel/gemm_quant_kernel.hpp"
+
 namespace primus_turbo {
 
 // *************** HipBlasLt ***************
@@ -22,14 +24,12 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
 // *****************************************
 
-template <typename AType, typename BType, typename CType, typename ACCType, typename KernelArgsType>
-struct CKGemmFP8Params {
-    KernelArgsType *args_ptr = nullptr;
-    const AType    *a_ptr    = nullptr;
-    const BType    *b_ptr    = nullptr;
-    CType          *c_ptr    = nullptr;
-    const ACCType  *aq_ptr   = nullptr;
-    const ACCType  *bq_ptr   = nullptr;
+template <typename AType, typename BType, typename CType, typename ACCType> struct CKGemmFP8Params {
+    const AType   *a_ptr  = nullptr;
+    const BType   *b_ptr  = nullptr;
+    CType         *c_ptr  = nullptr;
+    const ACCType *aq_ptr = nullptr;
+    const ACCType *bq_ptr = nullptr;
 
     bool transA = false;
     bool transB = false;
@@ -42,9 +42,7 @@ struct CKGemmFP8Params {
     uint32_t    num_cu = 0;
 };
 
-template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
-          typename KernelArgsType>
-void ck_gemm_fp8(
-    const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType, KernelArgsType> &params);
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
+void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
 
 } // namespace primus_turbo
