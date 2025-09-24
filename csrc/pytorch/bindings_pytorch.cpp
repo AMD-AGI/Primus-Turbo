@@ -18,8 +18,6 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ********* Quantization *********
     m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");
     m.def("fp8_dequantize(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> Tensor");
-    m.def("fp8_quantize_row_col(Tensor input, Tensor scale, ScalarType dest_dtype, bool "
-          "is_row_major) -> Tensor");
 
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype) -> Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis) -> Tensor[]");
@@ -49,7 +47,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* Quantization *********
     m.impl("fp8_quantize", fp8_quantize);
     m.impl("fp8_dequantize", fp8_dequantize);
-    m.impl("fp8_quantize_row_col", fp8_quantize_row_col);
 
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
@@ -73,7 +70,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Quantization *********
     m.impl("fp8_quantize", fp8_quantize_meta);
     m.impl("fp8_dequantize", fp8_dequantize_meta);
-    m.impl("fp8_quantize_row_col", fp8_quantize_row_col_meta);
 
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);

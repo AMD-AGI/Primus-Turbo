@@ -9,12 +9,7 @@ import torch
 import torch.utils.benchmark as benchmark
 from tabulate import tabulate
 
-from primus_turbo.pytorch.core.float8 import (
-    Float8QuantConfig,
-    Format,
-    ScalingGranularity,
-)
-from primus_turbo.pytorch.ops import gemm_fp8
+from primus_turbo.pytorch.ops import gemm
 
 ModelConfigs = {
     "llama2-7b": {
@@ -79,17 +74,16 @@ def gen_gemm_test_cases(model_config):
     return gemm_shape_list
 
 
-def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
+def profile_gemm(M, N, K, dtype, trans_b):
     device = "cuda"
     b_shape = (N, K) if trans_b else (K, N)
-    a = torch.randn((M, K), dtype=ori_dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
-    config = Float8QuantConfig(format=format, granularity=granularity)
+    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
 
-    out = gemm_fp8(a, b, trans_b=trans_b, config=config)
+    out = gemm(a, b, trans_b=trans_b)
     grad_out = torch.randn_like(out)
     # Forward pass for implementation
-    fwd_func = lambda: gemm_fp8(a, b, trans_b=trans_b, config=config)
+    fwd_func = lambda: gemm(a, b, trans_b=trans_b)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -126,7 +120,7 @@ def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops
 
 
-def benchmark_gemm_fp8():
+def benchmark_gemm():
     # DataFrame to store results
     results = pd.DataFrame(
         columns=[
@@ -136,8 +130,6 @@ def benchmark_gemm_fp8():
             "M",
             "N",
             "K",
-            "format",
-            "granularity",
             "Forward Time (ms)",
             "Forward TFLOPS",
             "Backward Time (ms)",
@@ -145,11 +137,9 @@ def benchmark_gemm_fp8():
         ]
     )
 
-    MBS_LIST = [1]
+    MBS_LIST = [1, 2, 4]
     test_id = 0
-    ori_dtype = torch.bfloat16
-    format = Format.E4M3
-    granularity = ScalingGranularity.TENSORWISE
+    dtype = torch.bfloat16
     trans_b = True
     for model_name, model_config in ModelConfigs.items():
         test_cases = gen_gemm_test_cases(model_config)
@@ -162,14 +152,10 @@ def benchmark_gemm_fp8():
                 K = shape[2]
 
                 print(f"\n{'='*50}")
-                print(
-                    f"Testing Case: {model_name} with MBS={MBS}, M={M}, N={N}, K={K}, format={format}, granularity={granularity}"
-                )
+                print(f"Testing Case: {model_name} with MBS={MBS}, M={M}, N={N}, K={K}, dtype={dtype}")
                 print(f"{'='*50}")
 
-                fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = profile_gemm_fp8(
-                    M, N, K, ori_dtype, format, granularity, trans_b
-                )
+                fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = profile_gemm(M, N, K, dtype, trans_b)
                 # Add to results table
                 new_row = {
                     "TestID": test_id,
@@ -178,8 +164,6 @@ def benchmark_gemm_fp8():
                     "M": M,
                     "N": N,
                     "K": K,
-                    "format": format,
-                    "granularity": granularity,
                     "Forward Time (ms)": f"{fwd_time_ms:.2f}",
                     "Forward TFLOPS": f"{fwd_tflops:.2f}",
                     "Backward Time (ms)": f"{bwd_time_ms:.2f}",
@@ -192,9 +176,9 @@ def benchmark_gemm_fp8():
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
     # Save to CSV
-    results.to_csv("gemm_fp8_benchmark_results.csv", index=False)
-    print("Results saved to gemm_fp8_benchmark_results.csv")
+    results.to_csv("gemm_benchmark_results.csv", index=False)
+    print("Results saved to gemm_benchmark_results.csv")
 
 
 if __name__ == "__main__":
-    benchmark_gemm_fp8()
+    benchmark_gemm()
