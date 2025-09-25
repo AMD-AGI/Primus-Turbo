@@ -5,7 +5,7 @@
 #include "../extensions.h"
 #include "../type_traits.h"
 #include "primus_turbo/arch.h"
-#include "primus_turbo/grouped_gemm.h"
+#include "primus_turbo/gemm.h"
 
 namespace primus_turbo::pytorch {
 
@@ -41,7 +41,7 @@ uint32_t get_gemm_num_cu(c10::optional<int64_t> num_cu) {
 at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                     const bool transA, const bool transB, at::ScalarType out_dtype,
                     const std::string &granularity, c10::optional<int64_t> num_cu) {
-    printf("test1\n");
+    printf("test21\n");
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));
@@ -50,9 +50,9 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                        "out_dtype must be kBFloat16 or kHalf");
 
     // Determine output tensor size based on transA and transB
-    const int64_t m = transA ? A.size(1) : A.size(0);
-    const int64_t k = transA ? A.size(0) : A.size(1);
-    const int64_t n = transB ? B.size(0) : B.size(1);
+    const int64_t m = transA ? a.size(1) : a.size(0);
+    const int64_t k = transA ? a.size(0) : a.size(1);
+    const int64_t n = transB ? b.size(0) : b.size(1);
 
     // Process Scale
     at::Tensor aq_tensor;
@@ -77,13 +77,19 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                a, b, c, aq_tensor, bq_tensor, transA, transB, m, n, k, stream,
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
+                static_cast<const float *>(aq_tensor.data_ptr()),
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
             ck_gemm_fp8<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                a, b, c, aq_tensor, bq_tensor, transA, transB, m, n, k, stream,
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
+                static_cast<const float *>(aq_tensor.data_ptr()),
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
             ck_gemm_fp8<AType, BType, CType, float>(params);
         } else {
@@ -96,13 +102,19 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                a, b, c, aq_tensor, bq_tensor, transA, transB, m, n, k, stream,
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
+                static_cast<const float *>(aq_tensor.data_ptr()),
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
             ck_gemm_fp8<AType, BType, CType, float>(params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                a, b, c, aq_tensor, bq_tensor, transA, transB, m, n, k, stream,
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
+                static_cast<const float *>(aq_tensor.data_ptr()),
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
             ck_gemm_fp8<AType, BType, CType, float>(params);
         } else {
