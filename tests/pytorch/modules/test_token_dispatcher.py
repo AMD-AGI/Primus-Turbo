@@ -23,9 +23,9 @@ import primus_turbo.pytorch as turbo
 class TokenDispatcherTestConfig:
     # random data generation
     num_tokens: int
-    # TurboDeepEPTokenDispatcher init
     hidden_size: int
     dtype: torch.dtype
+    # TurboDeepEPTokenDispatcher init
     router_topk: int
     num_experts: int
     permute_fusion: bool
@@ -109,25 +109,27 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
-    def _init_dispatcher(self, kwargs):
         ep_group = dist.group.WORLD
-        return turbo.modules.TurboDeepEPTokenDispatcher(ep_group, **kwargs)
+        tp_group = dist.new_group([self.rank])
+        tp_ep_group = ep_group
+        return ep_group, tp_group, tp_ep_group
 
     def test_token_dispatcher_dropless(self):
-        self._init_process()
+        ep_group, tp_group, tp_ep_group = self._init_process()
         ep_group = dist.group.WORLD
 
         for cfg in get_token_dispatcher_config():
-            dispatcher = turbo.modules.TurboDeepEPTokenDispatcher(
-                ep_group,
-                cfg.router_topk,
+            dispatcher = turbo.modules.DeepEPTokenDispatcher(
                 cfg.num_experts,
-                cfg.hidden_size,
-                cfg.dtype,
+                cfg.router_topk,
+                ep_group,
+                tp_group,
+                tp_ep_group,
                 permute_fusion=cfg.permute_fusion,
                 deepep_use_cuda_num_tokens_per_expert=cfg.deepep_use_cuda_num_tokens_per_expert,
+                deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
+                permute_max_token_num=cfg.permute_max_token_num,
             )
-            combiner = turbo.modules.TurboDeepEPTokenCombiner()
 
             hidden_states = torch.randn((cfg.num_tokens, cfg.hidden_size), dtype=cfg.dtype, device="cuda")
             ans = hidden_states
@@ -138,18 +140,16 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                 / cfg.router_topk
             )
 
-            (permuted_local_hidden_states, tokens_per_expert, permuted_probs, handle) = dispatcher(
+            (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = dispatcher.token_dispatch(
                 hidden_states,
                 probs,
-                deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
-                permute_max_token_num=cfg.permute_max_token_num,
             )
 
             permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
 
-            permuted_local_hidden_states = permuted_local_hidden_states.to(hidden_states.dtype)
+            permuted_local_hidden_states = permuted_local_hidden_states.to(ans.dtype)
 
-            restored_hidden_states, _ = combiner(permuted_local_hidden_states, handle)
+            restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
 
             assert torch.allclose(
                 restored_hidden_states, ans

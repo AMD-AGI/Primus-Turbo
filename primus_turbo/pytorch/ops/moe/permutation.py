@@ -34,10 +34,10 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             ctx.probs = probs
             return inp, torch.tensor([], device=inp.device), torch.tensor([], device=inp.device)
 
-        assert inp.is_cuda, "TransformerEngine needs CUDA."
-        assert routing_map.is_cuda, "TransformerEngine needs CUDA."
+        assert inp.is_cuda, "Primus-Turbo needs CUDA."
+        assert routing_map.is_cuda, "Primus-Turbo needs CUDA."
         if probs is not None:
-            assert probs.is_cuda, "TransformerEngine needs CUDA."
+            assert probs.is_cuda, "Primus-Turbo needs CUDA."
 
         assert inp.size(0) == routing_map.size(0), "Permute not possible"
         num_tokens, hidden_size = inp.size()
@@ -57,7 +57,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             fp8_dtype = None
             scale_hidden_dim = None
 
-        turbo.modules.TurboDeepEPTokenDispatcher.maybe_cpu_sync()
+        turbo.modules.DeepEPTokenDispatcher.maybe_cpu_sync()
 
         output, permuted_scale, permuted_probs = permutation.permute_with_mask_map(
             inp,
@@ -257,6 +257,8 @@ def token_permute(
     probs: Optional[torch.Tensor] = None,
     routing_map: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    drop_and_pad: bool = False,
+    fused: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Permute the tokens based on the routing_map. Token with the same index will be grouped together.
@@ -278,22 +280,73 @@ def token_permute(
         The token to expert mapping tensor.
         topk_indices is of shape [num_tokens, topK] and dtype 'int32'.
         The values in it are the routed expert indices.
+
+    fused (bool, optional): Whether use the fused permute function.
+    drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                   and pads the number of tokens to the expert capacity.
+                                   If set to true, routing_map has a fixed number of non-zeros
+                                   in each column.e
     """
-    if topk_indices != None:
-        raise NotImplementedError("not support topk_indices")
-    if routing_map != None:
-        output, row_id_map, permuted_probs = TokenPermuteMaskMap.apply(
-            inp, routing_map, num_out_tokens, probs
+    if fused:
+        if topk_indices != None:
+            raise NotImplementedError("not support topk_indices")
+        if routing_map != None:
+            output, row_id_map, permuted_probs = TokenPermuteMaskMap.apply(
+                inp, routing_map, num_out_tokens, probs
+            )
+            return output, permuted_probs, row_id_map
+        raise ValueError("must be set topk_indices or routing_map")
+
+    num_tokens, _ = inp.shape
+    num_experts = routing_map.shape[1]
+    permuted_probs = None
+    if drop_and_pad and not (num_out_tokens is None):
+        capacity = num_out_tokens // num_experts
+        assert not routing_map.requires_grad
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
+        # use argsort to put indices of all non-zeros in the beginning of list
+        # and keep the first `capacity` number of indices
+        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[:, :capacity].contiguous()
+        # flatten from [num_experts, capacity] to 1D
+        sorted_indices = sorted_indices.view(-1)
+
+        if probs is not None:
+            # [num_tokens, num_experts] -> num_experts * num_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_tokens + indices_dim1).view(-1)
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
+    else:
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.bool().T.contiguous()
+
+        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
+        token_indices = (
+            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
         )
-        return output, permuted_probs, row_id_map
-    raise ValueError("must be set topk_indices or routing_map")
+        sorted_indices = token_indices.masked_select(routing_map)
+
+        if probs is not None:
+            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+
+    # use the mapping to permute the tokens
+    permuted_input = inp.index_select(0, sorted_indices)
+
+    return permuted_input, permuted_probs, sorted_indices
 
 
 def token_unpermute(
     inp: torch.Tensor,
-    row_id_map: torch.Tensor,
+    sorted_indices: torch.Tensor,
     merging_probs: Optional[torch.Tensor] = None,
     restore_shape: Optional[torch.Size] = None,
+    routing_map: Optional[torch.Tensor] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
 ) -> torch.Tensor:
     """
     Unpermute a tensor with permuted tokens, and optionally merge the tokens with their
@@ -303,14 +356,52 @@ def token_unpermute(
     ----------
     inp: torch.Tensor
         Input tensor with permuted tokens of shape `[num_tokens, hidden_size]` to be unpermuted.
-    row_id_map: torch.Tensor
-        The tensor of a mapping table for sorted indices used to unpermute the tokens,
-        which is the second output tensor of `Permute`.
+    sorted_indices: torch.Tensor
+        The indices used to sort the tokens.
     merging_probs: torch.Tensor, default = None
         The tensor of probabilities corresponding to the permuted tokens. If provided,
         the unpermuted tokens will be merged with their respective probabilities.
         By default, set to an empty tensor, which means that the tokens are directly merged by accumulation.
     restore_shape: torch.Size, default = None
         The output shape after the unpermute operation.
+    fused (bool, optional): Whether use the fused unpermute function.
+    drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                    and pads the number of tokens to the expert capacity.
     """
-    return TokenUnpermuteMaskMap.apply(inp, row_id_map, merging_probs, restore_shape)
+    if fused:
+        return TokenUnpermuteMaskMap.apply(inp, sorted_indices, merging_probs, restore_shape)
+
+    _, hidden = restore_shape
+    input_dtype = inp.dtype
+
+    if merging_probs is not None:
+        assert routing_map is not None, "Mask must be provided to permute the probs."
+        if drop_and_pad:
+            num_experts = routing_map.size(1)
+            num_permuted_tokens = sorted_indices.size(0)
+            capacity = num_permuted_tokens // num_experts
+            num_unpermuted_tokens = merging_probs.size(0)
+
+            # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
+            probs_T_1D = merging_probs.T.contiguous().view(-1)
+
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
+
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
+        else:
+            permuted_probs = merging_probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
+        # higher precision due to moe_router_dtype being enabled. This can lead to
+        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
+        # allocation.
+        inp = inp * permuted_probs.unsqueeze(-1)
+
+    # Create an output tensor filled with zeros
+    output_tokens = torch.zeros(restore_shape, dtype=inp.dtype, device=inp.device)
+    # Scatter add the permuted_input back to the original positions
+    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), inp)
+    return output_tokens.to(dtype=input_dtype)

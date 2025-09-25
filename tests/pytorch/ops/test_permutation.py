@@ -94,7 +94,10 @@ def _test_permutation_mask_map(
     turbo_permute_bwd_input = pytorch_permute_bwd_input.detach()
 
     turbo_permute_output, _, row_id_map = turbo.ops.token_permute(
-        turbo_permute_fwd_input, routing_map=routing_map, num_out_tokens=num_out_tokens
+        turbo_permute_fwd_input,
+        routing_map=routing_map,
+        num_out_tokens=num_out_tokens,
+        fused=True,
     )
     turbo_permute_output.backward(turbo_permute_bwd_input, retain_graph=True)
 
@@ -107,7 +110,11 @@ def _test_permutation_mask_map(
     turbo_unpermute_bwd_input = pytorch_unpermute_bwd_input.detach()
 
     turbo_unpermute_output = turbo.ops.token_unpermute(
-        turbo_unpermute_fwd_input, row_id_map, turbo_probs, restore_shape
+        turbo_unpermute_fwd_input,
+        row_id_map,
+        turbo_probs,
+        restore_shape,
+        fused=True,
     )
     turbo_unpermute_output.backward(turbo_unpermute_bwd_input, retain_graph=True)
 
@@ -116,7 +123,6 @@ def _test_permutation_mask_map(
     # Results Check
     #
     ###################################################################################################################################
-    # TODO: can't pass turbo tolerances
     tol = get_tolerances(dtype)
     torch.testing.assert_close(
         pytorch_permute_output,
