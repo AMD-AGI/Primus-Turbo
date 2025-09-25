@@ -26,8 +26,7 @@ inline void _launch_ck_gemm_kernel(const ck_tile::stream_config &stream_cfg,
                                    ck_tile::QuantGemmKernelArgs &kargs, uint32_t num_cu) {
     constexpr int kBlockPerCu = 1;
     const dim3    blocks      = Kernel::BlockSize();
-    dim3          grids       = Kernel::MaxOccupancyGridSize(stream_cfg);
-    grids.x                   = std::min(grids.x, num_cu);
+    dim3          grids       = Kernel::GridSize(kargs.M, kargs.N, kargs.k_batch);
     ck_tile::launch_kernel(stream_cfg,
                            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
 }
@@ -59,7 +58,7 @@ public:
         ck_tile::TileGemmQuantTraits<TileConfig::kPadM, TileConfig::kPadN, TileConfig::kPadK,
                                      false /*PreshuffleQuant*/, ALayout, BLayout, CLayout,
                                      QuantMode, AQLayout, BQLayout, false /*DoubleSmemBuffer*/,
-                                     true /*UsePersistentKernel*/>;
+                                     false /*UsePersistentKernel*/>;
 
     // using ComputeDataType = ADataType;
     // using GemmPipelineProblem =
@@ -75,7 +74,7 @@ public:
     // static constexpr bool has_hot_loop_v = has_hot_loop;
     // static constexpr auto tail_number_v  = tail_num;
     using QuantGemmProblem =
-        ck_tile::GemmRowColQuantPipelineProblem<ADataType, BDataType, CDataType, AccDataType,
+        ck_tile::GemmRowColQuantPipelineProblem<ADataType, BDataType, AccDataType, AccDataType,
                                                 GemmShape, GemmUniversalTraits>;
 
     // V3
