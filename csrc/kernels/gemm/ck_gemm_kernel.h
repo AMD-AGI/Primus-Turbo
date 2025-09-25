@@ -7,7 +7,6 @@
 #include "ck_tile/core.hpp"
 #include "ck_tile/host.hpp"
 #include "ck_tile/host/kernel_launch.hpp"
-#include "ck_tile/ops/elementwise/unary_element_wise_operation.hpp"
 #include "ck_tile/ops/epilogue.hpp"
 #include "ck_tile/ops/gemm.hpp"
 #include "ck_tile/ops/gemm_group_quant.hpp"
@@ -24,25 +23,26 @@ using ColMajor = ck_tile::tensor_layout::gemm::ColumnMajor;
 
 template <typename Kernel>
 inline void _launch_ck_gemm_kernel(const ck_tile::stream_config &stream_cfg,
-                                   QuantGemmKernelArgs &kargs, uint32_t num_cu) {
+                                   ck_tile::QuantGemmKernelArgs &kargs, uint32_t num_cu) {
     constexpr int kBlockPerCu = 1;
     const dim3    blocks      = Kernel::BlockSize();
     dim3          grids       = Kernel::MaxOccupancyGridSize(stream_cfg);
     grids.x                   = std::min(grids.x, num_cu);
-    ck_tile::launch_kernel(stream_cfg, ck_tile::make_kernel<GemmConfig::kBlockPerCu>(
-                                           Kernel{}, grids, blocks, 0, kargs));
+    ck_tile::launch_kernel(stream_cfg,
+                           ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
 }
 
 class CKGemmRunnerInterFace {
 public:
     virtual ~CKGemmRunnerInterFace() = default;
     // virtual void init_args() = 0;
-    virtual void run(const ck_tile::stream_config &stream_cfg, QuantGemmKernelArgs &kargs,
+    virtual void run(const ck_tile::stream_config &stream_cfg, ck_tile::QuantGemmKernelArgs &kargs,
                      uint32_t num_cu) = 0;
 };
 
-template <typename ADataType, typename BDataType, typename CDataType, typename ALayout,
-          typename BLayout, typename CLayout, typename TileConfig, typename AccDataType = float>
+template <GPUArch arch, typename ADataType, typename BDataType, typename CDataType,
+          typename ALayout, typename BLayout, typename CLayout, typename TileConfig,
+          typename AccDataType = float>
 class CKQuantGemmRunner : public CKGemmRunnerInterFace {
 public:
     using GemmShape = ck_tile::TileGemmShape<
@@ -56,23 +56,27 @@ public:
     using BQLayout                                = ck_tile::tensor_layout::gemm::ColumnMajor;
 
     using GemmUniversalTraits =
-        ck_tile::TileGemmQuantTraits<TileConfig::kPadM, TileConfig::kPadN, TileConfig::kPadK, false,
-                                     ALayout, BLayout, CLayout, QuantMode, AQLayout, BQLayout,
-                                     false, true>;
+        ck_tile::TileGemmQuantTraits<TileConfig::kPadM, TileConfig::kPadN, TileConfig::kPadK,
+                                     false /*PreshuffleQuant*/, ALayout, BLayout, CLayout,
+                                     QuantMode, AQLayout, BQLayout, false /*DoubleSmemBuffer*/,
+                                     true /*UsePersistentKernel*/>;
 
-    using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<
-        typename TypeConfig::ADataType, typename TypeConfig::BDataType,
-        typename TypeConfig::AccDataType, GemmShape, GemmUniversalTraits, ComputeDataType>;
+    // using ComputeDataType = ADataType;
+    // using GemmPipelineProblem =
+    //     ck_tile::GemmPipelineProblemBase<ADataType, BDataType, AccDataType, GemmShape,
+    //                                      GemmUniversalTraits, ComputeDataType>;
 
-    using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
+    // using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
 
-    const ck_tile::index_t    K_split      = 1;
-    const ck_tile::index_t    num_loop     = TilePartitioner::GetLoopNum(K_split);
-    const bool                has_hot_loop = BaseGemmPipeline::BlockHasHotloop(num_loop);
-    const ck_tile::TailNumber tail_num     = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
-
-    using QuantGemmProblem = ck_tile::GemmRowColQuantPipelineProblem<
-        ADataType, BDataType, AccDataType, AccDataType, GemmShape, GemmUniversalTraits, false, >;
+    // const ck_tile::index_t K_split =1;
+    // const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
+    // const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
+    // const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
+    // static constexpr bool has_hot_loop_v = has_hot_loop;
+    // static constexpr auto tail_number_v  = tail_num;
+    using QuantGemmProblem =
+        ck_tile::GemmRowColQuantPipelineProblem<ADataType, BDataType, CDataType, AccDataType,
+                                                GemmShape, GemmUniversalTraits>;
 
     // V3
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;
@@ -82,13 +86,13 @@ public:
         ADataType, BDataType, ck_tile::tuple<>, AccDataType, CDataType, ck_tile::tuple<>, CLayout,
         ck_tile::element_wise::PassThrough, TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
         TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile,
-        TileConfig::K_Warp_Tile, QuantGemmProblem::TransposeC, MemoryOp>>;
+        TileConfig::K_Warp_Tile, false, MemoryOp>>;
 
     using Kernel = ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue,
                                             GemmUniversalTraits::kQuantType>;
 
 public:
-    void run(const ck_tile::stream_config &stream_cfg, QuantGemmKernelArgs &kargs,
+    void run(const ck_tile::stream_config &stream_cfg, ck_tile::QuantGemmKernelArgs &kargs,
              uint32_t num_cu) override {
         _launch_ck_gemm_kernel<Kernel>(stream_cfg, kargs, num_cu);
     }
@@ -97,8 +101,9 @@ public:
 #ifdef PRIMUS_TURBO_GFX942
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           typename ALayout, typename BLayout, typename CLayout>
-get_ck_gemm_instance_gfx942(const ck_tile::index_t m, const ck_tile::index_t n,
-                            const ck_tile::index_t k) {
+std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx942(const ck_tile::index_t m,
+                                                                   const ck_tile::index_t n,
+                                                                   const ck_tile::index_t k) {
     std::unique_ptr<CKGemmRunnerInterFace> runner = nullptr;
     if (get_current_arch() != GPUArch::GFX942) {
         PRIMUS_TURBO_ERROR("Currently Arch != gfx942");
@@ -132,8 +137,9 @@ get_ck_gemm_instance_gfx942(const ck_tile::index_t m, const ck_tile::index_t n,
 #ifdef PRIMUS_TURBO_GFX950
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           typename ALayout, typename BLayout, typename CLayout>
-get_ck_gemm_instance_gfx950(const ck_tile::index_t m, const ck_tile::index_t n,
-                            const ck_tile::index_t k) {
+std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile::index_t m,
+                                                                   const ck_tile::index_t n,
+                                                                   const ck_tile::index_t k) {
     std::unique_ptr<CKGemmRunnerInterFace> runner = nullptr;
     if (get_current_arch() != GPUArch::GFX950) {
         PRIMUS_TURBO_ERROR("Currently Arch != gfx950");

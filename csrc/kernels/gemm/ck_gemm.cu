@@ -5,17 +5,17 @@
 #include "ck_tile/host/hip_check_error.hpp"
 
 #include "ck_gemm_kernel.h"
-#include "primus_turbo/grouped_gemm.h"
-
+#include "ck_tile/ops/gemm_group_quant/kernel/gemm_quant_kernel.hpp"
+#include "primus_turbo/gemm.h"
 namespace primus_turbo {
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
-QuantGemmKernelArgs
+ck_tile::QuantGemmKernelArgs
 compute_gemm_args(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params,
                   const ck_tile::index_t strideA, const ck_tile::index_t strideB,
                   const ck_tile::index_t strideC, const ck_tile::index_t strideAQ,
                   const ck_tile::index_t strideBQ) {
-    QuantGemmKernelArgs args;
+    ck_tile::QuantGemmKernelArgs args;
 
     args.a_ptr  = params.a_ptr;
     args.b_ptr  = params.b_ptr;
