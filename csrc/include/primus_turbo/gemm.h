@@ -8,8 +8,6 @@
 #include <hipblaslt/hipblaslt.h>
 #include <stdexcept>
 
-#include "ck_tile/ops/gemm_group_quant/kernel/gemm_quant_kernel.hpp"
-
 namespace primus_turbo {
 
 // *************** HipBlasLt ***************
