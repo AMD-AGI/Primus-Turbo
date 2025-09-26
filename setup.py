@@ -96,15 +96,25 @@ def get_version():
 
 
 def get_offload_archs():
+    def _get_device_arch():
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("No GPU found!")
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()
+
     gpu_archs = os.environ.get("GPU_ARCHS", None)
 
     arch_list = []
     if gpu_archs is None or gpu_archs.strip() == "":
-        import torch
-
-        arch_list = [torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()]
+        arch_list = [_get_device_arch()]
     else:
-        arch_list = [arch.strip().lower() for arch in gpu_archs.split(";")]
+        for arch in gpu_archs.split(";"):
+            arch = arch.strip().lower()
+            if arch == "native":
+                arch = _get_device_arch()
+            if arch not in arch_list:
+                arch_list.append(arch)
 
     # TODO:Support compile multi-arch.
     assert len(arch_list) == 1, "Primus Turbo only supports single arch for now."

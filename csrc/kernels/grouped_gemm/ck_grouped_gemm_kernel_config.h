@@ -60,7 +60,6 @@ using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
 using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
     256, 128, 64, 32, 32, 16, 2, 2, 1, false, true
 >;
-
 // ***********************************************
 
 // ****** GFX942 Tile Config Specialization ******
