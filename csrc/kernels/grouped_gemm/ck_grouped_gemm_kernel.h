@@ -316,19 +316,42 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
     if (get_current_arch() != GPUArch::GFX950) {
         PRIMUS_TURBO_ERROR("Currently Arch != gfx950");
     }
-
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
-        using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding;
-        using Runner = CKGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout, BLayout,
-                                            CLayout, TileConfig, AccDataType>;
-        runner = std::make_unique<Runner>();
+        if (n % 256 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else if (n % 128 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else {
+            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        }
     } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
                          std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        using TileConfig = CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1;
-        using Runner = CKQuantGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout, BLayout,
-                                               CLayout, TileConfig, AccDataType>;
-        runner = std::make_unique<Runner>();
+        if (n % 256 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1;
+            using Runner     = CKQuantGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else if (n % 128 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding;
+            using Runner     = CKQuantGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else {
+            using TileConfig = CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1;
+            using Runner     = CKQuantGroupedGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                                        BLayout, CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        }
     } else {
         PRIMUS_TURBO_ERROR("Grouped Gemm only support fp16/bf16/fp8/bf8");
     }
