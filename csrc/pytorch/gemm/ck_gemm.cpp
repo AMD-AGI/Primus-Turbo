@@ -41,7 +41,7 @@ uint32_t get_gemm_num_cu(c10::optional<int64_t> num_cu) {
 at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                     const bool transA, const bool transB, at::ScalarType out_dtype,
                     const std::string &granularity, c10::optional<int64_t> num_cu) {
-    printf("test21\n");
+
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));

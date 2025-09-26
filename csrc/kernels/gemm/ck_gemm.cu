@@ -79,4 +79,16 @@ void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataT
     runner->run(stream_cfg, args, params.num_cu);
 }
 
+// fp8 * fp8 -> fp16
+template void ck_gemm_fp8<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * bf8 -> fp16
+template void ck_gemm_fp8<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * fp8 -> bf16
+template void ck_gemm_fp8<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float> &params);
+// bf8 * bf8 -> bf16
+template void ck_gemm_fp8<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float> &params);
 } // namespace primus_turbo

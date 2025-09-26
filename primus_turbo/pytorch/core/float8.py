@@ -98,6 +98,7 @@ class Float8QuantConfig:
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+    backend: str = "ck"  # "hipblaslt" or "ck"
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
