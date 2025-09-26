@@ -15,7 +15,7 @@ class SwiGLU(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, probs: torch.Tensor, tokens_per_expert: Union[torch.Tensor, None]):
         assert x.size(0) == probs.size(0), "first dimension of x and probs must be the same"
         assert x.ndim == 2, "x must be 2D tensor"
-        assert probs.ndim == 2, "probs must be 2D tensor"
+        # assert probs.ndim == 2, "probs must be 2D tensor"
         assert probs.dtype == torch.float32, "probs must be float32"
 
         if tokens_per_expert is not None:

@@ -118,6 +118,7 @@ def swiglu_bwd_with_tokens_per_expert_kernel(
         )
 
         grad_probs = grad_out * silu * down
+        grad_probs_sum = tl.sum(grad_probs, dtype=compute_type)
 
         grad_out_with_probs = grad_out * probs
 
@@ -127,8 +128,8 @@ def swiglu_bwd_with_tokens_per_expert_kernel(
         grad_up = grad_out_with_probs * (down * grad_silu)
 
         tl.store(
-            grad_probs_ptr + row_idx * stride_grad_probs_token + col_off,
-            grad_probs.to(grad_probs_data_type),
+            grad_probs_ptr + row_idx * stride_grad_probs_token,
+            grad_probs_sum.to(grad_probs_data_type),
             mask=row_mask,
         )
         tl.store(
@@ -233,6 +234,7 @@ def swiglu_bwd_kernel(
     grad_out = tl.load(grad_out_ptr + row_idx * stride_grad_out_token + col_off, mask=mask).to(compute_type)
 
     grad_probs = grad_out * (silu * down_fp32)
+    grad_probs_sum = tl.sum(grad_probs, dtype=compute_type)
 
     grad_out_with_probs = grad_out * probs
 
@@ -242,9 +244,9 @@ def swiglu_bwd_kernel(
     grad_up = grad_out_with_probs * (down_fp32 * grad_silu)
 
     tl.store(
-        grad_probs_ptr + row_idx * stride_grad_probs_token + col_off,
-        grad_probs.to(grad_probs_data_type),
-        mask=mask,
+        grad_probs_ptr + row_idx * stride_grad_probs_token,
+        grad_probs_sum.to(grad_probs_data_type),
+        mask=row_mask,
     )
     tl.store(grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask)
     tl.store(

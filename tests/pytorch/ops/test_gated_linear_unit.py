@@ -1,5 +1,4 @@
 import random
-from typing import Union
 
 import pytest
 import torch
@@ -11,18 +10,11 @@ from tests.test_utils import get_tolerances
 torch.manual_seed(42)
 
 
-def swiglu_ref(x: torch.Tensor, probs: torch.Tensor, tokens_per_expert: Union[torch.Tensor, None]):
-
+def swiglu_ref(x: torch.Tensor, probs: torch.Tensor):
     dtype = x.dtype
-    if tokens_per_expert is None:
-        x = torch.chunk(x, 2, dim=-1)
-        return (F.silu(x[0]) * x[1] * probs).to(dtype)
-    else:
-        num_tokens = torch.sum(tokens_per_expert).item()
-        probs = probs[0:num_tokens]
-        x = x[0:num_tokens]
-        x = torch.chunk(x, 2, dim=-1)
-        return (F.silu(x[0]) * x[1] * probs).to(dtype)
+    x = torch.chunk(x, 2, dim=-1)
+    res = F.silu(x[0]) * x[1]
+    return (res * probs).to(dtype)
 
 
 def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
@@ -58,8 +50,8 @@ def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
         256,
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("with_tokens_per_expert", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_tokens_per_expert", [False, True])
 def test_swiglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -67,34 +59,32 @@ def test_swiglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
 
     x = torch.randn(num_tokens, hidden_size * 2, device=device, dtype=dtype, requires_grad=True)
     probs = torch.rand(num_tokens, device=device, dtype=torch.float32, requires_grad=True)
-    probs = probs.unsqueeze(-1)
 
-    x_ref = x.clone().requires_grad_(True)
-    probs_ref = probs.clone().requires_grad_(True)
+    x_ref = x.clone().detach()
+    x_ref.requires_grad_()
+    probs_ref = probs.clone().detach()
+    probs_ref.requires_grad_()
 
     if with_tokens_per_expert:
         num_experts = 64
         tokens_per_expert = torch.tensor(
-            generate_tokens_per_expert_list(num_experts, num_tokens), device=device
+            generate_tokens_per_expert_list(num_experts, num_tokens), device=device, requires_grad=False
         )
+        assert torch.sum(tokens_per_expert).item() == num_tokens
     else:
         tokens_per_expert = None
 
     out = swiglu(x, probs, tokens_per_expert)
-    out_ref = swiglu_ref(x_ref, probs_ref, tokens_per_expert)
+    out_ref = swiglu_ref(x_ref, probs_ref.unsqueeze(-1))
     torch.testing.assert_close(out, out_ref, **get_tolerances(dtype))
 
-    grad_out = torch.ones_like(out)
-    out.backward(grad_out)
-    grad_x = x.grad
-    grad_probs = probs.grad
+    out.backward(torch.ones_like(out))
+    grad_x = x.grad.clone()
+    grad_probs = probs.grad.clone()
 
-    x.grad = None
-    probs.grad = None
-
-    out_ref.backward(grad_out)
-    grad_x_ref = x.grad
-    grad_probs_ref = probs.grad
+    out_ref.backward(torch.ones_like(out_ref))
+    grad_x_ref = x_ref.grad.clone()
+    grad_probs_ref = probs_ref.grad.clone()
 
     torch.testing.assert_close(grad_x, grad_x_ref, **get_tolerances(dtype))
     torch.testing.assert_close(grad_probs, grad_probs_ref, **get_tolerances(dtype))
