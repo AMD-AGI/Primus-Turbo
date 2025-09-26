@@ -136,8 +136,8 @@ def get_common_flags():
     extra_link_args = [
         "-Wl,-rpath,/opt/rocm/lib",
         f"-L/usr/lib/{arch}-linux-gnu",
-        "-fgpu-rdc",
-        "--hip-link",
+        # "-fgpu-rdc",
+        # "--hip-link",
     ]
 
     cxx_flags = [
@@ -167,7 +167,7 @@ def get_common_flags():
         "-mllvm",
         "-amdgpu-function-calls=false",
         "-std=c++20",
-        "-fgpu-rdc",
+        # "-fgpu-rdc",
     ]
 
     # Device Archs
