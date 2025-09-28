@@ -421,7 +421,7 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            assert num_worst_tokens == 0, "Internode dispatch does not support `num_worst_tokens > 0`"
+            # assert num_worst_tokens == 0, "Internode dispatch does not support `num_worst_tokens > 0`"
             return self.internode_dispatch(
                 x,
                 handle,
@@ -432,10 +432,12 @@ class Buffer:
                 topk_idx,
                 topk_weights,
                 expert_alignment,
+                num_worst_tokens,
                 config,
                 previous_event,
                 async_finish,
                 allocate_on_comm_stream,
+                num_recv_tokens_per_expert_as_cuda,
             )
 
         # Launch the kernel with cached or non-cached mode
@@ -610,10 +612,12 @@ class Buffer:
         topk_idx: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         expert_alignment: int = 1,
+        num_worst_tokens: int = 0,
         config: Optional[Config] = None,
         previous_event: Optional[EventOverlap] = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        num_recv_tokens_per_expert_as_cuda: bool = False,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         Optional[torch.Tensor],
@@ -646,7 +650,7 @@ class Buffer:
             ) = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = (
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, event = (
                 self.runtime.internode_dispatch(
                     x,
                     x_scales,
@@ -663,6 +667,7 @@ class Buffer:
                     gbl_channel_prefix_matrix,
                     recv_gbl_rank_prefix_sum,
                     expert_alignment,
+                    num_worst_tokens,
                     config,
                     getattr(previous_event, "event", None),
                     async_finish,
@@ -689,6 +694,7 @@ class Buffer:
                 recv_topk_idx,
                 recv_topk_weights,
                 num_recv_tokens_per_expert_list,
+                num_recv_tokens_per_expert_cuda,
                 rdma_channel_prefix_matrix,
                 gbl_channel_prefix_matrix,
                 recv_rdma_channel_prefix_matrix,
@@ -715,6 +721,7 @@ class Buffer:
                 None,
                 None,
                 expert_alignment,
+                num_worst_tokens,
                 config,
                 getattr(previous_event, "event", None),
                 async_finish,
@@ -736,7 +743,11 @@ class Buffer:
                 (recv_x, recv_x_scales) if x_scales is not None else recv_x,
                 recv_topk_idx,
                 recv_topk_weights,
-                num_recv_tokens_per_expert_list,
+                (
+                    num_recv_tokens_per_expert_list
+                    if not num_recv_tokens_per_expert_as_cuda
+                    else num_recv_tokens_per_expert_cuda
+                ),
                 handle,
                 EventOverlap(event),
             )
