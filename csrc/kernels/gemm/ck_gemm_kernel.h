@@ -60,19 +60,6 @@ public:
                                      QuantMode, AQLayout, BQLayout, false /*DoubleSmemBuffer*/,
                                      false /*UsePersistentKernel*/>;
 
-    // using ComputeDataType = ADataType;
-    // using GemmPipelineProblem =
-    //     ck_tile::GemmPipelineProblemBase<ADataType, BDataType, AccDataType, GemmShape,
-    //                                      GemmUniversalTraits, ComputeDataType>;
-
-    // using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
-
-    // const ck_tile::index_t K_split =1;
-    // const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
-    // const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
-    // const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
-    // static constexpr bool has_hot_loop_v = has_hot_loop;
-    // static constexpr auto tail_number_v  = tail_num;
     using QuantGemmProblem =
         ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType, BDataType, AccDataType,
                                                       AccDataType, GemmShape, GemmUniversalTraits>;
