@@ -9,7 +9,7 @@
 #include "ck_tile/host/kernel_launch.hpp"
 #include "ck_tile/ops/epilogue.hpp"
 #include "ck_tile/ops/gemm.hpp"
-#include "ck_tile/ops/gemm_group_quant.hpp"
+#include "ck_tile/ops/gemm_quant.hpp"
 #include <hip/hip_runtime.h>
 #include <string>
 
@@ -74,8 +74,8 @@ public:
     // static constexpr bool has_hot_loop_v = has_hot_loop;
     // static constexpr auto tail_number_v  = tail_num;
     using QuantGemmProblem =
-        ck_tile::GemmRowColQuantPipelineProblem<ADataType, BDataType, AccDataType, AccDataType,
-                                                GemmShape, GemmUniversalTraits>;
+        ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType, BDataType, AccDataType,
+                                                      AccDataType, GemmShape, GemmUniversalTraits>;
 
     // V3
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;

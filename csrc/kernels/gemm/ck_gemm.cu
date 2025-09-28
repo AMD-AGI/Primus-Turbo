@@ -5,7 +5,7 @@
 #include "ck_tile/host/hip_check_error.hpp"
 
 #include "ck_gemm_kernel.h"
-#include "ck_tile/ops/gemm_group_quant/kernel/gemm_quant_kernel.hpp"
+#include "ck_tile/ops/gemm_quant.hpp"
 #include "primus_turbo/gemm.h"
 namespace primus_turbo {
 

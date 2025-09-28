@@ -86,10 +86,11 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 @pytest.mark.parametrize("m", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [255, 512, 1024, 2048])
-@pytest.mark.parametrize("layout", ["NN", "NT"])
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
+@pytest.mark.parametrize("backend", ["hipblaslt"])
+def test_gemm_fp8_tensorwise_hipblaslt(m, n, k, layout, format, dtype, backend):
     print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
 
     device = "cuda:0"
@@ -115,7 +116,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
-    config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=format, backend="hipblaslt")
+    config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=format, backend=backend)
     print(config)
     c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
     c.backward(grad_c)
@@ -143,14 +144,15 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
 
 
-"""
 @pytest.mark.parametrize("m", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [255, 512, 1024, 2048])
-@pytest.mark.parametrize("layout", ["NT"])
-@pytest.mark.parametrize("format", [Format.E4M3])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype):
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("layout", ["NN", "NT"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["ck"])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
+def test_gemm_fp8_ck(m, n, k, layout, format, dtype, backend, granularity):
     print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
 
     device = "cuda:0"
@@ -176,7 +178,8 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype):
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
-    config = Float8QuantConfig(granularity=ScalingGranularity.ROWWISE, format=format)
+    config = Float8QuantConfig(granularity=granularity, format=format, backend=backend)
+    print(config)
     c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
     c.backward(grad_c)
 
@@ -201,7 +204,3 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype):
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
-"""
-
-if __name__ == "__main__":
-    test_gemm_fp8_tensorwise(2048, 2048, 2048, "NT", Format.E4M3, torch.bfloat16)
