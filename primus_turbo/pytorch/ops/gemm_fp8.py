@@ -321,7 +321,7 @@ class FP8GemmFunctionHipblas(torch.autograd.Function):
         return (a_grad, b_grad, None, None, None, None)
 
 
-class FP8GemmFunctionCK(torch.autograd.Function):
+class FP8GemmTensorFunctionCK(torch.autograd.Function):
 
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -344,31 +344,12 @@ class FP8GemmFunctionCK(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
-        assert trans_a == True
-        a_dtype = FP8GemmFunctionCK.get_fp8_dtype(config.format, True)
-        b_dtype = FP8GemmFunctionCK.get_fp8_dtype(config.format, True)
+        assert trans_a == False, "trans_a has to be False"
+        a_dtype = FP8GemmTensorFunctionCK.get_fp8_dtype(config.format, True)
+        b_dtype = FP8GemmTensorFunctionCK.get_fp8_dtype(config.format, True)
 
-        a_t_fp8, b_t_fp8 = None, None
-        a_t_scale_inv, b_t_scale_inv = None, None
-        if config.granularity == ScalingGranularity.TENSORWISE:
-            a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
-            b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
-        # elif config.granularity == ScalingGranularity.ROWWISE:
-        #     assert (
-        #         trans_a == False and trans_b == True
-        #     ), f"{ScalingGranularity.ROWWISE} only support NT layout."
-        #     assert config.format == Format.E4M3, f"{ScalingGranularity.ROWWISE} only support E4M3 format."
-        #     assert (
-        #         out_dtype == torch.bfloat16
-        #     ), f"{ScalingGranularity.ROWWISE} only support bfloat16 as out_dtype."
-
-        #     a_fp8, a_scale_inv = quantize_fp8_rowwise(a, a_dtype, dim=(-1))
-        #     b_fp8, b_scale_inv = quantize_fp8_rowwise(b, b_dtype, dim=(-1))
-
-        #     a_t_fp8, a_t_scale_inv = quantize_fp8_rowwise(a.transpose(0, 1).contiguous(), a_dtype, dim=(-1))
-        #     b_t_fp8, b_t_scale_inv = quantize_fp8_rowwise(b.transpose(0, 1).contiguous(), b_dtype, dim=(-1))
-        else:
-            raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
+        a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
+        b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
 
         # NN
         out = gemm_fp8_impl(
@@ -383,9 +364,7 @@ class FP8GemmFunctionCK(torch.autograd.Function):
             backend=config.backend,
             granularity=config.granularity,
         )
-        ctx.save_for_backward(
-            a_fp8, a_scale_inv, b_fp8, b_scale_inv, a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv
-        )
+        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -395,64 +374,151 @@ class FP8GemmFunctionCK(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        (a_fp8, a_scale_inv, b_fp8, b_scale_inv, a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv) = (
-            ctx.saved_tensors
+        (a_fp8, a_scale_inv, b_fp8, b_scale_inv) = ctx.saved_tensors
+        grad_out_dtype = FP8GemmTensorFunctionCK.get_fp8_dtype(ctx.config.format, False)
+
+        grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
+
+        # NT
+        a_grad = gemm_fp8_impl(
+            grad_out_fp8,
+            grad_out_scale_inv,
+            False,
+            b_fp8,
+            b_scale_inv,
+            not ctx.trans_b,
+            ctx.out_dtype,
+            ctx.trans_a,
+            backend=ctx.config.backend,
+            granularity=ctx.config.granularity,
         )
-        grad_out_dtype = FP8GemmFunctionCK.get_fp8_dtype(ctx.config.format, False)
 
-        if ctx.config.granularity == ScalingGranularity.TENSORWISE:
-            grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
+        lhs, rhs = (grad_out_fp8, a_fp8) if ctx.trans_b else (a_fp8, grad_out_fp8)
+        lhs_scale, rhs_scale = (
+            (grad_out_scale_inv, a_scale_inv) if ctx.trans_b else (a_scale_inv, grad_out_scale_inv)
+        )
 
-            # NT
-            a_grad = gemm_fp8_impl(
-                grad_out_fp8,
-                grad_out_scale_inv,
-                False,
-                b_fp8,
-                b_scale_inv,
-                not ctx.trans_b,
-                ctx.out_dtype,
-                ctx.trans_a,
-                backend=ctx.config.backend,
-                granularity=ctx.config.granularity,
-            )
+        # TN
+        b_grad = gemm_fp8_impl(
+            lhs,
+            lhs_scale,
+            not ctx.trans_a,
+            rhs,
+            rhs_scale,
+            False,
+            ctx.out_dtype,
+            ctx.trans_b,
+            backend=ctx.config.backend,
+            granularity=ctx.config.granularity,
+        )
 
-            lhs, rhs = (grad_out_fp8, a_fp8) if ctx.trans_b else (a_fp8, grad_out_fp8)
-            lhs_scale, rhs_scale = (
-                (grad_out_scale_inv, a_scale_inv) if ctx.trans_b else (a_scale_inv, grad_out_scale_inv)
-            )
+        return (a_grad, b_grad, None, None, None, None)
 
-            # TN
-            b_grad = gemm_fp8_impl(
-                lhs,
-                lhs_scale,
-                not ctx.trans_a,
-                rhs,
-                rhs_scale,
-                False,
-                ctx.out_dtype,
-                ctx.trans_b,
-                backend=ctx.config.backend,
-                granularity=ctx.config.granularity,
-            )
-        # elif ctx.config.granularity == ScalingGranularity.ROWWISE:
-        #     # NOTE: rowwise only support NT layout.
-        #     grad_out_fp8, grad_out_scale_inv = quantize_fp8_rowwise(grad_out, grad_out_dtype, dim=(-1))
-        #     grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_rowwise(
-        #         grad_out.transpose(0, 1).contiguous(), grad_out_dtype, dim=(-1)
-        #     )
 
-        #     # NT
-        #     a_grad = gemm_fp8_impl(
-        #         grad_out_fp8, grad_out_scale_inv, False, b_t_fp8, b_t_scale_inv, True, ctx.out_dtype, False
-        #     )
+class FP8GemmRowFunctionCK(torch.autograd.Function):
 
-        #     # TN
-        #     b_grad = gemm_fp8_impl(
-        #         a_t_fp8, a_t_scale_inv, False, grad_out_t_fp8, grad_out_t_scale_inv, True, ctx.out_dtype, True
-        #     )
+    @staticmethod
+    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
+        if format == Format.E4M3:
+            return float8_e4m3
+        elif format == Format.E5M2:
+            return float8_e5m2
+        elif format == Format.HYBRID:
+            return float8_e4m3 if is_fwd_stage else float8_e5m2
         else:
-            raise ValueError(f"Unsupported FP8 ScalingGranularity: {ctx.config.granularity}")
+            raise ValueError(f"Unsupported FP8 format: {format}")
+
+    @staticmethod
+    def forward(
+        ctx,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        trans_a: bool,  # trans_a has to be False
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        config: Float8QuantConfig,
+    ):
+        assert trans_a == False, "trans_a has to be False"
+        a_dtype = FP8GemmRowFunctionCK.get_fp8_dtype(config.format, True)
+        b_dtype = FP8GemmRowFunctionCK.get_fp8_dtype(config.format, True)
+
+        a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, config.granularity, axis=-1)
+        b_fp8_row, b_scale_inv_row = quantize_fp8(
+            b, b_dtype, config.granularity, axis=(-1 if trans_b else -2)
+        )
+
+        out = gemm_fp8_impl(
+            a_fp8_row,
+            a_scale_inv_row,
+            trans_a,
+            b_fp8_row,
+            b_scale_inv_row,
+            trans_b,
+            out_dtype,
+            False,
+            backend=config.backend,
+            granularity=config.granularity,
+        )
+
+        a_fp8_col, a_scale_inv_col = quantize_fp8(a, a_dtype, config.granularity, axis=-2)
+        b_fp8_col, b_scale_inv_col = quantize_fp8(
+            b, b_dtype, config.granularity, axis=(-2 if trans_b else -1)
+        )
+
+        ctx.save_for_backward(a_fp8_col, a_scale_inv_col, b_fp8_col, b_scale_inv_col)
+        ctx.trans_a = trans_a
+        ctx.trans_b = trans_b
+        ctx.out_dtype = out_dtype
+        ctx.config = config
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (a_fp8_col, a_scale_inv_col, b_fp8_col, b_scale_inv_col) = ctx.saved_tensors
+        grad_out_dtype = FP8GemmRowFunctionCK.get_fp8_dtype(ctx.config.format, False)
+
+        grad_out_fp8_row, grad_out_scale_inv_row = quantize_fp8(
+            grad_out, grad_out_dtype, ctx.config.granularity, axis=-1
+        )
+
+        # NT
+        a_grad = gemm_fp8_impl(
+            grad_out_fp8_row,
+            grad_out_scale_inv_row,
+            False,
+            b_fp8_col,
+            b_scale_inv_col,
+            not ctx.trans_b,
+            ctx.out_dtype,
+            ctx.trans_a,
+            backend=ctx.config.backend,
+            granularity=ctx.config.granularity,
+        )
+
+        grad_out_fp8_col, grad_out_scale_inv_col = quantize_fp8(
+            grad_out, grad_out_dtype, ctx.config.granularity, axis=-2
+        )
+        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
+        lhs_scale, rhs_scale = (
+            (grad_out_scale_inv_col, a_scale_inv_col)
+            if ctx.trans_b
+            else (a_scale_inv_col, grad_out_scale_inv_col)
+        )
+
+        # TN
+        b_grad = gemm_fp8_impl(
+            lhs,
+            lhs_scale,
+            not ctx.trans_a,
+            rhs,
+            rhs_scale,
+            False,
+            ctx.out_dtype,
+            ctx.trans_b,
+            backend=ctx.config.backend,
+            granularity=ctx.config.granularity,
+        )
 
         return (a_grad, b_grad, None, None, None, None)
 
@@ -477,4 +543,7 @@ def gemm_fp8(
     if config.backend == "hipblaslt":
         return FP8GemmFunctionHipblas.apply(*args)
     elif config.backend == "ck":
-        return FP8GemmFunctionCK.apply(*args)
+        if config.granularity == ScalingGranularity.TENSORWISE:
+            return FP8GemmTensorFunctionCK.apply(*args)
+        elif config.granularity == ScalingGranularity.ROWWISE:
+            return FP8GemmRowFunctionCK.apply(*args)
