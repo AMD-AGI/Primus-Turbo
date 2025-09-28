@@ -22,11 +22,17 @@ class TokenDispatcher:
         num_experts: int,
         router_topk: int,
         ep_group: dist.ProcessGroup,
-        tp_group: dist.ProcessGroup,
-        tp_ep_group: dist.ProcessGroup,
+        tp_group: Optional[dist.ProcessGroup],
+        tp_ep_group: Optional[dist.ProcessGroup],
     ):
-        self.num_experts = num_experts
-        self.router_topk = router_topk
+
+        self.ep_size = ep_group.size()
+        # only use ep_group
+        if tp_group is None and tp_ep_group is None:
+            tp_group = dist.new_group([dist.get_rank()], backend=dist.get_backend(ep_group))
+            tp_ep_group = ep_group
+        else:
+            assert tp_group and tp_ep_group, "tp_group or tp_ep_group is None"
 
         self.ep_group = ep_group
         self.tp_group = tp_group
@@ -34,10 +40,13 @@ class TokenDispatcher:
 
         self.ep_size = ep_group.size()
         self.tp_size = tp_group.size()
-        self.tp_ep_size = tp_ep_group.size()
+        self.tp_ep_size = self.ep_size * self.tp_size
 
         assert num_experts % self.ep_size == 0
         self.num_local_experts = num_experts // self.ep_size
+
+        self.num_experts = num_experts * self.tp_size
+        self.router_topk = router_topk * self.tp_size
 
     def token_dispatch(
         self,
@@ -120,8 +129,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         num_experts: int,
         router_topk: int,
         ep_group: dist.ProcessGroup,
-        tp_group: dist.ProcessGroup,
-        tp_ep_group: dist.ProcessGroup,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        tp_ep_group: Optional[dist.ProcessGroup] = None,
         router_padding_for_fp8: bool = False,
         router_dtype: Optional[str] = None,
         expert_capacity_factor: Optional[float] = None,
@@ -144,7 +153,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         if router_padding_for_fp8:
             raise NotImplementedError("not support for now!")
 
-        self.group = tp_ep_group
         self.capacity_factor = expert_capacity_factor
 
         self.router_padding_for_fp8 = router_padding_for_fp8
@@ -220,7 +228,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 token_indices=self.token_indices,
                 token_probs=token_probs,
                 num_experts=self.num_experts,
-                group=self.group,
+                group=self.tp_ep_group,
                 async_finish=self.deepep_async_finish,
                 allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,
                 num_worst_tokens=self.deepep_num_worst_tokens,
@@ -285,7 +293,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
     def _exec_combine(self, hidden_states):
         hidden_states = turbo.ops.deepep_combine(
             hidden_states,
-            self.group,
+            self.tp_ep_group,
             self.handle,
             async_finish=self.deepep_async_finish,
             allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,

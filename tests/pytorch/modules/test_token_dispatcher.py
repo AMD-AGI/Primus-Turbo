@@ -109,13 +109,8 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
-        ep_group = dist.group.WORLD
-        tp_group = dist.new_group([self.rank])
-        tp_ep_group = ep_group
-        return ep_group, tp_group, tp_ep_group
-
     def test_token_dispatcher_dropless(self):
-        ep_group, tp_group, tp_ep_group = self._init_process()
+        self._init_process()
         ep_group = dist.group.WORLD
 
         for cfg in get_token_dispatcher_config():
@@ -123,8 +118,6 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                 cfg.num_experts,
                 cfg.router_topk,
                 ep_group,
-                tp_group,
-                tp_ep_group,
                 permute_fusion=cfg.permute_fusion,
                 deepep_use_cuda_num_tokens_per_expert=cfg.deepep_use_cuda_num_tokens_per_expert,
                 deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
