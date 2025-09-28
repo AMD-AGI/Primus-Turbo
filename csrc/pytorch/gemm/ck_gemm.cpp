@@ -48,24 +48,17 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
+    PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "ROWWISE",
+                       "granularity must be 'TENSORWISE' or 'ROWWISE'");
 
     // Determine output tensor size based on transA and transB
     const int64_t m = transA ? a.size(1) : a.size(0);
     const int64_t k = transA ? a.size(0) : a.size(1);
     const int64_t n = transB ? b.size(0) : b.size(1);
     PRIMUS_TURBO_CHECK(k % 128 == 0, "Inner dimension K must be multiple of 128");
-    // Process Scale
-    at::Tensor aq_tensor;
-    at::Tensor bq_tensor;
-    if (granularity == "TENSORWISE") {
-        aq_tensor = a_scales.reshape({1, 1}).expand({m, 1});
-        bq_tensor = b_scales.reshape({1, 1}).expand({1, n});
-    } else {
-        aq_tensor = a_scales.clone();
-        bq_tensor = b_scales.clone();
-    }
-    aq_tensor = aq_tensor.contiguous();
-    bq_tensor = bq_tensor.contiguous();
+
+    at::Tensor aq_tensor = a_scales.contiguous();
+    at::Tensor bq_tensor = b_scales.contiguous();
 
     at::Tensor c      = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
     auto       stream = at::cuda::getCurrentCUDAStream();
@@ -82,7 +75,10 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
-            ck_gemm_fp8<AType, BType, CType, float>(params);
+            if (granularity == "TENSORWISE")
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
+            else
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
@@ -91,7 +87,10 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
-            ck_gemm_fp8<AType, BType, CType, float>(params);
+            if (granularity == "TENSORWISE")
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
+            else
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(params);
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
         }
@@ -107,7 +106,10 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
-            ck_gemm_fp8<AType, BType, CType, float>(params);
+            if (granularity == "TENSORWISE")
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
+            else
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
@@ -116,7 +118,10 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
                 get_gemm_num_cu(num_cu));
-            ck_gemm_fp8<AType, BType, CType, float>(params);
+            if (granularity == "TENSORWISE")
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
+            else
+                ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(params);
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e5m2");
         }

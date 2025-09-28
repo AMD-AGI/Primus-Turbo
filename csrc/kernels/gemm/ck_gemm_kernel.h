@@ -41,7 +41,7 @@ public:
 
 template <GPUArch arch, typename ADataType, typename BDataType, typename CDataType,
           typename ALayout, typename BLayout, typename CLayout, typename TileConfig,
-          typename AccDataType = float>
+          ck_tile::QuantType QuantMode, typename AccDataType = float>
 class CKQuantGemmRunner : public CKGemmRunnerInterFace {
 public:
     using GemmShape = ck_tile::TileGemmShape<
@@ -49,10 +49,9 @@ public:
         ck_tile::sequence<TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::K_Warp>,
         ck_tile::sequence<TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile,
                           TileConfig::K_Warp_Tile>>;
-    static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
-    using TilePartitioner                         = ck_tile::GemmTile1DPartitioner<GemmShape>;
-    using AQLayout                                = ck_tile::tensor_layout::gemm::RowMajor;
-    using BQLayout                                = ck_tile::tensor_layout::gemm::ColumnMajor;
+    using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
+    using AQLayout        = ck_tile::tensor_layout::gemm::RowMajor;
+    using BQLayout        = ck_tile::tensor_layout::gemm::ColumnMajor;
 
     using GemmUniversalTraits =
         ck_tile::TileGemmQuantTraits<TileConfig::kPadM, TileConfig::kPadN, TileConfig::kPadK,
@@ -74,8 +73,7 @@ public:
         TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile,
         TileConfig::K_Warp_Tile, false, MemoryOp>>;
 
-    using Kernel = ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue,
-                                            GemmUniversalTraits::kQuantType>;
+    using Kernel = ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
 
 public:
     void run(const ck_tile::stream_config &stream_cfg, ck_tile::QuantGemmKernelArgs &kargs,
@@ -86,7 +84,7 @@ public:
 
 #ifdef PRIMUS_TURBO_GFX942
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
-          typename ALayout, typename BLayout, typename CLayout>
+          typename ALayout, typename BLayout, typename CLayout, ck_tile::QuantType QuantMode>
 std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx942(const ck_tile::index_t m,
                                                                    const ck_tile::index_t n,
                                                                    const ck_tile::index_t k) {
@@ -99,19 +97,22 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx942(const ck_tile
                   std::is_same_v<ADataType, ck_tile::fp8_t>) {
         if (n % 256 == 0) {
             using TileConfig = CKGemmTileCfg_256x256x128_32x32x32_2x2x1;
-            using Runner     = CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType,
-                                                 ALayout, BLayout, CLayout, TileConfig, AccDataType>;
-            runner           = std::make_unique<Runner>();
+            using Runner =
+                CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
+                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
         } else if (n % 128 == 0) {
             using TileConfig = CKGemmTileCfg_256x128x128_32x32x32_2x2x1;
-            using Runner     = CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType,
-                                                 ALayout, BLayout, CLayout, TileConfig, AccDataType>;
-            runner           = std::make_unique<Runner>();
+            using Runner =
+                CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
+                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
         } else {
             using TileConfig = CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding;
-            using Runner     = CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType,
-                                                 ALayout, BLayout, CLayout, TileConfig, AccDataType>;
-            runner           = std::make_unique<Runner>();
+            using Runner =
+                CKQuantGemmRunner<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
+                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
         }
     } else {
         PRIMUS_TURBO_ERROR("CK Gemm only support fp8/bf8");
@@ -122,7 +123,7 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx942(const ck_tile
 
 #ifdef PRIMUS_TURBO_GFX950
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
-          typename ALayout, typename BLayout, typename CLayout>
+          typename ALayout, typename BLayout, typename CLayout, ck_tile::QuantType QuantMode>
 std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile::index_t m,
                                                                    const ck_tile::index_t n,
                                                                    const ck_tile::index_t k) {
@@ -135,14 +136,16 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile
                   std::is_same_v<ADataType, ck_tile::fp8_t>) {
         if (n % 256 == 0) {
             using TileConfig = CKGemmTileCfg_256x256x128_16x16x128_2x2x1;
-            using Runner     = CKQuantGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType,
-                                                 ALayout, BLayout, CLayout, TileConfig, AccDataType>;
-            runner           = std::make_unique<Runner>();
+            using Runner =
+                CKQuantGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
         } else {
             using TileConfig = CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding;
-            using Runner     = CKQuantGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType,
-                                                 ALayout, BLayout, CLayout, TileConfig, AccDataType>;
-            runner           = std::make_unique<Runner>();
+            using Runner =
+                CKQuantGemmRunner<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
         }
     } else {
         PRIMUS_TURBO_ERROR("CK Gemm only support fp8/bf8");
@@ -152,7 +155,7 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile
 #endif
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
-          typename ALayout, typename BLayout, typename CLayout>
+          typename ALayout, typename BLayout, typename CLayout, ck_tile::QuantType QuantMode>
 std::unique_ptr<CKGemmRunnerInterFace>
 get_ck_gemm_instance(const ck_tile::index_t m, const ck_tile::index_t n, const ck_tile::index_t k) {
     const GPUArch arch = get_current_arch();
@@ -160,13 +163,13 @@ get_ck_gemm_instance(const ck_tile::index_t m, const ck_tile::index_t n, const c
 #ifdef PRIMUS_TURBO_GFX942
     case GPUArch::GFX942: {
         return get_ck_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                           BLayout, CLayout>(m, n, k);
+                                           BLayout, CLayout, QuantMode>(m, n, k);
     }
 #endif
 #ifdef PRIMUS_TURBO_GFX950
     case GPUArch::GFX950: {
         return get_ck_gemm_instance_gfx950<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                           BLayout, CLayout>(m, n, k);
+                                           BLayout, CLayout, QuantMode>(m, n, k);
     }
 #endif
     default:
@@ -176,36 +179,52 @@ get_ck_gemm_instance(const ck_tile::index_t m, const ck_tile::index_t n, const c
 // clang-format off
 // **************** GFX942 Instantiation ****************
 #ifdef PRIMUS_TURBO_GFX942
-#define DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)           \
+#define DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout, QuantMode) \
 extern template std::unique_ptr<CKGemmRunnerInterFace>                                       \
-get_ck_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
+get_ck_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout, QuantMode>( \
                             const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
 
 // FP8_E4M3 * FP8_E4M3 = FP16
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E4M3 * FP8_E4M3 = BF16
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E5M2 * FP8_E5M2 = FP16
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E5M2 * FP8_E5M2 = BF16
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX942_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 #undef DECL_CK_GEMM_GFX942_EXTERN_INSTANCE
 
-#define DECL_CK_GEMM_GFX942_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)             \
+#define DECL_CK_GEMM_GFX942_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout, QuantMode) \
 template std::unique_ptr<CKGemmRunnerInterFace>                                                  \
-get_ck_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout>(              \
+get_ck_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayout, QuantMode>(   \
                             const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
 #endif
 // ******************************************************
@@ -213,47 +232,71 @@ get_ck_gemm_instance_gfx942<AType, BType, CType, float, ALayout, BLayout, CLayou
 
 // **************** GFX950 Instantiation ****************
 #ifdef PRIMUS_TURBO_GFX950
-#define DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)       \
+#define DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout, QuantMode) \
 extern template std::unique_ptr<CKGemmRunnerInterFace>                                     \
-get_ck_gemm_instance_gfx950<AType, BType, CType, float, ALayout, BLayout, CLayout>(               \
+get_ck_gemm_instance_gfx950<AType, BType, CType, float, ALayout, BLayout, CLayout, QuantMode>( \
                             const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
 
 // FP16 * FP16 = FP16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // BF16 * BF16 = BF16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E4M3 * FP8_E4M3 = FP16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E4M3 * FP8_E4M3 = BF16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E5M2 * FP8_E5M2 = FP16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // FP8_E5M2 * FP8_E5M2 = BF16
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
-DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)
+
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
+DECL_CK_GEMM_GFX950_EXTERN_INSTANCE(ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 #undef DECL_CK_GEMM_GFX950_EXTERN_INSTANCE
 
-#define DECL_CK_GEMM_GFX950_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)                \
-template std::unique_ptr<CKGemmRunnerInterFace>                                                     \
-get_ck_gemm_instance_gfx950<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
-                                    const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
+#define DECL_CK_GEMM_GFX950_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout, QuantMode) \
+template std::unique_ptr<CKGemmRunnerInterFace>                                                  \
+get_ck_gemm_instance_gfx950<AType, BType, CType, float, ALayout, BLayout, CLayout, QuantMode>(   \
+                            const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
 #endif
 // ******************************************************
 
