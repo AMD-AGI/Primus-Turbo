@@ -262,7 +262,6 @@ def gemm_fp8_impl(
     )
 
     if backend == "hipblaslt":
-        # TODO(ruibzhan): support more backends.
         out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(*args)
     elif backend == "ck":
         out = torch.ops.primus_turbo_cpp_extension.gemm_fp8(
