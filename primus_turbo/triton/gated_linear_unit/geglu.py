@@ -1,11 +1,13 @@
 import triton
 import triton.language as tl
 
+from primus_turbo.triton.utils.gelu import gelu_bwd_none, gelu_none
+
 from .utils import _calc_and_valid_num_tokens
 
 
 @triton.jit
-def swiglu_fwd_kernel_with_tokens_per_expert(
+def geglu_fwd_kernel_with_tokens_per_expert(
     # pointers
     x_ptr,
     probs_ptr,
@@ -49,7 +51,7 @@ def swiglu_fwd_kernel_with_tokens_per_expert(
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
-        up = tl.fdiv(up, (1.0 + tl.exp(-up)))
+        up = gelu_none(up)
         out = up * down
 
         probs = tl.load(probs_ptr + row_idx * stride_probs_token)
@@ -59,7 +61,7 @@ def swiglu_fwd_kernel_with_tokens_per_expert(
 
 
 @triton.jit
-def swiglu_bwd_with_tokens_per_expert_kernel(
+def geglu_bwd_with_tokens_per_expert_kernel(
     # pointers
     grad_out_ptr,
     x_ptr,
@@ -108,14 +110,13 @@ def swiglu_bwd_with_tokens_per_expert_kernel(
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
-        sigmoid = tl.sigmoid(up)
-        silu = sigmoid * up
+        gelu = gelu_none(up)
 
         grad_out = tl.load(grad_out_ptr + row_idx * stride_grad_out_token + col_off, mask=mask).to(
             compute_type
         )
 
-        grad_probs = grad_out * silu * down
+        grad_probs = grad_out * gelu * down
         grad_probs_sum = tl.sum(grad_probs, dtype=compute_type)
 
         tl.store(
@@ -127,9 +128,9 @@ def swiglu_bwd_with_tokens_per_expert_kernel(
         probs = tl.load(probs_ptr + row_idx * stride_probs_token).to(compute_type)
 
         grad_out_with_probs = grad_out * probs
-        grad_down = grad_out_with_probs * silu
-        grad_silu = sigmoid * (1.0 + up * (1.0 - sigmoid))
-        grad_up = grad_out_with_probs * (down * grad_silu)
+        grad_down = grad_out_with_probs * gelu
+        grad_gelu = gelu_bwd_none(up, grad_out_with_probs)
+        grad_up = grad_out_with_probs * (down * grad_gelu)
 
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask
@@ -142,7 +143,7 @@ def swiglu_bwd_with_tokens_per_expert_kernel(
 
 
 @triton.jit
-def swiglu_fwd_kernel(
+def geglu_fwd_kernel(
     # pointers
     x_ptr,
     probs_ptr,
@@ -176,7 +177,7 @@ def swiglu_fwd_kernel(
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
-    up = tl.fdiv(up, (1.0 + tl.exp(-up)))
+    up = gelu_none(up)
     out = up * down
 
     probs = tl.load(probs_ptr + row_idx * stride_probs_token)
@@ -186,7 +187,7 @@ def swiglu_fwd_kernel(
 
 
 @triton.jit
-def swiglu_bwd_kernel(
+def geglu_bwd_kernel(
     # pointers
     grad_out_ptr,
     x_ptr,
@@ -225,12 +226,11 @@ def swiglu_bwd_kernel(
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
-    sigmoid = tl.sigmoid(up)
-    silu = sigmoid * up
+    gelu = gelu_none(up)
 
     grad_out = tl.load(grad_out_ptr + row_idx * stride_grad_out_token + col_off, mask=mask).to(compute_type)
 
-    grad_probs = grad_out * silu * down
+    grad_probs = grad_out * gelu * down
     grad_probs_sum = tl.sum(grad_probs, dtype=compute_type)
 
     tl.store(
@@ -242,9 +242,9 @@ def swiglu_bwd_kernel(
     probs = tl.load(probs_ptr + row_idx * stride_probs_token).to(compute_type)
 
     grad_out_with_probs = grad_out * probs
-    grad_down = grad_out_with_probs * silu
-    grad_silu = sigmoid * (1.0 + up * (1.0 - sigmoid))
-    grad_up = grad_out_with_probs * (down * grad_silu)
+    grad_down = grad_out_with_probs * gelu
+    grad_gelu = gelu_bwd_none(up, grad_out)
+    grad_up = grad_out_with_probs * down * grad_gelu
 
     tl.store(grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask)
     tl.store(

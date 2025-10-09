@@ -3,15 +3,15 @@ from typing import Optional
 import torch
 import triton
 
-from primus_turbo.triton.gated_linear_unit.swiglu import (
-    swiglu_bwd_kernel,
-    swiglu_bwd_with_tokens_per_expert_kernel,
-    swiglu_fwd_kernel,
-    swiglu_fwd_kernel_with_tokens_per_expert,
+from primus_turbo.triton.gated_linear_unit.geglu import (
+    geglu_bwd_kernel,
+    geglu_bwd_with_tokens_per_expert_kernel,
+    geglu_fwd_kernel,
+    geglu_fwd_kernel_with_tokens_per_expert,
 )
 
 
-def swiglu_fwd_with_tokens_per_expert(
+def geglu_fwd_with_tokens_per_expert(
     x: torch.Tensor, probs: torch.Tensor, tokens_per_expert: Optional[torch.Tensor] = None
 ):
     num_tokens, double_hidden_size = x.size()
@@ -22,7 +22,7 @@ def swiglu_fwd_with_tokens_per_expert(
 
     if tokens_per_expert is None:
         grid = (num_tokens,)
-        swiglu_fwd_kernel[grid](
+        geglu_fwd_kernel[grid](
             x,
             probs,
             out,
@@ -38,7 +38,7 @@ def swiglu_fwd_with_tokens_per_expert(
 
         BLOCK_SIZE = 8192
         grid = (BLOCK_SIZE,)
-        swiglu_fwd_kernel_with_tokens_per_expert[grid](
+        geglu_fwd_kernel_with_tokens_per_expert[grid](
             x,
             probs,
             tokens_per_expert,
@@ -56,7 +56,7 @@ def swiglu_fwd_with_tokens_per_expert(
     return out
 
 
-def swiglu_bwd_with_tokens_per_expert(
+def geglu_bwd_with_tokens_per_expert(
     grad_out: torch.Tensor,
     x: torch.Tensor,
     probs: torch.Tensor,
@@ -69,7 +69,7 @@ def swiglu_bwd_with_tokens_per_expert(
 
     if tokens_per_expert is None:
         grid = (num_tokens,)
-        swiglu_bwd_kernel[grid](
+        geglu_bwd_kernel[grid](
             grad_out,
             x,
             probs,
@@ -89,7 +89,7 @@ def swiglu_bwd_with_tokens_per_expert(
 
         BLOCK_SIZE = 8192
         grid = (BLOCK_SIZE,)
-        swiglu_bwd_with_tokens_per_expert_kernel[grid](
+        geglu_bwd_with_tokens_per_expert_kernel[grid](
             grad_out,
             x,
             probs,
