@@ -303,7 +303,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         return hidden_states
 
     def _post_combine(self, hidden_states):
-        return hidden_states
+        return hidden_states.view(self.hidden_shape)
 
     def _pad_routing_map(
         self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
