@@ -2,6 +2,7 @@
 //
 // See LICENSE for license information.
 
+#include "primus_turbo/quantization.h"
 #include "../extensions.h"
 #include "../utils.h"
 #include "primus_turbo/reduce.h"
@@ -43,7 +44,7 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
     auto          input_max = torch::empty({}, input.options().dtype(at::kFloat));
     const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
     auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
-    TORCH_TYPE_SWITCH_FLOAT(input.scalar_type(), InT, {
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
         reduce_row<InT, float, float>(
             PrimusTurboReduceOp::REDUCE_ABS_MAX, reinterpret_cast<InT *>(input.data_ptr()),
             input_max.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
@@ -56,8 +57,16 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
     auto        scale_inv = 1.0f / scale;
 
     // Quantize
-    // TODO: refactor
-    auto output = fp8_quantize(input, scale, dest_dtype);
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), OutType, {
+            quantize_tensorwise_impl<InType, OutType>(
+                reinterpret_cast<const InType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale.data_ptr()),
+                reinterpret_cast<OutType *>(output.data_ptr()), input.numel(), stream);
+        });
+    });
+
     return {output, scale_inv};
 }
 
