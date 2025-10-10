@@ -117,7 +117,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         `deepep_use_comm_stream`: DeepEP will use current stream as communication stream when deepep_use_comm_stream is False
         `deepep_num_use_cu`: number of cu deepep used
         `deepep_num_worst_tokens`: number of worst tokens for deepep, see DeepEP for more detail.
-        `deepep_use_cuda_num_tokens_per_expert`: TurboDeepEPTokenDispatcher will return num_tokens_per_expert by cuda tensor instead of cpu tensor, this may elimate groumlp cpu sync when use turbo's groupgemm.
+        `deepep_use_cuda_num_tokens_per_expert`: DeepEPTokenDispatcher will return num_tokens_per_expert by cuda tensor instead of cpu tensor, this may elimate groumlp cpu sync when use turbo's groupgemm.
         `deepep_autotune_config`: use autotuned DeepEP config to initialize DeepEP buffer for better performance.
 
     """

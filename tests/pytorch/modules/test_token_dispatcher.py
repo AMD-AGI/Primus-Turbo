@@ -25,13 +25,13 @@ class TokenDispatcherTestConfig:
     num_tokens: int
     hidden_size: int
     dtype: torch.dtype
-    # TurboDeepEPTokenDispatcher init
+    # DeepEPTokenDispatcher init
     router_topk: int
     num_experts: int
     permute_fusion: bool
     deepep_use_cuda_num_tokens_per_expert: bool
 
-    # TurboDeepEPTokenDispatcher forward
+    # DeepEPTokenDispatcher forward
     deepep_num_worst_tokens: int
     permute_max_token_num: int
 
