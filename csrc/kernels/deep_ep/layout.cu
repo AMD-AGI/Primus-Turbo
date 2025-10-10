@@ -22,10 +22,10 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
 #pragma unroll
         for (int i = 0; i < kNumExpertsPerSM; ++i)
             num_tokens_per_expert_per_thread[thread_id][i] = 0;
-#pragma unroll
+#pragma unroll 2
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx = topk_idx + i * num_topk;
-#pragma unroll
+#pragma unroll 2
             for (int j = 0, expert_idx; j < num_topk; ++j) {
                 expert_idx = static_cast<int>(shifted_topk_idx[j]);
                 if (expert_begin_idx <= expert_idx and expert_idx < expert_end_idx)
@@ -71,11 +71,11 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
 #pragma unroll
         for (int i = 0; i < kNumRDMARanksPerSM; ++i)
             num_tokens_per_rdma_rank_per_thread[thread_id][i] = 0;
-#pragma unroll
+#pragma unroll 2
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx           = topk_idx + i * num_topk;
             int  is_in_rank[kNumRanksPerSM] = {0}, is_in_rdma_rank[kNumRDMARanksPerSM] = {0};
-#pragma unroll
+#pragma unroll 2
             for (int j = 0, expert_idx, rank_idx; j < num_topk; ++j) {
                 expert_idx = static_cast<int>(shifted_topk_idx[j]);
                 if (expert_begin <= expert_idx and expert_idx < expert_end) {
@@ -86,13 +86,13 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
             }
 
             auto shifted_is_token_in_rank = is_token_in_rank + i * num_ranks;
-#pragma unroll
+#pragma unroll 2
             for (int j = 0; j + rank_begin_idx < rank_end_idx; ++j) {
                 shifted_is_token_in_rank[j + rank_begin_idx] = (is_in_rank[j] > 0);
                 num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0);
             }
 
-#pragma unroll
+#pragma unroll 2
             for (int j = 0; j + rdma_rank_begin_idx < rdma_rank_end_idx; ++j)
                 num_tokens_per_rdma_rank_per_thread[thread_id][j] += (is_in_rdma_rank[j] > 0);
         }

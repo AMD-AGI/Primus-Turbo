@@ -47,7 +47,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
         int num_experts_per_rank = num_experts / kNumRanks;
         if (thread_id < kNumRanks) {
             per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
-#pragma unroll
+#pragma unroll 2
             for (int i = 0; i < num_experts_per_rank; ++i)
                 per_expert_buffer[rank * num_experts_per_rank + i] =
                     num_tokens_per_expert[thread_id * num_experts_per_rank + i];
@@ -83,12 +83,12 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
         __syncthreads();
 
 // Copy rank size prefix matrix to another tensor
-#pragma unroll
+#pragma unroll 2
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
             rank_prefix_matrix_copy[i] = local_per_rank_buffer[i];
 
 // Extra memset for later communication queue
-#pragma unroll
+#pragma unroll 2
         for (int i = thread_id; i < num_memset_int; i += num_threads)
             local_per_expert_buffer[i] = 0;
 
@@ -113,7 +113,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
 
         // Pre-compute prefix sum for all channels
         if (thread_id == 0) {
-#pragma unroll
+#pragma unroll 2
             for (int i = 1; i < num_channels; ++i)
                 channel_prefix_matrix[dst_rank * num_channels + i] +=
                     channel_prefix_matrix[dst_rank * num_channels + i - 1];
@@ -155,10 +155,10 @@ __global__ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_me
     // Copy and clean
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto ptr = static_cast<int *>(buffer_ptrs[rank]);
-#pragma unroll
+#pragma unroll 2
     for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
         ptr[i] = rank_prefix_matrix[i];
-#pragma unroll
+#pragma unroll 2
     for (int i = thread_id; i < num_memset_int; i += num_threads)
         ptr[kNumRanks * kNumRanks + i] = 0;
 
@@ -349,7 +349,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     }
 
 // Copy `x_scales`
-#pragma unroll
+#pragma unroll 2
                     for (int i = lane_id; i < num_scales; i += kWarpSize) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
                         channel_x_scales_buffers[dst_slot_idx * num_scales + i] =
@@ -455,7 +455,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
 // Copy `src_idx`
-#pragma unroll 4
+#pragma unroll 2
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank;
                  chunk_idx < cached_channel_tail_idx;
                  chunk_idx += kWarpSize * num_recv_warps_per_rank)
@@ -463,7 +463,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
 
 // Copy `topk_idx` and `topk_weights`
-#pragma unroll 4
+#pragma unroll 2
             for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk;
                  idx += kWarpSize * num_recv_warps_per_rank) {
                 int chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
@@ -479,7 +479,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
 // Copy `x_scales`
-#pragma unroll 4
+#pragma unroll 2
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales;
                  i += kWarpSize * num_recv_warps_per_rank) {
                 int chunk_idx = i / num_scales, scales_idx = i % num_scales;
@@ -514,7 +514,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         const auto clean_start        = num_recv_tokens * num_topk + sm_id * kNumThreads;
         const auto clean_end          = num_worst_tokens * num_topk;
         const auto clean_stride       = num_sms * kNumThreads;
-#pragma unroll
+#pragma unroll 2
         for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
             recv_topk_idx[i] = -1;
     }
@@ -564,7 +564,6 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
         // Clean
         auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
         auto ptr = static_cast<int *>(buffer_ptrs[rank]);
-#pragma unroll
         for (int i = thread_id; i < num_memset_int; i += num_threads)
             ptr[i] = 0;
 
@@ -584,7 +583,6 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
 
         // NOTES: `1 << 25` is a heuristic large number
         int last_head = 1 << 25;
-#pragma unroll
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx;
              token_idx_tail -= kWarpSize) {
             int  token_idx = token_idx_tail - lane_id, expected_head = 0;
@@ -723,7 +721,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             syncwarp();
 
 // Send by chunk
-#pragma unroll
+#pragma unroll 2
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
                 // Get an empty slot
                 int dst_slot_idx = (current_channel_tail_idx + i) % num_recv_buffer_tokens;
@@ -786,7 +784,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             while (lane_id < kNumRanks) {
                 // Check retired
                 bool retired = true;
-#pragma unroll
+#pragma unroll 2
                 for (int i = 1; i < num_recv_warps; ++i)
                     retired = retired and warp_retired[i];
                 if (retired)
@@ -797,7 +795,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
-#pragma unroll
+#pragma unroll 2
                 for (int i = 1; i < num_recv_warps; ++i)
                     if (not warp_retired[i])
                         min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
@@ -876,7 +874,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 }
 
 // Reduce data
-#pragma unroll
+#pragma unroll 4
                 for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
                     // Read bias
                     // TODO: make it as a template
@@ -893,7 +891,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     for (int j = 0; j < kDtypePerInt4; ++j)
                         values[j] = static_cast<float>(bias_0_values[j]) +
                                     static_cast<float>(bias_1_values[j]);
-#pragma unroll
+#pragma unroll 2
                     for (int j = 0; j < num_topk_ranks; ++j) {
                         int4 recv_value = __ldg(channel_x_buffers[topk_ranks[j]].buffer() +
                                                 slot_indices[j] * hidden_int4 + i);
@@ -917,7 +915,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // Reduce `topk_weights`
                 if (lane_id < num_topk) {
                     float value = 0;
-#pragma unroll
+#pragma unroll 2
                     for (int i = 0; i < num_topk_ranks; ++i)
                         value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() +
                                               slot_indices[i] * num_topk + lane_id);

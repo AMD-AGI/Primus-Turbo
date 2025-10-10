@@ -22,13 +22,13 @@ namespace primus_turbo::pytorch::deep_ep {
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
                bool low_latency_mode, bool explicitly_destroy,
                bool use_default_stream_as_comm_stream)
-    : rank(rank), num_ranks(num_ranks), num_nvl_bytes(num_nvl_bytes),
-      num_rdma_bytes(num_rdma_bytes), low_latency_mode(low_latency_mode),
-      explicitly_destroy(explicitly_destroy),
-      use_default_stream_as_comm_stream(use_default_stream_as_comm_stream),
+    : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
+      num_rdma_bytes(num_rdma_bytes), rank(rank), num_ranks(num_ranks),
       comm_stream(use_default_stream_as_comm_stream
                       ? at::hip::getCurrentHIPStreamMasqueradingAsCUDA()
-                      : at::hip::getStreamFromPoolMasqueradingAsCUDA(true)) {
+                      : at::hip::getStreamFromPoolMasqueradingAsCUDA(true)),
+      explicitly_destroy(explicitly_destroy),
+      use_default_stream_as_comm_stream(use_default_stream_as_comm_stream) {
     // Metadata memory
     int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes         = NUM_MAX_NVL_PEERS * sizeof(void *);
@@ -229,7 +229,7 @@ void Buffer::sync(const std::vector<int>                                &device_
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
-        PRIMUS_TURBO_CHECK(num_ranks == device_ids.size());
+        PRIMUS_TURBO_CHECK(static_cast<size_t>(num_ranks) == device_ids.size());
         PRIMUS_TURBO_CHECK(device_ids.size() == all_gathered_handles.size());
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             PRIMUS_TURBO_CHECK(all_gathered_handles[offset + i].has_value());
@@ -512,8 +512,8 @@ Buffer::intranode_dispatch(
         *moe_recv_counter = -1;
         for (int i = 0; i < num_local_experts; ++i)
             moe_recv_expert_counter[i] = -1;
-        PRIMUS_TURBO_CHECK(num_ranks * (num_ranks + num_local_experts) * sizeof(int) <=
-                           num_nvl_bytes);
+        PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_ranks * (num_ranks + num_local_experts) *
+                                                sizeof(int)) <= num_nvl_bytes);
         primus_turbo::deep_ep::intranode::notify_dispatch(
             num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
             num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped,
@@ -586,21 +586,22 @@ Buffer::intranode_dispatch(
     }
 
     // Dispatch
-    PRIMUS_TURBO_CHECK(num_ranks * num_ranks * sizeof(int) +            // Size prefix matrix
-                           num_channels * num_ranks * sizeof(int) +     // Channel start offset
-                           num_channels * num_ranks * sizeof(int) +     // Channel end offset
-                           num_channels * num_ranks * sizeof(int) * 2 + // Queue head and tail
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               hidden * recv_x.element_size() + // Data buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               sizeof(int) + // Source index buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               num_topk * sizeof(int64_t) + // Top-k index buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               num_topk * sizeof(float) + // Top-k weight buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               sizeof(float) * num_scales // FP8 scale buffer
-                       <= num_nvl_bytes);
+    PRIMUS_TURBO_CHECK(
+        static_cast<int64_t>(num_ranks * num_ranks * sizeof(int) +        // Size prefix matrix
+                             num_channels * num_ranks * sizeof(int) +     // Channel start offset
+                             num_channels * num_ranks * sizeof(int) +     // Channel end offset
+                             num_channels * num_ranks * sizeof(int) * 2 + // Queue head and tail
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 hidden * recv_x.element_size() + // Data buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(int) + // Source index buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(int64_t) + // Top-k index buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(float) + // Top-k weight buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(float) * num_scales // FP8 scale buffer
+                             ) <= num_nvl_bytes);
     primus_turbo::deep_ep::intranode::dispatch(
         recv_x.data_ptr(), recv_x_scales_ptr, recv_src_idx.data_ptr<int>(), recv_topk_idx_ptr,
         recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
@@ -721,7 +722,8 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
     }
 
     // Launch barrier and reset queue head and tail
-    PRIMUS_TURBO_CHECK(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
+    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_channels * num_ranks * sizeof(int) * 2) <=
+                       num_nvl_bytes);
     primus_turbo::deep_ep::intranode::cached_notify_combine(
         buffer_ptrs_gpu, send_head.data_ptr<int>(), num_channels, num_recv_tokens,
         num_channels * num_ranks * 2, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
@@ -740,14 +742,15 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    PRIMUS_TURBO_CHECK(num_channels * num_ranks * sizeof(int) * 2 + // Queue head and tail
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               hidden * x.element_size() + // Data buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               sizeof(int) + // Source index buffer
-                           num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
-                               num_topk * sizeof(float) // Top-k weight buffer
-                       <= num_nvl_bytes);
+    PRIMUS_TURBO_CHECK(
+        static_cast<int64_t>(num_channels * num_ranks * sizeof(int) * 2 + // Queue head and tail
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 hidden * x.element_size() + // Data buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(int) + // Source index buffer
+                             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(float) // Top-k weight buffer
+                             ) <= num_nvl_bytes);
     primus_turbo::deep_ep::intranode::combine(
         at::cuda::ScalarTypeToCudaDataType(x.scalar_type()), recv_x.data_ptr(),
         recv_topk_weights_ptr, x.data_ptr(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
