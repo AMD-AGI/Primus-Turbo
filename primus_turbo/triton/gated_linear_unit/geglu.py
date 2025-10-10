@@ -135,8 +135,8 @@ def geglu_bwd_with_tokens_per_expert_kernel(
 
         grad_out_with_probs = grad_out * probs
         grad_down = grad_out_with_probs * gelu
-        grad_gelu = gelu_bwd_none(up, grad_out_with_probs)
-        grad_up = grad_out_with_probs * (down * grad_gelu)
+        grad_gelu = gelu_bwd_none(up, grad_out)
+        grad_up = grad_out_with_probs * down * grad_gelu
 
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask

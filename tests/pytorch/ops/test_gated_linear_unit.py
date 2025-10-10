@@ -126,10 +126,8 @@ def geglu_ref(x: torch.Tensor, probs: torch.Tensor):
         256,
     ],
 )
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("with_tokens_per_expert", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("with_tokens_per_expert", [False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_tokens_per_expert", [False, True])
 def test_geglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
