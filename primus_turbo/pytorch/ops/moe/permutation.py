@@ -49,6 +49,9 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         use_fp8 = isinstance(inp, Float8Tensor)
 
         if use_fp8:
+            raise ValueError("FP8 is not supported for now.")
+
+        if use_fp8:
             fp8_scale = inp._scale
             fp8_dtype = inp._fp8_dtype
             scale_hidden_dim = fp8_scale.shape[1]
