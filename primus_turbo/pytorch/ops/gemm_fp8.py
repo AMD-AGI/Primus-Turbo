@@ -216,25 +216,6 @@ def gemm_fp8_blockwise(
     return BlockwiseFP8GemmFunction.apply(a, b, trans_a, trans_b, out_dtype, config)
 
 
-@torch.compile
-def calc_scale_and_scale_inv(x: torch.Tensor, fp8_max: float):
-    amax = x.abs().amax()
-    scale = torch.full([1], fill_value=fp8_max, dtype=torch.float32, device=x.device) / amax
-    scale_inv = 1.0 / scale
-
-    return scale, scale_inv
-
-
-@torch.compile
-def quantize_fp8_rowwise(x: torch.Tensor, dtype: torch.dtype, dim: int = -1, eps: float = 1e-12):
-    fp8_max = torch.finfo(dtype).max
-    max_abs = torch.amax(x.to(torch.float32).abs(), dim=dim, keepdim=True)
-    scale_inv = torch.clamp(max_abs / fp8_max, min=eps)
-    scale = 1.0 / scale_inv
-    x_fp8 = x * scale
-    return x_fp8.to(dtype), scale_inv.view(-1).to(torch.float)
-
-
 class FP8GemmTensorFunction(torch.autograd.Function):
 
     @staticmethod
