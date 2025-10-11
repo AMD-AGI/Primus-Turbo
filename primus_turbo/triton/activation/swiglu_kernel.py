@@ -40,7 +40,7 @@ def swiglu_with_mask_fwd_kernel(
         col_mask = col_off < half_stride_x_token
 
         extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
-        mask = row_mask & col_mask & extra_mask
+        mask = (row_mask & col_mask) & (extra_mask != 0)
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
@@ -94,7 +94,7 @@ def swiglu_with_mask_bwd_kernel(
         col_mask = col_off < half_stride_x_token
 
         extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
-        mask = row_mask & col_mask & extra_mask
+        mask = (row_mask & col_mask) & (extra_mask != 0)
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
