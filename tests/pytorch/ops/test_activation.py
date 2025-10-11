@@ -83,7 +83,7 @@ def test_swiglu_with_probs(num_tokens, hidden_size, dtype, with_tokens_per_exper
         tokens_per_expert = torch.tensor(
             generate_tokens_per_expert_list(num_experts, num_tokens), device=device, requires_grad=False
         )
-        row_mask = torch.zeros(num_tokens, device=device, dtype=torch.bool, requires_grad=False)
+        row_mask = torch.zeros(num_tokens, device=device, dtype=torch.int64, requires_grad=False)
         row_mask[: torch.sum(tokens_per_expert)] = 1
     else:
         row_mask = None

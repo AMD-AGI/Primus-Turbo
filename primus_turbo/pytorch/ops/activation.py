@@ -39,7 +39,7 @@ class GLUWithProbs(torch.autograd.Function):
             assert row_mask.is_cuda, "row_mask must be a CUDA tensor"
             assert x.size(0) == row_mask.size(0), "first dimension of x and row_mask must be the same"
             assert row_mask.ndim == 1, "row_mask must be 1D tensor"
-            assert row_mask.dtype == torch.bool, "The dtype of row_mask must be bool."
+            assert row_mask.dtype == torch.int64, "The dtype of row_mask must be torch.int64."
 
         if act_type == "silu":
             out = swiglu_fwd_with_probs(x, probs, row_mask)
