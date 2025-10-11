@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.ops.gated_linear_unit import geglu, swiglu
+from primus_turbo.pytorch.ops.activation import geglu_with_probs, swiglu_with_probs
 from tests.test_utils import get_tolerances
 
 torch.manual_seed(42)
@@ -18,7 +18,7 @@ torch.manual_seed(42)
 
 # NOTE: Align precision with torch.compile
 @torch.compile
-def swiglu_ref(x: torch.Tensor, probs: torch.Tensor):
+def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
     dtype = x.dtype
     x = torch.chunk(x, 2, dim=-1)
     res = F.silu(x[0]) * x[1]
@@ -49,6 +49,7 @@ def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
         128,
         2048,
         2025,
+        8192 * 8,
     ],
 )
 @pytest.mark.parametrize(
@@ -56,11 +57,12 @@ def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
     [
         128,
         256,
+        2048,
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_tokens_per_expert", [False, True])
-def test_swiglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
+def test_swiglu_with_probs(num_tokens, hidden_size, dtype, with_tokens_per_expert):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -81,12 +83,13 @@ def test_swiglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
         tokens_per_expert = torch.tensor(
             generate_tokens_per_expert_list(num_experts, num_tokens), device=device, requires_grad=False
         )
-        assert torch.sum(tokens_per_expert).item() == num_tokens
+        row_mask = torch.zeros(num_tokens, device=device, dtype=torch.bool, requires_grad=False)
+        row_mask[: torch.sum(tokens_per_expert)] = 1
     else:
-        tokens_per_expert = None
+        row_mask = None
 
-    out = swiglu(x, probs, tokens_per_expert)
-    out_ref = swiglu_ref(x_ref, probs_ref.unsqueeze(-1))
+    out = swiglu_with_probs(x, probs, row_mask)
+    out_ref = swiglu_with_probs_ref(x_ref, probs_ref.unsqueeze(-1))
     torch.testing.assert_close(out, out_ref, **get_tolerances(dtype))
 
     out.backward(torch.ones_like(out))
@@ -103,7 +106,7 @@ def test_swiglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
 
 # NOTE: Align precision with torch.compile
 @torch.compile
-def geglu_ref(x: torch.Tensor, probs: torch.Tensor):
+def geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
     dtype = x.dtype
     x = torch.chunk(x, 2, dim=-1)
     res = F.gelu(x[0]) * x[1]
@@ -117,6 +120,7 @@ def geglu_ref(x: torch.Tensor, probs: torch.Tensor):
         128,
         2048,
         2025,
+        8192 * 8,
     ],
 )
 @pytest.mark.parametrize(
@@ -124,11 +128,12 @@ def geglu_ref(x: torch.Tensor, probs: torch.Tensor):
     [
         128,
         256,
+        2048,
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_tokens_per_expert", [False, True])
-def test_geglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
+def test_geglu_with_probs(num_tokens, hidden_size, dtype, with_tokens_per_expert):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -149,12 +154,13 @@ def test_geglu(num_tokens, hidden_size, dtype, with_tokens_per_expert):
         tokens_per_expert = torch.tensor(
             generate_tokens_per_expert_list(num_experts, num_tokens), device=device, requires_grad=False
         )
-        assert torch.sum(tokens_per_expert).item() == num_tokens
+        row_mask = torch.zeros(num_tokens, device=device, dtype=torch.bool, requires_grad=False)
+        row_mask[: torch.sum(tokens_per_expert)] = 1
     else:
-        tokens_per_expert = None
+        row_mask = None
 
-    out = geglu(x, probs, tokens_per_expert)
-    out_ref = geglu_ref(x_ref, probs_ref.unsqueeze(-1))
+    out = geglu_with_probs(x, probs, row_mask)
+    out_ref = geglu_with_probs_ref(x_ref, probs_ref.unsqueeze(-1))
     torch.testing.assert_close(out, out_ref, **get_tolerances(dtype))
 
     out.backward(torch.ones_like(out))

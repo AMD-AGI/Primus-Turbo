@@ -9,26 +9,22 @@ import triton.language as tl
 
 from primus_turbo.triton.utils.gelu import gelu_bwd_none, gelu_none
 
-from .utils import _calc_and_valid_num_tokens
-
 
 @triton.jit
-def geglu_fwd_kernel_with_tokens_per_expert(
+def geglu_with_mask_fwd_kernel(
     # pointers
     x_ptr,
     probs_ptr,
-    tokens_per_expert_ptr,
+    row_mask_ptr,
     out_ptr,
     # sizes
-    dummy_num_tokens: tl.constexpr,
-    num_expert: tl.constexpr,
+    num_tokens: tl.constexpr,
     # strides
     stride_x_token,
     stride_probs_token,
     stride_out_token,
     # metas
-    LOAD_WIDTH_X: tl.constexpr,
-    LOAD_WIDTH_TOKENS_PER_EXPERT: tl.constexpr,
+    LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -37,19 +33,16 @@ def geglu_fwd_kernel_with_tokens_per_expert(
     data_type = x_ptr.dtype.element_ty
     idx_type = tl.int64
 
-    num_tokens = _calc_and_valid_num_tokens(
-        tokens_per_expert_ptr, dummy_num_tokens, num_expert, LOAD_WIDTH_TOKENS_PER_EXPERT
-    )
-
     half_stride_x_token = stride_x_token // 2
     loop = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
     for i in range(0, loop):
         row_idx = (i * BLOCK_SIZE + pid).to(idx_type)
         row_mask = row_idx < num_tokens
-        col_off = tl.arange(0, LOAD_WIDTH_X)
+        col_off = tl.arange(0, LOAD_WIDTH)
         col_mask = col_off < half_stride_x_token
 
-        mask = row_mask & col_mask
+        extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
+        mask = row_mask & col_mask & extra_mask
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
@@ -67,17 +60,16 @@ def geglu_fwd_kernel_with_tokens_per_expert(
 
 
 @triton.jit
-def geglu_bwd_with_tokens_per_expert_kernel(
+def geglu_with_mask_bwd_kernel(
     # pointers
     grad_out_ptr,
     x_ptr,
     probs_ptr,
-    tokens_per_expert_ptr,
+    row_mask_ptr,
     grad_x_ptr,
     grad_probs_ptr,
     # sizes
-    dummy_num_tokens: tl.constexpr,
-    num_expert: tl.constexpr,
+    num_tokens: tl.constexpr,
     # strides
     stride_grad_out_token,
     stride_x_token,
@@ -85,8 +77,7 @@ def geglu_bwd_with_tokens_per_expert_kernel(
     stride_grad_x_token,
     stride_grad_probs_token,
     # metas
-    LOAD_WIDTH_X: tl.constexpr,
-    LOAD_WIDTH_TOKENS_PER_EXPERT: tl.constexpr,
+    LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -96,19 +87,16 @@ def geglu_bwd_with_tokens_per_expert_kernel(
     grad_probs_data_type = grad_probs_ptr.dtype.element_ty
     idx_type = tl.int64
 
-    num_tokens = _calc_and_valid_num_tokens(
-        tokens_per_expert_ptr, dummy_num_tokens, num_expert, LOAD_WIDTH_TOKENS_PER_EXPERT
-    )
-
     half_stride_x_token = stride_x_token // 2
     loop = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
     for i in range(0, loop):
         row_idx = (i * BLOCK_SIZE + pid).to(idx_type)
         row_mask = row_idx < num_tokens
-        col_off = tl.arange(0, LOAD_WIDTH_X)
+        col_off = tl.arange(0, LOAD_WIDTH)
         col_mask = col_off < half_stride_x_token
 
-        mask = row_mask & col_mask
+        extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
+        mask = row_mask & col_mask & extra_mask
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
