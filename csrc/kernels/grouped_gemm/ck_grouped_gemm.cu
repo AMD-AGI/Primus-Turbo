@@ -4,7 +4,8 @@
 
 #include "ck_tile/host/hip_check_error.hpp"
 
-#include "ck_grouped_gemm_kernel.h"
+#include "ck_grouped_gemm_kernel_instance_factory.h"
+#include "ck_grouped_gemm_kernel_template.h"
 #include "primus_turbo/grouped_gemm.h"
 
 namespace primus_turbo {
