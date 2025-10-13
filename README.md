@@ -54,6 +54,9 @@ cd Primus-Turbo
 ```
 pip3 install -r requirements.txt
 pip3 install --no-build-isolation .
+
+# Set GPU_ARCHS to compile Turbo for multiple AMD GPU architectures.
+GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
 ```
 
 #### Developer Install (editable mode)
