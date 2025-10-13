@@ -196,7 +196,7 @@ fp8_cfg = Float8QuantConfig(
     granularity=ScalingGranularity.TENSORWISE,  # or ROWWISE
 )
 
-c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=quant_config)
+c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=fp8_cfg)
 print(c)
 print(c.shape) # [128, 256]
 ```

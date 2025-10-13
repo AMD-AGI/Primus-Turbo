@@ -26,8 +26,7 @@ using ColMajor = ck_tile::tensor_layout::gemm::ColumnMajor;
 template <typename Kernel>
 inline void _launch_ck_grouped_kernel(const ck_tile::stream_config& stream_cfg,
                                       ck_tile::index_t group_num,
-                                      void* args_ptr,
-                                      uint32_t num_cu) {
+                                      void* args_ptr, uint32_t num_cu) {
     constexpr int kBlockPerCu = 1;
     const dim3 blocks = Kernel::BlockSize();
     dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
@@ -49,7 +48,6 @@ public:
 
 
 template <
-    GPUArch arch,
     typename ADataType,
     typename BDataType,
     typename CDataType,
@@ -93,7 +91,8 @@ public:
     using GemmUniversalTraits = ck_tile::PersistentTileGemmUniversalTraits<
         TileConfig::kPadM, TileConfig::kPadN, TileConfig::kPadK,
         TileConfig::DoubleSmemBuffer,
-        ALayout, BLayout, CLayout>;
+        ALayout, BLayout, CLayout
+    >;
 
 
     static constexpr ck_tile::GemmPipelineScheduler GemmPipelineScheduler = ck_tile::GemmPipelineScheduler::Intrawave;
@@ -137,7 +136,6 @@ public:
 };
 
 template <
-    GPUArch arch,
     typename ADataType,
     typename BDataType,
     typename CDataType,
@@ -235,6 +233,75 @@ public:
         _launch_ck_grouped_kernel<Kernel>(stream_cfg, group_num, args_ptr, num_cu);
     }
 };
+
+
+template <
+    GPUArch arch,
+    typename ADataType,
+    typename BDataType,
+    typename CDataType,
+    typename ALayout,
+    typename BLayout,
+    typename CLayout,
+    typename TileConfig,
+    typename AccDataType=float
+>
+class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
+        ADataType, BDataType, CDataType,
+        ALayout, BLayout, CLayout,
+        TileConfig, AccDataType> {
+    static_assert(TileConfig::arch == arch, "Tile arch mismatch with runner arch");
+};
+
+// ***********************************************************************************
+#define DECL_CK_GG_RUNNER_EXTERN(A, B, C, AL, BL, CL, TileCfg)                      \
+    extern template class CKGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;
+
+#define DECL_CK_GG_RUNNER(A, B, C, AL, BL, CL, TileCfg)                             \
+    template class CKGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;
+
+#define APPLY_CK_GG_ALL_LAYOUT(MACRO, A, B, C, TileCfg)   \
+    MACRO(A, B, C, RowMajor, ColMajor, RowMajor, TileCfg) \
+    MACRO(A, B, C, RowMajor, RowMajor, RowMajor, TileCfg) \
+    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, TileCfg)
+
+// ***********************************************************************************
+#define DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH(ARCH, A, B, C, AL, BL, CL, TileCfg)                         \
+    extern template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;                \
+    extern template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, float>;
+
+#define DECL_CK_QGG_RUNNER_WITH_ARCH(ARCH, A, B, C, AL, BL, CL, TileCfg)                        \
+    template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;               \
+    template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, float>;
+
+#define APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg)           \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg)           \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg)
+
+// ***********************************************************************************
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding)
+#endif
+
+// ***********************************************************************************
+#ifdef PRIMUS_TURBO_GFX942
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+#endif
+
+// ***********************************************************************************
+#ifdef PRIMUS_TURBO_GFX950
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_EXTERN_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+#endif
 
 // clang-format on
 } // namespace primus_turbo
