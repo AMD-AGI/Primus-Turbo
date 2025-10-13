@@ -19,7 +19,7 @@
 
 namespace primus_turbo::pytorch::deep_ep {
 
-Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
+Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
                bool low_latency_mode, bool explicitly_destroy,
                bool use_default_stream_as_comm_stream)
     : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
@@ -95,26 +95,26 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     *moe_recv_counter = -1;
 
     // MoE expert-level counter
-    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_expert_counter,
-                                         sizeof(int) * NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
+    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(
+        &moe_recv_expert_counter, sizeof(int64_t) * NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
     PRIMUS_TURBO_CHECK_HIP(
         hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_expert_counter_mapped),
-                                const_cast<int *>(moe_recv_expert_counter), 0));
+                                const_cast<int64_t *>(moe_recv_expert_counter), 0));
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
         PRIMUS_TURBO_CHECK_HIP(
-            hipHostMalloc(&moe_recv_rdma_counter, sizeof(int), hipHostAllocMapped));
+            hipHostMalloc(&moe_recv_rdma_counter, sizeof(int64_t), hipHostAllocMapped));
         PRIMUS_TURBO_CHECK_HIP(
             hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_rdma_counter_mapped),
-                                    const_cast<int *>(moe_recv_rdma_counter), 0));
+                                    const_cast<int64_t *>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
 }
 
-Buffer::~Buffer() noexcept(false) {
+Buffer::~Buffer() {
     if (not explicitly_destroy) {
         destroy();
     } else if (not destroyed) {
@@ -132,19 +132,19 @@ bool Buffer::is_internode_available() const {
     return is_available() and num_ranks > NUM_MAX_NVL_PEERS;
 }
 
-int Buffer::get_num_rdma_ranks() const {
+int64_t Buffer::get_num_rdma_ranks() const {
     return num_rdma_ranks;
 }
 
-int Buffer::get_rdma_rank() const {
+int64_t Buffer::get_rdma_rank() const {
     return rdma_rank;
 }
 
-int Buffer::get_root_rdma_rank(bool global) const {
+int64_t Buffer::get_root_rdma_rank(bool global) const {
     return global ? nvl_rank : 0;
 }
 
-int Buffer::get_local_device_id() const {
+int64_t Buffer::get_local_device_id() const {
     return device_id;
 }
 
@@ -216,7 +216,7 @@ void Buffer::destroy() {
     PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_counter)));
 
     // Free chunked mode staffs
-    PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_expert_counter)));
+    PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int64_t *>(moe_recv_expert_counter)));
 
     destroyed = true;
     available = false;
@@ -290,7 +290,7 @@ void Buffer::sync(const std::vector<int>                                &device_
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
            std::optional<EventHandle>>
-Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
+Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int64_t num_experts,
                             std::optional<EventHandle> &previous_event, bool async,
                             bool allocate_on_comm_stream) {
     PRIMUS_TURBO_CHECK(topk_idx.dim() == 2);
@@ -332,7 +332,7 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
         num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>()
                                              : nullptr,
         num_tokens_per_expert.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(), num_tokens,
-        num_topk, num_ranks, num_experts, comm_stream);
+        num_topk, num_ranks, static_cast<int>(num_experts), comm_stream);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -369,10 +369,10 @@ Buffer::intranode_dispatch(
     const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
     const std::optional<torch::Tensor> &topk_idx, const std::optional<torch::Tensor> &topk_weights,
     const std::optional<torch::Tensor> &num_tokens_per_rank, const torch::Tensor &is_token_in_rank,
-    const std::optional<torch::Tensor> &num_tokens_per_expert, int cached_num_recv_tokens,
+    const std::optional<torch::Tensor> &num_tokens_per_expert, int64_t cached_num_recv_tokens,
     const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
-    const std::optional<torch::Tensor> &cached_channel_prefix_matrix, int expert_alignment,
-    int num_worst_tokens, const primus_turbo::deep_ep::Config &config,
+    const std::optional<torch::Tensor> &cached_channel_prefix_matrix, int64_t expert_alignment,
+    int64_t num_worst_tokens, const primus_turbo::deep_ep::Config &config,
     std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
@@ -789,7 +789,7 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+           std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
            torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>,
            torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
            std::optional<torch::Tensor>, std::optional<EventHandle>>
@@ -800,12 +800,12 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                            const std::optional<torch::Tensor> &num_tokens_per_rdma_rank,
                            const torch::Tensor                &is_token_in_rank,
                            const std::optional<torch::Tensor> &num_tokens_per_expert,
-                           int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
+                           int64_t cached_num_recv_tokens, int64_t cached_num_rdma_recv_tokens,
                            const std::optional<torch::Tensor> &cached_rdma_channel_prefix_matrix,
                            const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
                            const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-                           int expert_alignment, int num_worst_tokens,
+                           int64_t expert_alignment, int num_worst_tokens,
                            const primus_turbo::deep_ep::Config &config,
                            std::optional<EventHandle> &previous_event, bool async,
                            bool allocate_on_comm_stream) {
@@ -931,12 +931,12 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
     }
 
     // Create handles (only return for non-cached mode)
-    int              num_recv_tokens = -1, num_rdma_recv_tokens = -1;
-    auto             rdma_channel_prefix_matrix = torch::Tensor();
-    auto             recv_rdma_rank_prefix_sum  = torch::Tensor();
-    auto             gbl_channel_prefix_matrix  = torch::Tensor();
-    auto             recv_gbl_rank_prefix_sum   = torch::Tensor();
-    std::vector<int> num_recv_tokens_per_expert_list;
+    int                  num_recv_tokens = -1, num_rdma_recv_tokens = -1;
+    auto                 rdma_channel_prefix_matrix = torch::Tensor();
+    auto                 recv_rdma_rank_prefix_sum  = torch::Tensor();
+    auto                 gbl_channel_prefix_matrix  = torch::Tensor();
+    auto                 recv_gbl_rank_prefix_sum   = torch::Tensor();
+    std::vector<int64_t> num_recv_tokens_per_expert_list;
     torch::Tensor    num_recv_tokens_per_expert = torch::empty(
         {num_local_experts}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
 
@@ -1009,20 +1009,19 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                 if (ready)
                     break;
 
-                // Timeout check
-                if (std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > NUM_CPU_TIMEOUT_SECS) {
-                    printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank,
-                           num_recv_tokens, num_rdma_recv_tokens);
-                    for (int i = 0; i < num_local_experts; ++i)
-                        printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
-                    throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
-                }
+            // Timeout check
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::high_resolution_clock::now() - start_time)
+                    .count() > NUM_CPU_TIMEOUT_SECS) {
+                printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank,
+                       num_recv_tokens, num_rdma_recv_tokens);
+                for (int i = 0; i < num_local_experts; ++i)
+                    printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
+                throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
             }
-            num_recv_tokens_per_expert_list = std::vector<int>(
-                moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
+        num_recv_tokens_per_expert_list = std::vector<int64_t>(
+            moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     }
 
     // Allocate new tensors
@@ -1306,8 +1305,8 @@ Buffer::internode_combine(
 #endif
 }
 
-void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden,
-                                      int num_experts) {
+void Buffer::clean_low_latency_buffer(int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
+                                      int64_t num_experts) {
     PRIMUS_TURBO_CHECK(false, "not support low latency");
 }
 
@@ -1316,8 +1315,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Te
 Buffer::low_latency_dispatch(const torch::Tensor &x, const torch::Tensor &topk_idx,
                              const std::optional<torch::Tensor> &cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor> &dispatch_wait_recv_cost_stats,
-                             int num_max_dispatch_tokens_per_rank, int num_experts, bool use_fp8,
-                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook) {
+                             int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+                             bool use_fp8, bool round_scale, bool use_ue8m0, bool async,
+                             bool return_recv_hook) {
     PRIMUS_TURBO_CHECK(false, "not support low latency");
     return {};
 }
@@ -1327,15 +1327,16 @@ Buffer::low_latency_combine(const torch::Tensor &x, const torch::Tensor &topk_id
                             const torch::Tensor &topk_weights, const torch::Tensor &src_info,
                             const torch::Tensor                &layout_range,
                             const std::optional<torch::Tensor> &combine_wait_recv_cost_stats,
-                            int num_max_dispatch_tokens_per_rank, int num_experts, bool use_logfmt,
-                            bool zero_copy, bool async, bool return_recv_hook,
+                            int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+                            bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor> &out) {
     PRIMUS_TURBO_CHECK(false, "not support low latency");
     return {};
 }
 
-torch::Tensor Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank,
-                                                          int hidden, int num_experts) const {
+torch::Tensor Buffer::get_next_low_latency_combine_buffer(int64_t num_max_dispatch_tokens_per_rank,
+                                                          int64_t hidden,
+                                                          int64_t num_experts) const {
 
     PRIMUS_TURBO_CHECK(false, "not support low latency");
     return {};

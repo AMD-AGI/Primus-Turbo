@@ -52,7 +52,7 @@ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
 namespace intranode {
 
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
-                     const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                     const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
                      int64_t *moe_num_recv_tokens_per_experts, int num_experts, int num_tokens,
                      const bool *is_token_in_rank, int *channel_prefix_matrix,
                      int *rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
@@ -91,7 +91,7 @@ int get_source_meta_bytes();
 
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
                      const int *num_tokens_per_rdma_rank, int *moe_recv_rdma_counter_mapped,
-                     const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                     const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
                      int64_t *moe_num_recv_tokens_per_experts, int num_experts,
                      const bool *is_token_in_rank, int num_tokens, int num_channels,
                      int hidden_int4, int num_scales, int num_topk, int expert_alignment,

@@ -9,20 +9,23 @@
 #pragma once
 
 #include "primus_turbo/common.h"
+
+#include <torch/custom_class.h>
 #include "primus_turbo/deep_ep/api.h"
 #include "primus_turbo/deep_ep/configs.h"
 
 namespace primus_turbo::deep_ep {
 
-struct Config {
-    int num_sms;
-    int num_max_nvl_chunked_send_tokens;
-    int num_max_nvl_chunked_recv_tokens;
-    int num_max_rdma_chunked_send_tokens;
-    int num_max_rdma_chunked_recv_tokens;
+struct Config : torch::CustomClassHolder {
+    int64_t num_sms;
+    int64_t num_max_nvl_chunked_send_tokens;
+    int64_t num_max_nvl_chunked_recv_tokens;
+    int64_t num_max_rdma_chunked_send_tokens;
+    int64_t num_max_rdma_chunked_recv_tokens;
 
-    Config(int num_sms, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
-           int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens)
+    Config(int64_t num_sms, int64_t num_max_nvl_chunked_send_tokens,
+           int64_t num_max_nvl_chunked_recv_tokens, int64_t num_max_rdma_chunked_send_tokens,
+           int64_t num_max_rdma_chunked_recv_tokens)
         : num_sms(num_sms), num_max_nvl_chunked_send_tokens(num_max_nvl_chunked_send_tokens),
           num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
           num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
@@ -36,7 +39,7 @@ struct Config {
 
         // Ceil up RDMA buffer size
         this->num_max_rdma_chunked_recv_tokens =
-            ALIGN<int>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
+            ALIGN<int64_t>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
         PRIMUS_TURBO_CHECK(num_max_rdma_chunked_send_tokens < num_max_rdma_chunked_recv_tokens);
         // NOTES: this assertion is related to RDMA lazy head update, we must ensure senders always
         // have space to push
@@ -44,16 +47,16 @@ struct Config {
                            num_max_rdma_chunked_recv_tokens / 2);
     }
 
-    size_t get_nvl_buffer_size_hint(size_t hidden_bytes, int num_ranks) const {
+    int64_t get_nvl_buffer_size_hint(int64_t hidden_bytes, int64_t num_ranks) const {
         // Below are some assumptions
         // TODO: add assertions
         constexpr int kNumMaxTopK   = 128;
         constexpr int kNumMaxScales = 128;
         PRIMUS_TURBO_CHECK(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
         PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS or num_sms % 2 == 0);
-        const auto num_rdma_ranks = std::max(num_ranks / NUM_MAX_NVL_PEERS, 1);
-        const auto num_nvl_ranks  = std::min(num_ranks, NUM_MAX_NVL_PEERS);
-        const int  num_channels   = num_sms / 2;
+        const auto    num_rdma_ranks = std::max<int64_t>(num_ranks / NUM_MAX_NVL_PEERS, 1);
+        const auto    num_nvl_ranks  = std::min<int64_t>(num_ranks, NUM_MAX_NVL_PEERS);
+        const int64_t num_channels   = num_sms / 2;
 
         size_t num_bytes = 0;
         num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
@@ -72,7 +75,7 @@ struct Config {
         return num_bytes;
     }
 
-    size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
+    int64_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int64_t num_ranks) const {
 #ifndef DISABLE_ROCSHMEM
         // Legacy mode
         if (num_ranks <= NUM_MAX_NVL_PEERS)
