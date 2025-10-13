@@ -37,8 +37,11 @@ def test_linear_accuracy(bs, seq_len, in_features, out_features, bias, dtype, en
 
     if enable_torch_compile:
         torch._dynamo.reset()  # Clean compile cache, avoid cache limit.
-        primus_linear = torch.compile(primus_linear, fullgraph=True, mode="max-autotune")
-        torch_linear = torch.compile(torch_linear, fullgraph=True, mode="max-autotune")
+        # NOTE: Disable max-autotune because of torch's bug on triton==3.4.0
+        # primus_linear = torch.compile(primus_linear, fullgraph=True, mode="max-autotune")
+        # torch_linear = torch.compile(torch_linear, fullgraph=True, mode="max-autotune")
+        primus_linear = torch.compile(primus_linear, fullgraph=True)
+        torch_linear = torch.compile(torch_linear, fullgraph=True)
 
     x1 = torch.randn(*bs, seq_len, in_features, device=device, dtype=dtype, requires_grad=True)
     x2 = x1.detach().clone().requires_grad_()
