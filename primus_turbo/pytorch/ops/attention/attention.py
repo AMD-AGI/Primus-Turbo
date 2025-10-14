@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional
 
 import torch
@@ -29,6 +30,14 @@ __all__ = ["flash_attn_func", "attention_fp8_blockwise"]
 
 
 class AttentionCKFunction(torch.autograd.Function):
+
+    @staticmethod
+    def _resolve_is_v3_atomic_fp32(is_v3_atomic_fp32: Optional[bool]) -> bool:
+        if is_v3_atomic_fp32 in [True, False]:
+            return is_v3_atomic_fp32
+        val = os.getenv("PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32", "1")
+        return val == "1" if val in ("0", "1") else True
+
     @staticmethod
     def forward(
         ctx,
@@ -45,9 +54,17 @@ class AttentionCKFunction(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_v3_atomic_fp32: Optional[bool] = None,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
+        # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
+        # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
+        is_v3_atomic_fp32 = AttentionCKFunction._resolve_is_v3_atomic_fp32(is_v3_atomic_fp32)
+
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        if get_device_compute_capability() >= (9, 5):
+            how_v3_bf16_cvt = 0
+
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -290,11 +307,6 @@ def flash_attn_func(
         )
 
     if backend_type == "ck":
-        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
-        how_v3_bf16_cvt = 1
-        if get_device_compute_capability() >= (9, 5):
-            how_v3_bf16_cvt = 0
-
         return AttentionCKFunction.apply(
             q,
             k,
@@ -309,8 +321,6 @@ def flash_attn_func(
             return_lse,
             return_attn_probs,
             torch.is_grad_enabled(),
-            True,
-            how_v3_bf16_cvt,
         )
     elif backend_type == "triton":
         return AttentionTritonFunction.apply(
