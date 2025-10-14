@@ -11,7 +11,7 @@
 namespace primus_turbo {
 
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num) {
-    return group_num * sizeof(ck_tile::GemmTransKernelArg);
+    return group_num * sizeof(ck_tile::GemmTransKernelArg<>);
 }
 
 std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num) {
@@ -20,7 +20,7 @@ std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num) {
 
 template <typename ADataType, typename BDataType, typename CDataType>
 __global__ void
-compute_grouped_gemm_args(ck_tile::GemmTransKernelArg *args_ptr, const ADataType *a_ptr,
+compute_grouped_gemm_args(ck_tile::GemmTransKernelArg<> *args_ptr, const ADataType *a_ptr,
                           const BDataType *b_ptr, CDataType *c_ptr, const int64_t *group_lens_ptr,
                           const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
                           const ck_tile::index_t n, const ck_tile::index_t k,
@@ -118,7 +118,7 @@ void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> 
         const int blocks  = (params.group_num + threads - 1) / threads;
         compute_grouped_gemm_args<ADataType, BDataType, CDataType>
             <<<blocks, threads, 0, params.stream>>>(
-                reinterpret_cast<ck_tile::GemmTransKernelArg *>(params.args_ptr), params.a_ptr,
+                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
                 params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
                 params.group_num, params.n, params.k, strideA, strideB, strideC, k_batch);
     }
@@ -190,7 +190,7 @@ void ck_grouped_gemm_fp8(
 
 template <typename ADataType, typename BDataType, typename CDataType>
 __global__ void compute_grouped_gemm_variable_k_args(
-    ck_tile::GemmTransKernelArg *args_ptr, const ADataType *a_ptr, const BDataType *b_ptr,
+    ck_tile::GemmTransKernelArg<> *args_ptr, const ADataType *a_ptr, const BDataType *b_ptr,
     CDataType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
     const bool transA, const bool transB, const ck_tile::index_t group_num,
     const ck_tile::index_t m, const ck_tile::index_t n, const ck_tile::index_t strideA,
@@ -283,7 +283,7 @@ void ck_grouped_gemm_variable_k(
         const int grids   = (params.group_num + threads - 1) / threads;
         compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
             <<<grids, threads, 0, params.stream>>>(
-                reinterpret_cast<ck_tile::GemmTransKernelArg *>(params.args_ptr), params.a_ptr,
+                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
                 params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
                 params.transA, params.transB, params.group_num, params.m, params.n, strideA,
                 strideB, strideC, k_batch);
