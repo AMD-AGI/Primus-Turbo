@@ -180,12 +180,14 @@ public:
         TileConfig::kPadN,
         TileConfig::kPadK,
         false,
+        false,
         ALayout,
         BLayout,
         CLayout,
         QuantMode,
         AQLayout,
         BQLayout,
+        false,
         TileConfig::DoubleSmemBuffer,
         true
     >;
