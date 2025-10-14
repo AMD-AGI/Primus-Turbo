@@ -190,12 +190,14 @@ public:
         true
     >;
 
-    using QuantGemmProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType,
-                                                                     BDataType,
-                                                                     AccDataType,
-                                                                     AccDataType,
-                                                                     GemmShape,
-                                                                     GemmUniversalTraits>;
+    using QuantGemmProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<
+        ADataType,
+        BDataType,
+        AccDataType,
+        AccDataType,
+        GemmShape,
+        GemmUniversalTraits
+    >;
 
     // V3
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;
@@ -203,14 +205,14 @@ public:
     static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<
-                                         ADataType,
-                                         BDataType,
-                                         ck_tile::tuple<>,
-                                         AccDataType,
-                                         CDataType,
-                                         ck_tile::tuple<>,
-                                         CLayout,
-                                        ck_tile::element_wise::PassThrough,
+            ADataType,
+            BDataType,
+            ck_tile::tuple<>,
+            AccDataType,
+            CDataType,
+            ck_tile::tuple<>,
+            CLayout,
+            ck_tile::element_wise::PassThrough,
             TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
             TileConfig::M_Warp, TileConfig::N_Warp,
             TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile, TileConfig::K_Warp_Tile,

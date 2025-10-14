@@ -2,7 +2,7 @@
 //
 // See LICENSE for license information.
 
-#include "../ck_grouped_gemm_kernel_template.h"
+#include "kernels/grouped_gemm/ck_grouped_gemm_kernel_template.h"
 
 namespace primus_turbo {
 // clang-format off

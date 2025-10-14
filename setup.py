@@ -316,9 +316,9 @@ def build_kernels_extension():
     kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
 
     include_dirs = [
+        Path(PROJECT_ROOT / "csrc"),
         Path(PROJECT_ROOT / "csrc" / "include"),
         Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
-        Path(PROJECT_ROOT / "csrc"),
     ]
     library_dirs = []
 
@@ -371,9 +371,9 @@ def build_torch_extension():
         name="primus_turbo.pytorch._C",
         sources=sources,
         include_dirs=[
+            Path(PROJECT_ROOT / "csrc"),
             Path(PROJECT_ROOT / "csrc" / "include"),
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
-            Path(PROJECT_ROOT / "csrc"),
         ],
         **extra_flags,
     )
@@ -403,9 +403,9 @@ def build_jax_extension():
         name="primus_turbo.jax._C",
         sources=sources,
         include_dirs=[
+            Path(PROJECT_ROOT / "csrc"),
             Path(PROJECT_ROOT / "csrc" / "include"),
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
-            Path(PROJECT_ROOT / "csrc"),
             ffi.include_dir(),
             pybind11.get_include(),
         ],
