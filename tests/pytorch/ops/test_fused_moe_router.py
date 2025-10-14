@@ -40,7 +40,7 @@ def test_moe_router(batch, config, score_function, scaling_factor):
     )
     logits_2 = logits_1.clone().detach().requires_grad_(True)
 
-    output_scores, output_probs, output_routing_map = pt.ops.fused_group_topk_routing_with_aux_score(
+    output_scores, output_probs, output_routing_map = pt.ops.moe.fused_group_topk_routing_with_aux_score(
         logits_1, config.topk, config.groups, config.selected_groups, score_function, scaling_factor
     )
 
