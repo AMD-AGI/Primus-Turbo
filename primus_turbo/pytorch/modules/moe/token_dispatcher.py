@@ -75,29 +75,29 @@ class TokenDispatcher:
         routing_map: Optional[torch.Tensor] = None,
         indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return
+        raise NotImplementedError
 
     @abstractmethod
     def _exec_dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        return
+        raise NotImplementedError
 
     @abstractmethod
     def _post_dispatch(
         self, hidden_states: torch.Tensor, probs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def _pre_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def _exec_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def _post_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pass
+        raise NotImplementedError
 
 
 class DeepEPTokenDispatcher(TokenDispatcher):
@@ -109,8 +109,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         `ep_group`: the group to use for expert parallism.
         `tp_group`: the group to use for tensor parallism.
         `tp_ep_group`: the group to use for tensor-expert parallism.
-        `router_padding_for_fp8`: Whether to pad the routing_map to make sure the number of tokens each expert received
-        `router_dtype`: Data type for routing and expert output weighted averaging
         `expert_capacity_factor`: The capacity factor for each expert, None means no token will be dropped
         `permute_fusion`: use permuate fusion kernel when permute_fusion is True
         `permute_max_token_num`: use max_token_num can elimite host sync in permute when set deepep_use_cuda_num_tokens_per_expert=True
@@ -131,8 +129,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         ep_group: dist.ProcessGroup,
         tp_group: Optional[dist.ProcessGroup] = None,
         tp_ep_group: Optional[dist.ProcessGroup] = None,
-        router_padding_for_fp8: bool = False,
-        router_dtype: Optional[str] = None,
         expert_capacity_factor: Optional[float] = None,
         permute_fusion: bool = False,
         permute_max_token_num: int = 0,
@@ -150,13 +146,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             raise ValueError(
                 "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
             )
-        if router_padding_for_fp8:
-            raise NotImplementedError("not support for now!")
 
         self.capacity_factor = expert_capacity_factor
-
-        self.router_padding_for_fp8 = router_padding_for_fp8
-        self.router_dtype = router_dtype
 
         # permute
         self.permute_fusion = permute_fusion
@@ -262,11 +253,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             self.dispatched_indices, dispatched_probs, self.num_local_experts, fused=self.permute_fusion
         )
 
-        if self.router_padding_for_fp8:
-            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
-                self.dispatched_routing_map, self.tokens_per_expert
-            )
-
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
         hidden_states, permuted_probs, self.reversed_mapping_for_combine = turbo.ops.token_permute(
@@ -276,8 +262,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             probs=dispatched_probs,
             fused=self.permute_fusion,
         )
-        if self.router_dtype == "fp64":
-            permuted_probs = permuted_probs.to(torch.float64)
         return hidden_states, self.tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):
@@ -304,29 +288,3 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     def _post_combine(self, hidden_states):
         return hidden_states.view(self.hidden_shape)
-
-    def _pad_routing_map(
-        self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Pad the routing map to the nearest multiple of the pad_multiple.
-        """
-
-        # TODO: ensure turbo fp8 alignment size for fp8 gemm
-        pad_multiple = 32
-
-        num_input_tokens = routing_map.shape[0]
-        target_tokens_per_expert = (torch.ceil(tokens_per_expert / pad_multiple) * pad_multiple).long()
-
-        # Check if there are enough tokens to pad
-        enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
-        if not enough_tokens_to_pad:
-            warnings.warn(
-                "Not enough tokens to pad. The total number of tokens received in this rank "
-                "is smaller than the target number of tokens for each expert. "
-                "Falling back to explicit padding within GroupedMLP"
-            )
-        else:
-            routing_map = turbo.ops.pad_routing_map(routing_map, pad_multiple, fused=self.permute_fusion)
-            tokens_per_expert = target_tokens_per_expert
-        return routing_map, tokens_per_expert
