@@ -19,4 +19,13 @@ at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
     return at::empty(c_shape, options);
 }
 
+at::Tensor gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
+                         const bool transA, const bool transB, at::ScalarType out_dtype,
+                         const std::string &granularity, c10::optional<int64_t> num_cu) {
+    const int64_t m = transA ? a.size(1) : a.size(0);
+    const int64_t n = transB ? b.size(0) : b.size(1);
+    at::Tensor    c = at::empty({m, n}, at::dtype(out_dtype).device(at::kMeta));
+    return c;
+}
+
 } // namespace primus_turbo::pytorch
