@@ -14,6 +14,7 @@ from primus_turbo.pytorch.ops.activation import geglu_with_probs, swiglu_with_pr
 from tests.test_utils import get_tolerances
 
 torch.manual_seed(42)
+random.seed(42)
 
 
 # NOTE: Align precision with torch.compile
@@ -26,7 +27,6 @@ def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
 
 
 def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
-    random.seed(42)
 
     if num_experts == 1:
         return [num_tokens]
