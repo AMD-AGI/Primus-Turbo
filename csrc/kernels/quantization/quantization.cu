@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/elementwise/unary_kernel_template.cuh"
+#include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
 
 namespace primus_turbo {
@@ -30,25 +31,50 @@ struct QuantTensorwiseScalePtrOp : QuantOpBase<ComputeType> {
     }
 };
 
-template <typename FType, typename QType>
+template <typename FType, typename QType, typename ComputeType>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream) {
-    using ComputeType = float;
-    ComputeType qmax  = static_cast<ComputeType>(std::numeric_limits<QType>::max());
-    ComputeType qmin  = static_cast<ComputeType>(std::numeric_limits<QType>::lowest());
-
     QuantTensorwiseScalePtrOp<ComputeType> op{
         {},
         reinterpret_cast<const ComputeType *>(scale),
         static_cast<ComputeType>(std::numeric_limits<QType>::lowest()),
         static_cast<ComputeType>(std::numeric_limits<QType>::max())};
-    // printf("quantize_tensorwise_impl: qmax=%f, qmin=%f\n", qmax, qmin);
 
     const int32_t BLOCK_SIZE = 512;
-    const int32_t GRID_SIZE  = DIVUP<int32_t>(n, BLOCK_SIZE);
 
-    unary_kernel<FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
-        <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, y, n, op);
+    int32_t pack_size = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
+    switch (pack_size) {
+    case 8: {
+        const int32_t       UNROLL = valid_pack<FType, 8>();
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
+    case 4: {
+        const int32_t       UNROLL = valid_pack<FType, 4>();
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
+    case 2: {
+        const int32_t       UNROLL = valid_pack<FType, 2>();
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
+    case 1: {
+        PackedEltwiseConfig pack_cfg(n, 1, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, 1, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
+    default:
+        PRIMUS_TURBO_ERROR("Error Pack Size");
+        break;
+    }
 }
 
 #define DECL_QUANT_TENSORWISE_INSTANCE(FType, QType)                                               \
