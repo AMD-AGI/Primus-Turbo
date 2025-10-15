@@ -10,6 +10,7 @@ import torch
 import triton
 from torch.library import custom_op, triton_op, wrap_triton
 
+from primus_turbo.pytorch.core.float8 import ScalingGranularity
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_nn_kernel,
     gemm_fp8_blockwise_nt_kernel,
@@ -241,9 +242,13 @@ def gemm_fp8_impl(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend="hipblaslt",
+    backend: str = "hipblaslt",
+    granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
+    # todo: num_cu is not supported yet
+    num_cu: int | None = None,
 ) -> torch.Tensor:
-    assert backend in ("hipblaslt")
+    assert backend in ("hipblaslt", "ck"), f"Unsupported backend: {backend}"
+    assert num_cu is None
 
     args = (
         a,
@@ -257,7 +262,9 @@ def gemm_fp8_impl(
     )
 
     if backend == "hipblaslt":
-        # TODO(ruibzhan): support more backends.
         out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(*args)
-
+    elif backend == "ck":
+        out = torch.ops.primus_turbo_cpp_extension.gemm_fp8(
+            a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name, num_cu
+        )
     return out

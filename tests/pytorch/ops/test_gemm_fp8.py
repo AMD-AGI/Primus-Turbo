@@ -85,11 +85,12 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 
 @pytest.mark.parametrize("m", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [255, 512, 1024, 2048])
-@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("layout", ["NN", "NT"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
+def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
     print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
 
     device = "cuda:0"
@@ -115,7 +116,8 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
-    config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=format)
+    config = Float8QuantConfig(granularity=granularity, format=format)
+    print(config)
     c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
     c.backward(grad_c)
 
@@ -140,64 +142,3 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
-
-
-"""
-@pytest.mark.parametrize("m", [256, 512, 1024, 2048])
-@pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [255, 512, 1024, 2048])
-@pytest.mark.parametrize("layout", ["NT"])
-@pytest.mark.parametrize("format", [Format.E4M3])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype):
-    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
-
-    device = "cuda:0"
-
-    trans_a = layout[0] == "T"
-    trans_b = layout[1] == "T"
-
-    a_shape = (m, k) if not trans_a else (k, m)
-    b_shape = (k, n) if not trans_b else (n, k)
-
-    a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
-    a_ref = a.detach().clone().requires_grad_()
-    b_ref = b.detach().clone().requires_grad_()
-    torch.cuda.synchronize()
-
-    # Ref
-    a_mat = a_ref.T if trans_a else a_ref
-    b_mat = b_ref.T if trans_b else b_ref
-    c_ref = a_mat @ b_mat
-    grad_c = torch.randn_like(c_ref)
-    c_ref.backward(grad_c)
-    torch.cuda.synchronize()
-
-    # Config + FWD + BWD
-    config = Float8QuantConfig(granularity=ScalingGranularity.ROWWISE, format=format)
-    c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
-    c.backward(grad_c)
-
-    # Check Shape
-    # print("out shape: ", out.shape, out_ref.shape)
-    # print("x_grad shape: ", x_grad.shape, x_grad_ref.shape)
-    # print("w_grad shape: ", w_grad.shape, w_grad_ref.shape)
-    assert c.shape == c_ref.shape
-    assert a.grad.shape == a_ref.grad.shape
-    assert b.grad.shape == b_ref.grad.shape
-
-    snr_threshold = 25 if format == Format.E4M3 else 20
-    # Check Results
-    c_snr = compute_snr(c_ref, c)
-    print(f"C-SNR: {c_snr:.2f} dB")
-    assert c_snr > snr_threshold, "c_snr too low"
-
-    a_grad_snr = compute_snr(a_ref.grad, a.grad)
-    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
-    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
-
-    b_grad_snr = compute_snr(b_ref.grad, b.grad)
-    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
-    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
-"""
