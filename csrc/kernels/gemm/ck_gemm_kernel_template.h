@@ -91,10 +91,12 @@ class CKQuantGemmRunnerWithArch
 
 // ***********************************************************************************
 #define DECL_CK_QGEMM_RUNNER_WITH_ARCH_EXTERN(ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode)       \
+    extern template class CKQuantGemmRunner<A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;       \
     extern template class CKQuantGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode, \
                                                     float>;
 
 #define DECL_CK_QGEMM_RUNNER_WITH_ARCH(ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode)              \
+    template class CKQuantGemmRunner<A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;              \
     template class CKQuantGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;
 
 #define APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)                          \
