@@ -5,16 +5,29 @@
 #pragma once
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/device/utils.cuh"
 #include <hip/hip_runtime.h>
 
 namespace primus_turbo {
 
-// TODO: Opt performance
-template <typename InT, typename OutT, typename Op>
-__global__ void unary_kernel(const InT *__restrict__ x, OutT *__restrict__ y, int64_t n, Op op) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        y[idx] = static_cast<OutT>(op(x[idx]));
+template <int BLOCK, int UNROLL, typename InT, typename OutT, typename Op>
+__launch_bounds__(BLOCK) __global__
+    void unary_kernel(const InT *__restrict__ x, OutT *__restrict__ y, Op op,
+                      PackedEltwiseConfig pack_cfg) {
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * BLOCK + threadIdx.x;
+
+    if (tid < pack_cfg.nPack) {
+        InT  ld_regs[UNROLL];
+        OutT st_regs[UNROLL];
+        load_data<InT, UNROLL>(x + tid * UNROLL, ld_regs);
+#pragma unroll
+        for (int i = 0; i < UNROLL; ++i) {
+            st_regs[i] = static_cast<OutT>(op(ld_regs[i]));
+        }
+        store_data<OutT, UNROLL>(y + tid * UNROLL, st_regs);
+    } else if (UNROLL > 1 && tid < pack_cfg.nThread) {
+        const int64_t idx = tid + pack_cfg.nPack * (UNROLL - 1);
+        y[idx]            = static_cast<OutT>(op(x[idx]));
     }
 }
 
