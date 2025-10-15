@@ -4,7 +4,8 @@
 
 #include "ck_tile/host/hip_check_error.hpp"
 
-#include "ck_gemm_kernel.h"
+#include "ck_gemm_kernel_instance_factory.h"
+#include "ck_gemm_kernel_template.h"
 #include "ck_tile/ops/gemm_quant.hpp"
 #include "primus_turbo/gemm.h"
 namespace primus_turbo {
@@ -74,7 +75,7 @@ void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataT
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                              BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
     } else {
-        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm only support NN and NT");
+        PRIMUS_TURBO_CHECK(false, "CK Gemm only support NN and NT");
     }
     auto args = compute_gemm_args(params, strideA, strideB, strideC, strideAQ, strideBQ);
     runner->run(stream_cfg, args, params.num_cu);
