@@ -12,7 +12,7 @@ namespace primus_turbo {
 // TODO: DeQuantize
 
 // *************** Quantize ***************
-template <typename FType, typename QType>
+template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 

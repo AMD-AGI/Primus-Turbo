@@ -3,9 +3,9 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/quantization.h"
-#include "../extensions.h"
-#include "../utils.h"
 #include "primus_turbo/reduce.h"
+#include "pytorch/extensions.h"
+#include "pytorch/utils.h"
 
 namespace primus_turbo::pytorch {
 
@@ -50,6 +50,7 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
             input_max.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
     });
 
+    // TODO: develop a cuda kernel to compute scale & scale_inv
     input_max = input_max.clamp_min(1e-12f);
     // Compute Scale
     const float fp8_max   = get_float8_max(dest_dtype);
