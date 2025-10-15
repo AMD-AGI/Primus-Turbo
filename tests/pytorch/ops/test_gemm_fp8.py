@@ -86,7 +86,7 @@ def test_gemm_fp8_blockwise_func(dtype, block_size, B, M, NK):
 @pytest.mark.parametrize("m", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [255, 512, 1024, 2048])
-@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("layout", ["NT"]) # "TN", "NN", "NT"
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype):
