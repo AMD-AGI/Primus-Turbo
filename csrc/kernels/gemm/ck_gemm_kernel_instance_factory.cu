@@ -69,7 +69,7 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile
         else if (n % 128 == 0) {
             using TileConfig = GFX950_CKGemmTileCfg_256x128x128_16x16x128_2x2x1;
             using Runner =
-                CKQuantGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
+                CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
                                   BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
             runner = std::make_unique<Runner>();
         }else {
