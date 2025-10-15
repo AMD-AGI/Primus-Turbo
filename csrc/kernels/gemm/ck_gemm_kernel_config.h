@@ -80,12 +80,16 @@ using GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKTileGemmTileCo
 
 // ****** GFX950 Tile Config Specialization ******
 // FP8
-using GFX950_CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding = CKTileGemmTileConfig<
-    GPUArch::GFX950, 128, 128, 128, 32, 32, 64, 2, 2, 1, false, true
->;
-using GFX950_CKGemmTileCfg_256x256x128_16x16x128_2x2x1 = CKTileGemmTileConfig<
+using GFX950_CKGemmTileCfg_256x256x128_16x16x128_2x2x1 = CKTileGemmTileConfigWithArch<
     GPUArch::GFX950, 256, 256, 128, 16, 16, 128, 2, 2, 1, false, false
 >;
+using GFX950_CKGemmTileCfg_256x128x128_16x16x128_2x2x1 = CKTileGemmTileConfigWithArch<
+    GPUArch::GFX950, 256, 128, 128, 16, 16, 128, 2, 2, 1, false, false
+>;
+using GFX950_CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding = CKTileGemmTileConfigWithArch<
+    GPUArch::GFX950, 128, 128, 128, 32, 32, 64, 2, 2, 1, false, true
+>;
+
 // ***********************************************
 // clang-format on
 } // namespace primus_turbo
