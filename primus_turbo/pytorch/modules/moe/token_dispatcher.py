@@ -201,7 +201,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         # Mask the indices of dropped tokens with -1
         if self.capacity_factor is not None:
-            mask = self.token_probs == 0
+            mask = token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
 
         return hidden_states, token_probs

@@ -30,6 +30,7 @@ class TokenDispatcherTestConfig:
     num_experts: int
     permute_fusion: bool
     deepep_use_cuda_num_tokens_per_expert: bool
+    expert_capacity_factor: float
 
     # DeepEPTokenDispatcher forward
     deepep_num_worst_tokens: int
@@ -45,6 +46,7 @@ def get_token_dispatcher_config():
     num_experts_list = [256]
     permute_fusion_list = [True]
     deepep_use_cuda_num_tokens_per_expert_list = [False, True]
+    expert_capacity_factor_list = [None, 0.5]
     for (
         num_tokens,
         hidden_size,
@@ -53,6 +55,7 @@ def get_token_dispatcher_config():
         num_experts,
         permute_fusion,
         deepep_use_cuda_num_tokens_per_expert,
+        expert_capacity_factor,
     ) in product(
         num_tokens_list,
         hidden_size_list,
@@ -61,6 +64,7 @@ def get_token_dispatcher_config():
         num_experts_list,
         permute_fusion_list,
         deepep_use_cuda_num_tokens_per_expert_list,
+        expert_capacity_factor_list,
     ):
         deepep_num_worst_tokens_list = [0, num_tokens * 8]
         permute_max_token_num_list = [0, num_tokens * 8 * router_topk]
@@ -80,6 +84,7 @@ def get_token_dispatcher_config():
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 permute_fusion=permute_fusion,
                 deepep_num_worst_tokens=deepep_num_worst_tokens,
+                expert_capacity_factor=expert_capacity_factor,
                 permute_max_token_num=permute_max_token_num,
             )
 
@@ -122,6 +127,7 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                 deepep_use_cuda_num_tokens_per_expert=cfg.deepep_use_cuda_num_tokens_per_expert,
                 deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
                 permute_max_token_num=cfg.permute_max_token_num,
+                expert_capacity_factor=cfg.expert_capacity_factor,
             )
 
             hidden_states = torch.randn((cfg.num_tokens, cfg.hidden_size), dtype=cfg.dtype, device="cuda")

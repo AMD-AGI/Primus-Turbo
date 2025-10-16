@@ -9,9 +9,12 @@ import random
 import pytest
 import torch
 
-from primus_turbo.pytorch.ops.tokens_per_expert_to_mask import tokens_per_expert_to_mask
+from primus_turbo.pytorch.ops.moe.tokens_per_expert_to_mask import (
+    tokens_per_expert_to_mask,
+)
 
 torch.manual_seed(42)
+random.seed(42)
 
 
 def tokens_per_expert_to_mask_ref(tokens_per_expert, num_tokens):
@@ -24,8 +27,6 @@ def tokens_per_expert_to_mask_ref(tokens_per_expert, num_tokens):
 
 
 def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
-    random.seed(42)
-
     if num_experts == 1:
         return [num_tokens]
 
