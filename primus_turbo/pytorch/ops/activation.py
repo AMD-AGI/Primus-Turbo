@@ -25,9 +25,13 @@ class GLUWithProbs(torch.autograd.Function):
     def forward(
         ctx, x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None], act_type: str
     ):
+        x_origin_shape = x.size()
+        probs_origin_shape = probs.size()
+
+        x = x.view(-1, x.size(-1))
+        probs = probs.view(-1)
+
         assert x.size(0) == probs.size(0), "first dimension of x and probs must be the same"
-        assert x.ndim == 2, "x must be 2D tensor"
-        assert probs.ndim == 1, "probs must be 1D tensor"
         assert probs.dtype == torch.float32, "probs must be float32"
 
         SUPPORTED_ACT_TYPES = ["silu", "gelu"]
@@ -48,6 +52,8 @@ class GLUWithProbs(torch.autograd.Function):
 
         ctx.save_for_backward(x, probs, row_mask)
         ctx.act_type = act_type
+        ctx.x_origin_shape = x_origin_shape
+        ctx.probs_origin_shape = probs_origin_shape
 
         return out
 
@@ -62,7 +68,7 @@ class GLUWithProbs(torch.autograd.Function):
         elif ctx.act_type == "gelu":
             grad_x, grad_probs = geglu_bwd_with_probs(grad_output, x, probs, row_mask)
 
-        return grad_x, grad_probs, None, None
+        return grad_x.view(ctx.x_origin_shape), grad_probs.view(ctx.probs_origin_shape), None, None
 
 
 def swiglu_with_probs(

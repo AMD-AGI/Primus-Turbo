@@ -9,7 +9,9 @@ import random
 import pytest
 import torch
 
-from primus_turbo.pytorch.ops.tokens_per_expert_to_mask import tokens_per_expert_to_mask
+from primus_turbo.pytorch.ops.moe.tokens_per_expert_to_mask import (
+    tokens_per_expert_to_mask,
+)
 
 torch.manual_seed(42)
 random.seed(42)
