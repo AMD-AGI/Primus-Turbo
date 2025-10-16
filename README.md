@@ -40,7 +40,10 @@ Note: JAX and Optim support are planned but not yet available.
 ### 2. Docker (Recommended)
 Use the pre-built AMD ROCm image:
 ```
-rocm/megatron-lm:v25.7_py310
+# For GFX942
+rocm/primus:v25.9_gfx942
+# For GFX950
+rocm/primus:v25.9_gfx950
 ```
 
 ### 3. Install from Source
@@ -63,6 +66,9 @@ GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
 ```
 pip3 install -r requirements.txt
 pip3 install --no-build-isolation -e . -v
+
+# Set GPU_ARCHS to compile Turbo for multiple AMD GPU architectures.
+GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
 ```
 
 ### 4. Build & Deploy Wheel

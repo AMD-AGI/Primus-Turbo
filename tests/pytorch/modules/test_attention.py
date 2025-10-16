@@ -78,9 +78,7 @@ def test_attention_fp16(batch, seq, config, causal, backend_type, enable_torch_c
     attention_ref = TurboAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
         torch._dynamo.reset()
-        # NOTE: Disable max-autotune because of torch's bug on triton==3.4.0
-        # primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
-        primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True)
+        primus_attention_ck = torch.compile(primus_attention_ck, fullgraph=True, mode="max-autotune")
     torch.cuda.synchronize()
 
     # Test
@@ -147,9 +145,7 @@ def test_attention_fp8(batch, config, causal, backend_type, enable_torch_compile
     attention_ref = TurboAttentionRef(softmax_scale=sm_scale, causal=causal)
     if enable_torch_compile:
         torch._dynamo.reset()
-        # NOTE: Disable max-autotune because of torch's bug on triton==3.4.0
-        # primus_attention_triton = torch.compile(primus_attention_triton, fullgraph=True, mode="max-autotune")
-        primus_attention_triton = torch.compile(primus_attention_triton, fullgraph=True)
+        primus_attention_triton = torch.compile(primus_attention_triton, fullgraph=True, mode="max-autotune")
     torch.cuda.synchronize()
 
     # Test
