@@ -24,7 +24,7 @@ from tests.test_utils import get_tolerances
 def manual_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    random.seed = seed
+    random.seed(seed)
 
 
 def _test_permutation_mask_map(
