@@ -20,6 +20,9 @@ from tests.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize(
     "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
 )
+# @pytest.mark.parametrize(
+#     "N_K", [(3072, 5120)]
+# )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
@@ -35,8 +38,11 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
-    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    a = torch.randn((B * M, K), dtype=torch.float32, device=device)
+    b = torch.randn(b_shape, dtype=torch.float32, device=device)
+    a = a.to(dtype).requires_grad_(True)
+    b = b.to(dtype).requires_grad_(True)
+
     a_ref = a.detach().clone().requires_grad_(True)
     b_ref = b.detach().clone().requires_grad_(True)
 
@@ -63,3 +69,6 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     assert b_grad_snr > 20, "b_grad_snr too low"
     torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
+
+if __name__ == "__main__":
+    test_grouped_gemm_func(16, 2048, (3072, 5120), torch.bfloat16, True, True, 32)
