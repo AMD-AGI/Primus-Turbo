@@ -92,6 +92,7 @@ jobs:
             echo "UT_LOG_PATH dir exists. Deleting..."
             rm -rf "${{ env.UT_LOG_PATH }}"
           fi
+          unset AITER_ASM_DIR
           pip3 install -r requirements.txt
-          pip3 install -e .
+          GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
           pytest -v tests/pytorch --log-cli-level=INFO
