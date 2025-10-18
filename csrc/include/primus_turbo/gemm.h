@@ -3,11 +3,11 @@
 // See LICENSE for license information.
 
 #pragma once
+#include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <stdexcept>
-
 namespace primus_turbo {
 
 // *************** HipBlasLt ***************
@@ -22,6 +22,26 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
 // *****************************************
 
-// TODO: CK
+template <typename AType, typename BType, typename CType, typename ACCType> struct CKGemmFP8Params {
+    const AType   *a_ptr  = nullptr;
+    const BType   *b_ptr  = nullptr;
+    CType         *c_ptr  = nullptr;
+    const ACCType *aq_ptr = nullptr;
+    const ACCType *bq_ptr = nullptr;
+
+    bool transA = false;
+    bool transB = false;
+
+    int32_t m = 0;
+    int32_t n = 0;
+    int32_t k = 0;
+
+    hipStream_t stream = nullptr;
+    uint32_t    num_cu = 0;
+};
+
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
+          ck_tile::QuantType QuantMode>
+void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
 
 } // namespace primus_turbo

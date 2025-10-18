@@ -35,8 +35,11 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
-    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    a = torch.randn((B * M, K), dtype=torch.float32, device=device)
+    b = torch.randn(b_shape, dtype=torch.float32, device=device)
+    a = a.to(dtype).requires_grad_(True)
+    b = b.to(dtype).requires_grad_(True)
+
     a_ref = a.detach().clone().requires_grad_(True)
     b_ref = b.detach().clone().requires_grad_(True)
 
