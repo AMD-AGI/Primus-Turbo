@@ -20,9 +20,6 @@ from tests.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize(
     "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
 )
-# @pytest.mark.parametrize(
-#     "N_K", [(3072, 5120)]
-# )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
