@@ -9,7 +9,9 @@
 
 namespace primus_turbo {
 
-// TODO: DeQuantize
+template <typename T>
+void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
+                             hipStream_t stream, const float eps = 1e-12);
 
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>

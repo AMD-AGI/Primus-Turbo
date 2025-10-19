@@ -21,14 +21,31 @@ from tests.pytorch.test_utils import get_tolerances
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
-def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel):
+@pytest.mark.parametrize("dynamic_quantize", [True, False])
+@pytest.mark.parametrize("torch_compile", [True, False])
+def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, dynamic_quantize, torch_compile):
+    torch._dynamo.reset()
     torch.manual_seed(42)
 
     x = torch.rand(numel, device="cuda", dtype=orig_dtype)
     x_ref = x.detach().clone()
+    x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_tensorwise_ref(x_ref, dest_dtype)
 
-    x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=ScalingGranularity.TENSORWISE)
-    x_fp8_ref, x_scale_inv_ref = quantize_fp8_tensorwise_ref(x_ref, dest_dtype)
+    scale = None
+    if dynamic_quantize == False:
+        scale = x_scale_ref.detach().clone()
+
+    if torch_compile is True:
+        compiled_func = torch.compile(
+            lambda t: quantize_fp8(t, dest_dtype, granularity=ScalingGranularity.TENSORWISE, scale=scale),
+            fullgraph=True,
+            mode="max-autotune",
+        )
+        x_fp8, x_scale_inv = compiled_func(x)
+    else:
+        x_fp8, x_scale_inv = quantize_fp8(
+            x, dest_dtype, granularity=ScalingGranularity.TENSORWISE, scale=scale
+        )
 
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(

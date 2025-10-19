@@ -21,7 +21,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");
     m.def("fp8_dequantize(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> Tensor");
 
-    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype) -> Tensor[]");
+    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
+          "Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis) -> Tensor[]");
 
     // ********* RMSNorm *********
