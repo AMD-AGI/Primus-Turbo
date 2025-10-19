@@ -2,6 +2,7 @@
 //
 // See LICENSE for license information.
 
+#include "primus_turbo/common.h"
 #include "primus_turbo/elementwise/unary_kernel_template.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
@@ -30,6 +31,29 @@ struct QuantTensorwiseScalePtrOp : QuantOpBase<ComputeType> {
         return QuantOpBase<ComputeType>::quant(x, scale, clip_min, clip_max);
     }
 };
+
+template <typename T>
+__global__ void compute_scale_from_amax_kernel(const T *amax_ptr, const T q_max, T *scale_ptr,
+                                               T *scale_inv_ptr, const int64_t n, const float eps) {
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        float amax         = static_cast<float>(amax_ptr[tid]);
+        amax               = fmax(amax, eps);
+        float scale        = static_cast<float>(q_max) / amax;
+        float scale_inv    = 1.0f / scale;
+        scale_ptr[tid]     = static_cast<T>(scale);
+        scale_inv_ptr[tid] = static_cast<T>(scale_inv);
+    }
+}
+
+template <typename T>
+void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
+                             hipStream_t stream, const float eps) {
+    const int64_t BLOCK_SIZE = 512;
+    const int64_t GRID_SIZE  = DIVUP<int64_t>(n, BLOCK_SIZE);
+    compute_scale_from_amax_kernel<T>
+        <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(amax, q_max, scale, scale_inv, n, eps);
+}
 
 template <typename FType, typename QType, typename ComputeType>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
@@ -76,6 +100,10 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
         break;
     }
 }
+
+template void compute_scale_from_amax<float>(const float *amax, float q_max, float *scale,
+                                             float *scale_inv, const int64_t n, hipStream_t stream,
+                                             const float eps);
 
 #define DECL_QUANT_TENSORWISE_INSTANCE(FType, QType)                                               \
     template void quantize_tensorwise_impl<FType, QType>(                                          \
