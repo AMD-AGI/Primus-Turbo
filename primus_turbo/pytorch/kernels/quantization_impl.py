@@ -27,5 +27,5 @@ def quantize_fp8_rowwise_impl(
     """
     if not x.is_contiguous():
         x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, dtype, axis)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, dtype, axis, scale)
     return x_fp8, scale_inv

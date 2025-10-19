@@ -33,4 +33,4 @@ def quantize_fp8_rowwise_ref(x, dtype, axis, EPS=1e-12):
     # Quantize
     x_scaled = x * scale
     x_clamped = torch.clamp(x_scaled, -fp8_max, fp8_max)
-    return x_clamped.to(dtype), scale_inv.to(torch.float32)
+    return x_clamped.to(dtype), scale.to(torch.float32), scale_inv.to(torch.float32)

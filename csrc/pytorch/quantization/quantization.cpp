@@ -82,23 +82,34 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
 }
 
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
-                                             const at::ScalarType dest_dtype, const int64_t axis) {
+                                             const at::ScalarType dest_dtype, const int64_t axis,
+                                             c10::optional<at::Tensor> scale_opt) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
 
-    const float fp8_max = get_float8_max(dest_dtype);
-
     const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
     PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
 
-    // TODO: Opt Reduce
-    // ReduceMax
-    auto x_max = input.abs().amax(valid_axis, true).to(at::kFloat);
-    x_max      = at::clamp(x_max, 1e-8f, std::numeric_limits<float>::infinity());
-    // Compute Scale
-    auto scale     = fp8_max / x_max;
-    auto scale_inv = 1.0f / scale;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    std::vector<int64_t> input_shape(input.sizes().begin(), input.sizes().end());
+    input_shape[valid_axis] = 1;
+    auto scale              = at::empty(input_shape, input.options().dtype(at::kFloat));
+    auto scale_inv          = at::empty(input_shape, input.options().dtype(at::kFloat));
+
+    const float fp8_max = get_float8_max(dest_dtype);
+    if (scale_opt.has_value()) {
+        scale     = scale_opt.value();
+        scale_inv = 1.0f / scale;
+    } else {
+        // TODO: Opt Reduce
+        auto amax = input.abs().amax(valid_axis, true).to(at::kFloat);
+        compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
+                                       reinterpret_cast<float *>(scale.data_ptr()),
+                                       reinterpret_cast<float *>(scale_inv.data_ptr()),
+                                       amax.numel(), stream);
+    }
 
     // TODO: Opt Quantize
     auto x_scaled  = input * scale;

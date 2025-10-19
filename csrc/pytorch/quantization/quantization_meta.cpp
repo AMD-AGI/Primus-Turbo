@@ -14,9 +14,10 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
     return {input_fp8, scale_inv};
 }
 
-std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor     input,
-                                                  const at::ScalarType dest_dtype,
-                                                  const int64_t        axis) {
+std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
+                                                  const at::ScalarType      dest_dtype,
+                                                  const int64_t             axis,
+                                                  c10::optional<at::Tensor> scale_opt) {
     const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
     PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
     auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));

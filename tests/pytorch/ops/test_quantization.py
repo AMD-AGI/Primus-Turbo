@@ -61,16 +61,23 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, dynamic_quantize
 @pytest.mark.parametrize("B", [4])
 @pytest.mark.parametrize("M", [1, 7168])
 @pytest.mark.parametrize("N", [4096])
-def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N):
+@pytest.mark.parametrize("dynamic_quantize", [True, False])
+def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N, dynamic_quantize):
     # print("\n", orig_dtype, dest_dtype, axis, B, M, N)
 
     torch.manual_seed(42)
 
     x = torch.rand((B, M, N), device="cuda", dtype=orig_dtype)
     x_ref = x.detach().clone()
+    x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_rowwise_ref(x_ref, dest_dtype, axis)
 
-    x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=ScalingGranularity.ROWWISE, axis=axis)
-    x_fp8_ref, x_scale_inv_ref = quantize_fp8_rowwise_ref(x_ref, dest_dtype, axis)
+    scale = None
+    if dynamic_quantize == False:
+        scale = x_scale_ref.detach().clone()
+
+    x_fp8, x_scale_inv = quantize_fp8(
+        x, dest_dtype, granularity=ScalingGranularity.ROWWISE, axis=axis, scale=scale
+    )
 
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(

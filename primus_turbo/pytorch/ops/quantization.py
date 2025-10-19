@@ -19,8 +19,9 @@ __all__ = ["quantize_fp8"]
 
 def quantize_fp8(
     x: torch.Tensor,
-    dtype: torch.dtype,
+    out_dtype: torch.dtype,
     granularity: ScalingGranularity,
+    *,
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -28,13 +29,24 @@ def quantize_fp8(
     FP8 Quantize
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_impl(x, dtype, scale)
+        return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
     elif granularity == ScalingGranularity.ROWWISE:
         if axis is None:
             raise ValueError("axis must be specified for rowwise FP8 quantization")
-        return quantize_fp8_rowwise_impl(x, dtype, axis, scale)
+        return quantize_fp8_rowwise_impl(x, out_dtype, axis, scale)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def dequantize_fp8(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    *,
+    axis: Optional[int] = None,
+    scale_inv: torch.Tensor,
+):
+    pass
 
 
 """

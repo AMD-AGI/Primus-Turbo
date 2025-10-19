@@ -46,11 +46,13 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      c10::optional<at::Tensor> scale_opt);
 
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
-                                             const at::ScalarType dest_dtype, const int64_t axis);
+                                             const at::ScalarType dest_dtype, const int64_t axis,
+                                             c10::optional<at::Tensor> scale_opt);
 
-std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor     input,
-                                                  const at::ScalarType dest_dtype,
-                                                  const int64_t        axis);
+std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
+                                                  const at::ScalarType      dest_dtype,
+                                                  const int64_t             axis,
+                                                  c10::optional<at::Tensor> scale_opt);
 
 /* GEMM */
 
