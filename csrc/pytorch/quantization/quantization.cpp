@@ -90,32 +90,66 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
 
     const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
     PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
-
-    auto stream = at::cuda::getCurrentCUDAStream();
+    const bool is_row_major = valid_axis == (input.dim() - 1);
 
     std::vector<int64_t> scale_shape(input.sizes().begin(), input.sizes().end());
     scale_shape[valid_axis] = 1;
     auto scale              = at::empty(scale_shape, input.options().dtype(at::kFloat));
     auto scale_inv          = at::empty(scale_shape, input.options().dtype(at::kFloat));
+    auto output             = at::empty_like(input, input.options().dtype(dest_dtype));
 
+    auto        stream  = at::cuda::getCurrentCUDAStream();
     const float fp8_max = get_float8_max(dest_dtype);
     if (scale_opt.has_value()) {
+        PRIMUS_TURBO_CHECK(scale_opt.value().sizes() == at::IntArrayRef(scale_shape));
+
         scale     = scale_opt.value();
         scale_inv = 1.0f / scale;
-    } else {
-        // TODO: Opt Reduce
-        auto amax = input.abs().amax(valid_axis, true).to(at::kFloat);
-        compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
-                                       reinterpret_cast<float *>(scale.data_ptr()),
-                                       reinterpret_cast<float *>(scale_inv.data_ptr()),
-                                       amax.numel(), stream);
-    }
 
-    // TODO: Opt Quantize
-    auto x_scaled  = input * scale;
-    auto x_clamped = at::clamp(x_scaled, -fp8_max, fp8_max);
-    auto x_fp8     = x_clamped.to(dest_dtype);
-    return {x_fp8, scale_inv};
+        if (is_row_major) {
+            const int64_t inner_len = input.sizes()[valid_axis];
+            const int64_t outer_len = input.numel() / inner_len;
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_row_major_impl<FType, QType, float, true>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), outer_len, inner_len, stream);
+                });
+            });
+        } else {
+            // TODO: reduce-col + binary kernel
+            auto output_scaled  = input * scale;
+            auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
+            output              = output_clamped.to(dest_dtype);
+        }
+    } else {
+        if (is_row_major) {
+            const int64_t inner_len = input.sizes()[valid_axis];
+            const int64_t outer_len = input.numel() / inner_len;
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_row_major_impl<FType, QType, float, false>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), outer_len, inner_len, stream);
+                });
+            });
+        } else {
+            // TODO: reduce-col + binary kernel
+            auto amax = input.abs().amax(valid_axis, true).to(at::kFloat);
+            compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()),
+                                           fp8_max, reinterpret_cast<float *>(scale.data_ptr()),
+                                           reinterpret_cast<float *>(scale_inv.data_ptr()),
+                                           amax.numel(), stream);
+            auto output_scaled  = input * scale;
+            auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
+            output              = output_clamped.to(dest_dtype);
+        }
+    }
+    return {output, scale_inv};
 }
 
 // De-Quantize
