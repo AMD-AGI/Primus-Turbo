@@ -18,6 +18,18 @@ template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 
+template <typename FType, typename QType, typename ComputeType = float,
+          bool PreComputeScale = false>
+void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const int64_t outer_len, const int64_t inner_len,
+                                     hipStream_t stream);
+
+// template <typename FType, typename QType, typename ComputeType = float, bool PreComputeScale =
+// false> void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType
+// *y,
+//                                      const int64_t outer_len, const int64_t inner_len,
+//                                      hipStream_t stream);
+
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,

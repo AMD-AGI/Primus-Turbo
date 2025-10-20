@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/elementwise/unary_kernel_template.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
@@ -40,6 +41,13 @@ template <typename ComputeType = float> struct DeQuantTensorwiseScaleInvPtrOp {
         return x * scale_inv;
     }
 };
+
+template <typename T = float>
+PRIMUS_TURBO_DEVICE T compute_scale_from_amax_device_kernel(const T amax, const T q_max,
+                                                            const float eps) {
+    float amax_t = fmax(static_cast<float>(amax), eps);
+    return static_cast<T>(static_cast<float>(q_max) / amax_t);
+}
 
 template <typename T>
 __global__ void compute_scale_from_amax_kernel(const T *amax_ptr, const T q_max, T *scale_ptr,
@@ -153,7 +161,7 @@ void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y
     }
 }
 
-// ****  ****
+// **** Explicit Instantiation ****
 template void compute_scale_from_amax<float>(const float *amax, float q_max, float *scale,
                                              float *scale_inv, const int64_t n, hipStream_t stream,
                                              const float eps);
@@ -172,5 +180,174 @@ DECL_QUANT_ADN_DEQUANT_TENSORWISE_INSTANCE(dtype::float32, dtype::float8_e4m3)
 DECL_QUANT_ADN_DEQUANT_TENSORWISE_INSTANCE(dtype::float32, dtype::float8_e5m2)
 
 #undef DECL_QUANT_ADN_DEQUANT_TENSORWISE_INSTANCE
+
+// ******************************************************************
+// ******************************************************************
+// ******************************************************************
+
+template <typename T>
+int32_t get_quantize_rowwise_pack_size(const int32_t pack_size, const int64_t inner_len) {
+    PRIMUS_TURBO_CHECK(pack_size == 8 || pack_size == 4 || pack_size == 2 || pack_size == 1);
+    PRIMUS_TURBO_CHECK(inner_len > 0);
+
+    int32_t u = 1;
+    if (pack_size == 8) {
+        u = valid_pack<T, 8>();
+    } else if (pack_size == 4) {
+        u = valid_pack<T, 4>();
+    } else if (pack_size == 2) {
+        u = valid_pack<T, 2>();
+    } else {
+        u = 1;
+    }
+
+    while (u > 1 && (inner_len % u) != 0) {
+        u >>= 1;
+    }
+    return u;
+}
+
+template <int BLOCK_SIZE, int UNROLL, bool PreComputeScale, typename FType, typename QType,
+          typename ComputeType = float>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void quantize_rowwise_row_major_two_scan_kernel(const FType *__restrict__ input_ptr,
+                                                    float *__restrict__ scale_ptr,
+                                                    float *__restrict__ scale_inv_ptr,
+                                                    QType *__restrict__ output_ptr,
+                                                    const int64_t inner_len) {
+    const int64_t bid     = blockIdx.x;
+    const int32_t warp_id = threadIdx.x / BLOCK_SIZE;
+    const int32_t lane_id = threadIdx.x % BLOCK_SIZE;
+
+    const ComputeType CLIP_MIN = static_cast<ComputeType>(std::numeric_limits<QType>::lowest());
+    const ComputeType CLIP_MAX = static_cast<ComputeType>(std::numeric_limits<QType>::max());
+    const ComputeType EPS      = 1e-12;
+
+    const int32_t start_offset = warp_id * BLOCK_SIZE * UNROLL + lane_id * UNROLL;
+
+    input_ptr += bid * inner_len;
+    output_ptr += bid * inner_len;
+
+    FType ld_regs[UNROLL];
+#pragma unroll
+    for (int32_t i = 0; i < UNROLL; ++i) {
+        ld_regs[i] = static_cast<FType>(0.0f);
+    }
+
+    // scale & scale_inv
+    ComputeType scale;
+    ComputeType scale_inv;
+    if (PreComputeScale == true) {
+        scale     = static_cast<ComputeType>(scale_ptr[bid]);
+        scale_inv = static_cast<ComputeType>(scale_inv_ptr[bid]);
+    } else {
+        // amax
+        ComputeType amax_regs[UNROLL];
+#pragma unroll
+        for (int32_t i = 0; i < UNROLL; ++i) {
+            amax_regs[i] = AbsMaxOp<ComputeType>::init();
+        }
+
+        for (int64_t offset = start_offset; offset < inner_len; offset += (BLOCK_SIZE * UNROLL)) {
+            load_data<FType, UNROLL>(input_ptr + offset, ld_regs);
+#pragma unroll
+            for (int32_t i = 0; i < UNROLL; ++i) {
+                amax_regs[i] =
+                    AbsMaxOp<ComputeType>::op(amax_regs[i], static_cast<ComputeType>(ld_regs[i]));
+            }
+        }
+
+        ComputeType amax = AbsMaxOp<ComputeType>::init();
+#pragma unroll
+        for (int32_t i = 0; i < UNROLL; ++i) {
+            amax = AbsMaxOp<ComputeType>::op(amax, amax_regs[i]);
+        }
+        amax = BlockReduce<AbsMaxOp, ComputeType>(amax);
+
+        // scale
+        scale     = compute_scale_from_amax_device_kernel<ComputeType>(amax, CLIP_MAX, EPS);
+        scale_inv = 1.0f / scale;
+    }
+
+    // quantize
+    QType st_regs[UNROLL];
+    for (int64_t offset = start_offset; offset < inner_len; offset += (BLOCK_SIZE * UNROLL)) {
+        load_data<FType, UNROLL>(input_ptr + offset, ld_regs);
+#pragma unroll
+        for (int i = 0; i < UNROLL; ++i) {
+            st_regs[i] = static_cast<QType>(
+                QuantOpBase<ComputeType>::quant(ld_regs[i], scale, CLIP_MIN, CLIP_MAX));
+        }
+        store_data<QType, UNROLL>(output_ptr + offset, st_regs);
+    }
+
+    if (PreComputeScale == false && threadIdx.x == 0) {
+        scale_ptr[bid]     = static_cast<float>(scale);
+        scale_inv_ptr[bid] = static_cast<float>(scale_inv);
+    }
+}
+
+// Rowwise
+template <typename FType, typename QType, typename ComputeType, bool PreComputeScale>
+void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const int64_t outer_len, const int64_t inner_len,
+                                     hipStream_t stream) {
+
+    const int32_t BLOCK_SIZE = 512;
+    const int32_t GRID_SIZE  = outer_len;
+    int32_t       pack_size  = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
+    pack_size                = get_quantize_rowwise_pack_size<FType>(pack_size, inner_len);
+
+    switch (pack_size) {
+    case 8: {
+        const int32_t UNROLL = valid_pack<FType, 8>();
+        quantize_rowwise_row_major_two_scan_kernel<BLOCK_SIZE, UNROLL, PreComputeScale, FType,
+                                                   QType, ComputeType>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        break;
+    }
+    case 4: {
+        const int32_t UNROLL = valid_pack<FType, 4>();
+        quantize_rowwise_row_major_two_scan_kernel<BLOCK_SIZE, UNROLL, PreComputeScale, FType,
+                                                   QType, ComputeType>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        break;
+    }
+    case 2: {
+        const int32_t UNROLL = valid_pack<FType, 2>();
+        quantize_rowwise_row_major_two_scan_kernel<BLOCK_SIZE, UNROLL, PreComputeScale, FType,
+                                                   QType, ComputeType>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        break;
+    }
+    case 1: {
+        const int32_t UNROLL = 1;
+        quantize_rowwise_row_major_two_scan_kernel<BLOCK_SIZE, UNROLL, PreComputeScale, FType,
+                                                   QType, ComputeType>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        break;
+    }
+    default:
+        PRIMUS_TURBO_ERROR("Error Pack Size");
+        break;
+    }
+}
+
+#define DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(FType, QType)                                      \
+    template void quantize_rowwise_row_major_impl<FType, QType, float, true>(                      \
+        const FType *x, float *scale, float *scale_inv, QType *y, const int64_t outer_len,         \
+        const int64_t inner_len, hipStream_t stream);                                              \
+    template void quantize_rowwise_row_major_impl<FType, QType, float, false>(                     \
+        const FType *x, float *scale, float *scale_inv, QType *y, const int64_t outer_len,         \
+        const int64_t inner_len, hipStream_t stream);
+
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float16, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float16, dtype::float8_e5m2)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::bfloat16, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float32, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float32, dtype::float8_e5m2)
+
+#undef DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE
 
 } // namespace primus_turbo
