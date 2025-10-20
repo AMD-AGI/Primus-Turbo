@@ -69,12 +69,12 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
 
     // Quantize
     at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
-    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InType, {
-        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), OutType, {
-            quantize_tensorwise_impl<InType, OutType>(
-                reinterpret_cast<const InType *>(input.data_ptr()),
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale.data_ptr()),
-                reinterpret_cast<OutType *>(output.data_ptr()), input.numel(), stream);
+                reinterpret_cast<QType *>(output.data_ptr()), input.numel(), stream);
         });
     });
 
@@ -93,10 +93,10 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    std::vector<int64_t> input_shape(input.sizes().begin(), input.sizes().end());
-    input_shape[valid_axis] = 1;
-    auto scale              = at::empty(input_shape, input.options().dtype(at::kFloat));
-    auto scale_inv          = at::empty(input_shape, input.options().dtype(at::kFloat));
+    std::vector<int64_t> scale_shape(input.sizes().begin(), input.sizes().end());
+    scale_shape[valid_axis] = 1;
+    auto scale              = at::empty(scale_shape, input.options().dtype(at::kFloat));
+    auto scale_inv          = at::empty(scale_shape, input.options().dtype(at::kFloat));
 
     const float fp8_max = get_float8_max(dest_dtype);
     if (scale_opt.has_value()) {
@@ -116,6 +116,28 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
     auto x_clamped = at::clamp(x_scaled, -fp8_max, fp8_max);
     auto x_fp8     = x_clamped.to(dest_dtype);
     return {x_fp8, scale_inv};
+}
+
+// De-Quantize
+at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                     const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                       dest_dtype == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()));
+    PRIMUS_TURBO_CHECK(scale_inv.numel() == 1, "tensorwise scale_inv must be scalar tensor");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            dequantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                reinterpret_cast<FType *>(output.data_ptr()), input.numel(), stream);
+        });
+    });
+
+    return output;
 }
 
 } // namespace primus_turbo::pytorch
