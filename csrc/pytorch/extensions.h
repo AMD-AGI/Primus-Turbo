@@ -22,21 +22,7 @@
 
 namespace primus_turbo::pytorch {
 
-/* Quantize */
-
-at::Tensor fp8_quantize(const at::Tensor input, const at::Tensor scale,
-                        const at::ScalarType dest_dtype);
-
-at::Tensor fp8_quantize_meta(const at::Tensor input, const at::Tensor scale,
-                             const at::ScalarType dest_dtype);
-
-at::Tensor fp8_dequantize(const at::Tensor input, const at::Tensor scale_inv,
-                          const at::ScalarType dest_dtype);
-
-at::Tensor fp8_dequantize_meta(const at::Tensor input, const at::Tensor scale_inv,
-                               const at::ScalarType dest_dtype);
-
-/* New Quantization */
+/* Quantization */
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
                                                 c10::optional<at::Tensor> scale_opt);
