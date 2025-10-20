@@ -23,7 +23,7 @@ using ColMajor = ck_tile::tensor_layout::gemm::ColumnMajor;
 
 template <typename Kernel>
 inline void _launch_ck_gemm_kernel(const ck_tile::stream_config &stream_cfg,
-                                   ck_tile::QuantGemmKernelArgs &kargs, uint32_t num_cu) {
+                                   ck_tile::QuantGemmKernelArgs &kargs) {
     constexpr int kBlockPerCu = 1;
     const dim3    blocks      = Kernel::BlockSize();
     dim3          grids       = Kernel::GridSize(kargs.M, kargs.N, kargs.k_batch);
@@ -33,9 +33,9 @@ inline void _launch_ck_gemm_kernel(const ck_tile::stream_config &stream_cfg,
 
 class CKGemmRunnerInterFace {
 public:
-    virtual ~CKGemmRunnerInterFace()  = default;
-    virtual void run(const ck_tile::stream_config &stream_cfg, ck_tile::QuantGemmKernelArgs &kargs,
-                     uint32_t num_cu) = 0;
+    virtual ~CKGemmRunnerInterFace()                      = default;
+    virtual void run(const ck_tile::stream_config &stream_cfg,
+                     ck_tile::QuantGemmKernelArgs &kargs) = 0;
 };
 
 template <typename ADataType, typename BDataType, typename CDataType, typename ALayout,
@@ -74,9 +74,9 @@ public:
     using Kernel = ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
 
 public:
-    void run(const ck_tile::stream_config &stream_cfg, ck_tile::QuantGemmKernelArgs &kargs,
-             uint32_t num_cu) override {
-        _launch_ck_gemm_kernel<Kernel>(stream_cfg, kargs, num_cu);
+    void run(const ck_tile::stream_config &stream_cfg,
+             ck_tile::QuantGemmKernelArgs &kargs) override {
+        _launch_ck_gemm_kernel<Kernel>(stream_cfg, kargs);
     }
 };
 

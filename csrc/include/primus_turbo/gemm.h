@@ -22,7 +22,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
 // *****************************************
 
-template <typename AType, typename BType, typename CType, typename ACCType> struct CKGemmFP8Params {
+template <typename AType, typename BType, typename CType, typename ACCType = float>
+struct CKGemmFP8Params {
     const AType   *a_ptr  = nullptr;
     const BType   *b_ptr  = nullptr;
     CType         *c_ptr  = nullptr;
@@ -37,7 +38,6 @@ template <typename AType, typename BType, typename CType, typename ACCType> stru
     int32_t k = 0;
 
     hipStream_t stream = nullptr;
-    uint32_t    num_cu = 0;
 };
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,

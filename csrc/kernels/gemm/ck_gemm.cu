@@ -2,8 +2,6 @@
 //
 // See LICENSE for license information.
 
-#include "ck_tile/host/hip_check_error.hpp"
-
 #include "ck_gemm_kernel_instance_factory.h"
 #include "ck_gemm_kernel_template.h"
 #include "ck_tile/ops/gemm_quant.hpp"
@@ -75,10 +73,10 @@ void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataT
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                              BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
     } else {
-        PRIMUS_TURBO_CHECK(false, "CK Gemm only support NN and NT");
+        PRIMUS_TURBO_CHECK(false, "CK Gemm only support NN, TN and NT");
     }
     auto args = compute_gemm_args(params, strideA, strideB, strideC, strideAQ, strideBQ);
-    runner->run(stream_cfg, args, params.num_cu);
+    runner->run(stream_cfg, args);
 }
 
 // fp8 * fp8 -> fp16 - RowColQuant

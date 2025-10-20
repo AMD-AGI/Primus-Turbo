@@ -13,8 +13,7 @@ template <typename AType, typename BType, typename CType, typename ACCType>
 inline CKGemmFP8Params<AType, BType, CType, ACCType>
 make_ck_gemm_fp8_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
                         const at::Tensor &a_scales, const at::Tensor &b_scales, bool transA,
-                        bool transB, int32_t m, int32_t n, int32_t k, hipStream_t stream,
-                        uint32_t num_cu) {
+                        bool transB, int32_t m, int32_t n, int32_t k, hipStream_t stream) {
     CKGemmFP8Params<AType, BType, CType, ACCType> params;
     params.a_ptr  = reinterpret_cast<const AType *>(a.data_ptr());
     params.b_ptr  = reinterpret_cast<const BType *>(b.data_ptr());
@@ -27,20 +26,12 @@ make_ck_gemm_fp8_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
     params.n      = n;
     params.k      = k;
     params.stream = stream;
-    params.num_cu = num_cu;
     return params;
-}
-
-uint32_t get_gemm_num_cu(c10::optional<int64_t> num_cu) {
-    auto    stream     = at::cuda::getCurrentCUDAStream();
-    int32_t cus        = get_multi_processor_count(stream.device_index());
-    int32_t num_cu_val = num_cu.has_value() ? num_cu.value() : -1;
-    return num_cu_val <= 0 ? uint32_t(cus) : uint32_t(std::min(num_cu_val, cus));
 }
 
 at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                     const bool transA, const bool transB, at::ScalarType out_dtype,
-                    const std::string &granularity, c10::optional<int64_t> num_cu) {
+                    const std::string &granularity) {
 
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
@@ -73,8 +64,7 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
                 static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
-                get_gemm_num_cu(num_cu));
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
                 ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
             else
@@ -85,8 +75,7 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
                 static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
-                get_gemm_num_cu(num_cu));
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
                 ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
             else
@@ -104,8 +93,7 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
                 static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
-                get_gemm_num_cu(num_cu));
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
                 ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
             else
@@ -116,8 +104,7 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
                 static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
                 static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream,
-                get_gemm_num_cu(num_cu));
+                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
                 ck_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
             else

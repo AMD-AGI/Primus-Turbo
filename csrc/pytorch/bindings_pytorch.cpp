@@ -15,7 +15,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hipblaslt_gemm(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
           "ScalarType out_dtype, bool transA, bool transB, bool transC) -> Tensor");
     m.def("gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
-          "bool transB, ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
+          "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
     // ********* Quantization *********
     m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");

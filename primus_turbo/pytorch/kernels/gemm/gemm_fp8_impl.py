@@ -244,11 +244,8 @@ def gemm_fp8_impl(
     trans_c: bool,
     backend: str = "hipblaslt",
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
-    # todo: num_cu is not supported yet
-    num_cu: int | None = None,
 ) -> torch.Tensor:
     assert backend in ("hipblaslt", "ck"), f"Unsupported backend: {backend}"
-    assert num_cu is None
 
     args = (
         a,
@@ -265,6 +262,6 @@ def gemm_fp8_impl(
         out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(*args)
     elif backend == "ck":
         out = torch.ops.primus_turbo_cpp_extension.gemm_fp8(
-            a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name, num_cu
+            a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name
         )
     return out
