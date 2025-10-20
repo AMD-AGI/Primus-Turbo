@@ -143,6 +143,7 @@ template <
     typename BLayout,
     typename CLayout,
     typename TileConfig,
+    ck_tile::QuantType QuantMode,
     typename AccDataType=float
 >
 class CKQuantGroupedGemmRunner : public CKGroupedGemmRunnerInterFace {
@@ -171,7 +172,6 @@ public:
         TileConfig::TileParitionerM01
     >;
 
-    static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
     using AQLayout = ck_tile::tensor_layout::gemm::RowMajor;
     using BQLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
 
@@ -248,12 +248,13 @@ template <
     typename BLayout,
     typename CLayout,
     typename TileConfig,
+    ck_tile::QuantType QuantMode,
     typename AccDataType=float
 >
 class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
         ADataType, BDataType, CDataType,
         ALayout, BLayout, CLayout,
-        TileConfig, AccDataType> {
+        TileConfig, QuantMode, AccDataType> {
     static_assert(TileConfig::arch == arch, "Tile arch mismatch with Runner arch");
 };
 
@@ -270,18 +271,21 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
     MACRO(A, B, C, ColMajor, RowMajor, RowMajor, TileCfg)
 
 // ***********************************************************************************
-#define DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN(ARCH, A, B, C, AL, BL, CL, TileCfg)                         \
-    extern template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;                \
-    extern template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, float>;
+#define DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN(ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode)                         \
+    extern template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;                \
+    extern template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;
 
-#define DECL_CK_QGG_RUNNER_WITH_ARCH(ARCH, A, B, C, AL, BL, CL, TileCfg)                        \
-    template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, float>;               \
-    template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, float>;
+#define DECL_CK_QGG_RUNNER_WITH_ARCH(ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode)                        \
+    template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;               \
+    template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;
 
 #define APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
-    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg)           \
-    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg)           \
-    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg)
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)
 
 // ***********************************************************************************
 #if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
