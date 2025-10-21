@@ -1,6 +1,6 @@
 from typing import Any, Dict
 
-from jax.core import Primitive
+from jax.extend.core import Primitive
 
 IMPL_TABLE: Dict[Primitive, Any] = {}
 ABSTRACT_EVAL_TABLE: Dict[Primitive, Any] = {}

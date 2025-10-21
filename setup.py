@@ -16,9 +16,13 @@ DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
 # try to found rocshmem in default path or enviorment
 ROCSHMEM_LIBRARY = find_rocshmem_library()
 
-# -------- env switches --------
-BUILD_TORCH = os.environ.get("PRIMUS_TURBO_BUILD_TORCH", "1") == "1"
-BUILD_JAX = os.environ.get("PRIMUS_TURBO_BUILD_JAX", "0") == "1"
+# -------- Framework Switches --------
+# PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX"
+PRIMUS_TURBO_FRAMEWORK = [
+    fw.strip().upper() for fw in os.environ.get("PRIMUS_TURBO_FRAMEWORK", "PYTORCH").split(";")
+]
+BUILD_TORCH = "PYTORCH" in PRIMUS_TURBO_FRAMEWORK
+BUILD_JAX = "JAX" in PRIMUS_TURBO_FRAMEWORK
 
 # -------- Supported GPU ARCHS --------
 SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
@@ -395,6 +399,10 @@ def build_jax_extension():
         *extra_flags.get("extra_link_args", []),
     ]
 
+    if ROCSHMEM_LIBRARY is None:
+        extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
+        extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
+
     # CPP
     jax_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "jax")
     sources = all_files_in_dir(jax_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
@@ -433,7 +441,6 @@ if __name__ == "__main__":
     ]
     if BUILD_JAX:
         entry_points["jax_plugins"] = ["primus_turbo = primus_turbo.jax"]
-        install_requires.append("jax[rocm]")
 
     setup(
         name="primus_turbo",
