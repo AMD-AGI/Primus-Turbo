@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/configs.h"
 
 namespace primus_turbo::deep_ep {
 

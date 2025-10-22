@@ -9,8 +9,8 @@
 #pragma once
 
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/api.cuh"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/api.h"
+#include "primus_turbo/deep_ep/configs.h"
 
 namespace primus_turbo::deep_ep {
 

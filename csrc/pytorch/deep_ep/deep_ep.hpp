@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "primus_turbo/deep_ep/config.hpp"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/configs.h"
 
 #include "event.hpp"
 namespace primus_turbo::pytorch::deep_ep {

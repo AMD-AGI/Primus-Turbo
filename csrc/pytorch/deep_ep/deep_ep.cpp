@@ -13,7 +13,7 @@
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
-#include "primus_turbo/deep_ep/api.cuh"
+#include "primus_turbo/deep_ep/api.h"
 
 #include "deep_ep.hpp"
 

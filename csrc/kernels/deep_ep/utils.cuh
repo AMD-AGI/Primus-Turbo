@@ -8,7 +8,7 @@
 
 #pragma once
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/configs.h"
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                  \
     {                                                                                              \

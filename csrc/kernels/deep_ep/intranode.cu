@@ -10,7 +10,7 @@
 #include "hip/hip_runtime.h"
 #include "launch.cuh"
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/configs.h"
 #include "utils.cuh"
 
 namespace primus_turbo::deep_ep {

@@ -10,8 +10,8 @@
 
 #include "launch.cuh"
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/api.cuh"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/api.h"
+#include "primus_turbo/deep_ep/configs.h"
 #include "utils.cuh"
 
 #ifndef DISABLE_ROCSHMEM

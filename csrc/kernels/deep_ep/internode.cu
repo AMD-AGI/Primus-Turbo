@@ -8,7 +8,7 @@
 
 #include "buffer.cuh"
 #include "launch.cuh"
-#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/configs.h"
 #include "primus_turbo/macros.h"
 #include "utils.cuh"
 
