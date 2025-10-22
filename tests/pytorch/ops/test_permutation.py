@@ -16,7 +16,7 @@ from tests.pytorch.ref.permuatation_ref import (
     pytorch_permute_mask_map,
     pytorch_unpermute_mask_map,
 )
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 # TODO: add FP8 test
 

@@ -33,12 +33,15 @@ Note: JAX and Optim support are planned but not yet available.
 
 
 #### Hardware
-- AMD Instinct GPUs
-- GFX942: MI300X, MI325X
-- GFX950: MI350X, MI355X
+| Architecture | Supported GPUs      |
+| -------------| --------------------|
+| GFX942       | ✅MI300X, ✅MI325X |
+| GFX950       | ✅MI350X, ✅MI355X |
 
 ### 2. Docker (Recommended)
 Use the pre-built AMD ROCm image:
+
+**PyTorch Ecosystem**
 ```
 # For GFX942
 rocm/primus:v25.9_gfx942

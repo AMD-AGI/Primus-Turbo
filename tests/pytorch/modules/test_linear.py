@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.modules import Linear
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 
 @pytest.mark.parametrize("bs", [[], [1], [2], [3, 2]])

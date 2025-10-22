@@ -7,7 +7,8 @@
 from functools import partial
 
 import jax
-from jax.core import Primitive, ShapedArray
+from jax.core import ShapedArray
+from jax.extend.core import Primitive
 from jax.interpreters import xla
 
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE

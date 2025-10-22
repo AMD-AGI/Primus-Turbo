@@ -25,7 +25,7 @@ from primus_turbo.pytorch.core.float8 import (
     float8_e5m2,
 )
 from primus_turbo.pytorch.dist import FP8AllToAll
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 shapes = [
     # (b, s, h, topk)
