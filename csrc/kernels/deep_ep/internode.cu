@@ -6,11 +6,11 @@
  * See LICENSE for license information.
  */
 
-#include "buffer.h"
-#include "configs.h"
-#include "launch.h"
+#include "buffer.cuh"
+#include "launch.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
 #include "primus_turbo/macros.h"
-#include "utils.h"
+#include "utils.cuh"
 
 #ifndef DISABLE_ROCSHMEM
 

@@ -8,11 +8,11 @@
 
 #pragma once
 
-#include "../kernels/deep_ep/api.h"
-#include "../kernels/deep_ep/configs.h"
 #include "primus_turbo/common.h"
+#include "primus_turbo/deep_ep/api.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
 
-namespace primus_turbo::pytorch::deep_ep {
+namespace primus_turbo::deep_ep {
 
 struct Config {
     int num_sms;
@@ -215,4 +215,4 @@ inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_ran
            NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
-} // namespace primus_turbo::pytorch::deep_ep
+} // namespace primus_turbo::deep_ep

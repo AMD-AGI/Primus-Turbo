@@ -8,10 +8,11 @@
 
 #include <cstring>
 
-#include "configs.h"
-#include "launch.h"
+#include "launch.cuh"
 #include "primus_turbo/common.h"
-#include "utils.h"
+#include "primus_turbo/deep_ep/api.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "utils.cuh"
 
 #ifndef DISABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>

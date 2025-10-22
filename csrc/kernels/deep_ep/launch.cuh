@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "configs.h"
+#include "primus_turbo/deep_ep/configs.cuh"
 #include "primus_turbo/macros.h"
 
 // ROCm helper functions and structures

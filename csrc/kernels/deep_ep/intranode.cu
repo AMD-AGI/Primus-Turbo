@@ -6,12 +6,12 @@
  * See LICENSE for license information.
  */
 
-#include "buffer.h"
-#include "configs.h"
+#include "buffer.cuh"
 #include "hip/hip_runtime.h"
-#include "launch.h"
+#include "launch.cuh"
 #include "primus_turbo/common.h"
-#include "utils.h"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "utils.cuh"
 
 namespace primus_turbo::deep_ep {
 

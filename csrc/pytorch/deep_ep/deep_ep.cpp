@@ -13,8 +13,8 @@
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
-#include "../kernels/deep_ep/api.h"
-#include "../kernels/deep_ep/configs.h"
+#include "primus_turbo/deep_ep/api.cuh"
+
 #include "deep_ep.hpp"
 
 namespace primus_turbo::pytorch::deep_ep {
@@ -372,8 +372,8 @@ Buffer::intranode_dispatch(
     const std::optional<torch::Tensor> &num_tokens_per_expert, int cached_num_recv_tokens,
     const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
     const std::optional<torch::Tensor> &cached_channel_prefix_matrix, int expert_alignment,
-    int num_worst_tokens, const Config &config, std::optional<EventHandle> &previous_event,
-    bool async, bool allocate_on_comm_stream) {
+    int num_worst_tokens, const primus_turbo::deep_ep::Config &config,
+    std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for
@@ -659,9 +659,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,
                           const std::optional<torch::Tensor> &bias_0,
                           const std::optional<torch::Tensor> &bias_1, const torch::Tensor &src_idx,
-                          const torch::Tensor &rank_prefix_matrix,
-                          const torch::Tensor &channel_prefix_matrix,
-                          const torch::Tensor &send_head, const Config &config,
+                          const torch::Tensor                 &rank_prefix_matrix,
+                          const torch::Tensor                 &channel_prefix_matrix,
+                          const torch::Tensor                 &send_head,
+                          const primus_turbo::deep_ep::Config &config,
                           std::optional<EventHandle> &previous_event, bool async,
                           bool allocate_on_comm_stream) {
     PRIMUS_TURBO_CHECK(x.dim() == 2 and x.is_contiguous());
@@ -804,7 +805,8 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                            const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
                            const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-                           int expert_alignment, int num_worst_tokens, const Config &config,
+                           int expert_alignment, int num_worst_tokens,
+                           const primus_turbo::deep_ep::Config &config,
                            std::optional<EventHandle> &previous_event, bool async,
                            bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
@@ -1150,7 +1152,7 @@ Buffer::internode_combine(
     const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
     const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
     const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
-    const torch::Tensor &combined_nvl_head, const Config &config,
+    const torch::Tensor &combined_nvl_head, const primus_turbo::deep_ep::Config &config,
     std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
     const int num_channels = config.num_sms / 2;

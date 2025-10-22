@@ -99,16 +99,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ********* DeepEP *********
     auto deep_ep_module =
         m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");
-    pybind11::class_<deep_ep::Config>(deep_ep_module, "Config")
+    pybind11::class_<primus_turbo::deep_ep::Config>(deep_ep_module, "Config")
         .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = DEFAULT_NUM_CU,
              py::arg("num_max_nvl_chunked_send_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
              py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
-        .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
-        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
+        .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint",
+             &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);
 
-    deep_ep_module.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
+    deep_ep_module.def("get_low_latency_rdma_size_hint",
+                       &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
 
     pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
         .def(pybind11::init<>())

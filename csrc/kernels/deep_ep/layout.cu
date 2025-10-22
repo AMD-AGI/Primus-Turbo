@@ -1,5 +1,5 @@
-#include "configs.h"
-#include "launch.h"
+#include "launch.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
 
 namespace primus_turbo::deep_ep {
 
