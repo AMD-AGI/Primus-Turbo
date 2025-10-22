@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as turbo
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])

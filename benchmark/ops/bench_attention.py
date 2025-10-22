@@ -13,7 +13,7 @@ from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
 )
-from tests.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr
 
 test_cases_turbo = [
     AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),

@@ -15,7 +15,7 @@ from tests.pytorch.ref.quantization_ref import (
     quantize_fp8_rowwise_ref,
     quantize_fp8_tensorwise_ref,
 )
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])

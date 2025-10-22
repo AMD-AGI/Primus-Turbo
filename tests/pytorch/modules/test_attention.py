@@ -10,7 +10,7 @@ import torch._dynamo.config
 
 from primus_turbo.pytorch.modules import TurboAttention
 from tests.pytorch.ref.attention_ref import AttnConfig, TurboAttentionRef
-from tests.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr
 
 test_cases = [
     # MHA

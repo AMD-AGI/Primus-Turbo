@@ -12,7 +12,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.test_utils import compute_snr, get_tolerances
+from tests.pytorch.test_utils import compute_snr, get_tolerances
 
 
 @pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])

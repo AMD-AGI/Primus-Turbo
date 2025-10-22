@@ -12,7 +12,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.test_utils import compute_snr, get_tolerances
+from tests.pytorch.test_utils import compute_snr, get_tolerances
 
 M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 EP_SIZE_LIST = [32, 16, 8]

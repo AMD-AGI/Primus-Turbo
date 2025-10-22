@@ -14,7 +14,7 @@ from primus_turbo.pytorch.core.float8 import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.modules import MXLinear
-from tests.test_utils import compute_snr, get_tolerances
+from tests.pytorch.test_utils import compute_snr, get_tolerances
 
 
 # TODO: ori_dtype torch.float32

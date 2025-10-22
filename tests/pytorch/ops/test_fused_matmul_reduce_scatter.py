@@ -20,7 +20,7 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as pt
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 _backend_streams: Dict[int, List[torch.cuda.Stream]] = {}
 

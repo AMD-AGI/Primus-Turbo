@@ -18,7 +18,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr
 
 
 def _check_hit_int32_limit(B, M, N, K):

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from primus_turbo.pytorch.ops.normalization import rmsnorm
-from tests.test_utils import get_tolerances
+from tests.pytorch.test_utils import get_tolerances
 
 
 # @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])

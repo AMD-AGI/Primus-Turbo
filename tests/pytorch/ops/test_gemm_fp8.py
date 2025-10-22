@@ -13,7 +13,7 @@ from primus_turbo.pytorch.core.float8 import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.ops import gemm_fp8, gemm_fp8_blockwise
-from tests.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
 
