@@ -10,31 +10,6 @@ from primus_turbo.triton.quantize.quant_blockwise import (
 )
 
 """
-Tensorwise Quantization Kernel
-"""
-
-
-def quant_fp8_tensorwise_impl(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    dtype: torch.dtype,
-):
-    x_fp8 = torch.ops.primus_turbo_cpp_extension.fp8_quantize(x, scale, dtype)
-
-    return x_fp8
-
-
-def dequant_fp8_tensorwise_impl(
-    x: torch.Tensor,
-    scale_inv: torch.Tensor,
-    dtype: torch.dtype,
-):
-    orig_x = torch.ops.primus_turbo_cpp_extension.fp8_dequantize(x, scale_inv, dtype)
-
-    return orig_x
-
-
-"""
 Blockwise Quantization Kernel
 """
 

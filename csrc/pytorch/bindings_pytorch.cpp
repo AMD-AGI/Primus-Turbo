@@ -18,11 +18,13 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
     // ********* Quantization *********
-    m.def("fp8_quantize(Tensor input, Tensor scale, ScalarType dest_dtype) -> Tensor");
-    m.def("fp8_dequantize(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> Tensor");
+    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
+          "Tensor[]");
+    m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
+          "scale_opt=None) -> Tensor[]");
 
-    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype) -> Tensor[]");
-    m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis) -> Tensor[]");
+    m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
+          "Tensor");
 
     // ********* RMSNorm *********
     m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
@@ -47,11 +49,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_gemm", hipblaslt_gemm);
     m.impl("gemm_fp8", gemm_fp8);
     // ********* Quantization *********
-    m.impl("fp8_quantize", fp8_quantize);
-    m.impl("fp8_dequantize", fp8_dequantize);
-
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
+
+    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd);
@@ -71,10 +72,8 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("gemm_fp8", gemm_fp8_meta);
 
     // ********* Quantization *********
-    m.impl("fp8_quantize", fp8_quantize_meta);
-    m.impl("fp8_dequantize", fp8_dequantize_meta);
-
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
+    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
 
     // ********* RMSNorm *********

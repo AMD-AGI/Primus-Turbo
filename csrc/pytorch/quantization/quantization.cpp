@@ -2,9 +2,10 @@
 //
 // See LICENSE for license information.
 
-#include "../extensions.h"
-#include "../utils.h"
+#include "primus_turbo/quantization.h"
 #include "primus_turbo/reduce.h"
+#include "pytorch/extensions.h"
+#include "pytorch/utils.h"
 
 namespace primus_turbo::pytorch {
 
@@ -32,59 +33,182 @@ inline bool is_torch_fp8(const at::ScalarType dtype) {
            dtype == at::kFloat8_e5m2 || dtype == at::kFloat8_e5m2fnuz;
 }
 
-std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
-                                                const at::ScalarType dest_dtype) {
+std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
+                                                const at::ScalarType      dest_dtype,
+                                                c10::optional<at::Tensor> scale_opt) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Reduce
-    auto          input_max = torch::empty({}, input.options().dtype(at::kFloat));
-    const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
-    auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
-    TORCH_TYPE_SWITCH_FLOAT(input.scalar_type(), InT, {
-        reduce_row<InT, float, float>(
-            PrimusTurboReduceOp::REDUCE_ABS_MAX, reinterpret_cast<InT *>(input.data_ptr()),
-            input_max.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
-    });
+    at::Tensor scale     = torch::empty({}, input.options().dtype(at::kFloat));
+    at::Tensor scale_inv = torch::empty({}, input.options().dtype(at::kFloat));
 
-    input_max = input_max.clamp_min(1e-12f);
-    // Compute Scale
-    const float fp8_max   = get_float8_max(dest_dtype);
-    auto        scale     = fp8_max / input_max;
-    auto        scale_inv = 1.0f / scale;
+    if (scale_opt.has_value()) {
+        scale = scale_opt.value();
+        PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
+        scale_inv = 1.0f / scale;
+    } else {
+        // Reduce
+        auto          amax      = torch::empty({}, input.options().dtype(at::kFloat));
+        const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
+        auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
+            reduce_row<InT, float, float>(
+                PrimusTurboReduceOp::REDUCE_ABS_MAX, reinterpret_cast<InT *>(input.data_ptr()),
+                amax.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
+        });
+
+        // Compute Scale
+        const float fp8_max = get_float8_max(dest_dtype);
+        compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
+                                       reinterpret_cast<float *>(scale.data_ptr()),
+                                       reinterpret_cast<float *>(scale_inv.data_ptr()),
+                                       amax.numel(), stream);
+    }
 
     // Quantize
-    // TODO: refactor
-    auto output = fp8_quantize(input, scale, dest_dtype);
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()), input.numel(), stream);
+        });
+    });
+
     return {output, scale_inv};
 }
 
+inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, int64_t axis,
+                                             int64_t &B, int64_t &M, int64_t &N) {
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    if (ndim == 0) {
+        B = M = N = 1;
+        return;
+    }
+    PRIMUS_TURBO_CHECK(axis >= 0 && axis < ndim);
+
+    auto prod = [](const std::vector<int64_t> &v, int64_t start, int64_t end) {
+        return std::accumulate(v.begin() + start, v.begin() + end, int64_t{1},
+                               std::multiplies<int64_t>());
+    };
+    B = prod(shape, 0, axis);
+    M = shape[axis];
+    N = prod(shape, axis + 1, ndim);
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
-                                             const at::ScalarType dest_dtype, const int64_t axis) {
+                                             const at::ScalarType dest_dtype, const int64_t axis,
+                                             c10::optional<at::Tensor> scale_opt) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
 
-    const float fp8_max = get_float8_max(dest_dtype);
-
     const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
     PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
+    const bool is_row_major = valid_axis == (input.dim() - 1);
 
-    // TODO: Opt Reduce
-    // ReduceMax
-    auto x_max = input.abs().amax(valid_axis, true).to(at::kFloat);
-    x_max      = at::clamp(x_max, 1e-8f, std::numeric_limits<float>::infinity());
-    // Compute Scale
-    auto scale     = fp8_max / x_max;
-    auto scale_inv = 1.0f / scale;
+    std::vector<int64_t> input_shape(input.sizes().begin(), input.sizes().end());
+    std::vector<int64_t> scale_shape(input.sizes().begin(), input.sizes().end());
+    scale_shape[valid_axis] = 1;
+    auto scale              = at::empty(scale_shape, input.options().dtype(at::kFloat));
+    auto scale_inv          = at::empty(scale_shape, input.options().dtype(at::kFloat));
+    auto output             = at::empty_like(input, input.options().dtype(dest_dtype));
 
-    // TODO: Opt Quantize
-    auto x_scaled  = input * scale;
-    auto x_clamped = at::clamp(x_scaled, -fp8_max, fp8_max);
-    auto x_fp8     = x_clamped.to(dest_dtype);
-    return {x_fp8, scale_inv};
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    if (scale_opt.has_value()) {
+        PRIMUS_TURBO_CHECK(scale_opt.value().sizes() == at::IntArrayRef(scale_shape));
+
+        scale     = scale_opt.value();
+        scale_inv = 1.0f / scale;
+
+        if (is_row_major) {
+            const int64_t inner_len = input.sizes()[valid_axis];
+            const int64_t outer_len = input.numel() / inner_len;
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_row_major_impl<FType, QType, float, true>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), outer_len, inner_len, stream);
+                });
+            });
+        } else {
+            int64_t B, M, N;
+            compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
+
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_col_major_impl<FType, QType, float, true>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), B, M, N, stream);
+                });
+            });
+        }
+    } else {
+        if (is_row_major) {
+            const int64_t inner_len = input.sizes()[valid_axis];
+            const int64_t outer_len = input.numel() / inner_len;
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_row_major_impl<FType, QType, float, false>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), outer_len, inner_len, stream);
+                });
+            });
+        } else {
+            // TODO: reduce-col + binary kernel
+            auto amax = input.abs().amax(valid_axis, true).to(at::kFloat);
+            compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()),
+                                           fp8_max, reinterpret_cast<float *>(scale.data_ptr()),
+                                           reinterpret_cast<float *>(scale_inv.data_ptr()),
+                                           amax.numel(), stream);
+
+            int64_t B, M, N;
+            compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
+
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_col_major_impl<FType, QType, float, false>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()), B, M, N, stream);
+                });
+            });
+        }
+    }
+    return {output, scale_inv};
+}
+
+// De-Quantize
+at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                     const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                       dest_dtype == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()));
+    PRIMUS_TURBO_CHECK(scale_inv.numel() == 1, "tensorwise scale_inv must be scalar tensor");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            dequantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                reinterpret_cast<FType *>(output.data_ptr()), input.numel(), stream);
+        });
+    });
+
+    return output;
 }
 
 } // namespace primus_turbo::pytorch
