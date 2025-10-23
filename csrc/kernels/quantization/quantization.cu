@@ -4,6 +4,7 @@
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/reduce.cuh"
+#include "primus_turbo/elementwise/binary_kernel_template.cuh"
 #include "primus_turbo/elementwise/unary_kernel_template.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
@@ -18,6 +19,16 @@ template <typename ComputeType = float> struct QuantOpBase {
                                                       const ComputeType clip_max) {
         const ComputeType v = x * scale;
         return fmax(fmin(v, clip_max), clip_min);
+    }
+};
+
+template <typename ComputeType = float> struct QuantOp : QuantOpBase<ComputeType> {
+    ComputeType clip_min;
+    ComputeType clip_max;
+
+    PRIMUS_TURBO_HOST_DEVICE ComputeType operator()(const ComputeType x,
+                                                    const ComputeType scale) const {
+        return QuantOpBase<ComputeType>::quant(x, scale, clip_min, clip_max);
     }
 };
 
@@ -333,7 +344,109 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
     }
 }
 
-#define DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(FType, QType)                                      \
+inline void print_vector(const std::vector<int64_t> &vec, const std::string &name = "") {
+    if (!name.empty())
+        std::cout << name << ": ";
+    std::cout << "[";
+    for (size_t i = 0; i < vec.size(); ++i) {
+        std::cout << vec[i];
+        if (i + 1 < vec.size())
+            std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+}
+
+template <int NumDim, typename FType, typename QType, typename ComputeType, bool PreComputeScale>
+void _quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                      const std::vector<int64_t> x_dims,
+                                      const std::vector<int64_t> x_strides,
+                                      const std::vector<int64_t> scale_dims,
+                                      const std::vector<int64_t> scale_strides,
+                                      const std::vector<int64_t> y_dims,
+                                      const std::vector<int64_t> y_strides, hipStream_t stream) {
+    // print_vector(x_dims, "x_dims");
+    // print_vector(x_strides, "x_strides");
+    // print_vector(scale_dims, "scale_dims");
+    // print_vector(scale_strides, "scale_strides");
+    // print_vector(y_dims, "y_dims");
+    // print_vector(y_strides, "y_strides");
+    // printf("\n");
+
+    QuantOp<ComputeType> op{{},
+                            static_cast<ComputeType>(std::numeric_limits<QType>::lowest()),
+                            static_cast<ComputeType>(std::numeric_limits<QType>::max())};
+
+    Array<int64_t, NumDim>            x_strides_arr;
+    Array<int64_t, NumDim>            scale_strides_arr;
+    Array<IntDivMod<int64_t>, NumDim> y_divmod_arr;
+
+    for (int i = 0; i < NumDim; ++i) {
+        x_strides_arr[i]     = x_dims[NumDim - i - 1] > 1 ? x_strides[NumDim - i - 1] : 0;
+        scale_strides_arr[i] = scale_dims[NumDim - i - 1] > 1 ? scale_strides[NumDim - i - 1] : 0;
+        y_divmod_arr[i]      = IntDivMod<int64_t>(y_dims[NumDim - i - 1]);
+    }
+
+    const int64_t numel =
+        std::accumulate(y_dims.begin(), y_dims.end(), int64_t(1), std::multiplies<int64_t>());
+
+    const int32_t BLOCK  = 256;
+    const int32_t GRID   = DIVUP<int64_t>(numel, BLOCK);
+    const int32_t UNROLL = 4;
+
+    binary_broadcast_kernel<NumDim, BLOCK, UNROLL, FType, float, QType, float>
+        <<<GRID, BLOCK, 0, stream>>>(x, scale, y, numel, y_divmod_arr, x_strides_arr,
+                                     scale_strides_arr, op);
+}
+
+template <typename FType, typename QType, typename ComputeType, bool PreComputeScale>
+void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const std::vector<int64_t> x_dims,
+                                     const std::vector<int64_t> x_strides,
+                                     const std::vector<int64_t> scale_dims,
+                                     const std::vector<int64_t> scale_strides,
+                                     const std::vector<int64_t> y_dims,
+                                     const std::vector<int64_t> y_strides, hipStream_t stream) {
+
+    const size_t num_dim = x_dims.size();
+
+    switch (num_dim) {
+    case 5: {
+        _quantize_rowwise_col_major_impl<5, FType, QType, ComputeType, PreComputeScale>(
+            x, scale, scale_inv, y, x_dims, x_strides, scale_dims, scale_strides, y_dims, y_strides,
+            stream);
+        break;
+    }
+    case 4: {
+        _quantize_rowwise_col_major_impl<4, FType, QType, ComputeType, PreComputeScale>(
+            x, scale, scale_inv, y, x_dims, x_strides, scale_dims, scale_strides, y_dims, y_strides,
+            stream);
+        break;
+    }
+    case 3: {
+        _quantize_rowwise_col_major_impl<3, FType, QType, ComputeType, PreComputeScale>(
+            x, scale, scale_inv, y, x_dims, x_strides, scale_dims, scale_strides, y_dims, y_strides,
+            stream);
+        break;
+    }
+    case 2: {
+        _quantize_rowwise_col_major_impl<2, FType, QType, ComputeType, PreComputeScale>(
+            x, scale, scale_inv, y, x_dims, x_strides, scale_dims, scale_strides, y_dims, y_strides,
+            stream);
+        break;
+    }
+    case 1: {
+        _quantize_rowwise_col_major_impl<1, FType, QType, ComputeType, PreComputeScale>(
+            x, scale, scale_inv, y, x_dims, x_strides, scale_dims, scale_strides, y_dims, y_strides,
+            stream);
+        break;
+    }
+    default:
+        PRIMUS_TURBO_ERROR("num_dim only support <= 5");
+        break;
+    }
+}
+
+#define DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(FType, QType)                            \
     template void quantize_rowwise_row_major_impl<FType, QType, float, true>(                      \
         const FType *x, float *scale, float *scale_inv, QType *y, const int64_t outer_len,         \
         const int64_t inner_len, hipStream_t stream);                                              \
@@ -341,13 +454,37 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
         const FType *x, float *scale, float *scale_inv, QType *y, const int64_t outer_len,         \
         const int64_t inner_len, hipStream_t stream);
 
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float16, dtype::float8_e4m3)
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float16, dtype::float8_e5m2)
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::bfloat16, dtype::float8_e4m3)
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float32, dtype::float8_e4m3)
-DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE(dtype::float32, dtype::float8_e5m2)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::float16, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::float16, dtype::float8_e5m2)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::bfloat16, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::float32, dtype::float8_e4m3)
+DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::float32, dtype::float8_e5m2)
 
 #undef DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE
+
+#define DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(FType, QType)                            \
+    template void quantize_rowwise_col_major_impl<FType, QType, float, true>(                      \
+        const FType *x, float *scale, float *scale_inv, QType *y,                                  \
+        const std::vector<int64_t> x_dims, const std::vector<int64_t> x_strides,                   \
+        const std::vector<int64_t> scale_dims, const std::vector<int64_t> scale_strides,           \
+        const std::vector<int64_t> y_dims, const std::vector<int64_t> y_strides,                   \
+        hipStream_t stream);                                                                       \
+    template void quantize_rowwise_col_major_impl<FType, QType, float, false>(                     \
+        const FType *x, float *scale, float *scale_inv, QType *y,                                  \
+        const std::vector<int64_t> x_dims, const std::vector<int64_t> x_strides,                   \
+        const std::vector<int64_t> scale_dims, const std::vector<int64_t> scale_strides,           \
+        const std::vector<int64_t> y_dims, const std::vector<int64_t> y_strides,                   \
+        hipStream_t stream);
+
+// F16/BF16/F32 -> FP8 (E4M3/E5M2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float16, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float16, dtype::float8_e5m2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::bfloat16, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float32, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float32, dtype::float8_e5m2)
+
+#undef DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE
 
 } // namespace primus_turbo
