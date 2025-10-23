@@ -81,6 +81,24 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     return {output, scale_inv};
 }
 
+inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, int64_t axis,
+                                             int64_t &B, int64_t &M, int64_t &N) {
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    if (ndim == 0) {
+        B = M = N = 1;
+        return;
+    }
+    PRIMUS_TURBO_CHECK(axis >= 0 && axis < ndim);
+
+    auto prod = [](const std::vector<int64_t> &v, int64_t start, int64_t end) {
+        return std::accumulate(v.begin() + start, v.begin() + end, int64_t{1},
+                               std::multiplies<int64_t>());
+    };
+    B = prod(shape, 0, axis);
+    M = shape[axis];
+    N = prod(shape, axis + 1, ndim);
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                              const at::ScalarType dest_dtype, const int64_t axis,
                                              c10::optional<at::Tensor> scale_opt) {
@@ -92,6 +110,7 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
     PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
     const bool is_row_major = valid_axis == (input.dim() - 1);
 
+    std::vector<int64_t> input_shape(input.sizes().begin(), input.sizes().end());
     std::vector<int64_t> scale_shape(input.sizes().begin(), input.sizes().end());
     scale_shape[valid_axis] = 1;
     auto scale              = at::empty(scale_shape, input.options().dtype(at::kFloat));
@@ -144,9 +163,9 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                            fp8_max, reinterpret_cast<float *>(scale.data_ptr()),
                                            reinterpret_cast<float *>(scale_inv.data_ptr()),
                                            amax.numel(), stream);
-            // auto output_scaled  = input * scale;
-            // auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
-            // output              = output_clamped.to(dest_dtype);
+
+            int64_t B, M, N;
+            compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
 
             TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
                 TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
@@ -154,14 +173,7 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                         reinterpret_cast<const FType *>(input.data_ptr()),
                         reinterpret_cast<float *>(scale.data_ptr()),
                         reinterpret_cast<float *>(scale_inv.data_ptr()),
-                        reinterpret_cast<QType *>(output.data_ptr()),
-                        std::vector<int64_t>(input.sizes().begin(), input.sizes().end()),
-                        std::vector<int64_t>(input.strides().begin(), input.strides().end()),
-                        std::vector<int64_t>(scale.sizes().begin(), scale.sizes().end()),
-                        std::vector<int64_t>(scale.strides().begin(), scale.strides().end()),
-                        std::vector<int64_t>(output.sizes().begin(), output.sizes().end()),
-                        std::vector<int64_t>(output.strides().begin(), output.strides().end()),
-                        stream);
+                        reinterpret_cast<QType *>(output.data_ptr()), B, M, N, stream);
                 });
             });
         }

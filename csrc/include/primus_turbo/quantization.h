@@ -34,6 +34,12 @@ void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_
                                      const std::vector<int64_t> y_dims,
                                      const std::vector<int64_t> y_strides, hipStream_t stream);
 
+template <typename FType, typename QType, typename ComputeType = float,
+          bool PreComputeScale = false>
+void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const int64_t batch, const int64_t m, const int64_t n,
+                                     hipStream_t stream);
+
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,

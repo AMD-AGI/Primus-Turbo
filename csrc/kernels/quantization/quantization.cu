@@ -344,6 +344,106 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
     }
 }
 
+template <int BLOCK_SIZE, int UNROLL_M, int UNROLL_N, typename FType, typename QType,
+          typename ComputeType = float>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void quantize_rowwise_col_major_kernel(const FType *__restrict__ input_ptr,
+                                           const float *__restrict__ scale_ptr,
+                                           QType *__restrict__ output_ptr, const int64_t m,
+                                           const int64_t n) {
+    const ComputeType CLIP_MIN = static_cast<ComputeType>(std::numeric_limits<QType>::lowest());
+    const ComputeType CLIP_MAX = static_cast<ComputeType>(std::numeric_limits<QType>::max());
+
+    const int32_t tid   = threadIdx.x;
+    const int32_t bid_x = blockIdx.x;
+    const int32_t bid_y = blockIdx.y;
+    const int32_t bid_z = blockIdx.z;
+
+    const int64_t offset_m     = bid_y * UNROLL_M;
+    const int64_t offset_n     = bid_x * BLOCK_SIZE * UNROLL_N + tid * UNROLL_N;
+    const int64_t offset_input = bid_z * m * n + offset_m * n + offset_n;
+    const int64_t offset_scale = bid_z * n + offset_n;
+
+    if (offset_n >= n)
+        return;
+
+    input_ptr += offset_input;
+    scale_ptr += offset_scale;
+    output_ptr += offset_input;
+
+    FType ld_regs[UNROLL_N];
+    QType st_regs[UNROLL_N];
+    float scale_regs[UNROLL_N];
+
+    if constexpr (UNROLL_N == 8) {
+        load_data<float, 4>(scale_ptr + 0, scale_regs + 0);
+        load_data<float, 4>(scale_ptr + 4, scale_regs + 4);
+    } else {
+        load_data<float, UNROLL_N>(scale_ptr, scale_regs);
+    }
+
+    const int32_t m_remaining = static_cast<int32_t>(m - offset_m);
+    const int32_t m_valid     = m_remaining > UNROLL_M ? UNROLL_M : m_remaining;
+    for (int mi = 0; mi < m_valid; ++mi) {
+        load_data<FType, UNROLL_N>(input_ptr + mi * n, ld_regs);
+#pragma unroll
+        for (int i = 0; i < UNROLL_N; ++i) {
+            st_regs[i] = static_cast<QType>(
+                QuantOpBase<ComputeType>::quant(ld_regs[i], scale_regs[i], CLIP_MIN, CLIP_MAX));
+        }
+        store_data<QType, UNROLL_N>(output_ptr + mi * n, st_regs);
+    }
+}
+
+template <typename FType, typename QType, typename ComputeType, bool PreComputeScale>
+void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const int64_t batch, const int64_t m, const int64_t n,
+                                     hipStream_t stream) {
+    const int32_t UNROLL_M = 32;
+
+    int32_t pack_size        = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
+    pack_size                = get_quantize_rowwise_pack_size<FType>(pack_size, n);
+    const int32_t BLOCK_SIZE = 512;
+
+    switch (pack_size) {
+    case 8: {
+        const int32_t UNROLL_N = valid_pack<FType, 8>();
+        const dim3 GRID_SIZE(DIVUP<int64_t>(n, BLOCK_SIZE * UNROLL_N), DIVUP<int64_t>(m, UNROLL_M),
+                             batch);
+        quantize_rowwise_col_major_kernel<BLOCK_SIZE, UNROLL_M, UNROLL_N, FType, QType, float>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, y, m, n);
+        break;
+    }
+    case 4: {
+        const int32_t UNROLL_N = valid_pack<FType, 4>();
+        const dim3 GRID_SIZE(DIVUP<int64_t>(n, BLOCK_SIZE * UNROLL_N), DIVUP<int64_t>(m, UNROLL_M),
+                             batch);
+        quantize_rowwise_col_major_kernel<BLOCK_SIZE, UNROLL_M, UNROLL_N, FType, QType, float>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, y, m, n);
+        break;
+    }
+    case 2: {
+        const int32_t UNROLL_N = valid_pack<FType, 2>();
+        const dim3 GRID_SIZE(DIVUP<int64_t>(n, BLOCK_SIZE * UNROLL_N), DIVUP<int64_t>(m, UNROLL_M),
+                             batch);
+        quantize_rowwise_col_major_kernel<BLOCK_SIZE, UNROLL_M, UNROLL_N, FType, QType, float>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, y, m, n);
+        break;
+    }
+    case 1: {
+        const int32_t UNROLL_N = 1;
+        const dim3 GRID_SIZE(DIVUP<int64_t>(n, BLOCK_SIZE * UNROLL_N), DIVUP<int64_t>(m, UNROLL_M),
+                             batch);
+        quantize_rowwise_col_major_kernel<BLOCK_SIZE, UNROLL_M, UNROLL_N, FType, QType, float>
+            <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, y, m, n);
+        break;
+    }
+    default:
+        PRIMUS_TURBO_ERROR("Error Pack Size");
+        break;
+    }
+}
+
 inline void print_vector(const std::vector<int64_t> &vec, const std::string &name = "") {
     if (!name.empty())
         std::cout << name << ": ";
@@ -486,5 +586,23 @@ DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float32, dtype::float8_
 DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(dtype::float32, dtype::float8_e5m2)
 
 #undef DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE
+
+#define DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(FType, QType)                        \
+    template void quantize_rowwise_col_major_impl<FType, QType, float, true>(                      \
+        const FType *x, float *scale, float *scale_inv, QType *y, const int64_t batch,             \
+        const int64_t m, const int64_t n, hipStream_t stream);                                     \
+    template void quantize_rowwise_col_major_impl<FType, QType, float, false>(                     \
+        const FType *x, float *scale, float *scale_inv, QType *y, const int64_t batch,             \
+        const int64_t m, const int64_t n, hipStream_t stream);
+
+// F16/BF16/F32 -> FP8 (E4M3/E5M2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::float16, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::float16, dtype::float8_e5m2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::bfloat16, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::bfloat16, dtype::float8_e5m2)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::float32, dtype::float8_e4m3)
+DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW(dtype::float32, dtype::float8_e5m2)
+
+#undef DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE_NEW
 
 } // namespace primus_turbo
