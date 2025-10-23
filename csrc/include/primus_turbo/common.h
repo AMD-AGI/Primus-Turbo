@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -44,5 +45,59 @@ struct PackedEltwiseConfig {
         nBlock  = DIVUP<int64_t>(nThread, block_size);
     }
 };
+
+// Cross device Array
+template <typename T, int N> struct Array {
+    T data[N];
+
+    Array() = default;
+
+    // construct from host side
+    template <typename S> Array(const S *src, int n) {
+        PRIMUS_TURBO_CHECK(n <= N, "n size must be <= N");
+        for (int i = 0; i < n; ++i) {
+            data[i] = static_cast<T>(src[i]);
+        }
+    }
+
+    PRIMUS_TURBO_HOST_DEVICE
+    T &operator[](size_t i) { return data[i]; }
+
+    PRIMUS_TURBO_HOST_DEVICE
+    const T &operator[](size_t i) const { return data[i]; }
+
+    PRIMUS_TURBO_HOST_DEVICE
+    constexpr int size() const { return N; }
+};
+
+// Integer Div/Mod
+template <typename T> struct DivModData {
+    T div;
+    T mod;
+    PRIMUS_TURBO_HOST_DEVICE
+    DivModData(T d, T m) : div(d), mod(m) {}
+};
+
+template <typename T> struct IntDivMod {
+    static_assert(std::is_integral_v<T>, "IntDivMod<T>: T must be an integral type");
+
+    T d_;
+
+    PRIMUS_TURBO_HOST_DEVICE
+    IntDivMod() = default;
+
+    PRIMUS_TURBO_HOST_DEVICE
+    explicit IntDivMod(T d) : d_(d) {}
+
+    PRIMUS_TURBO_HOST_DEVICE T div(T n) const { return n / d_; }
+
+    PRIMUS_TURBO_HOST_DEVICE T mod(T n) const { return n % d_; }
+
+    PRIMUS_TURBO_HOST_DEVICE DivModData<T> div_mod(T n) const {
+        return DivModData<T>(n / d_, n % d_);
+    }
+};
+
+// TODO Fast Integer Div/Mod
 
 } // namespace primus_turbo

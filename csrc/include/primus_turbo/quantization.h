@@ -24,11 +24,15 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
                                      const int64_t outer_len, const int64_t inner_len,
                                      hipStream_t stream);
 
-// template <typename FType, typename QType, typename ComputeType = float, bool PreComputeScale =
-// false> void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType
-// *y,
-//                                      const int64_t outer_len, const int64_t inner_len,
-//                                      hipStream_t stream);
+template <typename FType, typename QType, typename ComputeType = float,
+          bool PreComputeScale = false>
+void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                     const std::vector<int64_t> x_dims,
+                                     const std::vector<int64_t> x_strides,
+                                     const std::vector<int64_t> scale_dims,
+                                     const std::vector<int64_t> scale_strides,
+                                     const std::vector<int64_t> y_dims,
+                                     const std::vector<int64_t> y_strides, hipStream_t stream);
 
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>

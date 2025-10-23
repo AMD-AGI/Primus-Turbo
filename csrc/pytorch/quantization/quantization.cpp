@@ -119,7 +119,7 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                 });
             });
         } else {
-            // TODO: reduce-col + binary kernel
+            // TODO: binary kernel
             auto output_scaled  = input * scale;
             auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
             output              = output_clamped.to(dest_dtype);
@@ -144,9 +144,26 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                            fp8_max, reinterpret_cast<float *>(scale.data_ptr()),
                                            reinterpret_cast<float *>(scale_inv.data_ptr()),
                                            amax.numel(), stream);
-            auto output_scaled  = input * scale;
-            auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
-            output              = output_clamped.to(dest_dtype);
+            // auto output_scaled  = input * scale;
+            // auto output_clamped = at::clamp(output_scaled, -fp8_max, fp8_max);
+            // output              = output_clamped.to(dest_dtype);
+
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+                TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                    quantize_rowwise_col_major_impl<FType, QType, float, false>(
+                        reinterpret_cast<const FType *>(input.data_ptr()),
+                        reinterpret_cast<float *>(scale.data_ptr()),
+                        reinterpret_cast<float *>(scale_inv.data_ptr()),
+                        reinterpret_cast<QType *>(output.data_ptr()),
+                        std::vector<int64_t>(input.sizes().begin(), input.sizes().end()),
+                        std::vector<int64_t>(input.strides().begin(), input.strides().end()),
+                        std::vector<int64_t>(scale.sizes().begin(), scale.sizes().end()),
+                        std::vector<int64_t>(scale.strides().begin(), scale.strides().end()),
+                        std::vector<int64_t>(output.sizes().begin(), output.sizes().end()),
+                        std::vector<int64_t>(output.strides().begin(), output.strides().end()),
+                        stream);
+                });
+            });
         }
     }
     return {output, scale_inv};
