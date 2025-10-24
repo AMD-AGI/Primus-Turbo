@@ -9,7 +9,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.float8_tensor import Float8Tensor
 from primus_turbo.triton.moe import permutation
 
@@ -25,6 +24,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         routing_map: torch.Tensor,
         num_out_tokens: int,
         probs: torch.Tensor,
+        return_tokens_per_expert: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         # store inp shape for boundary case
@@ -32,7 +32,12 @@ class TokenPermuteMaskMap(torch.autograd.Function):
 
         if not inp.numel():
             ctx.probs = probs
-            return inp, torch.tensor([], device=inp.device), torch.tensor([], device=inp.device)
+            return (
+                inp,
+                torch.tensor([], device=inp.device),
+                torch.tensor([], device=inp.device),
+                torch.tensor([], device=inp.device),
+            )
 
         assert inp.is_cuda, "Primus-Turbo needs CUDA."
         assert routing_map.is_cuda, "Primus-Turbo needs CUDA."
@@ -44,7 +49,12 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         num_experts = routing_map.size(1)
         assert num_out_tokens is not None, "num_out_tokens must be provided to the fused permute function."
 
-        row_id_map = permutation.make_row_id_map(routing_map, num_tokens, num_experts)
+        row_id_map, tokens_per_experts = permutation.make_row_id_map(
+            routing_map, num_tokens, num_experts, return_tokens_per_expert
+        )
+
+        if num_out_tokens < 0:
+            num_out_tokens = tokens_per_experts.sum().item()
 
         use_fp8 = isinstance(inp, Float8Tensor)
 
@@ -59,8 +69,6 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             fp8_scale = None
             fp8_dtype = None
             scale_hidden_dim = None
-
-        turbo.modules.DeepEPTokenDispatcher.maybe_cpu_sync()
 
         output, permuted_scale, permuted_probs = permutation.permute_with_mask_map(
             inp,
@@ -91,7 +99,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.num_tokens = num_tokens
         ctx.hidden_size = hidden_size
-        return output, row_id_map, permuted_probs
+        return output, row_id_map, permuted_probs, tokens_per_experts
 
     @staticmethod
     def backward(
@@ -99,6 +107,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         permuted_act_grad: torch.Tensor,
         _,
         permuted_probs_grad: torch.Tensor,
+        __,
     ) -> Tuple[torch.Tensor, ...]:
         if not permuted_act_grad.numel():
             return (
@@ -106,6 +115,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
                 None,
                 None,
                 ctx.probs,
+                None,
             )
 
         act_grad = None
@@ -126,7 +136,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             )
         if not ctx.needs_input_grad[3]:
             probs_grad = None
-        return act_grad, None, None, probs_grad
+        return act_grad, None, None, probs_grad, None
 
 
 class TokenUnpermuteMaskMap(torch.autograd.Function):
@@ -262,7 +272,8 @@ def token_permute(
     topk_indices: Optional[torch.Tensor] = None,
     drop_and_pad: bool = False,
     fused: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_tokens_per_expert: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Permute the tokens based on the routing_map. Token with the same index will be grouped together.
     Tokens with the same designated expert will be grouped together.
@@ -289,15 +300,16 @@ def token_permute(
                                    and pads the number of tokens to the expert capacity.
                                    If set to true, routing_map has a fixed number of non-zeros
                                    in each column.e
+    return_tokens_per_expert (bool, optinal): Wheter compute tokens_per_expert by permute phase
     """
     if fused:
         if topk_indices != None:
             raise NotImplementedError("not support topk_indices")
         if routing_map != None:
-            output, row_id_map, permuted_probs = TokenPermuteMaskMap.apply(
-                inp, routing_map, num_out_tokens, probs
+            output, row_id_map, permuted_probs, tokens_per_experts = TokenPermuteMaskMap.apply(
+                inp, routing_map, num_out_tokens, probs, return_tokens_per_expert
             )
-            return output, permuted_probs, row_id_map
+            return output, permuted_probs, row_id_map, tokens_per_experts
         raise ValueError("must be set topk_indices or routing_map")
 
     num_tokens, _ = inp.shape
@@ -339,7 +351,7 @@ def token_permute(
     # use the mapping to permute the tokens
     permuted_input = inp.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices
+    return permuted_input, permuted_probs, sorted_indices, routing_map.sum(axis=0)
 
 
 def token_unpermute(

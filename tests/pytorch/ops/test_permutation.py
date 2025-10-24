@@ -35,6 +35,7 @@ def _test_permutation_mask_map(
     topK,
     num_out_tokens,
     with_probs,
+    return_tokens_per_expert,
 ):
     if topK > num_expert:
         pytest.skip("topK should be smaller than the number of experts.")
@@ -74,6 +75,7 @@ def _test_permutation_mask_map(
     #
     ###################################################################################################################################
     pytorch_permute_output, sorted_indices = pytorch_permute_mask_map(pytorch_permute_fwd_input, routing_map)
+    pytorch_tokens_per_expert = routing_map.sum(axis=0)
     pytorch_permute_output.backward(pytorch_permute_bwd_input, retain_graph=True)
 
     pytorch_unpermute_fwd_input = pytorch_permute_output.detach()
@@ -93,11 +95,12 @@ def _test_permutation_mask_map(
     turbo_permute_fwd_input.requires_grad_(True)
     turbo_permute_bwd_input = pytorch_permute_bwd_input.detach()
 
-    turbo_permute_output, _, row_id_map = turbo.ops.token_permute(
+    turbo_permute_output, _, row_id_map, tokens_per_experts = turbo.ops.token_permute(
         turbo_permute_fwd_input,
         routing_map=routing_map,
         num_out_tokens=num_out_tokens,
         fused=True,
+        return_tokens_per_expert=return_tokens_per_expert,
     )
     turbo_permute_output.backward(turbo_permute_bwd_input, retain_graph=True)
 
@@ -123,6 +126,15 @@ def _test_permutation_mask_map(
     # Results Check
     #
     ###################################################################################################################################
+
+    if num_tokens > 0:
+        if return_tokens_per_expert:
+            assert torch.equal(
+                pytorch_tokens_per_expert, tokens_per_experts
+            ), f"Mismatch in tokens_per_expert: ({pytorch_tokens_per_expert}, {tokens_per_experts})"
+        else:
+            assert tokens_per_experts is None
+
     tol = get_tolerances(dtype)
     torch.testing.assert_close(
         pytorch_permute_output,
@@ -162,6 +174,7 @@ def _test_permutation_mask_map(
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("topK", [1, 2, 5])
 @pytest.mark.parametrize("num_out_tokens", [None, 2039])
+@pytest.mark.parametrize("return_tokens_per_expert", [False, True])
 def test_permutation_mask_map(
     dtype,
     num_tokens,
@@ -169,6 +182,7 @@ def test_permutation_mask_map(
     hidden_size,
     topK,
     num_out_tokens,
+    return_tokens_per_expert,
 ):
     with_probs = True
 
@@ -180,6 +194,7 @@ def test_permutation_mask_map(
         topK=topK,
         num_out_tokens=num_out_tokens,
         with_probs=with_probs,
+        return_tokens_per_expert=return_tokens_per_expert,
     )
 
 
@@ -194,4 +209,5 @@ def test_permutation_mask_map_empty_input(dtype):
         topK=2,
         num_out_tokens=0,
         with_probs=with_probs,
+        return_tokens_per_expert=False,
     )

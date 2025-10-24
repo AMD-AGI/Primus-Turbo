@@ -120,8 +120,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     """
 
-    cuda_dtoh_stream = None
-
     def __init__(
         self,
         num_experts: int,
@@ -164,9 +162,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             use_comm_stream=deepep_use_comm_stream,
             autotune_config=deepep_autotune_config,
         )
-
-        if deepep_use_cuda_num_tokens_per_expert and DeepEPTokenDispatcher.cuda_dtoh_stream is None:
-            DeepEPTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
     @classmethod
     def maybe_cpu_sync(cls):
@@ -213,7 +208,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()  # downcast or upcast
 
-        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+        hidden_states, dispatched_indices, dispatched_probs, tokens_per_expert, handle = (
             turbo.ops.deepep_dispatch(
                 hidden_states,
                 token_indices=self.token_indices,
@@ -228,26 +223,23 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         )
 
         self.handle = handle
-        self.tokens_per_expert = num_tokens_per_expert
+
+        # cuda num_tokens_per_expert computed by permute
+        # cpu num_tokens_per_expert computed directly by DeepEP
+        self.tokens_per_expert = None if self.deepep_use_cuda_num_tokens_per_expert else tokens_per_expert
         self.dispatched_indices = dispatched_indices
 
         return hidden_states, dispatched_probs
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
+
         if self.permute_max_token_num > 0:
             num_out_tokens = self.permute_max_token_num
+        elif self.tokens_per_expert is not None:
+            num_out_tokens = self.tokens_per_expert.sum().item()
         else:
-            num_out_tokens = self.tokens_per_expert.sum()
-            if num_out_tokens.device.type == "cuda":
-                self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
-                num_out_tokens.record_stream(self.cuda_dtoh_stream)
-                with self.cuda_dtoh_stream:
-                    num_out_tokens_cpu = torch.empty_like(
-                        num_out_tokens, dtype=num_out_tokens.dtype, device="cpu", pin_memory=True
-                    )
-                    num_out_tokens_cpu.copy_(num_out_tokens, non_blocking=True)
-
-                num_out_tokens = num_out_tokens_cpu
+            # will case cpu sync at permute phase
+            num_out_tokens = -1
 
         self.dispatched_routing_map, dispatched_probs = turbo.ops.indices_to_multihot(
             self.dispatched_indices, dispatched_probs, self.num_local_experts, fused=self.permute_fusion
@@ -255,14 +247,21 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        hidden_states, permuted_probs, self.reversed_mapping_for_combine = turbo.ops.token_permute(
-            hidden_states,
-            num_out_tokens=num_out_tokens,
-            routing_map=self.dispatched_routing_map,
-            probs=dispatched_probs,
-            fused=self.permute_fusion,
+        hidden_states, permuted_probs, self.reversed_mapping_for_combine, tokens_per_expert = (
+            turbo.ops.token_permute(
+                hidden_states,
+                num_out_tokens=num_out_tokens,
+                routing_map=self.dispatched_routing_map,
+                probs=dispatched_probs,
+                fused=self.permute_fusion,
+                return_tokens_per_expert=self.deepep_use_cuda_num_tokens_per_expert,
+            )
         )
-        return hidden_states, self.tokens_per_expert, permuted_probs
+        if not self.deepep_use_cuda_num_tokens_per_expert:
+            tokens_per_expert = self.tokens_per_expert
+            self.tokens_per_expert = None
+
+        return hidden_states, tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):
         hidden_states = turbo.ops.token_unpermute(

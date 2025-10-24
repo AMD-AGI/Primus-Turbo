@@ -110,6 +110,7 @@ def _row_id_map_pass_1_kernel(
 def _row_id_map_pass_2_kernel(
     # pointers
     row_id_map_ptr,
+    tokens_per_expert_ptr,
     workspace_ptr,
     # sizes
     num_tokens,
@@ -117,6 +118,7 @@ def _row_id_map_pass_2_kernel(
     stride_row_id_map_token,
     stride_row_id_map_expert,
     # metas
+    NUM_OF_BLOCK_TOKEN: tl.constexpr,
     WORKSPACE_LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -142,6 +144,14 @@ def _row_id_map_pass_2_kernel(
         row_id,
         mask=(offset < num_tokens),
     )
+
+    # last block compute tokens_per_experts
+    if tokens_per_expert_ptr and pid_n == 0:
+        col_offset = tl.arange(0, NUM_OF_BLOCK_TOKEN) + pid_m * tl.cdiv(num_tokens, BLOCK_SIZE)
+        col_tensor = tl.load(
+            workspace_ptr + col_offset, mask=col_offset < tl.num_programs(0) * tl.cdiv(num_tokens, BLOCK_SIZE)
+        )
+        tl.store(tokens_per_expert_ptr + pid_m, tl.sum(col_tensor))
 
 
 @triton.jit
@@ -187,6 +197,7 @@ def make_row_id_map(
     routing_map: torch.Tensor,
     num_tokens: int,
     num_experts: int,
+    return_tokens_per_expert: bool = True,
 ):
     """
     Prepare the row_id_map for the permutation.
@@ -201,6 +212,8 @@ def make_row_id_map(
         Number of tokens in the input tensor.
     num_experts: int
         Number of experts in the input tensor.
+    return_tokens_per_expert: bool
+        compute tokens_per_expert from routing_map
 
     Returns
     -------
@@ -210,8 +223,14 @@ def make_row_id_map(
         The first n_routed items are the destination row indices in the permuted tokens.
         The [num_experts, num_experts + n_routed) items are the indices of the experts corresponding
         to the first n_routed row indices above.
+    tokens_per_expert: optional tensor
+
     """
     row_id_map = torch.empty((num_tokens, num_experts * 2 + 1), dtype=torch.int32, device="cuda")
+    tokens_per_expert = None
+    if return_tokens_per_expert:
+        tokens_per_expert = torch.empty((num_experts,), dtype=torch.int32, device="cuda")
+
     block_size = 1024
     grid = (num_experts, triton.cdiv(num_tokens, block_size))
     workspace_tensor = torch.empty(grid, dtype=torch.int32, device="cuda")
@@ -254,10 +273,12 @@ def make_row_id_map(
     #  [-1, -1, -1, r, r, r, r]]
     _row_id_map_pass_2_kernel[grid](
         row_id_map,
+        tokens_per_expert,
         workspace_tensor,
         num_tokens,
         row_id_map.stride(0),
         row_id_map.stride(1),
+        triton.cdiv(num_tokens, block_size),
         triton.next_power_of_2(num_experts * triton.cdiv(num_tokens, block_size)),
         block_size,
     )
@@ -277,7 +298,7 @@ def make_row_id_map(
         row_id_map.stride(1),
         triton.next_power_of_2(num_experts),
     )
-    return row_id_map
+    return row_id_map, tokens_per_expert
 
 
 @triton.jit
