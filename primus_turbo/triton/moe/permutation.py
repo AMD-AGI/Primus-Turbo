@@ -229,7 +229,8 @@ def make_row_id_map(
     row_id_map = torch.empty((num_tokens, num_experts * 2 + 1), dtype=torch.int32, device="cuda")
     tokens_per_expert = None
     if return_tokens_per_expert:
-        tokens_per_expert = torch.empty((num_experts,), dtype=torch.int32, device="cuda")
+        # TurboGroupedGemm use torch.int64
+        tokens_per_expert = torch.empty((num_experts,), dtype=torch.int64, device="cuda")
 
     block_size = 1024
     grid = (num_experts, triton.cdiv(num_tokens, block_size))
