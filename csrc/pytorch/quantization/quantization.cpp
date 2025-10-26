@@ -165,16 +165,33 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                 });
             });
         } else {
-            // TODO: reduce-col + binary kernel
-            auto amax = input.abs().amax(valid_axis, true).to(at::kFloat);
+            int64_t B, M, N;
+            compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
+            // std::cout << " B " << B << " M " << M << " N " << N << std::endl;
+
+            // AMAX
+            // auto amax_ref = input.abs().amax(valid_axis, true).to(at::kFloat);
+
+            // TODO: reduce-col
+            auto          amax      = at::empty_like(scale);
+            const int64_t ws_size   = get_reduce_col_workspace_sizes<float>(B, M, N);
+            auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
+                reduce_col<InT, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
+                                              reinterpret_cast<const InT *>(input.data_ptr()),
+                                              amax.data_ptr<float>(), B, M, N, ws_size,
+                                              workspace.data_ptr(), stream);
+            });
+
+            // std::cout << "amax: \n" << amax << std::endl;
+            // std::cout << "amax_ref: \n" << amax_ref << std::endl;
+
+            // Scale
             compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()),
                                            fp8_max, reinterpret_cast<float *>(scale.data_ptr()),
                                            reinterpret_cast<float *>(scale_inv.data_ptr()),
                                            amax.numel(), stream);
-
-            int64_t B, M, N;
-            compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
-
+            // Quant
             TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
                 TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
                     quantize_rowwise_col_major_impl<FType, QType, float, false>(
