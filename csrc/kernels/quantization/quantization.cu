@@ -395,7 +395,7 @@ __launch_bounds__(BLOCK_SIZE) __global__
     }
 }
 
-template <typename FType, typename QType, typename ComputeType, bool PreComputeScale>
+template <typename FType, typename QType, typename ComputeType>
 void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
                                      const int64_t batch, const int64_t m, const int64_t n,
                                      hipStream_t stream) {
@@ -462,10 +462,7 @@ DECL_QUANT_ADN_DEQUANT_ROWWISE_ROW_MAJOR_INSTANCE(dtype::float32, dtype::float8_
 #undef DECL_QUANT_ADN_DEQUANT_ROWWISE_INSTANCE
 
 #define DECL_QUANT_AND_DEQUANT_ROWWISE_COL_MAJOR_INSTANCE(FType, QType)                            \
-    template void quantize_rowwise_col_major_impl<FType, QType, float, true>(                      \
-        const FType *x, float *scale, float *scale_inv, QType *y, const int64_t batch,             \
-        const int64_t m, const int64_t n, hipStream_t stream);                                     \
-    template void quantize_rowwise_col_major_impl<FType, QType, float, false>(                     \
+    template void quantize_rowwise_col_major_impl<FType, QType, float>(                            \
         const FType *x, float *scale, float *scale_inv, QType *y, const int64_t batch,             \
         const int64_t m, const int64_t n, hipStream_t stream);
 

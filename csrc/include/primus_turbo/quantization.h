@@ -24,8 +24,7 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
                                      const int64_t outer_len, const int64_t inner_len,
                                      hipStream_t stream);
 
-template <typename FType, typename QType, typename ComputeType = float,
-          bool PreComputeScale = false>
+template <typename FType, typename QType, typename ComputeType = float>
 void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
                                      const int64_t batch, const int64_t m, const int64_t n,
                                      hipStream_t stream);
