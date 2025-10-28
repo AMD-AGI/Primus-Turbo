@@ -162,6 +162,10 @@ FP8 quantization is configured through `Float8QuantConfig`:
 - **granularity**
   - `ScalingGranularity.TENSORWISE` (default)
   - `ScalingGranularity.ROWWISE`
+  - `ScalingGranularity.BLOCKWISE`
+- **block_size**
+  - Specifies the size of each block when using BLOCKWISE granularity.
+  - This parameter must be explicitly specified in BLOCKWISE mode; otherwise, an error will be raised.
 
 ### 3.2 FP8 GEMM
 

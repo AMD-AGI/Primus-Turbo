@@ -32,167 +32,147 @@ from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 __all__ = [
     "grouped_gemm_fp8",
-    "grouped_gemm_fp8_blockwise",
 ]
 
 
-class BlockwiseFP8GroupedGemmFunc(torch.autograd.Function):
+class GroupedGemmFP8BlockFunc(torch.autograd.Function):
+    @staticmethod
+    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
+        if format == Format.E4M3:
+            return float8_e4m3
+        elif format == Format.E5M2:
+            return float8_e5m2
+        else:
+            raise ValueError(f"Unsupported FP8 format: {format}")
+
     @staticmethod
     def forward(
         ctx,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        seg_lens: torch.Tensor,
-        block_size: int = 128,
-        dtype=float8_e4m3,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,  # [B,] int64
+        group_offs: torch.Tensor,  # [B+1,] int64
+        trans_b: bool,
+        config: Float8QuantConfig,
+        num_cu: int | None,
     ):
-        batch_size = seg_lens.size(0)
-        assert batch_size == weight.size(0)
-        seg_indptr = torch.cat([torch.tensor([0], device=seg_lens.device), seg_lens.cumsum(0)])
+        assert config.granularity == ScalingGranularity.BLOCKWISE
+        assert a.ndim == 2, "Input tensor must be 3-dimensions."
+        assert b.ndim == 3, "Weight tensor must be 3-dimensional."
+        assert group_lens.size(0) == b.size(0), "group_lens size must match b size(0)."
+        out_dtype = a.dtype
+        assert out_dtype in [torch.float16, torch.bfloat16]
 
-        # Quantize input activation (row): shape [M, K] → FP8
-        x_fp8_row, x_scales_row = quant_fp8_blockwise_impl(x, dtype, axis=1, block_size=block_size)
-        # Quantize weight blockwise: shape [B, N, K] → FP8
-        w_fp8, w_scales = quant_fp8_blockwise_for_weight_impl(weight, dtype, block_size)
+        a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
+        b_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
+        a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
+            a, a_dtype, axis=1, block_size=config.block_size
+        )
+        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
-        # TODO: Opt
         out = grouped_gemm_fp8_blockwise_impl(
-            x_fp8_row,
-            w_fp8,
-            x_scales_row,
-            w_scales,
-            batch_size,
-            seg_indptr,
-            out_dtype=x.dtype,
+            a_fp8_row,
+            b_fp8,
+            a_scale_inv_row,
+            b_scale_inv,
+            group_lens.size(0),
+            group_offs,
+            out_dtype=out_dtype,
             scale_group_size_m=1,
-            scale_group_size_n=block_size,
-            scale_group_size_k=block_size,
+            scale_group_size_n=config.block_size,
+            scale_group_size_k=config.block_size,
             trans_a=False,
-            trans_b=True,
+            trans_b=trans_b,
         )
 
-        ctx.save_for_backward(x, w_fp8, w_scales, seg_lens, seg_indptr)
-        ctx.batch_size = batch_size
-        ctx.block_size = block_size
-        ctx.dtype = dtype
+        # for bgrad
+        a_scale_inv_col_group_lens = torch.ceil(group_lens.float() / config.block_size).to(group_lens.dtype)
+        a_scale_inv_col_group_offs = torch.cat(
+            [
+                torch.tensor([0], device=group_lens.device),
+                a_scale_inv_col_group_lens.cumsum(0),
+            ]
+        )
+        a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_segment_m_impl(
+            a,
+            group_lens.size(0),
+            group_lens,
+            group_offs,
+            a_scale_inv_col_group_offs,
+            a_dtype,
+            config.block_size,
+        )
+
+        ctx.save_for_backward(
+            a_fp8_col, a_scale_inv_col, b_fp8, b_scale_inv, group_lens, group_offs, a_scale_inv_col_group_offs
+        )
+        ctx.trans_a = False
+        ctx.trans_b = trans_b
+        ctx.config = config
+        ctx.out_dtype = out_dtype
+        ctx.num_cu = num_cu
 
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, w_fp8, w_scales, seg_lens, seg_indptr = ctx.saved_tensors
-        batch_size = ctx.batch_size
-        block_size = ctx.block_size
-        dtype = ctx.dtype
-
-        # quant grad_out
-        grad_out_fp8_row, grad_out_scales_row = quant_fp8_blockwise_impl(
-            grad_out, dtype, axis=1, block_size=block_size
+        a_fp8_col, a_scale_inv_col, b_fp8, b_scale_inv, group_lens, group_offs, a_scale_inv_col_group_offs = (
+            ctx.saved_tensors
         )
 
-        # TODO: Opt
-        # DGrad NN:
-        grad_x = grouped_gemm_fp8_blockwise_impl(
+        # for grad_a
+        grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
+        grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
+            grad_out, grad_out_dtype, axis=1, block_size=ctx.config.block_size
+        )
+        grad_a = grouped_gemm_fp8_blockwise_impl(
             grad_out_fp8_row,
-            w_fp8,
-            grad_out_scales_row,
-            w_scales,
-            batch_size,
-            seg_indptr,
-            out_dtype=grad_out.dtype,
+            b_fp8,
+            grad_out_scale_inv_row,
+            b_scale_inv,
+            group_lens.size(0),
+            group_offs,
+            out_dtype=ctx.out_dtype,
             scale_group_size_m=1,
-            scale_group_size_n=block_size,
-            scale_group_size_k=block_size,
+            scale_group_size_n=ctx.config.block_size,
+            scale_group_size_k=ctx.config.block_size,
             trans_a=False,
-            trans_b=False,
+            trans_b=not ctx.trans_b,
         )
 
-        # TODO: Opt
-        # WGrad TN
-        # grad_w = grad_out.T @ x
-        # [b, n, k] = [m, n] * [m, k]
-        act_scales_col_seg_lens = torch.ceil(seg_lens.float() / block_size).to(seg_lens.dtype)
-        act_scales_col_seg_indptr = torch.cat(
-            [
-                torch.tensor([0], device=seg_lens.device),
-                act_scales_col_seg_lens.cumsum(0),
-            ]
-        )
-
-        x_fp8_col, x_scales_col = quant_fp8_blockwise_segment_m_impl(
-            x,
-            batch_size,
-            seg_lens,
-            seg_indptr,
-            act_scales_col_seg_indptr,
-            dtype,
-            block_size,
-        )
-        grad_out_fp8_col, grad_out_scales_col = quant_fp8_blockwise_segment_m_impl(
+        # for grad_b
+        grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_segment_m_impl(
             grad_out,
-            batch_size,
-            seg_lens,
-            seg_indptr,
-            act_scales_col_seg_indptr,
-            dtype,
-            block_size,
+            group_lens.size(0),
+            group_lens,
+            group_offs,
+            a_scale_inv_col_group_offs,
+            grad_out_dtype,
+            ctx.config.block_size,
+        )
+        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
+        lhs_scale, rhs_scale = (
+            (grad_out_scale_inv_col, a_scale_inv_col)
+            if ctx.trans_b
+            else (a_scale_inv_col, grad_out_scale_inv_col)
         )
 
-        grad_w = grouped_gemm_variable_k_fp8_blockwise_impl(
-            grad_out_fp8_col,
-            x_fp8_col,
-            grad_out_scales_col,
-            x_scales_col,
-            batch_size,
-            seg_indptr,
-            act_scales_col_seg_indptr,
-            out_dtype=grad_out.dtype,
+        grad_b = grouped_gemm_variable_k_fp8_blockwise_impl(
+            lhs,
+            rhs,
+            lhs_scale,
+            rhs_scale,
+            group_lens.size(0),
+            group_offs,
+            a_scale_inv_col_group_offs,
+            out_dtype=ctx.out_dtype,
             scale_group_size_m=1,
             scale_group_size_n=1,
-            scale_group_size_k=block_size,
+            scale_group_size_k=ctx.config.block_size,
             trans_a=True,
             trans_b=False,
         )
-
-        return (
-            grad_x,
-            grad_w,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
-def grouped_gemm_fp8_blockwise(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    seg_lens: torch.Tensor,
-    block_size: int = 128,
-    dtype=float8_e4m3,
-):
-    """
-    Grouped GEMM with FP8 blockwise quantization.
-
-    Args:
-        x (torch.Tensor): Input tensor of shape [M, K], float16/bfloat16.
-        weight (torch.Tensor): Weight tensor of shape [B, N, K], float16/bfloat16.
-        seg_lens (torch.Tensor): Segment lengths of shape [B], int64. Sum should equal M.
-        block_size (int): Block size for quantization. Default: 128.
-        dtype (torch.dtype): FP8 type. Default: turbo.float8_e4m3.
-
-    Returns:
-        torch.Tensor: Output tensor of shape [M, N], same dtype as x.
-
-    Example:
-        >>> x = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-        >>> weight = torch.randn(4, 64, 128, device="cuda", dtype=torch.bfloat16)
-        >>> seg_lens = torch.tensor([64, 64, 64, 64], dtype=torch.long, device="cuda")
-        >>> out = grouped_gemm_fp8_blockwise(x, weight, seg_lens)
-        >>> print(out.shape)  # torch.Size([256, 64])
-    """
-    return BlockwiseFP8GroupedGemmFunc.apply(x, weight, seg_lens, block_size, dtype)
+        return grad_a, grad_b, None, None, None, None, None
 
 
 class GroupedGemmFP8RowFunc(torch.autograd.Function):
@@ -430,6 +410,8 @@ def grouped_gemm_fp8(
         return GroupedGemmFP8TensorFunc.apply(*args)
     elif config.granularity == ScalingGranularity.ROWWISE:
         return GroupedGemmFP8RowFunc.apply(*args)
+    elif config.granularity == ScalingGranularity.BLOCKWISE:
+        return GroupedGemmFP8BlockFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
 
