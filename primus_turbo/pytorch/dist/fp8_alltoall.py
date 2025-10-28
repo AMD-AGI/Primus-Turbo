@@ -17,10 +17,7 @@ from primus_turbo.pytorch.core.float8 import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.kernels.quantize import (
-    dequant_fp8_tensorwise_impl,
-    quant_fp8_tensorwise_impl,
-)
+from primus_turbo.pytorch.ops.quantization import dequantize_fp8, quantize_fp8
 
 __all__ = ["FP8AllToAll"]
 
@@ -99,7 +96,7 @@ class FP8AllToAll(torch.autograd.Function):
             scale, scale_inv = calc_scale_and_scale_inv(input_, torch.finfo(fwd_fp8_dtype).max)
             dist.all_reduce(scale, op=dist.ReduceOp.MIN, group=group)
 
-            input_ = quant_fp8_tensorwise_impl(input_, scale, fwd_fp8_dtype)
+            input_, scale_inv = quantize_fp8(input_, fwd_fp8_dtype, config.granularity, scale=scale)
             input_ = input_.view(torch.uint8)
 
         if output_split_sizes is None:
@@ -135,7 +132,7 @@ class FP8AllToAll(torch.autograd.Function):
                     # recompute scale_inv
                     scale_inv = 1 / scale
 
-                output = dequant_fp8_tensorwise_impl(output, scale_inv, orig_dtype)
+                output = dequantize_fp8(output, orig_dtype, config.granularity, scale_inv=scale_inv)
 
         ctx.config = config
         ctx.group = group
@@ -173,7 +170,7 @@ class FP8AllToAll(torch.autograd.Function):
             scale, scale_inv = calc_scale_and_scale_inv(grad_output, torch.finfo(bwd_fp8_dtype).max)
             dist.all_reduce(scale, op=dist.ReduceOp.MIN, group=ctx.group)
 
-            grad_output = quant_fp8_tensorwise_impl(grad_output, scale, bwd_fp8_dtype)
+            grad_output, scale_inv = quantize_fp8(grad_output, bwd_fp8_dtype, config.granularity, scale=scale)
             grad_output = grad_output.view(torch.uint8)
 
         if ctx.input_split_sizes is None:
@@ -209,7 +206,7 @@ class FP8AllToAll(torch.autograd.Function):
                     # recompute sclae_inv
                     scale_inv = 1 / scale
 
-                dgrad = dequant_fp8_tensorwise_impl(dgrad, scale_inv, orig_dtype)
+                dgrad = dequantize_fp8(dgrad, orig_dtype, config.granularity, scale_inv=scale_inv)
 
         return (
             None,
