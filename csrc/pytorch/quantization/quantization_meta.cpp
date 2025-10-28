@@ -2,7 +2,7 @@
 //
 // See LICENSE for license information.
 
-#include "../extensions.h"
+#include "pytorch/extensions.h"
 
 namespace primus_turbo::pytorch {
 
@@ -27,6 +27,12 @@ std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          inpu
     auto scale_inv =
         at::empty(scale_inv_shape, input.options().dtype(at::kFloat).device(at::kMeta));
     return {input_fp8, scale_inv};
+}
+
+at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                          const at::ScalarType dest_dtype) {
+    at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    return output;
 }
 
 } // namespace primus_turbo::pytorch

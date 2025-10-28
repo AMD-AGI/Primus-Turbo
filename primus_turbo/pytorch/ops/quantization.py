@@ -10,11 +10,13 @@ import torch
 
 from primus_turbo.pytorch.core.float8 import ScalingGranularity
 from primus_turbo.pytorch.kernels.quantization_impl import (
+    dequantize_fp8_rowwise_impl,
+    dequantize_fp8_tensorwise_impl,
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
 )
 
-__all__ = ["quantize_fp8"]
+__all__ = ["quantize_fp8", "dequantize_fp8"]
 
 
 def quantize_fp8(
@@ -46,7 +48,17 @@ def dequantize_fp8(
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
 ):
-    pass
+    """
+    FP8 DeQuantize
+    """
+    if granularity == ScalingGranularity.TENSORWISE:
+        return dequantize_fp8_tensorwise_impl(x, out_dtype, scale_inv)
+    elif granularity == ScalingGranularity.ROWWISE:
+        if axis is None:
+            raise ValueError("axis must be specified for rowwise FP8 de-quantization")
+        return dequantize_fp8_rowwise_impl(x, out_dtype, axis, scale_inv)
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
 
 
 """

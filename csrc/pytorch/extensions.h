@@ -54,6 +54,12 @@ std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          inpu
                                                   const int64_t             axis,
                                                   c10::optional<at::Tensor> scale_opt);
 
+at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                     const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                          const at::ScalarType dest_dtype);
+
 /* GEMM */
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
