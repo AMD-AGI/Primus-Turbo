@@ -101,11 +101,7 @@ class Float8QuantConfig:
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
-            support_block_size = [128]
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
-            assert (
-                self.block_size in support_block_size
-            ), f"block_size should be {support_block_size} when granularity is BLOCKWISE"
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
             mx_support_block_size = [32]

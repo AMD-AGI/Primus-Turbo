@@ -57,6 +57,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         num_cu: int | None,
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
+        assert config.block_size in [128], "Only block_size 128 is supported currently."
         assert a.ndim == 2, "Input tensor must be 3-dimensions."
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         assert group_lens.size(0) == b.size(0), "group_lens size must match b size(0)."
