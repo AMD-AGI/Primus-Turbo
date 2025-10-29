@@ -7,7 +7,7 @@ from pathlib import Path
 from setuptools import find_packages, setup
 
 from tools.build_ext import TurboBuildExt
-from tools.build_utils import HIPExtension, find_rocshmem_library
+from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
 
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
@@ -71,23 +71,16 @@ def get_version():
 
 
 def get_offload_archs():
-    def _get_device_arch():
-        import torch
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("No GPU found!")
-        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()
-
     gpu_archs = os.environ.get("GPU_ARCHS", None)
 
     arch_list = []
     if gpu_archs is None or gpu_archs.strip() == "":
-        arch_list = [_get_device_arch()]
+        arch_list = [get_gpu_arch()]
     else:
         for arch in gpu_archs.split(";"):
             arch = arch.strip().lower()
             if arch == "native":
-                arch = _get_device_arch()
+                arch = get_gpu_arch()
             if arch not in arch_list:
                 arch_list.append(arch)
 

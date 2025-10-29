@@ -5,7 +5,9 @@
 ###############################################################################
 
 import os
+import re
 import shutil
+import subprocess
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,3 +193,28 @@ def find_rocshmem_library() -> Library:
         ],
     )
     return rocshmem_library
+
+
+def get_gpu_arch(gpu_id: int = 0) -> str:
+    GPU_ARCH_PATTERN = re.compile(r"Name:\s*(gfx\d+\w*)")
+    try:
+        result = subprocess.run(
+            ["rocminfo"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("rocminfo not found. Please ensure ROCm is installed.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"rocminfo failed: {e.stderr}")
+
+    matches = GPU_ARCH_PATTERN.findall(result.stdout)
+
+    if not matches:
+        raise RuntimeError("No gfx architecture found in rocminfo output.")
+    if gpu_id >= len(matches):
+        raise IndexError(f"gpu_id {gpu_id} out of range (found {len(matches)} GPUs).")
+
+    return matches[gpu_id].lower()
