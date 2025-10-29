@@ -77,6 +77,20 @@ def _find_library_home(
     return lib_home
 
 
+def find_rocm_home() -> Optional[str]:
+    """Find the ROCm install path."""
+    hipcc_path = shutil.which("hipcc")
+    if hipcc_path is not None:
+        rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
+        if os.path.basename(rocm_home) == "hip":
+            rocm_home = os.path.dirname(rocm_home)
+    else:
+        fallback_path = TURBO_FALLBACK_LIBRARY_HOME
+        if os.path.exists(fallback_path):
+            rocm_home = fallback_path
+    return rocm_home
+
+
 def find_hip_home() -> str:
     return _find_library_home(["HIP_HOME", "HIP_PATH", "HIP_DIR"], ["hipcc"], fallback_path="/opt/rocm")
 

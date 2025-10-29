@@ -138,7 +138,7 @@ jobs:
             rm -rf "${{ env.UT_LOG_PATH }}"
           fi
           unset AITER_ASM_DIR
-          pip3 install torch==2.10.0.dev20251021+rocm7.0 --index-url https://download.pytorch.org/whl/nightly/
+          # pip3 install torch==2.10.0.dev20251021+rocm7.0 --index-url https://download.pytorch.org/whl/nightly/
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
           pytest -v tests/jax --log-cli-level=INFO
