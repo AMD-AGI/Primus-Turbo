@@ -2,11 +2,11 @@ import os
 import warnings
 from typing import Optional
 
-import torch
-from torch.utils import cpp_extension
-
 
 def patch_torch_extension():
+    import torch
+    from torch.utils import cpp_extension
+
     # copy from torchv2.8.0-rc8
     def _get_rocm_arch_flags(cflags: Optional[list[str]] = None) -> list[str]:
         # If cflags is given, there may already be user-provided arch flags in it

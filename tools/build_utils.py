@@ -16,9 +16,15 @@ from typing import List, Optional
 import setuptools
 from hipify_torch.hipify_python import hipify
 
-from .patch import patch_torch_extension
+try:
+    import torch  # noqa: F401
 
-patch_torch_extension()
+    from .patch import patch_torch_extension
+except ImportError:
+    warnings.warn("PyTorch not found, skip patch_torch_extension.", ImportWarning)
+else:
+    # TODO: pytorch version check
+    patch_torch_extension()
 
 
 TURBO_FALLBACK_LIBRARY_HOME = "/opt/rocm"
