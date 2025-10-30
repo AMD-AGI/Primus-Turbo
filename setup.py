@@ -6,16 +6,12 @@ from pathlib import Path
 
 from setuptools import find_packages, setup
 
-from tools.build_ext import TurboBuildExt
+from tools.build_ext import TurboBuildExt, _join_rocm_home
 from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
 
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
-DEFAULT_HIPCC = "/opt/rocm/bin/hipcc"
 
-# try to found rocshmem in default path or enviorment
-ROCSHMEM_LIBRARY = find_rocshmem_library()
-
-# -------- Framework Switches --------
+# -------- Framework Switches ---------
 # PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX"
 PRIMUS_TURBO_FRAMEWORK = [
     fw.strip().upper() for fw in os.environ.get("PRIMUS_TURBO_FRAMEWORK", "PYTORCH").split(";")
@@ -25,6 +21,12 @@ BUILD_JAX = "JAX" in PRIMUS_TURBO_FRAMEWORK
 
 # -------- Supported GPU ARCHS --------
 SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
+
+# -------- ROCSHMEM LIB ---------------
+# try to found rocshmem in default path or enviorment
+ROCSHMEM_LIBRARY = find_rocshmem_library()
+
+# -------------------------------------
 
 
 def all_files_in_dir(path, name_extensions=None):
@@ -39,6 +41,7 @@ def all_files_in_dir(path, name_extensions=None):
 
 
 def setup_cxx_env():
+    DEFAULT_HIPCC = _join_rocm_home("bin", "hipcc")
     user_cxx = os.environ.get("CXX")
     if user_cxx:
         print(f"[Primus-Turbo Setup] Using user-provided CXX: {user_cxx}")
