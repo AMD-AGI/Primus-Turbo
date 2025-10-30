@@ -378,6 +378,15 @@ def _write_ninja_file(
     cuda_dlink_post_cflags = sanitize_flags(cuda_dlink_post_cflags)
     ldflags = sanitize_flags(ldflags)
 
+    # print("***************************************************")
+    # print("cflags\n", cflags)
+    # print("post_cflags\n", post_cflags)
+    # print("cuda_cflags\n", cuda_cflags)
+    # print("cuda_post_cflags\n", cuda_post_cflags)
+    # print("cuda_dlink_post_cflags\n", cuda_dlink_post_cflags)
+    # print("ldflags\n", ldflags)
+    # print("***************************************************")
+
     # Sanity checks...
     if len(sources) != len(objects):
         raise AssertionError("sources and objects lists must be the same length")
@@ -393,12 +402,18 @@ def _write_ninja_file(
         nvcc = _join_rocm_home("bin", "hipcc")
         config.append(f"nvcc = {nvcc}")
 
+    user_enabled_gfx942 = False
+    user_enabled_gfx950 = False
     post_cflags = COMMON_HIP_FLAGS + post_cflags
     flags = [f'cflags = {" ".join(cflags)}']
     flags.append(f'post_cflags = {" ".join(post_cflags)}')
     if with_cuda:
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
+        cuda_post_cflags_gfx942, user_enabled_gfx942 = _filter_compile_arch_args(cuda_post_cflags, "gfx942")
+        flags.append(f'cuda_post_cflags_gfx942 = {" ".join(cuda_post_cflags_gfx942)}')
+        cuda_post_cflags_gfx950, user_enabled_gfx950 = _filter_compile_arch_args(cuda_post_cflags, "gfx950")
+        flags.append(f'cuda_post_cflags_gfx950 = {" ".join(cuda_post_cflags_gfx950)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
 
     # Turn into absolute paths so we can emit them into the ninja build
@@ -412,18 +427,37 @@ def _write_ninja_file(
     compile_rule.append("  deps = gcc")
 
     if with_cuda:
-        cuda_compile_rule = ["rule cuda_compile"]
         nvcc_gendeps = ""
-        cuda_compile_rule.append(
-            f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags"
-        )
+        cuda_compile_rule = [
+            "rule cuda_compile",
+            f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        ]
+        cuda_compile_rule_gfx942 = [
+            "rule cuda_compile_gfx942",
+            f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_gfx942",
+        ]
+        cuda_compile_rule_gfx950 = [
+            "rule cuda_compile_gfx950",
+            f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_gfx950",
+        ]
 
     # Emit one build rule per source to enable incremental build.
     build = []
     for source_file, object_file in zip(sources, objects):
         is_cuda_source = _is_cuda_file(source_file) and with_cuda
         if is_cuda_source:
-            rule = "cuda_compile"
+            if source_file.endswith("_gfx942.cu") or source_file.endswith("_gfx942.hip"):
+                if user_enabled_gfx942:
+                    rule = "cuda_compile_gfx942"
+                else:
+                    continue
+            elif source_file.endswith("_gfx950.cu") or source_file.endswith("_gfx950.hip"):
+                if user_enabled_gfx950:
+                    rule = "cuda_compile_gfx950"
+                else:
+                    continue
+            else:
+                rule = "cuda_compile"
         else:
             rule = "compile"
         source_file = source_file.replace(" ", "$ ")
@@ -451,11 +485,29 @@ def _write_ninja_file(
     blocks = [config, flags, compile_rule]
     if with_cuda:
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_gfx942)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_gfx950)  # type: ignore[possibly-undefined]
+
     blocks += [cuda_devlink_rule, link_rule, build, cuda_devlink, link, default]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
     content += "\n"
     _maybe_write(path, content)
+
+
+def _filter_compile_arch_args(compile_args: list[str], arch: str) -> list[str]:
+    offload_arch = f"--offload-arch={arch.lower()}"
+    macro_arch = f"-DPRIMUS_TURBO_{arch.upper()}"
+    exists = any(a == offload_arch or a == macro_arch for a in compile_args)
+
+    new_compile_args = []
+    for arg in compile_args:
+        if arg.startswith("--offload-arch=") or arg.startswith("-DPRIMUS_TURBO_"):
+            continue
+        new_compile_args.append(arg)
+    new_compile_args.append(offload_arch)
+    new_compile_args.append(macro_arch)
+    return new_compile_args, exists
 
 
 # *****************************************
@@ -464,8 +516,11 @@ def _write_ninja_file(
 
 def _select_base_build_ext():
     try:
+        import torch  # noqa: F401
         from torch.utils.cpp_extension import BuildExtension as TorchBuildExtension
 
+        # Monkey patching
+        torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
         return TorchBuildExtension
     except Exception:
         return BuildExtension
@@ -502,120 +557,20 @@ class TurboBuildExt(BaseBuildExtension):
         return filename
 
     def build_extension(self, ext):
-        if ext.name != self.KERNEL_EXT_NAME:
-            return super().build_extension(ext)
+        super().build_extension(ext)
 
-        build_temp = Path(self.build_temp)
-        build_temp.mkdir(parents=True, exist_ok=True)
+        if ext.name == self.KERNEL_EXT_NAME:
+            built_path = Path(self.get_ext_fullpath(ext.name))
+            filename = built_path.name
 
-        # Args
-        cxx_compile_args = list(ext.extra_compile_args.get("cxx", []))
-        nvcc_compile_args = list(ext.extra_compile_args.get("nvcc", []))
-        include_dirs = list(ext.include_dirs or [])
-        macros = list(ext.define_macros or [])
-        library_dirs = list(ext.library_dirs or [])
-        libraries = list(ext.libraries or [])
-        extra_link_args = list(ext.extra_link_args or [])
+            print(f"[TurboBuildExt] Copied {filename} to:")
 
-        # print("*** cxx_compile_args", cxx_compile_args)
-        # print("*** nvcc_compile_args", nvcc_compile_args)
-        # print("*** include_dirs", include_dirs)
-        # print("*** macros", macros)
-        # print("*** library_dirs", library_dirs)
-        # print("*** libraries", libraries)
-        # print("*** extra_link_args", extra_link_args)
+            src_dst_dir = Path("primus_turbo/lib")
+            src_dst_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(built_path, src_dst_dir / filename)
+            print(f"  -  {src_dst_dir}")
 
-        cxx_srcs = []
-        hip_srcs = []
-        hip_srcs_gfx942 = []
-        hip_srcs_gfx950 = []
-        for source_file in ext.sources:
-            if self._is_hip_src(source_file):
-                if source_file.endswith("_gfx942.cu") or source_file.endswith("_gfx942.hip"):
-                    hip_srcs_gfx942.append(source_file)
-                elif source_file.endswith("_gfx950.cu") or source_file.endswith("_gfx950.hip"):
-                    hip_srcs_gfx950.append(source_file)
-                else:
-                    hip_srcs.append(source_file)
-            else:
-                cxx_srcs.append(source_file)
-
-        objects = []
-        # Compile cxx files
-        if cxx_srcs:
-            cxx_objs = self.compiler.compile(
-                sources=cxx_srcs,
-                output_dir=str(build_temp),
-                include_dirs=include_dirs,
-                extra_postargs=cxx_compile_args,
-                macros=macros,
-                debug=self.debug,
-            )
-            objects.extend(cxx_objs)
-
-        # Compile hip general files
-        if hip_srcs:
-            hip_objs = self.compiler.compile(
-                sources=hip_srcs,
-                output_dir=str(build_temp),
-                include_dirs=include_dirs,
-                extra_postargs=nvcc_compile_args,
-                macros=macros,
-                debug=self.debug,
-            )
-            objects.extend(hip_objs)
-
-        # Compile hip gfx942 files
-        nvcc_compile_args_only_gfx942, has_gfx942_arch = self._filter_nvcc_compile_args(
-            nvcc_compile_args, "gfx942"
-        )
-        if hip_srcs_gfx942 and has_gfx942_arch:
-            hip_objs_gfx942 = self.compiler.compile(
-                sources=hip_srcs_gfx942,
-                output_dir=str(build_temp),
-                include_dirs=include_dirs,
-                extra_postargs=nvcc_compile_args_only_gfx942,
-                macros=macros,
-                debug=self.debug,
-            )
-            objects.extend(hip_objs_gfx942)
-
-        # Compile hip gfx950 files
-        nvcc_compile_args_only_gfx950, has_gfx950_arch = self._filter_nvcc_compile_args(
-            nvcc_compile_args, "gfx950"
-        )
-        if hip_srcs_gfx950 and has_gfx950_arch:
-            hip_objs_gfx950 = self.compiler.compile(
-                sources=hip_srcs_gfx950,
-                output_dir=str(build_temp),
-                include_dirs=include_dirs,
-                extra_postargs=nvcc_compile_args_only_gfx950,
-                macros=macros,
-                debug=self.debug,
-            )
-            objects.extend(hip_objs_gfx950)
-
-        # Link
-        self.compiler.link_shared_object(
-            objects=objects,
-            output_filename=self.get_ext_fullpath(ext.name),
-            library_dirs=library_dirs,
-            libraries=libraries,
-            extra_postargs=extra_link_args,
-            debug=self.debug,
-            target_lang="c++",
-        )
-
-        # Copy to primus_turbo/lib
-        built_path = Path(self.get_ext_fullpath(ext.name))
-        filename = built_path.name
-
-        src_dst_dir = Path("primus_turbo/lib")
-        src_dst_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(built_path, src_dst_dir / filename)
-        build_dst_dir = Path(self.build_lib) / "primus_turbo" / "lib"
-        build_dst_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(built_path, build_dst_dir / filename)
-        print(f"[TurboBuildExt] Copied {filename} to:")
-        print(f"  -  {src_dst_dir}")
-        print(f"  -  {build_dst_dir}")
+            build_dst_dir = Path(self.build_lib) / "primus_turbo" / "lib"
+            build_dst_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(built_path, build_dst_dir / filename)
+            print(f"  -  {build_dst_dir}")

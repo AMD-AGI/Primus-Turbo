@@ -8,11 +8,6 @@ namespace primus_turbo {
 // clang-format off
 #ifdef PRIMUS_TURBO_GFX942
 
-// FP8_E5M2 * FP8_E5M2 = FP16
-APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGEMM_RUNNER_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGemmTileCfg_256x256x128_32x32x32_2x2x1)
-APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGEMM_RUNNER_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1)
-APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGEMM_RUNNER_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
-
 // FP8_E5M2 * FP8_E5M2 = BF16
 APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGEMM_RUNNER_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGemmTileCfg_256x256x128_32x32x32_2x2x1)
 APPLY_CK_GEMM_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGEMM_RUNNER_WITH_ARCH, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1)
