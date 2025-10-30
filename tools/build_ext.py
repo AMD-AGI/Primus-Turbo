@@ -43,6 +43,12 @@ def is_ninja_available():
         return True
 
 
+def verify_ninja_availability():
+    """Raise ``RuntimeError`` if `ninja <https://ninja-build.org/>`_ build system is not available on the system, does nothing otherwise."""
+    if not is_ninja_available():
+        raise RuntimeError("Ninja is required to load C++ extensions (pip install ninja to get it)")
+
+
 def get_cxx_compiler():
     compiler = os.environ.get("CXX", "c++")
     return compiler
@@ -79,7 +85,6 @@ class BuildExtension(build_ext):
             self.force = True
 
     def build_extensions(self) -> None:
-        # TODO: ABI Check
 
         cuda_ext = False
         extension_iter = iter(self.extensions)
@@ -99,12 +104,10 @@ class BuildExtension(build_ext):
                         extension.extra_compile_args[ext] = []
 
             # self._add_compile_flag(extension, '-DTORCH_API_INCLUDE_EXTENSION_H')
-            # self._hipify_compile_flags(extension)
+            self._hipify_compile_flags(extension)
             # self._define_torch_extension_name(extension)
 
         self.compiler.src_extensions += [".cu", ".cuh", ".hip"]
-
-        self.compiler._compile
 
         def append_std17_if_no_std_present(cflags) -> None:
             # NVCC does not allow multiple -std to be passed, so we avoid
@@ -182,12 +185,39 @@ class BuildExtension(build_ext):
             if self.use_ninja:
                 self.compiler.compile = unix_wrap_ninja_compile
             else:
-                pass
-                # self.compiler._compile = unix_wrap_single_compile
+                raise RuntimeError(
+                    "[Primus-Turbo BuildExtension] Non-ninja backend is not supported yet. "
+                    "Please enable ninja to build."
+                )
         else:
-            raise RuntimeError(f"Unsupported compiler type: {self.compiler.compiler_type}")
+            raise RuntimeError(
+                f"[Primus-Turbo BuildExtension] Unsupported compiler type: {self.compiler.compiler_type}"
+            )
 
         build_ext.build_extensions(self)
+
+    # Simple hipify, replace the first occurrence of CUDA with HIP
+    # in flags starting with "-" and containing "CUDA", but exclude -I flags
+    def _hipify_compile_flags(self, extension):
+        if isinstance(extension.extra_compile_args, dict) and "nvcc" in extension.extra_compile_args:
+            modified_flags = []
+            for flag in extension.extra_compile_args["nvcc"]:
+                if flag.startswith("-") and "CUDA" in flag and not flag.startswith("-I"):
+                    # check/split flag into flag and value
+                    parts = flag.split("=", 1)
+                    if len(parts) == 2:
+                        flag_part, value_part = parts
+                        # replace fist instance of "CUDA" with "HIP" only in the flag and not flag value
+                        modified_flag_part = flag_part.replace("CUDA", "HIP", 1)
+                        modified_flag = f"{modified_flag_part}={value_part}"
+                    else:
+                        # replace fist instance of "CUDA" with "HIP" in flag
+                        modified_flag = flag.replace("CUDA", "HIP", 1)
+                    modified_flags.append(modified_flag)
+                    print(f"Modified flag: {flag} -> {modified_flag}")
+                else:
+                    modified_flags.append(flag)
+            extension.extra_compile_args["nvcc"] = modified_flags
 
 
 def _is_cuda_file(path: str) -> bool:
@@ -253,10 +283,12 @@ def _write_ninja_file_and_compile_objects(
     verbose: bool,
     with_cuda: Optional[bool],
 ) -> None:
-    get_cxx_compiler()
+    verify_ninja_availability()
 
     # TODO:
+    # compiler = get_cxx_compiler()
     # get_compiler_abi_compatibility_and_version(compiler)
+
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
     build_file_path = os.path.join(build_directory, "build.ninja")
@@ -531,24 +563,6 @@ BaseBuildExtension = _select_base_build_ext()
 
 class TurboBuildExt(BaseBuildExtension):
     KERNEL_EXT_NAME = "libprimus_turbo_kernels"
-
-    def _is_hip_src(self, p: str) -> bool:
-        p = p.lower()
-        return p.endswith(".cu") or p.endswith(".hip")
-
-    def _filter_nvcc_compile_args(self, nvcc_compile_args: list[str], arch: str) -> list[str]:
-        offload_arch = f"--offload-arch={arch.lower()}"
-        macro_arch = f"-DPRIMUS_TURBO_{arch.upper()}"
-        exists = any(a == offload_arch or a == macro_arch for a in nvcc_compile_args)
-
-        new_nvcc_compile_args = []
-        for arg in nvcc_compile_args:
-            if arg.startswith("--offload-arch=") or arg.startswith("-DPRIMUS_TURBO_"):
-                continue
-            new_nvcc_compile_args.append(arg)
-        new_nvcc_compile_args.append(offload_arch)
-        new_nvcc_compile_args.append(macro_arch)
-        return new_nvcc_compile_args, exists
 
     def get_ext_filename(self, ext_name: str) -> str:
         filename = super().get_ext_filename(ext_name)
