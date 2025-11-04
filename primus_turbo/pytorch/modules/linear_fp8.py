@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 
 from primus_turbo.pytorch.core.float8 import Float8QuantConfig, ScalingGranularity
-from primus_turbo.pytorch.ops.gemm_fp8 import gemm_fp8_blockwise
+from primus_turbo.pytorch.ops.gemm_fp8 import FP8GemmBlockFunction
 
 __all__ = ["MXLinear"]
 
@@ -31,14 +31,8 @@ class MXLinear(torch.nn.Linear):
         self.config = config
 
     def forward(self, x):
-        out = gemm_fp8_blockwise(
-            x,
-            self.weight,
-            trans_a=False,
-            trans_b=True,
-            out_dtype=x.dtype,
-            config=self.config,
-        )
+        # TODO:
+        out = FP8GemmBlockFunction.apply(x, self.weight, False, True, x.dtype, self.config)
         if self.bias is not None:
             out = out + self.bias
         return out
