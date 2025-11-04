@@ -10,26 +10,34 @@ WORKDIR /workspace
 # ───── install dependenies ─────
 RUN apt-get update && \
         apt install -y  rdma-core libibverbs-dev ibverbs-utils
-\
-# ───── Clean up apt cache ─────
-    rm -rf /var/lib/apt/lists/*
+
+# ───── patch llvm for rocm7.0 ─────
+COPY 7.0-deepep.patch /workspace
+
+RUN git clone https://github.com/ROCm/llvm-project.git
+RUN cd llvm-project && \
+    git checkout release/rocm-rel-7.0 && \
+    git am /workspace/7.0-deepep.patch && \
+    mkdir -p /opt/llvm-7.0-patch && mkdir build && cd build && \
+    cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/llvm-7.0-patch \
+    -DLLVM_ENABLE_PROJECTS="clang;lld" \
+    -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+    -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" \
+    -DCLANG_DEFAULT_LINKER=lld \
+    -DLLVM_PARALLEL_LINK_JOBS=4 \
+    ../llvm && \
+    ninja && ninja install
 
 # ───── install rocSHMEM ─────
 RUN git clone https://github.com/ROCm/rocSHMEM.git -b develop
 
+ENV HIP_CLANG_PATH=/opt/llvm-7.0-patch/bin
 
-ENV PATH="/opt/ompi/bin:/opt/ompi/sbin:${PATH}" \
-    LD_LIBRARY_PATH="/opt/ompi/lib:${LD_LIBRARY_PATH}" \
-    C_INCLUDE_PATH="/opt/ompi/include:${C_INCLUDE_PATH}" \
-    CPLUS_INCLUDE_PATH="/opt/ompi/include:${CPLUS_INCLUDE_PATH}" \
-    PKG_CONFIG_PATH="/opt/ompi/lib/pkgconfig:${PKG_CONFIG_PATH}" \
-    MANPATH="/opt/ompi/share/man:${MANPATH}" \
-    CMAKE_C_COMPILER="/opt/ompi/bin/mpicc" \
-    CMAKE_CXX_COMPILER="/opt/ompi/bin/mpicxx"
-
-RUN cd rocrocSHMEM && \
+RUN cd rocSHMEM && \
         mkdir build && cd build && \
-            INSTALL_PREFIX=/opt/rocshmem MPI_ROOT=/opt/ompi UCX_ROOT=/opt/ucx \
+            INSTALL_PREFIX=/opt/rocshmem \
+            MPI_ROOT=/opt/ompi UCX_ROOT=/opt/ucx \
                 ../scripts/build_configs/gda_mlx5 -DGDA_BNXT=ON -DUSE_IPC=ON
 
 

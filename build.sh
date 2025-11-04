@@ -2,23 +2,23 @@
 set -e
 set -x
 
-BASE_IMAGE=${BASE_IMAGE:-docker.io/rocm/primus:v25.9_gfx942}
+BASE_IMAGE=${BASE_IMAGE:-rocm/primus:v25.9_gfx942}
 
-IMAGE_NAME=${IMAGE_NAME:-primus-turbo-deepep:v25.9_gfx942}
+IMAGE_NAME=${IMAGE_NAME:-${BASE_IMAGE}_patch}
 WHEEL_DIR=${WHEEL_DIR:-"dist"}
 
 mkdir -p "${WHEEL_DIR}"
 
-# git submodule update --init --recursive
-
 build_turbo() {
  local WHEEL_DIR=$1
 
- cd 3rdparty/Primus-Turbo
  pip install -r requirements.txt
  export MPI_HOME=/opt/ompi
  export UCX_HOME=/opt/ucx
+ export ROCM_HOME=/opt/rocm-7.0-patch
  export ROCSHMEM_HOME=/opt/rocshmem
+
+ export HIP_CLANG_PATH=/opt/llvm-7.0-patch/bin
 
  python3 setup.py bdist_wheel
 
@@ -28,7 +28,7 @@ build_turbo() {
 
 
 podman build --build-arg BASE_IMAGE="${BASE_IMAGE}" \
-             -t "${IMAGE_NAME}" -f docker/Dockerfile.rocm
+             -t "${IMAGE_NAME}" -f docker/Dockerfile
 
 podman run --rm  \
   --ipc=host \
