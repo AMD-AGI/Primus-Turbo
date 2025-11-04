@@ -13,31 +13,38 @@ from primus_turbo.pytorch.core.float8 import (
     Format,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.modules import MXLinear
+from primus_turbo.pytorch.modules import Float8Linear
 from tests.pytorch.test_utils import compute_snr, get_tolerances
 
+float8_quant_configs = [
+    Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE),
+    Float8QuantConfig(granularity=ScalingGranularity.ROWWISE),
+    Float8QuantConfig(granularity=ScalingGranularity.BLOCKWISE, block_size=128),
+]
 
-# TODO: ori_dtype torch.float32
-@pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("dtype", [Format.E4M3])
-@pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("M", [4096])
-@pytest.mark.parametrize("NK", [(4096, 4096)])
+
+@pytest.mark.parametrize("config", float8_quant_configs)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("M", [128, 4096])
+@pytest.mark.parametrize("N", [256, 4096])
+@pytest.mark.parametrize("K", [512, 2048, 8192])
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
-def test_mxlinear(ori_dtype, dtype, block_size, M, NK, bias, enable_torch_compile):
-    N, K = NK
+def test_float8linear(config, dtype, format, M, N, K, bias, enable_torch_compile):
     device = "cuda:0"
 
+    config.format = format
+
     print(
-        f"\nM={M}, N={N}, K={K}, ori_dtype={ori_dtype}, dtype={dtype}, block_size={block_size}, bias={bias}, Compile={enable_torch_compile}"
+        f"\nM={M}, N={N}, K={K}, dtype={dtype}, bias={bias}, config={config}, torch_compile={enable_torch_compile}"
     )
 
-    x1 = torch.randn((M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    x1 = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
     x2 = x1.detach().clone().requires_grad_()
 
     # Ref
-    model = nn.Linear(K, N, bias=bias).to(device, dtype=ori_dtype)
+    model = nn.Linear(K, N, bias=bias).to(device, dtype=dtype)
     out_ref = model(x1)
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out)
@@ -53,11 +60,10 @@ def test_mxlinear(ori_dtype, dtype, block_size, M, NK, bias, enable_torch_compil
         model.bias.grad.zero_()
     x2.grad = None
 
-    # MX
-    config = Float8QuantConfig(granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
-    MXLinear.from_float(model, config)
-    assert isinstance(model, MXLinear)
+    model = Float8Linear.from_float(model, config)
+    assert isinstance(model, Float8Linear)
     if enable_torch_compile:
+        torch._dynamo.reset()
         model = torch.compile(model, fullgraph=True, mode="max-autotune")
 
     out = model(x2)
@@ -90,4 +96,4 @@ def test_mxlinear(ori_dtype, dtype, block_size, M, NK, bias, enable_torch_compil
     assert wgrad_snr > 20, "wgrad_snr too low"
 
     if bias:
-        torch.testing.assert_close(bias_grad, bias_grad_ref, **get_tolerances(ori_dtype))
+        torch.testing.assert_close(bias_grad, bias_grad_ref, **get_tolerances(dtype))
