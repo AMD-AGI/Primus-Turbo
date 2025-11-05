@@ -24,7 +24,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          hipblasOperation_t transB, void *D, const hipDataType D_type,
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
                          void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream) {
+                         hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
+                         hipStream_t stream) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
@@ -52,24 +53,12 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
         hipblasLtMatmulDescAttributes_t scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
         hipblasLtMatmulDescAttributes_t scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
-#if 0
-        if (use_rowwise) {
-#if 1
-            // New hipblaslt
-            hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            PRIMUS_TURBO_CHECK_HIPBLAS(
-                hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
-                                                &scale_mode, sizeof(scale_mode)));
-            PRIMUS_TURBO_CHECK_HIPBLAS(
-                hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
-                                                &scale_mode, sizeof(scale_mode)));
-#else
-            // New hipblaslt will deprecated HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT
-            scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT;
-            scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER_VEC_EXT;
-#endif
-        }
-#endif
+
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
             operation_desc, scaleA_inv_ptr_desc, &scaleA_inv, sizeof(scaleA_inv)));
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(

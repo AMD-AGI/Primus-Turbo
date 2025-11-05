@@ -19,7 +19,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          hipblasOperation_t transB, void *D, const hipDataType D_type,
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
                          void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         const bool use_rowwise, hipblasLtHandle_t handle, hipStream_t stream);
+                         const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
+                         hipStream_t stream);
 // *****************************************
 
 template <typename AType, typename BType, typename CType, typename ACCType = float>
@@ -42,6 +43,6 @@ struct CKGemmFP8Params {
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           ck_tile::QuantType QuantMode>
-void ck_gemm_fp8(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
+void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
 
 } // namespace primus_turbo

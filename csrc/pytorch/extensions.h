@@ -48,20 +48,28 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
 
 /* GEMM */
 
-at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
-                          const at::ScalarType out_dtype, bool transA, bool transB, bool transC);
+at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
+                          bool transB, bool transC);
 
-at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
-                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                               bool transB, bool transC);
+at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
+                               bool transA, bool transB, bool transC);
 
-at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
-                    const bool transA, const bool transB, at::ScalarType out_dtype,
-                    const std::string &granularity);
+at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                              at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
+                              bool transB, bool transC, const std::string &granularity);
 
-at::Tensor gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
-                         const bool transA, const bool transB, at::ScalarType out_dtype,
-                         const std::string &granularity);
+at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                   at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                   bool transA, bool transB, bool transC,
+                                   const std::string &granularity);
+
+at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
+                       const bool transA, const bool transB, at::ScalarType out_dtype,
+                       const std::string &granularity);
+
+at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                            at::Tensor &b_scales, const bool transA, const bool transB,
+                            at::ScalarType out_dtype, const std::string &granularity);
 
 std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
                                             const std::vector<int64_t> &shape,

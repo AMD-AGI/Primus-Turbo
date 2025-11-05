@@ -7,10 +7,6 @@
 import torch
 
 
-def _empty_tensor(device):
-    return torch.Tensor().to(device)
-
-
 def gemm_impl(
     a: torch.Tensor,
     trans_a: bool,
@@ -24,9 +20,7 @@ def gemm_impl(
 
     args = (
         a,
-        _empty_tensor(device=a.device),
         b,
-        _empty_tensor(device=b.device),
         out_dtype,
         trans_a,
         trans_b,

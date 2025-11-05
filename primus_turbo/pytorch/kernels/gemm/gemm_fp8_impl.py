@@ -247,21 +247,13 @@ def gemm_fp8_impl(
 ) -> torch.Tensor:
     assert backend in ("hipblaslt", "ck"), f"Unsupported backend: {backend}"
 
-    args = (
-        a,
-        a_scale_inv,
-        b,
-        b_scale_inv,
-        out_dtype,
-        trans_a,
-        trans_b,
-        trans_c,
-    )
-
     if backend == "hipblaslt":
-        out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(*args)
+        out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
+            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        )
     elif backend == "ck":
-        out = torch.ops.primus_turbo_cpp_extension.gemm_fp8(
+        out = torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8(
             a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name
         )
+
     return out

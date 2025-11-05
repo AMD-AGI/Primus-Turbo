@@ -8,9 +8,8 @@
 
 namespace primus_turbo::pytorch {
 
-at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
-                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                               bool transB, bool transC) {
+at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
+                               bool transA, bool transB, bool transC) {
     const int64_t m = transA ? A.size(1) : A.size(0);
     const int64_t n = transB ? B.size(0) : B.size(1);
 
@@ -19,9 +18,16 @@ at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
     return at::empty(c_shape, options);
 }
 
-at::Tensor gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
-                         const bool transA, const bool transB, at::ScalarType out_dtype,
-                         const std::string &granularity) {
+at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                   at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                   bool transA, bool transB, bool transC,
+                                   const std::string &granularity) {
+    return hipblaslt_gemm_meta(A, B, out_dtype, transA, transB, transC);
+}
+
+at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                            at::Tensor &b_scales, const bool transA, const bool transB,
+                            at::ScalarType out_dtype, const std::string &granularity) {
     const int64_t m = transA ? a.size(1) : a.size(0);
     const int64_t n = transB ? b.size(0) : b.size(1);
     at::Tensor    c = at::empty({m, n}, at::dtype(out_dtype).device(at::kMeta));
