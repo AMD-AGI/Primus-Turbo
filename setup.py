@@ -37,7 +37,26 @@ def all_files_in_dir(path, name_extensions=None):
             if name_extensions and suffix not in name_extensions:
                 continue
             all_files.append(Path(dirname, name))
-    return all_files
+    return filter_files_by_arch(all_files)
+
+
+def filter_files_by_arch(files):
+    offload_arch_list, _ = get_offload_archs()
+    enabled_gfx942 = "--offload-arch=gfx942" in offload_arch_list
+    enabled_gfx950 = "--offload-arch=gfx950" in offload_arch_list
+
+    filtered_files = []
+    for file in files:
+        file_str = str(file)
+        if file_str.endswith("_gfx942.cu") or file_str.endswith("_gfx942.hip"):
+            if enabled_gfx942:
+                filtered_files.append(file)
+        elif file_str.endswith("_gfx950.cu") or file_str.endswith("_gfx950.hip"):
+            if enabled_gfx950:
+                filtered_files.append(file)
+        else:
+            filtered_files.append(file)
+    return filtered_files
 
 
 def setup_cxx_env():
@@ -273,7 +292,6 @@ def build_jax_extension():
 
 
 if __name__ == "__main__":
-
     # set cxx
     setup_cxx_env()
 

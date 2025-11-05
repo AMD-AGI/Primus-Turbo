@@ -417,6 +417,9 @@ def _write_ninja_file(
     # print("cuda_post_cflags\n", cuda_post_cflags)
     # print("cuda_dlink_post_cflags\n", cuda_dlink_post_cflags)
     # print("ldflags\n", ldflags)
+    # print("sources\n", sources)
+    # print("objects\n", objects)
+    # print("library_target\n", library_target)
     # print("***************************************************")
 
     # Sanity checks...
@@ -434,17 +437,15 @@ def _write_ninja_file(
         nvcc = _join_rocm_home("bin", "hipcc")
         config.append(f"nvcc = {nvcc}")
 
-    user_enabled_gfx942 = False
-    user_enabled_gfx950 = False
     post_cflags = COMMON_HIP_FLAGS + post_cflags
     flags = [f'cflags = {" ".join(cflags)}']
     flags.append(f'post_cflags = {" ".join(post_cflags)}')
     if with_cuda:
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
-        cuda_post_cflags_gfx942, user_enabled_gfx942 = _filter_compile_arch_args(cuda_post_cflags, "gfx942")
+        cuda_post_cflags_gfx942, _ = _filter_compile_arch_args(cuda_post_cflags, "gfx942")
         flags.append(f'cuda_post_cflags_gfx942 = {" ".join(cuda_post_cflags_gfx942)}')
-        cuda_post_cflags_gfx950, user_enabled_gfx950 = _filter_compile_arch_args(cuda_post_cflags, "gfx950")
+        cuda_post_cflags_gfx950, _ = _filter_compile_arch_args(cuda_post_cflags, "gfx950")
         flags.append(f'cuda_post_cflags_gfx950 = {" ".join(cuda_post_cflags_gfx950)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
 
@@ -479,15 +480,9 @@ def _write_ninja_file(
         is_cuda_source = _is_cuda_file(source_file) and with_cuda
         if is_cuda_source:
             if source_file.endswith("_gfx942.cu") or source_file.endswith("_gfx942.hip"):
-                if user_enabled_gfx942:
-                    rule = "cuda_compile_gfx942"
-                else:
-                    continue
+                rule = "cuda_compile_gfx942"
             elif source_file.endswith("_gfx950.cu") or source_file.endswith("_gfx950.hip"):
-                if user_enabled_gfx950:
-                    rule = "cuda_compile_gfx950"
-                else:
-                    continue
+                rule = "cuda_compile_gfx950"
             else:
                 rule = "cuda_compile"
         else:
