@@ -56,10 +56,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
         backend = "hipblaslt" if trans_b else "ck"
 
-        if backend == "ck":
-            assert a.shape[-1] % 128 == 0, "Inner dimension K of a must be multiple of 128 for ck backend"
-            assert b.shape[-1] % 128 == 0, "Inner dimension K of b must be multiple of 128 for ck backend"
-
         out = gemm_fp8_impl(
             a_fp8,
             a_scale_inv,
@@ -152,9 +148,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
         b_fp8_row, b_scale_inv_row = quantize_fp8(
             b, b_dtype, config.granularity, axis=(-1 if trans_b else -2)
         )
-
-        assert a.shape[-1] % 128 == 0, "Inner dimension K of a must be multiple of 128 for ck backend"
-        assert b.shape[-1] % 128 == 0, "Inner dimension K of b must be multiple of 128 for ck backend"
 
         out = gemm_fp8_impl(
             a_fp8_row,
