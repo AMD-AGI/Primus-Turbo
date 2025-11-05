@@ -344,6 +344,46 @@ def gemm_fp8(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float8QuantConfig, None] = None,
 ) -> torch.Tensor:
+    """General matrix multiplication (GEMM) with FP8 quantization, supporting autograd.
+
+    Automatically quantizes inputs to FP8 format during forward and backward passes
+    to accelerate training and inference.
+
+    Args:
+        a: Input matrix A with shape (M, K), must be 2D tensor
+        b: Input matrix B with shape (K, N) or (N, K), must be 2D tensor
+        trans_a: Whether to transpose matrix A
+        trans_b: Whether to transpose matrix B, if True B shape is (N, K)
+        out_dtype: Output data type, defaults to None (auto-inferred)
+        config: FP8 quantization config, defaults to None (uses TENSORWISE + E4M3)
+
+    Returns:
+        torch.Tensor: Output matrix with shape (M, N)
+
+    Scaling Granularity (config.granularity):
+        - TENSORWISE
+        - ROWWISE
+        - BLOCKWISE
+
+    FP8 Format (config.format):
+        - E4M3
+        - E5M2
+
+    Example::
+
+        >>> # Basic usage
+        >>> a = torch.randn(128, 512, device='cuda')
+        >>> b = torch.randn(512, 256, device='cuda')
+        >>> out = gemm_fp8(a, b)
+        >>>
+        >>> # ROWWISE quantization
+        >>> config = Float8QuantConfig(
+        ...     format=Format.E4M3,
+        ...     granularity=ScalingGranularity.ROWWISE
+        ... )
+        >>> out = gemm_fp8(a, b, trans_b=True, config=config)
+
+    """
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
 
     if out_dtype is None:
