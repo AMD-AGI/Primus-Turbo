@@ -385,7 +385,8 @@ def gemm_fp8(
 
     """
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
-
+    assert a.shape[-1] % 128 == 0, "Inner dimension K of a must be multiple of 128"
+    assert b.shape[-1] % 128 == 0, "Inner dimension K of b must be multiple of 128"
     if out_dtype is None:
         out_dtype = torch.result_type(a, b)
 

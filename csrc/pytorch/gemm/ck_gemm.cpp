@@ -46,7 +46,6 @@ at::Tensor gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tens
     const int64_t m = transA ? a.size(1) : a.size(0);
     const int64_t k = transA ? a.size(0) : a.size(1);
     const int64_t n = transB ? b.size(0) : b.size(1);
-    PRIMUS_TURBO_CHECK(k % 128 == 0, "Inner dimension K must be multiple of 128");
 
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();

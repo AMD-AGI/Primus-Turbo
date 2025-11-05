@@ -18,7 +18,7 @@ from tests.pytorch.test_utils import compute_snr
 torch.manual_seed(42)
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
