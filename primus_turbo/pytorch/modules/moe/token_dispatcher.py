@@ -224,10 +224,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
 
-        if self.tokens_per_expert is not None:
-            assert (
-                self.tokens_per_expert.device.type == "cpu"
-            ), "tokens_per_expert must be cpu tensor returned by DeepEP"
+        if self.tokens_per_expert.numel() > 0:
             num_out_tokens = self.tokens_per_expert.sum().item()
         elif self.permute_max_token_num > 0:
             num_out_tokens = self.permute_max_token_num
