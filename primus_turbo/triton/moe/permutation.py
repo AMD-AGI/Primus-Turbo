@@ -147,10 +147,10 @@ def _row_id_map_pass_2_kernel(
 
     # last block compute tokens_per_experts
     if tokens_per_expert_ptr and pid_n == 0:
-        col_offset = tl.arange(0, NUM_OF_BLOCK_TOKEN) + pid_m * tl.cdiv(num_tokens, BLOCK_SIZE)
-        col_tensor = tl.load(
-            workspace_ptr + col_offset, mask=col_offset < tl.num_programs(0) * tl.cdiv(num_tokens, BLOCK_SIZE)
-        )
+        t = tl.cdiv(num_tokens, BLOCK_SIZE)
+        col_offset = tl.arange(0, NUM_OF_BLOCK_TOKEN) + pid_m * t
+        mask = col_offset < min(t + pid_m * t, tl.num_programs(0) * t)
+        col_tensor = tl.load(workspace_ptr + col_offset, mask=mask, other=0)
         tl.store(tokens_per_expert_ptr + pid_m, tl.sum(col_tensor))
 
 
@@ -279,7 +279,7 @@ def make_row_id_map(
         num_tokens,
         row_id_map.stride(0),
         row_id_map.stride(1),
-        triton.cdiv(num_tokens, block_size),
+        triton.next_power_of_2(triton.cdiv(num_tokens, block_size)),
         triton.next_power_of_2(num_experts * triton.cdiv(num_tokens, block_size)),
         block_size,
     )
