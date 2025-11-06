@@ -421,7 +421,6 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            # assert num_worst_tokens == 0, "Internode dispatch does not support `num_worst_tokens > 0`"
             return self.internode_dispatch(
                 x,
                 handle,
@@ -796,6 +795,7 @@ class Buffer:
             rdma_channel_prefix_matrix,
             rdma_rank_prefix_sum,
             gbl_channel_prefix_matrix,
+            gbl_rank_prefix_sum,
             send_rdma_head,
             send_nvl_head,
             config,

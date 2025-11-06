@@ -1419,11 +1419,11 @@ __launch_bounds__((NUM_MAX_NVL_PEERS + kNumForwarders) * kEmulatedWarpSize + kWa
             const int4 *x, const float *topk_weights, const int4 *bias_0, const int4 *bias_1,
             const int *combined_rdma_head, const int *combined_nvl_head, const SourceMeta *src_meta,
             const int *rdma_channel_prefix_matrix, const int *rdma_rank_prefix_sum,
-            const int *gbl_channel_prefix_matrix, int num_tokens, int num_combined_tokens,
-            int hidden, int num_topk, void *rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
-            int num_max_rdma_chunked_recv_tokens, void **buffer_ptrs,
-            int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank,
-            int num_ranks) {
+            const int *gbl_channel_prefix_matrix, const int *gbl_rank_prefix_sum, int num_tokens,
+            int num_combined_tokens, int hidden, int num_topk, void *rdma_buffer_ptr,
+            int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+            void **buffer_ptrs, int num_max_nvl_chunked_send_tokens,
+            int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
     const auto sm_id       = static_cast<int>(blockIdx.x);
@@ -1432,6 +1432,9 @@ __launch_bounds__((NUM_MAX_NVL_PEERS + kNumForwarders) * kEmulatedWarpSize + kWa
     auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id() % kEmulatedWarpSize;
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_rdma_receiver_sm = sm_id % 2 == 1;
+
+    if (gbl_rank_prefix_sum != nullptr)
+        num_tokens = gbl_rank_prefix_sum[num_ranks - 1];
 
     __shared__ rocshmem::rocshmem_ctx_t ctx;
     rocshmem::rocshmem_wg_ctx_create(0, &ctx);
@@ -2030,11 +2033,12 @@ void combine(hipDataType type, void *combined_x, float *combined_topk_weights,
              const void *bias_0, const void *bias_1, const int *combined_rdma_head,
              const int *combined_nvl_head, const void *src_meta,
              const int *rdma_channel_prefix_matrix, const int *rdma_rank_prefix_sum,
-             const int *gbl_channel_prefix_matrix, int num_tokens, int num_combined_tokens,
-             int hidden, int num_topk, void *rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
-             int num_max_rdma_chunked_recv_tokens, void **buffer_ptrs,
-             int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank,
-             int num_ranks, hipStream_t stream, int num_channels, bool low_latency_mode) {
+             const int *gbl_channel_prefix_matrix, const int *gbl_rank_prefix_sum, int num_tokens,
+             int num_combined_tokens, int hidden, int num_topk, void *rdma_buffer_ptr,
+             int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+             void **buffer_ptrs, int num_max_nvl_chunked_send_tokens,
+             int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks, hipStream_t stream,
+             int num_channels, bool low_latency_mode) {
     constexpr int kNumCombineForwarderWarps = 16;
 
 #define COMBINE_LAUNCH_CASE(num_rdma_ranks)                                                        \
@@ -2049,9 +2053,10 @@ void combine(hipDataType type, void *combined_x, float *combined_topk_weights,
             reinterpret_cast<const int4 *>(bias_0), reinterpret_cast<const int4 *>(bias_1),        \
             combined_rdma_head, combined_nvl_head, reinterpret_cast<const SourceMeta *>(src_meta), \
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,           \
-            num_tokens, num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,                    \
-            num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, buffer_ptrs,       \
-            num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, rank, num_ranks);    \
+            gbl_rank_prefix_sum, num_tokens, num_combined_tokens, hidden, num_topk,                \
+            rdma_buffer_ptr, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens,   \
+            buffer_ptrs, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, rank,   \
+            num_ranks);                                                                            \
     }                                                                                              \
     break
 

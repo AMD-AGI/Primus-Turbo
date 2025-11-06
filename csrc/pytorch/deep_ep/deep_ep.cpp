@@ -1151,9 +1151,11 @@ Buffer::internode_combine(
     const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
     const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
     const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
-    const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
-    const torch::Tensor &combined_nvl_head, const primus_turbo::deep_ep::Config &config,
-    std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream) {
+    const torch::Tensor                &gbl_channel_prefix_matrix,
+    const std::optional<torch::Tensor> &gbl_rank_prefix_sum,
+    const torch::Tensor &combined_rdma_head, const torch::Tensor &combined_nvl_head,
+    const primus_turbo::deep_ep::Config &config, std::optional<EventHandle> &previous_event,
+    bool async, bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
     const int num_channels = config.num_sms / 2;
     PRIMUS_TURBO_CHECK(config.num_sms % 2 == 0);
@@ -1258,18 +1260,21 @@ Buffer::internode_combine(
         }
 
     // Launch data combine
-    auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    auto       combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    const int *gbl_rank_prefix_sum_ptr =
+        gbl_rank_prefix_sum.has_value() ? gbl_rank_prefix_sum->data_ptr<int>() : nullptr;
     primus_turbo::deep_ep::internode::combine(
         at::cuda::ScalarTypeToCudaDataType(x.scalar_type()), combined_x.data_ptr(),
         combined_topk_weights_ptr, is_combined_token_in_rank.data_ptr<bool>(), x.data_ptr(),
         topk_weights_ptr, bias_ptrs[0], bias_ptrs[1], combined_rdma_head.data_ptr<int>(),
         combined_nvl_head.data_ptr<int>(), src_meta.data_ptr(),
         rdma_channel_prefix_matrix.data_ptr<int>(), rdma_rank_prefix_sum.data_ptr<int>(),
-        gbl_channel_prefix_matrix.data_ptr<int>(), num_tokens, num_combined_tokens, hidden,
-        num_topk, rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens,
-        config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens, rank,
-        num_ranks, comm_stream, num_channels, low_latency_mode);
+        gbl_channel_prefix_matrix.data_ptr<int>(), gbl_rank_prefix_sum_ptr, num_tokens,
+        num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,
+        config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream, num_channels,
+        low_latency_mode);
 
     // Wait streams
     std::optional<EventHandle> event;

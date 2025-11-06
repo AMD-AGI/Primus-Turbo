@@ -130,11 +130,12 @@ void combine(hipDataType type, void *combined_x, float *combined_topk_weights,
              const void *bias_0, const void *bias_1, const int *combined_rdma_head,
              const int *combined_nvl_head, const void *src_meta,
              const int *rdma_channel_prefix_matrix, const int *rdma_rank_prefix_sum,
-             const int *gbl_channel_prefix_matrix, int num_tokens, int num_combined_tokens,
-             int hidden, int num_topk, void *rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
-             int num_max_rdma_chunked_recv_tokens, void **buffer_ptrs,
-             int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank,
-             int num_ranks, hipStream_t stream, int num_channels, bool low_latency_mode);
+             const int *gbl_channel_prefix_matrix, const int *gbl_rank_prefix_sum, int num_tokens,
+             int num_combined_tokens, int hidden, int num_topk, void *rdma_buffer_ptr,
+             int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+             void **buffer_ptrs, int num_max_nvl_chunked_send_tokens,
+             int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks, hipStream_t stream,
+             int num_channels, bool low_latency_mode);
 
 } // namespace internode
 } // namespace primus_turbo::deep_ep
