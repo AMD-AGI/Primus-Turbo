@@ -111,8 +111,8 @@ __global__ void
 notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
                 const int *num_tokens_per_rdma_rank, int *moe_recv_rdma_counter_mapped,
                 const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
-                int64_t *moe_recv_tokens_per_experts, int num_experts, const bool *is_token_in_rank,
-                int num_tokens, int num_channels, int expert_alignment, const int rdma_clean_offset,
+                int num_experts, const bool *is_token_in_rank, int num_tokens, int num_worst_tokens,
+                int num_channels, int expert_alignment, const int rdma_clean_offset,
                 const int rdma_num_int_clean, const int nvl_clean_offset,
                 const int nvl_num_int_clean, int *rdma_channel_prefix_matrix,
                 int *recv_rdma_rank_prefix_sum, int *gbl_channel_prefix_matrix,
@@ -223,9 +223,12 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
                     rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + num_rdma_experts];
                 recv_rdma_rank_prefix_sum[i] = sum;
             }
-            while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
-                ;
-            *moe_recv_rdma_counter_mapped = sum;
+
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
+                    ;
+                *moe_recv_rdma_counter_mapped = sum;
+            }
         }
 
         // Send numbers of tokens per rank/expert to NVL ranks
@@ -263,10 +266,12 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
                 sum += nvl_recv_num_tokens_per_expert.buffer(i)[thread_id];
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
-            while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1)
-                ;
-            moe_recv_expert_counter_mapped[thread_id] = sum;
-            moe_recv_tokens_per_experts[thread_id]    = sum;
+
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1)
+                    ;
+                moe_recv_expert_counter_mapped[thread_id] = sum;
+            }
         }
 
         // Finally barrier
@@ -336,15 +341,15 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
                      const int *num_tokens_per_rdma_rank, int *moe_recv_rdma_counter_mapped,
                      const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
-                     int64_t *moe_recv_tokens_per_experts, int num_experts,
-                     const bool *is_token_in_rank, int num_tokens, int num_channels,
-                     int hidden_int4, int num_scales, int num_topk, int expert_alignment,
-                     int *rdma_channel_prefix_matrix, int *recv_rdma_rank_prefix_sum,
-                     int *gbl_channel_prefix_matrix, int *recv_gbl_rank_prefix_sum,
-                     void *rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
-                     void **buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
-                     int **barrier_signal_ptrs, int rank, hipStream_t stream,
-                     int64_t num_rdma_bytes, int64_t num_nvl_bytes, bool low_latency_mode) {
+                     int num_experts, const bool *is_token_in_rank, int num_tokens,
+                     int num_worst_tokens, int num_channels, int hidden_int4, int num_scales,
+                     int num_topk, int expert_alignment, int *rdma_channel_prefix_matrix,
+                     int *recv_rdma_rank_prefix_sum, int *gbl_channel_prefix_matrix,
+                     int *recv_gbl_rank_prefix_sum, void *rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens, void **buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens, int **barrier_signal_ptrs, int rank,
+                     hipStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
+                     bool low_latency_mode) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                \
     {                                                                                              \
         auto notify_dispatch_func = low_latency_mode ? notify_dispatch<true, num_rdma_ranks>       \
@@ -352,8 +357,8 @@ void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mappe
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, notify_dispatch_func, num_tokens_per_rank, moe_recv_counter_mapped, num_ranks,   \
             num_tokens_per_rdma_rank, moe_recv_rdma_counter_mapped, num_tokens_per_expert,         \
-            moe_recv_expert_counter_mapped, moe_recv_tokens_per_experts, num_experts,              \
-            is_token_in_rank, num_tokens, num_channels, expert_alignment, rdma_clean_meta.first,   \
+            moe_recv_expert_counter_mapped, num_experts, is_token_in_rank, num_tokens,             \
+            num_worst_tokens, num_channels, expert_alignment, rdma_clean_meta.first,               \
             rdma_clean_meta.second, nvl_clean_meta.first, nvl_clean_meta.second,                   \
             rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix,      \
             recv_gbl_rank_prefix_sum, rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,     \

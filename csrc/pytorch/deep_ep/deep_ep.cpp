@@ -364,7 +364,7 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
            std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+           torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::intranode_dispatch(
     const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
     const std::optional<torch::Tensor> &topk_idx, const std::optional<torch::Tensor> &topk_weights,
@@ -481,9 +481,6 @@ Buffer::intranode_dispatch(
     auto             rank_prefix_matrix    = torch::Tensor();
     auto             channel_prefix_matrix = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
-    torch::Tensor    num_recv_tokens_per_expert = torch::empty(
-        {num_local_experts}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
-
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
     int num_memset_int = num_channels * num_ranks * 4;
@@ -516,9 +513,8 @@ Buffer::intranode_dispatch(
                                                 sizeof(int)) <= num_nvl_bytes);
         primus_turbo::deep_ep::intranode::notify_dispatch(
             num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
-            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped,
-            num_recv_tokens_per_expert.data_ptr<int64_t>(), num_experts, num_tokens,
-            is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
+            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped, num_experts,
+            num_tokens, is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, expert_alignment, buffer_ptrs_gpu,
             barrier_signal_ptrs_gpu, rank, comm_stream, num_channels);
 
@@ -646,7 +642,6 @@ Buffer::intranode_dispatch(
             recv_topk_idx,
             recv_topk_weights,
             num_recv_tokens_per_expert_list,
-            num_recv_tokens_per_expert,
             rank_prefix_matrix,
             channel_prefix_matrix,
             recv_channel_prefix_matrix,
@@ -790,9 +785,9 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
            std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
-           torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>,
-           torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>, std::optional<EventHandle>>
+           std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
+           std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+           std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                            const std::optional<torch::Tensor> &topk_idx,
                            const std::optional<torch::Tensor> &topk_weights,
@@ -937,8 +932,6 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
     auto             gbl_channel_prefix_matrix  = torch::Tensor();
     auto             recv_gbl_rank_prefix_sum   = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
-    torch::Tensor    num_recv_tokens_per_expert = torch::empty(
-        {num_local_experts}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
 
     // Barrier or send sizes
     if (cached_mode) {
@@ -975,13 +968,12 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         primus_turbo::deep_ep::internode::notify_dispatch(
             num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
             num_tokens_per_rdma_rank->data_ptr<int>(), moe_recv_rdma_counter_mapped,
-            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped,
-            num_recv_tokens_per_expert.data_ptr<int64_t>(), num_experts,
-            is_token_in_rank.data_ptr<bool>(), num_tokens, num_channels, hidden_int4, num_scales,
-            num_topk, expert_alignment, rdma_channel_prefix_matrix.data_ptr<int>(),
-            recv_rdma_rank_prefix_sum.data_ptr<int>(), gbl_channel_prefix_matrix.data_ptr<int>(),
-            recv_gbl_rank_prefix_sum.data_ptr<int>(), rdma_buffer_ptr,
-            config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
+            num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped, num_experts,
+            is_token_in_rank.data_ptr<bool>(), num_tokens, num_worst_tokens, num_channels,
+            hidden_int4, num_scales, num_topk, expert_alignment,
+            rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
+            gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
+            rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
             config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, comm_stream,
             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
             low_latency_mode);
@@ -1126,7 +1118,6 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             recv_topk_idx,
             recv_topk_weights,
             num_recv_tokens_per_expert_list,
-            num_recv_tokens_per_expert,
             rdma_channel_prefix_matrix,
             gbl_channel_prefix_matrix,
             recv_rdma_channel_prefix_matrix,
