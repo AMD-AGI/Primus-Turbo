@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 
 import primus_turbo.pytorch._C.dist as turbo_dist
 
@@ -11,10 +12,12 @@ def dma_all_gather_into_tensor(
         async_op=False):
 
     group = group or dist.group.WORLD
+    group_tag = c10d._get_group_tag(group)
     work = turbo_dist.dma_all_gather_into_tensor(
         output_tensor,
         input_tensor,
         group,
+        group_tag,
     )
     if async_op:
         return work

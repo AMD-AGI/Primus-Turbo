@@ -91,7 +91,6 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
         if (sharedMemoryCreate(shm_name.c_str(), sizeof(AllGatherShmStruct), info) != 0) {
             throw std::runtime_error("Failed to create allgather handle.");
         }
-
         volatile AllGatherShmStruct *shm = nullptr;
         shm                              = (volatile AllGatherShmStruct *) info->addr;
 
