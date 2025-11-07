@@ -11,6 +11,8 @@
 #include <ATen/miopen/Handle.h>
 #include <ATen/native/DispatchStub.h>
 #include <c10/macros/Macros.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -136,8 +138,8 @@ int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint3
 void destroy_stream(const int device_id, const int64_t stream_ptr);
 
 /* Torch Distributed */
-void dma_all_gather_into_tensor_nobuffer(uintptr_t handle_ptr, torch::Tensor output_tensor,
-                                         torch::Tensor input_tensor, size_t group_rank,
-                                         size_t group_world_size, uintptr_t stream_ptr);
+c10::intrusive_ptr<c10d::Work>
+dma_all_gather_into_tensor(at::Tensor output_tensor, const at::Tensor input_tensor,
+                           c10::intrusive_ptr<c10d::ProcessGroup> pg);
 
 } // namespace primus_turbo::pytorch
