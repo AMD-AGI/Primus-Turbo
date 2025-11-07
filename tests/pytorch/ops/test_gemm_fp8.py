@@ -137,3 +137,16 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+if __name__ == "__main__":
+    test_gemm_fp8_blockwise(
+        m=768,
+        n=1024,
+        k=2048,
+        layout="NT",
+        format=Format.E4M3,
+        dtype=torch.bfloat16,
+        granularity=ScalingGranularity.BLOCKWISE,
+        block_size=128,
+    )

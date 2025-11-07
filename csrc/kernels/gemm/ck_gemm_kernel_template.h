@@ -43,6 +43,13 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           typename AccDataType = float>
 class CKQuantGemmRunner : public CKGemmRunnerInterFace {
 public:
+    // Static assertion: ABQuantGrouped only supports RowMajor × ColMajor layout
+    static_assert(
+        QuantMode != ck_tile::QuantType::ABQuantGrouped ||
+            (std::is_same_v<ALayout, ck_tile::tensor_layout::gemm::RowMajor> &&
+             std::is_same_v<BLayout, ck_tile::tensor_layout::gemm::ColumnMajor>),
+        "ABQuantGrouped (BLOCKWISE) only supports RowMajor × ColMajor layout (NT layout)");
+
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<TileConfig::M_Tile, TileConfig::N_Tile, TileConfig::K_Tile>,
         ck_tile::sequence<TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::K_Warp>,
@@ -57,12 +64,33 @@ public:
         false /*PreshuffleB*/, ALayout, BLayout, CLayout, QuantMode, AQLayout, BQLayout,
         false /*TransposeC*/, false /*DoubleSmemBuffer*/, false /*UsePersistentKernel*/>;
 
-    using QuantGemmProblem =
+    // Select appropriate Problem and Pipeline based on QuantMode
+    // For RowColQuant and TensorQuant, use GemmRowColTensorQuantPipelineProblem +
+    // GemmPipelineAgBgCrCompV3 For ABQuantGrouped, use GemmABQuantPipelineProblem +
+    // ABQuantGemmPipelineAgBgCrCompV3
+    using QuantGemmProblem = std::conditional_t<
+        QuantMode == ck_tile::QuantType::RowColQuant ||
+            QuantMode == ck_tile::QuantType::TensorQuant,
         ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType, BDataType, AccDataType,
-                                                      AccDataType, GemmShape, GemmUniversalTraits>;
+                                                      AccDataType, GemmShape, GemmUniversalTraits>,
+        ck_tile::GemmABQuantPipelineProblem<
+            ADataType,           // ADataType
+            AccDataType,         // AQDataType: same as AccDataType
+            BDataType,           // BDataType
+            AccDataType,         // BQDataType: same as AccDataType
+            AccDataType,         // CDataType (accumulator)
+            GemmShape,           // BlockGemmShape
+            GemmUniversalTraits, // Traits
+            ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>,   // AQuantGroupSize
+            ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>, // BQuantGroupSize
+            false /*TransposeC*/>>;
 
-    // V3
-    using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;
+    // V3: Select appropriate Pipeline based on QuantMode
+    using GemmPipeline =
+        std::conditional_t<QuantMode == ck_tile::QuantType::RowColQuant ||
+                               QuantMode == ck_tile::QuantType::TensorQuant,
+                           ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>,
+                           ck_tile::ABQuantGemmPipelineAgBgCrCompV3<QuantGemmProblem>>;
 
     static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<ck_tile::CShuffleEpilogueProblem<
@@ -105,7 +133,8 @@ class CKQuantGemmRunnerWithArch
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
-    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
 
 // ***********************************************************************************
 // clang-format off

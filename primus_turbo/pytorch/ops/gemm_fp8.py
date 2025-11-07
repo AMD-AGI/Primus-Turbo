@@ -268,7 +268,21 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             trans_a=trans_a,
             trans_b=trans_b,
         )
-
+        out_ck = gemm_fp8_impl(
+            a_fp8_row,
+            a_scale_inv_row,
+            trans_a,
+            b_fp8,
+            b_scale_inv,  # Don't transpose: (N//128, K//128) RowMajor == (K//128, N//128) ColMajor
+            trans_b,
+            out_dtype,
+            False,
+            backend="ck",
+            granularity=config.granularity,
+        )
+        print(out)
+        print(out_ck)
+        print(torch.matmul(a, b))
         ctx.save_for_backward(a, b_fp8, b_scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
