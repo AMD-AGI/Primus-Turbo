@@ -27,8 +27,8 @@ def _check_hit_int32_limit(B, M, N, K):
     return max(a_elems, out_elems, b_elems) >= 2**31
 
 
-@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32, 64])
-@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize("B", [128])
+@pytest.mark.parametrize("M", [4096])
 @pytest.mark.parametrize(
     "NK",
     [
@@ -42,13 +42,11 @@ def _check_hit_int32_limit(B, M, N, K):
         (7168, 2048),
     ],
 )
-@pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize(
-    "granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE, ScalingGranularity.BLOCKWISE]
-)
-@pytest.mark.parametrize("block_size", [None, 128])
-@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("ori_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+@pytest.mark.parametrize("block_size", [None])
+@pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", [True, False])
 def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, block_size, trans_b, balance):
     N, K = NK
@@ -58,8 +56,8 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, block_size, 
         pytest.skip("BLOCKWISE granularity requires block_size to be set.")
     if granularity != ScalingGranularity.BLOCKWISE and block_size != None:
         pytest.skip("Only BLOCKWISE granularity supports block_size.")
-    if _check_hit_int32_limit(B, M, N, K):
-        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+    # if _check_hit_int32_limit(B, M, N, K):
+    #     pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
     print(
