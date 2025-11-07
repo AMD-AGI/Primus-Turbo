@@ -156,6 +156,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
     runtime_module.def("destroy_stream", &destroy_stream);
+
+    auto dist = m.def_submodule("dist", "Distributed operations");
+    dist.def("dma_all_gather_into_tensor_nobuffer", &dma_all_gather_into_tensor_nobuffer);
 }
 
 /********************************************/
