@@ -47,19 +47,25 @@ class AllGatherTestCase(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @parametrize("dtype", [torch.float32])
-    def test_fp8_alltoall(
+    def test_dma_all_gather(
         self,
         dtype: torch.dtype,
     ) -> None:
         self._init_process()
 
-        num_elems = 1024
+        num_elems = 16 * 1024 * 1024
         input_tensor = torch.full(
             [num_elems], self.rank, dtype=dtype, device=self.device)
         output_tensor = torch.zeros(
             [num_elems * self.world_size], dtype=dtype, device=self.device)
+        output_tensor_ref = torch.ones(
+            [num_elems * self.world_size], dtype=dtype, device=self.device)
+
+        dist.all_gather_into_tensor(output_tensor_ref, input_tensor)
         dma_all_gather_into_tensor(output_tensor, input_tensor)
-        print(output_tensor)
+
+        torch.testing.assert_close(
+            output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
         pass
 
 

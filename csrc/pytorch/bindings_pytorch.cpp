@@ -158,7 +158,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     runtime_module.def("destroy_stream", &destroy_stream);
 
     auto dist = m.def_submodule("dist", "Distributed operations");
-    dist.def("dma_all_gather_into_tensor_nobuffer", &dma_all_gather_into_tensor_nobuffer);
+    dist.def("dma_all_gather_into_tensor", &dma_all_gather_into_tensor);
 }
 
 /********************************************/
