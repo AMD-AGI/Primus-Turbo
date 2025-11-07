@@ -135,4 +135,9 @@ int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint3
 
 void destroy_stream(const int device_id, const int64_t stream_ptr);
 
+/* Torch Distributed */
+void dma_all_gather_into_tensor_nobuffer(uintptr_t handle_ptr, torch::Tensor output_tensor,
+                                         torch::Tensor input_tensor, size_t group_rank,
+                                         size_t group_world_size, uintptr_t stream_ptr);
+
 } // namespace primus_turbo::pytorch
