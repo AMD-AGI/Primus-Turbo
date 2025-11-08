@@ -305,7 +305,7 @@ if __name__ == "__main__":
     # Entry points and Install Requires
     entry_points = {}
     install_requires = [
-        "aiter @ git+https://github.com/ROCm/aiter.git@a0b424d3848f461b2d94d9e3d1d329bd18f4d3b9",
+        "aiter @ git+https://github.com/ROCm/aiter.git@a25cb58ee4ee97cb5ad4b426b648a8e66103d706",
         "hip-python",
     ]
     if BUILD_JAX:

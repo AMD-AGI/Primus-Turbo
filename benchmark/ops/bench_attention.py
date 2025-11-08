@@ -16,16 +16,14 @@ from tests.pytorch.ref.attention_ref import (
 from tests.pytorch.test_utils import compute_snr
 
 test_cases_turbo = [
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
+    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(
         seqlen_q=4096, seqlen_kv=4096, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128
     ),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 test_cases_flash_attn = [
