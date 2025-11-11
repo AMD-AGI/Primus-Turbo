@@ -12,10 +12,10 @@
 #include <iostream>
 #include <thread>
 
-namespace primus_turbo::pytorch {
+namespace primus_turbo::pytorch::dist {
 
-static hipStream_t copy_streams_g[MAX_DEVICES];
-static hipEvent_t  copy_events_g[MAX_DEVICES];
+// static hipStream_t copy_streams_g[MAX_DEVICES];
+// static hipEvent_t  copy_events_g[MAX_DEVICES];
 
 static void reusable_barrier(volatile std::atomic<int> &barrier, volatile std::atomic<int> &sense,
                              unsigned int n) {
@@ -89,7 +89,7 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
             shm->is_first_run[i] = true;
             shm->entry_events[i] = nullptr;
             shm->exit_events[i]  = nullptr;
-            copy_streams_g[i]    = nullptr;
+            // copy_streams_g[i]    = nullptr;
 
             // shm->output_mem_handles[i] = nullptr;
             // shm->remote_base_mem_handles[i] = nullptr;
@@ -164,18 +164,18 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
         shm->exit_events[group_rank] = nullptr;
     }
 
-    for (size_t i = 0; i < MAX_DEVICES; ++i) {
+    // for (size_t i = 0; i < MAX_DEVICES; ++i) {
 
-        if (copy_events_g[i] != nullptr) {
-            PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events_g[i]));
-            copy_events_g[i] = nullptr;
-        }
+        // if (copy_events_g[i] != nullptr) {
+        //     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events_g[i]));
+        //     copy_events_g[i] = nullptr;
+        // }
 
-        if (copy_streams_g[i] != nullptr) {
-            PRIMUS_TURBO_CHECK_HIP(hipStreamDestroy(copy_streams_g[i]));
-            copy_streams_g[i] = nullptr;
-        }
-    }
+        // if (copy_streams_g[i] != nullptr) {
+        //     PRIMUS_TURBO_CHECK_HIP(hipStreamDestroy(copy_streams_g[i]));
+        //     copy_streams_g[i] = nullptr;
+        // }
+    // }
     // reusable_barrier(shm->barrier, shm->sense, group_world_size);
 
     if (group_rank == 0) {
@@ -209,13 +209,16 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
 //     // reusable_barrier(shm->barrier, shm->sense, shm->group_world_size);
 // }
 
-void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, void *input,
-                                             size_t size_bytes, size_t group_rank,
-                                             size_t group_world_size, hipStream_t stream) {
+void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
+    size_t size_bytes, hipStream_t stream) {
     // make sure stream has at least one kernel running
     // launch_emtpy_kernel(stream);
-
-    SharedMemoryInfo *info = handle;
+    
+    SharedMemoryInfo *info = reinterpret_cast<SharedMemoryInfo*>(dma_handle->GetPtr());
+    size_t group_rank = dma_handle->GetGroupRank();
+    size_t group_world_size = dma_handle->GetGroupSize();
+    hipStream_t *copy_streams = dma_handle->GetCopyStreams(); 
+    hipEvent_t *copy_events = dma_handle->GetCopyEvents();
 
     volatile AllGatherShmStruct *shm = nullptr;
     shm                              = (volatile AllGatherShmStruct *) info->addr;
@@ -259,19 +262,19 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
             shm->remote_exit_events[group_rank][i] = remote_exit_event;
         }
 
-        for (size_t i = 0; i < MAX_DEVICES; ++i) {
-            hipEvent_t copy_event = nullptr;
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
-            copy_events_g[i] = copy_event;
+        // for (size_t i = 0; i < MAX_DEVICES; ++i) {
+            // hipEvent_t copy_event = nullptr;
+            // PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
+            // copy_events_g[i] = copy_event;
 
-            hipStream_t copy_stream = nullptr;
-            int         leastPriority, greatestPriority;
-            PRIMUS_TURBO_CHECK_HIP(
-                hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipStreamCreateWithPriority(&copy_stream, hipStreamNonBlocking, greatestPriority));
-            copy_streams_g[i] = copy_stream;
-        }
+            // hipStream_t copy_stream = nullptr;
+            // int         leastPriority, greatestPriority;
+            // PRIMUS_TURBO_CHECK_HIP(
+            //     hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+            // PRIMUS_TURBO_CHECK_HIP(
+            //     hipStreamCreateWithPriority(&copy_stream, hipStreamNonBlocking, greatestPriority));
+            // copy_streams_g[i] = copy_stream;
+        // }
 
         shm->group_world_size         = group_world_size;
         shm->is_first_run[group_rank] = false;
@@ -325,14 +328,14 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
     PRIMUS_TURBO_CHECK_HIP(hipEventRecord(shm->entry_events[group_rank], stream));
 
     for (size_t i = 0; i < group_world_size; ++i) {
-        hipStream_t copy_stream = copy_streams_g[i];
+        hipStream_t copy_stream = copy_streams[i];
         PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(copy_stream, shm->entry_events[group_rank], 0));
     }
 
     for (size_t i = 0; i < group_world_size; ++i) {
         size_t      i_split     = group_rank;
         size_t      remote_rank = (group_rank + i) % group_world_size;
-        hipStream_t copy_stream = copy_streams_g[remote_rank];
+        hipStream_t copy_stream = copy_streams[remote_rank];
 
         void *src        = input;
         void *remote_ptr = static_cast<void *>(
@@ -349,8 +352,8 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
 
     for (size_t i = 0; i < group_world_size; ++i) {
         size_t      remote_rank = (group_rank + i) % group_world_size;
-        hipStream_t copy_stream = copy_streams_g[remote_rank];
-        hipEvent_t  copy_event  = copy_events_g[remote_rank];
+        hipStream_t copy_stream = copy_streams[remote_rank];
+        hipEvent_t  copy_event  = copy_events[remote_rank];
         PRIMUS_TURBO_CHECK_HIP(hipEventRecord(copy_event, copy_stream));
         PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, copy_event, 0));
 
@@ -379,7 +382,7 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
     }
 }
 
-} // namespace primus_turbo::pytorch
+} // namespace primus_turbo::pytorch::dist
 
 
 /*

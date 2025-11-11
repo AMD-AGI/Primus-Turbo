@@ -1,6 +1,6 @@
 #include "primus_turbo/dist/shmem.h"
 
-namespace primus_turbo::pytorch {
+namespace primus_turbo::pytorch::dist {
 
 int sharedMemoryCreate(const char *name, size_t sz, SharedMemoryInfo *info) {
     info->size = sz;
@@ -52,4 +52,4 @@ void shareMemoryDelete(const char *name) {
     shm_unlink(name);
 }
 
-} // namespace primus_turbo::pytorch
+} // namespace primus_turbo::pytorch::dist
