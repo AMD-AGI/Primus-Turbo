@@ -11,15 +11,7 @@
 
 #include <cstddef>
 
-#if defined(__linux__)
-#define cpu_atomic_add32(a, x) __sync_add_and_fetch(a, x)
-#elif defined(WIN32) || defined(_WIN32) || defined(WIN64) || defined(_WIN64)
-#define cpu_atomic_add32(a, x) InterlockedAdd((volatile LONG *) a, x)
-#else
-#error Unsupported system
-#endif
-
-namespace primus_turbo::pytorch {
+namespace primus_turbo::pytorch::dist {
 
 struct SharedMemoryInfo {
     void  *addr  = nullptr;
@@ -32,11 +24,11 @@ struct SharedMemoryInfo {
         : addr(addr_), size(size_), shmFd(shmFd_) {}
 };
 
-using dmaHandle_t = SharedMemoryInfo *;
+// using dmaHandle_t = SharedMemoryInfo *;
 
 int  sharedMemoryCreate(const char *name, size_t sz, SharedMemoryInfo *info);
 int  sharedMemoryOpen(const char *name, size_t sz, SharedMemoryInfo *info);
 void sharedMemoryClose(SharedMemoryInfo *info);
 void shareMemoryDelete(const char *name);
 
-} // namespace primus_turbo::pytorch
+} // namespace primus_turbo::pytorch::dist
