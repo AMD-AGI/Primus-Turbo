@@ -171,9 +171,11 @@ public:
         const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
         const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
         const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
-        const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
-        const torch::Tensor &combined_nvl_head, const primus_turbo::deep_ep::Config &config,
-        std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream);
+        const torch::Tensor                &gbl_channel_prefix_matrix,
+        const std::optional<torch::Tensor> &gbl_rank_prefix_sum,
+        const torch::Tensor &combined_rdma_head, const torch::Tensor &combined_nvl_head,
+        const primus_turbo::deep_ep::Config &config, std::optional<EventHandle> &previous_event,
+        bool async, bool allocate_on_comm_stream);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden,
                                   int num_experts);

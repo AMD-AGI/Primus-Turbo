@@ -796,6 +796,7 @@ class Buffer:
             rdma_channel_prefix_matrix,
             rdma_rank_prefix_sum,
             gbl_channel_prefix_matrix,
+            gbl_rank_prefix_sum,
             send_rdma_head,
             send_nvl_head,
             config,
