@@ -66,7 +66,6 @@ class AllGatherTestCase(MultiProcessTestCase):
 
         torch.testing.assert_close(
             output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
-        pass
 
 
 if __name__ == "__main__":
