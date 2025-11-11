@@ -156,8 +156,9 @@ int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint3
 void destroy_stream(const int device_id, const int64_t stream_ptr);
 
 /* Torch Distributed */
-c10::intrusive_ptr<c10d::Work>
-dma_all_gather_into_tensor(at::Tensor output_tensor, const at::Tensor input_tensor,
-                           c10::intrusive_ptr<c10d::ProcessGroup> pg, const std::string & group_tag);
+c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       output_tensor,
+                                                          const at::Tensor input_tensor,
+                                                          c10::intrusive_ptr<c10d::ProcessGroup> pg,
+                                                          const std::string &group_tag);
 
 } // namespace primus_turbo::pytorch

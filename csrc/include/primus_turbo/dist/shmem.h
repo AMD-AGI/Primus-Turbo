@@ -1,3 +1,7 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #pragma once
 
 #include <errno.h>
@@ -23,8 +27,6 @@ struct SharedMemoryInfo {
     SharedMemoryInfo(void *addr_, size_t size_, int shmFd_)
         : addr(addr_), size(size_), shmFd(shmFd_) {}
 };
-
-// using dmaHandle_t = SharedMemoryInfo *;
 
 int  sharedMemoryCreate(const char *name, size_t sz, SharedMemoryInfo *info);
 int  sharedMemoryOpen(const char *name, size_t sz, SharedMemoryInfo *info);

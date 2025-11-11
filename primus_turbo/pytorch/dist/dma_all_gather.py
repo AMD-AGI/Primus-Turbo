@@ -1,5 +1,11 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+
 import os
-from signal import default_int_handler
 
 import torch
 import torch.distributed as dist
@@ -10,12 +16,7 @@ import primus_turbo.pytorch._C.dist as turbo_dist
 origin_all_gather_into_tensor = dist.all_gather_into_tensor
 
 
-def _fallback_to_torch(
-    output_tensor: torch.Tensor,
-    input_tensor: torch.Tensor,
-    group,
-    async_op
-):
+def _fallback_to_torch(output_tensor: torch.Tensor, input_tensor: torch.Tensor, group, async_op):
     # TODO (limou)
     # support async_op for NCCL backend
     if async_op:
@@ -34,8 +35,7 @@ def _fallback_to_torch(
     # dict of (global_rank: local_rank)
     rank_dict = c10d._world.pg_group_ranks[group]
     maxdiff = max(rank_dict) - min(rank_dict)
-    local_world_size = int(
-        os.getenv("LOCAL_WORLD_SIZE", f"{torch.cuda.device_count()}"))
+    local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", f"{torch.cuda.device_count()}"))
     if maxdiff >= local_world_size:
         return True
 
@@ -43,10 +43,8 @@ def _fallback_to_torch(
 
 
 def dma_all_gather_into_tensor(
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group=None,
-        async_op=False):
+    output_tensor: torch.Tensor, input_tensor: torch.Tensor, group=None, async_op=False
+):
     group = group or dist.group.WORLD
 
     if _fallback_to_torch(output_tensor, input_tensor, group, async_op):

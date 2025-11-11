@@ -1,6 +1,9 @@
-// #include <ATen/ATen.h>
-#include "pytorch/extensions.h"
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// See LICENSE for license information.
+
 #include "primus_turbo/dist/all_gather/dma_all_gather.h"
+#include "pytorch/extensions.h"
 
 #include <sstream>
 #include <unordered_map>
@@ -23,7 +26,7 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
 
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
     dist::run_dma_all_gather_into_tensor_nobuffer(dma_handle, output_tensor.data_ptr(),
-                                            input_tensor.data_ptr(), size_bytes, stream);
+                                                  input_tensor.data_ptr(), size_bytes, stream);
     return c10::intrusive_ptr<c10d::Work>(nullptr);
 }
 

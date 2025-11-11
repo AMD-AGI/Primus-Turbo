@@ -16,8 +16,6 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
-from tests.pytorch.test_utils import get_tolerances
-
 from primus_turbo.pytorch.dist import dma_all_gather_into_tensor
 
 
@@ -54,18 +52,14 @@ class AllGatherTestCase(MultiProcessTestCase):
         self._init_process()
 
         num_elems = 16 * 1024 * 1024
-        input_tensor = torch.full(
-            [num_elems], self.rank, dtype=dtype, device=self.device)
-        output_tensor = torch.zeros(
-            [num_elems * self.world_size], dtype=dtype, device=self.device)
-        output_tensor_ref = torch.ones(
-            [num_elems * self.world_size], dtype=dtype, device=self.device)
+        input_tensor = torch.full([num_elems], self.rank, dtype=dtype, device=self.device)
+        output_tensor = torch.zeros([num_elems * self.world_size], dtype=dtype, device=self.device)
+        output_tensor_ref = torch.ones([num_elems * self.world_size], dtype=dtype, device=self.device)
 
         dist.all_gather_into_tensor(output_tensor_ref, input_tensor)
         dma_all_gather_into_tensor(output_tensor, input_tensor)
 
-        torch.testing.assert_close(
-            output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":
