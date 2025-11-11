@@ -16,20 +16,6 @@ namespace primus_turbo::pytorch {
 
 static hipStream_t copy_streams_g[MAX_DEVICES];
 static hipEvent_t  copy_events_g[MAX_DEVICES];
-static void       *recv_buffer     = nullptr;
-static size_t      max_buffer_size = 0;
-static void       *remote_ptrs[MAX_DEVICES][MAX_DEVICES];
-
-static size_t group_rank_g = 0;
-
-void barrier(std::atomic<int> &barrier, int rank, int world_size) {
-    barrier.fetch_add(1, std::memory_order_acq_rel);
-
-    while (barrier.load(std::memory_order_acquire) < world_size) {
-        // 10 us
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-    }
-}
 
 static void reusable_barrier(volatile std::atomic<int> &barrier, volatile std::atomic<int> &sense,
                              unsigned int n) {
@@ -138,29 +124,29 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
     return reinterpret_cast<uintptr_t>(info);
 }
 
-void wait_all_gather_handle(uintptr_t handle_ptr, size_t group_rank, size_t group_world_size) {
-    SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(handle_ptr);
-    AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
+// void wait_all_gather_handle(uintptr_t handle_ptr, size_t group_rank, size_t group_world_size) {
+//     SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(handle_ptr);
+//     AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
 
-    PRIMUS_TURBO_CHECK_HIP(hipEventSynchronize(shm->exit_events[group_rank]));
+//     PRIMUS_TURBO_CHECK_HIP(hipEventSynchronize(shm->exit_events[group_rank]));
 
-    // make sure all processes synced the stream
-    // reusable_barrier(shm->barrier, shm->sense, group_world_size);
-}
+//     // make sure all processes synced the stream
+//     // reusable_barrier(shm->barrier, shm->sense, group_world_size);
+// }
 
-void stream_wait_all_gather_handle(uintptr_t handle_ptr, uintptr_t stream_ptr, size_t group_rank,
-                                   size_t group_world_size) {
-    SharedMemoryInfo   *info   = reinterpret_cast<SharedMemoryInfo *>(handle_ptr);
-    AllGatherShmStruct *shm    = (AllGatherShmStruct *) info->addr;
-    hipStream_t         stream = reinterpret_cast<hipStream_t>(stream_ptr);
+// void stream_wait_all_gather_handle(uintptr_t handle_ptr, uintptr_t stream_ptr, size_t group_rank,
+//                                    size_t group_world_size) {
+//     SharedMemoryInfo   *info   = reinterpret_cast<SharedMemoryInfo *>(handle_ptr);
+//     AllGatherShmStruct *shm    = (AllGatherShmStruct *) info->addr;
+//     hipStream_t         stream = reinterpret_cast<hipStream_t>(stream_ptr);
 
-    if (shm->exit_events[group_rank] != nullptr) {
-        PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, shm->exit_events[group_rank], 0));
-    }
+//     if (shm->exit_events[group_rank] != nullptr) {
+//         PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, shm->exit_events[group_rank], 0));
+//     }
 
-    // make sure all processes synced the stream
-    // reusable_barrier(shm->barrier, shm->sense, group_world_size);
-}
+//     // make sure all processes synced the stream
+//     // reusable_barrier(shm->barrier, shm->sense, group_world_size);
+// }
 
 void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name, size_t group_rank,
                                size_t group_world_size) {
@@ -179,12 +165,6 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
     }
 
     for (size_t i = 0; i < MAX_DEVICES; ++i) {
-        if (remote_ptrs[group_rank][i] != nullptr) {
-            if (i != group_rank) {
-                PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(remote_ptrs[group_rank][i]));
-            }
-            remote_ptrs[group_rank][i] = nullptr;
-        }
 
         if (copy_events_g[i] != nullptr) {
             PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events_g[i]));
@@ -196,11 +176,6 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
             copy_streams_g[i] = nullptr;
         }
     }
-
-    if (recv_buffer != nullptr) {
-        PRIMUS_TURBO_CHECK_HIP(hipFree(recv_buffer));
-    }
-
     // reusable_barrier(shm->barrier, shm->sense, group_world_size);
 
     if (group_rank == 0) {
@@ -211,28 +186,28 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
     delete info;
 }
 
-static void stream_callback(hipStream_t stream, hipError_t status, void *userData) {
-    volatile AllGatherShmStruct *shm = (volatile AllGatherShmStruct *) userData;
-    reusable_barrier(shm->barrier, shm->sense, shm->group_world_size);
-}
+// static void stream_callback(hipStream_t stream, hipError_t status, void *userData) {
+//     volatile AllGatherShmStruct *shm = (volatile AllGatherShmStruct *) userData;
+//     reusable_barrier(shm->barrier, shm->sense, shm->group_world_size);
+// }
 
-static void close_handle_stream_callback(hipStream_t stream, hipError_t status, void *userData) {
-    volatile AllGatherShmStruct *shm = (volatile AllGatherShmStruct *) userData;
+// static void close_handle_stream_callback(hipStream_t stream, hipError_t status, void *userData) {
+//     volatile AllGatherShmStruct *shm = (volatile AllGatherShmStruct *) userData;
 
-    // TODO: if pointer is hipfree by pytorch?
-    // close all remote handles opened by this rank
-    for (size_t i = 0; i < shm->group_world_size; ++i) {
-        if (i != group_rank_g && shm->remote_base_ptrs[i] != nullptr) {
-            PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(shm->remote_base_ptrs[group_rank_g][i]));
-        }
-        shm->remote_base_ptrs[group_rank_g][i] = nullptr;
-        shm->remote_base_offsets[i]            = 0;
-    }
-    // std::cout << "Second run, RANK[" << group_rank_g << "], line=" << __LINE__
-    // << "close handle" << std::endl;
+//     // TODO: if pointer is hipfree by pytorch?
+//     // close all remote handles opened by this rank
+//     for (size_t i = 0; i < shm->group_world_size; ++i) {
+//         if (i != group_rank_g && shm->remote_base_ptrs[i] != nullptr) {
+//             PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(shm->remote_base_ptrs[group_rank_g][i]));
+//         }
+//         shm->remote_base_ptrs[group_rank_g][i] = nullptr;
+//         shm->remote_base_offsets[i]            = 0;
+//     }
+//     // std::cout << "Second run, RANK[" << group_rank_g << "], line=" << __LINE__
+//     // << "close handle" << std::endl;
 
-    // reusable_barrier(shm->barrier, shm->sense, shm->group_world_size);
-}
+//     // reusable_barrier(shm->barrier, shm->sense, shm->group_world_size);
+// }
 
 void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, void *input,
                                              size_t size_bytes, size_t group_rank,
@@ -248,7 +223,7 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
     if (shm->is_first_run[group_rank]) {
         // std::cout << "First run, RANK[" << group_rank << "], line=" << __LINE__
         // << std::endl;
-        group_rank_g = group_rank;
+
         // first run will create following items:
         // shm: entry_event, exit_event, copy_events,
         // global: copy_streams_g
@@ -305,9 +280,6 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
             throw std::runtime_error("Must keep group world size the same.");
         }
 
-        if (group_rank_g != group_rank) {
-            throw std::runtime_error("Must keep group rank the same.");
-        }
         // std::cout << "Second run, RANK[" << group_rank << "], line=" << __LINE__
         // << std::endl;
 
@@ -408,3 +380,10 @@ void run_dma_all_gather_into_tensor_nobuffer(dmaHandle_t handle, void *output, v
 }
 
 } // namespace primus_turbo::pytorch
+
+
+/*
+global vars
+async_op
+create_file
+*/

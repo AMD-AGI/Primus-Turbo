@@ -33,8 +33,8 @@ public:
         if (handle_ptr_ != 0) {
             primus_turbo::pytorch::destroy_all_gather_handle(handle_ptr_, shm_tag_, group_rank_,
                                                              group_size_);
+            handle_ptr_ = 0;
         }
-        handle_ptr_ = 0;
     }
     uintptr_t GetPtr() const { return handle_ptr_; }
     DMAHandle(const DMAHandle &)            = delete;
@@ -67,19 +67,7 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
     int group_size = pg->getSize();
 
     DMAHandle *dma_handle = DMAHandle::GetHandle(group_tag, group_rank, group_size);
-
-    size_t input_numel  = input_tensor.numel();
-    size_t element_size = input_tensor.element_size(); // Size of each element in bytes
-    size_t size_bytes   = input_numel * element_size;
-
-    c10::Device device    = input_tensor.device();
-    int         device_id = device.index();
-    TORCH_CHECK(device_id == output_tensor.device().index());
-    TORCH_CHECK(device_id >= 0 && device_id < 8);
-    // std::cout << "Device type: " << device.type() << "Device ID: " << device_id
-    // << std::endl;
-
-    // TODO(wenx): check output tensor size
+    size_t     size_bytes = input_tensor.numel() * input_tensor.element_size();
 
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
     run_dma_all_gather_into_tensor_nobuffer(reinterpret_cast<dmaHandle_t>(dma_handle->GetPtr()),
