@@ -19,10 +19,7 @@ struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    bool   is_first_run[MAX_DEVICES_PER_NODE];
-    size_t group_world_size;
-
-    hipIpcMemHandle_t output_mem_handles[MAX_DEVICES_PER_NODE];
+    bool is_first_run[MAX_DEVICES_PER_NODE];
 
     // set by each rank
     hipIpcMemHandle_t remote_base_mem_handles[MAX_DEVICES_PER_NODE];
@@ -51,25 +48,45 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
 class DMAHandle final {
     static std::unordered_map<std::string, std::unique_ptr<DMAHandle>> dma_handles_;
 
+    DMAHandle(uintptr_t handle_ptr, const std::string &shm_tag, size_t group_rank,
+              size_t group_size)
+        : handle_ptr_(handle_ptr), shm_tag_(shm_tag), group_rank_(group_rank),
+          group_size_(group_size) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+
+            hipStream_t copy_stream = nullptr;
+            int         leastPriority, greatestPriority;
+            PRIMUS_TURBO_CHECK_HIP(
+                hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipStreamCreateWithPriority(&copy_stream, hipStreamNonBlocking, greatestPriority));
+            copy_streams_[i] = copy_stream;
+
+            hipEvent_t copy_event = nullptr;
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
+            copy_events_[i] = copy_event;
+        }
+    }
+
 public:
     static DMAHandle *get_handle(const std::string &group_tag, size_t group_rank,
                                  size_t group_size) {
         // TODO (limou)
         // multiple-threads cases
-        auto it = dma_handles_.find(group_tag);
-        if (it == dma_handles_.end()) {
+        auto it = DMAHandle::dma_handles_.find(group_tag);
+        if (it == DMAHandle::dma_handles_.end()) {
             uintptr_t new_handle_ptr = create_all_gather_handle(group_tag, group_rank, group_size);
-            auto      uptr           = std::unique_ptr<DMAHandle>(
+            auto      new_dma_handle = std::unique_ptr<DMAHandle>(
                 new DMAHandle(new_handle_ptr, group_tag, group_rank, group_size));
 
-            auto result = dma_handles_.emplace(group_tag, std::move(uptr));
-            PRIMUS_TURBO_CHECK(result.second, "emplace DMAHandle failed");
+            auto result = DMAHandle::dma_handles_.emplace(group_tag, std::move(new_dma_handle));
+            PRIMUS_TURBO_CHECK(result.second, "emplace new_dma_handle failed");
             it = result.first;
         }
         return it->second.get();
     }
     // TODO
-    // primus_turbo currently uses a check macros like PRIMUS_TURBO_CHECK which throws exceptions
+    // primus_turbo currently uses check macros like PRIMUS_TURBO_CHECK which throws exceptions
     // however, destructors are not allowed to throw exceptions
     // so noexcept(false) is temporarily used as a workaround
     // during stack unwinding, this will directly trigger std::terminate()
@@ -99,27 +116,6 @@ public:
     size_t       get_group_size() const { return group_size_; }
     hipStream_t *get_copy_streams() { return copy_streams_; }
     hipEvent_t  *get_copy_events() { return copy_events_; }
-
-private:
-    DMAHandle(uintptr_t handle_ptr, const std::string &shm_tag, size_t group_rank,
-              size_t group_size)
-        : handle_ptr_(handle_ptr), shm_tag_(shm_tag), group_rank_(group_rank),
-          group_size_(group_size) {
-        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
-
-            hipStream_t copy_stream = nullptr;
-            int         leastPriority, greatestPriority;
-            PRIMUS_TURBO_CHECK_HIP(
-                hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipStreamCreateWithPriority(&copy_stream, hipStreamNonBlocking, greatestPriority));
-            copy_streams_[i] = copy_stream;
-
-            hipEvent_t copy_event = nullptr;
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
-            copy_events_[i] = copy_event;
-        }
-    }
 
 private:
     uintptr_t         handle_ptr_{0};
