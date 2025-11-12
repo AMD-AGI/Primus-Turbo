@@ -74,9 +74,9 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
     const std::string barrier_path = "/tmp/barrier_" + shm_name;
 
     if (group_rank == 0) {
-        if (shared_memory_create(shm_name.c_str(), sizeof(AllGatherShmStruct), info) != 0) {
-            throw std::runtime_error("Failed to create allgather handle.");
-        }
+        PRIMUS_TURBO_CHECK(
+            shared_memory_create(shm_name.c_str(), sizeof(AllGatherShmStruct), info) == 0,
+            "failed to create allgather handle");
         volatile AllGatherShmStruct *shm = nullptr;
         shm                              = (volatile AllGatherShmStruct *) info->addr;
 
@@ -88,7 +88,6 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
         for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
             shm->is_first_run[i] = true;
             shm->entry_events[i] = nullptr;
-            shm->exit_events[i]  = nullptr;
 
             shm->remote_base_offsets[i] = 0;
             shm->local_exit_events[i]   = nullptr;
@@ -127,11 +126,6 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
     if (shm->entry_events[group_rank] != nullptr) {
         PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(shm->entry_events[group_rank]));
         shm->entry_events[group_rank] = nullptr;
-    }
-
-    if (shm->exit_events[group_rank] != nullptr) {
-        PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(shm->exit_events[group_rank]));
-        shm->exit_events[group_rank] = nullptr;
     }
 
     if (group_rank == 0) {
@@ -184,12 +178,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
             shm->remote_exit_events[group_rank][i] = remote_exit_event;
         }
 
-        shm->group_world_size         = group_world_size;
         shm->is_first_run[group_rank] = false;
-    } else {
-        if (shm->group_world_size != group_world_size) {
-            throw std::runtime_error("Must keep group world size the same.");
-        }
     }
 
     // wait for all mem handle ready
