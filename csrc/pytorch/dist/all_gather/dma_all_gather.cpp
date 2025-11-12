@@ -3,16 +3,14 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/dist/all_gather/dma_all_gather.h"
+#include "primus_turbo/dist/shmem.h"
 #include "primus_turbo/macros.h"
 
-#include <fcntl.h>
-
-#include <thread>
-#include <vector>
-
 #include <chrono>
+#include <cstring>
 #include <filesystem>
-#include <iostream>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -20,20 +18,18 @@ namespace {
 
 class FileGuard final {
 public:
-    static void WaitFile(const std::string &path) {
+    static void wait_file(const std::string &path) {
         while (!std::filesystem::exists(path)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    static void CreateFile(const std::string &path) {
-        int fd = open(path.c_str(), O_CREAT | O_WRONLY, 0666);
-        PRIMUS_TURBO_CHECK(fd >= 0);
-        close(fd);
+    static void create_file(const std::string &path) {
+        std::ofstream file(path.c_str(), std::ios::app);
     }
 
 public:
     explicit FileGuard(const std::string &path) : file_path_(path) {
-        FileGuard::CreateFile(file_path_);
+        FileGuard::create_file(file_path_);
     }
     ~FileGuard() { std::filesystem::remove(file_path_); }
 
@@ -41,12 +37,8 @@ private:
     const std::string &file_path_;
 };
 
-} // namespace
-
-namespace primus_turbo::pytorch::dist {
-
-static void reusable_barrier(volatile std::atomic<int> &barrier, volatile std::atomic<int> &sense,
-                             unsigned int n) {
+void reusable_barrier(volatile std::atomic<int> &barrier, volatile std::atomic<int> &sense,
+                      unsigned int n) {
 
     static_assert(std::atomic<int>::is_always_lock_free);
 
@@ -71,6 +63,10 @@ static void reusable_barrier(volatile std::atomic<int> &barrier, volatile std::a
     }
 }
 
+} // namespace
+
+namespace primus_turbo::pytorch::dist {
+
 uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_rank,
                                    size_t group_world_size) {
     SharedMemoryInfo *info = new SharedMemoryInfo();
@@ -78,7 +74,7 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
     const std::string barrier_path = "/tmp/barrier_" + shm_name;
 
     if (group_rank == 0) {
-        if (sharedMemoryCreate(shm_name.c_str(), sizeof(AllGatherShmStruct), info) != 0) {
+        if (shared_memory_create(shm_name.c_str(), sizeof(AllGatherShmStruct), info) != 0) {
             throw std::runtime_error("Failed to create allgather handle.");
         }
         volatile AllGatherShmStruct *shm = nullptr;
@@ -89,7 +85,7 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
         new (const_cast<std::atomic<int> *>(&shm->barrier)) std::atomic<int>(0);
         new (const_cast<std::atomic<int> *>(&shm->sense)) std::atomic<int>(0);
 
-        for (size_t i = 0; i < MAX_DEVICES; ++i) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
             shm->is_first_run[i] = true;
             shm->entry_events[i] = nullptr;
             shm->exit_events[i]  = nullptr;
@@ -97,7 +93,7 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
             shm->remote_base_offsets[i] = 0;
             shm->local_exit_events[i]   = nullptr;
 
-            for (size_t j = 0; j < MAX_DEVICES; ++j) {
+            for (size_t j = 0; j < MAX_DEVICES_PER_NODE; ++j) {
                 shm->remote_base_ptrs[i][j]   = nullptr;
                 shm->remote_exit_events[i][j] = nullptr;
             }
@@ -110,13 +106,13 @@ uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_ran
     } else {
         int ret = 1;
         do {
-            ret = sharedMemoryOpen(shm_name.c_str(), sizeof(AllGatherShmStruct), info);
+            ret = shared_memory_open(shm_name.c_str(), sizeof(AllGatherShmStruct), info);
         } while (ret != 0);
 
         volatile AllGatherShmStruct *shm = nullptr;
         shm                              = (volatile AllGatherShmStruct *) info->addr;
 
-        FileGuard::WaitFile(barrier_path);
+        FileGuard::wait_file(barrier_path);
         reusable_barrier(shm->barrier, shm->sense, group_world_size);
     }
     return reinterpret_cast<uintptr_t>(info);
@@ -139,8 +135,8 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
     }
 
     if (group_rank == 0) {
-        sharedMemoryClose(info);
-        shareMemoryDelete(shm_name.c_str());
+        shared_memory_close(info);
+        shared_memory_delete(shm_name.c_str());
     }
 
     delete info;
@@ -149,11 +145,11 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
 void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
                                              size_t size_bytes, hipStream_t stream) {
 
-    SharedMemoryInfo *info             = reinterpret_cast<SharedMemoryInfo *>(dma_handle->GetPtr());
-    size_t            group_rank       = dma_handle->GetGroupRank();
-    size_t            group_world_size = dma_handle->GetGroupSize();
-    hipStream_t      *copy_streams     = dma_handle->GetCopyStreams();
-    hipEvent_t       *copy_events      = dma_handle->GetCopyEvents();
+    SharedMemoryInfo *info       = reinterpret_cast<SharedMemoryInfo *>(dma_handle->get_ptr());
+    size_t            group_rank = dma_handle->get_group_rank();
+    size_t            group_world_size = dma_handle->get_group_size();
+    hipStream_t      *copy_streams     = dma_handle->get_copy_streams();
+    hipEvent_t       *copy_events      = dma_handle->get_copy_events();
 
     volatile AllGatherShmStruct *shm = nullptr;
     shm                              = (volatile AllGatherShmStruct *) info->addr;
@@ -177,7 +173,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
         reusable_barrier(shm->barrier, shm->sense, group_world_size);
 
         // remote events
-        for (size_t i = 0; i < MAX_DEVICES; ++i) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
             if (i == group_rank) {
                 continue;
             }
@@ -263,7 +259,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
         // wait all ranks finish event recording
         reusable_barrier(shm->barrier, shm->sense, group_world_size);
 
-        for (size_t i = 0; i < MAX_DEVICES; ++i) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
             if (i == group_rank) {
                 continue;
             }
