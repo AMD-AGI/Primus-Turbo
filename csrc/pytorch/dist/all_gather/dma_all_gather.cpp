@@ -139,11 +139,12 @@ void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name
 void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
                                              size_t size_bytes, hipStream_t stream) {
 
-    SharedMemoryInfo *info       = reinterpret_cast<SharedMemoryInfo *>(dma_handle->get_ptr());
-    size_t            group_rank = dma_handle->get_group_rank();
-    size_t            group_world_size = dma_handle->get_group_size();
-    hipStream_t      *copy_streams     = dma_handle->get_copy_streams();
-    hipEvent_t       *copy_events      = dma_handle->get_copy_events();
+    SharedMemoryInfo    *info       = reinterpret_cast<SharedMemoryInfo *>(dma_handle->get_ptr());
+    DMAHandle::RankInfo *rankinfo   = dma_handle->get_rankinfo();
+    size_t               group_rank = rankinfo->group_rank;
+    size_t               group_world_size = rankinfo->group_size;
+    hipStream_t         *copy_streams     = rankinfo->copy_streams;
+    hipEvent_t          *copy_events      = rankinfo->copy_events;
 
     volatile AllGatherShmStruct *shm = nullptr;
     shm                              = (volatile AllGatherShmStruct *) info->addr;
@@ -261,3 +262,9 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
 }
 
 } // namespace primus_turbo::pytorch::dist
+
+/*
+只需要handle在shm中
+copy_stream wait entry_event
+
+*/

@@ -10,6 +10,7 @@
 namespace primus_turbo::pytorch {
 
 using dist::DMAHandle;
+using RankInfo = dist::DMAHandle::RankInfo;
 
 std::unordered_map<std::string, std::unique_ptr<DMAHandle>> DMAHandle::dma_handles_;
 
@@ -21,8 +22,9 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
     size_t group_size = pg->getSize();
 
     DMAHandle *dma_handle = DMAHandle::get_handle(group_tag, group_rank, group_size);
-    PRIMUS_TURBO_CHECK(group_rank == dma_handle->get_group_rank(), "group_rank check failed");
-    PRIMUS_TURBO_CHECK(group_size == dma_handle->get_group_size(), "group_size check failed");
+    RankInfo  *rankinfo   = dma_handle->get_rankinfo();
+    PRIMUS_TURBO_CHECK(group_rank == rankinfo->group_rank, "group_rank check failed");
+    PRIMUS_TURBO_CHECK(group_size == rankinfo->group_size, "group_size check failed");
     size_t size_bytes = input_tensor.numel() * input_tensor.element_size();
 
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();

@@ -19,20 +19,22 @@ struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    bool is_first_run[MAX_DEVICES_PER_NODE];
+    bool is_first_run[MAX_DEVICES_PER_NODE]; // 可以去掉，统一初始化
 
     // set by each rank
     hipIpcMemHandle_t remote_base_mem_handles[MAX_DEVICES_PER_NODE];
     size_t            remote_base_offsets[MAX_DEVICES_PER_NODE];
     // opened by each rank, saved for future handle close
-    void *remote_base_ptrs[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE];
+    void *remote_base_ptrs[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE]; // 不需要shm，改成1维
     // copy event
-    hipEvent_t          local_exit_events[MAX_DEVICES_PER_NODE];
-    hipIpcEventHandle_t local_exit_event_handles[MAX_DEVICES_PER_NODE];
-    hipEvent_t          remote_exit_events[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE];
+    hipEvent_t local_exit_events[MAX_DEVICES_PER_NODE]; // 不需要shm，改成scalar
+    hipIpcEventHandle_t
+        local_exit_event_handles[MAX_DEVICES_PER_NODE]; // 改成exit_events, 不区分local/remote
+    hipEvent_t remote_exit_events[MAX_DEVICES_PER_NODE]
+                                 [MAX_DEVICES_PER_NODE]; // 不需要shm，改成1维?
 
-    hipEvent_t entry_events[MAX_DEVICES_PER_NODE];
-    hipEvent_t exit_events[MAX_DEVICES_PER_NODE];
+    hipEvent_t entry_events[MAX_DEVICES_PER_NODE]; // 不需要shm 改成scalar
+    hipEvent_t exit_events[MAX_DEVICES_PER_NODE];  // 不需要shm
 
     AllGatherShmStruct() = default;
 };
@@ -50,22 +52,8 @@ class DMAHandle final {
 
     DMAHandle(uintptr_t handle_ptr, const std::string &shm_tag, size_t group_rank,
               size_t group_size)
-        : handle_ptr_(handle_ptr), shm_tag_(shm_tag), group_rank_(group_rank),
-          group_size_(group_size) {
-        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
-
-            hipStream_t copy_stream = nullptr;
-            int         leastPriority, greatestPriority;
-            PRIMUS_TURBO_CHECK_HIP(
-                hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipStreamCreateWithPriority(&copy_stream, hipStreamNonBlocking, greatestPriority));
-            copy_streams_[i] = copy_stream;
-
-            hipEvent_t copy_event = nullptr;
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
-            copy_events_[i] = copy_event;
-        }
+        : handle_ptr_(handle_ptr), rankinfo_(shm_tag, group_rank, group_size) {
+        rankinfo_.initialize();
     }
 
 public:
@@ -85,47 +73,68 @@ public:
         }
         return it->second.get();
     }
-    // TODO
-    // primus_turbo currently uses check macros like PRIMUS_TURBO_CHECK which throws exceptions
-    // however, destructors are not allowed to throw exceptions
-    // so noexcept(false) is temporarily used as a workaround
-    // during stack unwinding, this will directly trigger std::terminate()
-    ~DMAHandle() noexcept(false) {
+    ~DMAHandle() {
         if (handle_ptr_ != 0) {
-            destroy_all_gather_handle(handle_ptr_, shm_tag_, group_rank_, group_size_);
+            destroy_all_gather_handle(handle_ptr_, rankinfo_.shm_tag, rankinfo_.group_rank,
+                                      rankinfo_.group_size);
             handle_ptr_ = 0;
         }
-        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
-            if (copy_events_[i] != nullptr) {
-                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events_[i]));
-                copy_events_[i] = nullptr;
-            }
-            if (copy_streams_[i] != nullptr) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamDestroy(copy_streams_[i]));
-                copy_streams_[i] = nullptr;
-            }
-        }
+
+        // TODO (limou)
+        // primus_turbo currently uses check macros like PRIMUS_TURBO_CHECK which throws exceptions
+        // however, destructors are not allowed to throw exceptions
+        // during stack unwinding, this will directly trigger std::terminate()
+        rankinfo_.finalize();
     }
     DMAHandle(const DMAHandle &)            = delete;
     DMAHandle(DMAHandle &&)                 = delete;
     DMAHandle &operator=(const DMAHandle &) = delete;
     DMAHandle &operator=(DMAHandle &&)      = delete;
 
-    uintptr_t    get_ptr() const { return handle_ptr_; }
-    size_t       get_group_rank() const { return group_rank_; }
-    size_t       get_group_size() const { return group_size_; }
-    hipStream_t *get_copy_streams() { return copy_streams_; }
-    hipEvent_t  *get_copy_events() { return copy_events_; }
+    struct RankInfo final {
+        RankInfo(const std::string &shm_tag_in, size_t group_rank_in, size_t group_size_in)
+            : shm_tag(shm_tag_in), group_rank(group_rank_in), group_size(group_size_in) {}
+        void initialize() {
+            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+
+                hipStream_t copy_stream = nullptr;
+                int         leastPriority, greatestPriority;
+                PRIMUS_TURBO_CHECK_HIP(
+                    hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+                PRIMUS_TURBO_CHECK_HIP(hipStreamCreateWithPriority(
+                    &copy_stream, hipStreamNonBlocking, greatestPriority));
+                copy_streams[i] = copy_stream;
+
+                hipEvent_t copy_event = nullptr;
+                PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
+                copy_events[i] = copy_event;
+            }
+        }
+        void finalize() {
+            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+                if (copy_events[i] != nullptr) {
+                    PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events[i]));
+                    copy_events[i] = nullptr;
+                }
+                if (copy_streams[i] != nullptr) {
+                    PRIMUS_TURBO_CHECK_HIP(hipStreamDestroy(copy_streams[i]));
+                    copy_streams[i] = nullptr;
+                }
+            }
+        }
+        const std::string shm_tag;
+        size_t            group_rank;
+        size_t            group_size;
+        hipStream_t       copy_streams[MAX_DEVICES_PER_NODE];
+        hipEvent_t        copy_events[MAX_DEVICES_PER_NODE];
+    };
+
+    uintptr_t get_ptr() const { return handle_ptr_; }
+    RankInfo *get_rankinfo() { return &rankinfo_; }
 
 private:
-    uintptr_t         handle_ptr_{0};
-    const std::string shm_tag_;
-    size_t            group_rank_{0};
-    size_t            group_size_{0};
-
-private:
-    hipStream_t copy_streams_[MAX_DEVICES_PER_NODE];
-    hipEvent_t  copy_events_[MAX_DEVICES_PER_NODE];
+    uintptr_t handle_ptr_{0};
+    RankInfo  rankinfo_;
 };
 
 void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
