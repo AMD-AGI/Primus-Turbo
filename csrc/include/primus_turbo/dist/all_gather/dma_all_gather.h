@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include "primus_turbo/dist/shmem.h"
 #include "primus_turbo/macros.h"
 
 #include <hip/hip_runtime.h>
@@ -14,29 +13,29 @@
 
 namespace primus_turbo::pytorch::dist {
 
-constexpr std::size_t MAX_DEVICES = 8;
+constexpr std::size_t MAX_DEVICES_PER_NODE = 8;
 
 struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    bool   is_first_run[MAX_DEVICES];
+    bool   is_first_run[MAX_DEVICES_PER_NODE];
     size_t group_world_size;
 
-    hipIpcMemHandle_t output_mem_handles[MAX_DEVICES];
+    hipIpcMemHandle_t output_mem_handles[MAX_DEVICES_PER_NODE];
 
     // set by each rank
-    hipIpcMemHandle_t remote_base_mem_handles[MAX_DEVICES];
-    size_t            remote_base_offsets[MAX_DEVICES];
+    hipIpcMemHandle_t remote_base_mem_handles[MAX_DEVICES_PER_NODE];
+    size_t            remote_base_offsets[MAX_DEVICES_PER_NODE];
     // opened by each rank, saved for future handle close
-    void *remote_base_ptrs[MAX_DEVICES][MAX_DEVICES];
+    void *remote_base_ptrs[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE];
     // copy event
-    hipEvent_t          local_exit_events[MAX_DEVICES];
-    hipIpcEventHandle_t local_exit_event_handles[MAX_DEVICES];
-    hipEvent_t          remote_exit_events[MAX_DEVICES][MAX_DEVICES];
+    hipEvent_t          local_exit_events[MAX_DEVICES_PER_NODE];
+    hipIpcEventHandle_t local_exit_event_handles[MAX_DEVICES_PER_NODE];
+    hipEvent_t          remote_exit_events[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE];
 
-    hipEvent_t entry_events[MAX_DEVICES];
-    hipEvent_t exit_events[MAX_DEVICES];
+    hipEvent_t entry_events[MAX_DEVICES_PER_NODE];
+    hipEvent_t exit_events[MAX_DEVICES_PER_NODE];
 
     AllGatherShmStruct() = default;
 };
@@ -53,8 +52,8 @@ class DMAHandle final {
     static std::unordered_map<std::string, std::unique_ptr<DMAHandle>> dma_handles_;
 
 public:
-    static DMAHandle *GetHandle(const std::string &group_tag, size_t group_rank,
-                                size_t group_size) {
+    static DMAHandle *get_handle(const std::string &group_tag, size_t group_rank,
+                                 size_t group_size) {
         // TODO (limou)
         // multiple-threads cases
         auto it = dma_handles_.find(group_tag);
@@ -69,12 +68,17 @@ public:
         }
         return it->second.get();
     }
-    ~DMAHandle() {
+    // TODO
+    // primus_turbo currently uses a check macros like PRIMUS_TURBO_CHECK which throws exceptions
+    // however, destructors are not allowed to throw exceptions
+    // so noexcept(false) is temporarily used as a workaround
+    // during stack unwinding, this will directly trigger std::terminate()
+    ~DMAHandle() noexcept(false) {
         if (handle_ptr_ != 0) {
             destroy_all_gather_handle(handle_ptr_, shm_tag_, group_rank_, group_size_);
             handle_ptr_ = 0;
         }
-        for (size_t i = 0; i < MAX_DEVICES; i++) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
             if (copy_events_[i] != nullptr) {
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events_[i]));
                 copy_events_[i] = nullptr;
@@ -90,18 +94,18 @@ public:
     DMAHandle &operator=(const DMAHandle &) = delete;
     DMAHandle &operator=(DMAHandle &&)      = delete;
 
-    uintptr_t    GetPtr() const { return handle_ptr_; }
-    size_t       GetGroupRank() const { return group_rank_; }
-    size_t       GetGroupSize() const { return group_size_; }
-    hipStream_t *GetCopyStreams() { return copy_streams_; }
-    hipEvent_t  *GetCopyEvents() { return copy_events_; }
+    uintptr_t    get_ptr() const { return handle_ptr_; }
+    size_t       get_group_rank() const { return group_rank_; }
+    size_t       get_group_size() const { return group_size_; }
+    hipStream_t *get_copy_streams() { return copy_streams_; }
+    hipEvent_t  *get_copy_events() { return copy_events_; }
 
 private:
     DMAHandle(uintptr_t handle_ptr, const std::string &shm_tag, size_t group_rank,
               size_t group_size)
         : handle_ptr_(handle_ptr), shm_tag_(shm_tag), group_rank_(group_rank),
           group_size_(group_size) {
-        for (size_t i = 0; i < MAX_DEVICES; i++) {
+        for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
 
             hipStream_t copy_stream = nullptr;
             int         leastPriority, greatestPriority;
@@ -124,8 +128,8 @@ private:
     size_t            group_size_{0};
 
 private:
-    hipStream_t copy_streams_[MAX_DEVICES];
-    hipEvent_t  copy_events_[MAX_DEVICES];
+    hipStream_t copy_streams_[MAX_DEVICES_PER_NODE];
+    hipEvent_t  copy_events_[MAX_DEVICES_PER_NODE];
 };
 
 void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,

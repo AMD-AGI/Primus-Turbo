@@ -4,9 +4,14 @@
 
 #include "primus_turbo/dist/shmem.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace primus_turbo::pytorch::dist {
 
-int sharedMemoryCreate(const char *name, size_t sz, SharedMemoryInfo *info) {
+int shared_memory_create(const char *name, size_t sz, SharedMemoryInfo *info) {
     info->size = sz;
 
     info->shmFd = shm_open(name, O_RDWR | O_CREAT, 0777);
@@ -27,7 +32,7 @@ int sharedMemoryCreate(const char *name, size_t sz, SharedMemoryInfo *info) {
     return 0;
 }
 
-int sharedMemoryOpen(const char *name, size_t sz, SharedMemoryInfo *info) {
+int shared_memory_open(const char *name, size_t sz, SharedMemoryInfo *info) {
     info->size = sz;
 
     info->shmFd = shm_open(name, O_RDWR, 0777);
@@ -43,7 +48,7 @@ int sharedMemoryOpen(const char *name, size_t sz, SharedMemoryInfo *info) {
     return 0;
 }
 
-void sharedMemoryClose(SharedMemoryInfo *info) {
+void shared_memory_close(SharedMemoryInfo *info) {
     if (info->addr) {
         munmap(info->addr, info->size);
     }
@@ -52,7 +57,7 @@ void sharedMemoryClose(SharedMemoryInfo *info) {
     }
 }
 
-void shareMemoryDelete(const char *name) {
+void shared_memory_delete(const char *name) {
     shm_unlink(name);
 }
 

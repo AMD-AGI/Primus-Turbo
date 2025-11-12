@@ -6,9 +6,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
-
-#include <exception>
-#include <iostream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 
@@ -70,11 +68,9 @@ inline std::string hipblas_status_to_string(hipblasStatus_t status) {
 
 #define PRIMUS_TURBO_ERROR(...)                                                                    \
     do {                                                                                           \
-        std::cerr << primus_turbo::concat_strings(__FILE__ ":", __LINE__, " Error in function ",   \
-                                                  __func__, ": ",                                  \
-                                                  ::primus_turbo::concat_strings(__VA_ARGS__))     \
-                  << std::endl;                                                                    \
-        std::terminate();                                                                          \
+        throw ::std::runtime_error(                                                                \
+            ::primus_turbo::concat_strings(__FILE__ ":", __LINE__, " in function ", __func__,      \
+                                           ": ", ::primus_turbo::concat_strings(__VA_ARGS__)));    \
     } while (false)
 
 #define PRIMUS_TURBO_CHECK(expr, ...)                                                              \
