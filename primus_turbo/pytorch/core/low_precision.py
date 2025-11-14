@@ -117,3 +117,25 @@ class Float8QuantConfig:
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+
+
+@dataclass
+class Float4QuantConfig:
+    format: Format = Format.E2M1_X2
+    granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
+    strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    block_size: Optional[int] = None
+
+    def __post_init__(self):
+        assert (
+            self.granularity == ScalingGranularity.MX_BLOCKWISE
+        ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+
+        if self.block_size is None:
+            self.block_size = 32
+
+        mx_support_block_size = [32]
+        assert (
+            self.block_size in mx_support_block_size
+        ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
