@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.float8 import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
 )
@@ -357,6 +358,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
+        supported_mxfp8_backend, reason = check_mxfp8_support()
+        assert supported_mxfp8_backend, reason
+
         assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert (
             trans_a == False and trans_b == True
