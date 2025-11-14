@@ -4,12 +4,42 @@
 
 #pragma once
 
+#include "primus_turbo/dist/shmem.h"
 #include "primus_turbo/macros.h"
 
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <cstring>
 #include <memory>
+#include <thread>
+
+namespace {
+void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, unsigned int n) {
+
+    static_assert(std::atomic<int>::is_always_lock_free);
+
+    // Check-in
+    int count = barrier.fetch_add(1, std::memory_order_acq_rel);
+    if (count + 1 == static_cast<int>(n)) {
+        sense.store(1, std::memory_order_release); // Last thread sets the sense
+    } else {
+        while (sense.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+    }
+
+    // Check-out
+    count = barrier.fetch_sub(1, std::memory_order_acq_rel);
+    if (count - 1 == 0) {
+        sense.store(0, std::memory_order_release); // Last thread resets the sense
+    } else {
+        while (sense.load(std::memory_order_acquire) == 1) {
+            std::this_thread::yield();
+        }
+    }
+}
+} // namespace
 
 namespace primus_turbo::pytorch::dist {
 
@@ -19,41 +49,27 @@ struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    bool is_first_run[MAX_DEVICES_PER_NODE]; // 可以去掉，统一初始化
-
-    // set by each rank
-    hipIpcMemHandle_t remote_base_mem_handles[MAX_DEVICES_PER_NODE];
-    size_t            remote_base_offsets[MAX_DEVICES_PER_NODE];
-    // opened by each rank, saved for future handle close
-    void *remote_base_ptrs[MAX_DEVICES_PER_NODE][MAX_DEVICES_PER_NODE]; // 不需要shm，改成1维
-    // copy event
-    hipEvent_t local_exit_events[MAX_DEVICES_PER_NODE]; // 不需要shm，改成scalar
-    hipIpcEventHandle_t
-        local_exit_event_handles[MAX_DEVICES_PER_NODE]; // 改成exit_events, 不区分local/remote
-    hipEvent_t remote_exit_events[MAX_DEVICES_PER_NODE]
-                                 [MAX_DEVICES_PER_NODE]; // 不需要shm，改成1维?
-
-    hipEvent_t entry_events[MAX_DEVICES_PER_NODE]; // 不需要shm 改成scalar
-    hipEvent_t exit_events[MAX_DEVICES_PER_NODE];  // 不需要shm
-
-    AllGatherShmStruct() = default;
+    hipIpcMemHandle_t   base_mem_handles[MAX_DEVICES_PER_NODE];
+    size_t              base_mem_offsets[MAX_DEVICES_PER_NODE];
+    hipIpcEventHandle_t exit_event_handles[MAX_DEVICES_PER_NODE];
 };
 
-uintptr_t create_all_gather_handle(const std::string &shm_name, size_t group_rank,
-                                   size_t group_world_size);
-void      wait_all_gather_handle(uintptr_t handle_ptr, size_t group_rank, size_t group_world_size);
-void stream_wait_all_gather_handle(uintptr_t handle_ptr, uintptr_t stream_ptr, size_t group_rank,
-                                   size_t group_world_size);
-void destroy_all_gather_handle(uintptr_t handle_ptr, const std::string &shm_name, size_t group_rank,
-                               size_t group_world_size);
+uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t group_rank,
+                                         size_t group_world_size);
+
+void destroy_allgather_shared_handle(uintptr_t allgather_shared_handle, const std::string &shm_name,
+                                     size_t group_rank, size_t group_world_size);
 
 class DMAHandle final {
     static std::unordered_map<std::string, std::unique_ptr<DMAHandle>> dma_handles_;
 
-    DMAHandle(uintptr_t handle_ptr, const std::string &shm_tag, size_t group_rank,
+    DMAHandle(uintptr_t allgather_shared_handle, const std::string &shm_tag, size_t group_rank,
               size_t group_size)
-        : handle_ptr_(handle_ptr), rankinfo_(shm_tag, group_rank, group_size) {
-        rankinfo_.initialize();
+        : allgather_shared_handle_(allgather_shared_handle),
+          rankinfo_(shm_tag, group_rank, group_size) {
+        SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(allgather_shared_handle_);
+        AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
+        rankinfo_.initialize(shm);
     }
 
 public:
@@ -63,9 +79,10 @@ public:
         // multiple-threads cases
         auto it = DMAHandle::dma_handles_.find(group_tag);
         if (it == DMAHandle::dma_handles_.end()) {
-            uintptr_t new_handle_ptr = create_all_gather_handle(group_tag, group_rank, group_size);
-            auto      new_dma_handle = std::unique_ptr<DMAHandle>(
-                new DMAHandle(new_handle_ptr, group_tag, group_rank, group_size));
+            uintptr_t allgather_shared_handle =
+                create_allgather_shared_handle(group_tag, group_rank, group_size);
+            auto new_dma_handle = std::unique_ptr<DMAHandle>(
+                new DMAHandle(allgather_shared_handle, group_tag, group_rank, group_size));
 
             auto result = DMAHandle::dma_handles_.emplace(group_tag, std::move(new_dma_handle));
             PRIMUS_TURBO_CHECK(result.second, "emplace new_dma_handle failed");
@@ -74,17 +91,19 @@ public:
         return it->second.get();
     }
     ~DMAHandle() {
-        if (handle_ptr_ != 0) {
-            destroy_all_gather_handle(handle_ptr_, rankinfo_.shm_tag, rankinfo_.group_rank,
-                                      rankinfo_.group_size);
-            handle_ptr_ = 0;
-        }
-
+        SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(allgather_shared_handle_);
+        AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
         // TODO (limou)
         // primus_turbo currently uses check macros like PRIMUS_TURBO_CHECK which throws exceptions
         // however, destructors are not allowed to throw exceptions
         // during stack unwinding, this will directly trigger std::terminate()
-        rankinfo_.finalize();
+        rankinfo_.finalize(shm);
+
+        if (allgather_shared_handle_ != 0) {
+            destroy_allgather_shared_handle(allgather_shared_handle_, rankinfo_.shm_tag,
+                                            rankinfo_.group_rank, rankinfo_.group_size);
+            allgather_shared_handle_ = 0;
+        }
     }
     DMAHandle(const DMAHandle &)            = delete;
     DMAHandle(DMAHandle &&)                 = delete;
@@ -94,7 +113,9 @@ public:
     struct RankInfo final {
         RankInfo(const std::string &shm_tag_in, size_t group_rank_in, size_t group_size_in)
             : shm_tag(shm_tag_in), group_rank(group_rank_in), group_size(group_size_in) {}
-        void initialize() {
+
+        // TODO : for to group_size
+        void initialize(AllGatherShmStruct *shm) {
             for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
 
                 hipStream_t copy_stream = nullptr;
@@ -109,9 +130,41 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
                 copy_events[i] = copy_event;
             }
+
+            hipEvent_t local_exit_event = nullptr;
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(
+                &local_exit_event, hipEventDisableTiming | hipEventInterprocess));
+
+            hipIpcEventHandle_t local_exit_event_handle;
+            PRIMUS_TURBO_CHECK_HIP(
+                hipIpcGetEventHandle(&local_exit_event_handle, local_exit_event));
+            memcpy((void *) &shm->exit_event_handles[group_rank], &local_exit_event_handle,
+                   sizeof(hipIpcEventHandle_t));
+
+            reusable_barrier(shm->barrier, shm->sense, group_size);
+
+            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
+                if (i == group_rank) {
+                    exit_events[i] = local_exit_event;
+                } else {
+                    PRIMUS_TURBO_CHECK_HIP(hipIpcOpenEventHandle(
+                        &exit_events[i], *(hipIpcEventHandle_t *) &shm->exit_event_handles[i]));
+                }
+            }
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&entry_event, hipEventDisableTiming));
         }
-        void finalize() {
+        void finalize(AllGatherShmStruct *shm) {
+            reusable_barrier(shm->barrier, shm->sense, group_size);
+            if (entry_event != nullptr) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(entry_event));
+                entry_event = nullptr;
+            }
+
             for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+                if (exit_events[i] != nullptr) {
+                    PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[i]));
+                    exit_events[i] = nullptr;
+                }
                 if (copy_events[i] != nullptr) {
                     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events[i]));
                     copy_events[i] = nullptr;
@@ -125,15 +178,21 @@ public:
         const std::string shm_tag;
         size_t            group_rank;
         size_t            group_size;
-        hipStream_t       copy_streams[MAX_DEVICES_PER_NODE];
-        hipEvent_t        copy_events[MAX_DEVICES_PER_NODE];
+        hipStream_t       copy_streams[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t        copy_events[MAX_DEVICES_PER_NODE]{};
+
+        // TODO : destroy
+        hipEvent_t exit_events[MAX_DEVICES_PER_NODE]{};
+        // TODO : destroy
+        hipEvent_t entry_event{};
+        void      *base_mem_ptrs[MAX_DEVICES_PER_NODE]{};
     };
 
-    uintptr_t get_ptr() const { return handle_ptr_; }
+    uintptr_t get_allgather_shared_handle() const { return allgather_shared_handle_; }
     RankInfo *get_rankinfo() { return &rankinfo_; }
 
 private:
-    uintptr_t handle_ptr_{0};
+    uintptr_t allgather_shared_handle_{0};
     RankInfo  rankinfo_;
 };
 
