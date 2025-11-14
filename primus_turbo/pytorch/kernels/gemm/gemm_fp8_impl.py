@@ -10,7 +10,7 @@ import torch
 import triton
 from torch.library import custom_op, triton_op, wrap_triton
 
-from primus_turbo.pytorch.core.float8 import ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_nn_kernel,
     gemm_fp8_blockwise_nt_kernel,

@@ -25,6 +25,13 @@ def is_fp8_dtype(dtype):
     return dtype in TORCH_FP8_DTYPE
 
 
+def is_fp4_dtype(dtype):
+    TORCH_FP4_DTYPE = [
+        torch.float4_e2m1fn_x2,
+    ]
+    return dtype in TORCH_FP4_DTYPE
+
+
 def check_fp8_support() -> Tuple[bool, str]:
     """Return if fp8 support is available"""
     if get_device_compute_capability() >= (9, 4):
@@ -35,13 +42,13 @@ def check_fp8_support() -> Tuple[bool, str]:
     )
 
 
-def check_mxfp8_support() -> Tuple[bool, str]:
-    """Return if fp8 support is available"""
+def check_fp4_support() -> Tuple[bool, str]:
+    """Return if fp4 support is available"""
     if get_device_compute_capability() >= (9, 5):
         return True, ""
     return (
         False,
-        "Device compute capability gfx950 or higher required for FP8 execution.",
+        "Device compute capability gfx950 or higher required for FP4 execution.",
     )
 
 
@@ -72,11 +79,13 @@ except AttributeError:
 
 class Format(Enum):
     """
-    Supported FP8 formats.
+    Supported FP8/FP4 formats.
     """
 
     E4M3 = auto()
     E5M2 = auto()
+    E8M0 = auto()
+    E2M1_X2 = auto()
     HYBRID = auto()
 
 
