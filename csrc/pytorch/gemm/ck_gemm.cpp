@@ -63,24 +63,21 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
         PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
     }
 
-    // Ensure all tensors are contiguous
-    at::Tensor a_contig  = a.contiguous();
-    at::Tensor b_contig  = b.contiguous();
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();
 
     at::Tensor c      = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
     auto       stream = at::cuda::getCurrentCUDAStream();
 
-    if (a_contig.dtype() == at::kFloat8_e4m3fnuz || a_contig.dtype() == at::kFloat8_e4m3fn) {
+    if (a.dtype() == at::kFloat8_e4m3fnuz || a.dtype() == at::kFloat8_e4m3fn) {
         using AType = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;
         using BType = AType;
 
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a_contig.data_ptr()),
-                static_cast<const BType *>(b_contig.data_ptr()), static_cast<CType *>(c.data_ptr()),
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
@@ -95,8 +92,8 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a_contig.data_ptr()),
-                static_cast<const BType *>(b_contig.data_ptr()), static_cast<CType *>(c.data_ptr()),
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
@@ -111,15 +108,15 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
         }
-    } else if (a_contig.dtype() == at::kFloat8_e5m2fnuz || a_contig.dtype() == at::kFloat8_e5m2) {
+    } else if (a.dtype() == at::kFloat8_e5m2fnuz || a.dtype() == at::kFloat8_e5m2) {
         using AType = typename TorchToCKTileType<at::kFloat8_e5m2fnuz>::type;
         using BType = AType;
 
         if (out_dtype == at::kBFloat16) {
             using CType = typename TorchToCKTileType<at::kBFloat16>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a_contig.data_ptr()),
-                static_cast<const BType *>(b_contig.data_ptr()), static_cast<CType *>(c.data_ptr()),
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")
@@ -134,8 +131,8 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a_contig.data_ptr()),
-                static_cast<const BType *>(b_contig.data_ptr()), static_cast<CType *>(c.data_ptr()),
+                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
+                static_cast<CType *>(c.data_ptr()),
                 static_cast<const float *>(aq_tensor.data_ptr()),
                 static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
             if (granularity == "TENSORWISE")

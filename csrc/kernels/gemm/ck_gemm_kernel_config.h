@@ -71,7 +71,7 @@ using GFX942_CKGemmTileCfg_256x256x128_32x32x32_2x2x1 = CKTileGemmTileConfigWith
     GPUArch::GFX942, 256, 256, 128, 32, 32, 32, 2, 2, 1, false, false
 >;
 using GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1 = CKTileGemmTileConfigWithArch<
-    GPUArch::GFX942, 256, 128, 128, 32, 32, 32, 1, 4, 1, false, false
+    GPUArch::GFX942, 256, 128, 128, 32, 32, 32, 2, 2, 1, false, false
 >;
 using GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKTileGemmTileConfigWithArch<
     GPUArch::GFX942, 256, 128, 128, 32, 32, 32, 2, 2, 1, false, true
