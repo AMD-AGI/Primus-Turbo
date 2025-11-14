@@ -56,17 +56,17 @@ void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, Acc
     // Calculate proper strides and QK values for quantization scales
     ck_tile::index_t strideAQ, strideBQ, QK_A, QK_B;
     if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
-        // AQuantGroupSize: <1, 1, 128> => A scale shape: (M, AQK), AQLayout is RowMajor
+        // A scale shape: (M, AQK), AQLayout is RowMajor
         // AQK = K / 128 = number of K-dimension scale groups per row
         const ck_tile::index_t AQK = (params.k + 127) / 128;
         QK_A                       = AQK; // QK_A is the K-dimension size of the scale tensor
-        strideAQ                   = AQK; // RowMajor stride = number of columns
+        strideAQ                   = AQK;
 
-        // BQuantGroupSize: <1, 128, 128> => B scale shape: (BQK, BQN), BQLayout is ColumnMajor
+        // B scale shape: (BQK, BQN), BQLayout is ColumnMajor
         // BQK = K / 128, BQN = N / 128
         const ck_tile::index_t BQK = (params.k + 127) / 128;
         QK_B                       = BQK; // QK_B is the K-dimension size of the B scale tensor
-        strideBQ                   = BQK; // ColumnMajor stride = number of rows
+        strideBQ                   = BQK;
     } else {
         // For RowColQuant and TensorQuant, QK_A and QK_B should be 1
         QK_A     = 1;
@@ -83,7 +83,7 @@ void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, Acc
         using BLayout = RowMajor;
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                              BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
-    } else if (!params.transA && params.transB) { // NT (RowMajor × ColMajor)
+    } else if (!params.transA && params.transB) { // NT
         using ALayout = RowMajor;
         using BLayout = ColMajor;
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
