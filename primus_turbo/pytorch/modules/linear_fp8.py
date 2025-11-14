@@ -8,7 +8,10 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import Float8QuantConfig, ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.ops.gemm_fp8 import gemm_fp8
 
 __all__ = ["Float8Linear"]

@@ -6,7 +6,7 @@
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import Float8QuantConfig
+from primus_turbo.pytorch.core.low_precision import Float8QuantConfig
 
 
 # TODO: This Class is still develop.

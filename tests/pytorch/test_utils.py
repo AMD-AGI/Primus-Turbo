@@ -6,7 +6,7 @@
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import is_fp8_dtype
+from primus_turbo.pytorch.core.low_precision import is_fp8_dtype
 
 
 def is_ROCM():

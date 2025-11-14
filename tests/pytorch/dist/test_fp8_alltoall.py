@@ -18,7 +18,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
-from primus_turbo.pytorch.core.float8 import (
+from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     float8_e4m3,

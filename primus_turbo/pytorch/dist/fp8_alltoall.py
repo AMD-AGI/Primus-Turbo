@@ -9,7 +9,7 @@ from typing import List, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from primus_turbo.pytorch.core.float8 import (
+from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
