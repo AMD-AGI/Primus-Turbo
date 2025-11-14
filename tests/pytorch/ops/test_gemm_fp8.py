@@ -79,14 +79,16 @@ def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
 
 
-@pytest.mark.parametrize("m", [256, 257, 512, 1024])
-@pytest.mark.parametrize("n", [255, 512, 1024, 4096])
-@pytest.mark.parametrize("k", [129, 256, 1024, 4096])
+# n and k must be a multiple of 128
+# block_size must be 128
+@pytest.mark.parametrize("m", [255, 257, 512, 1024])
+@pytest.mark.parametrize("n", [256, 512, 1024, 4096])
+@pytest.mark.parametrize("k", [256, 1024, 4096])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
-@pytest.mark.parametrize("block_size", [128, 256])
+@pytest.mark.parametrize("block_size", [128])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_size):
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, granularity={granularity}, block_size={block_size}"
@@ -137,16 +139,3 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
-
-
-if __name__ == "__main__":
-    test_gemm_fp8_blockwise(
-        m=768,
-        n=1024,
-        k=2048,
-        layout="NT",
-        format=Format.E4M3,
-        dtype=torch.bfloat16,
-        granularity=ScalingGranularity.BLOCKWISE,
-        block_size=128,
-    )

@@ -79,36 +79,20 @@ void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, Acc
     std::unique_ptr<CKGemmRunnerInterFace> runner;
     using CLayout = RowMajor;
     if (!params.transA && !params.transB) { // NN
-        // ABQuantGrouped only supports NT layout - use compile-time check
-        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
-            PRIMUS_TURBO_CHECK(
-                false,
-                "ABQuantGrouped (BLOCKWISE) only supports NT layout (transA=False, transB=True)");
-        } else {
-            using ALayout = RowMajor;
-            using BLayout = RowMajor;
-            runner =
-                get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout, BLayout,
-                                     CLayout, QuantMode>(params.m, params.n, params.k);
-        }
+        using ALayout = RowMajor;
+        using BLayout = RowMajor;
+        runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
+                                             BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
     } else if (!params.transA && params.transB) { // NT (RowMajor × ColMajor)
         using ALayout = RowMajor;
         using BLayout = ColMajor;
         runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                              BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
     } else if (params.transA && !params.transB) { // TN
-        // ABQuantGrouped only supports NT layout - use compile-time check
-        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
-            PRIMUS_TURBO_CHECK(
-                false,
-                "ABQuantGrouped (BLOCKWISE) only supports NT layout (transA=False, transB=True)");
-        } else {
-            using ALayout = ColMajor;
-            using BLayout = RowMajor;
-            runner =
-                get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout, BLayout,
-                                     CLayout, QuantMode>(params.m, params.n, params.k);
-        }
+        using ALayout = ColMajor;
+        using BLayout = RowMajor;
+        runner        = get_ck_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
+                                             BLayout, CLayout, QuantMode>(params.m, params.n, params.k);
     } else {
         PRIMUS_TURBO_CHECK(false, "CK Gemm only support NN, TN and NT");
     }

@@ -43,13 +43,6 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           typename AccDataType = float>
 class CKQuantGemmRunner : public CKGemmRunnerInterFace {
 public:
-    // Static assertion: ABQuantGrouped only supports RowMajor × ColMajor layout
-    static_assert(
-        QuantMode != ck_tile::QuantType::ABQuantGrouped ||
-            (std::is_same_v<ALayout, ck_tile::tensor_layout::gemm::RowMajor> &&
-             std::is_same_v<BLayout, ck_tile::tensor_layout::gemm::ColumnMajor>),
-        "ABQuantGrouped (BLOCKWISE) only supports RowMajor × ColMajor layout (NT layout)");
-
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<TileConfig::M_Tile, TileConfig::N_Tile, TileConfig::K_Tile>,
         ck_tile::sequence<TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::K_Warp>,
@@ -64,6 +57,17 @@ public:
         false /*PreshuffleB*/, ALayout, BLayout, CLayout, QuantMode, AQLayout, BQLayout,
         false /*TransposeC*/, false /*DoubleSmemBuffer*/, false /*UsePersistentKernel*/>;
 
+    // Select appropriate quantization group sizes based on A layout
+    // A is always 1D quantization: <1, 1, 128>
+    // B quantization depends on A's layout:
+    //   - When A is RowMajor (R+C or R+R): B uses 2D quantization <1, 128, 128>
+    //   - When A is ColMajor (C+R): B uses 1D quantization <1, 1, 128>
+    using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
+    using BQuantGroupSize = std::conditional_t<
+        std::is_same_v<ALayout, RowMajor>,
+        ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>, // A is RowMajor: B uses 2D
+        ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>>;  // A is ColMajor: B uses 1D
+
     // Select appropriate Problem and Pipeline based on QuantMode
     // For RowColQuant and TensorQuant, use GemmRowColTensorQuantPipelineProblem +
     // GemmPipelineAgBgCrCompV3 For ABQuantGrouped, use GemmABQuantPipelineProblem +
@@ -73,17 +77,17 @@ public:
             QuantMode == ck_tile::QuantType::TensorQuant,
         ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType, BDataType, AccDataType,
                                                       AccDataType, GemmShape, GemmUniversalTraits>,
-        ck_tile::GemmABQuantPipelineProblem<
-            ADataType,           // ADataType
-            AccDataType,         // AQDataType: same as AccDataType
-            BDataType,           // BDataType
-            AccDataType,         // BQDataType: same as AccDataType
-            AccDataType,         // CDataType (accumulator)
-            GemmShape,           // BlockGemmShape
-            GemmUniversalTraits, // Traits
-            ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>,   // AQuantGroupSize
-            ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>, // BQuantGroupSize
-            false /*TransposeC*/>>;
+        ck_tile::GemmABQuantPipelineProblem<ADataType,           // ADataType
+                                            AccDataType,         // AQDataType: same as AccDataType
+                                            BDataType,           // BDataType
+                                            AccDataType,         // BQDataType: same as AccDataType
+                                            AccDataType,         // CDataType (accumulator)
+                                            GemmShape,           // BlockGemmShape
+                                            GemmUniversalTraits, // Traits
+                                            AQuantGroupSize,     // AQuantGroupSize: 1D <1, 1, 128>
+                                            BQuantGroupSize, // BQuantGroupSize: 2D <1, 128, 128> or
+                                                             // 1D <1, 1, 128>
+                                            false /*TransposeC*/>>;
 
     // V3: Select appropriate Pipeline based on QuantMode
     using GemmPipeline =
@@ -134,7 +138,11 @@ class CKQuantGemmRunnerWithArch
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
-    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg,                                    \
+          ck_tile::QuantType::ABQuantGrouped)                                                      \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg,                                    \
+          ck_tile::QuantType::ABQuantGrouped)                                                      \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
 
 // ***********************************************************************************
 // clang-format off

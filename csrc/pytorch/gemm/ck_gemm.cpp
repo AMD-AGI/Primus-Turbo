@@ -54,15 +54,13 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
                            "For NT or NN layout, k must be a multiple of 128, got k=", k);
     }
 
-    // For BLOCKWISE (ABQuantGrouped), only support NT layout and additional alignment requirements
-    if (granularity == "BLOCKWISE") {
-        PRIMUS_TURBO_CHECK(
-            !transA && transB,
-            "BLOCKWISE granularity only supports NT layout (transA=False, transB=True)");
+    // For BLOCKWISE (ABQuantGrouped), NN and NT layout, k and n must be a multiple of 128
+    if (granularity == "BLOCKWISE" && !transA) {
         PRIMUS_TURBO_CHECK(k % 128 == 0,
                            "For BLOCKWISE granularity, k must be a multiple of 128, got k=", k);
         PRIMUS_TURBO_CHECK(n % 128 == 0,
                            "For BLOCKWISE granularity, n must be a multiple of 128, got n=", n);
+        PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
     }
 
     // Ensure all tensors are contiguous
