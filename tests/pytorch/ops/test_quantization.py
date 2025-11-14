@@ -97,3 +97,29 @@ def test_quantize_fp8_rowwise(
         x_fp8.to(torch.float32) * x_scale_inv,
         **get_tolerances(dest_dtype)
     )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 256, 1024])
+@pytest.mark.parametrize("N", [32, 256, 1024])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, granularity):
+    MX_BLOCK_SIZE = 32
+    torch.manual_seed(42)
+
+    x = torch.rand((B, M, N), device="cuda", dtype=orig_dtype)
+    x.detach().clone()
+
+    x_fp8, x_scale_inv = quantize_fp8(
+        x,
+        dest_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+    )
+    out = dequantize_fp8(
+        x_fp8, orig_dtype, granularity=granularity, block_size=MX_BLOCK_SIZE, scale_inv=x_scale_inv
+    )
+
+    torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
