@@ -76,6 +76,9 @@ using GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1 = CKTileGemmTileConfigWith
 using GFX942_CKGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKTileGemmTileConfigWithArch<
     GPUArch::GFX942, 256, 128, 128, 32, 32, 32, 2, 2, 1, false, true
 >;
+using GFX942_CKGemmTileCfg_128x128x128_32x32x32_2x2x1 = CKTileGemmTileConfigWithArch<
+    GPUArch::GFX942, 128, 128, 128, 32, 32, 32, 2, 2, 1, false, false
+>;
 // ***********************************************
 
 // ****** GFX950 Tile Config Specialization ******
