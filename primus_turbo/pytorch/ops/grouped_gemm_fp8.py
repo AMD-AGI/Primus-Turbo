@@ -24,7 +24,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_csrc_impl,
     grouped_gemm_variable_k_fp8_blockwise_impl,
 )
-from primus_turbo.pytorch.kernels.quantize import (
+from primus_turbo.pytorch.kernels.quantize.quantize_impl import (
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
 )

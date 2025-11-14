@@ -121,6 +121,8 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_END;
     if (granularity == "TENSORWISE") {
         scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    } else if (granularity == "MX_BLOCKWISE") {
+        scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
     } else {
         PRIMUS_TURBO_ERROR("Invalid granularity.");
     }
@@ -128,8 +130,14 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(A.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(B.scalar_type()));
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype));
-    PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kFloat);
-    PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kFloat);
+    if (granularity != "MX_BLOCKWISE") {
+        PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kFloat);
+        PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kFloat);
+    } else {
+        // scaling factor is e8m0 format.
+        PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kByte);
+        PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kByte);
+    }
 
     // contiguous check
     PRIMUS_TURBO_CHECK(A.is_contiguous(), "A must be contiguous");
@@ -167,6 +175,19 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         ldd = n;
     } else {
         PRIMUS_TURBO_ERROR("Not support layout.");
+    }
+
+    // MXFP8 extra check, ref:
+    // https://rocm.docs.amd.com/projects/hipBLASLt/en/latest/reference/api-reference.html#supported-data-types
+    if (granularity == "MX_BLOCKWISE") {
+        PRIMUS_TURBO_CHECK(n % 16 == 0);
+        PRIMUS_TURBO_CHECK(m % 16 == 0);
+        PRIMUS_TURBO_CHECK(k % 128 == 0);
+
+        PRIMUS_TURBO_CHECK(!transA && transB);
+
+        PRIMUS_TURBO_CHECK(scaleA_inv.dim() == 2, "Scale A must be a 2-D tensor.");
+        PRIMUS_TURBO_CHECK(scaleB_inv.dim() == 2, "Scale B must be a 2-D tensor.");
     }
 
     at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
