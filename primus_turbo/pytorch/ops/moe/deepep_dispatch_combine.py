@@ -105,7 +105,6 @@ class DeepEPDispatch(torch.autograd.Function):
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
-        use_cuda_num_token_per_expert: bool = False,
         num_worst_tokens: int = 0,
     ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -156,7 +155,6 @@ class DeepEPDispatch(torch.autograd.Function):
             previous_event=previous_event,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
-            num_recv_tokens_per_expert_as_cuda=use_cuda_num_token_per_expert,
             num_worst_tokens=num_worst_tokens,
         )
 
@@ -169,8 +167,7 @@ class DeepEPDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
 
-        if not use_cuda_num_token_per_expert:
-            assert isinstance(tokens_per_expert, list)
+        if tokens_per_expert is not None:
             tokens_per_expert = torch.tensor(tokens_per_expert)
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
@@ -250,7 +247,6 @@ def deepep_dispatch(
     group,
     async_finish=False,
     allocate_on_comm_stream=False,
-    use_cuda_num_token_per_expert: bool = False,
     num_worst_tokens: int = 0,
 ):
     """Perform fused dispatch operation if deep_ep is available.
@@ -261,7 +257,6 @@ def deepep_dispatch(
         token_probs: Token routing probabilities [num_tokens, topk]
         num_experts: Number of experts
         group: Process group
-        use_cuda_num_token_per_expert: return num_token_per_expert as cuda tensor when use_cuda_num_token_per_expert is True
         num_worst_tokens: set num_worst_token for deepep dispatch which can elimite host sync
     Returns:
         Result of FusedDispatch
@@ -274,7 +269,6 @@ def deepep_dispatch(
         group,
         async_finish,
         allocate_on_comm_stream,
-        use_cuda_num_token_per_expert,
         num_worst_tokens,
     )
 
