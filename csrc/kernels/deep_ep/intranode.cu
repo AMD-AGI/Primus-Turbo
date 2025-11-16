@@ -122,7 +122,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
 }
 
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
-                     const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                     const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
                      int64_t *moe_recv_tokens_per_experts, int num_experts, int num_tokens,
                      const bool *is_token_in_rank, int *channel_prefix_matrix,
                      int *rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,

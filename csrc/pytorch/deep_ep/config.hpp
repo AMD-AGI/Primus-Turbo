@@ -10,11 +10,11 @@
 
 #include "primus_turbo/common.h"
 
-#include <torch/custom_class.h>
 #include "primus_turbo/deep_ep/api.h"
 #include "primus_turbo/deep_ep/configs.h"
+#include <torch/custom_class.h>
 
-namespace primus_turbo::deep_ep {
+namespace primus_turbo::pytorch::deep_ep {
 
 struct Config : torch::CustomClassHolder {
     int64_t num_sms;
@@ -218,4 +218,4 @@ inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_ran
            NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
-} // namespace primus_turbo::deep_ep
+} // namespace primus_turbo::pytorch::deep_ep

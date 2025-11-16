@@ -12,9 +12,9 @@
 #include <tuple>
 #include <vector>
 
-#include "primus_turbo/deep_ep/config.hpp"
 #include "primus_turbo/deep_ep/configs.h"
 
+#include "config.hpp"
 #include "event.hpp"
 
 #include <torch/custom_class.h>
@@ -93,31 +93,31 @@ public:
 
     int64_t get_local_device_id() const;
 
-    pybind11::bytearray get_local_ipc_handle() const;
+    torch::Tensor get_local_ipc_handle() const;
 
-    pybind11::bytearray get_local_nvshmem_unique_id() const;
+    torch::Tensor get_local_nvshmem_unique_id() const;
 
-    torch::Tensor get_local_buffer_tensor(const pybind11::object &dtype, int64_t offset,
+    torch::Tensor get_local_buffer_tensor(const torch::ScalarType &dtype, int64_t offset,
                                           bool use_rdma_buffer) const;
 
     torch::Stream get_comm_stream() const;
 
-    void sync(const std::vector<int>                                &device_ids,
-              const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
-              const std::optional<pybind11::bytearray>              &root_unique_id_opt);
+    void sync(const std::vector<int64_t>                      &device_ids,
+              const std::vector<std::optional<torch::Tensor>> &all_gathered_handles,
+              const std::optional<torch::Tensor>              &root_unique_id_opt);
 
     void destroy();
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
-               std::optional<EventHandle>>
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     get_dispatch_layout(const torch::Tensor &topk_idx, int64_t num_experts,
-                        std::optional<EventHandle> &previous_event, bool async,
+                        std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
                         bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-               std::optional<EventHandle>>
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     intranode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const std::optional<torch::Tensor> &topk_idx,
                        const std::optional<torch::Tensor> &topk_weights,
@@ -128,26 +128,27 @@ public:
                        const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
                        const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
                        int64_t expert_alignment, int64_t num_worst_tokens,
-                       const primus_turbo::deep_ep::Config &config,
-                       std::optional<EventHandle> &previous_event, bool async,
+                       const c10::intrusive_ptr<Config>               config,
+                       std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
                        bool allocate_on_comm_stream);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     intranode_combine(const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,
                       const std::optional<torch::Tensor> &bias_0,
                       const std::optional<torch::Tensor> &bias_1, const torch::Tensor &src_idx,
                       const torch::Tensor &rank_prefix_matrix,
                       const torch::Tensor &channel_prefix_matrix, const torch::Tensor &send_head,
-                      const primus_turbo::deep_ep::Config &config,
-                      std::optional<EventHandle> &previous_event, bool async,
+                      const c10::intrusive_ptr<Config>               config,
+                      std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
                       bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
                torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
                std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<EventHandle>>
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     internode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const std::optional<torch::Tensor> &topk_idx,
                        const std::optional<torch::Tensor> &topk_weights,
@@ -160,26 +161,29 @@ public:
                        const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
                        const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-                       int64_t expert_alignment, int num_worst_tokens,
-                       const primus_turbo::deep_ep::Config &config,
-                       std::optional<EventHandle> &previous_event, bool async,
+                       int64_t expert_alignment, int64_t num_worst_tokens,
+                       const c10::intrusive_ptr<Config>               config,
+                       std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
                        bool allocate_on_comm_stream);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     internode_combine(
         const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,
         const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
         const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
         const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
         const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
-        const torch::Tensor &combined_nvl_head, const primus_turbo::deep_ep::Config &config,
-        std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream);
+        const torch::Tensor &combined_nvl_head, const c10::intrusive_ptr<Config> config,
+        std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
+        bool allocate_on_comm_stream);
 
     void clean_low_latency_buffer(int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
                                   int64_t num_experts);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
-               torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+               torch::Tensor, std::optional<c10::intrusive_ptr<EventHandle>>,
+               std::optional<std::function<void()>>>
     low_latency_dispatch(const torch::Tensor &x, const torch::Tensor &topk_idx,
                          const std::optional<torch::Tensor> &cumulative_local_expert_recv_stats,
                          const std::optional<torch::Tensor> &dispatch_wait_recv_cost_stats,
@@ -187,7 +191,8 @@ public:
                          bool use_fp8, bool round_scale, bool use_ue8m0, bool async,
                          bool return_recv_hook);
 
-    std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+    std::tuple<torch::Tensor, std::optional<c10::intrusive_ptr<EventHandle>>,
+               std::optional<std::function<void()>>>
     low_latency_combine(const torch::Tensor &x, const torch::Tensor &topk_idx,
                         const torch::Tensor &topk_weights, const torch::Tensor &src_info,
                         const torch::Tensor                &layout_range,

@@ -110,7 +110,7 @@ template <bool kLowLatencyMode, int kNumRDMARanks>
 __global__ void
 notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
                 const int *num_tokens_per_rdma_rank, int *moe_recv_rdma_counter_mapped,
-                const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
                 int64_t *moe_recv_tokens_per_experts, int num_experts, const bool *is_token_in_rank,
                 int num_tokens, int num_channels, int expert_alignment, const int rdma_clean_offset,
                 const int rdma_num_int_clean, const int nvl_clean_offset,
@@ -335,7 +335,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
 
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
                      const int *num_tokens_per_rdma_rank, int *moe_recv_rdma_counter_mapped,
-                     const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                     const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
                      int64_t *moe_recv_tokens_per_experts, int num_experts,
                      const bool *is_token_in_rank, int num_tokens, int num_channels,
                      int hidden_int4, int num_scales, int num_topk, int expert_alignment,
