@@ -111,6 +111,18 @@ struct Config : torch::CustomClassHolder {
                                   "rocSHMEM by following docs/install_dependencies.md");
 #endif
     }
+
+    std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, int64_t>>
+    __obj_flatten__() const {
+        return std::make_tuple(
+            std::make_tuple("num_sms", num_sms),
+            std::make_tuple("num_max_nvl_chunked_send_tokens", num_max_nvl_chunked_send_tokens),
+            std::make_tuple("num_max_nvl_chunked_recv_tokens", num_max_nvl_chunked_recv_tokens),
+            std::make_tuple("num_max_rdma_chunked_send_tokens", num_max_rdma_chunked_send_tokens),
+            std::make_tuple("num_max_rdma_chunked_recv_tokens", num_max_rdma_chunked_recv_tokens));
+    }
 };
 
 struct LowLatencyBuffer {

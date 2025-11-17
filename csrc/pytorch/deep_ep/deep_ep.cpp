@@ -114,6 +114,20 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
     }
 }
 
+std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+           std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+           std::tuple<std::string, bool>, std::tuple<std::string, bool>,
+           std::tuple<std::string, bool>>
+Buffer::__obj_flatten__() const {
+    return std::make_tuple(
+        std::make_tuple("rank", rank), std::make_tuple("num_ranks", num_ranks),
+        std::make_tuple("num_nvl_bytes", num_nvl_bytes),
+        std::make_tuple("num_rdma_bytes", num_rdma_bytes),
+        std::make_tuple("low_latency_mode", low_latency_mode),
+        std::make_tuple("explicitly_destroy", explicitly_destroy),
+        std::make_tuple("use_default_stream_as_comm_stream", use_default_stream_as_comm_stream));
+}
+
 Buffer::~Buffer() {
     if (not explicitly_destroy) {
         destroy();
@@ -149,8 +163,9 @@ int64_t Buffer::get_local_device_id() const {
 }
 
 torch::Tensor Buffer::get_local_ipc_handle() const {
-    return torch::from_blob(ipc_handles[nvl_rank].reserved, {HIP_IPC_HANDLE_SIZE},
-                            at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+    auto handle = std::vector<uint8_t>(ipc_handles[nvl_rank].reserved,
+                                       ipc_handles[nvl_rank].reserved + HIP_IPC_HANDLE_SIZE);
+    return torch::tensor(handle, at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 }
 
 torch::Tensor Buffer::get_local_nvshmem_unique_id() const {
@@ -223,22 +238,22 @@ void Buffer::destroy() {
     available = false;
 }
 
-void Buffer::sync(const std::vector<int64_t>                      &device_ids,
-                  const std::vector<std::optional<torch::Tensor>> &all_gathered_handles,
-                  const std::optional<torch::Tensor>              &root_unique_id_opt) {
+void Buffer::sync(const std::vector<int64_t> &device_ids, const torch::Tensor &all_gathered_handles,
+                  const std::optional<torch::Tensor> &root_unique_id_opt) {
     PRIMUS_TURBO_CHECK(not is_available());
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         PRIMUS_TURBO_CHECK(static_cast<size_t>(num_ranks) == device_ids.size());
-        PRIMUS_TURBO_CHECK(device_ids.size() == all_gathered_handles.size());
+        PRIMUS_TURBO_CHECK(device_ids.size() ==
+                           static_cast<size_t>(all_gathered_handles.sizes()[0]));
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
-            PRIMUS_TURBO_CHECK(all_gathered_handles[offset + i].has_value());
-            auto handle_str = std::string(all_gathered_handles[offset + i].value());
-            PRIMUS_TURBO_CHECK(all_gathered_handles[offset + i]->numel() == HIP_IPC_HANDLE_SIZE);
-            if (offset + i != rank) {
-                std::memcpy(ipc_handles[i].reserved, all_gathered_handles[offset + i] data_ptr(),
+            PRIMUS_TURBO_CHECK(all_gathered_handles[offset + i].numel() == HIP_IPC_HANDLE_SIZE);
+            auto handle_str =
+                std::string(static_cast<char *>(all_gathered_handles[offset + i].data_ptr()),
                             HIP_IPC_HANDLE_SIZE);
+            if (offset + i != rank) {
+                std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), HIP_IPC_HANDLE_SIZE);
                 PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i],
                                                            hipIpcMemLazyEnablePeerAccess));
                 barrier_signal_ptrs[i] =
@@ -264,9 +279,9 @@ void Buffer::sync(const std::vector<int64_t>                      &device_ids,
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
         PRIMUS_TURBO_CHECK(root_unique_id_opt.has_value());
-        std::vector<uint8_t> root_unique_id(root_unique_id_opt->numel());
-        std::memcpy(root_unique_id.data(), root_unique_id_opt->data_ptr(),
-                    root_unique_id_opt->nbytes());
+        std::vector<uint8_t> root_unique_id(root_unique_id_opt.nbytes());
+        std::memcpy(root_unique_id.data(), root_unique_id_opt.data_ptr(),
+                    root_unique_id_opt.nbytes());
         auto nvshmem_rank      = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
         PRIMUS_TURBO_CHECK(nvshmem_rank ==

@@ -23,7 +23,7 @@ __all__ = [
 ]
 
 _buffer = None
-_buffer_config: Tuple = None
+_buffer_config: Tuple = (32, False, None)
 
 
 def get_hidden_bytes(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> int:
@@ -41,7 +41,7 @@ def get_hidden_bytes(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) 
 
 def set_buffer_config(
     num_use_cu: int = 32,
-    use_comm_stream: bool = True,
+    use_comm_stream: bool = False,
     autotune_config: Optional[Tuple[Config, Config]] = None,
 ):
     global _buffer_config

@@ -79,6 +79,12 @@ public:
     Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
            bool low_latency_mode, bool explicitly_destroy, bool use_default_stream_as_comm_stream);
 
+    std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, bool>, std::tuple<std::string, bool>,
+               std::tuple<std::string, bool>>
+    __obj_flatten__() const;
+
     ~Buffer() override;
 
     bool is_available() const;
@@ -102,9 +108,8 @@ public:
 
     torch::Stream get_comm_stream() const;
 
-    void sync(const std::vector<int64_t>                      &device_ids,
-              const std::vector<std::optional<torch::Tensor>> &all_gathered_handles,
-              const std::optional<torch::Tensor>              &root_unique_id_opt);
+    void sync(const std::vector<int64_t> &device_ids, const torch::Tensor &all_gathered_handles,
+              const std::optional<torch::Tensor> &root_unique_id_opt);
 
     void destroy();
 
