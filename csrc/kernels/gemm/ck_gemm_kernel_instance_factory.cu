@@ -69,25 +69,33 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile
 
     if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
                   std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        if (n % 256 == 0) {
-            using TileConfig = GFX950_CKGemmTileCfg_256x256x128_16x16x128_2x2x1;
+        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+            using TileConfig = GFX950_CKGemmTileCfg_128x128x128_32x32x64_2x2x1;
             using Runner =
                 CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
-                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+                                BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
             runner = std::make_unique<Runner>();
-        }
-        else if (n % 128 == 0) {
-            using TileConfig = GFX950_CKGemmTileCfg_256x128x128_16x16x128_2x2x1;
-            using Runner =
-                CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
-                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
-            runner = std::make_unique<Runner>();
-        }else {
-            using TileConfig = GFX950_CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding;
-            using Runner =
-                CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
-                                  BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
-            runner = std::make_unique<Runner>();
+        } else {
+            if (n % 256 == 0) {
+                using TileConfig = GFX950_CKGemmTileCfg_256x256x128_16x16x128_2x2x1;
+                using Runner =
+                    CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                    BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+                runner = std::make_unique<Runner>();
+            }
+            else if (n % 128 == 0) {
+                using TileConfig = GFX950_CKGemmTileCfg_256x128x128_16x16x128_2x2x1;
+                using Runner =
+                    CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                    BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+                runner = std::make_unique<Runner>();
+            }else {
+                using TileConfig = GFX950_CKGemmTileCfg_128x128x128_32x32x64_2x2x1_padding;
+                using Runner =
+                    CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
+                                    BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+                runner = std::make_unique<Runner>();
+            }
         }
     } else {
         PRIMUS_TURBO_ERROR("CK Gemm only support fp8/bf8");
