@@ -68,7 +68,7 @@ class DMAHandle final {
         : allgather_shared_handle_(allgather_shared_handle),
           rankinfo_(shm_tag, group_rank, group_size) {
         SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(allgather_shared_handle_);
-        AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
+        AllGatherShmStruct *shm  = static_cast<AllGatherShmStruct *>(info->addr);
         rankinfo_.initialize(shm);
     }
 
@@ -92,7 +92,7 @@ public:
     }
     ~DMAHandle() {
         SharedMemoryInfo   *info = reinterpret_cast<SharedMemoryInfo *>(allgather_shared_handle_);
-        AllGatherShmStruct *shm  = (AllGatherShmStruct *) info->addr;
+        AllGatherShmStruct *shm  = static_cast<AllGatherShmStruct *>(info->addr);
         // TODO (limou)
         // primus_turbo currently uses check macros like PRIMUS_TURBO_CHECK which throws exceptions
         // however, destructors are not allowed to throw exceptions
@@ -137,7 +137,7 @@ public:
             hipIpcEventHandle_t local_exit_event_handle;
             PRIMUS_TURBO_CHECK_HIP(
                 hipIpcGetEventHandle(&local_exit_event_handle, local_exit_event));
-            memcpy((void *) &shm->exit_event_handles[group_rank], &local_exit_event_handle,
+            memcpy(&shm->exit_event_handles[group_rank], &local_exit_event_handle,
                    sizeof(hipIpcEventHandle_t));
 
             reusable_barrier(shm->barrier, shm->sense, group_size);
@@ -158,7 +158,6 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(entry_event));
                 entry_event = nullptr;
             }
-
             for (size_t i = 0; i < group_size; i++) {
                 if (exit_events[i] != nullptr) {
                     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[i]));
