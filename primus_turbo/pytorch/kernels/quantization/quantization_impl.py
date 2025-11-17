@@ -10,11 +10,11 @@ import torch
 import triton
 from torch.library import triton_op, wrap_triton
 
-from primus_turbo.triton.quantize.quant_blockwise import (
+from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
 )
-from primus_turbo.triton.quantize.quantize_mxfp8 import (
+from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
 )

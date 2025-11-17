@@ -108,4 +108,3 @@ class Float8QuantConfig:
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
-            assert self.format == Format.E4M3, "Format must be set E4M3 when granularity is MX_BLOCKWISE"

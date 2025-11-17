@@ -143,7 +143,7 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
 @pytest.mark.parametrize("n", [256, 2048, 4096])
 @pytest.mark.parametrize("k", [128, 512, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NT"])
-@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):

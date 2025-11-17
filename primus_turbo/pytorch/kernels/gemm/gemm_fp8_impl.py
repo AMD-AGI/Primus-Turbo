@@ -16,7 +16,7 @@ from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_nt_kernel,
     gemm_fp8_blockwise_tn_kernel,
 )
-from primus_turbo.triton.quantize.quant_blockwise import (
+from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_act_grad_kernel,
     quant_fp8_blockwise_for_weight_kernel,
 )

@@ -21,7 +21,9 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
-from primus_turbo.pytorch.kernels.quantize.quantize_impl import quant_fp8_blockwise_impl
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quant_fp8_blockwise_impl,
+)
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 __all__ = ["gemm_fp8"]
@@ -345,6 +347,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
         if format == Format.E4M3:
             return float8_e4m3
+        elif format == Format.E5M2:
+            return float8_e5m2
+        elif format == Format.HYBRID:
+            return float8_e4m3 if is_fwd_stage else float8_e5m2
         else:
             raise ValueError(f"Unsupported FP8 format: {format}")
 
@@ -407,7 +413,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         a_2d_view, b_2d_view = ctx.saved_tensors
-        grad_out_dtype = FP8GemmBlockFunction.get_fp8_dtype(ctx.config.format, False)
+        grad_out_dtype = FP8GemmMXFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out_2d_view = grad_out.view(grad_out.shape[0], -1)
         grad_out_t_2d_view = grad_out_2d_view.T.contiguous()

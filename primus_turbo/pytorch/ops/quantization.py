@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.pytorch.core.float8 import ScalingGranularity
-from primus_turbo.pytorch.kernels.quantize.quantize_impl import (
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp8_impl,
