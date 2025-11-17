@@ -9,6 +9,24 @@
 
 namespace primus_turbo::pytorch {
 
+namespace dist {
+
+class DMAAllGahterWork : public c10d::Work {
+public:
+    DMAAllGahterWork(DMAHandle *dma_handle, hipStream_t stream)
+        : c10d::Work(-1), dma_handle_(dma_handle), stream_(stream) {}
+    bool wait(std::chrono::milliseconds timeout = kNoTimeout) override {
+        run_dma_stream_wait(dma_handle_, stream_);
+        return true;
+    }
+
+private:
+    DMAHandle  *dma_handle_;
+    hipStream_t stream_;
+};
+
+} // namespace dist
+
 using dist::DMAHandle;
 using RankInfo = dist::DMAHandle::RankInfo;
 
@@ -30,7 +48,8 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
     dist::run_dma_all_gather_into_tensor_nobuffer(dma_handle, output_tensor.data_ptr(),
                                                   input_tensor.data_ptr(), size_bytes, stream);
-    return c10::intrusive_ptr<c10d::Work>(nullptr);
+    // return c10::intrusive_ptr<c10d::Work>(nullptr);
+    return c10::make_intrusive<dist::DMAAllGahterWork>(dma_handle, stream);
 }
 
 } // namespace primus_turbo::pytorch

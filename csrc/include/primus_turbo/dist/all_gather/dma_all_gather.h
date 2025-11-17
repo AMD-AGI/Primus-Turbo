@@ -114,9 +114,8 @@ public:
         RankInfo(const std::string &shm_tag_in, size_t group_rank_in, size_t group_size_in)
             : shm_tag(shm_tag_in), group_rank(group_rank_in), group_size(group_size_in) {}
 
-        // TODO : for to group_size
         void initialize(AllGatherShmStruct *shm) {
-            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+            for (size_t i = 0; i < group_size; i++) {
 
                 hipStream_t copy_stream = nullptr;
                 int         leastPriority, greatestPriority;
@@ -143,7 +142,7 @@ public:
 
             reusable_barrier(shm->barrier, shm->sense, group_size);
 
-            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; ++i) {
+            for (size_t i = 0; i < group_size; ++i) {
                 if (i == group_rank) {
                     exit_events[i] = local_exit_event;
                 } else {
@@ -160,7 +159,7 @@ public:
                 entry_event = nullptr;
             }
 
-            for (size_t i = 0; i < MAX_DEVICES_PER_NODE; i++) {
+            for (size_t i = 0; i < group_size; i++) {
                 if (exit_events[i] != nullptr) {
                     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[i]));
                     exit_events[i] = nullptr;
@@ -180,12 +179,9 @@ public:
         size_t            group_size;
         hipStream_t       copy_streams[MAX_DEVICES_PER_NODE]{};
         hipEvent_t        copy_events[MAX_DEVICES_PER_NODE]{};
-
-        // TODO : destroy
-        hipEvent_t exit_events[MAX_DEVICES_PER_NODE]{};
-        // TODO : destroy
-        hipEvent_t entry_event{};
-        void      *base_mem_ptrs[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t        exit_events[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t        entry_event{};
+        void             *base_mem_ptrs[MAX_DEVICES_PER_NODE]{};
     };
 
     uintptr_t get_allgather_shared_handle() const { return allgather_shared_handle_; }
@@ -198,5 +194,6 @@ private:
 
 void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
                                              size_t size_bytes, hipStream_t stream);
+void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream);
 
 } // namespace primus_turbo::pytorch::dist
