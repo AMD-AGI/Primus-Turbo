@@ -35,10 +35,19 @@ private:
 };
 
 void close_handle_callback(hipStream_t stream, hipError_t status, void *userData) {
-    void *ptr = userData;
+    using RankInfo          = primus_turbo::pytorch::dist::DMAHandle::RankInfo;
+    RankInfo *rankinfo      = static_cast<RankInfo *>(userData);
+    size_t    group_rank    = rankinfo->group_rank;
+    size_t    group_size    = rankinfo->group_size;
+    void    **base_mem_ptrs = rankinfo->base_mem_ptrs;
+
+    printf("in close_handle_callback, group_rank=%lu, rankinfo=%p\n", group_rank, rankinfo);
     fflush(stdout);
-    if (ptr != nullptr) {
-        PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(ptr));
+
+    for (size_t i = 0; i < group_size; i++) {
+        if (i != group_rank && base_mem_ptrs[i] != nullptr) {
+            PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(base_mem_ptrs[i]));
+        }
     }
 }
 
@@ -56,10 +65,10 @@ uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t gro
         PRIMUS_TURBO_CHECK(
             shared_memory_create(shm_name.c_str(), sizeof(AllGatherShmStruct), info) == 0,
             "failed to create allgather handle");
-        AllGatherShmStruct *shm = (AllGatherShmStruct *) info->addr;
+        AllGatherShmStruct *shm = static_cast<AllGatherShmStruct *>(info->addr);
 
         // init shm
-        memset((void *) shm, 0, sizeof(*shm));
+        memset(shm, 0, sizeof(*shm));
         new (const_cast<std::atomic<int> *>(&shm->barrier)) std::atomic<int>(0);
         new (const_cast<std::atomic<int> *>(&shm->sense)) std::atomic<int>(0);
 
@@ -68,7 +77,7 @@ uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t gro
         }
 
         {
-            FileGuard file_guard(barrier_path);
+            const FileGuard file_guard(barrier_path);
             reusable_barrier(shm->barrier, shm->sense, group_size);
         }
     } else {
@@ -77,7 +86,7 @@ uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t gro
             ret = shared_memory_open(shm_name.c_str(), sizeof(AllGatherShmStruct), info);
         } while (ret != 0);
 
-        AllGatherShmStruct *shm = (AllGatherShmStruct *) info->addr;
+        AllGatherShmStruct *shm = static_cast<AllGatherShmStruct *>(info->addr);
 
         FileGuard::wait_file(barrier_path);
         reusable_barrier(shm->barrier, shm->sense, group_size);
@@ -102,7 +111,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
 
     SharedMemoryInfo *info =
         reinterpret_cast<SharedMemoryInfo *>(dma_handle->get_allgather_shared_handle());
-    AllGatherShmStruct *shm = (AllGatherShmStruct *) info->addr;
+    AllGatherShmStruct *shm = static_cast<AllGatherShmStruct *>(info->addr);
 
     DMAHandle::RankInfo *rankinfo      = dma_handle->get_rankinfo();
     size_t               group_rank    = rankinfo->group_rank;
@@ -112,9 +121,6 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
     hipEvent_t          *exit_events   = rankinfo->exit_events;
     void               **base_mem_ptrs = rankinfo->base_mem_ptrs;
 
-    // wait for all mem handle ready
-    reusable_barrier(shm->barrier, shm->sense, group_size);
-
     // get output handle, and copy it to shm
     void  *output_base_ptr = nullptr;
     size_t alloc_size      = 0;
@@ -122,12 +128,10 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
 
     hipIpcMemHandle_t base_mem_handle;
     PRIMUS_TURBO_CHECK_HIP(hipIpcGetMemHandle(&base_mem_handle, output_base_ptr));
-    memcpy((void *) &shm->base_mem_handles[group_rank], &base_mem_handle,
-           sizeof(hipIpcMemHandle_t));
+    memcpy(&shm->base_mem_handles[group_rank], &base_mem_handle, sizeof(hipIpcMemHandle_t));
     shm->base_mem_offsets[group_rank] =
         static_cast<char *>(output) - static_cast<char *>(output_base_ptr);
 
-    // wait for all mem handle ready
     reusable_barrier(shm->barrier, shm->sense, group_size);
 
     for (size_t i = 0; i < group_size; ++i) {
@@ -135,7 +139,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
             void *remote_base_ptr = nullptr;
             // TODO : hipIpcCloseMemHandle
             PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(
-                &remote_base_ptr, *(hipIpcMemHandle_t *) &shm->base_mem_handles[i],
+                &remote_base_ptr, *static_cast<hipIpcMemHandle_t *>(&shm->base_mem_handles[i]),
                 hipIpcMemLazyEnablePeerAccess));
 
             base_mem_ptrs[i] = remote_base_ptr;
@@ -144,7 +148,6 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
         }
     }
 
-    // record op stream
     PRIMUS_TURBO_CHECK_HIP(hipEventRecord(rankinfo->entry_event, stream));
 
     for (size_t i = 0; i < group_size; ++i) {
@@ -164,13 +167,8 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
 
         PRIMUS_TURBO_CHECK_HIP(
             hipMemcpyAsync(dst, src, size_bytes, hipMemcpyDeviceToDeviceNoCU, copy_stream));
-        // if (remote_rank != group_rank) {
-        //     PRIMUS_TURBO_CHECK_HIP(hipStreamAddCallback(copy_stream, close_handle_callback,
-        //                                                 base_mem_ptrs[remote_rank], 0));
-        // }
     }
 
-    //
     for (size_t i = 0; i < group_size; i++) {
         size_t      remote_rank = (group_rank + i) % group_size;
         hipStream_t copy_stream = copy_streams[remote_rank];
@@ -182,7 +180,7 @@ void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output
 void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream) {
     SharedMemoryInfo *info =
         reinterpret_cast<SharedMemoryInfo *>(dma_handle->get_allgather_shared_handle());
-    AllGatherShmStruct *shm = (AllGatherShmStruct *) info->addr;
+    AllGatherShmStruct *shm = static_cast<AllGatherShmStruct *>(info->addr);
 
     DMAHandle::RankInfo *rankinfo    = dma_handle->get_rankinfo();
     size_t               group_rank  = rankinfo->group_rank;
@@ -190,11 +188,14 @@ void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream) {
     hipEvent_t          *copy_events = rankinfo->copy_events;
     hipEvent_t          *exit_events = rankinfo->exit_events;
 
+    printf("run_dma_stream_wait, group_rank=%lu, rankinfo=%p\n", group_rank, rankinfo);
+
     for (size_t i = 0; i < group_size; i++) {
         size_t     remote_rank = (group_rank + i) % group_size;
         hipEvent_t copy_event  = copy_events[remote_rank];
         PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, copy_event, 0));
     }
+
     hipEventRecord(exit_events[group_rank], stream);
     reusable_barrier(shm->barrier, shm->sense, group_size);
 
@@ -203,6 +204,9 @@ void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream) {
             PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, exit_events[i], 0));
         }
     }
+
+    // PRIMUS_TURBO_CHECK_HIP(
+    //     hipStreamAddCallback(stream, close_handle_callback, rankinfo, 0));
 }
 
 } // namespace primus_turbo::pytorch::dist
