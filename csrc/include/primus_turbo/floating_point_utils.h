@@ -1,8 +1,11 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
 // See LICENSE for license information.
+#pragma once
 
 #include "primus_turbo/platform.h"
+#include <cstdint>
+#include <cstring>
 
 namespace primus_turbo {
 
