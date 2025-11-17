@@ -54,6 +54,9 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         )
 
         if num_out_tokens < 0:
+            assert (
+                tokens_per_experts is not None
+            ), "tokens_per_experts must be provided to the fused permute function when num_out_tokens is -1"
             num_out_tokens = tokens_per_experts.sum().item()
 
         use_fp8 = isinstance(inp, Float8Tensor)
