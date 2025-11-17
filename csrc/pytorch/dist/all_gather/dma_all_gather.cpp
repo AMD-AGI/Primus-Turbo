@@ -41,7 +41,6 @@ void close_handle_callback(hipStream_t stream, hipError_t status, void *userData
     size_t    group_size    = rankinfo->group_size;
     void    **base_mem_ptrs = rankinfo->base_mem_ptrs;
 
-    printf("in close_handle_callback, group_rank=%lu, rankinfo=%p\n", group_rank, rankinfo);
     fflush(stdout);
 
     for (size_t i = 0; i < group_size; i++) {
@@ -187,8 +186,6 @@ void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream) {
     size_t               group_size  = rankinfo->group_size;
     hipEvent_t          *copy_events = rankinfo->copy_events;
     hipEvent_t          *exit_events = rankinfo->exit_events;
-
-    printf("run_dma_stream_wait, group_rank=%lu, rankinfo=%p\n", group_rank, rankinfo);
 
     for (size_t i = 0; i < group_size; i++) {
         size_t     remote_rank = (group_rank + i) % group_size;

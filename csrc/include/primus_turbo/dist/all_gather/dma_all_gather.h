@@ -131,6 +131,10 @@ public:
             }
 
             hipEvent_t local_exit_event = nullptr;
+            // TODO (limou)
+            // After calling this API, a hip_eventXXX file is created in the /dev/shm/ directory.
+            // Even after calling hipEventDestroy(), the file is not removed in the end
+            // this may be a bug, At least on ROCm-7.0 + MI300X, this issue exists.
             PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(
                 &local_exit_event, hipEventDisableTiming | hipEventInterprocess));
 
