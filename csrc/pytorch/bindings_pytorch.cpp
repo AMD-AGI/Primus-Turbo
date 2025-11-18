@@ -61,15 +61,38 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
                   DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS})
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
-        .def("__obj_flatten__", &deep_ep::Config::__obj_flatten__);
+        .def("__obj_flatten__", &deep_ep::Config::obj_flatten);
+    .def_pickle(
+        // __getstate__
+        [](const c10::intrusive_ptr<deep_ep::Config> &self)
+            -> std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> {
+            return self->obj_flatten();
+        },
+        //__setstate__
+        [](std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> state)
+            -> c10::intrusive_ptr<deep_ep::Config> {
+            auto [num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
+                  num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens] = state;
+            return c10::make_intrusive<deep_ep::Config>(
+                num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
+                num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
+        });
 
     m.class_<deep_ep::EventHandle>("EventHandle")
         .def(torch::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
-        .def("__obj_flatten__", &deep_ep::EventHandle::__obj_flatten__);
+        .def("__obj_flatten__", &deep_ep::EventHandle::obj_flatten)
+        .def_pickle(
+            // __getstate__
+            [](const c10::intrusive_ptr<deep_ep::EventHandle> &self) { return std::make_tuple(); },
+            //__setstate__
+            [](std::tuple<> state) -> c10::intrusive_ptr<deep_ep::EventHandle> {
+                auto handle = c10::make_intrusive<deep_ep::EventHandle>();
+                return handle;
+            });
 
     m.class_<deep_ep::Buffer>("Buffer")
-        .def(torch::init<int64_t, int64_t, int64_t, int64_t, bool, bool, bool>())
+        .def(torch::init<std::string, int64_t, int64_t, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
@@ -86,17 +109,21 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
-        .def("__obj_flatten__", &deep_ep::Buffer::__obj_flatten__)
+        .def("__obj_flatten__", &deep_ep::Buffer::obj_flatten)
         .def_pickle(
             // __getstate__
-            [](const c10::intrusive_ptr<deep_ep::Buffer> &self) -> std::vector<std::string> {
-                PRIMUS_TURBO_CHECK(false, "not support __getstate__");
-                return {};
+            [](const c10::intrusive_ptr<deep_ep::Buffer> &self)
+                -> std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> {
+                return self->get_state();
             },
             //__setstate__
-            [](std::vector<std::string> state) -> c10::intrusive_ptr<deep_ep::Buffer> {
-                PRIMUS_TURBO_CHECK(false, "not support __setstate__");
-                return c10::intrusive_ptr<deep_ep::Buffer>();
+            [](std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> state)
+                -> c10::intrusive_ptr<deep_ep::Buffer> {
+                auto [group_name, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
+                      explicitly_destroy, use_default_stream_as_comm_stream, available] = state;
+                return deep_ep::make_buffer(group_name, num_nvl_bytes, num_rdma_bytes,
+                                            low_latency_mode, explicitly_destroy,
+                                            use_default_stream_as_comm_stream, available);
             });
 }
 

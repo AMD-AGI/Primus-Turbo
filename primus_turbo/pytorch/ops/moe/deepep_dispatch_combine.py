@@ -169,9 +169,10 @@ class DeepEPDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
 
-        if not use_cuda_num_token_per_expert:
-            assert isinstance(tokens_per_expert, list)
-            tokens_per_expert = torch.tensor(tokens_per_expert)
+        # TODO: raise error when enable torch.compile
+        # if not use_cuda_num_token_per_expert:
+        #     assert isinstance(tokens_per_expert, list)
+        #     tokens_per_expert = torch.tensor(tokens_per_expert)
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 

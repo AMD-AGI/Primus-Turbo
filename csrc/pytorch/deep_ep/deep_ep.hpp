@@ -23,6 +23,8 @@ namespace primus_turbo::pytorch::deep_ep {
 struct Buffer : torch::CustomClassHolder {
 
 private:
+    std::string group_name;
+
     // Low-latency mode buffer
     int  low_latency_buffer_idx = 0;
     bool low_latency_mode       = false;
@@ -76,14 +78,15 @@ private:
     bool use_default_stream_as_comm_stream = false;
 
 public:
-    Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
+    Buffer(std::string group_name, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
            bool low_latency_mode, bool explicitly_destroy, bool use_default_stream_as_comm_stream);
 
-    std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
-               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
-               std::tuple<std::string, bool>, std::tuple<std::string, bool>,
-               std::tuple<std::string, bool>>
-    __obj_flatten__() const;
+    std::tuple<std::tuple<std::string, std::string>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, int64_t>, std::tuple<std::string, bool>,
+               std::tuple<std::string, bool>, std::tuple<std::string, bool>>
+    obj_flatten() const;
+
+    std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> get_state() const;
 
     ~Buffer() override;
 
@@ -108,7 +111,7 @@ public:
 
     torch::Stream get_comm_stream() const;
 
-    void sync(const std::vector<int64_t> &device_ids, const torch::Tensor &all_gathered_handles,
+    void sync(const torch::Tensor                &all_gathered_handles,
               const std::optional<torch::Tensor> &root_unique_id_opt);
 
     void destroy();
@@ -209,5 +212,10 @@ public:
     torch::Tensor get_next_low_latency_combine_buffer(int64_t num_max_dispatch_tokens_per_rank,
                                                       int64_t hidden, int64_t num_experts) const;
 };
+
+c10::intrusive_ptr<Buffer> make_buffer(std::string group_name, int64_t num_nvl_bytes,
+                                       int64_t num_rdma_bytes, bool low_latency_mode,
+                                       bool explicitly_destroy,
+                                       bool use_default_stream_as_comm_stream, bool available);
 
 } // namespace primus_turbo::pytorch::deep_ep

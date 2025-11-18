@@ -32,7 +32,7 @@ struct EventHandle : torch::CustomClassHolder {
         at::hip::getCurrentHIPStreamMasqueradingAsCUDA().unwrap().wait(*event);
     }
 
-    std::tuple<> __obj_flatten__() const { return std::make_tuple(); }
+    std::tuple<> obj_flatten() const { return std::make_tuple(); }
 };
 
 inline torch::Event create_event(const at::hip::HIPStreamMasqueradingAsCUDA &s) {

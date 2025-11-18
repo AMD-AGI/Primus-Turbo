@@ -85,9 +85,9 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+
         self.runtime = CppBuffer(
-            self.rank,
-            self.group_size,
+            group.group_name,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode,
@@ -146,7 +146,7 @@ class Buffer:
             ]
 
         # Make CPP runtime available
-        self.runtime.sync(device_ids, torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
+        self.runtime.sync(torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
         assert self.runtime.is_available()
 
     def destroy(self):
@@ -170,7 +170,8 @@ class Buffer:
         """
 
         assert new_num_sms % 2 == 0, "The SM count must be even"
-        Buffer.num_sms = new_num_sms
+        # TODO
+        # Buffer.num_sms = new_num_sms
 
     @staticmethod
     def capture() -> EventOverlap:

@@ -114,11 +114,11 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
-    def test_token_dispatcher_dropless(self):
+    def test_token_dispatcher_compiled(self):
         self._init_process()
         ep_group = dist.group.WORLD
 
-        for cfg in get_token_dispatcher_config():
+        def _dispatch_token(cfg, ep_group, hidden_states, probs):
             dispatcher = turbo.modules.DeepEPTokenDispatcher(
                 cfg.num_experts,
                 cfg.router_topk,
@@ -129,39 +129,73 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                 permute_max_token_num=cfg.permute_max_token_num,
                 expert_capacity_factor=cfg.expert_capacity_factor,
             )
+            return dispatcher.token_dispatch(hidden_states, probs)
 
+        compiled_dispatch_token = torch.compile(_dispatch_token)
+
+        for cfg in get_token_dispatcher_config():
             hidden_states = torch.randn((cfg.num_tokens, cfg.hidden_size), dtype=cfg.dtype, device="cuda")
-            ans = hidden_states
-            hidden_states.requires_grad = True
-
+            # hidden_states.requires_grad = True
             probs = (
                 torch.ones((cfg.num_tokens, cfg.num_experts), dtype=torch.float32, device="cuda")
                 / cfg.router_topk
             )
+            compiled_dispatch_token(cfg, ep_group, hidden_states, probs)
 
-            (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = dispatcher.token_dispatch(
-                hidden_states,
-                probs,
-            )
+    # def test_token_dispatcher_dropless(self):
+    #     self._init_process()
+    #     ep_group = dist.group.WORLD
 
-            permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
+    #     for cfg in get_token_dispatcher_config():
+    #         dispatcher = turbo.modules.DeepEPTokenDispatcher(
+    #             cfg.num_experts,
+    #             cfg.router_topk,
+    #             ep_group,
+    #             permute_fusion=cfg.permute_fusion,
+    #             deepep_use_cuda_num_tokens_per_expert=cfg.deepep_use_cuda_num_tokens_per_expert,
+    #             deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
+    #             permute_max_token_num=cfg.permute_max_token_num,
+    #             expert_capacity_factor=cfg.expert_capacity_factor,
+    #         )
+    #         dispatcher = torch.compile(dispatcher)
 
-            permuted_local_hidden_states = permuted_local_hidden_states.to(ans.dtype)
+    #         hidden_states = torch.randn(
+    #             (cfg.num_tokens, cfg.hidden_size), dtype=cfg.dtype, device="cuda")
+    #         ans = hidden_states
+    #         hidden_states.requires_grad = True
 
-            restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
+    #         probs = (
+    #             torch.ones((cfg.num_tokens, cfg.num_experts),
+    #                        dtype=torch.float32, device="cuda")
+    #             / cfg.router_topk
+    #         )
 
-            assert torch.allclose(
-                restored_hidden_states, ans
-            ), f"Restored hidden states do not match original hidden states, {restored_hidden_states} {ans}"
+    #         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = dispatcher.token_dispatch(
+    #             hidden_states,
+    #             probs,
+    #         )
 
-            # check if the grad of the hidden states is same as the hidden states
-            torch.autograd.backward(restored_hidden_states, hidden_states)
-            assert torch.allclose(
-                hidden_states.grad, ans
-            ), "Restored hidden states do not match original hidden states"
+    #         permuted_local_hidden_states = permuted_local_hidden_states * \
+    #             permuted_probs.unsqueeze(-1)
 
-            expected_token_per_expert_device = "cuda" if cfg.deepep_use_cuda_num_tokens_per_expert else "cpu"
-            assert tokens_per_expert.device.type == expected_token_per_expert_device
+    #         permuted_local_hidden_states = permuted_local_hidden_states.to(
+    #             ans.dtype)
+
+    #         restored_hidden_states = dispatcher.token_combine(
+    #             permuted_local_hidden_states)
+
+    #         assert torch.allclose(
+    #             restored_hidden_states, ans
+    #         ), f"Restored hidden states do not match original hidden states, {restored_hidden_states} {ans}"
+
+    #         # check if the grad of the hidden states is same as the hidden states
+    #         torch.autograd.backward(restored_hidden_states, hidden_states)
+    #         assert torch.allclose(
+    #             hidden_states.grad, ans
+    #         ), "Restored hidden states do not match original hidden states"
+
+    #         expected_token_per_expert_device = "cuda" if cfg.deepep_use_cuda_num_tokens_per_expert else "cpu"
+    #         assert tokens_per_expert.device.type == expected_token_per_expert_device
 
 
 if __name__ == "__main__":

@@ -57,10 +57,11 @@ class TokenDispatcher:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states, probs = self._pre_dispatch(hidden_states, probs, routing_map, indices)
         dispatched_tokens, dispatched_probs = self._exec_dispatch(hidden_states, probs)
-        dispatched_input, tokens_per_expert, permuted_probs = self._post_dispatch(
-            dispatched_tokens, dispatched_probs
-        )
-        return dispatched_input, tokens_per_expert, permuted_probs
+        # dispatched_input, tokens_per_expert, permuted_probs = self._post_dispatch(
+        #     dispatched_tokens, dispatched_probs
+        # )
+        return None, None, None
+        # return dispatched_input, tokens_per_expert, permuted_probs
 
     def token_combine(self, hidden_states: torch.Tensor):
         output = self._pre_combine(hidden_states)

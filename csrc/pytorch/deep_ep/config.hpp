@@ -115,7 +115,7 @@ struct Config : torch::CustomClassHolder {
     std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
                std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
                std::tuple<std::string, int64_t>>
-    __obj_flatten__() const {
+    obj_flatten() const {
         return std::make_tuple(
             std::make_tuple("num_sms", num_sms),
             std::make_tuple("num_max_nvl_chunked_send_tokens", num_max_nvl_chunked_send_tokens),

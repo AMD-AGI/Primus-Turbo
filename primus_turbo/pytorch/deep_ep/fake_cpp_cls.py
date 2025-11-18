@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -14,58 +14,52 @@ class FakeCppBuffer:
 
     def __init__(
         self,
-        rank: int,
-        num_ranks: int,
+        group_name: str,
         num_nvl_bytes: int,
         num_rdma_bytes: int,
         low_latency_mode: bool,
         explicitly_destroy: bool,
         use_default_stream_as_comm_stream: bool,
     ):
-        self.rank = rank
-        self.num_ranks = num_ranks
+        self.group_name = group_name
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.use_default_stream_as_comm_stream = use_default_stream_as_comm_stream
 
-        self.available = True
-        self.rdma_rank = rank // NUM_MAX_NVL_PEERS
-        self.nvl_rank = rank % NUM_MAX_NVL_PEERS
-
     def is_available(self) -> bool:
-        return self.available
+        pass
 
     def get_num_rdma_ranks(self) -> int:
-        return self.num_ranks // NUM_MAX_NVL_PEERS
+        pass
 
     def get_rdma_rank(self) -> int:
-        return self.rdma_rank
+        pass
 
     def get_root_rdma_rank(self, is_global: bool) -> int:
-        return self.nvl_rank if is_global else 0
+        pass
 
     def get_local_device_id(self) -> int:
-        return self.nvl_rank
+        pass
 
     def get_local_ipc_handle(self) -> torch.Tensor:
-        return torch.Tensor().cpu()
+        pass
 
     def get_local_nvshmem_unique_id(self) -> torch.Tensor:
-        return torch.Tensor().cpu()
+        pass
 
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int, use_rdma_buffer: bool) -> torch.Tensor:
-        return torch.Tensor().cuda()
+        pass
 
     def get_comm_stream(self) -> torch.Stream:
-        return torch.cuda.Stream()
+        pass
 
     def sync(
         self,
-        device_ids: List[int],
-        all_gathered_handles: torch.Tensor,
-        root_unique_id_opt: Optional[torch.Tensor],
+        device_ids,
+        all_gathered_handles,
+        root_unique_id_opt,
     ) -> None:
         pass
 
@@ -79,8 +73,8 @@ class FakeCppBuffer:
         previous_event: Optional[EventHandle],
         async_finish: bool,
         allocate_on_comm_stream: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[EventHandle]]:
-        return torch.Tensor().cuda(), None, torch.Tensor().cuda(), torch.Tensor().cuda(), None
+    ) -> Any:
+        pass
 
     def intranode_dispatch(
         self,
@@ -114,20 +108,7 @@ class FakeCppBuffer:
         torch.Tensor,
         Optional[EventHandle],
     ]:
-        return (
-            torch.Tensor().cuda(),
-            None,
-            None,
-            None,
-            [],
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            None,
-        )
+        pass
 
     def intranode_combine(
         self,
@@ -144,7 +125,7 @@ class FakeCppBuffer:
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[EventHandle]]:
-        return torch.Tensor().cuda(), None, None
+        pass
 
     def internode_dispatch(
         self,
@@ -186,24 +167,7 @@ class FakeCppBuffer:
         Optional[torch.Tensor],
         Optional[EventHandle],
     ]:
-        return (
-            torch.Tensor().cuda(),
-            None,
-            None,
-            None,
-            [],
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            torch.Tensor().cuda(),
-            None,
-            torch.Tensor().cuda(),
-            None,
-            torch.Tensor().cuda(),
-            None,
-            None,
-            None,
-            None,
-        )
+        pass
 
     def internode_combine(
         self,
@@ -223,19 +187,43 @@ class FakeCppBuffer:
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[EventHandle]]:
-        return torch.Tensor().cuda(), None, None
+        pass
 
-    def __getstate__(self) -> dict:
-        return {
-            "rank": self.rank,
-            "num_ranks": self.num_ranks,
-            "num_nvl_bytes": self.num_nvl_bytes,
-            "num_rdma_bytes": self.num_rdma_bytes,
-            "low_latency_mode": self.low_latency_mode,
-            "explicitly_destroy": self.explicitly_destroy,
-            "use_default_stream_as_comm_stream": self.use_default_stream_as_comm_stream,
-        }
+    @classmethod
+    def __obj_unflatten__(cls, flattened_obj):
+        return cls(**dict[Any, Any](flattened_obj))
+
+
+@torch._library.register_fake_class("primus_turbo_cpp_extension::EventHandle")
+class FakeEventHandle:
+
+    def __init__(self):
+        pass
+
+    def current_stream_wait(self):
+        pass
 
     @classmethod
     def __obj_unflatten__(cls, flattened_obj):
         return cls(**dict(flattened_obj))
+
+
+# @torch._library.register_fake_class("primus_turbo_cpp_extension::Config")
+# class FakeCppConfig:
+
+#     def __init__(
+#             self,
+#             num_sms: int = 20,
+#             num_max_nvl_chunked_send_tokens: int = 24,
+#             num_max_nvl_chunked_recv_tokens: int = 256,
+#             num_max_rdma_chunked_send_tokens: int = 6,
+#             num_max_rdma_chunked_recv_tokens: int = 128):
+#         self.num_sms = num_sms
+#         self.num_max_nvl_chunked_send_tokens = num_max_nvl_chunked_send_tokens
+#         self.num_max_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens
+#         self.num_max_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens
+#         self.num_max_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens
+
+#     @classmethod
+#     def __obj_unflatten__(cls, flattened_obj):
+#         return cls(**dict(flattened_obj))
