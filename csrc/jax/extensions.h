@@ -14,4 +14,8 @@ namespace primus_turbo::jax {
 XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormBwdHandler);
 
+XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmVariableKHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ComputeGroupOffsHandler);
+
 } // namespace primus_turbo::jax

@@ -23,6 +23,11 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, rmsnorm_fwd, RMSNormFwdHandler);
     REGISTER_FFI_HANDLER(dict, rmsnorm_bwd, RMSNormBwdHandler);
 
+    // Grouped GEMM
+    REGISTER_FFI_HANDLER(dict, grouped_gemm, GroupedGemmHandler);
+    REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k, GroupedGemmVariableKHandler);
+    REGISTER_FFI_HANDLER(dict, compute_group_offs, ComputeGroupOffsHandler);
+
     return dict;
 }
 
