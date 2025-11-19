@@ -342,6 +342,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 class FP8GemmMXFunction(torch.autograd.Function):
 
     MXFP8_GEMM_BACKEND = "hipblaslt"
+    HIPBLASLT_K_MULTIPLE = 128
 
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -375,8 +376,32 @@ class FP8GemmMXFunction(torch.autograd.Function):
         a_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
 
-        a_2d_view = a.view(a.shape[0], -1)
-        b_2d_view = b.view(b.shape[0], -1)
+        a_2d_view = a.view(a.size(0), -1)
+        b_2d_view = b.view(b.size(0), -1)
+
+        # padded k dim to 128 multiple
+        k_padding_size = (
+            (a_2d_view.size(1) + __class__.HIPBLASLT_K_MULTIPLE - 1) // __class__.HIPBLASLT_K_MULTIPLE
+        ) * __class__.HIPBLASLT_K_MULTIPLE - a_2d_view.size(1)
+        if k_padding_size > 0:
+            a_2d_view = torch.concat(
+                [
+                    a_2d_view,
+                    torch.zeros(
+                        a_2d_view.size(0), k_padding_size, dtype=a_2d_view.dtype, device=a_2d_view.device
+                    ),
+                ],
+                dim=1,
+            )
+            b_2d_view = torch.concat(
+                [
+                    b_2d_view,
+                    torch.zeros(
+                        b_2d_view.size(0), k_padding_size, dtype=b_2d_view.dtype, device=b_2d_view.device
+                    ),
+                ],
+                dim=1,
+            )
 
         a_fp8, a_scale_inv = quantize_fp8(
             a_2d_view, a_dtype, config.granularity, block_size=config.block_size
@@ -407,6 +432,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
         ctx.config = config
         ctx.a_fp8_dtype = a_fp8.dtype
         ctx.b_fp8_dtype = b_fp8.dtype
+        ctx.k_padding_size = k_padding_size
 
         return out
 
@@ -462,6 +488,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             backend=__class__.MXFP8_GEMM_BACKEND,
             granularity=ctx.config.granularity,
         )
+
+        if ctx.k_padding_size > 0:
+            grad_a = grad_a[:, : -ctx.k_padding_size]
+            grad_b = grad_b[:, : -ctx.k_padding_size]
 
         return grad_a, grad_b, None, None, None, None
 
