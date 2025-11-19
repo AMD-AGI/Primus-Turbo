@@ -135,8 +135,8 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kFloat);
     } else {
         // scaling factor is e8m0 format.
-        PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kByte);
-        PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kByte);
+        PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kFloat8_e8m0fnu);
+        PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kFloat8_e8m0fnu);
     }
 
     // contiguous check

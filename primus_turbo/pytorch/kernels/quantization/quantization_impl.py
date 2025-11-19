@@ -193,6 +193,7 @@ def quantize_mxfp8_impl(
         GROUP_Y,
         block_size,
     )
+    scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
 
     return y.view_as(x), scale_inv
 
@@ -211,7 +212,8 @@ def dequantize_mxfp8_impl(
 
     x_2d_view = x.view(num_rows, row_length)
 
-    scale_inv_2d_view = scale_inv.view(num_rows, row_length // block_size)
+    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
+    scale_inv_2d_view = scale_inv.view(num_rows, row_length // block_size).view(torch.uint8)
 
     scale_M, scale_N = scale_inv_2d_view.shape
     out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
