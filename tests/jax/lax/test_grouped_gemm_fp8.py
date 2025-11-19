@@ -9,7 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from primus_turbo.jax.lax.grouped_gemm import compute_group_offs, grouped_gemm_fp8
+from primus_turbo.jax.lax.grouped_gemm import compute_group_offs
+from primus_turbo.jax.lax.grouped_gemm_fp8 import grouped_gemm_fp8
 
 
 def quantize_fp8_simple(x, dtype):

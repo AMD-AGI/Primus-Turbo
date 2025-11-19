@@ -6,131 +6,84 @@
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
-from primus_turbo.jax.lax.grouped_gemm import compute_group_offs, grouped_gemm
+from primus_turbo.jax.lax.grouped_gemm import grouped_gemm
+from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
+from tests.jax.test_utils import compute_snr
 
 
-def grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=False):
-    """Reference implementation of grouped GEMM using JAX ops."""
-    bs = b.shape[0]
-    m = a.shape[0]
-    n = b.shape[2] if not transB else b.shape[1]
-
-    # Initialize output
-    c = jnp.zeros((m, n), dtype=a.dtype)
-
-    # Process each group
-    for i in range(bs):
-        start_idx = group_offs[i]
-        end_idx = group_offs[i + 1]
-
-        a_slice = a[start_idx:end_idx, :]
-        b_slice = b[i, :, :]
-
-        # Apply transpose if needed
-        if transA:
-            a_slice = a_slice.T
-        if transB:
-            b_slice = b_slice.T
-
-        # Compute matmul for this group
-        c_slice = jnp.matmul(a_slice, b_slice)
-        c = c.at[start_idx:end_idx, :].set(c_slice)
-
-    return c
-
-
-def generate_group_lens(bs, m, balance=True):
-    """Generate group lengths similar to PyTorch version."""
-    if balance:
-        # Balanced groups - all same size
-        return jnp.full((bs,), m, dtype=jnp.int64)
-    else:
-        # Unbalanced groups
-        key = jax.random.PRNGKey(42)
-        lengths = jax.random.randint(key, (bs,), m // 2, m * 2)
-        # Normalize to sum to bs * m
-        total = jnp.sum(lengths)
-        lengths = (lengths * (bs * m) / total).astype(jnp.int64)
-        return lengths
-
-
-@pytest.mark.parametrize("B", [2, 4])
-@pytest.mark.parametrize("M", [128, 256])
-@pytest.mark.parametrize("N_K", [(128, 256), (256, 512)])
-@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+@pytest.mark.parametrize("B", [32])
+@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize(
+    "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
+)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-def test_grouped_gemm(B, M, N_K, dtype, trans_b):
-    """Test grouped GEMM forward and backward passes."""
+@pytest.mark.parametrize("reduce_num_cu", [0])
+def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
+    """Test grouped GEMM forward and backward pass."""
     jax.config.update("jax_enable_x64", True)
 
     N, K = N_K
-    group_lens = generate_group_lens(B, M, balance=True)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance)
 
-    # Create input tensors
+    # Create input tensors (matches PyTorch version)
     key = jax.random.PRNGKey(0)
     key1, key2 = jax.random.split(key)
 
-    a = jax.random.normal(key1, (B * M, K), dtype=jnp.float32)
-    if trans_b:
-        b = jax.random.normal(key2, (B, N, K), dtype=jnp.float32)
-    else:
-        b = jax.random.normal(key2, (B, K, N), dtype=jnp.float32)
+    b_shape = (B, N, K) if trans_b else (B, K, N)
 
+    a = jax.random.normal(key1, (B * M, K), dtype=jnp.float32)
+    b = jax.random.normal(key2, b_shape, dtype=jnp.float32)
     a = a.astype(dtype)
     b = b.astype(dtype)
 
-    group_offs = compute_group_offs(group_lens)
+    # Create reference copies for accurate comparison (matches PyTorch detach().clone())
+    a_ref = jnp.array(a, copy=True)
+    b_ref = jnp.array(b, copy=True)
+
+    # Compute num_cu
+    num_cu = -1 if reduce_num_cu == 0 else reduce_num_cu
 
     #######################################
     # Forward
-    c = grouped_gemm(a, b, group_lens, group_offs, transA=False, transB=trans_b)
-    c_ref = grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=trans_b)
+    out = grouped_gemm(a, b, group_lens, transB=trans_b, num_cu=num_cu)
 
-    # Check forward results
-    if dtype == jnp.float16:
-        rtol, atol = 1e-2, 1e-2
-    else:  # bfloat16
-        rtol, atol = 1e-1, 1e-1
+    # Compute reference (matches PyTorch version)
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=trans_b)
 
-    c_f32 = c.astype(jnp.float32)
-    c_ref_f32 = c_ref.astype(jnp.float32)
-    np.testing.assert_allclose(c_f32, c_ref_f32, rtol=rtol, atol=atol)
+    # Check forward results using SNR
+    out_snr = compute_snr(out_ref, out)
+    print(f"Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > 20, f"out_snr too low: {out_snr:.2f} dB"
 
-    #######################################
-    # Backward
     def loss_fn(a, b):
-        return jnp.sum(grouped_gemm(a, b, group_lens, group_offs, transA=False, transB=trans_b))
+        return jnp.sum(grouped_gemm(a, b, group_lens, transB=trans_b, num_cu=num_cu))
 
     def loss_fn_ref(a, b):
-        return jnp.sum(grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=trans_b))
+        return jnp.sum(grouped_gemm_ref(a, b, group_lens, trans_b=trans_b))
 
     grad_fn = jax.grad(loss_fn, argnums=(0, 1))
     grad_fn_ref = jax.grad(loss_fn_ref, argnums=(0, 1))
 
     grad_a, grad_b = grad_fn(a, b)
-    grad_a_ref, grad_b_ref = grad_fn_ref(a, b)
+    grad_a_ref, grad_b_ref = grad_fn_ref(a_ref, b_ref)
 
-    # Check backward results
-    assert grad_a.shape == a.shape
-    assert grad_b.shape == b.shape
-    assert not jnp.any(jnp.isnan(grad_a))
-    assert not jnp.any(jnp.isnan(grad_b))
+    # Check gradients using SNR
+    a_grad_snr = compute_snr(grad_a_ref, grad_a)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > 20, f"a_grad_snr too low: {a_grad_snr:.2f} dB"
 
-    # Compare gradients with reference (looser tolerance for gradients)
-    grad_a_f32 = grad_a.astype(jnp.float32)
-    grad_a_ref_f32 = grad_a_ref.astype(jnp.float32)
-    grad_b_f32 = grad_b.astype(jnp.float32)
-    grad_b_ref_f32 = grad_b_ref.astype(jnp.float32)
-
-    np.testing.assert_allclose(grad_a_f32, grad_a_ref_f32, rtol=rtol * 5, atol=atol * 5)
-    np.testing.assert_allclose(grad_b_f32, grad_b_ref_f32, rtol=rtol * 5, atol=atol * 5)
+    b_grad_snr = compute_snr(grad_b_ref, grad_b)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > 20, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
 
 
 if __name__ == "__main__":
     # Quick test
     jax.config.update("jax_enable_x64", True)
     print("Testing grouped_gemm (forward + backward)...")
-    test_grouped_gemm(2, 256, (256, 512), jnp.float16, True)
+    test_grouped_gemm(2, 128, (256, 512), jnp.float16, True, False, 0)
+    print("✓ Test passed!")
