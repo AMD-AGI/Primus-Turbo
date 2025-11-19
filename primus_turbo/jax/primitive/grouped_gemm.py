@@ -126,62 +126,13 @@ LOWERING_TABLE[compute_group_offs_p] = jax.ffi.ffi_lowering("compute_group_offs"
 
 
 # ----------------------------------------
-# Step-5: Forward & Backward (custom_vjp)
-# ----------------------------------------
-def grouped_gemm_forward(a, b, group_lens, group_offs, transA=False, transB=False, num_cu=-1):
-    """Forward pass for grouped GEMM (with gradient tracking).
-
-    This is the main entry point for grouped GEMM with automatic differentiation support.
-    """
-    return grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
-
-
-def grouped_gemm_forward_fwd(a, b, group_lens, group_offs, transA=False, transB=False, num_cu=-1):
-    """Internal forward pass that saves values for backward."""
-    c = grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
-    return c, (a, b, group_lens, group_offs, transA, transB, num_cu)
-
-
-def grouped_gemm_backward(res, grad_c):
-    """Backward pass for grouped GEMM.
-
-    Computes gradients with respect to inputs a and b.
-    """
-    a, b, group_lens, group_offs, transA, transB, num_cu = res
-
-    # grad_a = grad_c @ b.T (or b if transB)
-    grad_a = grouped_gemm_p.bind(
-        grad_c, b, group_lens, group_offs, transA=False, transB=not transB, num_cu=num_cu
-    )
-
-    # grad_b = a.T @ grad_c (variable_k version)
-    # lhs, rhs = (grad_c, a) if transB else (a, grad_c)
-    if transB:
-        lhs, rhs = grad_c, a
-    else:
-        lhs, rhs = a, grad_c
-
-    grad_b = grouped_gemm_variable_k_p.bind(
-        lhs, rhs, group_lens, group_offs, transA=True, transB=False, num_cu=num_cu
-    )
-
-    # group_lens, group_offs, and scalar params don't have gradients
-    return grad_a, grad_b, None, None, None, None, None
-
-
-# Register custom VJP
-grouped_gemm_forward = jax.custom_vjp(grouped_gemm_forward)
-grouped_gemm_forward.defvjp(grouped_gemm_forward_fwd, grouped_gemm_backward)
-
-
-# ----------------------------------------
-# Step-6: batching
+# Step-5: batching
 # ----------------------------------------
 # TODO: Add batching support if needed
 
 
 __all__ = [
+    "grouped_gemm_p",
+    "grouped_gemm_variable_k_p",
     "compute_group_offs_p",
-    "grouped_gemm_forward",
-    "grouped_gemm_backward",
 ]

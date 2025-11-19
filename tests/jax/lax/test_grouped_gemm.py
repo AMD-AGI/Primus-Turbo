@@ -9,17 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from primus_turbo.jax.primitive.grouped_gemm import (
-    compute_group_offs_p,
-    grouped_gemm_forward,
-)
-
-
-def grouped_gemm(a, b, group_lens, group_offs=None, transA=False, transB=False, num_cu=-1):
-    """Grouped GEMM wrapper function."""
-    if group_offs is None:
-        group_offs = compute_group_offs_p.bind(group_lens)
-    return grouped_gemm_forward(a, b, group_lens, group_offs, transA, transB, num_cu)
+from primus_turbo.jax.lax.grouped_gemm import compute_group_offs, grouped_gemm
 
 
 def grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=False):
@@ -92,7 +82,7 @@ def test_grouped_gemm(B, M, N_K, dtype, trans_b):
     a = a.astype(dtype)
     b = b.astype(dtype)
 
-    group_offs = compute_group_offs_p.bind(group_lens)
+    group_offs = compute_group_offs(group_lens)
 
     #######################################
     # Forward
