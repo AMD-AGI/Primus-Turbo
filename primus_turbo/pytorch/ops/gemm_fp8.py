@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.float8 import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
 )
@@ -19,7 +20,9 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
-from primus_turbo.pytorch.kernels.quantize import quant_fp8_blockwise_impl
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quant_fp8_blockwise_impl,
+)
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 __all__ = ["gemm_fp8"]
@@ -335,6 +338,163 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         return a_grad, b_grad, None, None, None, None
 
 
+class FP8GemmMXFunction(torch.autograd.Function):
+
+    MXFP8_GEMM_BACKEND = "hipblaslt"
+    HIPBLASLT_K_MULTIPLE = 128
+
+    @staticmethod
+    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
+        if format == Format.E4M3:
+            return float8_e4m3
+        elif format == Format.E5M2:
+            return float8_e5m2
+        elif format == Format.HYBRID:
+            return float8_e4m3 if is_fwd_stage else float8_e5m2
+        else:
+            raise ValueError(f"Unsupported FP8 format: {format}")
+
+    @staticmethod
+    def forward(
+        ctx,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        config: Float8QuantConfig,
+    ):
+        supported_mxfp8_backend, reason = check_mxfp8_support()
+        assert supported_mxfp8_backend, reason
+
+        assert config.granularity == ScalingGranularity.MX_BLOCKWISE
+        assert (
+            trans_a == False and trans_b == True
+        ), "MXFP8 GEMM only supports trans_a=False and trans_b=True."
+
+        a_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
+        b_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
+
+        a_2d_view = a.view(a.size(0), -1)
+        b_2d_view = b.view(b.size(0), -1)
+
+        # padded k dim to 128 multiple
+        k_padding_size = (
+            (a_2d_view.size(1) + __class__.HIPBLASLT_K_MULTIPLE - 1) // __class__.HIPBLASLT_K_MULTIPLE
+        ) * __class__.HIPBLASLT_K_MULTIPLE - a_2d_view.size(1)
+        if k_padding_size > 0:
+            a_2d_view = torch.concat(
+                [
+                    a_2d_view,
+                    torch.zeros(
+                        a_2d_view.size(0), k_padding_size, dtype=a_2d_view.dtype, device=a_2d_view.device
+                    ),
+                ],
+                dim=1,
+            )
+            b_2d_view = torch.concat(
+                [
+                    b_2d_view,
+                    torch.zeros(
+                        b_2d_view.size(0), k_padding_size, dtype=b_2d_view.dtype, device=b_2d_view.device
+                    ),
+                ],
+                dim=1,
+            )
+
+        a_fp8, a_scale_inv = quantize_fp8(
+            a_2d_view, a_dtype, config.granularity, block_size=config.block_size
+        )
+        b_fp8, b_scale_inv = quantize_fp8(
+            b_2d_view, b_dtype, config.granularity, block_size=config.block_size
+        )
+
+        # NT layout
+        out = gemm_fp8_impl(
+            a_fp8,
+            a_scale_inv,
+            False,
+            b_fp8,
+            b_scale_inv,
+            True,
+            out_dtype,
+            False,
+            backend=__class__.MXFP8_GEMM_BACKEND,
+            granularity=config.granularity,
+        )
+
+        ctx.save_for_backward(a_2d_view, b_2d_view)
+
+        ctx.trans_a = trans_a
+        ctx.trans_b = trans_b
+        ctx.out_dtype = out_dtype
+        ctx.config = config
+        ctx.a_fp8_dtype = a_fp8.dtype
+        ctx.b_fp8_dtype = b_fp8.dtype
+        ctx.k_padding_size = k_padding_size
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        a_2d_view, b_2d_view = ctx.saved_tensors
+        grad_out_dtype = FP8GemmMXFunction.get_fp8_dtype(ctx.config.format, False)
+
+        grad_out_2d_view = grad_out.view(grad_out.shape[0], -1)
+        grad_out_t_2d_view = grad_out_2d_view.T.contiguous()
+        grad_out_fp8, grad_out_scale_inv = quantize_fp8(
+            grad_out_2d_view, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+        )
+        grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
+            grad_out_t_2d_view, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+        )
+
+        # TODO(ruibzhan): fuse transpose with quantize kernel
+        a_t_2d_view = a_2d_view.T.contiguous()
+        b_t_2d_view = b_2d_view.T.contiguous()
+
+        a_t_fp8, a_t_scale_inv = quantize_fp8(
+            a_t_2d_view, ctx.a_fp8_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+        )
+        b_t_fp8, b_t_scale_inv = quantize_fp8(
+            b_t_2d_view, ctx.b_fp8_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+        )
+
+        # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
+        grad_a = gemm_fp8_impl(
+            grad_out_fp8,
+            grad_out_scale_inv,
+            False,
+            b_t_fp8,
+            b_t_scale_inv,
+            True,
+            ctx.out_dtype,
+            False,
+            backend=__class__.MXFP8_GEMM_BACKEND,
+            granularity=ctx.config.granularity,
+        )
+
+        # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
+        grad_b = gemm_fp8_impl(
+            grad_out_t_fp8,
+            grad_out_t_scale_inv,
+            False,
+            a_t_fp8,
+            a_t_scale_inv,
+            True,
+            ctx.out_dtype,
+            False,
+            backend=__class__.MXFP8_GEMM_BACKEND,
+            granularity=ctx.config.granularity,
+        )
+
+        if ctx.k_padding_size > 0:
+            grad_a = grad_a[:, : -ctx.k_padding_size]
+            grad_b = grad_b[:, : -ctx.k_padding_size]
+
+        return grad_a, grad_b, None, None, None, None
+
+
 def gemm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -399,6 +559,6 @@ def gemm_fp8(
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         return FP8GemmBlockFunction.apply(*args)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
-        raise NotImplementedError("MX_BLOCKWISE is not supported yet")
+        return FP8GemmMXFunction.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

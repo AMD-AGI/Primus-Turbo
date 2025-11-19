@@ -9,14 +9,18 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.pytorch.core.float8 import ScalingGranularity
-from primus_turbo.pytorch.kernels.quantization_impl import (
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
+    dequantize_mxfp8_impl,
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
+    quantize_mxfp8_impl,
 )
 
 __all__ = ["quantize_fp8", "dequantize_fp8"]
+
+MX_BLOCK_SIZE = 32
 
 
 def quantize_fp8(
@@ -24,6 +28,7 @@ def quantize_fp8(
     out_dtype: torch.dtype,
     granularity: ScalingGranularity,
     *,
+    block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -33,9 +38,14 @@ def quantize_fp8(
     if granularity == ScalingGranularity.TENSORWISE:
         return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
     elif granularity == ScalingGranularity.ROWWISE:
-        if axis is None:
-            raise ValueError("axis must be specified for rowwise FP8 quantization")
+        assert axis is not None, "The axis must be specified for rowwise FP8 quantization"
+
         return quantize_fp8_rowwise_impl(x, out_dtype, axis, scale)
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
+        assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
+        assert scale is None, "The scale is not supported for MXFP8 quantization"
+
+        return quantize_mxfp8_impl(x, out_dtype, block_size)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -45,6 +55,7 @@ def dequantize_fp8(
     out_dtype: torch.dtype,
     granularity: ScalingGranularity,
     *,
+    block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
 ):
@@ -56,13 +67,11 @@ def dequantize_fp8(
     elif granularity == ScalingGranularity.ROWWISE:
         if axis is None:
             raise ValueError("axis must be specified for rowwise FP8 de-quantization")
+
         return dequantize_fp8_rowwise_impl(x, out_dtype, axis, scale_inv)
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
+        assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
+
+        return dequantize_mxfp8_impl(x, out_dtype, block_size, scale_inv)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
-
-
-"""
-TODO:
-quantize_mxfp8
-quantize_mxfp4
-"""
