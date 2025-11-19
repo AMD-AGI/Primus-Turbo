@@ -46,8 +46,8 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
     size_t size_bytes = input_tensor.numel() * input_tensor.element_size();
 
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
-    dist::run_dma_all_gather_into_tensor_nobuffer(dma_handle, output_tensor.data_ptr(),
-                                                  input_tensor.data_ptr(), size_bytes, stream);
+    dist::run_dma_all_gather_into_tensor(dma_handle, output_tensor.data_ptr(),
+                                         input_tensor.data_ptr(), size_bytes, stream);
     // return c10::intrusive_ptr<c10d::Work>(nullptr);
     return c10::make_intrusive<dist::DMAAllGahterWork>(dma_handle, stream);
 }
