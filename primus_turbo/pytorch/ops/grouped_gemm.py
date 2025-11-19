@@ -29,11 +29,10 @@ class GroupedGemmFunc(torch.autograd.Function):
         trans_b: bool,
         num_cu: int | None,
     ):
-        out_dtype = torch.result_type(a, b)
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)
-            out = gemm_impl(a, False, b_2d, trans_b, out_dtype, False)
+            out = gemm_impl(a, False, b_2d, trans_b, a.dtype, False)
         else:
             out = grouped_gemm_csrc_impl(
                 a,
