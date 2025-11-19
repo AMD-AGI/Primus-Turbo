@@ -37,7 +37,11 @@ def _fallback_to_torch(output_tensor: torch.Tensor, input_tensor: torch.Tensor, 
 
 
 def dma_all_gather_into_tensor(
-    output_tensor: torch.Tensor, input_tensor: torch.Tensor, group=None, async_op=False
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group=None,
+    async_op=False,
+    param_group_count: int = 0,
 ):
     group = group or dist.group.WORLD
 
@@ -47,7 +51,7 @@ def dma_all_gather_into_tensor(
     # TODO (limou)
     # if multiple training jobs are running concurrently on the same node, group_tag may be duplicated.
     # currently, only the single-training-job scenario is considered.
-    group_tag = c10d._get_group_tag(group)
+    group_tag = c10d._get_group_tag(group) + f"_{param_group_count}"
     work = turbo_dist.dma_all_gather_into_tensor(
         output_tensor,
         input_tensor,

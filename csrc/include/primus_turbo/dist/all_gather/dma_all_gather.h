@@ -15,7 +15,7 @@
 #include <thread>
 
 namespace {
-void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, unsigned int n) {
+void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, size_t n) {
 
     static_assert(std::atomic<int>::is_always_lock_free);
 
@@ -49,9 +49,7 @@ struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    hipIpcMemHandle_t   base_mem_handles[MAX_DEVICES_PER_NODE];
-    size_t              base_mem_offsets[MAX_DEVICES_PER_NODE];
-    hipIpcEventHandle_t exit_event_handles[MAX_DEVICES_PER_NODE];
+    hipIpcMemHandle_t buffer_mem_handles[MAX_DEVICES_PER_NODE];
 };
 
 uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t group_rank,
@@ -130,43 +128,25 @@ public:
                 copy_events[i] = copy_event;
             }
 
-            hipEvent_t local_exit_event = nullptr;
-            // TODO (limou)
-            // After calling this API, a hip_eventXXX file is created in the /dev/shm/ directory.
-            // Even after calling hipEventDestroy(), the file is not removed in the end
-            // this may be a bug, At least on ROCm-7.0 + MI300X, this issue exists.
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(
-                &local_exit_event, hipEventDisableTiming | hipEventInterprocess));
-
-            hipIpcEventHandle_t local_exit_event_handle;
-            PRIMUS_TURBO_CHECK_HIP(
-                hipIpcGetEventHandle(&local_exit_event_handle, local_exit_event));
-            memcpy(&shm->exit_event_handles[group_rank], &local_exit_event_handle,
-                   sizeof(hipIpcEventHandle_t));
-
-            reusable_barrier(shm->barrier, shm->sense, group_size);
-
-            for (size_t i = 0; i < group_size; ++i) {
-                if (i == group_rank) {
-                    exit_events[i] = local_exit_event;
-                } else {
-                    PRIMUS_TURBO_CHECK_HIP(hipIpcOpenEventHandle(
-                        &exit_events[i], *(hipIpcEventHandle_t *) &shm->exit_event_handles[i]));
-                }
-            }
             PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&entry_event, hipEventDisableTiming));
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&exit_event, hipEventDisableTiming));
         }
         void finalize(AllGatherShmStruct *shm) {
             reusable_barrier(shm->barrier, shm->sense, group_size);
+            // TODO (limou)
+            // hip_ipc_close_memhandle
+            //   buffer_mem_ptrs
+            //   recv_buffer
+
+            if (exit_event != nullptr) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_event));
+                exit_event = nullptr;
+            }
             if (entry_event != nullptr) {
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(entry_event));
                 entry_event = nullptr;
             }
             for (size_t i = 0; i < group_size; i++) {
-                if (exit_events[i] != nullptr) {
-                    PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[i]));
-                    exit_events[i] = nullptr;
-                }
                 if (copy_events[i] != nullptr) {
                     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events[i]));
                     copy_events[i] = nullptr;
@@ -178,13 +158,16 @@ public:
             }
         }
         const std::string shm_tag;
-        size_t            group_rank;
-        size_t            group_size;
-        hipStream_t       copy_streams[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t        copy_events[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t        exit_events[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t        entry_event{};
-        void             *base_mem_ptrs[MAX_DEVICES_PER_NODE]{};
+        size_t            group_rank{0};
+        size_t            group_size{0};
+
+        hipStream_t copy_streams[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t  copy_events[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t  exit_event{nullptr};
+        hipEvent_t  entry_event{nullptr};
+        void       *buffer_mem_ptrs[MAX_DEVICES_PER_NODE]{};
+        void       *recv_buffer{nullptr};
+        size_t      recv_buffer_size{0};
     };
 
     uintptr_t get_allgather_shared_handle() const { return allgather_shared_handle_; }
@@ -195,8 +178,8 @@ private:
     RankInfo  rankinfo_;
 };
 
-void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
-                                             size_t size_bytes, hipStream_t stream);
+void run_dma_all_gather_into_tensor(DMAHandle *dma_handle, void *output, void *input,
+                                    size_t size_bytes, hipStream_t stream);
 void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream);
 
 } // namespace primus_turbo::pytorch::dist
