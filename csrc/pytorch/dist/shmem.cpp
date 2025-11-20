@@ -25,7 +25,7 @@ int shared_memory_create(const char *name, size_t sz, SharedMemoryInfo *info) {
     }
 
     info->addr = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_SHARED, info->shmFd, 0);
-    if (info->addr == nullptr) {
+    if (info->addr == MAP_FAILED) {
         return errno;
     }
 
@@ -41,7 +41,7 @@ int shared_memory_open(const char *name, size_t sz, SharedMemoryInfo *info) {
     }
 
     info->addr = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_SHARED, info->shmFd, 0);
-    if (info->addr == nullptr) {
+    if (info->addr == MAP_FAILED) {
         return errno;
     }
 

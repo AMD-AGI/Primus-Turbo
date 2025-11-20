@@ -16,13 +16,17 @@ public:
     DMAAllGahterWork(DMAHandle *dma_handle, hipStream_t stream)
         : c10d::Work(-1), dma_handle_(dma_handle), stream_(stream) {}
     bool wait(std::chrono::milliseconds timeout = kNoTimeout) override {
+        if (waited_) {
+            return true;
+        }
         run_dma_stream_wait(dma_handle_, stream_);
-        return true;
+        return waited_ = true;
     }
 
 private:
     DMAHandle  *dma_handle_;
     hipStream_t stream_;
+    bool        waited_{false};
 };
 
 } // namespace dist
@@ -48,7 +52,6 @@ c10::intrusive_ptr<c10d::Work> dma_all_gather_into_tensor(at::Tensor       outpu
     hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
     dist::run_dma_all_gather_into_tensor_nobuffer(dma_handle, output_tensor.data_ptr(),
                                                   input_tensor.data_ptr(), size_bytes, stream);
-    // return c10::intrusive_ptr<c10d::Work>(nullptr);
     return c10::make_intrusive<dist::DMAAllGahterWork>(dma_handle, stream);
 }
 

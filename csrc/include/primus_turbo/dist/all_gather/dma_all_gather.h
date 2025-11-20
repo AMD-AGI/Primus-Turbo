@@ -15,13 +15,14 @@
 #include <thread>
 
 namespace {
-void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, unsigned int n) {
+
+void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, int n) {
 
     static_assert(std::atomic<int>::is_always_lock_free);
 
     // Check-in
     int count = barrier.fetch_add(1, std::memory_order_acq_rel);
-    if (count + 1 == static_cast<int>(n)) {
+    if (count + 1 == n) {
         sense.store(1, std::memory_order_release); // Last thread sets the sense
     } else {
         while (sense.load(std::memory_order_acquire) == 0) {
@@ -39,6 +40,7 @@ void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, unsign
         }
     }
 }
+
 } // namespace
 
 namespace primus_turbo::pytorch::dist {
@@ -55,10 +57,10 @@ struct AllGatherShmStruct {
 };
 
 uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t group_rank,
-                                         size_t group_world_size);
+                                         size_t group_size);
 
 void destroy_allgather_shared_handle(uintptr_t allgather_shared_handle, const std::string &shm_name,
-                                     size_t group_rank, size_t group_world_size);
+                                     size_t group_rank, size_t group_size);
 
 class DMAHandle final {
     static std::unordered_map<std::string, std::unique_ptr<DMAHandle>> dma_handles_;
@@ -146,12 +148,12 @@ public:
 
             reusable_barrier(shm->barrier, shm->sense, group_size);
 
-            for (size_t i = 0; i < group_size; ++i) {
+            for (size_t i = 0; i < group_size; i++) {
                 if (i == group_rank) {
                     exit_events[i] = local_exit_event;
                 } else {
-                    PRIMUS_TURBO_CHECK_HIP(hipIpcOpenEventHandle(
-                        &exit_events[i], *(hipIpcEventHandle_t *) &shm->exit_event_handles[i]));
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipIpcOpenEventHandle(&exit_events[i], shm->exit_event_handles[i]));
                 }
             }
             PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&entry_event, hipEventDisableTiming));
@@ -162,11 +164,11 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(entry_event));
                 entry_event = nullptr;
             }
+            if (exit_events[group_rank] != nullptr) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[group_rank]));
+                exit_events[group_rank] = nullptr;
+            }
             for (size_t i = 0; i < group_size; i++) {
-                if (exit_events[i] != nullptr) {
-                    PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[i]));
-                    exit_events[i] = nullptr;
-                }
                 if (copy_events[i] != nullptr) {
                     PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(copy_events[i]));
                     copy_events[i] = nullptr;
@@ -178,8 +180,8 @@ public:
             }
         }
         const std::string shm_tag;
-        size_t            group_rank;
-        size_t            group_size;
+        size_t            group_rank{0};
+        size_t            group_size{0};
         hipStream_t       copy_streams[MAX_DEVICES_PER_NODE]{};
         hipEvent_t        copy_events[MAX_DEVICES_PER_NODE]{};
         hipEvent_t        exit_events[MAX_DEVICES_PER_NODE]{};
@@ -195,7 +197,7 @@ private:
     RankInfo  rankinfo_;
 };
 
-void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, void *input,
+void run_dma_all_gather_into_tensor_nobuffer(DMAHandle *dma_handle, void *output, const void *input,
                                              size_t size_bytes, hipStream_t stream);
 void run_dma_stream_wait(DMAHandle *dma_handle, hipStream_t stream);
 
