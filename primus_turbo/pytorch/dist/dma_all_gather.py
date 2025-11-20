@@ -16,6 +16,9 @@ origin_all_gather_into_tensor = dist.all_gather_into_tensor
 
 
 def _fallback_to_torch(output_tensor: torch.Tensor, input_tensor: torch.Tensor, group, async_op):
+    if async_op:
+        return True
+
     if not (output_tensor.is_cuda and input_tensor.is_cuda):
         return True
 
@@ -56,4 +59,5 @@ def dma_all_gather_into_tensor(
     )
     if not async_op and work is not None:
         work.wait()
-    return work
+    else:
+        return work
