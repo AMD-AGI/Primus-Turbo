@@ -22,6 +22,7 @@ pybind11::dict Registrations() {
     // dict["rmsnorm_fwd"] = EncapsulateFFI(RMSNormFwdHandler);
     REGISTER_FFI_HANDLER(dict, rmsnorm_fwd, RMSNormFwdHandler);
     REGISTER_FFI_HANDLER(dict, rmsnorm_bwd, RMSNormBwdHandler);
+    REGISTER_FFI_HANDLER(dict, moe_dispatch, MoEDispatchHandler);
 
     // Grouped GEMM
     REGISTER_FFI_HANDLER(dict, grouped_gemm, GroupedGemmHandler);
