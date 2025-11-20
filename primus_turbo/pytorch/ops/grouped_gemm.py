@@ -6,6 +6,7 @@
 
 import torch
 
+from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_csrc_impl import (
     grouped_gemm_csrc_impl,
     grouped_gemm_variable_k_csrc_impl,
@@ -28,15 +29,20 @@ class GroupedGemmFunc(torch.autograd.Function):
         trans_b: bool,
         num_cu: int | None,
     ):
-        out = grouped_gemm_csrc_impl(
-            a,
-            b,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=trans_b,
-            num_cu=num_cu,
-        )
+        if len(group_lens) == 1:
+            assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
+            b_2d = b.squeeze(0)
+            out = gemm_impl(a, False, b_2d, trans_b, a.dtype, False)
+        else:
+            out = grouped_gemm_csrc_impl(
+                a,
+                b,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=trans_b,
+                num_cu=num_cu,
+            )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
         ctx.trans_b = trans_b
@@ -46,26 +52,32 @@ class GroupedGemmFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         a, b, group_lens, group_offs = ctx.saved_tensors
-        grad_a = grouped_gemm_csrc_impl(
-            grad_out,
-            b,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            num_cu=ctx.num_cu,
-        )
+        if len(group_lens) == 1:
+            assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
+            b_2d = b.squeeze(0)
+            grad_a = gemm_impl(grad_out, False, b_2d, not ctx.trans_b, a.dtype, ctx.trans_a)
+            grad_b = gemm_impl(a, True, grad_out, False, b.dtype, ctx.trans_b).view(b.size())
+        else:
+            grad_a = grouped_gemm_csrc_impl(
+                grad_out,
+                b,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                num_cu=ctx.num_cu,
+            )
 
-        lhs, rhs = (grad_out, a) if ctx.trans_b else (a, grad_out)
-        grad_b = grouped_gemm_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            group_lens,
-            group_offs,
-            trans_a=True,
-            trans_b=False,
-            num_cu=ctx.num_cu,
-        )
+            lhs, rhs = (grad_out, a) if ctx.trans_b else (a, grad_out)
+            grad_b = grouped_gemm_variable_k_csrc_impl(
+                lhs,
+                rhs,
+                group_lens,
+                group_offs,
+                trans_a=True,
+                trans_b=False,
+                num_cu=ctx.num_cu,
+            )
         return grad_a, grad_b, None, None, None, None
 
 
