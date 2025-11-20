@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 
 import torch
 
-
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,

@@ -62,6 +62,16 @@ def check_fp8_ocp_support() -> Tuple[bool, str]:
     )
 
 
+def check_mxfp8_support() -> Tuple[bool, str]:
+    """Return if mxfp8 support is available"""
+    if get_device_compute_capability() >= (9, 5):
+        return True, ""
+    return (
+        False,
+        "Device compute capability gfx950 or higher required for FP8 execution.",
+    )
+
+
 ###################################################
 
 try:
