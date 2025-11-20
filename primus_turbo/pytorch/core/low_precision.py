@@ -94,7 +94,6 @@ class Format(Enum):
 
     E4M3 = auto()
     E5M2 = auto()
-    E8M0 = auto()
     E2M1_X2 = auto()
     HYBRID = auto()
 
