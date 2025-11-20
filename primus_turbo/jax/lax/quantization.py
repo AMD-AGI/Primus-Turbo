@@ -37,7 +37,7 @@ def quantize_fp8(
     Returns: (x_q, scale_inv)
 
     Args:
-        x: Input tensor (float32)
+        x: Input tensor (float32, float16, or bfloat16)
         out_dtype: Output FP8 dtype (e.g., jnp.float8_e4m3fn)
         granularity: Scaling granularity (TENSORWISE or ROWWISE)
         axis: Axis for rowwise quantization (required if granularity is ROWWISE)

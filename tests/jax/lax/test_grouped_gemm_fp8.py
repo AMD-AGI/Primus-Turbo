@@ -6,197 +6,118 @@
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
-from primus_turbo.jax.lax.grouped_gemm import compute_group_offs
-from primus_turbo.jax.lax.grouped_gemm_fp8 import grouped_gemm_fp8
+from primus_turbo.jax.core.float8 import Float8QuantConfig, Format, ScalingGranularity
+from primus_turbo.jax.lax import grouped_gemm_fp8
+from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
+from tests.jax.test_utils import compute_snr
 
 
-def quantize_fp8_simple(x, dtype):
-    """Simple FP8 quantization for testing."""
-    # Calculate scale factor
-    max_val = jnp.max(jnp.abs(x))
-    # FP8 E4M3 max value is ~448, E5M2 is ~57344
-    fp8_max = 448.0 if dtype == jnp.float8_e4m3fn else 57344.0
-    scale = max_val / fp8_max
-
-    # Quantize
-    x_scaled = x / (scale + 1e-12)
-    x_fp8 = x_scaled.astype(dtype)
-
-    # Return quantized tensor and inverse scale
-    scale_inv = jnp.array([1.0 / (scale + 1e-12)], dtype=jnp.float32)
-    return x_fp8, scale_inv
+def _check_hit_int32_limit(B, M, N, K):
+    a_elems = B * M * K
+    b_elems = B * N * K
+    out_elems = B * M * N
+    return max(a_elems, out_elems, b_elems) >= 2**31
 
 
-def grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=False):
-    """Reference implementation of grouped GEMM using JAX ops."""
-    bs = b.shape[0]
-    m = a.shape[0]
-    n = b.shape[2] if not transB else b.shape[1]
-
-    # Initialize output
-    c = jnp.zeros((m, n), dtype=a.dtype)
-
-    # Process each group
-    for i in range(bs):
-        start_idx = group_offs[i]
-        end_idx = group_offs[i + 1]
-
-        a_slice = a[start_idx:end_idx, :]
-        b_slice = b[i, :, :]
-
-        # Apply transpose if needed
-        if transA:
-            a_slice = a_slice.T
-        if transB:
-            b_slice = b_slice.T
-
-        # Compute matmul for this group
-        c_slice = jnp.matmul(a_slice, b_slice)
-        c = c.at[start_idx:end_idx, :].set(c_slice)
-
-    return c
-
-
-def generate_group_lens(bs, m, balance=True):
-    """Generate group lengths similar to PyTorch version."""
-    if balance:
-        # Balanced groups - all same size
-        return jnp.full((bs,), m, dtype=jnp.int64)
-    else:
-        # Unbalanced groups
-        key = jax.random.PRNGKey(42)
-        lengths = jax.random.randint(key, (bs,), m // 2, m * 2)
-        # Normalize to sum to bs * m
-        total = jnp.sum(lengths)
-        lengths = (lengths * (bs * m) / total).astype(jnp.int64)
-        return lengths
-
-
-@pytest.mark.parametrize("B", [2, 4])
-@pytest.mark.parametrize("M", [128, 256])
-@pytest.mark.parametrize("N_K", [(128, 256), (256, 512)])
-@pytest.mark.parametrize("ori_dtype", [jnp.float16, jnp.bfloat16])
-@pytest.mark.parametrize("fp8_dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
-@pytest.mark.parametrize("granularity", ["TENSORWISE", "ROWWISE"])
+@pytest.mark.parametrize("B", [32])
+@pytest.mark.parametrize("M", [128, 1024, 2048])
+@pytest.mark.parametrize(
+    "NK",
+    [
+        (2048, 1536),
+        (2048, 1408),
+        (1408, 2048),
+        (2816, 2048),
+        (3072, 5120),
+        (5120, 1536),
+        (4096, 7168),
+        (7168, 2048),
+    ],
+)
+@pytest.mark.parametrize("ori_dtype", [jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("balance", [True, False])
-def test_grouped_gemm_fp8(B, M, N_K, ori_dtype, fp8_dtype, granularity, trans_b, balance):
-    """Test grouped GEMM FP8 forward pass."""
+def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, balance):
+    # Enable int64 support
     jax.config.update("jax_enable_x64", True)
 
-    N, K = N_K
-    group_lens = generate_group_lens(B, M, balance=balance)
+    N, K = NK
 
-    # Create input tensors
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance)
+    print(
+        f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
+        f"granularity={granularity}, trans_b={trans_b}, balance={balance}"
+    )
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+
+    # Initialize tensors in float32, then cast to target dtype (matches PyTorch pattern)
     key = jax.random.PRNGKey(0)
-    key1, key2 = jax.random.split(key)
+    key_a, key_b = jax.random.split(key)
 
-    a = jax.random.normal(key1, (B * M, K), dtype=jnp.float32)
-    if trans_b:
-        b = jax.random.normal(key2, (B, N, K), dtype=jnp.float32)
-    else:
-        b = jax.random.normal(key2, (B, K, N), dtype=jnp.float32)
+    a = jax.random.normal(key_a, (B * M, K), dtype=jnp.float32).astype(ori_dtype)
+    b = jax.random.normal(key_b, b_shape, dtype=jnp.float32).astype(ori_dtype)
 
-    a = a.astype(ori_dtype)
-    b = b.astype(ori_dtype)
+    # Create reference copies
+    a_ref = a.copy()
+    b_ref = b.copy()
 
-    group_offs = compute_group_offs(group_lens)
+    # Ref (using float32 for numerical stability)
+    a_ref_f32 = a_ref.astype(jnp.float32)
+    b_ref_f32 = b_ref.astype(jnp.float32)
+    out_ref = grouped_gemm_ref(a_ref_f32, b_ref_f32, group_lens, trans_b)
+    print(out_ref.shape, out_ref.dtype)
 
-    # Quantize to FP8
-    a_fp8, a_scales = quantize_fp8_simple(a, fp8_dtype)
+    # Ref backward
+    def loss_fn_ref(a, b):
+        return jnp.sum(grouped_gemm_ref(a, b, group_lens, trans_b))
 
-    # For rowwise, we need per-row scales
-    if granularity == "ROWWISE":
-        # Compute per-row scales for a
-        a_scales = []
-        a_fp8_list = []
-        for i in range(a.shape[0]):
-            row_fp8, row_scale = quantize_fp8_simple(a[i : i + 1, :], fp8_dtype)
-            a_fp8_list.append(row_fp8)
-            a_scales.append(row_scale)
-        a_fp8 = jnp.concatenate(a_fp8_list, axis=0)
-        a_scales = jnp.concatenate(a_scales, axis=0)
+    a_ref_grad, b_ref_grad = jax.grad(loss_fn_ref, argnums=(0, 1))(a_ref_f32, b_ref_f32)
+    print(a_ref_grad.shape, b_ref_grad.shape)
+    # Turbo forward
+    config = Float8QuantConfig(format=format, granularity=granularity)
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
 
-        # Compute per-column or per-row scales for b based on trans_b
-        b_scales = []
-        b_fp8_list = []
-        for i in range(B):
-            if trans_b:
-                # b is [B, N, K], scale per row (N dimension)
-                for j in range(N):
-                    slice_fp8, slice_scale = quantize_fp8_simple(b[i : i + 1, j : j + 1, :], fp8_dtype)
-                    b_fp8_list.append(slice_fp8)
-                    b_scales.append(slice_scale)
-            else:
-                # b is [B, K, N], scale per column (N dimension)
-                for j in range(N):
-                    slice_fp8, slice_scale = quantize_fp8_simple(b[i : i + 1, :, j : j + 1], fp8_dtype)
-                    b_fp8_list.append(slice_fp8)
-                    b_scales.append(slice_scale)
-        b_fp8 = jnp.stack(
-            [
-                jnp.concatenate([b_fp8_list[i * N + j] for j in range(N)], axis=-1 if not trans_b else 1)
-                for i in range(B)
-            ],
-            axis=0,
-        )
-        b_scales = jnp.concatenate(b_scales, axis=0)
-    else:
-        # Tensorwise quantization
-        b_fp8_list = []
-        b_scales_list = []
-        for i in range(B):
-            b_slice_fp8, b_slice_scale = quantize_fp8_simple(b[i], fp8_dtype)
-            b_fp8_list.append(b_slice_fp8)
-            b_scales_list.append(b_slice_scale)
-        b_fp8 = jnp.stack(b_fp8_list, axis=0)
-        b_scales = b_scales_list[0]  # Use first scale for all (tensorwise)
+    # Turbo backward
+    def loss_fn(a, b):
+        return jnp.sum(grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config))
 
-    #######################################
-    # Forward
-    try:
-        out = grouped_gemm_fp8(
-            a_fp8,
-            b_fp8,
-            a_scales,
-            b_scales,
-            group_lens,
-            group_offs,
-            transA=False,
-            transB=trans_b,
-            num_cu=-1,
-            out_dtype=ori_dtype,
-            granularity=granularity,
-        )
+    a_grad, b_grad = jax.grad(loss_fn, argnums=(0, 1))(a, b)
 
-        # Compute reference (using original float tensors)
-        out_ref = grouped_gemm_ref(a, b, group_lens, group_offs, transA=False, transB=trans_b)
+    # Check forward only
+    snr_threshold = 25 if format == Format.E4M3 else 20
 
-        # Check forward results (FP8 has lower precision)
-        if fp8_dtype == jnp.float8_e4m3fn:
-            rtol, atol = 5e-2, 5e-2
-        else:  # e5m2
-            rtol, atol = 1e-1, 1e-1
+    out_snr = compute_snr(out_ref.astype(jnp.float32), out.astype(jnp.float32))
+    print(f"Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > snr_threshold, f"out_snr too low: {out_snr:.2f} dB"
 
-        out_f32 = out.astype(jnp.float32)
-        out_ref_f32 = out_ref.astype(jnp.float32)
+    a_grad_snr = compute_snr(a_ref_grad.astype(jnp.float32), a_grad.astype(jnp.float32))
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, f"a_grad_snr too low: {a_grad_snr:.2f} dB"
 
-        # Allow some tolerance for FP8 quantization error
-        np.testing.assert_allclose(out_f32, out_ref_f32, rtol=rtol, atol=atol)
-        print(
-            f"\nTest passed: B={B}, M={M}, N={N}, K={K}, dtype={ori_dtype}, fp8={fp8_dtype}, "
-            f"granularity={granularity}, trans_b={trans_b}, balance={balance}"
-        )
+    b_grad_snr = compute_snr(b_ref_grad.astype(jnp.float32), b_grad.astype(jnp.float32))
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
 
-    except Exception as e:
-        pytest.skip(f"Test skipped due to: {str(e)}")
+    print("(Backward tests temporarily disabled for debugging)")
 
 
 if __name__ == "__main__":
-    # Quick test
-    jax.config.update("jax_enable_x64", True)
-    print("Testing grouped_gemm_fp8...")
-    test_grouped_gemm_fp8(2, 128, (128, 256), jnp.float16, jnp.float8_e4m3fn, "TENSORWISE", True, True)
+    # Run single ROWWISE case for debugging
+    test_grouped_gemm_fp8(
+        B=32,
+        M=128,
+        NK=(2048, 1536),
+        ori_dtype=jnp.bfloat16,
+        format=Format.E4M3,
+        granularity=ScalingGranularity.ROWWISE,
+        trans_b=True,
+        balance=True,
+    )

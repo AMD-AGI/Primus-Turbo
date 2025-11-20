@@ -25,12 +25,6 @@ grouped_gemm_variable_k_p.multiple_results = False
 compute_group_offs_p = Primitive("compute_group_offs")
 compute_group_offs_p.multiple_results = False
 
-grouped_gemm_fp8_p = Primitive("grouped_gemm_fp8")
-grouped_gemm_fp8_p.multiple_results = False
-
-grouped_gemm_fp8_variable_k_p = Primitive("grouped_gemm_fp8_variable_k")
-grouped_gemm_fp8_variable_k_p.multiple_results = False
-
 
 # ----------------------------------------
 # Step-2: Impl
@@ -38,8 +32,6 @@ grouped_gemm_fp8_variable_k_p.multiple_results = False
 IMPL_TABLE[grouped_gemm_p] = partial(xla.apply_primitive, grouped_gemm_p)
 IMPL_TABLE[grouped_gemm_variable_k_p] = partial(xla.apply_primitive, grouped_gemm_variable_k_p)
 IMPL_TABLE[compute_group_offs_p] = partial(xla.apply_primitive, compute_group_offs_p)
-IMPL_TABLE[grouped_gemm_fp8_p] = partial(xla.apply_primitive, grouped_gemm_fp8_p)
-IMPL_TABLE[grouped_gemm_fp8_variable_k_p] = partial(xla.apply_primitive, grouped_gemm_fp8_variable_k_p)
 
 
 # ----------------------------------------
@@ -123,76 +115,6 @@ def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, transA,
 ABSTRACT_EVAL_TABLE[grouped_gemm_variable_k_p] = _grouped_gemm_variable_k_abstract_eval
 
 
-def _grouped_gemm_fp8_abstract_eval(
-    a, b, a_scales, b_scales, group_lens, group_offs, transA, transB, num_cu, out_dtype, granularity
-):
-    """Abstract evaluation for grouped_gemm_fp8.
-
-    Args:
-        a: Input tensor A (FP8) with shape [m, k] or [k, m] if transA
-        b: Input tensor B (FP8) with shape [bs, k, n] or [bs, n, k] if transB
-        a_scales: Scaling factors for A
-        b_scales: Scaling factors for B
-        group_lens: Group lengths tensor [bs]
-        group_offs: Group offsets tensor [bs + 1]
-        transA: Whether A is transposed
-        transB: Whether B is transposed
-        num_cu: Number of compute units
-        out_dtype: Output dtype (fp16 or bf16)
-        granularity: Quantization granularity ("TENSORWISE" or "ROWWISE")
-
-    Returns:
-        Output tensor with shape [m, n]
-    """
-    # Calculate output shape based on transpose flags
-    m = a.shape[1] if transA else a.shape[0]
-    n = b.shape[1] if transB else b.shape[2]
-
-    return ShapedArray((m, n), out_dtype)
-
-
-ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_p] = _grouped_gemm_fp8_abstract_eval
-
-
-def _grouped_gemm_fp8_variable_k_abstract_eval(
-    a, b, a_scales, b_scales, group_lens, group_offs, transA, transB, num_cu, out_dtype, granularity
-):
-    """Abstract evaluation for grouped_gemm_fp8_variable_k.
-
-    Note: Only supports transA=True, transB=False
-
-    Args:
-        a: Input tensor A (FP8) with shape [k, m] (will be transposed)
-        b: Input tensor B (FP8) with shape [k, n]
-        a_scales: Scaling factors for A
-        b_scales: Scaling factors for B
-        group_lens: Group lengths tensor [bs]
-        group_offs: Group offsets tensor [bs + 1]
-        transA: Must be True
-        transB: Must be False
-        num_cu: Number of compute units
-        out_dtype: Output dtype (fp16 or bf16)
-        granularity: Quantization granularity ("TENSORWISE" or "ROWWISE")
-
-    Returns:
-        Output tensor with shape [bs, m, n]
-    """
-    assert transA == True and transB == False, "Only transA=True, transB=False supported"
-
-    # For transA=True, transB=False:
-    # a: [k, m] (will be transposed to [m, k]), b: [k, n]
-    # a.T @ b = [m, k] @ [k, n] = [m, n] for each group
-    # output: [bs, m, n]
-    bs = group_lens.shape[0]
-    m = a.shape[1]
-    n = b.shape[1]
-
-    return ShapedArray((bs, m, n), out_dtype)
-
-
-ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_abstract_eval
-
-
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
@@ -201,10 +123,6 @@ LOWERING_TABLE[grouped_gemm_p] = jax.ffi.ffi_lowering("grouped_gemm")
 LOWERING_TABLE[grouped_gemm_variable_k_p] = jax.ffi.ffi_lowering("grouped_gemm_variable_k")
 
 LOWERING_TABLE[compute_group_offs_p] = jax.ffi.ffi_lowering("compute_group_offs")
-
-LOWERING_TABLE[grouped_gemm_fp8_p] = jax.ffi.ffi_lowering("grouped_gemm_fp8")
-
-LOWERING_TABLE[grouped_gemm_fp8_variable_k_p] = jax.ffi.ffi_lowering("grouped_gemm_fp8_variable_k")
 
 
 # ----------------------------------------
@@ -217,6 +135,4 @@ __all__ = [
     "grouped_gemm_p",
     "grouped_gemm_variable_k_p",
     "compute_group_offs_p",
-    "grouped_gemm_fp8_p",
-    "grouped_gemm_fp8_variable_k_p",
 ]

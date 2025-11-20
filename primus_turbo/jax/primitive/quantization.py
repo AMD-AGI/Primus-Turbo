@@ -107,6 +107,7 @@ def _quantize_fp8_rowwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype
 
     # output: same shape as input but with FP8 dtype
     # scale_inv: same shape as input but with axis dimension = 1
+    # E.g., for input [M, K] and axis=-1, scale_inv is [M, 1]
     scale_inv_shape = list(input_aval.shape)
     scale_inv_shape[axis] = 1
 
