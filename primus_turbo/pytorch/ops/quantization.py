@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -73,5 +73,39 @@ def dequantize_fp8(
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
 
         return dequantize_mxfp8_impl(x, out_dtype, block_size, scale_inv)
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def quantize_fp4(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    *,
+    axis: Optional[int] = None,
+    scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    FP4 Quantize
+    """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        raise NotImplementedError("MX_BLOCKWISE FP4 quantization is not supported yet")
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def dequantize_fp4(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    *,
+    axis: Optional[int] = None,
+    scale_inv: torch.Tensor,
+):
+    """
+    FP4 DeQuantize
+    """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        raise NotImplementedError("MX_BLOCKWISE FP4 de-quantization is not supported yet")
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

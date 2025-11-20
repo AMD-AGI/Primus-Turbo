@@ -7,7 +7,7 @@ from typing import Union
 
 import torch
 
-from primus_turbo.pytorch.core.float8 import (
+from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.float8 import ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp8
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances

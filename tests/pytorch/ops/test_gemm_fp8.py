@@ -7,10 +7,11 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.float8 import (
+from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    check_mxfp8_support,
 )
 from primus_turbo.pytorch.ops import gemm_fp8
 from tests.pytorch.test_utils import compute_snr
@@ -149,8 +150,6 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
-    from primus_turbo.pytorch.core.float8 import check_mxfp8_support
-
     # Skip unit test on gfx942.
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
