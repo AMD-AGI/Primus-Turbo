@@ -422,8 +422,9 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
             }
             const int64_t outer_len_val = outer_len / inner_len;
 
-            // BUG FIX: kernel 在 auto-scale 模式 (PreComputeScale=false) 下仍然会写入 scale_ptr
-            // 所以即使我们不需要 scale 输出，也要为它分配临时缓冲区
+            // BUG FIX: The kernel still writes to scale_ptr in auto-scale mode
+            // (PreComputeScale=false) Therefore, we need to allocate a temporary buffer for it even
+            // if we don't need the scale output
             float     *temp_scale = nullptr;
             hipError_t alloc_err  = hipMalloc(&temp_scale, outer_len_val * sizeof(float));
             if (alloc_err != hipSuccess) {
@@ -476,7 +477,7 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
                 return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported FP8 dtype");
             }
 
-            // 释放临时缓冲区
+            // Release temporary buffer
             hipFree(temp_scale);
         } else {
             // Col-major: requires reduce-col to compute amax, then compute scale

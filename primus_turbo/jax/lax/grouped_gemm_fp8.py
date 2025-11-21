@@ -191,7 +191,7 @@ def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num
     # Quantize a and b (row-wise)
     a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-1)
     b_fp8_row, b_scale_inv_row = quantize_fp8(
-        b, b_dtype, ScalingGranularity.ROWWISE, axis=(2 if trans_b else 1)
+        b, b_dtype, ScalingGranularity.ROWWISE, axis=(-1 if trans_b else -2)
     )
 
     # Forward pass

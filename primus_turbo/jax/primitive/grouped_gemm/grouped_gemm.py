@@ -105,7 +105,6 @@ def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, transA,
     # a.T @ b = [m, k] @ [k, n] = [m, n] for each group
     # output: [bs, m, n]
     bs = group_lens.shape[0]
-    a.shape[0]
     m = a.shape[1]
     n = b.shape[1]
 

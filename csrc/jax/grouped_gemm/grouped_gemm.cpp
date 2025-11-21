@@ -456,16 +456,22 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
                                                ck_tile::QuantType::RowColQuant>(params);
         } else {
             hipFree(args_ptr);
+            hipFree(aq_expanded_ptr);
+            hipFree(bq_expanded_ptr);
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
         }
     } else {
         hipFree(args_ptr);
+        hipFree(aq_expanded_ptr);
+        hipFree(bq_expanded_ptr);
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "GroupedGemmFP8 only supports fp8 e4m3 and e5m2");
     }
 
     hipFree(args_ptr);
+    hipFree(aq_expanded_ptr);
+    hipFree(bq_expanded_ptr);
     return ffi::Error::Success();
 }
 
