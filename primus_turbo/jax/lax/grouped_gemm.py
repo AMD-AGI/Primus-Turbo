@@ -8,7 +8,7 @@ from functools import partial
 
 import jax
 
-from primus_turbo.jax.primitive.grouped_gemm import (
+from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import (
     compute_group_offs_p,
     grouped_gemm_p,
     grouped_gemm_variable_k_p,

@@ -18,8 +18,8 @@ from primus_turbo.jax.core.low_precision import (
     float8_e5m2,
 )
 from primus_turbo.jax.lax.quantization import quantize_fp8
-from primus_turbo.jax.primitive.grouped_gemm import compute_group_offs_p
-from primus_turbo.jax.primitive.grouped_gemm_fp8 import (
+from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import compute_group_offs_p
+from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_fp8 import (
     grouped_gemm_fp8_p,
     grouped_gemm_fp8_variable_k_p,
 )

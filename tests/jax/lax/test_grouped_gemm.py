@@ -76,11 +76,3 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     b_grad_snr = compute_snr(grad_b_ref, grad_b)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > 20, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
-
-
-if __name__ == "__main__":
-    # Quick test
-    jax.config.update("jax_enable_x64", True)
-    print("Testing grouped_gemm (forward + backward)...")
-    test_grouped_gemm(2, 128, (256, 512), jnp.float16, True, False, 0)
-    print("✓ Test passed!")
