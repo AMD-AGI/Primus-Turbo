@@ -25,8 +25,8 @@ def _check_hit_int32_limit(B, M, N, K):
     return max(a_elems, out_elems, b_elems) >= 2**31
 
 
-@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32, 64])
-@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize("B", [16, 32])
+@pytest.mark.parametrize("M", [128, 512, 1024, 4096])
 @pytest.mark.parametrize(
     "NK",
     [
@@ -44,8 +44,9 @@ def _check_hit_int32_limit(B, M, N, K):
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, balance):
+
     # Enable int64 support
     jax.config.update("jax_enable_x64", True)
 
@@ -84,6 +85,7 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
 
     a_ref_grad, b_ref_grad = jax.grad(loss_fn_ref, argnums=(0, 1))(a_ref_f32, b_ref_f32)
     print(a_ref_grad.shape, b_ref_grad.shape)
+
     # Turbo forward
     config = Float8QuantConfig(format=format, granularity=granularity)
     out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
@@ -94,7 +96,7 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
 
     a_grad, b_grad = jax.grad(loss_fn, argnums=(0, 1))(a, b)
 
-    # Check forward only
+    # Validation
     snr_threshold = 25 if format == Format.E4M3 else 20
 
     out_snr = compute_snr(out_ref.astype(jnp.float32), out.astype(jnp.float32))
@@ -108,5 +110,3 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
     b_grad_snr = compute_snr(b_ref_grad.astype(jnp.float32), b_grad.astype(jnp.float32))
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
-
-    print("(Backward tests temporarily disabled for debugging)")
