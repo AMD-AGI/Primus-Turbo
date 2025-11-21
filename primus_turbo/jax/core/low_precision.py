@@ -19,6 +19,7 @@ __all__ = [
     "ScalingGranularity",
     "ScalingStrategy",
     "Float8QuantConfig",
+    "Float4QuantConfig",
 ]
 
 
@@ -61,6 +62,13 @@ def is_fp8_dtype(dtype):
     return dtype in JAX_FP8_DTYPE
 
 
+def is_fp4_dtype(dtype):
+    """Check if dtype is a FP4 dtype."""
+    # Note: JAX may not have FP4 support yet, this is for future compatibility
+    JAX_FP4_DTYPE = []
+    return dtype in JAX_FP4_DTYPE
+
+
 def check_fp8_support() -> Tuple[bool, str]:
     """Return if fp8 support is available"""
     if get_device_compute_capability() >= (9, 4):
@@ -71,13 +79,13 @@ def check_fp8_support() -> Tuple[bool, str]:
     )
 
 
-def check_mxfp8_support() -> Tuple[bool, str]:
-    """Return if fp8 support is available"""
+def check_fp4_support() -> Tuple[bool, str]:
+    """Return if fp4 support is available"""
     if get_device_compute_capability() >= (9, 5):
         return True, ""
     return (
         False,
-        "Device compute capability gfx950 or higher required for FP8 execution.",
+        "Device compute capability gfx950 or higher required for FP4 execution.",
     )
 
 
@@ -88,6 +96,16 @@ def check_fp8_ocp_support() -> Tuple[bool, str]:
     return (
         False,
         "Device compute capability gfx950 or higher required for FP8 OCP format.",
+    )
+
+
+def check_mxfp8_support() -> Tuple[bool, str]:
+    """Return if mxfp8 support is available"""
+    if get_device_compute_capability() >= (9, 5):
+        return True, ""
+    return (
+        False,
+        "Device compute capability gfx950 or higher required for FP8 execution.",
     )
 
 
@@ -108,11 +126,12 @@ except AttributeError:
 
 class Format(Enum):
     """
-    Supported FP8 formats.
+    Supported FP8/FP4 formats.
     """
 
     E4M3 = auto()
     E5M2 = auto()
+    E2M1_X2 = auto()
     HYBRID = auto()
 
 
@@ -144,4 +163,25 @@ class Float8QuantConfig:
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
-            assert self.format == Format.E4M3, "Format must be set E4M3 when granularity is MX_BLOCKWISE"
+
+
+@dataclass
+class Float4QuantConfig:
+    format: Format = Format.E2M1_X2
+    granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
+    strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    block_size: Optional[int] = None
+
+    def __post_init__(self):
+        assert (
+            self.granularity == ScalingGranularity.MX_BLOCKWISE
+        ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+
+        if self.block_size is None:
+            self.block_size = 32
+
+        mx_support_block_size = [32]
+        assert (
+            self.block_size in mx_support_block_size
+        ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"

@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-from primus_turbo.jax.core.float8 import ScalingGranularity
+from primus_turbo.jax.core.low_precision import ScalingGranularity
 
 from ..primitive.quantization import (
     dequantize_fp8_tensorwise_p,

@@ -10,7 +10,7 @@ from typing import Optional, Union
 import jax
 import jax.numpy as jnp
 
-from primus_turbo.jax.core.float8 import (
+from primus_turbo.jax.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,

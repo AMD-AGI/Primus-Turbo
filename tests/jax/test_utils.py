@@ -6,7 +6,7 @@
 
 import jax.numpy as jnp
 
-from primus_turbo.jax.core.float8 import is_fp8_dtype
+from primus_turbo.jax.core.low_precision import is_fp8_dtype
 
 
 def get_tolerances(dtype):

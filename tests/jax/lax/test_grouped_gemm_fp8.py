@@ -8,7 +8,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from primus_turbo.jax.core.float8 import Float8QuantConfig, Format, ScalingGranularity
+from primus_turbo.jax.core.low_precision import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
 from primus_turbo.jax.lax import grouped_gemm_fp8
 from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
 from tests.jax.test_utils import compute_snr

@@ -4,4 +4,4 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from .float8 import *
+from .low_precision import *
