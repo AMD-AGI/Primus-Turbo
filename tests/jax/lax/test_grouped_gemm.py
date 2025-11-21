@@ -13,7 +13,7 @@ from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gem
 from tests.jax.test_utils import compute_snr
 
 
-@pytest.mark.parametrize("B", [32])
+@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
 @pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
 @pytest.mark.parametrize(
     "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
@@ -21,7 +21,7 @@ from tests.jax.test_utils import compute_snr
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("reduce_num_cu", [0])
+@pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
 def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     """Test grouped GEMM forward and backward pass."""
     jax.config.update("jax_enable_x64", True)

@@ -34,7 +34,7 @@ def grouped_gemm(a, b, group_lens, group_offs=None, transA=False, transB=False, 
     """Grouped GEMM with automatic differentiation support.
 
     Args:
-        a: Input tensor A with shape [m, k] or [k, m] if transA
+        a: Input tensor A with shape [bs * m, k] or [k, bs * m] if transA
         b: Input tensor B with shape [bs, k, n] or [bs, n, k] if transB
         group_lens: Group lengths tensor [bs]
         group_offs: Group offsets tensor [bs + 1]. If None, computed internally from group_lens
@@ -44,16 +44,6 @@ def grouped_gemm(a, b, group_lens, group_offs=None, transA=False, transB=False, 
 
     Returns:
         Output tensor with shape [m, n]
-
-    Example:
-        >>> import jax.numpy as jnp
-        >>> G, K, N = 3, 128, 64
-        >>> group_lens = jnp.array([32, 16, 48], dtype=jnp.int64)
-        >>> a = jax.random.normal(jax.random.PRNGKey(0), (group_lens.sum(), K), dtype=jnp.bfloat16)
-        >>> b = jax.random.normal(jax.random.PRNGKey(1), (G, K, N), dtype=jnp.bfloat16)
-        >>> out = grouped_gemm(a, b, group_lens)  # group_offs computed automatically
-        >>> out.shape
-        (96, 64)
     """
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)

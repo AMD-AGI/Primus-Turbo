@@ -370,7 +370,7 @@ def grouped_gemm_fp8(
     performs grouped matrix multiplication, and returns the result in the original dtype.
 
     Args:
-        a: Input tensor A with shape [m, k] (float16 or bfloat16)
+        a: Input tensor A with shape [bs * m, k] (float16 or bfloat16)
         b: Input tensor B with shape [bs, k, n] or [bs, n, k] if trans_b (float16 or bfloat16)
         group_lens: Group lengths tensor [bs] (int64)
         group_offs: Group offsets tensor [bs + 1] (int64). If None, computed from group_lens
@@ -384,24 +384,6 @@ def grouped_gemm_fp8(
     Raises:
         AssertionError: If input shapes or dtypes are invalid
         NotImplementedError: If BLOCKWISE quantization is requested
-
-    Example:
-        >>> import jax.numpy as jnp
-        >>> from primus_turbo.jax.lax.grouped_gemm_fp8 import grouped_gemm_fp8
-        >>> from primus_turbo.jax.core.float8 import Float8QuantConfig, ScalingGranularity
-        >>>
-        >>> # Setup
-        >>> G, M, K, N = 3, 96, 128, 64
-        >>> group_lens = jnp.array([32, 16, 48], dtype=jnp.int64)
-        >>> a = jax.random.normal(jax.random.PRNGKey(0), (M, K), dtype=jnp.float16)
-        >>> b = jax.random.normal(jax.random.PRNGKey(1), (G, K, N), dtype=jnp.float16)
-        >>>
-        >>> # TENSORWISE quantization (default)
-        >>> out = grouped_gemm_fp8(a, b, group_lens)
-        >>>
-        >>> # ROWWISE quantization
-        >>> config = Float8QuantConfig(granularity=ScalingGranularity.ROWWISE)
-        >>> out = grouped_gemm_fp8(a, b, group_lens, config=config)
     """
     supported_dtypes = [jnp.bfloat16, jnp.float16]
     assert a.dtype in supported_dtypes, f"Unsupported dtype {a.dtype}, expected one of {supported_dtypes}"

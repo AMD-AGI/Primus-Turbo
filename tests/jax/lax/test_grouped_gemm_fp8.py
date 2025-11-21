@@ -21,8 +21,8 @@ def _check_hit_int32_limit(B, M, N, K):
     return max(a_elems, out_elems, b_elems) >= 2**31
 
 
-@pytest.mark.parametrize("B", [32])
-@pytest.mark.parametrize("M", [128, 1024, 2048])
+@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32, 64])
+@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize(
     "NK",
     [
@@ -107,17 +107,3 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
     assert b_grad_snr > snr_threshold, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
 
     print("(Backward tests temporarily disabled for debugging)")
-
-
-if __name__ == "__main__":
-    # Run single ROWWISE case for debugging
-    test_grouped_gemm_fp8(
-        B=32,
-        M=128,
-        NK=(2048, 1536),
-        ori_dtype=jnp.bfloat16,
-        format=Format.E4M3,
-        granularity=ScalingGranularity.ROWWISE,
-        trans_b=True,
-        balance=True,
-    )
