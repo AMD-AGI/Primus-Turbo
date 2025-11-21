@@ -14,6 +14,7 @@
 #include <hip/hip_version.h>
 
 #include "primus_turbo/arch.h"
+#include "primus_turbo/floating_point_utils.h"
 #include "primus_turbo/platform.h"
 
 namespace primus_turbo {
@@ -310,6 +311,69 @@ struct float8_e5m2_t {
 static_assert(sizeof(float8_e5m2_t) == 1, "float8_e5m2_t must be 1 byte");
 static_assert(alignof(float8_e5m2_t) == 1);
 static_assert(std::is_trivially_copyable_v<float8_e5m2_t>);
+
+struct float8_e8m0_t {
+    using storage_t = uint8_t;
+    storage_t val;
+
+    PRIMUS_TURBO_HOST_DEVICE float8_e8m0_t() = default;
+
+    //---------------  from bits  -----------------
+    PRIMUS_TURBO_HOST_DEVICE static float8_e8m0_t from_bits(uint8_t bits) {
+        float8_e8m0_t x;
+        x.val = bits;
+        return x;
+    }
+
+    //---------------  float32  -----------------
+    PRIMUS_TURBO_HOST_DEVICE float8_e8m0_t(float f) { *this = f; }
+
+    PRIMUS_TURBO_HOST_DEVICE float8_e8m0_t &operator=(float f) {
+        uint32_t f_bits   = fp32_to_bits(f);
+        uint32_t exponent = (f_bits >> 23) & 0b11111111;
+        if (exponent == 0b11111111) { // NaN
+            val = exponent;
+        } else {
+            // guard bit - bit 23, or 22 zero-indexed
+            uint8_t g = (f_bits & 0x400000) > 0;
+            // round bit - bit 22, or 21 zero-indexed
+            uint8_t r = (f_bits & 0x200000) > 0;
+            // sticky bit - bits 21 to 1, or 20 to 0 zero-indexed
+            uint8_t s = (f_bits & 0x1FFFFF) > 0;
+            // in casting to e8m0, LSB is the implied mantissa bit. It equals to 0 if the
+            // original float32 is denormal, and to 1 if the original float32 is normal.
+            uint8_t lsb = exponent > 0;
+
+            bool round_up = false;
+            // if g == 0, round down (no-op)
+            if (g == 1) {
+                if ((r == 1) || (s == 1)) {
+                    round_up = true;
+                } else {
+                    if (lsb == 1) {
+                        round_up = true;
+                    }
+                }
+            }
+            val = round_up ? exponent + 1 : exponent;
+        }
+        return *this;
+    }
+
+    PRIMUS_TURBO_HOST_DEVICE operator float() const {
+        if (val == 0) {
+            return fp32_from_bits(0x00400000);
+        }
+        if (val == 0b11111111) {
+            return fp32_from_bits(0x7f800001);
+        }
+        uint32_t res = val << 23;
+        return fp32_from_bits(res);
+    }
+};
+static_assert(sizeof(float8_e8m0_t) == 1, "float8_e8m0_t must be 1 byte");
+static_assert(alignof(float8_e8m0_t) == 1);
+static_assert(std::is_trivially_copyable_v<float8_e8m0_t>);
 
 } // namespace primus_turbo
 

@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.float8 import (
+from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
@@ -152,7 +152,7 @@ def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
     # NOTE: user need to ensure m and n are multiples of 16.
     assert m % 16 == 0 and n % 16 == 0, "Assue m and n are multiples of 16."
 
-    from primus_turbo.pytorch.core.float8 import check_mxfp8_support
+    from primus_turbo.pytorch.core.low_precision import check_mxfp8_support
 
     # Skip unit test on gfx942.
     mxfp8_supported, reason = check_mxfp8_support()
