@@ -32,7 +32,6 @@ IMPL_TABLE[quantize_fp8_tensorwise_p] = partial(xla.apply_primitive, quantize_fp
 
 
 # Abstract eval
-# Matches PyTorch signature: (input, scale_opt) + out_dtype_str (static) -> (output, scale_inv)
 def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype_str):
     # Convert string to dtype
     dtype_map = {
@@ -68,7 +67,6 @@ IMPL_TABLE[dequantize_fp8_tensorwise_p] = partial(xla.apply_primitive, dequantiz
 
 
 # Abstract eval
-# Matches PyTorch signature: (input, scale_inv) + out_dtype_str (static) -> output
 def _dequantize_fp8_tensorwise_abstract_eval(input_aval, scale_inv_aval, *, out_dtype_str):
     # output: same shape as input but with float32 dtype
     return ShapedArray(input_aval.shape, jnp.float32)
@@ -92,7 +90,6 @@ IMPL_TABLE[quantize_fp8_rowwise_p] = partial(xla.apply_primitive, quantize_fp8_r
 
 
 # Abstract eval
-# Matches PyTorch signature: (input, scale_opt) + out_dtype_str, axis (static) -> (output, scale_inv)
 def _quantize_fp8_rowwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype_str, axis):
     # Convert string to dtype
     dtype_map = {

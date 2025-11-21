@@ -29,7 +29,6 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     N, K = N_K
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance)
 
-    # Create input tensors (matches PyTorch version)
     key = jax.random.PRNGKey(0)
     key1, key2 = jax.random.split(key)
 
@@ -40,7 +39,6 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     a = a.astype(dtype)
     b = b.astype(dtype)
 
-    # Create reference copies for accurate comparison (matches PyTorch detach().clone())
     a_ref = jnp.array(a, copy=True)
     b_ref = jnp.array(b, copy=True)
 
@@ -51,7 +49,6 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     # Forward
     out = grouped_gemm(a, b, group_lens, transB=trans_b, num_cu=num_cu)
 
-    # Compute reference (matches PyTorch version)
     out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=trans_b)
 
     # Check forward results using SNR

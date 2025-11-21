@@ -43,7 +43,6 @@ float get_float8_max(ffi::DataType dtype) {
 }
 
 // Tensorwise Quantize FP8 FFI
-// Signature matches PyTorch: quantize_fp8_tensorwise(input, dest_dtype, scale_opt)
 // Input parameters: input (F32/F16/BF16), out_dtype_str (string), scale_opt (F32 buffer, optional)
 // Output parameters (via ffi::Result): output, scale_inv
 // Return value: ffi::Error (status)
@@ -62,7 +61,6 @@ ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_d
     auto input_dtype = input.element_type();
 
     // Check if scale is provided (scale_opt.numel() > 0)
-    // This matches PyTorch's c10::optional<at::Tensor> behavior
     bool has_scale = (scale_opt.dimensions().size() > 0 && scale_opt.dimensions()[0] > 0);
 
     float scale_inv_val;
@@ -212,7 +210,6 @@ ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_d
 }
 
 // Tensorwise Dequantize FP8 FFI
-// Signature matches PyTorch: dequantize_fp8_tensorwise(input, scale_inv, dest_dtype)
 // Output parameters (via ffi::Result): output
 // Return value: ffi::Error (status)
 ffi::Error DequantizeFP8TensorwiseFFI(ffi::AnyBuffer                               input,
@@ -262,7 +259,6 @@ inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &input_s
 }
 
 // Rowwise Quantize FP8 FFI
-// Signature matches PyTorch: quantize_fp8_rowwise(input, dest_dtype, axis, scale_opt)
 // Output parameters (via ffi::Result): output, scale_inv
 // Return value: ffi::Error (status)
 ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtype_str, int64_t axis,

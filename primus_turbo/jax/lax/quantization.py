@@ -33,7 +33,6 @@ def quantize_fp8(
     """
     FP8 Quantize
 
-    Signature matches PyTorch: quantize_fp8(x, out_dtype, granularity, *, axis, scale)
     Returns: (x_q, scale_inv)
 
     Args:
@@ -106,7 +105,6 @@ def dequantize_fp8(
     """
     FP8 DeQuantize
 
-    Signature matches PyTorch: dequantize_fp8(x, out_dtype, granularity, *, axis, scale_inv)
     Returns: x_dq
 
     Args:

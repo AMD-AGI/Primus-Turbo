@@ -58,7 +58,6 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
-    # Initialize tensors in float32, then cast to target dtype (matches PyTorch pattern)
     key = jax.random.PRNGKey(0)
     key_a, key_b = jax.random.split(key)
 

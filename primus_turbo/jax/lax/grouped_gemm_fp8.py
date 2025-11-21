@@ -364,8 +364,6 @@ def grouped_gemm_fp8(
 ) -> jax.Array:
     """Grouped GEMM with FP8 quantization.
 
-    Signature matches PyTorch: grouped_gemm_fp8(a, b, group_lens, group_offs, trans_b, config, num_cu)
-
     This function automatically quantizes input tensors to FP8 based on the config,
     performs grouped matrix multiplication, and returns the result in the original dtype.
 

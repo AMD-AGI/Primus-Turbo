@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 
 def grouped_gemm_ref(a, b, group_lens, trans_b=True):
-    """Reference implementation of grouped GEMM using JAX ops (matches PyTorch version)."""
+    """Reference implementation of grouped GEMM using JAX ops."""
     group_lens_np = jnp.array(group_lens)
     out = []
     start = 0
@@ -41,7 +41,7 @@ def grouped_gemm_variable_k_ref(a, b, group_lens, trans_a=True, trans_b=False):
 
 
 def generate_grouped_gemm_group_lens(b, m, balance=True):
-    """Generate group lengths (matches PyTorch version)."""
+    """Generate group lengths."""
     if balance:
         return jnp.full((b,), m, dtype=jnp.int64)
     else:
