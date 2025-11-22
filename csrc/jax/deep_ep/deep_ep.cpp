@@ -8,6 +8,8 @@
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/deep_ep/api.h"
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <hip/hip_runtime.h>
 #include <memory>
@@ -21,16 +23,21 @@ namespace ffi = xla::ffi;
 
 namespace primus_turbo::jax::deep_ep {
 
-static std::shared_ptr<Buffer> g_buffer = nullptr;
+std::barrier g_barrier_signal(NUM_MAX_NVL_PEERS);
 
 static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
 
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::Config &config) {
+
+    PRIMUS_TURBO_CHECK(num_ranks == NUM_MAX_NVL_PEERS and
+                       "DeepEP only support intranode communication on Jax!");
+
     int device_id = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
-    printf("device_id: %d get_buffer\n", device_id);
-    auto num_nvl_bytes  = config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks);
+
+    // auto num_nvl_bytes = config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks);
+    int64_t num_nvl_bytes = 1024 * 1024 * 1024;
     // auto num_rdma_bytes = config.get_rdma_buffer_size_hint(hidden_bytes, num_ranks);
     int64_t num_rdma_bytes = 0;
     if (g_buffer_pool[device_id] == nullptr or g_buffer_pool[device_id]->rank() != rank or
@@ -38,10 +45,34 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
         g_buffer_pool[device_id]->num_nvl_bytes() < num_nvl_bytes or
         g_buffer_pool[device_id]->num_rdma_bytes() < num_rdma_bytes) {
         g_buffer_pool[device_id] =
-            std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes,
-                                     /* explicitly_destroy */ true);
+            std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, true);
+        g_barrier_signal.arrive_and_wait();
+        g_buffer_pool[device_id]->Sync();
     }
     return g_buffer_pool[device_id].get();
+}
+
+inline cudaDataType FFIDataTypeToHIPDataType(const ffi::DataType &data_type) {
+    switch (data_type) {
+    case ffi::DataType::U8:
+        return HIP_R_8U;
+    case ffi::DataType::S8:
+        return HIP_R_8I;
+    case ffi::DataType::S32:
+        return HIP_R_32I;
+    case ffi::DataType::F16:
+        return HIP_R_16F;
+    case ffi::DataType::F32:
+        return HIP_R_32F;
+    case ffi::DataType::F64:
+        return HIP_R_64F;
+    case ffi::DataType::F8E4M3FNUZ:
+        return HIP_R_8F_E4M3_FNUZ;
+    case ffi::DataType::F8E5M2FNUZ:
+        return HIP_R_8F_E5M2_FNUZ;
+    default:
+        PRIMUS_TURBO_CHECK(false, "Cannot convert ffi::DataType to hipDataType.");
+    }
 }
 
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
@@ -144,19 +175,11 @@ void Buffer::Destroy() {
     // Synchronize
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
-    if (num_nvl_bytes_ > 0) {
+    if (num_nvl_bytes_ > 0 and is_available()) {
         // Barrier
-        // primus_turbo::deep_ep::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
-        // num_nvl_ranks_,
-        //                                           );
+        primus_turbo::deep_ep::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
+                                                  num_nvl_ranks_, 0);
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
-
-        // Close remote IPC
-        if (is_available()) {
-            for (int i = 0; i < num_nvl_ranks_; ++i)
-                if (i != nvl_rank_)
-                    PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(buffer_ptrs_[i]));
-        }
 
         // Free local buffer and error flag
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
@@ -168,11 +191,12 @@ bool Buffer::is_internode_available() const {
     return false; // TODO: implement this
 }
 
-void Buffer::DispatchLayout(hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, int num_experts,
-                            ffi::Buffer<ffi::S32>                num_tokens_per_rank,
-                            std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
-                            ffi::Buffer<ffi::S32>                num_tokens_per_expert,
-                            ffi::Buffer<ffi::PRED>               is_token_in_rank) {
+void Buffer::DispatchLayout(
+    hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, int num_experts,
+    ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> num_tokens_per_rdma_rank,
+    ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert,
+    ffi::Result<ffi::Buffer<ffi::PRED>>               is_token_in_rank) {
     PRIMUS_TURBO_CHECK(topk_idx.dimensions().size() == 2);
     PRIMUS_TURBO_CHECK(num_experts > 0);
 
@@ -181,11 +205,11 @@ void Buffer::DispatchLayout(hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, 
 
     int *num_tokens_per_rdma_rank_ptr = nullptr;
     if (num_tokens_per_rdma_rank.has_value())
-        num_tokens_per_rdma_rank_ptr = num_tokens_per_rdma_rank->typed_data();
+        num_tokens_per_rdma_rank_ptr = num_tokens_per_rdma_rank.value()->typed_data();
 
     primus_turbo::deep_ep::layout::get_dispatch_layout(
-        topk_idx.typed_data(), num_tokens_per_rank.typed_data(), num_tokens_per_rdma_rank_ptr,
-        num_tokens_per_expert.typed_data(), is_token_in_rank.typed_data(), num_tokens, num_topk,
+        topk_idx.typed_data(), num_tokens_per_rank->typed_data(), num_tokens_per_rdma_rank_ptr,
+        num_tokens_per_expert->typed_data(), is_token_in_rank->typed_data(), num_tokens, num_topk,
         num_ranks_, num_experts, stream);
 }
 
@@ -242,159 +266,267 @@ void Buffer::IntranodeDispatch(
                            NUM_MAX_LOCAL_EXPERTS);
         PRIMUS_TURBO_CHECK(num_tokens_per_rank->dimensions().size() == 1 and
                            num_tokens_per_rank->dimensions()[0] == num_ranks_);
+    }
 
-        auto num_tokens = static_cast<int>(x.dimensions()[0]),
-             hidden     = static_cast<int>(x.dimensions()[1]);
+    auto num_tokens = static_cast<int>(x.dimensions()[0]),
+         hidden     = static_cast<int>(x.dimensions()[1]);
 
-        PRIMUS_TURBO_CHECK(num_worst_tokens > num_tokens);
-        auto num_experts =
-                 cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->dimensions()[0]),
-             num_local_experts = num_experts / num_ranks_;
+    PRIMUS_TURBO_CHECK(num_worst_tokens > num_tokens);
+    auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->dimensions()[0]),
+         num_local_experts = num_experts / num_ranks_;
 
-        // Top-k checks
-        int      num_topk         = 0;
-        int64_t *topk_idx_ptr     = nullptr;
-        float   *topk_weights_ptr = nullptr;
-        PRIMUS_TURBO_CHECK(topk_idx.has_value() == topk_weights.has_value());
-        if (topk_idx.has_value()) {
-            num_topk = static_cast<int>(topk_idx->dimensions()[1]);
-            PRIMUS_TURBO_CHECK(num_experts > 0);
-            PRIMUS_TURBO_CHECK(topk_idx->dimensions().size() == 2);
-            PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
-            PRIMUS_TURBO_CHECK(num_tokens == topk_idx->dimensions()[0] and
-                               num_tokens == topk_weights->dimensions()[0]);
-            PRIMUS_TURBO_CHECK(num_topk == topk_weights->dimensions()[1]);
-            topk_idx_ptr     = topk_idx->typed_data();
-            topk_weights_ptr = topk_weights->typed_data();
-        }
+    // Top-k checks
+    int      num_topk         = 0;
+    int64_t *topk_idx_ptr     = nullptr;
+    float   *topk_weights_ptr = nullptr;
+    PRIMUS_TURBO_CHECK(topk_idx.has_value() == topk_weights.has_value());
+    if (topk_idx.has_value()) {
+        num_topk = static_cast<int>(topk_idx->dimensions()[1]);
+        PRIMUS_TURBO_CHECK(num_experts > 0);
+        PRIMUS_TURBO_CHECK(topk_idx->dimensions().size() == 2);
+        PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
+        PRIMUS_TURBO_CHECK(num_tokens == topk_idx->dimensions()[0] and
+                           num_tokens == topk_weights->dimensions()[0]);
+        PRIMUS_TURBO_CHECK(num_topk == topk_weights->dimensions()[1]);
+        topk_idx_ptr     = topk_idx->typed_data();
+        topk_weights_ptr = topk_weights->typed_data();
+    }
 
-        // FP8 scales checks
-        float *x_scales_ptr = nullptr;
-        int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
-        if (x_scales.has_value()) {
-            PRIMUS_TURBO_CHECK(x_scales->element_count() == num_tokens);
-            PRIMUS_TURBO_CHECK(x_scales->dimensions().size() == 2);
-            PRIMUS_TURBO_CHECK(x_scales->dimensions()[0] == num_tokens);
-            num_scales =
-                x_scales->dimensions()[1] == 1 ? 1 : static_cast<int>(x_scales->dimensions()[1]);
-            x_scales_ptr        = x_scales->typed_data();
-            scale_token_stride  = static_cast<int>(x_scales->dimensions()[1]);
-            scale_hidden_stride = 1;
-        }
+    // FP8 scales checks
+    float *x_scales_ptr = nullptr;
+    int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (x_scales.has_value()) {
+        PRIMUS_TURBO_CHECK(x_scales->element_count() == num_tokens);
+        PRIMUS_TURBO_CHECK(x_scales->dimensions().size() == 2);
+        PRIMUS_TURBO_CHECK(x_scales->dimensions()[0] == num_tokens);
+        num_scales =
+            x_scales->dimensions()[1] == 1 ? 1 : static_cast<int>(x_scales->dimensions()[1]);
+        x_scales_ptr        = x_scales->typed_data();
+        scale_token_stride  = static_cast<int>(x_scales->dimensions()[1]);
+        scale_hidden_stride = 1;
+    }
 
-        // TODO: Wait previous tasks to be finished
+    // Create handles (only return for non-cached mode)
+    int num_recv_tokens = -1;
+    // Barrier or send sizes
+    // To clean: channel start/end offset, head and tail
+    int num_memset_int = num_channels * num_ranks_ * 4;
+    if (cached_mode) {
+        num_recv_tokens       = cached_num_recv_tokens;
+        rank_prefix_matrix    = cached_rank_prefix_matrix.value();
+        channel_prefix_matrix = cached_channel_prefix_matrix.value();
+        // Copy rank prefix matrix and clean flags
+        primus_turbo::deep_ep::intranode::cached_notify_dispatch(
+            rank_prefix_matrix.value()->typed_data(), num_memset_int, buffer_ptrs_gpu_,
+            barrier_signal_ptrs_gpu_, rank_, num_ranks_, stream);
+    } else {
 
-        // Create handles (only return for non-cached mode)
-        int              num_recv_tokens = -1;
-        std::vector<int> num_recv_tokens_per_expert_list;
-        // Barrier or send sizes
-        // To clean: channel start/end offset, head and tail
-        int num_memset_int = num_channels * num_ranks_ * 4;
-        if (cached_mode) {
-            num_recv_tokens = cached_num_recv_tokens;
-            // Copy rank prefix matrix and clean flags
-            primus_turbo::deep_ep::intranode::cached_notify_dispatch(
-                cached_rank_prefix_matrix->typed_data(), num_memset_int, buffer_ptrs_gpu_,
-                barrier_signal_ptrs_gpu_, rank_, num_ranks_, stream);
+        /// Send sizes
+        // Meta information:
+        //  - Size prefix by ranks, shaped as `[num_ranks, num_ranks]`
+        //  - Size prefix by experts (not used later), shaped as `[num_ranks,
+        //  num_local_experts]`
+        // NOTES: no more token dropping in this version
+        *moe_recv_counter_ = -1;
+        for (int i = 0; i < num_local_experts; ++i)
+            moe_recv_expert_counter_[i] = -1;
+        PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_ranks_ * (num_ranks_ + num_local_experts) *
+                                                sizeof(int)) <= num_nvl_bytes_);
+        PRIMUS_TURBO_CHECK(channel_prefix_matrix.has_value());
+        PRIMUS_TURBO_CHECK(rank_prefix_matrix.has_value());
+
+        primus_turbo::deep_ep::intranode::notify_dispatch(
+            num_tokens_per_rank->typed_data(), moe_recv_counter_mapped_, num_ranks_,
+            num_tokens_per_expert->typed_data(), moe_recv_expert_counter_mapped_, num_experts,
+            num_tokens, is_token_in_rank.typed_data(), channel_prefix_matrix.value()->typed_data(),
+            rank_prefix_matrix.value()->typed_data(), num_memset_int, expert_alignment,
+            buffer_ptrs_gpu_, barrier_signal_ptrs_gpu_, rank_, stream, num_channels);
+
+        if (num_worst_tokens > 0) {
+            // No CPU sync, just allocate the worst case
+            num_recv_tokens = num_worst_tokens;
+
+            // Must be forward with top-k stuffs
+            PRIMUS_TURBO_CHECK(topk_idx.has_value());
+            PRIMUS_TURBO_CHECK(topk_weights.has_value());
         } else {
+            // Synchronize total received tokens and tokens per expert
+            auto start_time = std::chrono::high_resolution_clock::now();
+            while (true) {
+                // Read total count
+                num_recv_tokens = static_cast<int>(*moe_recv_counter_);
 
-            /// Send sizes
-            // Meta information:
-            //  - Size prefix by ranks, shaped as `[num_ranks, num_ranks]`
-            //  - Size prefix by experts (not used later), shaped as `[num_ranks,
-            //  num_local_experts]`
-            // NOTES: no more token dropping in this version
-            *moe_recv_counter_ = -1;
-            for (int i = 0; i < num_local_experts; ++i)
-                moe_recv_expert_counter_[i] = -1;
-            PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_ranks_ * (num_ranks_ + num_local_experts) *
-                                                    sizeof(int)) <= num_nvl_bytes_);
-            PRIMUS_TURBO_CHECK(channel_prefix_matrix.has_value());
-            PRIMUS_TURBO_CHECK(rank_prefix_matrix.has_value());
-            primus_turbo::deep_ep::intranode::notify_dispatch(
-                num_tokens_per_rank->typed_data(), moe_recv_counter_mapped_, num_ranks_,
-                num_tokens_per_expert->typed_data(), moe_recv_expert_counter_mapped_, num_experts,
-                num_tokens, is_token_in_rank.typed_data(),
-                channel_prefix_matrix.value()->typed_data(),
-                rank_prefix_matrix.value()->typed_data(), num_memset_int, expert_alignment,
-                buffer_ptrs_gpu_, barrier_signal_ptrs_gpu_, rank_, stream, num_channels);
+                // Read per-expert count
+                bool ready = (num_recv_tokens >= 0);
+                for (int i = 0; i < num_local_experts and ready; ++i)
+                    ready &= moe_recv_expert_counter_[i] >= 0;
 
-            if (num_worst_tokens > 0) {
-                // No CPU sync, just allocate the worst case
-                num_recv_tokens = num_worst_tokens;
+                if (ready)
+                    break;
 
-                // Must be forward with top-k stuffs
-                PRIMUS_TURBO_CHECK(topk_idx.has_value());
-                PRIMUS_TURBO_CHECK(topk_weights.has_value());
-            } else {
-                // Synchronize total received tokens and tokens per expert
-                auto start_time = std::chrono::high_resolution_clock::now();
-                while (true) {
-                    // Read total count
-                    num_recv_tokens = static_cast<int>(*moe_recv_counter_);
-
-                    // Read per-expert count
-                    bool ready = (num_recv_tokens >= 0);
-                    for (int i = 0; i < num_local_experts and ready; ++i)
-                        ready &= moe_recv_expert_counter_[i] >= 0;
-
-                    if (ready)
-                        break;
-
-                    // Timeout check
-                    if (std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::high_resolution_clock::now() - start_time)
-                            .count() > NUM_CPU_TIMEOUT_SECS)
-                        throw std::runtime_error("DeepEP error: CPU recv timeout");
-                }
+                // Timeout check
+                if (std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::high_resolution_clock::now() - start_time)
+                        .count() > NUM_CPU_TIMEOUT_SECS)
+                    throw std::runtime_error("DeepEP error: CPU recv timeout");
             }
         }
-
-        // Assign pointers
-        int64_t *recv_topk_idx_ptr     = nullptr;
-        float   *recv_topk_weights_ptr = nullptr;
-        float   *recv_x_scales_ptr     = nullptr;
-
-        if (topk_idx.has_value()) {
-            recv_topk_idx_ptr     = recv_topk_idx.value()->typed_data();
-            recv_topk_weights_ptr = recv_topk_weights.value()->typed_data();
-        }
-        if (x_scales.has_value()) {
-            recv_x_scales_ptr = recv_x_scales.value()->typed_data();
-        }
-
-        // Dispatch
-        PRIMUS_TURBO_CHECK(static_cast<int64_t>(
-                               num_ranks_ * num_ranks_ * sizeof(int) +       // Size prefix  matrix
-                               num_channels * num_ranks_ * sizeof(int) +     // Channel start offset
-                               num_channels * num_ranks_ * sizeof(int) +     // Channel end offset
-                               num_channels * num_ranks_ * sizeof(int) * 2 + // Queue head and tail
-                               num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                   hidden * ffi::ByteWidth(recv_x->element_type()) + // Data buffer
-                               num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                   sizeof(int) + // Source index buffer
-                               num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                   num_topk * sizeof(int64_t) + // Top-k index buffer
-                               num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                   num_topk * sizeof(float) + // Top-k weight buffer
-                               num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                   sizeof(float) * num_scales // FP8 scale buffer
-                               ) <= num_nvl_bytes_);
-        primus_turbo::deep_ep::intranode::dispatch(
-            recv_x->untyped_data(), recv_x_scales_ptr, recv_src_idx->typed_data(),
-            recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix->typed_data(),
-            send_head->typed_data(), x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
-            is_token_in_rank.typed_data(),
-            cached_mode ? cached_channel_prefix_matrix->typed_data()
-                        : channel_prefix_matrix.value()->typed_data(),
-            num_tokens, num_worst_tokens,
-            static_cast<int>(hidden * ffi::ByteWidth(recv_x->element_type()) / sizeof(int4)),
-            num_topk, num_experts, num_scales, scale_token_stride, scale_hidden_stride,
-            buffer_ptrs_gpu_, rank_, num_ranks_, stream, config.num_sms,
-            config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens);
-
-        // TODO: Wait streams
     }
+
+    // Assign pointers
+    int64_t *recv_topk_idx_ptr     = nullptr;
+    float   *recv_topk_weights_ptr = nullptr;
+    float   *recv_x_scales_ptr     = nullptr;
+
+    if (topk_idx.has_value()) {
+        recv_topk_idx_ptr     = recv_topk_idx.value()->typed_data();
+        recv_topk_weights_ptr = recv_topk_weights.value()->typed_data();
+    }
+    if (x_scales.has_value()) {
+        recv_x_scales_ptr = recv_x_scales.value()->typed_data();
+    }
+
+    // Dispatch
+    PRIMUS_TURBO_CHECK(
+        static_cast<int64_t>(num_ranks_ * num_ranks_ * sizeof(int) +       // Size prefix  matrix
+                             num_channels * num_ranks_ * sizeof(int) +     // Channel start offset
+                             num_channels * num_ranks_ * sizeof(int) +     // Channel end offset
+                             num_channels * num_ranks_ * sizeof(int) * 2 + // Queue head and tail
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 hidden * ffi::ByteWidth(recv_x->element_type()) + // Data buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(int) + // Source index buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(int64_t) + // Top-k index buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(float) + // Top-k weight buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(float) * num_scales // FP8 scale buffer
+                             ) <= num_nvl_bytes_);
+
+    primus_turbo::deep_ep::intranode::dispatch(
+        recv_x->untyped_data(), recv_x_scales_ptr, recv_src_idx->typed_data(), recv_topk_idx_ptr,
+        recv_topk_weights_ptr, recv_channel_prefix_matrix->typed_data(), send_head->typed_data(),
+        x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
+        is_token_in_rank.typed_data(), channel_prefix_matrix.value()->typed_data(), num_tokens,
+        num_worst_tokens,
+        static_cast<int>(hidden * ffi::ByteWidth(recv_x->element_type()) / sizeof(int4)), num_topk,
+        num_experts, num_scales, scale_token_stride, scale_hidden_stride, buffer_ptrs_gpu_, rank_,
+        num_ranks_, stream, config.num_sms, config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens);
+}
+
+void Buffer::Sync() {
+    PRIMUS_TURBO_CHECK(not is_available());
+
+    if (num_nvl_bytes_ > 0) {
+        for (int i = 0; i < num_nvl_ranks_; ++i) {
+            if (i != rank_) {
+                barrier_signal_ptrs_[i] = reinterpret_cast<int *>(
+                    static_cast<uint8_t *>(g_buffer_pool[i]->buffer_ptrs_[i]) + num_nvl_bytes_);
+
+                buffer_ptrs_[i]     = g_buffer_pool[i]->buffer_ptrs_[i];
+                int can_access_peer = 0;
+                PRIMUS_TURBO_CHECK_HIP(hipDeviceCanAccessPeer(&can_access_peer, device_id_, i));
+                PRIMUS_TURBO_CHECK(can_access_peer != -1);
+
+                hipDeviceEnablePeerAccess(i, 0);
+            }
+        }
+    }
+
+    // Copy all buffer and barrier signal pointers to GPU
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
+                                     sizeof(void *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
+                                     sizeof(int *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+    PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+
+    // Ready to use
+    is_available_ = true;
+}
+
+void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
+                              std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+                              std::optional<ffi::AnyBuffer>        bias_0,
+                              std::optional<ffi::AnyBuffer> bias_1, ffi::Buffer<ffi::S32> src_idx,
+                              ffi::Buffer<ffi::S32> rank_prefix_matrix,
+                              ffi::Buffer<ffi::S32> channel_prefix_matrix,
+                              ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::Config config,
+                              ffi::Result<ffi::AnyBuffer>                       recv_x,
+                              std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights) {
+
+    PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
+    PRIMUS_TURBO_CHECK(src_idx.dimensions().size() == 1);
+    PRIMUS_TURBO_CHECK(send_head.dimensions().size() == 2);
+    PRIMUS_TURBO_CHECK(rank_prefix_matrix.dimensions().size() == 2);
+    PRIMUS_TURBO_CHECK(channel_prefix_matrix.dimensions().size() == 2);
+
+    // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for
+    // receiving.
+    PRIMUS_TURBO_CHECK(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+
+    auto num_tokens      = static_cast<int>(x.dimensions()[0]),
+         hidden          = static_cast<int>(x.dimensions()[1]);
+    auto num_recv_tokens = static_cast<int>(send_head.dimensions()[0]);
+
+    PRIMUS_TURBO_CHECK(src_idx.dimensions()[0] == num_tokens);
+    PRIMUS_TURBO_CHECK(send_head.dimensions()[1] == num_ranks_);
+    PRIMUS_TURBO_CHECK(rank_prefix_matrix.dimensions()[0] == num_ranks_ and
+                       rank_prefix_matrix.dimensions()[1] == num_ranks_);
+    PRIMUS_TURBO_CHECK(channel_prefix_matrix.dimensions()[0] == num_ranks_ and
+                       channel_prefix_matrix.dimensions()[1] == num_channels);
+    PRIMUS_TURBO_CHECK((hidden * ffi::ByteWidth(x.element_type())) % sizeof(int4) == 0);
+
+    int    num_topk              = 0;
+    float *topk_weights_ptr      = nullptr;
+    float *recv_topk_weights_ptr = nullptr;
+    if (topk_weights.has_value()) {
+        PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
+        PRIMUS_TURBO_CHECK(topk_weights->dimensions()[0] == num_tokens);
+        num_topk              = static_cast<int>(topk_weights->dimensions()[1]);
+        topk_weights_ptr      = topk_weights.value().typed_data();
+        recv_topk_weights_ptr = recv_topk_weights.value()->typed_data();
+    }
+
+    // Launch barrier and reset queue head and tail
+    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_channels * num_ranks_ * sizeof(int) * 2) <=
+                       num_nvl_bytes_);
+    primus_turbo::deep_ep::intranode::cached_notify_combine(
+        buffer_ptrs_gpu_, send_head.typed_data(), num_channels, num_recv_tokens,
+        num_channels * num_ranks_ * 2, barrier_signal_ptrs_gpu_, rank_, num_ranks_, stream);
+
+    // Assign bias pointers
+    auto  bias_opts    = std::vector<std::optional<ffi::AnyBuffer>>({bias_0, bias_1});
+    void *bias_ptrs[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i)
+        if (bias_opts[i].has_value()) {
+            auto bias = bias_opts[i].value();
+            PRIMUS_TURBO_CHECK(bias.dimensions().size() == 2);
+            PRIMUS_TURBO_CHECK(bias.element_type() == x.element_type());
+            PRIMUS_TURBO_CHECK(bias.dimensions()[0] == num_recv_tokens and
+                               bias.dimensions()[1] == hidden);
+            bias_ptrs[i] = bias.untyped_data();
+        }
+
+    // Combine data
+    PRIMUS_TURBO_CHECK(
+        static_cast<int64_t>(num_channels * num_ranks_ * sizeof(int) * 2 + // Queue head and tail
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 hidden * ffi::ByteWidth(x.element_type()) + // Data buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 sizeof(int) + // Source index buffer
+                             num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
+                                 num_topk * sizeof(float) // Top-k weight buffer
+                             ) <= num_nvl_bytes_);
+    primus_turbo::deep_ep::intranode::combine(
+        FFIDataTypeToHIPDataType(x.element_type()), recv_x->untyped_data(), recv_topk_weights_ptr,
+        x.untyped_data(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1], src_idx.typed_data(),
+        rank_prefix_matrix.typed_data(), channel_prefix_matrix.typed_data(), send_head.typed_data(),
+        num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu_, rank_, num_ranks_, stream,
+        config.num_sms, config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens);
 }
 
 } // namespace primus_turbo::jax::deep_ep

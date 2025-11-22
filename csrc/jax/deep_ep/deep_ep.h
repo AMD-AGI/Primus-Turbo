@@ -44,10 +44,10 @@ public:
     int local_device_id() const { return device_id_; }
 
     void DispatchLayout(hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, int num_experts,
-                        ffi::Buffer<ffi::S32>                num_tokens_per_rank,
-                        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
-                        ffi::Buffer<ffi::S32>                num_tokens_per_expert,
-                        ffi::Buffer<ffi::PRED>               is_token_in_rank);
+                        ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank,
+                        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> num_tokens_per_rdma_rank,
+                        ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert,
+                        ffi::Result<ffi::Buffer<ffi::PRED>>               is_token_in_rank);
 
     void IntranodeDispatch(hipStream_t stream, ffi::AnyBuffer x,
                            std::optional<ffi::Buffer<ffi::F32>> x_scales,
@@ -69,6 +69,18 @@ public:
                            ffi::Result<ffi::Buffer<ffi::S32>> recv_channel_prefix_matrix,
                            ffi::Result<ffi::Buffer<ffi::S32>> recv_src_idx,
                            ffi::Result<ffi::Buffer<ffi::S32>> send_head);
+
+    void Sync();
+
+    void IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
+                          std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+                          std::optional<ffi::AnyBuffer>        bias_0,
+                          std::optional<ffi::AnyBuffer> bias_1, ffi::Buffer<ffi::S32> src_idx,
+                          ffi::Buffer<ffi::S32> rank_prefix_matrix,
+                          ffi::Buffer<ffi::S32> channel_prefix_matrix,
+                          ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::Config config,
+                          ffi::Result<ffi::AnyBuffer>                       recv_x,
+                          std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights);
 
 private:
     // NVLink Buffer
@@ -115,6 +127,7 @@ private:
     int          *moe_recv_rdma_counter_mapped_ = nullptr;
 };
 
-Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes, const primus_turbo::deep_ep::Config &config);
+Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
+                   const primus_turbo::deep_ep::Config &config);
 
 } // namespace primus_turbo::jax::deep_ep

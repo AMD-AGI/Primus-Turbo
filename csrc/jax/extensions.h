@@ -28,5 +28,6 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(QuantizeFP8RowwiseHandler);
 /* DeepEP */
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoEDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECachedDispatchHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECombineHandler);
 
 } // namespace primus_turbo::jax

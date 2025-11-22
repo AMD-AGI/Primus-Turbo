@@ -34,6 +34,7 @@ IMPL_TABLE[moe_cached_dispatch_p] = partial(
 # ----------------------------------------
 # Step-3: Abstract eval
 # ----------------------------------------
+num_ranks = 8
 
 
 def _get_recv_x_scale_shape(x_scales: jnp.ndarray, num_worst_tokens: int) -> ShapedArray:
@@ -53,8 +54,6 @@ def _moe_dispatch_abstract_eval(x: jnp.ndarray,
                                 num_experts: int,
                                 expert_alignment: int,
                                 num_worst_tokens: int,
-                                rank: int,
-                                num_ranks: int,
                                 num_sms: int,
                                 num_max_nvl_chunked_send_tokens: int,
                                 num_max_nvl_chunked_recv_tokens: int,
@@ -69,36 +68,37 @@ def _moe_dispatch_abstract_eval(x: jnp.ndarray,
     num_tokens, hidden_size = x.shape
     num_topk = topk_idx.shape[1]
     num_channels = num_sms // 2
-    recv_x_scales_shape = _get_recv_x_scale_shape(x_scales, num_worst_tokens)
-    recv_x_shape = ShapedArray(
+    # recv_x_scales = _get_recv_x_scale_shape(x_scales, num_worst_tokens)
+    recv_x_scales = ShapedArray((num_worst_tokens, hidden_size), jnp.float32)
+    recv_x = ShapedArray(
         (num_worst_tokens, hidden_size), x.dtype)
-    recv_topk_idx_shape = ShapedArray(
+    recv_topk_idx = ShapedArray(
         (num_worst_tokens, num_topk), jnp.int64)
-    recv_topk_weights_shape = ShapedArray(
+    recv_topk_weights = ShapedArray(
         (num_worst_tokens, num_topk), jnp.float32)
-    is_token_in_rank_shape = ShapedArray((num_tokens, num_ranks), jnp.bool_)
+    is_token_in_rank = ShapedArray((num_tokens, num_ranks), jnp.bool_)
     num_tokens_per_rank = ShapedArray((num_ranks, ), jnp.int32)
     num_tokens_per_expert = ShapedArray((num_experts, ), jnp.int32)
-    rank_prefix_matrix_shape = ShapedArray((num_ranks, num_ranks), jnp.int32)
-    channel_prefix_matrix_shape = ShapedArray(
+    rank_prefix_matrix = ShapedArray((num_ranks, num_ranks), jnp.int32)
+    channel_prefix_matrix = ShapedArray(
         (num_ranks, num_channels), jnp.int32)
-    recv_channel_prefix_matrix_shape = ShapedArray(
+    recv_channel_prefix_matrix = ShapedArray(
         (num_ranks, num_channels), jnp.int32)
-    recv_src_idx_shape = ShapedArray((num_ranks, num_channels), jnp.int32)
-    send_head_shape = ShapedArray((num_ranks, num_channels), jnp.int32)
+    recv_src_idx = ShapedArray((num_worst_tokens,), jnp.int32)
+    send_head = ShapedArray((num_tokens, num_ranks), jnp.int32)
 
-    return (recv_x_shape, 
-            recv_x_scales_shape,
-            recv_topk_idx_shape, 
-            recv_topk_weights_shape, 
-            is_token_in_rank_shape, 
+    return (recv_x,
+            recv_x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            is_token_in_rank,
             num_tokens_per_rank,
             num_tokens_per_expert,
-            rank_prefix_matrix_shape, 
-            channel_prefix_matrix_shape, 
-            recv_channel_prefix_matrix_shape, 
-            recv_src_idx_shape, 
-            send_head_shape)
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            recv_channel_prefix_matrix,
+            recv_src_idx,
+            send_head)
 
 
 def _moe_cached_dispatch_abstract_eval(x: jnp.ndarray,
@@ -109,8 +109,6 @@ def _moe_cached_dispatch_abstract_eval(x: jnp.ndarray,
                                        num_recv_tokens: int,
                                        expert_alignment: int,
                                        num_worst_tokens: int,
-                                       rank,
-                                       num_ranks: int,
                                        num_sms: int,
                                        num_max_nvl_chunked_send_tokens: int,
                                        num_max_nvl_chunked_recv_tokens: int,

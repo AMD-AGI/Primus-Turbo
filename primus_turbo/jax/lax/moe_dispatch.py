@@ -5,29 +5,28 @@
 ###############################################################################
 
 
-import jax.numpy as jnp
-import jax
-from primus_turbo.jax.primitive.moe_dispatch import moe_dispatch_p, moe_cached_dispatch_p
 from functools import partial
-from typing import Optional, Tuple, Union, Any
-from typing import NamedTuple
+from typing import Any, Optional, Tuple, Union
 
+import jax
+import jax.numpy as jnp
 
-__all__ = ["Config", "get_dispatch_config", "moe_dispatch"]
+from primus_turbo.jax.lax.moe_combine import _moe_combine_fwd
+from primus_turbo.jax.primitive.moe_dispatch import (
+    moe_cached_dispatch_p,
+    moe_dispatch_p,
+)
 
+from .moe_utils import Config
 
-class Config(NamedTuple):
-    num_sms: int
-    num_max_nvl_chunked_send_tokens: int
-    num_max_nvl_chunked_recv_tokens: int
-    num_max_rdma_chunked_send_tokens: int
-    num_max_rdma_chunked_recv_tokens: int
+__all__ = ["get_dispatch_config", "moe_dispatch"]
 
 
 _default_num_sms = 32
+num_ranks = 8
 
 
-def get_dispatch_config(num_ranks: int) -> Config:
+def get_dispatch_config(num_ranks: int = 8) -> Config:
     """
     Get a recommended dispatch config.
 
@@ -38,39 +37,50 @@ def get_dispatch_config(num_ranks: int) -> Config:
         config: the recommended config.
     """
     global _default_num_sms
-
-    # TODO: automatically tune
-    config_map = {
-        2: Config(_default_num_sms, 24, 256, 6, 128),
-        4: Config(_default_num_sms, 6, 256, 6, 128),
-        8: Config(_default_num_sms, 6, 256, 6, 128),
-        16: Config(_default_num_sms, 36, 288, 20, 128),
-        24: Config(_default_num_sms, 8, 288, 32, 128),
-        32: Config(_default_num_sms, 32, 288, 32, 128),
-        64: Config(_default_num_sms, 20, 288, 28, 128),
-        128: Config(_default_num_sms, 20, 560, 32, 128),
-        144: Config(_default_num_sms, 32, 720, 12, 128),
-        160: Config(_default_num_sms, 28, 720, 12, 128),
-    }
-    assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
-    return config_map[num_ranks]
+    return Config(_default_num_sms, 36, 288, 20, 128)
 
 
-@partial[Any](jax.custom_vjp, nondiff_argnums=(7, ))
-def moe_dispatch(x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
-                 num_experts: int,
-                 handle: Optional[Tuple] = None,
-                 topk_idx: Optional[jnp.ndarray] = None,
-                 topk_weights: Optional[jnp.ndarray] = None,
-                 expert_alignment: int = 1,
-                 num_worst_tokens: int = 0,
-                 rank: int = 0,
-                 num_ranks: int = 1,
-                 config: Optional[Config] = None,
-                 ) -> Tuple[Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray],
-                            Optional[jnp.ndarray],
-                            Optional[jnp.ndarray],
-                            Tuple]:
+def moe_dispatch(
+    x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
+    handle: Optional[Tuple] = None,
+    topk_idx: Optional[jnp.ndarray] = None,
+    topk_weights: Optional[jnp.ndarray] = None,
+    expert_alignment: int = 1,
+    num_experts: Optional[int] = None,
+    config: Optional[Config] = None,
+) -> Tuple[
+    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
+]:
+    return _moe_dispatch(x, handle, topk_idx, topk_weights, expert_alignment, num_experts, config)
+
+
+@partial[Any](jax.custom_vjp, nondiff_argnums=(1, 2, 4, 5, 6))
+def _moe_dispatch(
+    x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
+    handle: Optional[Tuple] = None,
+    topk_idx: Optional[jnp.ndarray] = None,
+    topk_weights: Optional[jnp.ndarray] = None,
+    expert_alignment: int = 1,
+    num_experts: Optional[int] = None,
+    config: Optional[Config] = None,
+) -> Tuple[
+    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
+]:
+    out, _ = _moe_dispatch_fwd(x, handle, topk_idx, topk_weights, expert_alignment, num_experts, config)
+    return out
+
+
+def _moe_dispatch_fwd(
+    x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
+    handle: Optional[Tuple] = None,
+    topk_idx: Optional[jnp.ndarray] = None,
+    topk_weights: Optional[jnp.ndarray] = None,
+    expert_alignment: int = 1,
+    num_experts: Optional[int] = None,
+    config: Optional[Config] = None,
+) -> Tuple[
+    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
+]:
     if isinstance(x, tuple):
         x, x_scales = x
     else:
@@ -94,54 +104,58 @@ def moe_dispatch(x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
             send_head,
         ) = handle
         num_recv_tokens = recv_src_idx.size(0)
-        recv_x, recv_x_scales, _, _, _ = moe_cached_dispatch_p.bind(x,
-                                                                    x_scales,
-                                                                    is_token_in_rank,
-                                                                    rank_prefix_matrix,
-                                                                    channel_prefix_matrix,
-                                                                    num_recv_tokens,
-                                                                    expert_alignment=expert_alignment,
-                                                                    num_worst_tokens=num_worst_tokens,
-                                                                    rank=rank,
-                                                                    num_ranks=num_ranks,
-                                                                    num_sms=config.num_sms,
-                                                                    num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
-                                                                    num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
-                                                                    num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
-                                                                    num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens)
-        return ((recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
-                None,
-                None,
-                None,
-                )
+        recv_x, recv_x_scales, _, _, _ = moe_cached_dispatch_p.bind(
+            x,
+            x_scales,
+            is_token_in_rank,
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            num_recv_tokens,
+            expert_alignment=expert_alignment,
+            num_worst_tokens=num_worst_tokens,
+            num_sms=config.num_sms,
+            num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
+            num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
+            num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
+            num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
+        )
+        return (
+            (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
+            None,
+            None,
+            None,
+        )
     else:
         assert topk_idx is not None and topk_weights is not None
+        assert num_experts is not None
 
-        (recv_x,
-         recv_x_scales,
-         recv_topk_idx,
-         recv_topk_weights,
-         is_token_in_rank,
-         num_tokens_per_rank,
-         num_tokens_per_expert,
-         rank_prefix_matrix,
-         channel_prefix_matrix,
-         recv_channel_prefix_matrix,
-         recv_src_idx,
-         send_head) = moe_dispatch_p.bind(x,
-                                          x_scales,
-                                          topk_idx,
-                                          topk_weights,
-                                          num_experts=num_experts,
-                                          expert_alignment=expert_alignment,
-                                          num_worst_tokens=num_worst_tokens,
-                                          rank=rank,
-                                          num_ranks=num_ranks,
-                                          num_sms=config.num_sms,
-                                          num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
-                                          num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
-                                          num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
-                                          num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens)
+        (
+            recv_x,
+            recv_x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            is_token_in_rank,
+            num_tokens_per_rank,
+            num_tokens_per_expert,
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            recv_channel_prefix_matrix,
+            recv_src_idx,
+            send_head,
+        ) = moe_dispatch_p.bind(
+            x,
+            x_scales,
+            topk_idx,
+            topk_weights,
+            num_experts=num_experts,
+            expert_alignment=expert_alignment,
+            num_worst_tokens=num_worst_tokens,
+            num_sms=config.num_sms,
+            num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
+            num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
+            num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
+            num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
+        )
 
         handle = (
             rank_prefix_matrix,
@@ -151,73 +165,22 @@ def moe_dispatch(x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
             is_token_in_rank,
             send_head,
         )
-        return ((recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
-                recv_topk_idx,
-                recv_topk_weights,
-                handle)
-
-
-# Ref: https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html
-# Input : same input signature as the underlying primal function
-# Output: out, ctx
-def _moe_dispatch_fwd(x: jnp.ndarray,
-                      num_experts: int,
-                      expert_alignment: int,
-                      num_worst_tokens: int,
-                      rank: int,
-                      num_ranks: int,
-                      num_sms: int,
-                      num_max_nvl_chunked_send_tokens: int,
-                      num_max_nvl_chunked_recv_tokens: int,
-                      num_max_rdma_chunked_send_tokens: int,
-                      num_max_rdma_chunked_recv_tokens: int,
-                      x_scales: Optional[jnp.ndarray] = None,
-                      topk_idx: Optional[jnp.ndarray] = None,
-                      topk_weights: Optional[jnp.ndarray] = None,
-                      cached_rank_prefix_matrix: Optional[jnp.ndarray] = None,
-                      cached_channel_prefix_matrix: Optional[jnp.ndarray] = None,
-                      cached_recv_channel_prefix_matrix: Optional[jnp.ndarray] = None,
-                      cached_recv_src_idx: Optional[jnp.ndarray] = None,
-                      cached_send_head: Optional[jnp.ndarray] = None,
-                      num_tokens_per_rank: Optional[jnp.ndarray] = None,
-                      num_tokens_per_expert: Optional[jnp.ndarray] = None):
-    (is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights) = moe_dispatch_p.bind(x,
-                                                                                                                                                                                                      x_scales,
-                                                                                                                                                                                                      topk_idx,
-                                                                                                                                                                                                      topk_weights,
-                                                                                                                                                                                                      cached_rank_prefix_matrix,
-                                                                                                                                                                                                      cached_channel_prefix_matrix,
-                                                                                                                                                                                                      cached_recv_channel_prefix_matrix,
-                                                                                                                                                                                                      cached_recv_src_idx,
-                                                                                                                                                                                                      cached_send_head,
-                                                                                                                                                                                                      num_tokens_per_rank,
-                                                                                                                                                                                                      num_tokens_per_expert,
-                                                                                                                                                                                                      num_experts=num_experts,
-                                                                                                                                                                                                      expert_alignment=expert_alignment,
-                                                                                                                                                                                                      num_worst_tokens=num_worst_tokens,
-                                                                                                                                                                                                      rank=rank,
-                                                                                                                                                                                                      num_ranks=num_ranks,
-                                                                                                                                                                                                      num_sms=num_sms,
-                                                                                                                                                                                                      num_max_nvl_chunked_send_tokens=num_max_nvl_chunked_send_tokens,
-                                                                                                                                                                                                      num_max_nvl_chunked_recv_tokens=num_max_nvl_chunked_recv_tokens,
-                                                                                                                                                                                                      num_max_rdma_chunked_send_tokens=num_max_rdma_chunked_send_tokens,
-                                                                                                                                                                                                      num_max_rdma_chunked_recv_tokens=num_max_rdma_chunked_recv_tokens)
-    ctx = (
-        rank_prefix_matrix,
-        channel_prefix_matrix,
-        recv_channel_prefix_matrix,
-        recv_src_idx,
-        is_token_in_rank,
-        send_head,
-    )
-    return (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights), ctx
+        return (
+            (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            handle,
+        ), handle
 
 
 # input: nondiff_argnums, ctx, grad
 # output: input grad
-def _moe_dispatch_bwd(eps, ctx, dy):
-    pass
+def _moe_dispatch_bwd(
+    handle, topk_idx, experts_alignment, num_experts, config, ctx, grad_x, grad_topk_weights
+):
+    (recv_x, recv_topk_weights), _ = _moe_combine_fwd(grad_x, ctx, grad_topk_weights)
+
+    return recv_x, recv_topk_weights
 
 
-# moe_dispatch.defvjp(
-#     _moe_dispatch_fwd, _moe_dispatch_bwd)
+_moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
