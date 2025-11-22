@@ -16,10 +16,7 @@
 #include <pybind11/functional.h>
 
 #include "jax/deep_ep/deep_ep.h"
-
-#include <xla/ffi/api/ffi.h>
-
-namespace ffi = xla::ffi;
+#include "jax/ffi.h"
 
 namespace primus_turbo::jax::deep_ep {
 
@@ -50,29 +47,6 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
         g_buffer_pool[device_id]->Sync();
     }
     return g_buffer_pool[device_id].get();
-}
-
-inline cudaDataType FFIDataTypeToHIPDataType(const ffi::DataType &data_type) {
-    switch (data_type) {
-    case ffi::DataType::U8:
-        return HIP_R_8U;
-    case ffi::DataType::S8:
-        return HIP_R_8I;
-    case ffi::DataType::S32:
-        return HIP_R_32I;
-    case ffi::DataType::F16:
-        return HIP_R_16F;
-    case ffi::DataType::F32:
-        return HIP_R_32F;
-    case ffi::DataType::F64:
-        return HIP_R_64F;
-    case ffi::DataType::F8E4M3FNUZ:
-        return HIP_R_8F_E4M3_FNUZ;
-    case ffi::DataType::F8E5M2FNUZ:
-        return HIP_R_8F_E5M2_FNUZ;
-    default:
-        PRIMUS_TURBO_CHECK(false, "Cannot convert ffi::DataType to hipDataType.");
-    }
 }
 
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
@@ -521,11 +495,11 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
                                  num_topk * sizeof(float) // Top-k weight buffer
                              ) <= num_nvl_bytes_);
     primus_turbo::deep_ep::intranode::combine(
-        FFIDataTypeToHIPDataType(x.element_type()), recv_x->untyped_data(), recv_topk_weights_ptr,
-        x.untyped_data(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1], src_idx.typed_data(),
-        rank_prefix_matrix.typed_data(), channel_prefix_matrix.typed_data(), send_head.typed_data(),
-        num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu_, rank_, num_ranks_, stream,
-        config.num_sms, config.num_max_nvl_chunked_send_tokens,
+        primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()), recv_x->untyped_data(),
+        recv_topk_weights_ptr, x.untyped_data(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
+        src_idx.typed_data(), rank_prefix_matrix.typed_data(), channel_prefix_matrix.typed_data(),
+        send_head.typed_data(), num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu_,
+        rank_, num_ranks_, stream, config.num_sms, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
 }
 
