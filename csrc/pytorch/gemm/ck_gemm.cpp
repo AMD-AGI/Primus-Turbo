@@ -50,8 +50,8 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
 
     // For NT or NN layouts, k must be aligned to 128
     if (!transA) {
-        PRIMUS_TURBO_CHECK(k % 128 == 0,
-                           "For NT or NN layout, k must be a multiple of 128, got k=", k);
+        PRIMUS_TURBO_CHECK(k % 32 == 0,
+                           "For NT or NN layout, k must be a multiple of 32, got k=", k);
     }
 
     // For BLOCKWISE (ABQuantGrouped), NN and NT layout, k and n must be a multiple of 128

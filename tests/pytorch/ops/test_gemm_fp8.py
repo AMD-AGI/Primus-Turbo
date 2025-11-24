@@ -20,7 +20,7 @@ torch.manual_seed(42)
 
 @pytest.mark.parametrize("m", [255, 507, 1032, 2056])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
