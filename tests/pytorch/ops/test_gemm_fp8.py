@@ -143,14 +143,14 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
 
 @pytest.mark.parametrize("m", [256, 512, 1024])
 @pytest.mark.parametrize("n", [256, 352, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 127, 512, 1024])
+@pytest.mark.parametrize("k", [128, 160, 512, 1024])
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
-    # NOTE: user need to ensure m and n are multiples of 16.
-    assert m % 16 == 0 and n % 16 == 0, "Assume m and n are multiples of 16."
+    # NOTE: user need to ensure m, n and k are multiples of 16.
+    assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "Assume m, n and k are multiples of 16."
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp8_support
 

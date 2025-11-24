@@ -147,42 +147,73 @@ def quant_fp8_blockwise_segment_m_impl(
     return x_fp8, x_scales
 
 
+def padding_size(n: int, padding_align_size: int) -> int:
+    return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
+
+
 def quantize_mxfp8_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, block_size: int
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    padding_align_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.is_contiguous(), "The x tensor must be contiguous"
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() == 2, "The x must be 2D tensor."
+    assert axis in (0, 1), "The axis must be 0 or 1."
 
-    row_length = x.shape[-1]
-    num_rows = x.numel() // row_length
-    assert (
-        row_length % block_size == 0
-    ), "The last dimension of the x tensor must be divisible by the block size ."
+    num_rows, row_length = x.size()
 
-    x_2d_view = x.view(num_rows, row_length)
+    trans = axis == 0
 
-    # Compute scale
-    scale_M, scale_N = num_rows, row_length // block_size
+    if not trans:
+        padded_num_rows, padded_row_length = num_rows, row_length
+        if padding_align_size is not None:
+            padded_row_length += padding_size(row_length, padding_align_size)
 
-    y = torch.empty(num_rows, row_length, dtype=out_dtype, device=x.device)
-    scale_inv_shape = x.shape[:-1] + (scale_N,)
-    scale_inv = torch.empty(scale_inv_shape, dtype=torch.uint8, device=x.device)
-    scale_inv_2d_view = scale_inv.view(num_rows, scale_N)
+        assert (
+            padded_row_length % block_size == 0
+        ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
 
-    scale_stride_M, scale_stride_N = scale_inv_2d_view.stride(0), scale_inv_2d_view.stride(1)
+        scale_M, scale_N = padded_num_rows, padded_row_length // block_size
+
+        y = torch.empty((padded_num_rows, padded_row_length), dtype=out_dtype, device=x.device)
+        scale_inv = torch.empty(scale_M, scale_N, dtype=torch.uint8, device=x.device)
+    else:
+        padded_num_rows, padded_row_length = num_rows, row_length
+        if padding_align_size is not None:
+            padded_num_rows += padding_size(num_rows, padding_align_size)
+
+        assert (
+            padded_num_rows % block_size == 0
+        ), f"The first dimension of the x tensor must be divisible by the block size but got {padded_num_rows} % {block_size} != 0."
+
+        scale_M, scale_N = padded_num_rows // block_size, padded_row_length
+
+        y = torch.empty((padded_row_length, padded_num_rows), dtype=out_dtype, device=x.device)
+        scale_inv = torch.empty(scale_N, scale_M, dtype=torch.uint8, device=x.device)
+
+    scale_stride_M, scale_stride_N = scale_inv.stride(0), scale_inv.stride(1)
 
     BLOCK_X = 64
     BLOCK_Y = 64
     GROUP_Y = block_size
     max_fp8 = torch.finfo(out_dtype).max
-    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
+    grid = lambda META: (
+        triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
+    )
     quantize_mxfp8_kernel[grid](
-        x_2d_view,
+        x,
         y,
-        x_2d_view.stride(0),
-        x_2d_view.stride(1),
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
         num_rows,
         row_length,
-        scale_inv_2d_view,
+        padded_num_rows,
+        padded_row_length,
+        scale_inv,
         scale_stride_M,
         scale_stride_N,
         scale_M,
@@ -191,54 +222,62 @@ def quantize_mxfp8_impl(
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
+        trans,
         block_size,
     )
     scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
 
-    return y.view_as(x), scale_inv
+    return y, scale_inv
 
 
 def dequantize_mxfp8_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, block_size: int, scale_inv: torch.Tensor
+    x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
 ) -> torch.Tensor:
-    assert x.is_contiguous(), "The x tensor must be contiguous"
-    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous"
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() == 2, "The x must be 2D tensor."
+    assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
+    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
+    assert axis in (0, 1), "The axis must be 0 or 1."
 
-    row_length = x.shape[-1]
-    num_rows = x.numel() // row_length
+    trans = axis == 0
+
+    num_rows, row_length = x.size()
     assert (
         row_length % block_size == 0
-    ), "The last dimension of the x tensor must be divisible by the block size ."
-
-    x_2d_view = x.view(num_rows, row_length)
+    ), "The last dimension of the x tensor must be divisible by the block size."
 
     # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
-    scale_inv_2d_view = scale_inv.view(num_rows, row_length // block_size).view(torch.uint8)
+    scale_inv = scale_inv.view(torch.uint8)
 
-    scale_M, scale_N = scale_inv_2d_view.shape
-    out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
+    scale_M, scale_N = scale_inv.size()
+    if not trans:
+        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
+    else:
+        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
 
     BLOCK_X = 64
     BLOCK_Y = 64
     GROUP_Y = 4
-
     grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
     dequantize_mxfp8_kernel[grid](
-        x_2d_view,
-        out,
-        x_2d_view.stride(0),
-        x_2d_view.stride(1),
+        x,
+        y,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
         num_rows,
         row_length,
-        scale_inv_2d_view,
-        scale_inv_2d_view.stride(0),
-        scale_inv_2d_view.stride(1),
+        scale_inv,
+        scale_inv.stride(0),
+        scale_inv.stride(1),
         scale_M,
         scale_N,
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
+        trans,
         block_size,
     )
 
-    return out.view_as(x)
+    return y

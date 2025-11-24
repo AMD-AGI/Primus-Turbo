@@ -102,24 +102,65 @@ def test_quantize_fp8_rowwise(
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("B", [1, 4])
-@pytest.mark.parametrize("M", [32, 256, 1024])
-@pytest.mark.parametrize("N", [32, 256, 1024])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("padding_align_size", [None, 128])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, granularity):
+def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_size, granularity):
+    def padding_size(n: int, padding_align_size: int) -> int:
+        return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
+
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.rand((B, M, N), device="cuda", dtype=orig_dtype)
+    x = torch.ones((B, M, N), device="cuda", dtype=orig_dtype)
     x.detach().clone()
 
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+    if padding_align_size is not None:
+        if axis == 0:
+            x_2d_ref = torch.cat(
+                [
+                    x_2d,
+                    torch.zeros(
+                        padding_size(x_2d.size(0), padding_align_size),
+                        x_2d.size(1),
+                        device=x.device,
+                        dtype=orig_dtype,
+                    ),
+                ],
+                dim=axis,
+            )
+        else:
+            x_2d_ref = torch.cat(
+                [
+                    x_2d,
+                    torch.zeros(
+                        x_2d.size(0),
+                        padding_size(x_2d.size(1), padding_align_size),
+                        device=x.device,
+                        dtype=orig_dtype,
+                    ),
+                ],
+                dim=axis,
+            )
+    else:
+        x_2d_ref = x_2d
+
     x_fp8, x_scale_inv = quantize_fp8(
-        x,
+        x_2d,
         dest_dtype,
         granularity=granularity,
+        axis=axis,
         block_size=MX_BLOCK_SIZE,
-    )
-    out = dequantize_fp8(
-        x_fp8, orig_dtype, granularity=granularity, block_size=MX_BLOCK_SIZE, scale_inv=x_scale_inv
+        padding_align_size=padding_align_size,
     )
 
-    torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
+    # check quantize and dequantize precision
+    out = dequantize_fp8(
+        x_fp8, orig_dtype, granularity=granularity, block_size=MX_BLOCK_SIZE, axis=axis, scale_inv=x_scale_inv
+    )
+
+    torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
