@@ -33,9 +33,8 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
     int device_id = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
 
-    // auto num_nvl_bytes = config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks);
-    int64_t num_nvl_bytes = 1024 * 1024 * 1024;
-    // auto num_rdma_bytes = config.get_rdma_buffer_size_hint(hidden_bytes, num_ranks);
+    auto num_nvl_bytes = config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks);
+    // TODO: support internode
     int64_t num_rdma_bytes = 0;
     if (g_buffer_pool[device_id] == nullptr or g_buffer_pool[device_id]->rank() != rank or
         g_buffer_pool[device_id]->num_ranks() != num_ranks or

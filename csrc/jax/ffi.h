@@ -32,7 +32,10 @@ inline hipDataType FFIDataTypeToHIPDataType(const ffi::DataType &data_type) {
     case ffi::F8E5M2FNUZ:
         return HIP_R_8F_E5M2_FNUZ;
     default:
-        PRIMUS_TURBO_CHECK(false, "Cannot convert ffi::DataType to hipDataType.");
+        std::stringstream data_type_str;
+        data_type_str << data_type;
+        PRIMUS_TURBO_CHECK(false, "Cannot convert ffi::DataType ", data_type_str.str(),
+                           " to hipDataType.");
     }
 }
 
