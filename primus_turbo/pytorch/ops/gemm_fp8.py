@@ -54,8 +54,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
         b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
 
-        backend = "hipblaslt" if trans_b else "ck"
-
         out = gemm_fp8_impl(
             a_fp8,
             a_scale_inv,
@@ -65,7 +63,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             trans_b,
             out_dtype,
             False,
-            backend=backend,
+            backend="hipblaslt",
             granularity=config.granularity,
         )
         ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
@@ -92,25 +90,20 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             not ctx.trans_b,
             ctx.out_dtype,
             ctx.trans_a,
-            backend="ck",
+            backend="hipblaslt",
             granularity=ctx.config.granularity,
         )
 
-        lhs, rhs = (grad_out_fp8, a_fp8) if ctx.trans_b else (a_fp8, grad_out_fp8)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv, a_scale_inv) if ctx.trans_b else (a_scale_inv, grad_out_scale_inv)
-        )
-
         b_grad = gemm_fp8_impl(
-            lhs,
-            lhs_scale,
+            a_fp8,
+            a_scale_inv,
             not ctx.trans_a,
-            rhs,
-            rhs_scale,
+            grad_out_fp8,
+            grad_out_scale_inv,
             False,
             ctx.out_dtype,
             ctx.trans_b,
-            backend="ck",
+            backend="hipblaslt",
             granularity=ctx.config.granularity,
         )
 
