@@ -150,7 +150,7 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
     # NOTE: user need to ensure m and n are multiples of 16.
-    assert m % 16 == 0 and n % 16 == 0, "Assue m and n are multiples of 16."
+    assert m % 16 == 0 and n % 16 == 0, "Assume m and n are multiples of 16."
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp8_support
 
