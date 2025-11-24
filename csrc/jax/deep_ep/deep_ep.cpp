@@ -457,6 +457,7 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
     float *topk_weights_ptr      = nullptr;
     float *recv_topk_weights_ptr = nullptr;
     if (topk_weights.has_value()) {
+        PRIMUS_TURBO_CHECK(recv_topk_weights.has_value());
         PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
         PRIMUS_TURBO_CHECK(topk_weights->dimensions()[0] == num_tokens);
         num_topk              = static_cast<int>(topk_weights->dimensions()[1]);
