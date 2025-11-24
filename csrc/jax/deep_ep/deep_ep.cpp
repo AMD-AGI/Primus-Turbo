@@ -402,8 +402,6 @@ void Buffer::Sync() {
                 int can_access_peer = 0;
                 PRIMUS_TURBO_CHECK_HIP(hipDeviceCanAccessPeer(&can_access_peer, device_id_, i));
                 PRIMUS_TURBO_CHECK(can_access_peer != -1);
-
-                hipDeviceEnablePeerAccess(i, 0);
             }
         }
     }

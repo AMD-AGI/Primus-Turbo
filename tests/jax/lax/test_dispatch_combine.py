@@ -69,7 +69,7 @@ def calc_diff(x: jax.Array, y: jax.Array):
 
 @jax.jit
 @jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
-def _test_moe_dispatch(x, scores, topk_weights):
+def _test_moe_dispatch_combine(x, scores, topk_weights):
     assert scores.ndim == 2, f"scores must be a 2D array, but got {scores.ndim}"
     assert x.ndim == 2, f"x must be a 2D array, but got {x.ndim}"
     assert topk_weights.ndim == 2, f"topk_weights must be a 2D array, but got {topk_weights.ndim}"
@@ -171,10 +171,10 @@ def _test_moe_dispatch(x, scores, topk_weights):
 @pytest.mark.parametrize("hidden", [7168])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("num_experts", [256])
-def test_moe_dispatch(num_tokens, hidden, num_topk, num_experts):
+def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
-    dispatch_layout_result, recv_result, recv_topk_idx_result, combine_result = _test_moe_dispatch(
+    dispatch_layout_result, recv_result, recv_topk_idx_result, combine_result = _test_moe_dispatch_combine(
         x, scores, topk_weights
     )
 
@@ -226,4 +226,43 @@ def test_moe_dispatch(num_tokens, hidden, num_topk, num_experts):
     for (base, ref), diff_threshold in zip(combine_result, [5e-6, 1e-9]):
         check_combine(base, ref, diff_threshold)
 
-    # TODO: check backward
+
+@pytest.mark.parametrize("num_tokens", [4096])
+@pytest.mark.parametrize("hidden", [7168])
+@pytest.mark.parametrize("num_topk", [8])
+@pytest.mark.parametrize("num_experts", [256])
+def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts):
+
+    @jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
+    def _test_mode_dispatch_combine_backward(x, scores, topk_weights):
+        assert scores.ndim == 2, f"scores must be a 2D array, but got {scores.ndim}"
+        assert x.ndim == 2, f"x must be a 2D array, but got {x.ndim}"
+        assert topk_weights.ndim == 2, f"topk_weights must be a 2D array, but got {topk_weights.ndim}"
+
+        num_topk = topk_weights.shape[1]
+        topk_idx = jax.lax.top_k(scores, num_topk)[1]
+        topk_idx = topk_idx.astype(jnp.int64)
+
+        num_experts = scores.shape[1]
+
+        topk_idx = jax.lax.top_k(scores, num_topk)[1]
+        topk_idx = topk_idx.astype(jnp.int64)
+
+        recv_x, _, rect_topk_weights, handle = moe_dispatch(
+            x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts
+        )
+
+        combined_x = moe_combine(recv_x, handle=handle)
+
+        return combined_x, rect_topk_weights
+
+    @jax.jit
+    def _test_mode_dispatch_combine_backward_grad_fn(x, scores, topk_weights):
+        return jax.vjp(_test_mode_dispatch_combine_backward, x, scores, topk_weights)
+
+    x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
+
+    primals, f_vjp = _test_mode_dispatch_combine_backward_grad_fn(x, scores, topk_weights)
+    grad_out = f_vjp(primals)
+
+    jax.debug.print("grad_out: {grad_out}", grad_out=grad_out)

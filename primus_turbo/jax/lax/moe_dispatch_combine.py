@@ -107,7 +107,6 @@ def _moe_dispatch_fwd(
     x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     num_tokens, _ = x.shape
     num_worst_tokens = num_tokens * num_ranks
-
     # default config
     config = get_dispatch_config(num_ranks) if config is None else config
 
@@ -142,7 +141,7 @@ def _moe_dispatch_fwd(
             None,
             None,
             None,
-        ), None
+        ), (None, None, None, None)
     else:
         assert topk_idx is not None and topk_weights is not None
         assert num_experts is not None
@@ -188,17 +187,18 @@ def _moe_dispatch_fwd(
             recv_topk_idx,
             recv_topk_weights,
             handle,
-        ), handle
+        ), (handle, num_experts, expert_alignment, config)
 
 
-# input: nondiff_argnums, ctx, grad
-# output: input grad
-def _moe_dispatch_bwd(
-    experts_alignment, num_experts, config, ctx, grad_x, grad_handle, grad_topk_idx, grad_topk_weights
-):
-    (recv_x, recv_topk_weights), _ = _moe_combine_fwd(grad_x, ctx, grad_topk_weights)
+def _moe_dispatch_bwd(num_experts, expert_alignment, config, ctx, grad_output):
+    handle, _, _, _ = ctx
+    grad_x, _, grad_topk_weights, _ = grad_output
 
-    return recv_x, grad_handle, grad_topk_idx, recv_topk_weights
+    if isinstance(grad_x, tuple):
+        grad_x, _ = grad_x
+
+    (grad_x, grad_topk_weights), _ = _moe_combine_fwd(grad_x, handle)
+    return grad_x, None, grad_topk_weights, None
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
@@ -206,7 +206,7 @@ _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
 
 def moe_combine(
     x: jnp.ndarray,
-    handle: Optional[Tuple] = None,
+    handle: Tuple,
     topk_weights: Optional[jnp.ndarray] = None,
     bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
@@ -214,10 +214,10 @@ def moe_combine(
     return _moe_combine(x, handle, topk_weights, bias, config)
 
 
-@partial[Any](jax.custom_vjp, nondiff_argnums=(3, 4))
+@jax.custom_vjp
 def _moe_combine(
     x: jnp.ndarray,
-    handle: Optional[Tuple] = None,
+    handle: Tuple,
     topk_weights: Optional[jnp.ndarray] = None,
     bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
@@ -228,11 +228,11 @@ def _moe_combine(
 
 def _moe_combine_fwd(
     x: jnp.ndarray,
-    handle: Optional[Tuple] = None,
+    handle: Tuple,
     topk_weights: Optional[jnp.ndarray] = None,
     bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
-) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+) -> Tuple[jnp.ndarray]:
 
     # default config
     config = get_combine_config(num_ranks) if config is None else config
@@ -256,7 +256,7 @@ def _moe_combine_fwd(
 
     rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
 
-    recv_x, recv_topk_weights = moe_combine_p.bind(
+    combined_x, combined_topk_weights = moe_combine_p.bind(
         x,
         topk_weights,
         bias_0,
@@ -271,14 +271,15 @@ def _moe_combine_fwd(
         num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
         num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
     )
-    return (recv_x, recv_topk_weights), handle
+    return (combined_x, combined_topk_weights), (handle, bias, config)
 
 
-# input: nondiff_argnums, ctx, grad
-# output: input grad
-def _moe_combine_bwd(bias, config, ctx, grad_x, grad_handle, grad_topk_weights):
-    (recv_grad_x, _, _, _), _ = _moe_dispatch_fwd(grad_x, handle=ctx)
-    return recv_grad_x, None, None
+def _moe_combine_bwd(residuals, grad_output):
+    handle, _, _ = residuals
+    grad_x, _ = grad_output
+
+    (recv_grad_x, _, _, _), _ = _moe_dispatch_fwd(grad_x, handle=handle)
+    return recv_grad_x, None, None, None, None
 
 
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)

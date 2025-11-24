@@ -50,7 +50,6 @@ def _moe_combine_abstract_eval(
 
     assert x.ndim == 2, f"x must be a 2D array, but got {x.ndim}"
     assert send_head.ndim == 2, f"send_head must be a 2D array, but got {send_head.ndim}"
-    assert topk_weights.ndim == 2, f"topk_weights must be a 2D array, but got {topk_weights.ndim}"
 
     num_recv_tokens = send_head.shape[0]
     _, hidden_size = x.shape
