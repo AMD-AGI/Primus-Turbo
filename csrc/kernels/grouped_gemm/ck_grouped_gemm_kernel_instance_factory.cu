@@ -37,20 +37,14 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
         }
     } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
                          std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        if (n % 256 == 0) {
-            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1;
-            using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
-                                                            CDataType, ALayout, BLayout, CLayout,
-                                                            TileConfig, QuantMode, AccDataType>;
-            runner       = std::make_unique<Runner>();
-        } else if (n % 128 == 0) {
-            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1;
+        if (n % 128 == 0) {
+            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
                                                             CDataType, ALayout, BLayout, CLayout,
                                                             TileConfig, QuantMode, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else {
-            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding;
+            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1_padding;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
                                                             CDataType, ALayout, BLayout, CLayout,
                                                             TileConfig, QuantMode, AccDataType>;

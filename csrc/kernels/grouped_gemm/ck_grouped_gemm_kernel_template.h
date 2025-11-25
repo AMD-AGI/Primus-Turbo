@@ -304,23 +304,23 @@ APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::b
 #ifdef PRIMUS_TURBO_GFX942
 // FP8_E4M3 * FP8_E4M3 = FP16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1_padding)
 
 // FP8_E4M3 * FP8_E4M3 = BF16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1_padding)
 
 // FP8_E5M2 * FP8_E5M2 = FP16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1_padding)
 
 // FP8_E5M2 * FP8_E5M2 = BF16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_16x16x32_2x2x1_padding)
 #endif
 
 // ***********************************************************************************
