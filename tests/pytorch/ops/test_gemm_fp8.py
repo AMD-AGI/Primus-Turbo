@@ -79,16 +79,14 @@ def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
 
 
-# n and k must be a multiple of 128
-# block_size must be 128
-@pytest.mark.parametrize("m", [255, 257, 512, 1024])
-@pytest.mark.parametrize("n", [256, 512, 1024, 4096])
-@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("m", [256, 257, 512, 1024])
+@pytest.mark.parametrize("n", [255, 512, 1024, 4096])
+@pytest.mark.parametrize("k", [129, 256, 1024, 4096])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
-@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("block_size", [128, 256])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_size):
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, granularity={granularity}, block_size={block_size}"

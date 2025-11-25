@@ -24,10 +24,7 @@ get_ck_gemm_instance(const ck_tile::index_t m, const ck_tile::index_t n, const c
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)                  \
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)                  \
     MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)                  \
-    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)                  \
-    MACRO(A, B, C, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)               \
-    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)               \
-    MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)
+    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)
 
 // clang-format off
 // FP8_E4M3 * FP8_E4M3 = FP16

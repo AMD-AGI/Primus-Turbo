@@ -17,6 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e5m2,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
+    gemm_fp8_blockwise_impl,
     gemm_fp8_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
@@ -265,6 +266,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert trans_a == False
+
         a_dtype = FP8GemmBlockFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmBlockFunction.get_fp8_dtype(config.format, True)
 
@@ -273,21 +275,19 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         )
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
-        if not trans_b:
-            b_scale_inv = b_scale_inv.transpose(-1, -2)
-
-        out = gemm_fp8_impl(
+        out = gemm_fp8_blockwise_impl(
             a_fp8_row,
-            a_scale_inv_row,
-            trans_a,
             b_fp8,
+            a_scale_inv_row,
             b_scale_inv,
-            trans_b,
-            out_dtype,
-            False,
-            backend="ck",
-            granularity=config.granularity,
+            out_dtype=out_dtype,
+            scale_group_size_m=1,
+            scale_group_size_n=config.block_size,
+            scale_group_size_k=config.block_size,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
+
         ctx.save_for_backward(a, b_fp8, b_scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -319,18 +319,20 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a, a_dtype, axis=0, block_size=ctx.config.block_size
         )
 
-        a_grad = gemm_fp8_impl(
+        # AGrad
+        a_grad = gemm_fp8_blockwise_impl(
             grad_out_fp8_row,
-            grad_out_scale_inv_row,
-            False,
             b_fp8,
-            b_scale_inv.transpose(-1, -2),
-            not ctx.trans_b,
-            ctx.out_dtype,
-            False,
-            backend="ck",
-            granularity=ctx.config.granularity,
+            grad_out_scale_inv_row,
+            b_scale_inv,
+            out_dtype=ctx.out_dtype,
+            scale_group_size_m=1,
+            scale_group_size_n=ctx.config.block_size,
+            scale_group_size_k=ctx.config.block_size,
+            trans_a=False,
+            trans_b=not ctx.trans_b,
         )
+
         # BGrad
         lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
         lhs_scale_inv, rhs_scale_inv = (
@@ -338,18 +340,17 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             if ctx.trans_b
             else (a_scale_inv_col, grad_out_scale_inv_col)
         )
-
-        b_grad = gemm_fp8_impl(
+        b_grad = gemm_fp8_blockwise_impl(
             lhs,
-            lhs_scale_inv.transpose(-1, -2),
-            not ctx.trans_a,
             rhs,
-            rhs_scale_inv.transpose(-1, -2),
-            False,
-            ctx.out_dtype,
-            False,
-            backend="ck",
-            granularity=ctx.config.granularity,
+            lhs_scale_inv,
+            rhs_scale_inv,
+            out_dtype=ctx.out_dtype,
+            scale_group_size_m=1,
+            scale_group_size_n=1,
+            scale_group_size_k=ctx.config.block_size,
+            trans_a=not ctx.trans_a,
+            trans_b=False,
         )
         return a_grad, b_grad, None, None, None, None
 
