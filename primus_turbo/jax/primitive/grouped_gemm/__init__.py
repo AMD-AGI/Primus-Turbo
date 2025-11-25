@@ -6,3 +6,4 @@
 
 from .grouped_gemm import *  # noqa: F401, F403
 from .grouped_gemm_fp8 import *  # noqa: F401, F403
+from .grouped_gemm_hipblaslt import *  # noqa: F401, F403

@@ -16,6 +16,9 @@ from primus_turbo.jax.primitive import (
     TRANSPOSE_TABLE,
 )
 
+# Import Turbo grouped GEMM module
+from primus_turbo.jax import modules
+
 
 def initialize():
     """the function of jax_plugins entry_point"""
@@ -43,3 +46,9 @@ def initialize():
     # print("[Primus-Turbo/Jax] : primitive_batchers")
     # for primitive, func in BATCHING_TABLE.items():
     #     batching.primitive_batchers[primitive] = func
+
+
+# Export Turbo grouped GEMM API
+__all__ = [
+    "modules",
+]
