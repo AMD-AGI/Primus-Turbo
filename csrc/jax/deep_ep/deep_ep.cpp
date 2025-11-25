@@ -20,7 +20,7 @@
 
 namespace primus_turbo::jax::deep_ep {
 
-std::barrier g_barrier_signal(NUM_MAX_NVL_PEERS);
+static std::barrier g_barrier_signal(NUM_MAX_NVL_PEERS);
 
 static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
 
@@ -42,12 +42,11 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
         g_buffer_pool[device_id]->num_rdma_bytes() < num_rdma_bytes) {
 
         if (g_buffer_pool[device_id] != nullptr) {
-            g_buffer_pool[device_id]->Destroy();
             g_buffer_pool[device_id].reset();
         }
 
         g_buffer_pool[device_id] =
-            std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, true);
+            std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, false);
         g_barrier_signal.arrive_and_wait();
         g_buffer_pool[device_id]->Sync();
     }
@@ -91,8 +90,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
             &buffer_ptrs_[nvl_rank_],
             num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes,
             hipDeviceMallocUncached));
-        PRIMUS_TURBO_CHECK_HIP(
-            hipIpcGetMemHandle(&ipc_handles_[nvl_rank_], buffer_ptrs_[nvl_rank_]));
+
         buffer_ptrs_gpu_ = reinterpret_cast<void **>(
             static_cast<uint8_t *>(buffer_ptrs_[nvl_rank_]) + num_nvl_bytes + barrier_signal_bytes);
 
@@ -154,9 +152,8 @@ void Buffer::Destroy() {
     // Synchronize
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
-    if (num_nvl_bytes_ > 0 and is_available()) {
+    if (num_nvl_bytes_ > 0) {
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
-
         // Free local buffer and error flag
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
     }

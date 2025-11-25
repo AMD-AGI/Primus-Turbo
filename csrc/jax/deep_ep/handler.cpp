@@ -47,12 +47,13 @@ ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi:
     buffer->DispatchLayout(stream, topk_idx, static_cast<int>(num_experts), num_tokens_per_rank,
                            std::nullopt, num_tokens_per_expert, is_token_in_rank);
 
-    // bool is_fp8 = x_scales.element_count() > 0;
+    bool is_fp8 = x_scales.element_count() > 0;
     buffer->IntranodeDispatch(
-        stream, x, std::nullopt, topk_idx, topk_weights, *num_tokens_per_rank, *is_token_in_rank,
-        *num_tokens_per_expert, 0, std::nullopt, std::nullopt, expert_alignment, num_worst_tokens,
-        cfg, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
-        channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head);
+        stream, x, is_fp8 ? std::make_optional(x_scales) : std::nullopt, topk_idx, topk_weights,
+        *num_tokens_per_rank, *is_token_in_rank, *num_tokens_per_expert, 0, std::nullopt,
+        std::nullopt, expert_alignment, num_worst_tokens, cfg, recv_x, recv_x_scales, recv_topk_idx,
+        recv_topk_weights, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
+        recv_src_idx, send_head);
 
     return ffi::Error::Success();
 }
@@ -78,8 +79,7 @@ ffi::Error MoECachedDispatchFFI(
 
     auto    hidden_bytes = get_hidden_bytes(x);
     Buffer *buffer       = get_buffer(rank, num_ranks, hidden_bytes, cfg);
-
-    bool is_fp8 = x_scales.element_count() > 0;
+    bool    is_fp8       = x_scales.element_count() > 0;
     buffer->IntranodeDispatch(stream, x, is_fp8 ? std::make_optional(x_scales) : std::nullopt,
                               std::nullopt, std::nullopt, std::nullopt, is_token_in_rank,
                               std::nullopt, num_recv_tokens, cached_rank_prefix_matrix,

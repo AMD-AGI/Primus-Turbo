@@ -27,7 +27,7 @@ template <int kNumRanks> __global__ void barrier(int **barrier_signal_ptrs, int 
 
 void barrier(int **barrier_signal_ptrs, int rank, int num_ranks, hipStream_t stream) {
 #define BARRIER_LAUNCH_CASE(ranks)                                                                 \
-    LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, rank);                                \
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, barrier<ranks>, barrier_signal_ptrs, rank);                \
     break
 
     SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);

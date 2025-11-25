@@ -93,11 +93,10 @@ private:
     void   *rdma_buffer_ptr_ = nullptr;
 
     // Device info and communication
-    int               device_id_;
-    int               num_device_sms_;
-    int               rank_, rdma_rank_, nvl_rank_;
-    int               num_ranks_, num_rdma_ranks_, num_nvl_ranks_;
-    hipIpcMemHandle_t ipc_handles_[NUM_MAX_NVL_PEERS];
+    int device_id_;
+    int num_device_sms_;
+    int rank_, rdma_rank_, nvl_rank_;
+    int num_ranks_, num_rdma_ranks_, num_nvl_ranks_;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool is_available_ = false;
