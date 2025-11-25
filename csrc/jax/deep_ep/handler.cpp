@@ -19,7 +19,7 @@ ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi:
                           int64_t num_max_nvl_chunked_recv_tokens,
                           int64_t num_max_rdma_chunked_send_tokens,
                           int64_t num_max_rdma_chunked_recv_tokens,
-                          /* dispatched outputa */
+                          /* dispatched outputs */
                           ffi::Result<ffi::AnyBuffer>         recv_x,
                           ffi::Result<ffi::Buffer<ffi::F32>>  recv_x_scales,
                           ffi::Result<ffi::Buffer<ffi::S64>>  recv_topk_idx,

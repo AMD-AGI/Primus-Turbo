@@ -81,8 +81,6 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
     num_tokens, hidden = x.shape
     num_experts = scores.shape[1]
 
-    num_ranks = jax.lax.axis_size("x")
-    jax.lax.axis_index("x")
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx = rank_idx.astype(jnp.int64)
     rank_idx = inplace_unique(rank_idx, num_ranks)
@@ -244,9 +242,6 @@ def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts
         topk_idx = topk_idx.astype(jnp.int64)
 
         num_experts = scores.shape[1]
-
-        topk_idx = jax.lax.top_k(scores, num_topk)[1]
-        topk_idx = topk_idx.astype(jnp.int64)
 
         recv_x, _, rect_topk_weights, handle = moe_dispatch(
             x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts

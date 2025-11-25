@@ -21,13 +21,18 @@ from .moe_utils import Config
 __all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_combine"]
 
 
-_default_num_sms = 32
+_default_num_sms = 64
 num_ranks = 8
 
 P = jax.sharding.PartitionSpec
 
 # DeepEP topk_idx and topk_weights are int64, so we need to enable x64 precision.
 jax.config.update("jax_enable_x64", True)
+
+
+def set_default_num_sms(num_sms: int):
+    global _default_num_sms
+    _default_num_sms = num_sms
 
 
 def get_dispatch_config(num_ranks: int = 8) -> Config:
@@ -104,7 +109,7 @@ def _moe_dispatch_fwd(
     else:
         x_scales = jnp.array([], dtype=jnp.float32)
 
-    x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
+    assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     num_tokens, _ = x.shape
     num_worst_tokens = num_tokens * num_ranks
     # default config
