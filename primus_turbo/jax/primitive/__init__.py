@@ -10,4 +10,5 @@ TRANSPOSE_TABLE: Dict[Primitive, Any] = {}
 BATCHING_TABLE: Dict[Primitive, Any] = {}
 
 # Import primitives to register them
+from . import moe  # noqa: F401
 from . import grouped_gemm, normalization, quantization  # noqa: F401

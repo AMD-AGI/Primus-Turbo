@@ -40,6 +40,12 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
         g_buffer_pool[device_id]->num_ranks() != num_ranks or
         g_buffer_pool[device_id]->num_nvl_bytes() < num_nvl_bytes or
         g_buffer_pool[device_id]->num_rdma_bytes() < num_rdma_bytes) {
+
+        if (g_buffer_pool[device_id] != nullptr) {
+            g_buffer_pool[device_id]->Destroy();
+            g_buffer_pool[device_id].reset();
+        }
+
         g_buffer_pool[device_id] =
             std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, true);
         g_barrier_signal.arrive_and_wait();
@@ -149,14 +155,12 @@ void Buffer::Destroy() {
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
     if (num_nvl_bytes_ > 0 and is_available()) {
-        // Barrier
-        primus_turbo::deep_ep::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
-                                                  num_nvl_ranks_, 0);
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
         // Free local buffer and error flag
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
     }
+    destroyed_ = true;
 }
 
 bool Buffer::is_internode_available() const {

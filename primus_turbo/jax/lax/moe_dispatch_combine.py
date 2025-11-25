@@ -10,8 +10,8 @@ from typing import Any, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 
-from primus_turbo.jax.primitive.moe_combine import moe_combine_p
-from primus_turbo.jax.primitive.moe_dispatch import (
+from primus_turbo.jax.primitive.moe.moe_combine import moe_combine_p
+from primus_turbo.jax.primitive.moe.moe_dispatch import (
     moe_cached_dispatch_p,
     moe_dispatch_p,
 )
