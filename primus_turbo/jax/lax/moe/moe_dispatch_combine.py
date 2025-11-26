@@ -26,7 +26,7 @@ num_ranks = 8
 
 P = jax.sharding.PartitionSpec
 
-# DeepEP topk_idx and topk_weights are int64, so we need to enable x64 precision.
+# DeepEP topk_idx are int64, so we need to enable x64 precision.
 jax.config.update("jax_enable_x64", True)
 
 

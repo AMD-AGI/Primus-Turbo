@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from jax.sharding import PartitionSpec
 
-from primus_turbo.jax.lax import get_dispatch_config, moe_combine, moe_dispatch
+from primus_turbo.jax.lax.moe import get_dispatch_config, moe_combine, moe_dispatch
 from primus_turbo.jax.primitive.moe.moe_dispatch import moe_dispatch_p
 
 key = jax.random.PRNGKey(123)
