@@ -16,7 +16,7 @@ from primus_turbo.jax.primitive.moe.moe_dispatch import moe_dispatch_p
 
 key = jax.random.PRNGKey(123)
 
-num_ranks = jax.device_count()
+num_ranks = jax.local_device_count()
 
 mesh = jax.make_mesh((num_ranks,), ("x",), axis_types=(jax.sharding.AxisType.Explicit,))
 
@@ -170,6 +170,15 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("num_experts", [256])
 def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
+    """Test MoE dispatch/combine.
+
+    Args:
+        num_tokens (int): Number of tokens per device (rank)
+        hidden (int): Hidden dimension size
+        num_topk (int): Number of top-k experts selected per token
+        num_experts (int): Total number of experts
+    """
+
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
     dispatch_layout_result, recv_result, recv_topk_idx_result, combine_result = _test_moe_dispatch_combine(
@@ -252,12 +261,10 @@ def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts
         return combined_x, rect_topk_weights
 
     @jax.jit
-    def _test_mode_dispatch_combine_backward_grad_fn(x, scores, topk_weights):
+    def _test_moe_dispatch_combine_backward_grad_fn(x, scores, topk_weights):
         return jax.vjp(_test_mode_dispatch_combine_backward, x, scores, topk_weights)
 
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
-    primals, f_vjp = _test_mode_dispatch_combine_backward_grad_fn(x, scores, topk_weights)
-    grad_out = f_vjp(primals)
-
-    jax.debug.print("grad_out: {grad_out}", grad_out=grad_out)
+    primals, f_vjp = _test_moe_dispatch_combine_backward_grad_fn(x, scores, topk_weights)
+    f_vjp(primals)

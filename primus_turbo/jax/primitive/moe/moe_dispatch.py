@@ -31,7 +31,6 @@ IMPL_TABLE[moe_cached_dispatch_p] = partial(xla.apply_primitive, moe_cached_disp
 # ----------------------------------------
 # Step-3: Abstract eval
 # ----------------------------------------
-num_ranks = 8
 
 
 def _get_recv_x_scale_shape(x_scales: jnp.ndarray, num_worst_tokens: int) -> ShapedArray:
@@ -61,6 +60,9 @@ def _moe_dispatch_abstract_eval(
 
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     assert topk_idx.ndim == 2, "topk_idx must be a 2D array, but got {}".format(topk_idx.ndim)
+
+    num_ranks = jax.local_device_count()
+    assert num_ranks <= 8, "not support internode"
 
     num_tokens, hidden_size = x.shape
     num_topk = topk_idx.shape[1]
@@ -110,8 +112,11 @@ def _moe_cached_dispatch_abstract_eval(
     num_max_rdma_chunked_recv_tokens: int,
 ):
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
-    num_tokens, hidden_size = x.shape
+    _, hidden_size = x.shape
     num_channels = num_sms // 2
+
+    num_ranks = jax.local_device_count()
+    assert num_ranks <= 8, "not support internode"
 
     recv_x = ShapedArray((num_recv_tokens, hidden_size), x.dtype)
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_recv_tokens)

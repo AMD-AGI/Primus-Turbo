@@ -27,7 +27,7 @@ static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::Config &config) {
 
-    PRIMUS_TURBO_CHECK(num_ranks == NUM_MAX_NVL_PEERS and
+    PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS and
                        "DeepEP only support intranode communication on Jax!");
 
     int device_id = -1;

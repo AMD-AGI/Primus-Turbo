@@ -41,9 +41,10 @@ ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi:
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
-    int num_ranks = NUM_MAX_NVL_PEERS;
+    int num_ranks = -1;
     int rank      = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&rank));
+    PRIMUS_TURBO_CHECK_HIP(hipGetDeviceCount(&num_ranks));
 
     auto    hidden_bytes = get_hidden_bytes(x);
     Buffer *buffer       = get_buffer(rank, num_ranks, hidden_bytes, cfg);
@@ -77,9 +78,10 @@ ffi::Error MoECachedDispatchFFI(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
-    int num_ranks = NUM_MAX_NVL_PEERS;
+    int num_ranks = -1;
     int rank      = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&rank));
+    PRIMUS_TURBO_CHECK_HIP(hipGetDeviceCount(&num_ranks));
 
     auto    hidden_bytes = get_hidden_bytes(x);
     Buffer *buffer       = get_buffer(rank, num_ranks, hidden_bytes, cfg);
@@ -101,9 +103,10 @@ ffi::Error MoECombineFFI(
     int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
     int64_t num_max_rdma_chunked_send_tokens, int64_t num_max_rdma_chunked_recv_tokens,
     ffi::Result<ffi::AnyBuffer> recv_x, ffi::Result<ffi::Buffer<ffi::F32>> recv_topk_weights) {
-    int num_ranks = NUM_MAX_NVL_PEERS;
+    int num_ranks = -1;
     int rank      = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&rank));
+    PRIMUS_TURBO_CHECK_HIP(hipGetDeviceCount(&num_ranks));
 
     auto cfg = primus_turbo::deep_ep::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
