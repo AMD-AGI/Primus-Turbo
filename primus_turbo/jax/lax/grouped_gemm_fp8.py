@@ -24,6 +24,7 @@ from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import (
     get_ck_grouped_gemm_fp8_args_sizes,
 )
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_fp8 import (
+    grouped_gemm_fp8_fused_tensorwise_p,
     grouped_gemm_fp8_p,
     grouped_gemm_fp8_variable_k_p,
 )
@@ -61,6 +62,49 @@ def _get_workspace(group_num, is_fp8=False):
     workspace = jax.device_put(jnp.empty(args_size, dtype=jnp.uint8))
     _workspace_cache[cache_key] = (workspace, args_size)
     return workspace
+
+
+def _get_fused_workspace_size(a_size, b_size, group_num):
+    """Calculate workspace size for fused FP8 grouped_gemm.
+
+    Workspace layout: [quant_a_ws][quant_b_ws][a_fp8][b_fp8][a_scale][b_scale][gemm_args]
+    This must match the C++ implementation exactly.
+    """
+    from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import (
+        get_ck_grouped_gemm_fp8_args_sizes,
+    )
+
+    # Calculate reduce workspace sizes (matching C++ get_reduce_row_workspace_sizes)
+    # BLOCK=256, UNROLL=32, cnt = DIVUP(inner_len, BLOCK * UNROLL) * 2
+    # For tensorwise: outer_len=1, inner_len=a_size or b_size
+    def get_reduce_ws_size(inner_len):
+        BLOCK = 256
+        UNROLL = 32
+        cnt = ((inner_len + BLOCK * UNROLL - 1) // (BLOCK * UNROLL)) * 2
+        if cnt == 1:
+            return 0
+        return cnt * 1 * 4  # sizeof(float) * cnt * outer_len (outer_len=1)
+
+    reduce_ws_a_size = get_reduce_ws_size(a_size)
+    reduce_ws_b_size = get_reduce_ws_size(b_size)
+
+    # Quantization workspace sizes (matching C++ layout)
+    # amax(256) + reduce_ws(aligned) + scale(256) + scale_inv(256)
+    quant_ws_a_size = 256 + ((reduce_ws_a_size + 255) // 256) * 256 + 256 + 256
+    quant_ws_b_size = 256 + ((reduce_ws_b_size + 255) // 256) * 256 + 256 + 256
+
+    # FP8 buffers (aligned)
+    a_fp8_size = ((a_size + 255) // 256) * 256
+    b_fp8_size = ((b_size + 255) // 256) * 256
+
+    # Scales (256 bytes each, aligned)
+    scale_size = 256
+
+    # GEMM args
+    gemm_args_size = get_ck_grouped_gemm_fp8_args_sizes(group_num)
+
+    total_size = quant_ws_a_size + quant_ws_b_size + a_fp8_size + b_fp8_size + scale_size * 2 + gemm_args_size
+    return total_size
 
 
 def _expand_rowwise_scale_for_variable_k(scale, group_num):
@@ -115,32 +159,45 @@ def compute_group_offs(group_lens):
 def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, num_cu):
     """Grouped GEMM FP8 with TENSORWISE quantization."""
     # Get FP8 dtype
-    a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     out_dtype = a.dtype
 
     # Convert dtype to string for FFI
     dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str = dtype_map.get(out_dtype, "float16")
 
-    # Quantize a and b (auto-scale)
-    a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, ScalingGranularity.TENSORWISE)
-    b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
+    # Use fused version for better performance (single FFI call)
+    fp8_dtype_str = "e4m3" if config.format == Format.E4M3 else "e5m2"
 
-    # TENSORWISE scales are scalars - CK kernel handles expansion internally
-    workspace = _get_workspace(b_fp8.shape[0], is_fp8=True)
-    out = grouped_gemm_fp8_p.bind(
-        a_fp8,
-        b_fp8,
-        a_scale_inv,
-        b_scale_inv,
+    # Calculate workspace size for fused operation
+    a_size = a.size
+    b_size = b.size
+    group_num = b.shape[0]
+    ws_size = _get_fused_workspace_size(a_size, b_size, group_num)
+
+    # Get or create workspace
+    cache_key = ("fused", group_num, a_size, b_size)
+    if cache_key in _workspace_cache:
+        cached_workspace, cached_size = _workspace_cache[cache_key]
+        if cached_size >= ws_size:
+            workspace = cached_workspace
+        else:
+            workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+            _workspace_cache[cache_key] = (workspace, ws_size)
+    else:
+        workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+        _workspace_cache[cache_key] = (workspace, ws_size)
+
+    # Call fused primitive (quantize + gemm in one FFI call)
+    out = grouped_gemm_fp8_fused_tensorwise_p.bind(
+        a,
+        b,
         group_lens,
         group_offs,
         workspace,
         transA=False,
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
-        granularity="TENSORWISE",
+        fp8_dtype_str=fp8_dtype_str,
         out_dtype_str=out_dtype_str,
     )
     return out
