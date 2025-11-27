@@ -20,11 +20,10 @@ namespace intranode {
 template <int kNumRanks>
 __global__ void
 notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
-                const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
-                int64_t *moe_recv_tokens_per_experts, int num_experts, int num_tokens,
-                int num_channels, const bool *is_token_in_rank, int *channel_prefix_matrix,
-                int *rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
-                void **buffer_ptrs, int **barrier_signal_ptrs, int rank) {
+                const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                int num_experts, int num_tokens, int num_channels, const bool *is_token_in_rank,
+                int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
+                int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank) {
     auto sm_id     = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize,
@@ -78,7 +77,6 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
                 sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id];
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
-            moe_recv_tokens_per_experts[thread_id]    = sum;
         }
         __syncthreads();
 
@@ -122,19 +120,17 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
 }
 
 void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
-                     const int *num_tokens_per_expert, int64_t *moe_recv_expert_counter_mapped,
-                     int64_t *moe_recv_tokens_per_experts, int num_experts, int num_tokens,
-                     const bool *is_token_in_rank, int *channel_prefix_matrix,
-                     int *rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
-                     void **buffer_ptrs, int **barrier_signal_ptrs, int rank, hipStream_t stream,
-                     int num_channels) {
+                     const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
+                     int num_experts, int num_tokens, const bool *is_token_in_rank,
+                     int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
+                     int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
+                     hipStream_t stream, int num_channels) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                         \
-    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, notify_dispatch<ranks>, num_tokens_per_rank,               \
-                                  moe_recv_counter_mapped, num_tokens_per_expert,                  \
-                                  moe_recv_expert_counter_mapped, moe_recv_tokens_per_experts,     \
-                                  num_experts, num_tokens, num_channels, is_token_in_rank,         \
-                                  channel_prefix_matrix, rank_prefix_matrix_copy, num_memset_int,  \
-                                  expert_alignment, buffer_ptrs, barrier_signal_ptrs, rank);       \
+    LAUNCH_KERNEL_NON_COOPERATIVE(                                                                 \
+        &cfg, notify_dispatch<ranks>, num_tokens_per_rank, moe_recv_counter_mapped,                \
+        num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, num_tokens,            \
+        num_channels, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix_copy,            \
+        num_memset_int, expert_alignment, buffer_ptrs, barrier_signal_ptrs, rank);                 \
     break
 
     constexpr int kNumThreads = 128;

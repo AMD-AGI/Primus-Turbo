@@ -8,7 +8,7 @@ import torch
 import triton
 
 import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.float8 import ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     compute_m_num_tiles_indptr,
     grouped_gemm_fp8_blockwise_kernel,

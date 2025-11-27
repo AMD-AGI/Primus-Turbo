@@ -20,6 +20,7 @@ from .utils import EventOverlap
 CppConfig = torch.classes.primus_turbo_cpp_extension.Config
 
 
+@torch._library.register_fake_class("primus_turbo_cpp_extension::Config")
 class Config:
     def __init__(
         self,
@@ -42,6 +43,10 @@ class Config:
 
     def get_rdma_buffer_size_hint(self, hidden_bytes, num_ranks):
         return self.cfg.get_rdma_buffer_size_hint(hidden_bytes, num_ranks)
+
+    @classmethod
+    def __obj_unflatten__(cls, flattened_obj):
+        return cls(**dict(flattened_obj))
 
 
 __all__ = ["Buffer", "EventOverlap", "Config"]

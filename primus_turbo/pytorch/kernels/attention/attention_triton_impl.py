@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 
 from torch._library import wrap_triton
 
-from primus_turbo.pytorch.core.float8 import float8_e4m3, float8_e5m2
+from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
 from primus_turbo.triton.attention.attention_kernel import (
     DEBUG,
     FIXED_BLOCK_M,

@@ -123,8 +123,8 @@ public:
                         bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
-               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor,
                std::optional<c10::intrusive_ptr<EventHandle>>>
     intranode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const std::optional<torch::Tensor> &topk_idx,
@@ -152,11 +152,10 @@ public:
                       bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
-               torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
+               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<c10::intrusive_ptr<EventHandle>>>
+               torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::optional<EventHandle>>
     internode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const std::optional<torch::Tensor> &topk_idx,
                        const std::optional<torch::Tensor> &topk_weights,
@@ -181,8 +180,10 @@ public:
         const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
         const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
         const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
-        const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
-        const torch::Tensor &combined_nvl_head, const c10::intrusive_ptr<Config> config,
+        const torch::Tensor                &gbl_channel_prefix_matrix,
+        const std::optional<torch::Tensor> &gbl_rank_prefix_sum,
+        const torch::Tensor &combined_rdma_head, const torch::Tensor &combined_nvl_head,
+        const primus_turbo::deep_ep::Config &config, const c10::intrusive_ptr<Config> config,
         std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
         bool allocate_on_comm_stream);
 

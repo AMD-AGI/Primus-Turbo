@@ -164,11 +164,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             autotune_config=deepep_autotune_config,
         )
 
-    @classmethod
-    def maybe_cpu_sync(cls):
-        if cls.cuda_dtoh_stream is not None:
-            cls.cuda_dtoh_stream.synchronize()
-
     def _pre_dispatch(self, hidden_states, probs, routing_map=None, token_indices=None):
         self.hidden_shape = hidden_states.shape
 
@@ -219,25 +214,21 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 async_finish=self.deepep_async_finish,
                 allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,
                 num_worst_tokens=self.deepep_num_worst_tokens,
-                use_cuda_num_token_per_expert=self.deepep_use_cuda_num_tokens_per_expert,
             )
         )
 
         self.handle = handle
-
-        # cuda num_tokens_per_expert computed by permute
-        # cpu num_tokens_per_expert computed directly by DeepEP
-        self.tokens_per_expert = None if self.deepep_use_cuda_num_tokens_per_expert else tokens_per_expert
+        self.tokens_per_expert = tokens_per_expert
         self.dispatched_indices = dispatched_indices
 
         return hidden_states, dispatched_probs
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
 
-        if self.permute_max_token_num > 0:
-            num_out_tokens = self.permute_max_token_num
-        elif self.tokens_per_expert is not None:
+        if self.tokens_per_expert.numel() > 0:
             num_out_tokens = self.tokens_per_expert.sum().item()
+        elif self.permute_max_token_num > 0:
+            num_out_tokens = self.permute_max_token_num
         else:
             # will case cpu sync at permute phase
             num_out_tokens = -1
@@ -255,13 +246,17 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 routing_map=self.dispatched_routing_map,
                 probs=dispatched_probs,
                 fused=self.permute_fusion,
-                return_tokens_per_expert=self.deepep_use_cuda_num_tokens_per_expert,
+                return_tokens_per_expert=self.deepep_use_cuda_num_tokens_per_expert or num_out_tokens == -1,
             )
         )
-        if not self.deepep_use_cuda_num_tokens_per_expert:
-            tokens_per_expert = self.tokens_per_expert
-            self.tokens_per_expert = None
 
+        if not self.deepep_use_cuda_num_tokens_per_expert:
+            if self.tokens_per_expert is not None:
+                tokens_per_expert = self.tokens_per_expert
+            else:
+                tokens_per_expert = tokens_per_expert.cpu()
+
+        self.tokens_per_expert = None
         return hidden_states, tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):

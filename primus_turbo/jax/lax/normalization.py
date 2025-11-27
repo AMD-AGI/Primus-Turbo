@@ -9,7 +9,10 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from primus_turbo.jax.primitive.normalization import rmsnorm_bwd_p, rmsnorm_fwd_p
+from primus_turbo.jax.primitive.normalization.normalization import (
+    rmsnorm_bwd_p,
+    rmsnorm_fwd_p,
+)
 
 __all__ = ["rmsnorm"]
 

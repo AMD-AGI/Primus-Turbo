@@ -61,22 +61,25 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
                   DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS})
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
-        .def("__obj_flatten__", &deep_ep::Config::obj_flatten);
-    .def_pickle(
-        // __getstate__
-        [](const c10::intrusive_ptr<deep_ep::Config> &self)
-            -> std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> {
-            return self->obj_flatten();
-        },
-        //__setstate__
-        [](std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> state)
-            -> c10::intrusive_ptr<deep_ep::Config> {
-            auto [num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
-                  num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens] = state;
-            return c10::make_intrusive<deep_ep::Config>(
-                num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
-                num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
-        });
+        .def("__obj_flatten__", &deep_ep::Config::obj_flatten)
+        .def_pickle(
+            // __getstate__
+            [](const c10::intrusive_ptr<deep_ep::Config> &self)
+                -> std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> {
+                return std::make_tuple(self->num_sms, self->num_max_nvl_chunked_send_tokens,
+                                       self->num_max_nvl_chunked_recv_tokens,
+                                       self->num_max_rdma_chunked_send_tokens,
+                                       self->num_max_rdma_chunked_recv_tokens);
+            },
+            //__setstate__
+            [](std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> state)
+                -> c10::intrusive_ptr<deep_ep::Config> {
+                auto [num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
+                      num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens] = state;
+                return c10::make_intrusive<deep_ep::Config>(
+                    num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
+                    num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
+            });
 
     m.class_<deep_ep::EventHandle>("EventHandle")
         .def(torch::init<>())

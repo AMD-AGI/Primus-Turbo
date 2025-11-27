@@ -8,3 +8,6 @@ LOWERING_TABLE: Dict[Primitive, Any] = {}
 
 TRANSPOSE_TABLE: Dict[Primitive, Any] = {}
 BATCHING_TABLE: Dict[Primitive, Any] = {}
+
+# Import primitives to register them
+from . import grouped_gemm, normalization, quantization  # noqa: F401
