@@ -34,7 +34,19 @@ IMPL_TABLE[grouped_gemm_fp8_variable_k_p] = partial(xla.apply_primitive, grouped
 # Step-3: Abstract eval
 # ----------------------------------------
 def _grouped_gemm_fp8_abstract_eval(
-    a, b, a_scales, b_scales, group_lens, group_offs, *, transA, transB, num_cu, granularity, out_dtype_str
+    a,
+    b,
+    a_scales,
+    b_scales,
+    group_lens,
+    group_offs,
+    workspace,
+    *,
+    transA,
+    transB,
+    num_cu,
+    granularity,
+    out_dtype_str,
 ):
     """Abstract evaluation for grouped_gemm_fp8.
 
@@ -71,7 +83,19 @@ ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_p] = _grouped_gemm_fp8_abstract_eval
 
 
 def _grouped_gemm_fp8_variable_k_abstract_eval(
-    a, b, a_scales, b_scales, group_lens, group_offs, *, transA, transB, num_cu, granularity, out_dtype_str
+    a,
+    b,
+    a_scales,
+    b_scales,
+    group_lens,
+    group_offs,
+    workspace,
+    *,
+    transA,
+    transB,
+    num_cu,
+    granularity,
+    out_dtype_str,
 ):
     """Abstract evaluation for grouped_gemm_fp8_variable_k.
 
