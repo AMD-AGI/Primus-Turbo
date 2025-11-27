@@ -32,7 +32,7 @@ IMPL_TABLE[quantize_fp8_tensorwise_p] = partial(xla.apply_primitive, quantize_fp
 
 
 # Abstract eval
-def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype_str):
+def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, workspace_aval, *, out_dtype_str):
     # Convert string to dtype
     dtype_map = {
         "float8_e4m3fn": jnp.float8_e4m3fn,
@@ -90,7 +90,7 @@ IMPL_TABLE[quantize_fp8_rowwise_p] = partial(xla.apply_primitive, quantize_fp8_r
 
 
 # Abstract eval
-def _quantize_fp8_rowwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype_str, axis):
+def _quantize_fp8_rowwise_abstract_eval(input_aval, scale_opt_aval, workspace_aval, *, out_dtype_str, axis):
     # Convert string to dtype
     dtype_map = {
         "float8_e4m3fn": jnp.float8_e4m3fn,
