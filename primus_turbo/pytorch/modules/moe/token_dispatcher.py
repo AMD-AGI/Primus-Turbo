@@ -57,11 +57,10 @@ class TokenDispatcher:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states, probs = self._pre_dispatch(hidden_states, probs, routing_map, indices)
         dispatched_tokens, dispatched_probs = self._exec_dispatch(hidden_states, probs)
-        # dispatched_input, tokens_per_expert, permuted_probs = self._post_dispatch(
-        #     dispatched_tokens, dispatched_probs
-        # )
-        return None, None, None
-        # return dispatched_input, tokens_per_expert, permuted_probs
+        dispatched_input, tokens_per_expert, permuted_probs = self._post_dispatch(
+            dispatched_tokens, dispatched_probs
+        )
+        return dispatched_input, tokens_per_expert, permuted_probs
 
     def token_combine(self, hidden_states: torch.Tensor):
         output = self._pre_combine(hidden_states)
@@ -204,7 +203,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()  # downcast or upcast
 
-        hidden_states, dispatched_indices, dispatched_probs, tokens_per_expert, handle = (
+        hidden_states, dispatched_indices, dispatched_probs, tokens_per_expert_list, handle = (
             turbo.ops.deepep_dispatch(
                 hidden_states,
                 token_indices=self.token_indices,
@@ -218,15 +217,15 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         )
 
         self.handle = handle
-        self.tokens_per_expert = tokens_per_expert
+        self.tokens_per_expert_list = tokens_per_expert_list
         self.dispatched_indices = dispatched_indices
 
         return hidden_states, dispatched_probs
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
 
-        if self.tokens_per_expert.numel() > 0:
-            num_out_tokens = self.tokens_per_expert.sum().item()
+        if len(self.tokens_per_expert_list) > 0:
+            num_out_tokens = sum(self.tokens_per_expert_list)
         elif self.permute_max_token_num > 0:
             num_out_tokens = self.permute_max_token_num
         else:
@@ -246,17 +245,13 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 routing_map=self.dispatched_routing_map,
                 probs=dispatched_probs,
                 fused=self.permute_fusion,
-                return_tokens_per_expert=self.deepep_use_cuda_num_tokens_per_expert or num_out_tokens == -1,
+                return_tokens_per_expert=False,
             )
         )
 
-        if not self.deepep_use_cuda_num_tokens_per_expert:
-            if self.tokens_per_expert is not None:
-                tokens_per_expert = self.tokens_per_expert
-            else:
-                tokens_per_expert = tokens_per_expert.cpu()
+        # if not self.deepep_use_cuda_num_tokens_per_expert:
+        #     tokens_per_expert = torch.tensor(self.tokens_per_expert_list) if tokens_per_expert is None else tokens_per_expert.cpu()
 
-        self.tokens_per_expert = None
         return hidden_states, tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):

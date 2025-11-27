@@ -20,21 +20,17 @@
 
 namespace primus_turbo::pytorch::deep_ep {
 
-Buffer::Buffer(std::string group_name, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
+Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
                bool low_latency_mode, bool explicitly_destroy,
                bool use_default_stream_as_comm_stream)
-    : group_name(group_name), low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
-      num_rdma_bytes(num_rdma_bytes),
+    : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
+      num_rdma_bytes(num_rdma_bytes), rank(static_cast<int>(rank)),
+      num_ranks(static_cast<int>(num_ranks)),
       comm_stream(use_default_stream_as_comm_stream
                       ? at::hip::getCurrentHIPStreamMasqueradingAsCUDA()
                       : at::hip::getStreamFromPoolMasqueradingAsCUDA(true)),
       explicitly_destroy(explicitly_destroy),
       use_default_stream_as_comm_stream(use_default_stream_as_comm_stream) {
-
-    // Resolve process group
-    auto group = c10d::resolve_process_group(group_name);
-    rank       = group->getRank();
-    num_ranks  = group->getSize();
 
     // Metadata memory
     int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -95,28 +91,28 @@ Buffer::Buffer(std::string group_name, int64_t num_nvl_bytes, int64_t num_rdma_b
     PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
     // MoE counter
-    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_counter, sizeof(int64_t), hipHostAllocMapped));
+    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_counter, sizeof(int), hipHostAllocMapped));
     PRIMUS_TURBO_CHECK_HIP(
         hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_counter_mapped),
                                 const_cast<int *>(moe_recv_counter), 0));
     *moe_recv_counter = -1;
 
     // MoE expert-level counter
-    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(
-        &moe_recv_expert_counter, sizeof(int64_t) * NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
+    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_expert_counter,
+                                         sizeof(int) * NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
     PRIMUS_TURBO_CHECK_HIP(
         hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_expert_counter_mapped),
-                                const_cast<int64_t *>(moe_recv_expert_counter), 0));
+                                const_cast<int *>(moe_recv_expert_counter), 0));
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
         PRIMUS_TURBO_CHECK_HIP(
-            hipHostMalloc(&moe_recv_rdma_counter, sizeof(int64_t), hipHostAllocMapped));
+            hipHostMalloc(&moe_recv_rdma_counter, sizeof(int), hipHostAllocMapped));
         PRIMUS_TURBO_CHECK_HIP(
             hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_rdma_counter_mapped),
-                                    const_cast<int64_t *>(moe_recv_rdma_counter), 0));
+                                    const_cast<int *>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
 }
@@ -228,7 +224,7 @@ void Buffer::destroy() {
     PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_counter)));
 
     // Free chunked mode staffs
-    PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int64_t *>(moe_recv_expert_counter)));
+    PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_expert_counter)));
 
     destroyed = true;
     available = false;
@@ -376,7 +372,7 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int64_t num_experts,
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+           std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor,
            std::optional<c10::intrusive_ptr<EventHandle>>>
 Buffer::intranode_dispatch(
@@ -492,10 +488,10 @@ Buffer::intranode_dispatch(
     }
 
     // Create handles (only return for non-cached mode)
-    int              num_recv_tokens       = -1;
-    auto             rank_prefix_matrix    = torch::Tensor();
-    auto             channel_prefix_matrix = torch::Tensor();
-    std::vector<int> num_recv_tokens_per_expert_list;
+    int                  num_recv_tokens       = -1;
+    auto                 rank_prefix_matrix    = torch::Tensor();
+    auto                 channel_prefix_matrix = torch::Tensor();
+    std::vector<int64_t> num_recv_tokens_per_expert_list;
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
     int num_memset_int = num_channels * num_ranks * 4;
@@ -799,27 +795,26 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+           std::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
            std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
            std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
            std::optional<c10::intrusive_ptr<EventHandle>>>
-        ventHandle >>
-    Buffer::internode_dispatch(
-        const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
-        const std::optional<torch::Tensor> &topk_idx,
-        const std::optional<torch::Tensor> &topk_weights,
-        const std::optional<torch::Tensor> &num_tokens_per_rank,
-        const std::optional<torch::Tensor> &num_tokens_per_rdma_rank,
-        const torch::Tensor                &is_token_in_rank,
-        const std::optional<torch::Tensor> &num_tokens_per_expert, int64_t cached_num_recv_tokens,
-        int64_t                             cached_num_rdma_recv_tokens,
-        const std::optional<torch::Tensor> &cached_rdma_channel_prefix_matrix,
-        const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
-        const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
-        const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-        int64_t expert_alignment, int64_t num_worst_tokens, const c10::intrusive_ptr<Config> config,
-        std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
-        bool allocate_on_comm_stream) {
+Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+                           const std::optional<torch::Tensor> &topk_idx,
+                           const std::optional<torch::Tensor> &topk_weights,
+                           const std::optional<torch::Tensor> &num_tokens_per_rank,
+                           const std::optional<torch::Tensor> &num_tokens_per_rdma_rank,
+                           const torch::Tensor                &is_token_in_rank,
+                           const std::optional<torch::Tensor> &num_tokens_per_expert,
+                           int64_t cached_num_recv_tokens, int64_t cached_num_rdma_recv_tokens,
+                           const std::optional<torch::Tensor> &cached_rdma_channel_prefix_matrix,
+                           const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
+                           const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
+                           const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
+                           int64_t expert_alignment, int64_t num_worst_tokens,
+                           const c10::intrusive_ptr<Config>               config,
+                           std::optional<c10::intrusive_ptr<EventHandle>> previous_event,
+                           bool async, bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks,
     // which can be quite long. If users of DeepEP need to execute other Python code on other
@@ -942,12 +937,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
     }
 
     // Create handles (only return for non-cached mode)
-    int              num_recv_tokens = -1, num_rdma_recv_tokens = -1;
-    auto             rdma_channel_prefix_matrix = torch::Tensor();
-    auto             recv_rdma_rank_prefix_sum  = torch::Tensor();
-    auto             gbl_channel_prefix_matrix  = torch::Tensor();
-    auto             recv_gbl_rank_prefix_sum   = torch::Tensor();
-    std::vector<int> num_recv_tokens_per_expert_list;
+    int                  num_recv_tokens = -1, num_rdma_recv_tokens = -1;
+    auto                 rdma_channel_prefix_matrix = torch::Tensor();
+    auto                 recv_rdma_rank_prefix_sum  = torch::Tensor();
+    auto                 gbl_channel_prefix_matrix  = torch::Tensor();
+    auto                 recv_gbl_rank_prefix_sum   = torch::Tensor();
+    std::vector<int64_t> num_recv_tokens_per_expert_list;
 
     // Barrier or send sizes
     if (cached_mode) {
@@ -1151,7 +1146,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
 #endif
     }
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<c10::intrusive_ptr<EventHandle>>>
     Buffer::internode_combine(
         const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,
         const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
@@ -1160,7 +1156,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
         const torch::Tensor                &gbl_channel_prefix_matrix,
         const std::optional<torch::Tensor> &gbl_rank_prefix_sum,
         const torch::Tensor &combined_rdma_head, const torch::Tensor &combined_nvl_head,
-        const primus_turbo::deep_ep::Config &config, const c10::intrusive_ptr<Config> config,
+        const c10::intrusive_ptr<Config>               config,
         std::optional<c10::intrusive_ptr<EventHandle>> previous_event, bool async,
         bool allocate_on_comm_stream) {
 #ifndef DISABLE_ROCSHMEM
@@ -1357,32 +1353,35 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
         return {};
     }
 
-    std::tuple<std::tuple<std::string, std::string>, std::tuple<std::string, int64_t>,
-               std::tuple<std::string, int64_t>, std::tuple<std::string, bool>,
-               std::tuple<std::string, bool>, std::tuple<std::string, bool>>
+    std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+               std::tuple<std::string, bool>, std::tuple<std::string, bool>,
+               std::tuple<std::string, bool>>
     Buffer::obj_flatten() const {
-        auto state = std::make_tuple(std::make_tuple("group_name", group_name),
-                                     std::make_tuple("num_nvl_bytes", num_nvl_bytes),
-                                     std::make_tuple("num_rdma_bytes", num_rdma_bytes),
-                                     std::make_tuple("low_latency_mode", low_latency_mode),
-                                     std::make_tuple("explicitly_destroy", explicitly_destroy),
-                                     std::make_tuple("use_default_stream_as_comm_stream",
-                                                     use_default_stream_as_comm_stream));
+        auto state =
+            std::make_tuple(std::make_tuple("rank", rank), std::make_tuple("num_ranks", num_ranks),
+                            std::make_tuple("num_nvl_bytes", num_nvl_bytes),
+                            std::make_tuple("num_rdma_bytes", num_rdma_bytes),
+                            std::make_tuple("low_latency_mode", low_latency_mode),
+                            std::make_tuple("explicitly_destroy", explicitly_destroy),
+                            std::make_tuple("use_default_stream_as_comm_stream",
+                                            use_default_stream_as_comm_stream));
         return state;
     }
 
-    std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> Buffer::get_state() const {
-        return std::make_tuple(group_name, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
+    std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool, bool> Buffer::get_state()
+        const {
+        return std::make_tuple(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
                                explicitly_destroy, use_default_stream_as_comm_stream, available);
     }
 
-    c10::intrusive_ptr<Buffer> make_buffer(std::string group_name, int64_t num_nvl_bytes,
+    c10::intrusive_ptr<Buffer> make_buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes,
                                            int64_t num_rdma_bytes, bool low_latency_mode,
                                            bool explicitly_destroy,
                                            bool use_default_stream_as_comm_stream, bool available) {
-        auto buffer =
-            c10::make_intrusive<Buffer>(group_name, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
-                                        explicitly_destroy, use_default_stream_as_comm_stream);
+        auto buffer = c10::make_intrusive<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes,
+                                                  low_latency_mode, explicitly_destroy,
+                                                  use_default_stream_as_comm_stream);
 
         // if (available) {
         //     // NOTE: call Buffer::sync() at Python side if available is true

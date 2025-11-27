@@ -1,9 +1,14 @@
+import os
+
 import torch
+import torch.distributed as dist
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.deep_ep import Config
 
 EventHandle = torch.classes.primus_turbo_cpp_extension.EventHandle
+
+# torch.compiler.allow_in_graph(primus_turbo.pytorch.deep_ep.CppConfig)
 
 
 def test_buffer(group):
@@ -31,7 +36,7 @@ def test_config(
         num_max_rdma_chunked_send_tokens,
         num_max_rdma_chunked_recv_tokens,
     )
-    return config
+    return torch.tensor([1])
 
 
 def test_event_overlap():
@@ -40,16 +45,16 @@ def test_event_overlap():
 
 
 # compiled_event_overlap = torch.compile(test_event_overlap, fullgraph=True)
-compiled_cfg = torch.compile(test_config, fullgraph=True)
+compiled_cfg = torch.compile(test_config)
 # print(compiled_event_overlap())
-print(compiled_cfg(20, 24, 256, 6, 128).get_nvl_buffer_size_hint(7168, 8))
+print(compiled_cfg(20, 24, 256, 6, 128))
 
-# compiled_buffer = torch.compile(test_buffer)
+compiled_buffer = torch.compile(test_buffer)
 
-# rank = int(os.getenv("LOCAL_RANK", 0))
-# torch.cuda.set_device(rank)
+rank = int(os.getenv("LOCAL_RANK", 0))
+torch.cuda.set_device(rank)
 
-# dist.init_process_group(backend="nccl", rank=rank, world_size=8)
-# group = dist.group.WORLD
+dist.init_process_group(backend="nccl", rank=rank, world_size=8)
+group = dist.group.WORLD
 
-# print(compiled_buffer(group))
+print(compiled_buffer(group))

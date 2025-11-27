@@ -10,18 +10,20 @@ Config = torch.classes.primus_turbo_cpp_extension.Config
 
 
 @torch._library.register_fake_class("primus_turbo_cpp_extension::Buffer")
-class FakeCppBuffer:
+class FakeBuffer:
 
     def __init__(
         self,
-        group_name: str,
+        rank: int,
+        num_ranks: int,
         num_nvl_bytes: int,
         num_rdma_bytes: int,
         low_latency_mode: bool,
         explicitly_destroy: bool,
         use_default_stream_as_comm_stream: bool,
     ):
-        self.group_name = group_name
+        self.rank = rank
+        self.num_ranks = num_ranks
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -208,22 +210,23 @@ class FakeEventHandle:
         return cls(**dict(flattened_obj))
 
 
-# @torch._library.register_fake_class("primus_turbo_cpp_extension::Config")
-# class FakeCppConfig:
+@torch._library.register_fake_class("primus_turbo_cpp_extension::Config")
+class FakeConfig:
 
-#     def __init__(
-#             self,
-#             num_sms: int = 20,
-#             num_max_nvl_chunked_send_tokens: int = 24,
-#             num_max_nvl_chunked_recv_tokens: int = 256,
-#             num_max_rdma_chunked_send_tokens: int = 6,
-#             num_max_rdma_chunked_recv_tokens: int = 128):
-#         self.num_sms = num_sms
-#         self.num_max_nvl_chunked_send_tokens = num_max_nvl_chunked_send_tokens
-#         self.num_max_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens
-#         self.num_max_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens
-#         self.num_max_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens
+    def __init__(
+        self,
+        num_sms: int = 20,
+        num_max_nvl_chunked_send_tokens: int = 24,
+        num_max_nvl_chunked_recv_tokens: int = 256,
+        num_max_rdma_chunked_send_tokens: int = 6,
+        num_max_rdma_chunked_recv_tokens: int = 128,
+    ):
+        self.num_sms = num_sms
+        self.num_max_nvl_chunked_send_tokens = num_max_nvl_chunked_send_tokens
+        self.num_max_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens
+        self.num_max_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens
+        self.num_max_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens
 
-#     @classmethod
-#     def __obj_unflatten__(cls, flattened_obj):
-#         return cls(**dict(flattened_obj))
+    @classmethod
+    def __obj_unflatten__(cls, flattened_obj):
+        return cls(**dict(flattened_obj))

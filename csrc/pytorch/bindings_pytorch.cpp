@@ -61,7 +61,21 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
                   DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS})
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
-        .def("__obj_flatten__", &deep_ep::Config::obj_flatten)
+        .def("__obj_flatten__",
+             [](c10::intrusive_ptr<deep_ep::Config> self)
+                 -> std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+                               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+                               std::tuple<std::string, int64_t>> {
+                 return std::make_tuple(std::make_tuple("num_sms", self->num_sms),
+                                        std::make_tuple("num_max_nvl_chunked_send_tokens",
+                                                        self->num_max_nvl_chunked_send_tokens),
+                                        std::make_tuple("num_max_nvl_chunked_recv_tokens",
+                                                        self->num_max_nvl_chunked_recv_tokens),
+                                        std::make_tuple("num_max_rdma_chunked_send_tokens",
+                                                        self->num_max_rdma_chunked_send_tokens),
+                                        std::make_tuple("num_max_rdma_chunked_recv_tokens",
+                                                        self->num_max_rdma_chunked_recv_tokens));
+             })
         .def_pickle(
             // __getstate__
             [](const c10::intrusive_ptr<deep_ep::Config> &self)
@@ -95,7 +109,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
             });
 
     m.class_<deep_ep::Buffer>("Buffer")
-        .def(torch::init<std::string, int64_t, int64_t, bool, bool, bool>())
+        .def(torch::init<int64_t, int64_t, int64_t, int64_t, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
@@ -116,17 +130,17 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
         .def_pickle(
             // __getstate__
             [](const c10::intrusive_ptr<deep_ep::Buffer> &self)
-                -> std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> {
-                return self->get_state();
+                -> std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool> {
+                return std::make_tuple(0, 1, 0, 0, 0, 0, 0);
             },
             //__setstate__
-            [](std::tuple<std::string, int64_t, int64_t, bool, bool, bool, bool> state)
+            [](std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool> state)
                 -> c10::intrusive_ptr<deep_ep::Buffer> {
-                auto [group_name, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
-                      explicitly_destroy, use_default_stream_as_comm_stream, available] = state;
-                return deep_ep::make_buffer(group_name, num_nvl_bytes, num_rdma_bytes,
-                                            low_latency_mode, explicitly_destroy,
-                                            use_default_stream_as_comm_stream, available);
+                auto [rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
+                      explicitly_destroy, use_default_stream_as_comm_stream] = state;
+                return c10::make_intrusive<deep_ep::Buffer>(
+                    rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
+                    explicitly_destroy, use_default_stream_as_comm_stream);
             });
 }
 

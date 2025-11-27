@@ -87,7 +87,8 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
 
         self.runtime = CppBuffer(
-            group.group_name,
+            self.rank,
+            self.group_size,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode,
