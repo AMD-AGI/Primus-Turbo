@@ -148,14 +148,15 @@ def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, format, granularity, trans_b, 
     fwd_total_flops = 2 * B * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
-    # Define functions without JIT for now
-    def fwd_func():
-        return grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    # JIT compile functions (now supported with refactored custom_vjp)
+    fwd_func = jax.jit(lambda: grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config))
 
     # For backward, we need to use value_and_grad
-    def bwd_func():
+    def bwd_func_impl():
         _, grads = jax.value_and_grad(loss_fn, argnums=(0, 1))(a, b)
         return grads
+
+    bwd_func = jax.jit(bwd_func_impl)
 
     # Warmup
     warmup = 20

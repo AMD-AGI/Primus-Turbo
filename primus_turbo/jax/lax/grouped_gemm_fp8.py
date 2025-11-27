@@ -111,7 +111,7 @@ def compute_group_offs(group_lens):
 # ============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
 def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, num_cu):
     """Grouped GEMM FP8 with TENSORWISE quantization."""
     # Get FP8 dtype
@@ -183,7 +183,7 @@ def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, conf
     return out, ctx
 
 
-def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, num_cu, ctx, grad_out):
+def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
     """Backward pass for TENSORWISE quantization."""
     a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens_saved, group_offs_saved, a, b = ctx
 
@@ -242,7 +242,8 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
         out_dtype_str=out_dtype_str_b,
     )
 
-    return grad_a, grad_b
+    # group_lens and group_offs are differentiable args but don't have gradients
+    return grad_a, grad_b, None, None
 
 
 _grouped_gemm_fp8_tensorwise.defvjp(_grouped_gemm_fp8_tensorwise_fwd, _grouped_gemm_fp8_tensorwise_bwd)
@@ -253,7 +254,7 @@ _grouped_gemm_fp8_tensorwise.defvjp(_grouped_gemm_fp8_tensorwise_fwd, _grouped_g
 # ============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
 def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num_cu):
     """Grouped GEMM FP8 with ROWWISE quantization."""
     # Get FP8 dtype
@@ -334,7 +335,7 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
     return out, ctx
 
 
-def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_cu, ctx, grad_out):
+def _grouped_gemm_fp8_rowwise_bwd(trans_b, config, num_cu, ctx, grad_out):
     """Backward pass for ROWWISE quantization."""
     a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens_saved, group_offs_saved, a, b = ctx
 
@@ -403,7 +404,8 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
         out_dtype_str=out_dtype_str_b,
     )
 
-    return grad_a, grad_b
+    # group_lens and group_offs are differentiable args but don't have gradients
+    return grad_a, grad_b, None, None
 
 
 _grouped_gemm_fp8_rowwise.defvjp(_grouped_gemm_fp8_rowwise_fwd, _grouped_gemm_fp8_rowwise_bwd)
@@ -414,7 +416,7 @@ _grouped_gemm_fp8_rowwise.defvjp(_grouped_gemm_fp8_rowwise_fwd, _grouped_gemm_fp
 # ============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
 def _grouped_gemm_fp8_blockwise(a, b, group_lens, group_offs, trans_b, config, num_cu):
     """Grouped GEMM FP8 with BLOCKWISE quantization.
 
@@ -431,7 +433,7 @@ def _grouped_gemm_fp8_blockwise_fwd(a, b, group_lens, group_offs, trans_b, confi
     raise NotImplementedError("BLOCKWISE quantization not implemented")
 
 
-def _grouped_gemm_fp8_blockwise_bwd(group_lens, group_offs, trans_b, config, num_cu, ctx, grad_out):
+def _grouped_gemm_fp8_blockwise_bwd(trans_b, config, num_cu, ctx, grad_out):
     raise NotImplementedError("BLOCKWISE quantization not implemented")
 
 
