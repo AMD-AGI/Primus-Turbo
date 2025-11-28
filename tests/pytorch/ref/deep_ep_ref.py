@@ -228,14 +228,13 @@ def tune_and_verify_internode(
                         dispatch_args.update(
                             {
                                 "num_worst_tokens": num_worst_tokens,
-                                "num_recv_tokens_per_expert_as_cuda": True,
                             }
                         )
                         (
                             recv_worst_x,
                             recv_worst_topk_idx,
                             recv_worst_topk_weights,
-                            cuda_recv_num_tokens_per_expert,
+                            recv_num_tokens_per_expert_list,
                             _,
                             event,
                         ) = buffer.dispatch(**dispatch_args)
@@ -245,11 +244,7 @@ def tune_and_verify_internode(
                             if isinstance(recv_worst_x, tuple)
                             else recv_worst_x
                         )
-                        recv_num_tokens_per_expert_list = cuda_recv_num_tokens_per_expert.tolist()
-                        assert (
-                            gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
-                            == recv_num_tokens_per_expert_list
-                        )
+                        assert len(recv_num_tokens_per_expert_list) == 0
                         assert num_worst_tokens == recv_worst_x.size(0)
                         assert num_worst_tokens == recv_worst_topk_idx.size(0)
                         assert num_worst_tokens == recv_worst_topk_weights.size(0)

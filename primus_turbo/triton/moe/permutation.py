@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.language import core
-from triton.language.standard import _log2 as log2
+from triton.language.standard import _log2
 
 # The following three argsort related kernels are adapted from
 # the issue https://github.com/triton-lang/triton/issues/3698
@@ -167,7 +167,7 @@ def _row_id_map_pass_3_kernel(
     LOAD_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    n_dims: tl.constexpr = log2(LOAD_SIZE)
+    n_dims: tl.constexpr = _log2(LOAD_SIZE)
     off = tl.arange(0, LOAD_SIZE)
     row_id_map = tl.load(
         row_id_map_ptr + pid * stride_row_id_map_token + stride_row_id_map_expert * off,

@@ -167,6 +167,9 @@ class DeepEPDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
 
+        if tokens_per_expert is not None:
+            tokens_per_expert = torch.tensor(tokens_per_expert)
+
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
     @staticmethod

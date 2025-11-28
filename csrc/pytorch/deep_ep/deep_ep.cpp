@@ -116,7 +116,7 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
     }
 }
 
-Buffer::~Buffer() noexcept(false) {
+Buffer::~Buffer() {
     if (not explicitly_destroy) {
         destroy();
     } else if (not destroyed) {
@@ -165,7 +165,7 @@ torch::Tensor Buffer::get_local_nvshmem_unique_id() const {
     PRIMUS_TURBO_CHECK(rdma_rank == 0 and "Only RDMA rank 0 can get ROCSHMEM unique ID");
     auto unique_id = primus_turbo::deep_ep::internode::get_unique_id();
     auto unique_id_tensor =
-        torch::from_blob(unique_id.data(), {unique_id.size()},
+        torch::from_blob(unique_id.data(), {static_cast<int64_t>(unique_id.size())},
                          at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 
     // avoid memory leak
@@ -275,9 +275,9 @@ void Buffer::sync(const torch::Tensor                &all_gathered_handles,
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
         PRIMUS_TURBO_CHECK(root_unique_id_opt.has_value());
-        std::vector<uint8_t> root_unique_id(root_unique_id_opt.nbytes());
-        std::memcpy(root_unique_id.data(), root_unique_id_opt.data_ptr(),
-                    root_unique_id_opt.nbytes());
+        std::vector<uint8_t> root_unique_id(root_unique_id_opt->nbytes());
+        std::memcpy(root_unique_id.data(), root_unique_id_opt->data_ptr(),
+                    root_unique_id_opt->nbytes());
         auto nvshmem_rank      = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
         PRIMUS_TURBO_CHECK(nvshmem_rank ==
@@ -824,8 +824,6 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
     // which can be quite long. If users of DeepEP need to execute other Python code on other
     // threads, such as KV transfer, their code will get stuck due to GIL unless we release GIL
     // here.
-    pybind11::gil_scoped_release release;
-
     const int num_channels = config->num_sms / 2;
     PRIMUS_TURBO_CHECK(config->num_sms % 2 == 0);
     PRIMUS_TURBO_CHECK(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
@@ -988,9 +986,9 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             hidden_int4, num_scales, num_topk, expert_alignment,
             rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
             gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
-            rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-            config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, comm_stream,
-            config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
+            rdma_buffer_ptr, config->num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
+            config->num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, comm_stream,
+            config->get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
             low_latency_mode);
 
         if (num_worst_tokens > 0) {
@@ -1090,9 +1088,9 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
         is_token_in_rank.data_ptr<bool>(), num_tokens, static_cast<int>(num_worst_tokens),
         hidden_int4, num_scales, num_topk, num_experts, scale_token_stride, scale_hidden_stride,
-        rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens,
-        config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens, rank,
+        rdma_buffer_ptr, config->num_max_rdma_chunked_send_tokens,
+        config->num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
+        config->num_max_nvl_chunked_send_tokens, config->num_max_nvl_chunked_recv_tokens, rank,
         num_ranks, cached_mode, comm_stream, num_channels, low_latency_mode);
 
     // Wait streams
@@ -1281,9 +1279,9 @@ Buffer::internode_combine(const torch::Tensor &x, const std::optional<torch::Ten
         rdma_channel_prefix_matrix.data_ptr<int>(), rdma_rank_prefix_sum.data_ptr<int>(),
         gbl_channel_prefix_matrix.data_ptr<int>(), gbl_rank_prefix_sum_ptr, num_tokens,
         num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,
-        config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream, num_channels,
+        config->num_max_rdma_chunked_send_tokens, config->num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu, config->num_max_nvl_chunked_send_tokens,
+        config->num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream, num_channels,
         low_latency_mode);
 
     // Wait streams
