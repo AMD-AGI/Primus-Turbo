@@ -39,6 +39,11 @@
 #define DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS 256
 
 static constexpr int32_t kWarpSize = 64;
+#define WARP_SIZE 64
+#define WARP_MASK 0xffffffffffffffffu
+#define MAX_NTHREADS 1024
+#define MAX_GROUPS (MAX_NTHREADS / WARP_SIZE) // 16 warps in the block
+#define MAX_GROUPS_MASK 0xf
 // For ROCm equals to half the wave size or Nvidia warp size
 static constexpr int32_t  kEmulatedWarpSize = kWarpSize / 2;
 static constexpr uint64_t kFullWarpMask     = 0xffffffffffffffff;
