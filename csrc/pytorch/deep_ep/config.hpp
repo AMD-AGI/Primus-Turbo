@@ -8,226 +8,53 @@
 
 #pragma once
 
+#include <climits>
+
 #include "primus_turbo/common.h"
 
 #include "primus_turbo/deep_ep/api.h"
+#include "primus_turbo/deep_ep/config.hpp"
 #include "primus_turbo/deep_ep/configs.h"
 #include <torch/custom_class.h>
 
 namespace primus_turbo::pytorch::deep_ep {
 
-struct Config : torch::CustomClassHolder {
-    int64_t num_sms;
-    int64_t num_max_nvl_chunked_send_tokens;
-    int64_t num_max_nvl_chunked_recv_tokens;
-    int64_t num_max_rdma_chunked_send_tokens;
-    int64_t num_max_rdma_chunked_recv_tokens;
+using BaseConfig = primus_turbo::deep_ep::Config;
+
+struct Config : public BaseConfig, torch::CustomClassHolder {
 
     Config(int64_t num_sms, int64_t num_max_nvl_chunked_send_tokens,
            int64_t num_max_nvl_chunked_recv_tokens, int64_t num_max_rdma_chunked_send_tokens,
            int64_t num_max_rdma_chunked_recv_tokens)
-        : num_sms(num_sms), num_max_nvl_chunked_send_tokens(num_max_nvl_chunked_send_tokens),
-          num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
-          num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
-          num_max_rdma_chunked_recv_tokens(num_max_rdma_chunked_recv_tokens) {
-        PRIMUS_TURBO_CHECK(num_sms >= 0);
-        PRIMUS_TURBO_CHECK(num_max_nvl_chunked_send_tokens > 0 and
-                           num_max_nvl_chunked_recv_tokens > 0);
-        PRIMUS_TURBO_CHECK(num_max_nvl_chunked_send_tokens < num_max_nvl_chunked_recv_tokens);
-        PRIMUS_TURBO_CHECK(num_max_rdma_chunked_send_tokens > 0 and
-                           num_max_rdma_chunked_recv_tokens > 0);
-
-        // Ceil up RDMA buffer size
-        this->num_max_rdma_chunked_recv_tokens =
-            ALIGN<int64_t>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
-        PRIMUS_TURBO_CHECK(num_max_rdma_chunked_send_tokens < num_max_rdma_chunked_recv_tokens);
-        // NOTES: this assertion is related to RDMA lazy head update, we must ensure senders always
-        // have space to push
-        PRIMUS_TURBO_CHECK(num_max_rdma_chunked_send_tokens <=
-                           num_max_rdma_chunked_recv_tokens / 2);
-    }
-
-    int64_t get_nvl_buffer_size_hint(int64_t hidden_bytes, int64_t num_ranks) const {
-        // Below are some assumptions
-        // TODO: add assertions
-        constexpr int kNumMaxTopK   = 128;
-        constexpr int kNumMaxScales = 128;
-        PRIMUS_TURBO_CHECK(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
-        PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS or num_sms % 2 == 0);
-        const auto    num_rdma_ranks = std::max<int64_t>(num_ranks / NUM_MAX_NVL_PEERS, 1);
-        const auto    num_nvl_ranks  = std::min<int64_t>(num_ranks, NUM_MAX_NVL_PEERS);
-        const int64_t num_channels   = num_sms / 2;
-
-        size_t num_bytes = 0;
-        num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes;
-#ifndef DISABLE_ROCSHMEM
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens *
-                     primus_turbo::deep_ep::internode::get_source_meta_bytes();
-#endif
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK *
-                     sizeof(int64_t);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK *
-                     sizeof(float);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens *
-                     kNumMaxScales * sizeof(float);
-        num_bytes = ((num_bytes + 127) / 128) * 128;
-        return num_bytes;
+        : BaseConfig(static_cast<int>(num_sms), static_cast<int>(num_max_nvl_chunked_send_tokens),
+                     static_cast<int>(num_max_nvl_chunked_recv_tokens),
+                     static_cast<int>(num_max_rdma_chunked_send_tokens),
+                     static_cast<int>(num_max_rdma_chunked_recv_tokens)) {
+        // Validate that int64_t parameters fit within int range
+        PRIMUS_TURBO_CHECK(num_sms <= INT_MAX && num_sms >= INT_MIN, "num_sms out of int range");
+        PRIMUS_TURBO_CHECK(num_max_nvl_chunked_send_tokens <= INT_MAX &&
+                               num_max_nvl_chunked_send_tokens >= INT_MIN,
+                           "num_max_nvl_chunked_send_tokens out of int range");
+        PRIMUS_TURBO_CHECK(num_max_nvl_chunked_recv_tokens <= INT_MAX &&
+                               num_max_nvl_chunked_recv_tokens >= INT_MIN,
+                           "num_max_nvl_chunked_recv_tokens out of int range");
+        PRIMUS_TURBO_CHECK(num_max_rdma_chunked_send_tokens <= INT_MAX &&
+                               num_max_rdma_chunked_send_tokens >= INT_MIN,
+                           "num_max_rdma_chunked_send_tokens out of int range");
+        PRIMUS_TURBO_CHECK(num_max_rdma_chunked_recv_tokens <= INT_MAX &&
+                               num_max_rdma_chunked_recv_tokens >= INT_MIN,
+                           "num_max_rdma_chunked_recv_tokens out of int range");
     }
 
     int64_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int64_t num_ranks) const {
-#ifndef DISABLE_ROCSHMEM
-        // Legacy mode
-        if (num_ranks <= NUM_MAX_NVL_PEERS)
-            return 0;
-
-        // Below are some assumptions
-        // TODO: add assertions
-        constexpr int kNumMaxTopK   = 128;
-        constexpr int kNumMaxScales = 128;
-        PRIMUS_TURBO_CHECK(num_ranks % NUM_MAX_NVL_PEERS == 0);
-        PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
-        const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-        const int num_channels   = num_sms / 2;
-
-        size_t num_bytes = 0;
-        num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS * 2 + 2) * 2 * sizeof(int);
-        num_bytes +=
-            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     primus_turbo::deep_ep::internode::get_source_meta_bytes() * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxTopK * sizeof(int64_t) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxTopK * sizeof(float) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens *
-                     kNumMaxScales * sizeof(float) * 2;
-        num_bytes +=
-            num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2;
-        num_bytes = ((num_bytes + 127) / 128) * 128;
-        return num_bytes;
-#else
-        PRIMUS_TURBO_CHECK(false, "rocSHMEM is disabled during compilation, please install "
-                                  "rocSHMEM by following docs/install_dependencies.md");
-#endif
+        return static_cast<int64_t>(
+            BaseConfig::get_rdma_buffer_size_hint(hidden_bytes, static_cast<int>(num_ranks)));
     }
 
-    std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
-               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
-               std::tuple<std::string, int64_t>>
-    obj_flatten() const {
-        return std::make_tuple(
-            std::make_tuple("num_sms", num_sms),
-            std::make_tuple("num_max_nvl_chunked_send_tokens", num_max_nvl_chunked_send_tokens),
-            std::make_tuple("num_max_nvl_chunked_recv_tokens", num_max_nvl_chunked_recv_tokens),
-            std::make_tuple("num_max_rdma_chunked_send_tokens", num_max_rdma_chunked_send_tokens),
-            std::make_tuple("num_max_rdma_chunked_recv_tokens", num_max_rdma_chunked_recv_tokens));
+    int64_t get_nvl_buffer_size_hint(int64_t hidden_bytes, int64_t num_ranks) const {
+        return static_cast<int64_t>(BaseConfig::get_nvl_buffer_size_hint(
+            static_cast<size_t>(hidden_bytes), static_cast<int>(num_ranks)));
     }
 };
-
-struct LowLatencyBuffer {
-    int num_clean_int = 0;
-
-    void *dispatch_rdma_send_buffer       = nullptr;
-    void *dispatch_rdma_recv_data_buffer  = nullptr;
-    int  *dispatch_rdma_recv_count_buffer = nullptr;
-
-    void *combine_rdma_send_buffer      = nullptr;
-    void *combine_rdma_recv_data_buffer = nullptr;
-    int  *combine_rdma_recv_flag_buffer = nullptr;
-
-    void  *combine_rdma_send_buffer_data_start = nullptr;
-    size_t num_bytes_per_combine_msg           = 0;
-
-    std::pair<int *, int> clean_meta() {
-        PRIMUS_TURBO_CHECK(dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer);
-        return {dispatch_rdma_recv_count_buffer, num_clean_int};
-    }
-};
-
-struct LowLatencyLayout {
-    size_t           total_bytes = 0;
-    LowLatencyBuffer buffers[2];
-
-    template <typename out_ptr_t = void *, typename count_ptr_t = uint8_t *,
-              typename in_ptr_t = void *>
-    out_ptr_t advance(const in_ptr_t &ptr, size_t count) {
-        return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
-    }
-
-    LowLatencyLayout(void *rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden,
-                     int num_ranks, int num_experts) {
-        const int num_scales = hidden / 128;
-
-        // Dispatch and combine layout:
-        //  - 2 symmetric odd/even send buffer
-        //  - 2 symmetric odd/even receive buffers
-        //  - 2 symmetric odd/even signaling buffers
-
-        // Message sizes
-        // NOTES: you should add a control `int4` for combine messages if you want to do data
-        // transformation
-        PRIMUS_TURBO_CHECK(num_scales * sizeof(float) <= static_cast<size_t>(hidden));
-        size_t num_bytes_per_dispatch_msg =
-            sizeof(int4) +
-            std::max(hidden * sizeof(hip_bfloat16), hidden + num_scales * sizeof(float));
-        size_t num_bytes_per_combine_msg = hidden * sizeof(hip_bfloat16);
-
-        // Send buffer
-        size_t dispatch_send_buffer_bytes =
-            num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
-        size_t combine_send_buffer_bytes =
-            num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
-        size_t send_buffer_bytes = std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
-        PRIMUS_TURBO_CHECK(send_buffer_bytes % sizeof(int4) == 0);
-        total_bytes += send_buffer_bytes * 2;
-
-        // Symmetric receive buffers
-        // TODO: optimize memory usages
-        size_t dispatch_recv_data_buffer_bytes =
-            num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
-        size_t combine_recv_buffer_bytes =
-            num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
-        size_t recv_buffer_bytes =
-            std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
-        PRIMUS_TURBO_CHECK(recv_buffer_bytes % sizeof(int4) == 0);
-        total_bytes += recv_buffer_bytes * 2;
-
-        // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
-        size_t combine_recv_flag_buffer_bytes   = dispatch_recv_count_buffer_bytes;
-        size_t signaling_buffer_bytes =
-            std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
-        size_t signaling_buffer_bytes_aligned = ALIGN<size_t>(signaling_buffer_bytes, 128);
-        total_bytes += signaling_buffer_bytes_aligned * 2;
-
-        // Assign pointers
-        // NOTES: we still leave some space for distinguishing dispatch/combine buffer,
-        // so you may see some parameters are duplicated
-        for (int i = 0; i < 2; ++i) {
-            buffers[i] = {
-                static_cast<int>(signaling_buffer_bytes / sizeof(int)),
-                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
-                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 +
-                                         recv_buffer_bytes * i),
-                advance<int *>(rdma_buffer, signaling_buffer_bytes_aligned * i),
-                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
-                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 +
-                                         recv_buffer_bytes * i),
-                advance<int *>(rdma_buffer, signaling_buffer_bytes_aligned * i),
-                advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
-                num_bytes_per_combine_msg};
-        }
-    }
-};
-
-inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
-                                             int num_ranks, int num_experts) {
-    auto num_bytes =
-        LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
-            .total_bytes;
-    return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) *
-           NUM_BUFFER_ALIGNMENT_BYTES;
-}
 
 } // namespace primus_turbo::pytorch::deep_ep

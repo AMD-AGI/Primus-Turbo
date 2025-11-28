@@ -227,6 +227,12 @@ class FakeConfig:
         self.num_max_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens
         self.num_max_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens
 
+    def get_rdma_buffer_size_hint(self, hidden_bytes: int, num_ranks: int) -> int:
+        pass
+
+    def get_nvl_buffer_size_hint(self, hidden_bytes: int, num_ranks: int) -> int:
+        pass
+
     @classmethod
     def __obj_unflatten__(cls, flattened_obj):
         return cls(**dict(flattened_obj))

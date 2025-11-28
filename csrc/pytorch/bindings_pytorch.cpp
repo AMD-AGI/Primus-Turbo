@@ -75,38 +75,13 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
                                                         self->num_max_rdma_chunked_send_tokens),
                                         std::make_tuple("num_max_rdma_chunked_recv_tokens",
                                                         self->num_max_rdma_chunked_recv_tokens));
-             })
-        .def_pickle(
-            // __getstate__
-            [](const c10::intrusive_ptr<deep_ep::Config> &self)
-                -> std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> {
-                return std::make_tuple(self->num_sms, self->num_max_nvl_chunked_send_tokens,
-                                       self->num_max_nvl_chunked_recv_tokens,
-                                       self->num_max_rdma_chunked_send_tokens,
-                                       self->num_max_rdma_chunked_recv_tokens);
-            },
-            //__setstate__
-            [](std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> state)
-                -> c10::intrusive_ptr<deep_ep::Config> {
-                auto [num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
-                      num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens] = state;
-                return c10::make_intrusive<deep_ep::Config>(
-                    num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
-                    num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
-            });
+             });
 
     m.class_<deep_ep::EventHandle>("EventHandle")
         .def(torch::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
-        .def("__obj_flatten__", &deep_ep::EventHandle::obj_flatten)
-        .def_pickle(
-            // __getstate__
-            [](const c10::intrusive_ptr<deep_ep::EventHandle> &self) { return std::make_tuple(); },
-            //__setstate__
-            [](std::tuple<> state) -> c10::intrusive_ptr<deep_ep::EventHandle> {
-                auto handle = c10::make_intrusive<deep_ep::EventHandle>();
-                return handle;
-            });
+        .def("__obj_flatten__",
+             [](c10::intrusive_ptr<deep_ep::EventHandle> self) { return std::make_tuple(); });
 
     m.class_<deep_ep::Buffer>("Buffer")
         .def(torch::init<int64_t, int64_t, int64_t, int64_t, bool, bool, bool>())
@@ -126,22 +101,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
-        .def("__obj_flatten__", &deep_ep::Buffer::obj_flatten)
-        .def_pickle(
-            // __getstate__
-            [](const c10::intrusive_ptr<deep_ep::Buffer> &self)
-                -> std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool> {
-                return std::make_tuple(0, 1, 0, 0, 0, 0, 0);
-            },
-            //__setstate__
-            [](std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool> state)
-                -> c10::intrusive_ptr<deep_ep::Buffer> {
-                auto [rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
-                      explicitly_destroy, use_default_stream_as_comm_stream] = state;
-                return c10::make_intrusive<deep_ep::Buffer>(
-                    rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
-                    explicitly_destroy, use_default_stream_as_comm_stream);
-            });
+        .def("__obj_flatten__", &deep_ep::Buffer::get_state);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {

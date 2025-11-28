@@ -10,7 +10,8 @@ from typing import Union
 import torch
 import triton
 import triton.language as tl
-from triton.language import core, log2
+from triton.language import core
+from triton.language.standard import _log2 as log2
 
 # The following three argsort related kernels are adapted from
 # the issue https://github.com/triton-lang/triton/issues/3698
@@ -192,7 +193,6 @@ def _row_id_map_pass_3_kernel(
     )
 
 
-@torch.compile(fullgraph=True)
 def make_row_id_map(
     routing_map: torch.Tensor,
     num_tokens: int,
@@ -394,7 +394,6 @@ except RuntimeError:
     pass
 
 
-@torch.compile(fullgraph=True)
 def permute_with_mask_map(
     inp: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -574,7 +573,6 @@ except RuntimeError:
     pass
 
 
-@torch.compile(fullgraph=True)
 def unpermute_with_mask_map(
     inp: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -729,7 +727,6 @@ except RuntimeError:
     pass
 
 
-@torch.compile(fullgraph=True)
 def unpermute_with_mask_map_bwd_with_merging_probs(
     fwd_output_grad: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -830,7 +827,6 @@ def _make_chunk_sort_map_kernel(
     tl.store(dst_rows_ptr + pid, dst_row)
 
 
-@torch.compile(fullgraph=True)
 def make_chunk_sort_map(
     split_sizes: torch.Tensor,
     sorted_indices: torch.Tensor,
@@ -924,7 +920,6 @@ except RuntimeError:
     pass
 
 
-@torch.compile(fullgraph=True)
 def sort_chunks_by_map(
     inp: torch.Tensor,
     row_id_map: torch.Tensor,

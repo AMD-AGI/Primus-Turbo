@@ -46,7 +46,10 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
     @parametrize("num_topk", [8])
     @parametrize("num_experts", [128])
     @parametrize("num_sms", [24])
-    def test_intranode(self, num_tokens: int, hidden: int, num_topk: int, num_experts: int, num_sms: int):
+    @parametrize("compiled", [True, False])
+    def test_intranode(
+        self, num_tokens: int, hidden: int, num_topk: int, num_experts: int, num_sms: int, compiled: bool
+    ):
         # Random data
         buffer = self._init_process()
         group = dist.group.WORLD
@@ -55,7 +58,17 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         torch.manual_seed(42 + rank)
 
         tune_and_verify_intranode(
-            num_sms, num_tokens, hidden, num_topk, num_experts, rank, num_ranks, rank, buffer, group
+            num_sms,
+            num_tokens,
+            hidden,
+            num_topk,
+            num_experts,
+            rank,
+            num_ranks,
+            rank,
+            buffer,
+            group,
+            enable_torch_compile=compiled,
         )
 
 

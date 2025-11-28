@@ -343,9 +343,13 @@ def tune_and_verify_intranode(
     buffer: pt.deep_ep.Buffer,
     group: dist.ProcessGroup,
     verbose=True,
+    enable_torch_compile=False,
 ):
     if local_rank == 0 and verbose:
-        print(f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}", flush=True)
+        print(
+            f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, compile={enable_torch_compile}",
+            flush=True,
+        )
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -378,6 +382,35 @@ def tune_and_verify_intranode(
 
     nvl_buffer_size = 256
     config = pt.deep_ep.Config(num_sms, 8, nvl_buffer_size)
+
+    # Create wrapper functions for torch.compile
+    def dispatch_wrapper(buffer_obj, **kwargs):
+        # recompile dispatch function, because the kwargs may be changed in each iteration
+        torch._dynamo.reset()  # Clean compile cache, avoid cache limit.
+
+        def _dispatch(**kwargs):
+            return buffer_obj.dispatch(**kwargs)
+
+        func = torch.compile(_dispatch)
+        return func(**kwargs)
+
+    def combine_wrapper(buffer_obj, **kwargs):
+        # recompile combine function, because the kwargs may be changed in each iteration
+        torch._dynamo.reset()  # Clean compile cache, avoid cache limit.
+
+        def _combine(**kwargs):
+            return buffer_obj.combine(**kwargs)
+
+        func = torch.compile(_combine)
+        return func(**kwargs)
+
+    # Apply torch.compile if enabled
+    if enable_torch_compile:
+        dispatch_fn = dispatch_wrapper
+        combine_fn = combine_wrapper
+    else:
+        dispatch_fn = dispatch_wrapper
+        combine_fn = combine_wrapper
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -425,7 +458,7 @@ def tune_and_verify_intranode(
                         recv_num_tokens_per_expert_list,
                         handle,
                         event,
-                    ) = buffer.dispatch(**dispatch_args)
+                    ) = dispatch_fn(buffer, **dispatch_args)
                     event.current_stream_wait() if async_mode else ()
                     recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
@@ -463,7 +496,7 @@ def tune_and_verify_intranode(
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({"num_worst_tokens": num_worst_tokens})
                         recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = (
-                            buffer.dispatch(**dispatch_args)
+                            dispatch_fn(buffer, **dispatch_args)
                         )
                         event.current_stream_wait() if async_mode else ()
                         recv_worst_x = (
@@ -490,7 +523,7 @@ def tune_and_verify_intranode(
                         }
                         if previous_mode:
                             dispatch_args.update({"previous_event": buffer.capture()})
-                        recv_x, _, _, _, _, event = buffer.dispatch(**dispatch_args)
+                        recv_x, _, _, _, _, event = dispatch_fn(buffer, **dispatch_args)
                         event.current_stream_wait() if async_mode else ()
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if current_x is not x_pure_rand:
@@ -507,7 +540,7 @@ def tune_and_verify_intranode(
                         combine_args.update({"topk_weights": recv_topk_weights})
                     if previous_mode:
                         combine_args.update({"previous_event": buffer.capture()})
-                    combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
+                    combined_x, combined_topk_weights, event = combine_fn(buffer, **combine_args)
                     event.current_stream_wait() if async_mode else ()
                     check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if current_x is x_pure_rand else x

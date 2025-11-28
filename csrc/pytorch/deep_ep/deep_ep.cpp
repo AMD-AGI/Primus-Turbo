@@ -1357,7 +1357,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
                std::tuple<std::string, bool>, std::tuple<std::string, bool>,
                std::tuple<std::string, bool>>
-    Buffer::obj_flatten() const {
+    Buffer::get_state() const {
         auto state =
             std::make_tuple(std::make_tuple("rank", rank), std::make_tuple("num_ranks", num_ranks),
                             std::make_tuple("num_nvl_bytes", num_nvl_bytes),
@@ -1368,47 +1368,4 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                                             use_default_stream_as_comm_stream));
         return state;
     }
-
-    std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool, bool> Buffer::get_state()
-        const {
-        return std::make_tuple(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
-                               explicitly_destroy, use_default_stream_as_comm_stream, available);
-    }
-
-    c10::intrusive_ptr<Buffer> make_buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes,
-                                           int64_t num_rdma_bytes, bool low_latency_mode,
-                                           bool explicitly_destroy,
-                                           bool use_default_stream_as_comm_stream, bool available) {
-        auto buffer = c10::make_intrusive<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes,
-                                                  low_latency_mode, explicitly_destroy,
-                                                  use_default_stream_as_comm_stream);
-
-        // if (available) {
-        //     // NOTE: call Buffer::sync() at Python side if available is true
-        //     auto group = c10d::resolve_process_group(group_name);
-        //     auto rank = group->getRank();
-        //     auto num_ranks = group->getSize();
-        //     auto fake_device_ids =  std::vector<int64_t>(num_ranks, -1);
-        //     PRIMUS_TURBO_CHECK(group->getBackendType() == c10d::ProcessGroup::BackendType::NCCL);
-        //     auto option_cpu = at::TensorOptions(torch::kUInt8).device(at::kCPU);
-        //     auto option_gpu = at::TensorOptions(torch::kUInt8).device(at::kCUDA);
-
-        //     auto local_ipc_handle = buffer->get_local_ipc_handle();
-        //     auto gpu_ipc_handles = torch::empty({num_ranks, HIP_IPC_HANDLE_SIZE}, option_gpu);
-        //     auto gpu_local_ipc_handle = local_ipc_handle.to(option_gpu);
-        //     group->_allgather_base(gpu_ipc_handles, gpu_local_ipc_handle)->wait();
-        //     auto ipc_handles = gpu_ipc_handles.to(option_cpu);
-
-        //     std::optional<torch::Tensor> root_unique_id;
-        //     if ((low_latency_mode and rank == 0) or (not low_latency_mode and
-        //     buffer->get_rdma_rank() == 0))
-        //         root_unique_id = buffer->get_local_nvshmem_unique_id();
-
-        //     buffer->sync(fake_device_ids, ipc_handles, root_unique_id);
-        //     PRIMUS_TURBO_CHECK(buffer->is_available());
-        // }
-
-        return buffer;
-    }
-
 } // namespace primus_turbo::pytorch::deep_ep

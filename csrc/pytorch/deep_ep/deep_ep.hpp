@@ -83,9 +83,7 @@ public:
                std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
                std::tuple<std::string, bool>, std::tuple<std::string, bool>,
                std::tuple<std::string, bool>>
-    obj_flatten() const;
-
-    std::tuple<int64_t, int64_t, int64_t, int64_t, bool, bool, bool, bool> get_state() const;
+    get_state() const;
 
     ~Buffer() override;
 
