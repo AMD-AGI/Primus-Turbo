@@ -178,8 +178,7 @@ class Buffer:
         """
 
         assert new_num_sms % 2 == 0, "The SM count must be even"
-        # TODO
-        # Buffer.num_sms = new_num_sms
+        Buffer.num_sms = new_num_sms
 
     @staticmethod
     def capture() -> EventOverlap:
