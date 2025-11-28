@@ -29,8 +29,6 @@ IMPL_TABLE[moe_combine_p] = partial(xla.apply_primitive, moe_combine_p)
 # Step-3: Abstract eval
 # ----------------------------------------
 
-num_ranks = 8
-
 
 def _moe_combine_abstract_eval(
     x: jnp.ndarray,
