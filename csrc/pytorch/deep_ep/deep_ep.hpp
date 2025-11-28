@@ -85,7 +85,7 @@ public:
                std::tuple<std::string, bool>>
     get_state() const;
 
-    ~Buffer() override;
+    ~Buffer() noexcept(false) override;
 
     bool is_available() const;
 

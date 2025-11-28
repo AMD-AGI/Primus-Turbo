@@ -11,7 +11,6 @@
 #include <chrono>
 #include <hip/hip_runtime.h>
 #include <pybind11/functional.h>
-#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/python.h>
 
 #include "primus_turbo/deep_ep/api.h"
@@ -91,7 +90,7 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
     PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
     // MoE counter
-    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_counter, sizeof(int), hipHostAllocMapped));
+    PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_counter, sizeof(int64_t), hipHostAllocMapped));
     PRIMUS_TURBO_CHECK_HIP(
         hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_counter_mapped),
                                 const_cast<int *>(moe_recv_counter), 0));
@@ -117,7 +116,7 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
     }
 }
 
-Buffer::~Buffer() {
+Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy) {
         destroy();
     } else if (not destroyed) {
@@ -154,15 +153,23 @@ int64_t Buffer::get_local_device_id() const {
 torch::Tensor Buffer::get_local_ipc_handle() const {
     auto handle = std::vector<uint8_t>(ipc_handles[nvl_rank].reserved,
                                        ipc_handles[nvl_rank].reserved + HIP_IPC_HANDLE_SIZE);
-    return torch::tensor(handle, at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+    auto handle_tensor =
+        torch::from_blob(handle.data(), {HIP_IPC_HANDLE_SIZE},
+                         at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+    // avoid memory leak
+    return handle_tensor.clone();
 }
 
 torch::Tensor Buffer::get_local_nvshmem_unique_id() const {
 #ifndef DISABLE_ROCSHMEM
     PRIMUS_TURBO_CHECK(rdma_rank == 0 and "Only RDMA rank 0 can get ROCSHMEM unique ID");
     auto unique_id = primus_turbo::deep_ep::internode::get_unique_id();
-    return torch::from_blob(unique_id.data(), {unique_id.size()},
-                            at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+    auto unique_id_tensor =
+        torch::from_blob(unique_id.data(), {unique_id.size()},
+                         at::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+
+    // avoid memory leak
+    return unique_id_tensor.clone();
 #else
     PRIMUS_TURBO_CHECK(false, "rocSHMEM is disabled during compilation, please install rocSHMEM by "
                               "following docs/install_dependencies.md");
@@ -185,9 +192,6 @@ torch::Stream Buffer::get_comm_stream() const {
 
 void Buffer::destroy() {
     PRIMUS_TURBO_CHECK(not destroyed);
-
-    if (not available)
-        return;
 
     // Synchronize
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());

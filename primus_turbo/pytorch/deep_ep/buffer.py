@@ -108,7 +108,10 @@ class Buffer:
             None,
         ] * self.group_size
         local_ipc_handle = self.runtime.get_local_ipc_handle()
+        # uint8 tensor cast to int64_t python list
         dist.all_gather_object(ipc_handles, local_ipc_handle.tolist(), group)
+        # int64_t python list cast to uint8 tensor
+        ipc_handles = [torch.tensor(ipc_handle, dtype=torch.uint8) for ipc_handle in ipc_handles]
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
@@ -141,12 +144,16 @@ class Buffer:
                 not low_latency_mode and self.runtime.get_rdma_rank() == 0
             ):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
-            dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
+            # uint8 tensor cast to int64_t python list
+            dist.all_gather_object(nvshmem_unique_ids, root_unique_id.tolist(), group)
             root_unique_id = nvshmem_unique_ids[
                 0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)
             ]
 
         # Make CPP runtime available
+        if root_unique_id is not None:
+            # int64_t python list cast to uint8 tensor
+            root_unique_id = torch.tensor(root_unique_id, dtype=torch.uint8)
         self.runtime.sync(torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
         assert self.runtime.is_available()
 
