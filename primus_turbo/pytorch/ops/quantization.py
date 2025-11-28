@@ -42,7 +42,7 @@ def quantize_fp8(
 
         For MXFP8 quantization:
             1. The x must be 2D tensor.
-            2. The axis mean direction of quantization. The 0 means along column direction and 1 means along row direction.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
     """
@@ -79,7 +79,7 @@ def dequantize_fp8(
 
         For MXFP8 quantization:
             1. The x must be 2D tensor.
-            2. The axis mean direction of de-quantization. The 0 means along column direction and 1 means along row direction.
+            2. The axis means direction of de-quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.TENSORWISE:

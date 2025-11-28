@@ -227,7 +227,7 @@ def dequantize_mxfp8_kernel(
             if not TRANS:
                 store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
                 y_ptr_current_chunk = (
-                    y_ptr + offsets_Y[:, None] * stride_x_row + offsets_X[None, :] * stride_x_col
+                    y_ptr + offsets_Y[:, None] * stride_y_row + offsets_X[None, :] * stride_y_col
                 )
                 tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)
             else:
