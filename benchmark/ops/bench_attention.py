@@ -78,7 +78,7 @@ def bench_turbo_attention(batch, config, causal: bool, backend_type: str, use_fp
             backend_type=backend_type,
         )
     else:
-        fn_forward = lambda: pt.ops.attention_fp8_blockwise(
+        fn_forward = lambda: pt.ops.flash_attn_fp8_func(
             query,
             key,
             value,
@@ -91,7 +91,6 @@ def bench_turbo_attention(batch, config, causal: bool, backend_type: str, use_fp
             deterministic=False,
             return_lse=False,
             return_attn_probs=False,
-            backend_type=backend_type,
         )
 
     # Forward pass
