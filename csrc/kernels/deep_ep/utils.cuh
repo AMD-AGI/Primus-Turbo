@@ -13,10 +13,11 @@
 #define __syncwarp() __builtin_amdgcn_wave_barrier()
 #ifndef clock64
 #define clock64 wall_clock64
-
+#endif
 #ifndef DISABLE_AGGRESSIVE_ATOMIC
-#define HIP_ATOMIC_LOAD(ptr, order, scope) __builtin_nontemporal_load((ptr))
-#define HIP_ATOMIC_STORE(val, ptr, order, scope) __builtin_nontemporal_store((val), (ptr))
+#define HIP_ATOMIC_LOAD(ptr, order, scope) __hip_atomic_load((ptr), __ATOMIC_RELAXED, (scope))
+#define HIP_ATOMIC_STORE(val, ptr, order, scope)                                                   \
+    __hip_atomic_store((ptr), (val), __ATOMIC_RELAXED, (scope))
 #define HIP_ATOMIC_ADD(ptr, val, order, scope)                                                     \
     __hip_atomic_fetch_add((ptr), (val), __ATOMIC_RELAXED, (scope))
 #else
@@ -27,7 +28,7 @@
 #endif
 
 // workgroup-level barrier sync used shared memory
-
+namespace primus_turbo::deep_ep {
 struct SharedData {
     uint32_t barrier[MAX_GROUPS];
 };
@@ -184,6 +185,7 @@ template <typename dtype_t> __device__ __forceinline__ dtype_t ld_nc_global(dtyp
 template <> __device__ __forceinline__ uint8_t ld_nc_global(uint8_t const *ptr) {
     uint16_t ret;
     ret = __builtin_nontemporal_load(ptr);
+    return ret;
 }
 
 template <> __device__ __forceinline__ int ld_nc_global(int const *ptr) {
@@ -389,35 +391,31 @@ template <bool kUseUnsafedSync = false> __device__ inline void sync_barrier_1(in
     workgroup_sync_barrier<kUseUnsafedSync>(1, num_threads);
 }
 
-__device__ inline void sys_membar() {
-    asm volatile("membar.sys;" ::: "memory");
-}
-
 __device__ __forceinline__ void trap() {
     abort();
 }
 
 __device__ __forceinline__ int ld_volatile_global(int const *ptr) {
     int ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    ret = HIP_ATOMIC_LOAD(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
 
 __device__ __forceinline__ float ld_volatile_global(float const *ptr) {
     float ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    ret = HIP_ATOMIC_LOAD(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
 
 __device__ __forceinline__ int64_t ld_volatile_global(int64_t const *ptr) {
     int64_t ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    ret = HIP_ATOMIC_LOAD(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
 
 __device__ __forceinline__ int64_t ld_volatile_global(uint64_t const *ptr) {
     int64_t ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    ret = HIP_ATOMIC_LOAD(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
 
@@ -455,7 +453,7 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
         atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
         atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
     }
-    EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
+    PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= blockDim.x);
 
     // Check timeout
     auto start_time = clock64();
@@ -523,3 +521,4 @@ __forceinline__ __device__ void release_lock(int *mutex) {
     // use `release` for memory semantics
     atomic_exch_cta_release(mutex, 0);
 }
+} // namespace primus_turbo::deep_ep

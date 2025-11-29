@@ -26,8 +26,8 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
                 int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank) {
     auto sm_id     = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
-    auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize,
-         num_warps = num_threads / kWarpSize;
+    auto lane_id = thread_id % WARP_SIZE, warp_id = thread_id / WARP_SIZE,
+         num_warps = num_threads / WARP_SIZE;
 
     if (sm_id == 0) {
         // Barrier first
@@ -101,7 +101,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
 
             // Iterate over tokens
             int count = 0;
-            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += kWarpSize)
+            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += WARP_SIZE)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
             if (lane_id == 0)
@@ -198,7 +198,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     int num_experts_per_rank = num_experts / kNumRanks;
     PRIMUS_TURBO_DEVICE_CHECK(num_experts_per_rank > 0 or num_topk == 0);
-    PRIMUS_TURBO_DEVICE_CHECK(num_topk <= kWarpSize);
+    PRIMUS_TURBO_DEVICE_CHECK(num_topk <= WARP_SIZE);
     PRIMUS_TURBO_DEVICE_CHECK((topk_idx == nullptr) == (topk_weights == nullptr));
     PRIMUS_TURBO_DEVICE_CHECK((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
@@ -247,11 +247,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     if (is_sender) {
         // Workers for sending
-        constexpr int num_send_warps          = kNumThreads / kWarpSize;
+        constexpr int num_send_warps          = kNumThreads / WARP_SIZE;
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto    send_thread_id          = thread_id;
-        const auto    send_warp_id_in_rank    = send_thread_id % num_threads_per_rank / kWarpSize;
-        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= kWarpSize);
+        const auto    send_warp_id_in_rank    = send_thread_id % num_threads_per_rank / WARP_SIZE;
+        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= WARP_SIZE);
         PRIMUS_TURBO_DEVICE_CHECK(num_send_warps % kNumRanks == 0);
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
@@ -346,7 +346,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
 // Copy `x_scales`
 #pragma unroll 2
-                    for (int i = lane_id; i < num_scales; i += kWarpSize) {
+                    for (int i = lane_id; i < num_scales; i += WARP_SIZE) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
                         channel_x_scales_buffers[dst_slot_idx * num_scales + i] =
                             __ldg(x_scales + offset);
@@ -359,7 +359,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            if (num_threads_per_rank > kWarpSize) {
+            if (num_threads_per_rank > WARP_SIZE) {
                 __syncthreads();
             } else {
                 __syncwarp();
@@ -369,12 +369,12 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         }
     } else {
         // Workers for receiving and copying into buffer
-        constexpr int num_recv_warps          = kNumThreads / kWarpSize;
+        constexpr int num_recv_warps          = kNumThreads / WARP_SIZE;
         constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto    recv_thread_id          = thread_id;
         const auto    recv_thread_id_in_rank  = recv_thread_id % num_threads_per_rank;
-        const auto    recv_warp_id_in_rank    = recv_thread_id_in_rank / kWarpSize;
-        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= kWarpSize);
+        const auto    recv_warp_id_in_rank    = recv_thread_id_in_rank / WARP_SIZE;
+        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= WARP_SIZE);
         PRIMUS_TURBO_DEVICE_CHECK(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Calculate offset first
@@ -398,9 +398,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     total_offset;
             num_tokens_to_recv -= total_offset;
         }
-        total_offset = __shfl_sync(kFullWarpMask, total_offset, 0);
+        total_offset = __shfl_sync(WARP_MASK, total_offset, 0);
         total_offset += rank_offset;
-        num_tokens_to_recv = __shfl_sync(kFullWarpMask, num_tokens_to_recv, 0);
+        num_tokens_to_recv = __shfl_sync(WARP_MASK, num_tokens_to_recv, 0);
 
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
@@ -411,7 +411,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by
             // different warps are the same
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
+                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -429,7 +429,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            if (num_threads_per_rank > kWarpSize) {
+            if (num_threads_per_rank > WARP_SIZE) {
                 __syncthreads();
             } else {
                 __syncwarp();
@@ -454,14 +454,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 #pragma unroll 2
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank;
                  chunk_idx < cached_channel_tail_idx;
-                 chunk_idx += kWarpSize * num_recv_warps_per_rank)
+                 chunk_idx += WARP_SIZE * num_recv_warps_per_rank)
                 recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] = ld_nc_global(
                     channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
 
 // Copy `topk_idx` and `topk_weights`
 #pragma unroll 2
             for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk;
-                 idx += kWarpSize * num_recv_warps_per_rank) {
+                 idx += WARP_SIZE * num_recv_warps_per_rank) {
                 int chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
                 int token_idx_in_buffer =
                     (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
@@ -477,7 +477,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 // Copy `x_scales`
 #pragma unroll 2
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales;
-                 i += kWarpSize * num_recv_warps_per_rank) {
+                 i += WARP_SIZE * num_recv_warps_per_rank) {
                 int chunk_idx = i / num_scales, scales_idx = i % num_scales;
                 int token_idx_in_buffer =
                     (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
@@ -490,7 +490,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            if (num_threads_per_rank > kWarpSize) {
+            if (num_threads_per_rank > WARP_SIZE) {
                 __syncthreads();
             } else {
                 __syncwarp();
@@ -568,8 +568,8 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
     } else {
         const auto channel_id = sm_id - 1;
         const auto thread_id  = static_cast<int>(threadIdx.x);
-        const auto rank_id    = thread_id / kWarpSize;
-        const auto lane_id    = thread_id % kWarpSize;
+        const auto rank_id    = thread_id / WARP_SIZE;
+        const auto lane_id    = thread_id % WARP_SIZE;
         if (rank_id >= kNumRanks)
             return;
 
@@ -580,13 +580,13 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
         // NOTES: `1 << 25` is a heuristic large number
         int last_head = 1 << 25;
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx;
-             token_idx_tail -= kWarpSize) {
+             token_idx_tail -= WARP_SIZE) {
             int  token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx)
                                     ? __ldg(send_head + token_idx * kNumRanks + rank_id)
                                     : -1;
-            for (int i = 0; i < min(kWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
-                const int head = __shfl_sync(kFullWarpMask, current_head, i);
+            for (int i = 0; i < min(WARP_SIZE, token_idx_tail - token_start_idx + 1); ++i) {
+                const int head = __shfl_sync(WARP_MASK, current_head, i);
                 if (head < 0) {
                     if (lane_id == i)
                         expected_head = -last_head - 1;
@@ -609,7 +609,7 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
                                   barrier_signal_ptrs, rank);                                      \
     break
 
-    const int num_threads = std::max(128, kWarpSize * num_ranks);
+    const int num_threads = std::max(128, WARP_SIZE * num_ranks);
     PRIMUS_TURBO_CHECK(num_ranks <= num_threads);
     PRIMUS_TURBO_CHECK(num_threads <= 1024);
     PRIMUS_TURBO_CHECK(1 + num_channels <= num_channels * 2);
@@ -631,7 +631,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     const auto num_channels        = num_sms / 2;
     const bool is_sender           = sm_id % 2 == 0;
     const int  responsible_channel = sm_id / 2;
-    PRIMUS_TURBO_DEVICE_CHECK(num_topk <= kWarpSize);
+    PRIMUS_TURBO_DEVICE_CHECK(num_topk <= WARP_SIZE);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
     int           hidden_int4   = hidden * sizeof(dtype_t) / sizeof(int4);
@@ -643,14 +643,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
-        constexpr int num_send_warps_per_rank = (kNumThreads / kWarpSize) / kNumRanks;
+        constexpr int num_send_warps_per_rank = (kNumThreads / WARP_SIZE) / kNumRanks;
         constexpr int num_send_warps          = num_send_warps_per_rank * kNumRanks;
-        const auto    num_threads_per_rank    = num_send_warps_per_rank * kWarpSize;
+        const auto    num_threads_per_rank    = num_send_warps_per_rank * WARP_SIZE;
         const auto    send_thread_id          = thread_id;
-        const auto    send_warp_id            = send_thread_id / kWarpSize;
+        const auto    send_warp_id            = send_thread_id / WARP_SIZE;
         const auto    send_rank_id            = (responsible_channel + send_warp_id) % kNumRanks;
         const auto    send_warp_id_in_rank    = send_warp_id / kNumRanks;
-        PRIMUS_TURBO_STATIC_CHECK(num_send_warps * kWarpSize == kNumThreads, "Invalid warp count");
+        PRIMUS_TURBO_STATIC_CHECK(num_send_warps * WARP_SIZE == kNumThreads, "Invalid warp count");
 
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void *>(static_cast<int8_t *>(buffer_ptrs[send_rank_id]));
@@ -713,6 +713,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         rank, responsible_channel);
                     trap();
                 }
+                __builtin_amdgcn_s_sleep(1);
             }
             __syncwarp();
 
@@ -725,7 +726,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x         = x_int4 + (token_idx + i) * hidden_int4;
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x,
+
+                UNROLLED_WARP_COPY(1, lane_id, hidden_int4, shifted_x_buffers, shifted_x,
                                    ld_nc_global, st_na_global);
 
                 // Send source index
@@ -736,81 +738,38 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 if (num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
                         __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+
+                __syncwarp();
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            if (num_threads_per_rank > kWarpSize) {
-                __syncthreads();
-            } else {
-                __syncwarp();
-            }
+            __syncthreads();
             if (lane_id == 0 and send_warp_id_in_rank == 0)
                 st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
         // One warp for moving the queue head, others for reduction
-        constexpr int num_recv_warps = kNumThreads / kWarpSize;
-        const auto    recv_warp_id   = thread_id / kWarpSize;
-        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= kWarpSize and kNumThreads > kWarpSize);
-        PRIMUS_TURBO_DEVICE_CHECK(thread_id >= 0 and kNumThreads % kWarpSize == 0);
+        constexpr int num_recv_warps = kNumThreads / WARP_SIZE;
+        const auto    recv_warp_id   = thread_id / WARP_SIZE;
+        PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= WARP_SIZE and kNumThreads > WARP_SIZE);
+        PRIMUS_TURBO_DEVICE_CHECK(thread_id >= 0 and kNumThreads % WARP_SIZE == 0);
 
         int *channel_head_idx_ptr =
             static_cast<int *>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
         int *channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
         // Shared head, tail and retired flags for receiver warps
-        __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
-        //__shared__ volatile int  channel_tail_idx[kNumRanks];
+        __shared__ volatile int  warp_channel_head_idx[num_recv_warps][kNumRanks];
         __shared__ volatile bool warp_retired[num_recv_warps];
-
-        __shared__ volatile int last_head[kNumRanks];
-        __shared__ volatile int min_head[kNumRanks];
-        if (thread_id < num_recv_warps) {
+        if (thread_id < num_recv_warps)
             warp_retired[thread_id] = false;
-        }
 
-        if (lane_id < kNumRanks) {
-            last_head[lane_id]                           = 0;
+        if (lane_id < kNumRanks)
             warp_channel_head_idx[recv_warp_id][lane_id] = 0;
-        }
-
-        // if (thread_id < kNumRanks)
-        //     channel_tail_idx[thread_id] = 0;
 
         __syncthreads();
-
-        //         if (thread_id < kWarpSize) {
-        //             int *channel_head_idx_ptr =
-        //                 static_cast<int *>(buffer_ptrs[rank]) + responsible_channel * kNumRanks +
-        //                 lane_id;
-        //             int *channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
-
-        //             // Queue head updater
-        //             int last_head = 0;
-        //             while (lane_id < kNumRanks) {
-        //                 // Check retired
-        //                 bool retired = true;
-        // #pragma unroll 2
-        //                 for (int i = 1; i < num_recv_warps; ++i)
-        //                     retired = retired and warp_retired[i];
-        //                 if (retired)
-        //                     break;
-
-        //                 // Update queue tail
-        //                 channel_tail_idx[lane_id] = ld_relaxed_sys_global(channel_tail_idx_ptr);
-
-        //                 // Update minimum head
-        //                 int min_head = std::numeric_limits<int>::max();
-        // #pragma unroll 2
-        //                 for (int i = 1; i < num_recv_warps; ++i)
-        //                     if (not warp_retired[i])
-        //                         min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
-        //                 if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
-        //                     st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
-        //             }
-        //         } else {
         // Receivers
         // Channel metadata
         // All lanes will use data buffer, but only rank lane will use `head/tail/src_idx`
@@ -865,9 +824,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             int cached_channel_tail_idx = 0;
             while (true) {
                 if (lane_id < kNumRanks)
-                    cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx_ptr);
+                    cached_channel_tail_idx = ld_volatile_global(channel_tail_idx_ptr);
 
-                if (__any_sync(kFullWarpMask,
+                if (__any_sync(WARP_MASK,
                                cached_channel_tail_idx >= expected_head or expected_head < 0))
                     break;
 
@@ -894,7 +853,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
 // Reduce data
 #pragma unroll 4
-            for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
+            for (int i = lane_id; i < hidden_int4; i += WARP_SIZE) {
                 // Read bias
                 // TODO: make it as a template
                 int4  bias_0_value_int4     = bias_0_int4 != nullptr
@@ -948,10 +907,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 __syncthreads();
                 if (recv_warp_id == 0) {
                     // Update minimum head
-                    int min_head = lane_id < num_recv_warps
-                                       ? warp_channel_head_idx[lane_id][lane_id]
-                                       : std::numeric_limits<int>::max();
-                    min_head     = warp_reduce_min(min_head);
+                    int min_head = std::numeric_limits<int>::max();
+#pragma unroll
+                    for (int i = 0; i < num_recv_warps; ++i)
+                        min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
                     if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
                         st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
                 }
@@ -990,7 +949,7 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
     PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
-    PRIMUS_TURBO_CHECK(kNumThreads >= num_ranks * kWarpSize);
+    PRIMUS_TURBO_CHECK(kNumThreads >= num_ranks * WARP_SIZE);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
