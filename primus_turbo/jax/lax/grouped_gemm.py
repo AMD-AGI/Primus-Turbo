@@ -16,7 +16,7 @@ from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import (
     grouped_gemm_variable_k_p,
 )
 
-__all__ = ["grouped_gemm", "compute_group_offs"]
+__all__ = ["grouped_gemm", "compute_group_offs", "clear_gemm_workspace_cache"]
 
 
 def compute_group_offs(group_lens):
@@ -34,6 +34,12 @@ def compute_group_offs(group_lens):
 # Workspace cache for grouped_gemm
 # Use a simple dict with (group_num, args_size) as key
 _workspace_cache = {}
+
+
+def clear_gemm_workspace_cache():
+    """Clear the grouped gemm workspace cache to free GPU memory."""
+    global _workspace_cache
+    _workspace_cache.clear()
 
 
 def _get_workspace(group_num):

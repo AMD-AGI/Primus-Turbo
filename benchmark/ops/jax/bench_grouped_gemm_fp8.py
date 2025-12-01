@@ -130,9 +130,9 @@ def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, format, granularity, trans_b, 
     a_grad_snr = compute_snr(grad_a_ref.astype(ori_dtype), grad_a)
     b_grad_snr = compute_snr(grad_b_ref.astype(ori_dtype), grad_b)
 
-    # Adjust SNR threshold for gradient checks
-    # FP8 quantization has higher error in gradients, especially for certain M/N/K combinations
-    # Test cases use M in [128, 1024, 4096], but benchmark uses wider range
+    # Adjust SNR threshold for gradient checks.
+    # FP8 quantization accumulates error through the backward pass, resulting in lower SNR
+    # for gradients. This is especially pronounced for certain M/N/K combinations.
     grad_snr_threshold = 15  # Relaxed threshold for gradients (forward uses snr_threshold)
 
     if a_grad_snr <= grad_snr_threshold:

@@ -19,11 +19,17 @@ from ..primitive.quantization import (
     quantize_fp8_tensorwise_p,
 )
 
-__all__ = ["quantize_fp8", "dequantize_fp8"]
+__all__ = ["quantize_fp8", "dequantize_fp8", "clear_quantize_workspace_cache"]
 
 
 # Workspace cache for quantization
 _quantize_workspace_cache = {}
+
+
+def clear_quantize_workspace_cache():
+    """Clear the quantization workspace cache to free GPU memory."""
+    global _quantize_workspace_cache
+    _quantize_workspace_cache.clear()
 
 
 def _get_quantize_workspace(n, is_rowwise=False, B=1, M=1, N=1, is_row_major=True):

@@ -28,11 +28,17 @@ from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_fp8 import (
     grouped_gemm_fp8_variable_k_p,
 )
 
-__all__ = ["grouped_gemm_fp8"]
+__all__ = ["grouped_gemm_fp8", "clear_workspace_cache"]
 
 
 # Workspace cache for grouped_gemm_fp8
 _workspace_cache = {}
+
+
+def clear_workspace_cache():
+    """Clear the workspace cache to free GPU memory."""
+    global _workspace_cache
+    _workspace_cache.clear()
 
 
 def _get_workspace(group_num):
@@ -269,7 +275,8 @@ def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
         out_dtype_str=out_dtype_str_b,
     )
 
-    # group_lens and group_offs are differentiable args but don't have gradients
+    # group_lens and group_offs are integer indices used for grouping;
+    # they are not differentiable parameters, so their gradients are always None.
     return grad_a, grad_b, None, None
 
 
@@ -435,7 +442,7 @@ def _grouped_gemm_fp8_blockwise(a, b, group_lens, group_offs, trans_b, config, n
     This is a placeholder for future implementation.
     """
     raise NotImplementedError(
-        "BLOCKWISE quantization is not yet implemented in JAX. " "Please use TENSORWISE granularity."
+        "BLOCKWISE quantization is not yet implemented in JAX. Please use TENSORWISE or ROWWISE granularity."
     )
 
 
