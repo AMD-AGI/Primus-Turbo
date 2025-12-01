@@ -16,7 +16,6 @@ from primus_turbo.jax.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.jax.lax import grouped_gemm_fp8
-from tests.jax.ref.fp8_ref import grouped_gemm_fp8_reference
 from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
 from tests.jax.test_utils import compute_snr
 

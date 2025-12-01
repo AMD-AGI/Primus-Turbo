@@ -241,7 +241,7 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     const int64_t strideBK = transB ? 1 : n;
 
     args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
-    args_ptr[group_id].group_karg.bq_ptr = bq_ptr;   
+    args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
 
     // Set data pointers
     args_ptr[group_id].group_karg.a_ptr     = a_ptr + group_offs_ptr[group_id] * strideAK;

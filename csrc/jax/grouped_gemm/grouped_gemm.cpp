@@ -585,7 +585,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
     auto          input_dtype = a_fp16.element_type();
     ffi::DataType fp8_dtype;
     float         fp8_max;
-    bool use_ocp = is_gfx950();
+    bool          use_ocp = is_gfx950();
     if (fp8_dtype_str == "e4m3" || fp8_dtype_str == "float8_e4m3fn") {
         fp8_dtype = use_ocp ? ffi::F8E4M3FN : ffi::F8E4M3FNUZ;
     } else {
