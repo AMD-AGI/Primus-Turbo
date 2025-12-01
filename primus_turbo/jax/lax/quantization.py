@@ -19,7 +19,59 @@ from ..primitive.quantization import (
     quantize_fp8_tensorwise_p,
 )
 
-__all__ = ["quantize_fp8", "dequantize_fp8"]
+__all__ = ["quantize_fp8", "dequantize_fp8", "clear_quantize_workspace_cache"]
+
+
+# Workspace cache for quantization
+_quantize_workspace_cache = {}
+
+
+def clear_quantize_workspace_cache():
+    """Clear the quantization workspace cache to free GPU memory."""
+    global _quantize_workspace_cache
+    _quantize_workspace_cache.clear()
+
+
+def _get_quantize_workspace(n, is_rowwise=False, B=1, M=1, N=1, is_row_major=True):
+    """Get or create workspace buffer for quantization.
+
+    Args:
+        n: Total number of elements (for tensorwise)
+        is_rowwise: Whether this is rowwise quantization
+        B, M, N: Dimensions for rowwise quantization
+        is_row_major: Memory layout for rowwise
+
+    Returns:
+        Workspace buffer of appropriate size
+    """
+    if is_rowwise:
+        # Calculate rowwise workspace size
+        if is_row_major:
+            ws_size = ((B * N * 4 + 255) // 256) * 256  # temp_scale buffer
+        else:
+            # Col-major: amax + reduce workspace
+            # Simplified estimate: B*N*4 for amax + B*M*N*4 for reduce workspace
+            amax_size = ((B * N * 4 + 255) // 256) * 256
+            reduce_ws_size = ((B * M * N * 4 + 255) // 256) * 256  # Rough estimate
+            ws_size = amax_size + reduce_ws_size
+        cache_key = ("rowwise", B, M, N, is_row_major)
+    else:
+        # Tensorwise workspace size
+        # amax(256) + reduce_ws + scale(256) + scale_inv(256)
+        # Simplified: 256 + n*4 + 512
+        ws_size = 256 + ((n * 4 + 255) // 256) * 256 + 512
+        cache_key = ("tensorwise", n)
+
+    # Check cache
+    if cache_key in _quantize_workspace_cache:
+        cached_workspace, cached_size = _quantize_workspace_cache[cache_key]
+        if cached_size >= ws_size:
+            return cached_workspace
+
+    # Create new workspace
+    workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+    _quantize_workspace_cache[cache_key] = (workspace, ws_size)
+    return workspace
 
 
 def quantize_fp8(
@@ -68,8 +120,12 @@ def quantize_fp8(
                 scale = scale.reshape(1)
             scale_opt = scale
 
-        # Call primitive: (input, scale_opt) + out_dtype_str -> (output, scale_inv)
-        x_q, scale_inv = quantize_fp8_tensorwise_p.bind(x, scale_opt, out_dtype_str=out_dtype_str)
+        # Get workspace for tensorwise quantization
+        n = x.size
+        workspace = _get_quantize_workspace(n, is_rowwise=False)
+
+        # Call primitive: (input, scale_opt, workspace) + out_dtype_str -> (output, scale_inv)
+        x_q, scale_inv = quantize_fp8_tensorwise_p.bind(x, scale_opt, workspace, out_dtype_str=out_dtype_str)
 
         return x_q, scale_inv
 
@@ -85,8 +141,32 @@ def quantize_fp8(
                 scale = jnp.array(scale, dtype=jnp.float32)
             scale_opt = scale
 
-        # Call primitive: (input, scale_opt) + out_dtype_str, axis -> (output, scale_inv)
-        x_q, scale_inv = quantize_fp8_rowwise_p.bind(x, scale_opt, out_dtype_str=out_dtype_str, axis=axis)
+        # Get workspace for rowwise quantization
+        # Normalize axis and derive B/M/N consistent with C++ implementation.
+        shape = x.shape
+        ndim = len(shape)
+        axis = axis if axis >= 0 else ndim + axis
+        if axis < 0 or axis >= ndim:
+            raise ValueError(f"axis {axis} is out of bounds for shape {shape}")
+
+        # B = product of dimensions before axis, N = product after axis
+        def _prod(vals):
+            out = 1
+            for v in vals:
+                out *= v
+            return out
+
+        B = _prod(shape[:axis]) if axis > 0 else 1
+        M = shape[axis]
+        N = _prod(shape[axis + 1 :]) if axis < ndim - 1 else 1
+        is_row_major = axis == ndim - 1
+
+        workspace = _get_quantize_workspace(0, is_rowwise=True, B=B, M=M, N=N, is_row_major=is_row_major)
+
+        # Call primitive: (input, scale_opt, workspace) + out_dtype_str, axis -> (output, scale_inv)
+        x_q, scale_inv = quantize_fp8_rowwise_p.bind(
+            x, scale_opt, workspace, out_dtype_str=out_dtype_str, axis=axis
+        )
 
         return x_q, scale_inv
 

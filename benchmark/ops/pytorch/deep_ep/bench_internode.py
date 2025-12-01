@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(os.path.dirname(__file__)).parent.parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from benchmark.ops.deep_ep.model_cfg import DeepEPModelCfg, get_model_cfg
+from benchmark.ops.pytorch.deep_ep.model_cfg import DeepEPModelCfg, get_model_cfg
 from tests.pytorch.ref.deep_ep_ref import tune_and_verify_internode
 
 # fmt: on

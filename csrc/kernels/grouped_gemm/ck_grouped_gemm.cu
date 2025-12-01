@@ -239,18 +239,13 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
 
     const int64_t strideAK = transA ? m : 1;
     const int64_t strideBK = transB ? 1 : n;
-    if (QuantMode == ck_tile::QuantType::TensorQuant) {
-        args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
-        args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
-    } else if (QuantMode == ck_tile::QuantType::RowColQuant) {
-        args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_id * m;
-        ;
-        args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * n;
-    }
+
+    args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
+    args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
+
+    // Set data pointers
     args_ptr[group_id].group_karg.a_ptr     = a_ptr + group_offs_ptr[group_id] * strideAK;
     args_ptr[group_id].group_karg.b_ptr     = b_ptr + group_offs_ptr[group_id] * strideBK;
-    args_ptr[group_id].group_karg.aq_ptr    = aq_ptr + group_id * m;
-    args_ptr[group_id].group_karg.bq_ptr    = bq_ptr + group_id * n;
     args_ptr[group_id].group_karg.c_ptr     = c_ptr + group_id * m * n;
     args_ptr[group_id].group_karg.M         = m;
     args_ptr[group_id].group_karg.N         = n;

@@ -36,6 +36,8 @@ pybind11::dict Registrations() {
     // Grouped GEMM FP8
     REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8, GroupedGemmFP8Handler);
     REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8_variable_k, GroupedGemmFP8VariableKHandler);
+    REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8_fused_tensorwise,
+                         GroupedGemmFP8FusedTensorwiseHandler);
 
     // FP8 Quantization
     REGISTER_FFI_HANDLER(dict, quantize_fp8_tensorwise, QuantizeFP8TensorwiseHandler);

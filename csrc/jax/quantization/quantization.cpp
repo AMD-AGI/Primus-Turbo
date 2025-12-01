@@ -27,6 +27,37 @@ inline void compute_scale_inv_gpu(const float *scale, float *scale_inv, int64_t 
                        n);
 }
 
+// Calculate workspace size for tensorwise quantization
+inline int64_t get_quantize_fp8_tensorwise_workspace_size(int64_t n) {
+    // For auto-scale path:
+    // - amax_ptr: sizeof(float)
+    // - reduce workspace: get_reduce_row_workspace_sizes<float>(1, n)
+    // - scale_ptr: sizeof(float)
+    // - scale_inv_ptr: sizeof(float)
+    int64_t reduce_ws_size = get_reduce_row_workspace_sizes<float>(1, n);
+    // Align to 256 bytes for each buffer
+    int64_t total_size = 0;
+    total_size += 256;                                  // amax_ptr (aligned)
+    total_size += ((reduce_ws_size + 255) / 256) * 256; // reduce workspace (aligned)
+    total_size += 256;                                  // scale_ptr (aligned)
+    total_size += 256;                                  // scale_inv_ptr (aligned)
+    return total_size;
+}
+
+// Calculate workspace size for rowwise quantization
+inline int64_t get_quantize_fp8_rowwise_workspace_size(int64_t B, int64_t M, int64_t N,
+                                                       bool is_row_major) {
+    if (is_row_major) {
+        // Row-major: temp_scale buffer
+        return ((B * N * sizeof(float) + 255) / 256) * 256;
+    } else {
+        // Col-major: amax + reduce workspace
+        int64_t amax_size      = B * N * sizeof(float);
+        int64_t reduce_ws_size = get_reduce_col_workspace_sizes<float>(B, M, N);
+        return ((amax_size + 255) / 256) * 256 + ((reduce_ws_size + 255) / 256) * 256;
+    }
+}
+
 // TODO: Check correctness
 float get_float8_max(ffi::DataType dtype) {
     if (dtype == ffi::F8E4M3FN) {
@@ -43,12 +74,12 @@ float get_float8_max(ffi::DataType dtype) {
 }
 
 // Tensorwise Quantize FP8 FFI
-// Input parameters: input (F32/F16/BF16), out_dtype_str (string), scale_opt (F32 buffer, optional)
-// Output parameters (via ffi::Result): output, scale_inv
-// Return value: ffi::Error (status)
+// Input parameters: input (F32/F16/BF16), out_dtype_str (string), scale_opt (F32 buffer, optional),
+// workspace Output parameters (via ffi::Result): output, scale_inv Return value: ffi::Error
+// (status)
 ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_dtype_str,
-                                    ffi::Buffer<ffi::DataType::F32>              scale_opt,
-                                    ffi::Result<ffi::AnyBuffer>                  output,
+                                    ffi::Buffer<ffi::DataType::F32> scale_opt,
+                                    ffi::AnyBuffer workspace, ffi::Result<ffi::AnyBuffer> output,
                                     ffi::Result<ffi::Buffer<ffi::DataType::F32>> scale_inv_out) {
     hipStream_t stream = nullptr;
 
@@ -63,16 +94,13 @@ ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_d
     // Check if scale is provided (scale_opt.numel() > 0)
     bool has_scale = (scale_opt.dimensions().size() > 0 && scale_opt.dimensions()[0] > 0);
 
-    float scale_inv_val;
-
     if (has_scale) {
         // Use provided scale (GPU memory)
         const float *scale_ptr = scale_opt.typed_data();
 
-        // Copy scale to host to compute scale_inv
-        float scale_val_host;
-        hipMemcpy(&scale_val_host, scale_ptr, sizeof(float), hipMemcpyDeviceToHost);
-        scale_inv_val = 1.0f / scale_val_host;
+        // Compute scale_inv on GPU (1.0 / scale) and write to output
+        float *scale_inv_ptr = scale_inv_out->typed_data();
+        compute_scale_inv_gpu(scale_ptr, scale_inv_ptr, 1, stream);
 
         // Quantize - dispatch based on input dtype
         auto output_buf = output->untyped_data();
@@ -131,36 +159,35 @@ ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_d
         float         fp8_max = get_float8_max(fp8_dtype);
         const int64_t ws_size = get_reduce_row_workspace_sizes<float>(1, n);
 
-        // Allocate temporary buffers on GPU
-        float *amax_ptr;
-        void  *workspace_ptr;
-        hipMalloc(&amax_ptr, sizeof(float));
-        hipMalloc(&workspace_ptr, ws_size);
+        void *workspace_ptr = workspace.untyped_data();
+
+        // Layout workspace buffer:
+        // [amax_ptr: 256 bytes] [reduce_ws: aligned] [scale_ptr: 256 bytes]
+        char  *ws_char       = reinterpret_cast<char *>(workspace_ptr);
+        float *amax_ptr      = reinterpret_cast<float *>(ws_char);
+        void  *reduce_ws_ptr = ws_char + 256;
+        float *scale_ptr = reinterpret_cast<float *>(ws_char + 256 + ((ws_size + 255) / 256) * 256);
+
+        // Use output buffer directly for scale_inv (no extra copy needed)
+        float *scale_inv_ptr = scale_inv_out->typed_data();
 
         // Dispatch based on input dtype
         if (input_dtype == ffi::DataType::F32) {
             reduce_row<float, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                             const_cast<float *>(input.typed_data<float>()),
-                                            amax_ptr, 1, n, ws_size, workspace_ptr, stream);
+                                            amax_ptr, 1, n, ws_size, reduce_ws_ptr, stream);
         } else if (input_dtype == ffi::DataType::F16) {
             reduce_row<float16, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                               const_cast<float16 *>(input.typed_data<float16>()),
-                                              amax_ptr, 1, n, ws_size, workspace_ptr, stream);
+                                              amax_ptr, 1, n, ws_size, reduce_ws_ptr, stream);
         } else if (input_dtype == ffi::DataType::BF16) {
             reduce_row<bfloat16, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                                const_cast<bfloat16 *>(input.typed_data<bfloat16>()),
-                                               amax_ptr, 1, n, ws_size, workspace_ptr, stream);
+                                               amax_ptr, 1, n, ws_size, reduce_ws_ptr, stream);
         }
 
-        // Compute scale and scale_inv
-        float *scale_ptr, *scale_inv_ptr;
-        hipMalloc(&scale_ptr, sizeof(float));
-        hipMalloc(&scale_inv_ptr, sizeof(float));
-
+        // Compute scale and scale_inv, write directly to output
         compute_scale_from_amax<float>(amax_ptr, fp8_max, scale_ptr, scale_inv_ptr, 1, stream);
-
-        // Copy scale_inv from GPU to host
-        hipMemcpy(&scale_inv_val, scale_inv_ptr, sizeof(float), hipMemcpyDeviceToHost);
 
         // Now quantize with the computed scale
         auto output_buf = output->untyped_data();
@@ -195,16 +222,7 @@ ffi::Error QuantizeFP8TensorwiseFFI(ffi::AnyBuffer input, std::string_view out_d
                     reinterpret_cast<float8_e5m2_t *>(output_buf), n, stream);
             }
         }
-
-        // Free temporary buffers
-        hipFree(amax_ptr);
-        hipFree(workspace_ptr);
-        hipFree(scale_ptr);
-        hipFree(scale_inv_ptr);
     }
-
-    // Copy scale_inv to output
-    scale_inv_out->typed_data()[0] = scale_inv_val;
 
     return ffi::Error::Success();
 }
@@ -262,8 +280,8 @@ inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &input_s
 // Output parameters (via ffi::Result): output, scale_inv
 // Return value: ffi::Error (status)
 ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtype_str, int64_t axis,
-                                 ffi::Buffer<ffi::DataType::F32>              scale_opt,
-                                 ffi::Result<ffi::AnyBuffer>                  output,
+                                 ffi::Buffer<ffi::DataType::F32> scale_opt,
+                                 ffi::AnyBuffer workspace, ffi::Result<ffi::AnyBuffer> output,
                                  ffi::Result<ffi::Buffer<ffi::DataType::F32>> scale_inv_out) {
     hipStream_t stream = nullptr;
 
@@ -422,15 +440,8 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
             }
             const int64_t outer_len_val = outer_len / inner_len;
 
-            // BUG FIX: The kernel still writes to scale_ptr in auto-scale mode
-            // (PreComputeScale=false) Therefore, we need to allocate a temporary buffer for it even
-            // if we don't need the scale output
-            float     *temp_scale = nullptr;
-            hipError_t alloc_err  = hipMalloc(&temp_scale, outer_len_val * sizeof(float));
-            if (alloc_err != hipSuccess) {
-                return ffi::Error(ffi::ErrorCode::kInternal,
-                                  "Failed to allocate temp scale buffer");
-            }
+            void  *workspace_ptr = workspace.untyped_data();
+            float *temp_scale    = reinterpret_cast<float *>(workspace_ptr);
 
             if (out_dtype_str == "float8_e4m3fn" || out_dtype_str == "float8_e4m3fnuz") {
                 if (input_dtype == ffi::F32) {
@@ -449,7 +460,6 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
                         reinterpret_cast<float8_e4m3_t *>(output_buf), outer_len_val, inner_len,
                         stream);
                 } else {
-                    hipFree(temp_scale);
                     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported input dtype");
                 }
             } else if (out_dtype_str == "float8_e5m2" || out_dtype_str == "float8_e5m2fnuz") {
@@ -469,68 +479,49 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
                         reinterpret_cast<float8_e5m2_t *>(output_buf), outer_len_val, inner_len,
                         stream);
                 } else {
-                    hipFree(temp_scale);
                     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported input dtype");
                 }
             } else {
-                hipFree(temp_scale);
                 return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported FP8 dtype");
             }
-
-            // Release temporary buffer
-            hipFree(temp_scale);
         } else {
             // Col-major: requires reduce-col to compute amax, then compute scale
             int64_t B, M, N;
             compute_quantize_fp8_rowwise_bmn(shape_vec, valid_axis, B, M, N);
 
-            // Allocate amax buffer (same shape as scale_inv)
-            float     *amax_ptr       = nullptr;
-            hipError_t amax_alloc_err = hipMalloc(&amax_ptr, B * N * sizeof(float));
-            if (amax_alloc_err != hipSuccess) {
-                return ffi::Error(ffi::ErrorCode::kInternal, "Failed to allocate amax buffer");
-            }
+            void *workspace_ptr = workspace.untyped_data();
+            char *ws_char       = reinterpret_cast<char *>(workspace_ptr);
 
-            // Allocate workspace for reduce
-            const int64_t ws_size       = get_reduce_col_workspace_sizes<float>(B, M, N);
-            void         *workspace_ptr = nullptr;
-            hipError_t    ws_alloc_err  = hipMalloc(&workspace_ptr, ws_size);
-            if (ws_alloc_err != hipSuccess) {
-                hipFree(amax_ptr);
-                return ffi::Error(ffi::ErrorCode::kInternal, "Failed to allocate workspace");
-            }
+            int64_t amax_size = ((B * N * sizeof(float) + 255) / 256) * 256;
+            float  *amax_ptr  = reinterpret_cast<float *>(ws_char);
+
+            const int64_t ws_size              = get_reduce_col_workspace_sizes<float>(B, M, N);
+            void         *reduce_workspace_ptr = ws_char + amax_size;
 
             // Step 1: Reduce-Col to compute amax
             if (input_dtype == ffi::F32) {
                 reduce_col<float32, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                                   reinterpret_cast<const float32 *>(input_buf),
-                                                  amax_ptr, B, M, N, ws_size, workspace_ptr,
+                                                  amax_ptr, B, M, N, ws_size, reduce_workspace_ptr,
                                                   stream);
             } else if (input_dtype == ffi::F16) {
                 reduce_col<float16, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                                   reinterpret_cast<const float16 *>(input_buf),
-                                                  amax_ptr, B, M, N, ws_size, workspace_ptr,
+                                                  amax_ptr, B, M, N, ws_size, reduce_workspace_ptr,
                                                   stream);
             } else if (input_dtype == ffi::BF16) {
                 reduce_col<bfloat16, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                                    reinterpret_cast<const bfloat16 *>(input_buf),
-                                                   amax_ptr, B, M, N, ws_size, workspace_ptr,
+                                                   amax_ptr, B, M, N, ws_size, reduce_workspace_ptr,
                                                    stream);
             } else {
-                hipFree(amax_ptr);
-                hipFree(workspace_ptr);
                 return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported input dtype");
             }
 
-            // Allocate temp_scale buffer
-            float     *temp_scale      = nullptr;
-            hipError_t scale_alloc_err = hipMalloc(&temp_scale, B * N * sizeof(float));
-            if (scale_alloc_err != hipSuccess) {
-                hipFree(amax_ptr);
-                hipFree(workspace_ptr);
-                return ffi::Error(ffi::ErrorCode::kInternal,
-                                  "Failed to allocate temp scale buffer");
-            }
+            // temp_scale buffer: reuse amax storage once reduction is done.
+            // amax_ptr has size B * N (aligned) and is no longer needed after
+            // compute_scale_from_amax.
+            float *temp_scale = amax_ptr;
 
             // Step 2: Compute scale from amax
             ffi::DataType fp8_dtype;
@@ -578,11 +569,6 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
                         reinterpret_cast<float8_e5m2_t *>(output_buf), B, M, N, stream);
                 }
             }
-
-            // Cleanup
-            hipFree(amax_ptr);
-            hipFree(workspace_ptr);
-            hipFree(temp_scale);
         }
     }
 
@@ -595,6 +581,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(QuantizeFP8TensorwiseHandler, QuantizeFP8Tensorwis
                                   .Arg<ffi::AnyBuffer>()                   // input (F32/F16/BF16)
                                   .Attr<std::string_view>("out_dtype_str") // dest_dtype
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()  // scale_opt
+                                  .Arg<ffi::AnyBuffer>()                   // workspace
                                   .Ret<ffi::AnyBuffer>()                   // output (fp8)
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()  // scale_inv
 );
@@ -613,6 +600,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(QuantizeFP8RowwiseHandler, QuantizeFP8RowwiseFFI,
                                   .Attr<std::string_view>("out_dtype_str") // dest_dtype
                                   .Attr<int64_t>("axis")                   // axis
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()  // scale_opt
+                                  .Arg<ffi::AnyBuffer>()                   // workspace
                                   .Ret<ffi::AnyBuffer>()                   // output (fp8)
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()  // scale_inv
 );
