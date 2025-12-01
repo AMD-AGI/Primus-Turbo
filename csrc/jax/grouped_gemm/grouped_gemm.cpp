@@ -540,8 +540,8 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
     const int32_t n =
         static_cast<int32_t>(transB ? b_fp16.dimensions()[1] : b_fp16.dimensions()[2]);
     int64_t m_total = transA ? a_fp16.dimensions()[1] : a_fp16.dimensions()[0];
-    // For regular grouped_gemm, m is per-group (all groups have same m)
-    const int32_t m = static_cast<int32_t>(m_total / group_num);
+    // m should be m_total, same as non-fused version (CK uses group_lens for per-group sizes)
+    const int32_t m = static_cast<int32_t>(m_total);
 
     int64_t a_size = 1;
     for (auto dim : a_fp16.dimensions())
@@ -584,12 +584,14 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
 
     auto          input_dtype = a_fp16.element_type();
     ffi::DataType fp8_dtype;
+    float         fp8_max;
+    bool use_ocp = is_gfx950();
     if (fp8_dtype_str == "e4m3" || fp8_dtype_str == "float8_e4m3fn") {
-        fp8_dtype = ffi::F8E4M3FN;
+        fp8_dtype = use_ocp ? ffi::F8E4M3FN : ffi::F8E4M3FNUZ;
     } else {
-        fp8_dtype = ffi::F8E5M2;
+        fp8_dtype = use_ocp ? ffi::F8E5M2 : ffi::F8E5M2FNUZ;
     }
-    float fp8_max = (fp8_dtype == ffi::F8E4M3FN) ? 448.0f : 57344.0f;
+    fp8_max = get_float8_max(fp8_dtype);
 
     // Step 1: Quantize a (TENSORWISE)
     {
@@ -622,7 +624,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
         compute_scale_from_amax<float>(amax_ptr, fp8_max, scale_ptr, a_scale_inv_ptr, 1, stream);
 
         // Quantize
-        if (fp8_dtype == ffi::F8E4M3FN) {
+        if (fp8_dtype == ffi::F8E4M3FN || fp8_dtype == ffi::F8E4M3FNUZ) {
             if (input_dtype == ffi::F16) {
                 quantize_tensorwise_impl<float16, float8_e4m3_t, float>(
                     a_fp16.typed_data<float16>(), scale_ptr,
@@ -632,7 +634,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
                     a_fp16.typed_data<bfloat16>(), scale_ptr,
                     reinterpret_cast<float8_e4m3_t *>(a_fp8_ptr), a_size, stream);
             }
-        } else { // E5M2
+        } else { // E5M2 or E5M2FNUZ
             if (input_dtype == ffi::F16) {
                 quantize_tensorwise_impl<float16, float8_e5m2_t, float>(
                     a_fp16.typed_data<float16>(), scale_ptr,
@@ -676,7 +678,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
         compute_scale_from_amax<float>(amax_ptr, fp8_max, scale_ptr, b_scale_inv_ptr, 1, stream);
 
         // Quantize
-        if (fp8_dtype == ffi::F8E4M3FN) {
+        if (fp8_dtype == ffi::F8E4M3FN || fp8_dtype == ffi::F8E4M3FNUZ) {
             if (input_dtype == ffi::F16) {
                 quantize_tensorwise_impl<float16, float8_e4m3_t, float>(
                     b_fp16.typed_data<float16>(), scale_ptr,
@@ -686,7 +688,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
                     b_fp16.typed_data<bfloat16>(), scale_ptr,
                     reinterpret_cast<float8_e4m3_t *>(b_fp8_ptr), b_size, stream);
             }
-        } else { // E5M2
+        } else { // E5M2 or E5M2FNUZ
             if (input_dtype == ffi::F16) {
                 quantize_tensorwise_impl<float16, float8_e5m2_t, float>(
                     b_fp16.typed_data<float16>(), scale_ptr,
@@ -707,7 +709,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
     // Determine FP8 data type for CK kernel
-    if (fp8_dtype == ffi::F8E4M3FN) {
+    if (fp8_dtype == ffi::F8E4M3FN || fp8_dtype == ffi::F8E4M3FNUZ) {
         using AType = ck_tile::fp8_t;
         using BType = ck_tile::fp8_t;
 
@@ -730,7 +732,7 @@ ffi::Error GroupedGemmFP8FusedTensorwiseFFI(cudaStream_t stream, ffi::AnyBuffer 
             ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
                 params);
         }
-    } else { // E5M2
+    } else { // E5M2 or E5M2FNUZ
         using AType = ck_tile::bf8_t;
         using BType = ck_tile::bf8_t;
 

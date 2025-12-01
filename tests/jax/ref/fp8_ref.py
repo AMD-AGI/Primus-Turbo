@@ -14,13 +14,18 @@ from primus_turbo.jax.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    check_fp8_ocp_support,
     float8_e4m3,
     float8_e5m2,
 )
 from tests.jax.ref.gemm_ref import grouped_gemm_ref
 
+# Determine FP8 max values based on GPU architecture:
+# - gfx950 (OCP): E4M3FN max=448.0, E5M2 max=57344.0
+# - others (FNUZ): E4M3FNUZ max=240.0, E5M2FNUZ max=57344.0
+_use_ocp = check_fp8_ocp_support()[0]
 _FP8_FORMAT_INFO = {
-    Format.E4M3: (float8_e4m3, jnp.float32(448.0)),
+    Format.E4M3: (float8_e4m3, jnp.float32(448.0 if _use_ocp else 240.0)),
     Format.E5M2: (float8_e5m2, jnp.float32(57344.0)),
 }
 
