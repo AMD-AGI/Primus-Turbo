@@ -304,17 +304,8 @@ at::Tensor grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor 
     at::Tensor    c  = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kCUDA));
 
     // Process Scale
-    at::Tensor aq_tensor;
-    at::Tensor bq_tensor;
-    if (granularity == "TENSORWISE") {
-        aq_tensor = a_scales.reshape({1, 1}).expand({bs, m});
-        bq_tensor = b_scales.reshape({1, 1}).expand({bs, n});
-    } else {
-        aq_tensor = a_scales.reshape({1, m}).expand({bs, m});
-        bq_tensor = b_scales.reshape({1, n}).expand({bs, n});
-    }
-    aq_tensor = aq_tensor.contiguous();
-    bq_tensor = bq_tensor.contiguous();
+    at::Tensor aq_tensor = a_scales.contiguous();
+    at::Tensor bq_tensor = b_scales.contiguous();
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
