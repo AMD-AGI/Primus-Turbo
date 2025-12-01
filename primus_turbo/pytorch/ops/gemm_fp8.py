@@ -8,6 +8,7 @@ from typing import Union
 
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -65,7 +66,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             trans_b,
             out_dtype,
             False,
-            backend="hipblaslt",
+            backend=BackendType.HIPBLASLT,
             granularity=config.granularity,
         )
         ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
@@ -92,7 +93,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             not ctx.trans_b,
             ctx.out_dtype,
             ctx.trans_a,
-            backend="hipblaslt",
+            backend=BackendType.HIPBLASLT,
             granularity=ctx.config.granularity,
         )
 
@@ -105,7 +106,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             False,
             ctx.out_dtype,
             ctx.trans_b,
-            backend="hipblaslt",
+            backend=BackendType.HIPBLASLT,
             granularity=ctx.config.granularity,
         )
 
@@ -163,7 +164,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             trans_b,
             out_dtype,
             False,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=config.granularity,
         )
 
@@ -201,7 +202,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             not ctx.trans_b,
             ctx.out_dtype,
             ctx.trans_a,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
 
@@ -212,24 +213,18 @@ class FP8GemmRowFunction(torch.autograd.Function):
         grad_out_fp8_col, grad_out_scale_inv_col = quantize_fp8(
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-2
         )
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
 
         # TN
         b_grad = gemm_fp8_impl(
-            lhs,
-            lhs_scale,
+            a_fp8_col,
+            a_scale_inv_col,
             not ctx.trans_a,
-            rhs,
-            rhs_scale,
+            grad_out_fp8_col,
+            grad_out_scale_inv_col,
             False,
             ctx.out_dtype,
             ctx.trans_b,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
 
@@ -285,7 +280,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             trans_b,
             out_dtype,
             False,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=config.granularity,
         )
         ctx.save_for_backward(a, b_fp8, b_scale_inv)
@@ -328,7 +323,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             not ctx.trans_b,
             ctx.out_dtype,
             False,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
         # BGrad
@@ -348,15 +343,27 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             False,
             ctx.out_dtype,
             False,
-            backend="ck",
+            backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
+
+        # b_grad = gemm_fp8_impl(
+        #     a_fp8_col,
+        #     a_scale_inv_col,
+        #     not ctx.trans_a,
+        #     grad_out_fp8_col,
+        #     grad_out_scale_inv_col,
+        #     False,
+        #     ctx.out_dtype,
+        #     ctx.trans_b,
+        #     backend=BackendType.CK,
+        #     granularity=ctx.config.granularity,
+        # )
         return a_grad, b_grad, None, None, None, None
 
 
 class FP8GemmMXFunction(torch.autograd.Function):
 
-    MXFP8_GEMM_BACKEND = "hipblaslt"
     HIPBLASLT_M_MULTIPLE = 16
     HIPBLASLT_N_MULTIPLE = 16
     HIPBLASLT_K_MULTIPLE = 128
@@ -428,7 +435,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             True,
             out_dtype,
             False,
-            backend=__class__.MXFP8_GEMM_BACKEND,
+            backend=BackendType.HIPBLASLT,
             granularity=config.granularity,
         )
 
@@ -495,7 +502,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             True,
             ctx.out_dtype,
             False,
-            backend=__class__.MXFP8_GEMM_BACKEND,
+            backend=BackendType.HIPBLASLT,
             granularity=ctx.config.granularity,
         )
 
@@ -509,7 +516,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             True,
             ctx.out_dtype,
             False,
-            backend=__class__.MXFP8_GEMM_BACKEND,
+            backend=BackendType.HIPBLASLT,
             granularity=ctx.config.granularity,
         )
 

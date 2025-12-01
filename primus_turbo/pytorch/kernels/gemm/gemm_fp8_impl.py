@@ -4,13 +4,19 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from functools import lru_cache
 from typing import Tuple
 
 import torch
 import triton
 from torch.library import custom_op, triton_op, wrap_triton
 
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+from primus_turbo.pytorch.core.backend import BackendType, KernelBackend
+from primus_turbo.pytorch.core.low_precision import (
+    ScalingGranularity,
+    float8_e4m3,
+    float8_e5m2,
+)
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_nn_kernel,
     gemm_fp8_blockwise_nt_kernel,
@@ -233,6 +239,169 @@ def gemm_fp8_blockwise_impl_meta(
     return c
 
 
+_COMMON_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e4m3, torch.float16),
+    (float8_e4m3, float8_e4m3, torch.bfloat16),
+    (float8_e5m2, float8_e5m2, torch.float16),
+    (float8_e5m2, float8_e5m2, torch.bfloat16),
+)
+
+_HYBRID_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e5m2, torch.float16),
+    (float8_e4m3, float8_e5m2, torch.bfloat16),
+    (float8_e5m2, float8_e4m3, torch.float16),
+    (float8_e5m2, float8_e4m3, torch.bfloat16),
+)
+
+
+class GEMMFP8HipBLASLtBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = (
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.MX_BLOCKWISE,
+    )
+
+    # (a_dtype, b_dtype, c_dtype)
+    SUPPORTED_DTYPES = _COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES
+
+    # (trans_a, trans_b, trans_c)
+    SUPPORTED_LAYOUTS = (
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+    )
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def is_available() -> bool:
+        try:
+            torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_compatible(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        # check ScalingGranularity
+        supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
+        # check dtype
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8HipBLASLtBackend.SUPPORTED_DTYPES
+
+        # TODO:
+        # check layout
+        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8HipBLASLtBackend.SUPPORTED_LAYOUTS
+        # TODO:
+        # check shape
+
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
+            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        )
+
+
+class GEMMFP8CKBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = _COMMON_SUPPORTED_DTYPES
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def is_available() -> bool:
+        try:
+            torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_compatible(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        # check ScalingGranularity
+        supported &= granularity in GEMMFP8CKBackend.SUPPORTED_GRANULARITIES
+        # check dtype
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8CKBackend.SUPPORTED_DTYPES
+
+        # TODO: check layout
+        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8CKBackend.SUPPORTED_LAYOUTS
+
+        # TODO: check shape
+
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
+            if granularity == ScalingGranularity.BLOCKWISE:
+                lhs_scale_inv = lhs_scale_inv.transpose(-1, -2)
+                rhs_scale_inv = rhs_scale_inv.transpose(-1, -2)
+            trans_lhs = not trans_b
+            trans_rhs = not trans_a
+        else:
+            lhs, rhs = a, b
+            lhs_scale_inv, rhs_scale_inv = a_scale_inv, b_scale_inv
+            trans_lhs = trans_a
+            trans_rhs = trans_b
+
+        return torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8(
+            lhs, rhs, lhs_scale_inv, rhs_scale_inv, trans_lhs, trans_rhs, out_dtype, granularity.name
+        )
+
+
+_GEMM_FP8_BACKENDS = {
+    BackendType.HIPBLASLT: GEMMFP8HipBLASLtBackend,
+    BackendType.CK: GEMMFP8CKBackend,
+}
+
+
 def gemm_fp8_impl(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -242,18 +411,24 @@ def gemm_fp8_impl(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend: str = "hipblaslt",
-    granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
+    backend: BackendType,
+    granularity: ScalingGranularity,
 ) -> torch.Tensor:
-    assert backend in ("hipblaslt", "ck"), f"Unsupported backend: {backend}"
 
-    if backend == "hipblaslt":
-        out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
-        )
-    elif backend == "ck":
-        out = torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8(
-            a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name
-        )
+    # TODO: select backend by auto tune.
+    backend_cls = _GEMM_FP8_BACKENDS[backend]
 
-    return out
+    args = (a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, granularity)
+    try:
+        if backend_cls.is_compatible(*args):
+            return backend_cls.execute(*args)
+        else:
+            for fallback_cls in _GEMM_FP8_BACKENDS.values():
+                if fallback_cls.is_compatible(*args):
+                    return fallback_cls.execute(*args)
+            raise ValueError("No compatible GEMM FP8 backend found for the given arguments")
+    except Exception as e:
+        raise ValueError(f"GEMM FP8 Backend execution failed: {e}")
+
+
+# TODO gemm_fp8_impl_meta
