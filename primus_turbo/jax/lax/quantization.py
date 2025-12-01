@@ -136,19 +136,24 @@ def quantize_fp8(
             scale_opt = scale
 
         # Get workspace for rowwise quantization
-        # Estimate B, M, N from shape and axis
+        # Normalize axis and derive B/M/N consistent with C++ implementation.
         shape = x.shape
-        if len(shape) == 2:
-            if axis == -1 or axis == 1:
-                B, M, N = 1, shape[0], shape[1]
-                is_row_major = True
-            else:  # axis == 0 or -2
-                B, M, N = 1, shape[0], shape[1]
-                is_row_major = False
-        else:
-            # For higher dimensions, use simplified estimate
-            B, M, N = 1, x.size // shape[axis], shape[axis]
-            is_row_major = axis == len(shape) - 1 or axis == -1
+        ndim = len(shape)
+        axis = axis if axis >= 0 else ndim + axis
+        if axis < 0 or axis >= ndim:
+            raise ValueError(f"axis {axis} is out of bounds for shape {shape}")
+
+        # B = product of dimensions before axis, N = product after axis
+        def _prod(vals):
+            out = 1
+            for v in vals:
+                out *= v
+            return out
+
+        B = _prod(shape[:axis]) if axis > 0 else 1
+        M = shape[axis]
+        N = _prod(shape[axis + 1 :]) if axis < ndim - 1 else 1
+        is_row_major = axis == ndim - 1
 
         workspace = _get_quantize_workspace(0, is_rowwise=True, B=B, M=M, N=N, is_row_major=is_row_major)
 

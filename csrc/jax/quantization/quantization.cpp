@@ -518,9 +518,10 @@ ffi::Error QuantizeFP8RowwiseFFI(ffi::AnyBuffer input, std::string_view out_dtyp
                 return ffi::Error(ffi::ErrorCode::kInvalidArgument, "Unsupported input dtype");
             }
 
-            // temp_scale buffer: kernel writes scale output here
-            // We can reuse part of workspace or scale_inv_ptr directly
-            float *temp_scale = scale_inv_ptr;
+            // temp_scale buffer: reuse amax storage once reduction is done.
+            // amax_ptr has size B * N (aligned) and is no longer needed after
+            // compute_scale_from_amax.
+            float *temp_scale = amax_ptr;
 
             // Step 2: Compute scale from amax
             ffi::DataType fp8_dtype;

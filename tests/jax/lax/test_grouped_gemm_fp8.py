@@ -16,6 +16,7 @@ from primus_turbo.jax.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.jax.lax import grouped_gemm_fp8
+from tests.jax.ref.fp8_ref import grouped_gemm_fp8_reference
 from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
 from tests.jax.test_utils import compute_snr
 
@@ -62,7 +63,7 @@ def _check_hit_int32_limit(B, M, N, K):
 )
 @pytest.mark.parametrize("ori_dtype", [jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, balance):
@@ -126,3 +127,55 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, bal
     b_grad_snr = compute_snr(b_ref_grad.astype(jnp.float32), b_grad.astype(jnp.float32))
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, f"b_grad_snr too low: {b_grad_snr:.2f} dB"
+
+
+@pytest.mark.parametrize("B", [8])
+@pytest.mark.parametrize("M", [256])
+@pytest.mark.parametrize("N", [2048])
+@pytest.mark.parametrize("K", [2048])
+@pytest.mark.parametrize("ori_dtype", [jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("trans_b", [True, False])
+def test_grouped_gemm_fp8_rowwise_forward(B, M, N, K, ori_dtype, format, trans_b):
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False)
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.ROWWISE)
+
+    dtype_str = "bfloat16" if ori_dtype == jnp.bfloat16 else "float16"
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+
+    a = _get_cached_array((B * M, K), dtype_str, seed=2)
+    b = _get_cached_array(tuple(b_shape), dtype_str, seed=3)
+
+    out_ref = grouped_gemm_ref(a.astype(jnp.float32), b.astype(jnp.float32), group_lens, trans_b)
+    fp8_ref = grouped_gemm_fp8_reference(a, b, group_lens, trans_b=trans_b, config=config)
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    if jnp.isnan(fp8_ref).any():
+        print("Detected NaNs in grouped_gemm_fp8_reference output")
+    if jnp.isnan(out_ref).any():
+        print("Detected NaNs in grouped_gemm_ref output")
+
+    snr_threshold = 25 if format == Format.E4M3 else 20
+    out_ref_snr = compute_snr(out_ref.astype(jnp.float32), out.astype(jnp.float32))
+    print(
+        f"Rowwise FP8 implementation vs float32 SNR: {out_ref_snr:.2f} dB "
+        f"(threshold {snr_threshold:.1f} dB)"
+    )
+    assert (
+        out_ref_snr > snr_threshold
+    ), f"rowwise forward mismatch with float32 baseline: {out_ref_snr:.2f} dB"
+
+    ref_snr = compute_snr(out_ref.astype(jnp.float32), fp8_ref.astype(jnp.float32))
+    print(f"Rowwise FP8 reference vs float32 SNR: {ref_snr:.2f} dB " f"(threshold {snr_threshold:.1f} dB)")
+    if not jnp.isfinite(ref_snr):
+        print("ref stats", float(jnp.max(jnp.abs(out_ref))), float(jnp.max(jnp.abs(fp8_ref))))
+    assert ref_snr > snr_threshold, f"reference fp8 snr too low: {ref_snr:.2f} dB"
+
+    impl_snr = compute_snr(fp8_ref.astype(jnp.float32), out.astype(jnp.float32))
+    print(
+        f"Rowwise FP8 reference vs implementation SNR: {impl_snr:.2f} dB "
+        f"(threshold {snr_threshold:.1f} dB)"
+    )
+    assert impl_snr > snr_threshold, f"rowwise forward mismatch with reference: {impl_snr:.2f} dB"
