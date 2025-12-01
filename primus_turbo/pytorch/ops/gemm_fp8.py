@@ -392,33 +392,31 @@ class FP8GemmMXFunction(torch.autograd.Function):
         assert (
             a.size(0) % __class__.HIPBLASLT_M_MULTIPLE == 0
             and b.size(0) % __class__.HIPBLASLT_N_MULTIPLE == 0
-        ), "MXFP8 requires M and N are multiples of 16."
+        ), f"MXFP8 requires M are multiples of {__class__.HIPBLASLT_M_MULTIPLE} and N are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
+        assert (
+            a.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
+            and b.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
+        ), f"MXFP8 requires K are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
 
         a_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
 
-        # NOTE: Padding k dim to 128 multiple for HIPBLASLT.
-        k_padding_size = (
-            (a.size(1) + __class__.HIPBLASLT_K_MULTIPLE - 1) // __class__.HIPBLASLT_K_MULTIPLE
-        ) * __class__.HIPBLASLT_K_MULTIPLE - a.size(1)
-        if k_padding_size > 0:
-            a = torch.concat(
-                [
-                    a,
-                    torch.zeros(a.size(0), k_padding_size, dtype=a.dtype, device=a.device),
-                ],
-                dim=1,
-            )
-            b = torch.concat(
-                [
-                    b,
-                    torch.zeros(b.size(0), k_padding_size, dtype=b.dtype, device=b.device),
-                ],
-                dim=1,
-            )
-
-        a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity, block_size=config.block_size)
-        b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity, block_size=config.block_size)
+        a_fp8, a_scale_inv = quantize_fp8(
+            a,
+            a_dtype,
+            config.granularity,
+            block_size=config.block_size,
+            axis=1,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+        )
+        b_fp8, b_scale_inv = quantize_fp8(
+            b,
+            b_dtype,
+            config.granularity,
+            block_size=config.block_size,
+            axis=1,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+        )
 
         # NT layout
         out = gemm_fp8_impl(
@@ -442,7 +440,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
         ctx.config = config
         ctx.a_fp8_dtype = a_fp8.dtype
         ctx.b_fp8_dtype = b_fp8.dtype
-        ctx.k_padding_size = k_padding_size
 
         return out
 
@@ -452,84 +449,40 @@ class FP8GemmMXFunction(torch.autograd.Function):
         grad_out_dtype = FP8GemmMXFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
-        grad_out_t = grad_out.T.contiguous()
-
-        # TODO(ruibzhan): fuse transpose with quantize kernel
-        a_t = a.T.contiguous()
-        b_t = b.T.contiguous()
-
-        # NOTE: Padding k dim to 128 multiple for HIPBLASLT.
-        grad_out_k_padding_size = (
-            (grad_out.size(1) + __class__.HIPBLASLT_K_MULTIPLE - 1) // __class__.HIPBLASLT_K_MULTIPLE
-        ) * __class__.HIPBLASLT_K_MULTIPLE - grad_out.size(1)
-        if grad_out_k_padding_size > 0:
-            grad_out = torch.concat(
-                [
-                    grad_out,
-                    torch.zeros(
-                        grad_out.size(0),
-                        grad_out_k_padding_size,
-                        dtype=grad_out.dtype,
-                        device=grad_out.device,
-                    ),
-                ],
-                dim=1,
-            )
-            b_t = torch.concat(
-                [
-                    b_t,
-                    torch.zeros(
-                        b_t.size(0),
-                        grad_out_k_padding_size,
-                        dtype=b_t.dtype,
-                        device=b_t.device,
-                    ),
-                ],
-                dim=1,
-            )
-
-        # NOTE: Padding k dim to 128 multiple for HIPBLASLT.
-        grad_out_t_k_padding_size = (
-            (grad_out_t.size(1) + __class__.HIPBLASLT_K_MULTIPLE - 1) // __class__.HIPBLASLT_K_MULTIPLE
-        ) * __class__.HIPBLASLT_K_MULTIPLE - grad_out_t.size(1)
-        if grad_out_t_k_padding_size > 0:
-            grad_out_t = torch.concat(
-                [
-                    grad_out_t,
-                    torch.zeros(
-                        grad_out_t.size(0),
-                        grad_out_t_k_padding_size,
-                        dtype=grad_out_t.dtype,
-                        device=grad_out_t.device,
-                    ),
-                ],
-                dim=1,
-            )
-            a_t = torch.concat(
-                [
-                    a_t,
-                    torch.zeros(
-                        a_t.size(0),
-                        grad_out_t_k_padding_size,
-                        dtype=a_t.dtype,
-                        device=a_t.device,
-                    ),
-                ],
-                dim=1,
-            )
 
         grad_out_fp8, grad_out_scale_inv = quantize_fp8(
-            grad_out, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+            grad_out,
+            grad_out_dtype,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            axis=1,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
         grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
-            grad_out_t, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+            grad_out,
+            grad_out_dtype,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            axis=0,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
 
+        # TODO(ruibin): cache a_t and b_t for backward pass
         a_t_fp8, a_t_scale_inv = quantize_fp8(
-            a_t, ctx.a_fp8_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+            a,
+            ctx.a_fp8_dtype,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            axis=0,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
         b_t_fp8, b_t_scale_inv = quantize_fp8(
-            b_t, ctx.b_fp8_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+            b,
+            ctx.b_fp8_dtype,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            axis=0,
+            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
@@ -559,10 +512,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
             backend=__class__.MXFP8_GEMM_BACKEND,
             granularity=ctx.config.granularity,
         )
-
-        if ctx.k_padding_size > 0:
-            grad_a = grad_a[:, : -ctx.k_padding_size]
-            grad_b = grad_b[:, : -ctx.k_padding_size]
 
         return grad_a, grad_b, None, None, None, None
 
