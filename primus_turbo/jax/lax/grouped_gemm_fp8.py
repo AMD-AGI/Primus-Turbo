@@ -20,7 +20,6 @@ from primus_turbo.jax.core.low_precision import (
 from primus_turbo.jax.lax.quantization import quantize_fp8
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import (
     compute_group_offs_p,
-    get_ck_grouped_gemm_args_sizes,
     get_ck_grouped_gemm_fp8_args_sizes,
 )
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_fp8 import (
@@ -36,31 +35,16 @@ __all__ = ["grouped_gemm_fp8"]
 _workspace_cache = {}
 
 
-def _get_workspace(group_num, is_fp8=False):
-    """Get or create workspace buffer for grouped_gemm.
-
-    Args:
-        group_num: Number of groups (batch size)
-        is_fp8: Whether this is for FP8 operations
-
-    Returns:
-        Workspace buffer of appropriate size
-    """
-    if is_fp8:
-        args_size = get_ck_grouped_gemm_fp8_args_sizes(group_num)
-    else:
-        args_size = get_ck_grouped_gemm_args_sizes(group_num)
-
-    # Check cache
-    cache_key = (group_num, is_fp8)
+def _get_workspace(group_num):
+    """Get or create workspace for non-fused FP8 grouped_gemm."""
+    ws_size = get_ck_grouped_gemm_fp8_args_sizes(group_num)
+    cache_key = ("gemm_fp8", group_num)
     if cache_key in _workspace_cache:
         cached_workspace, cached_size = _workspace_cache[cache_key]
-        if cached_size >= args_size:
+        if cached_size >= ws_size:
             return cached_workspace
-
-    # Create new workspace
-    workspace = jax.device_put(jnp.empty(args_size, dtype=jnp.uint8))
-    _workspace_cache[cache_key] = (workspace, args_size)
+    workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+    _workspace_cache[cache_key] = (workspace, ws_size)
     return workspace
 
 
@@ -105,37 +89,6 @@ def _get_fused_workspace_size(a_size, b_size, group_num):
 
     total_size = quant_ws_a_size + quant_ws_b_size + a_fp8_size + b_fp8_size + scale_size * 2 + gemm_args_size
     return total_size
-
-
-def _expand_rowwise_scale_for_variable_k(scale, group_num):
-    """Expand rowwise scale for variable_k kernel.
-
-    Variable_k kernel with ROWWISE requires scales in [group_num, dim] format.
-
-    Args:
-        scale: Rowwise scale with shape [dim, 1], [1, dim], or [bs, dim, 1]
-        group_num: Number of groups
-
-    Returns:
-        Expanded scale with shape [group_num, dim]
-    """
-    if scale.ndim == 2:
-        # Shape [dim, 1] or [1, dim] -> broadcast to [group_num, dim]
-        if scale.shape[0] == 1:
-            # [1, dim] -> broadcast to [group_num, dim]
-            return jnp.broadcast_to(scale, (group_num, scale.shape[1]))
-        else:
-            # [dim, 1] -> squeeze and broadcast
-            scale_1d = jnp.squeeze(scale, axis=-1)  # [dim]
-            return jnp.broadcast_to(scale_1d[None, :], (group_num, scale_1d.shape[0]))
-    elif scale.ndim == 3:
-        # Shape [bs, dim, 1] or [bs, 1, dim] -> reshape to [group_num, dim]
-        if scale.shape[-1] == 1:
-            return jnp.squeeze(scale, axis=-1)  # [bs, dim]
-        else:
-            return jnp.squeeze(scale, axis=-2)  # [bs, dim]
-    else:
-        raise ValueError(f"Unexpected scale shape: {scale.shape}")
 
 
 def compute_group_offs(group_lens):
@@ -205,57 +158,79 @@ def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, 
 
 def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, config, num_cu):
     """Forward pass that saves values for backward."""
-    # Get FP8 dtype
-    a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     out_dtype = a.dtype
+    fp8_dtype_str = "e4m3" if config.format == Format.E4M3 else "e5m2"
 
     # Convert dtype to string for FFI
     dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str = dtype_map.get(out_dtype, "float16")
 
-    # Quantize a and b (auto-scale)
-    a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, ScalingGranularity.TENSORWISE)
-    b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
+    # Calculate workspace size for fused operation
+    a_size = a.size
+    b_size = b.size
+    group_num = b.shape[0]
+    ws_size = _get_fused_workspace_size(a_size, b_size, group_num)
 
-    # TENSORWISE scales are scalars - pass directly to CK kernel
-    workspace = _get_workspace(b_fp8.shape[0], is_fp8=True)
-    out = grouped_gemm_fp8_p.bind(
-        a_fp8,
-        b_fp8,
-        a_scale_inv,
-        b_scale_inv,
+    # Get or create workspace
+    cache_key = ("fused_fwd", group_num, a_size, b_size)
+    if cache_key in _workspace_cache:
+        cached_workspace, cached_size = _workspace_cache[cache_key]
+        if cached_size >= ws_size:
+            workspace = cached_workspace
+        else:
+            workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+            _workspace_cache[cache_key] = (workspace, ws_size)
+    else:
+        workspace = jax.device_put(jnp.empty(ws_size, dtype=jnp.uint8))
+        _workspace_cache[cache_key] = (workspace, ws_size)
+
+    # Use fused primitive (quantize + gemm in one FFI call)
+    out = grouped_gemm_fp8_fused_tensorwise_p.bind(
+        a,
+        b,
         group_lens,
         group_offs,
         workspace,
         transA=False,
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
-        granularity="TENSORWISE",
+        fp8_dtype_str=fp8_dtype_str,
         out_dtype_str=out_dtype_str,
     )
 
-    # Save for backward (don't save dtype - not a JAX type)
-    ctx = (a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs, a, b)
+    # Save original tensors for backward (will be re-quantized in backward)
+    ctx = (a, b, group_lens, group_offs)
     return out, ctx
 
 
 def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
-    """Backward pass for TENSORWISE quantization."""
-    a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens_saved, group_offs_saved, a, b = ctx
+    """Backward pass for TENSORWISE quantization.
 
-    # Get FP8 dtype for gradients (use same format as forward)
+    Note: Backward uses non-fused approach because:
+    1. The fused kernel's dimension calculation assumes specific tensor layouts
+    2. For grad_a, the transB logic doesn't match what we need for backward pass
+    3. For grad_b, we need variable_k kernel which has no fused version yet
+    """
+    a, b, group_lens_saved, group_offs_saved = ctx
+
+    # Get FP8 dtype for gradients
     grad_out_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
+    a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
+    b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
 
-    # Quantize grad_out (auto-scale)
+    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
+    out_dtype_str_a = dtype_map.get(a.dtype, "float16")
+    out_dtype_str_b = dtype_map.get(b.dtype, "float16")
+
+    group_num = b.shape[0]
+    workspace = _get_workspace(group_num)
+
+    # Quantize tensors for backward
     grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ScalingGranularity.TENSORWISE)
+    a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, ScalingGranularity.TENSORWISE)
+    b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
 
     # Compute grad_a: grad_out @ b.T (or grad_out @ b if trans_b)
-    # TENSORWISE scales are scalars - pass directly
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(a.dtype, "float16")
-
-    workspace = _get_workspace(b_fp8.shape[0], is_fp8=True)
     grad_a = grouped_gemm_fp8_p.bind(
         grad_out_fp8,
         b_fp8,
@@ -268,11 +243,10 @@ def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
         transB=not trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="TENSORWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype_str=out_dtype_str_a,
     )
 
     # Compute grad_b: a.T @ grad_out (variable_k version)
-    # After fixing kernel bug, TENSORWISE scalar scales can be passed directly
     if trans_b:
         lhs, rhs = grad_out_fp8, a_fp8
         lhs_scale, rhs_scale = grad_out_scale_inv, a_scale_inv
@@ -280,10 +254,6 @@ def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
         lhs, rhs = a_fp8, grad_out_fp8
         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
 
-    dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
-
-    workspace_var = _get_workspace(group_lens_saved.shape[0], is_fp8=True)
     grad_b = grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
@@ -291,7 +261,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(trans_b, config, num_cu, ctx, grad_out):
         rhs_scale,
         group_lens_saved,
         group_offs_saved,
-        workspace_var,
+        workspace,
         transA=True,
         transB=False,
         num_cu=num_cu if num_cu is not None else -1,
@@ -307,168 +277,6 @@ _grouped_gemm_fp8_tensorwise.defvjp(_grouped_gemm_fp8_tensorwise_fwd, _grouped_g
 
 
 # ============================================================================
-# ROWWISE Quantization
-# ============================================================================
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
-def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num_cu):
-    """Grouped GEMM FP8 with ROWWISE quantization."""
-    # Get FP8 dtype
-    a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
-
-    # Quantize a and b (row-wise)
-    a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-1)
-    b_fp8_row, b_scale_inv_row = quantize_fp8(
-        b, b_dtype, ScalingGranularity.ROWWISE, axis=(-1 if trans_b else -2)
-    )
-
-    # Forward pass - ROWWISE scales passed directly without expansion
-    workspace = _get_workspace(b_fp8_row.shape[0], is_fp8=True)
-    out = grouped_gemm_fp8_p.bind(
-        a_fp8_row,
-        b_fp8_row,
-        a_scale_inv_row,
-        b_scale_inv_row,
-        group_lens,
-        group_offs,
-        workspace,
-        transA=False,
-        transB=trans_b,
-        num_cu=num_cu if num_cu is not None else -1,
-        granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
-    )
-    return out
-
-
-def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config, num_cu):
-    """Forward pass that saves values for backward."""
-    # Get FP8 dtype
-    a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
-
-    # Quantize a and b (row-wise for forward)
-    a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-1)
-    b_fp8_row, b_scale_inv_row = quantize_fp8(
-        b, b_dtype, ScalingGranularity.ROWWISE, axis=(-1 if trans_b else -2)
-    )
-    # Forward pass
-    workspace = _get_workspace(b_fp8_row.shape[0], is_fp8=True)
-    out = grouped_gemm_fp8_p.bind(
-        a_fp8_row,
-        b_fp8_row,
-        a_scale_inv_row,
-        b_scale_inv_row,
-        group_lens,
-        group_offs,
-        workspace,
-        transA=False,
-        transB=trans_b,
-        num_cu=num_cu if num_cu is not None else -1,
-        granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
-    ).astype(out_dtype)
-
-    # Quantize a and b (col-wise for backward)
-    a_fp8_col, a_scale_inv_col = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-2)
-    b_fp8_col, b_scale_inv_col = quantize_fp8(
-        b, b_dtype, ScalingGranularity.ROWWISE, axis=(-2 if trans_b else -1)
-    )
-
-    # Save for backward
-    ctx = (a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens, group_offs, a, b)
-    return out, ctx
-
-
-def _grouped_gemm_fp8_rowwise_bwd(trans_b, config, num_cu, ctx, grad_out):
-    """Backward pass for ROWWISE quantization."""
-    a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens_saved, group_offs_saved, a, b = ctx
-
-    # Get FP8 dtype for gradients
-    grad_out_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-
-    # Quantize grad_out (row-wise for grad_a)
-    grad_out_fp8_row, grad_out_scale_inv_row = quantize_fp8(
-        grad_out, grad_out_dtype, ScalingGranularity.ROWWISE, axis=-1
-    )
-
-    # Compute grad_a - ROWWISE scales passed directly
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(a.dtype, "float16")
-
-    workspace = _get_workspace(b_fp8_col.shape[0], is_fp8=True)
-    grad_a = grouped_gemm_fp8_p.bind(
-        grad_out_fp8_row,
-        b_fp8_col,
-        grad_out_scale_inv_row,
-        b_scale_inv_col,
-        group_lens_saved,
-        group_offs_saved,
-        workspace,
-        transA=False,
-        transB=not trans_b,
-        num_cu=num_cu if num_cu is not None else -1,
-        granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
-    )
-
-    # Quantize grad_out (col-wise for grad_b)
-    grad_out_fp8_col, grad_out_scale_inv_col = quantize_fp8(
-        grad_out, grad_out_dtype, ScalingGranularity.ROWWISE, axis=-2
-    )
-
-    # Compute grad_b - ROWWISE needs expansion for variable_k
-    if trans_b:
-        lhs, rhs = grad_out_fp8_col, a_fp8_col
-        lhs_scale, rhs_scale = grad_out_scale_inv_col, a_scale_inv_col
-    else:
-        lhs, rhs = a_fp8_col, grad_out_fp8_col
-        lhs_scale, rhs_scale = a_scale_inv_col, grad_out_scale_inv_col
-
-    # Expand rowwise scales for variable_k kernel
-    group_num = group_lens_saved.shape[0]
-    lhs_scales = _expand_rowwise_scale_for_variable_k(lhs_scale, group_num)
-    rhs_scales = _expand_rowwise_scale_for_variable_k(rhs_scale, group_num)
-
-    dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
-
-    workspace_var = _get_workspace(group_num, is_fp8=True)
-    grad_b = grouped_gemm_fp8_variable_k_p.bind(
-        lhs,
-        rhs,
-        lhs_scales,
-        rhs_scales,
-        group_lens_saved,
-        group_offs_saved,
-        workspace_var,
-        transA=True,
-        transB=False,
-        num_cu=num_cu if num_cu is not None else -1,
-        granularity="ROWWISE",
-        out_dtype_str=out_dtype_str_b,
-    )
-
-    # group_lens and group_offs are differentiable args but don't have gradients
-    return grad_a, grad_b, None, None
-
-
-_grouped_gemm_fp8_rowwise.defvjp(_grouped_gemm_fp8_rowwise_fwd, _grouped_gemm_fp8_rowwise_bwd)
-
-
-# ============================================================================
 # BLOCKWISE Quantization (Placeholder - Not Implemented)
 # ============================================================================
 
@@ -481,8 +289,7 @@ def _grouped_gemm_fp8_blockwise(a, b, group_lens, group_offs, trans_b, config, n
     This is a placeholder for future implementation.
     """
     raise NotImplementedError(
-        "BLOCKWISE quantization is not yet implemented in JAX. "
-        "Please use TENSORWISE or ROWWISE granularity."
+        "BLOCKWISE quantization is not yet implemented in JAX. " "Please use TENSORWISE granularity."
     )
 
 
@@ -511,7 +318,7 @@ def grouped_gemm_fp8(
     config: Union[Float8QuantConfig, None] = None,
     num_cu: Optional[int] = None,
 ) -> jax.Array:
-    """Grouped GEMM with FP8 quantization.
+    """Grouped GEMM with FP8 quantization (TENSORWISE only).
 
     This function automatically quantizes input tensors to FP8 based on the config,
     performs grouped matrix multiplication, and returns the result in the original dtype.
@@ -530,7 +337,7 @@ def grouped_gemm_fp8(
 
     Raises:
         AssertionError: If input shapes or dtypes are invalid
-        NotImplementedError: If BLOCKWISE quantization is requested
+        NotImplementedError: If BLOCKWISE or ROWWISE quantization is requested
     """
     supported_dtypes = [jnp.bfloat16, jnp.float16]
     assert a.dtype in supported_dtypes, f"Unsupported dtype {a.dtype}, expected one of {supported_dtypes}"
@@ -544,11 +351,13 @@ def grouped_gemm_fp8(
     if config is None:
         config = Float8QuantConfig()
 
-    # Dispatch based on granularity
+    # Dispatch based on granularity (only TENSORWISE supported)
     if config.granularity == ScalingGranularity.TENSORWISE:
         return _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, num_cu)
     elif config.granularity == ScalingGranularity.ROWWISE:
-        return _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num_cu)
+        raise NotImplementedError(
+            "ROWWISE quantization is not yet implemented in JAX. " "Please use TENSORWISE granularity."
+        )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         return _grouped_gemm_fp8_blockwise(a, b, group_lens, group_offs, trans_b, config, num_cu)
     else:

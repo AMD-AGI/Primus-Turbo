@@ -63,6 +63,7 @@ def _grouped_gemm_fp8_abstract_eval(
         b_scales: Scaling factors for B
         group_lens: Group lengths tensor [bs]
         group_offs: Group offsets tensor [bs + 1]
+        workspace: Workspace buffer
         transA: Whether A is transposed
         transB: Whether B is transposed
         num_cu: Number of compute units
@@ -114,6 +115,7 @@ def _grouped_gemm_fp8_variable_k_abstract_eval(
         b_scales: Scaling factors for B
         group_lens: Group lengths tensor [bs]
         group_offs: Group offsets tensor [bs + 1]
+        workspace: Workspace buffer
         transA: Must be True
         transB: Must be False
         num_cu: Number of compute units

@@ -62,7 +62,7 @@ def _check_hit_int32_limit(B, M, N, K):
 )
 @pytest.mark.parametrize("ori_dtype", [jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, balance):

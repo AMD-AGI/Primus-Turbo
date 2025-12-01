@@ -278,23 +278,15 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
+            ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                params);
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
+            ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                params);
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -309,23 +301,15 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
+            ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                params);
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else
-                ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
+            ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                params);
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -374,9 +358,6 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
     // Get num_cu
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
-    // Scales are passed in already expanded from Python layer
-    // No need for hipMalloc/hipMemcpy/hipFree here
-
     // Call implementation based on dtype
     if (a.element_type() == ffi::F8E4M3FNUZ || a.element_type() == ffi::F8E4M3FN) {
         using AType             = ck_tile::fp8_t;
@@ -388,23 +369,15 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::TensorQuant>(params);
-            else
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::RowColQuant>(params);
+            ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
+                                           ck_tile::QuantType::TensorQuant>(params);
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::TensorQuant>(params);
-            else
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::RowColQuant>(params);
+            ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
+                                           ck_tile::QuantType::TensorQuant>(params);
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -419,23 +392,15 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::TensorQuant>(params);
-            else
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::RowColQuant>(params);
+            ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
+                                           ck_tile::QuantType::TensorQuant>(params);
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
                 args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
                 group_num, m, n, k, stream, num_cu_val);
-            if (granularity == "TENSORWISE")
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::TensorQuant>(params);
-            else
-                ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
-                                               ck_tile::QuantType::RowColQuant>(params);
+            ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
+                                           ck_tile::QuantType::TensorQuant>(params);
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
