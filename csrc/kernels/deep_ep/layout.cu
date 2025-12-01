@@ -130,9 +130,10 @@ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
                               "Invalid number of ranks per SM");
 
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    LAUNCH_KERNEL(&cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
-                  topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
-                  is_token_in_rank, num_tokens, num_topk, num_ranks, num_experts);
+    LAUNCH_KERNEL_NON_COOPERATIVE(
+        &cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>), topk_idx,
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
+        num_tokens, num_topk, num_ranks, num_experts);
 }
 
 } // namespace layout

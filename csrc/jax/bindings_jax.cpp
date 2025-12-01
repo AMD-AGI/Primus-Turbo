@@ -23,6 +23,11 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, rmsnorm_fwd, RMSNormFwdHandler);
     REGISTER_FFI_HANDLER(dict, rmsnorm_bwd, RMSNormBwdHandler);
 
+    // DeepEP
+    REGISTER_FFI_HANDLER(dict, moe_dispatch, MoEDispatchHandler);
+    REGISTER_FFI_HANDLER(dict, moe_cached_dispatch, MoECachedDispatchHandler);
+    REGISTER_FFI_HANDLER(dict, moe_combine, MoECombineHandler);
+
     // Grouped GEMM
     REGISTER_FFI_HANDLER(dict, grouped_gemm, GroupedGemmHandler);
     REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k, GroupedGemmVariableKHandler);
