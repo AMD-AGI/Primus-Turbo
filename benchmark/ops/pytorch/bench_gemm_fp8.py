@@ -79,15 +79,49 @@ def gen_gemm_test_cases(model_config):
     return gemm_shape_list
 
 
+def quantize_to_fp8(x, dtype=torch.float8_e4m3fn):
+    amax = x.abs().max()
+    scale = torch.finfo(dtype).max / amax.clamp(min=1e-12)
+    x_fp8 = (x * scale).to(dtype)
+    scale = scale.to(torch.float32)
+    return x_fp8, scale.reciprocal().reshape(1)
+
+
 def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
     device = "cuda"
     b_shape = (N, K) if trans_b else (K, N)
     a = torch.randn((M, K), dtype=ori_dtype, device=device, requires_grad=True)
     b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+
     config = Float8QuantConfig(format=format, granularity=granularity)
 
+    # Reference forward pass
+    a_fp8, scale_a = quantize_to_fp8(a_ref)
+    b_fp8, scale_b = quantize_to_fp8(b_ref)
+
+    if trans_b:
+        b_fp8_in = b_fp8.transpose(-1, -2)
+    else:
+        b_fp8_in = b_fp8
+
+    fwd_func_ref = lambda: torch._scaled_mm(
+        a_fp8, b_fp8_in, scale_a, scale_b, out_dtype=ori_dtype
+    )
+    out_ref = fwd_func_ref()
+    grad_out = torch.randn_like(out_ref)
+    bwd_func_ref = lambda: out_ref.backward(grad_out, retain_graph=True)
+
+    ref_bwd_supported = True
+    try:
+        bwd_func_ref()
+    except RuntimeError:
+        ref_bwd_supported = False
+
+    # Forward pass for implementation
     out = gemm_fp8(a, b, trans_b=trans_b, config=config)
-    grad_out = torch.randn_like(out)
     # Forward pass for implementation
     fwd_func = lambda: gemm_fp8(a, b, trans_b=trans_b, config=config)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
@@ -103,6 +137,9 @@ def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
     for _ in range(warmup):
         fwd_func()
         bwd_func()
+        fwd_func_ref()
+        if ref_bwd_supported:
+            bwd_func_ref()
     torch.cuda.synchronize()
 
     # Benchmark
@@ -114,16 +151,42 @@ def profile_gemm_fp8(M, N, K, ori_dtype, format, granularity, trans_b):
         stmt="fn()",
         globals={"fn": bwd_func},
     )
+    fwd_ref_timer = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": fwd_func_ref},
+    )
+
     fwd_measurement = fwd_timer.timeit(100)
     bwd_measurement = bwd_timer.timeit(100)
+    fwd_ref_measurement = fwd_ref_timer.timeit(100)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
     bwd_mean_time_ms = bwd_measurement.mean * 1e3
     fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
     bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
+    
+    fwd_ref_mean_time_ms = fwd_ref_measurement.mean * 1e3
+    fwd_ref_tflops = fwd_total_flops / (fwd_ref_mean_time_ms * 1e-3) / 1e12
+
+    if ref_bwd_supported:
+        bwd_ref_timer = benchmark.Timer(
+            stmt="fn()",
+            globals={"fn": bwd_func_ref},
+        )
+        bwd_ref_measurement = bwd_ref_timer.timeit(100)
+        bwd_ref_mean_time_ms = bwd_ref_measurement.mean * 1e3
+        bwd_ref_tflops = bwd_total_flops / (bwd_ref_mean_time_ms * 1e-3) / 1e12
+    else:
+        bwd_ref_mean_time_ms = float("nan")
+        bwd_ref_tflops = float("nan")
+
     print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
     print(f"Backward Mean time: {bwd_mean_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
-    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops
+    print(f"Ref Forward  Mean time: {fwd_ref_mean_time_ms:.3f} ms | TFLOPS: {fwd_ref_tflops:.2f}")
+    if ref_bwd_supported:
+        print(f"Ref Backward Mean time: {bwd_ref_mean_time_ms:.3f} ms | TFLOPS: {bwd_ref_tflops:.2f}")
+
+    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, fwd_ref_mean_time_ms, fwd_ref_tflops, bwd_ref_mean_time_ms, bwd_ref_tflops
 
 
 def benchmark_gemm_fp8():
@@ -142,6 +205,10 @@ def benchmark_gemm_fp8():
             "Forward TFLOPS",
             "Backward Time (ms)",
             "Backward TFLOPS",
+            "Ref Forward Time (ms)",
+            "Ref Forward TFLOPS",
+            "Ref Backward Time (ms)",
+            "Ref Backward TFLOPS",
         ]
     )
 
@@ -167,7 +234,16 @@ def benchmark_gemm_fp8():
                 )
                 print(f"{'='*50}")
 
-                fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = profile_gemm_fp8(
+                (
+                    fwd_time_ms,
+                    fwd_tflops,
+                    bwd_time_ms,
+                    bwd_tflops,
+                    fwd_ref_time_ms,
+                    fwd_ref_tflops,
+                    bwd_ref_time_ms,
+                    bwd_ref_tflops,
+                ) = profile_gemm_fp8(
                     M, N, K, ori_dtype, format, granularity, trans_b
                 )
                 # Add to results table
@@ -184,6 +260,10 @@ def benchmark_gemm_fp8():
                     "Forward TFLOPS": f"{fwd_tflops:.2f}",
                     "Backward Time (ms)": f"{bwd_time_ms:.2f}",
                     "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                    "Ref Forward Time (ms)": f"{fwd_ref_time_ms:.2f}",
+                    "Ref Forward TFLOPS": f"{fwd_ref_tflops:.2f}",
+                    "Ref Backward Time (ms)": f"{bwd_ref_time_ms:.2f}",
+                    "Ref Backward TFLOPS": f"{bwd_ref_tflops:.2f}",
                 }
                 results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 

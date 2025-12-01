@@ -10,7 +10,6 @@ import torch.utils.benchmark as benchmark
 from primus_turbo.pytorch.ops import grouped_gemm
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
-    grouped_gemm_ref,
 )
 from tests.pytorch.test_utils import compute_snr, get_tolerances
 
@@ -88,9 +87,13 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     w_ref = w.clone().detach().requires_grad_()
 
     # Reference forward pass
-    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens, True)
+    offs = torch.cumsum(group_lens, dim=0, dtype=torch.int32)
+    ww = w_ref.transpose(-1, -2)
+    fwd_func_ref = lambda: torch._grouped_mm(x_ref, ww, offs=offs, out_dtype=dtype)
+    out_ref = fwd_func_ref()
     grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out, retain_graph=True)
+    bwd_func_ref = lambda: out_ref.backward(grad_out, retain_graph=True)
+    bwd_func_ref()
 
     # Forward pass for implementation
     fwd_func = lambda: grouped_gemm(x, w, group_lens, trans_b=True)
@@ -127,6 +130,8 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     for _ in range(warmup):
         fwd_func()
         bwd_func()
+        fwd_func_ref()
+        bwd_func_ref()
     torch.cuda.synchronize()
 
     # Benchmark
@@ -138,16 +143,36 @@ def bench_grouped_gemm(B, M, N, K, dtype):
         stmt="fn()",
         globals={"fn": bwd_func},
     )
+    fwd_ref_timer = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": fwd_func_ref},
+    )
+    bwd_ref_timer = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": bwd_func_ref},
+    )
+
     fwd_measurement = fwd_timer.timeit(100)
     bwd_measurement = bwd_timer.timeit(100)
+    fwd_ref_measurement = fwd_ref_timer.timeit(100)
+    bwd_ref_measurement = bwd_ref_timer.timeit(100)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
     bwd_mean_time_ms = bwd_measurement.mean * 1e3
     fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
     bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
+
+    fwd_ref_mean_time_ms = fwd_ref_measurement.mean * 1e3
+    bwd_ref_mean_time_ms = bwd_ref_measurement.mean * 1e3
+    fwd_ref_tflops = fwd_total_flops / (fwd_ref_mean_time_ms * 1e-3) / 1e12
+    bwd_ref_tflops = bwd_total_flops / (bwd_ref_mean_time_ms * 1e-3) / 1e12
+
     print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
     print(f"Backward Mean time: {bwd_mean_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
-    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops
+    print(f"Ref Forward  Mean time: {fwd_ref_mean_time_ms:.3f} ms | TFLOPS: {fwd_ref_tflops:.2f}")
+    print(f"Ref Backward Mean time: {bwd_ref_mean_time_ms:.3f} ms | TFLOPS: {bwd_ref_tflops:.2f}")
+
+    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, fwd_ref_mean_time_ms, fwd_ref_tflops, bwd_ref_mean_time_ms, bwd_ref_tflops
 
 
 if __name__ == "__main__":
@@ -174,6 +199,10 @@ if __name__ == "__main__":
             "Forward TFLOPS",
             "Backward Time (ms)",
             "Backward TFLOPS",
+            "Ref Forward Time (ms)",
+            "Ref Forward TFLOPS",
+            "Ref Backward Time (ms)",
+            "Ref Backward TFLOPS",
         ]
     )
     test_id = 0
@@ -189,7 +218,16 @@ if __name__ == "__main__":
         test_id += 1
         try:
             # Run benchmark
-            fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = bench_grouped_gemm(
+            (
+                fwd_time_ms,
+                fwd_tflops,
+                bwd_time_ms,
+                bwd_tflops,
+                fwd_ref_time_ms,
+                fwd_ref_tflops,
+                bwd_ref_time_ms,
+                bwd_ref_tflops,
+            ) = bench_grouped_gemm(
                 B=B,
                 M=M,
                 N=N,
@@ -210,6 +248,10 @@ if __name__ == "__main__":
                 "Forward TFLOPS": f"{fwd_tflops:.2f}",
                 "Backward Time (ms)": f"{bwd_time_ms:.2f}",
                 "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                "Ref Forward Time (ms)": f"{fwd_ref_time_ms:.2f}",
+                "Ref Forward TFLOPS": f"{fwd_ref_tflops:.2f}",
+                "Ref Backward Time (ms)": f"{bwd_ref_time_ms:.2f}",
+                "Ref Backward TFLOPS": f"{bwd_ref_tflops:.2f}",
             }
             results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 
@@ -227,6 +269,10 @@ if __name__ == "__main__":
                 "Forward TFLOPS": "N/A",
                 "Backward Time (ms)": "Failed",
                 "Backward TFLOPS": "N/A",
+                "Ref Forward Time (ms)": "Failed",
+                "Ref Forward TFLOPS": "N/A",
+                "Ref Backward Time (ms)": "Failed",
+                "Ref Backward TFLOPS": "N/A",
             }
             results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 
