@@ -8,7 +8,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from enum import Enum, auto
-from typing import Hashable, List, Optional, Type
+from typing import Any, Dict, Hashable, Optional, Type
 
 import torch
 
@@ -37,6 +37,7 @@ class BackendConfig:
     2. Environment variables - PRIMUS_TURBO_GEMM_BACKEND, etc.
     3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1
     4. Code defaults
+    5. Fallback: try all backends
     """
 
     _gemm_backend: Optional[BackendType] = None
@@ -137,10 +138,10 @@ class TuneCache:
 
 class AutoKernelDispatcher(ABC):
     """
-    Base class for auto kernel dispatcher. Subclass must define _backends and _cache.
+    Base class for auto kernel dispatcher.
     """
 
-    _backends: List[Type[KernelBackend]] = []
+    _backends: Dict[BackendType, Type[KernelBackend]] = {}
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 50
     _profile_iters: int = 50
@@ -148,7 +149,7 @@ class AutoKernelDispatcher(ABC):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "_backends" not in cls.__dict__:
-            cls._backends = []
+            cls._backends = {}
         if "_cache" not in cls.__dict__:
             cls._cache = TuneCache()
 
@@ -185,7 +186,7 @@ class AutoKernelDispatcher(ABC):
 
         best_backend = None
         best_time = float("inf")
-        for backend in cls._backends:
+        for backend in cls._backends.values():
             if backend.can_handle(**kwargs):
                 try:
                     cur_time = cls.profile(backend, **kwargs)
@@ -198,3 +199,32 @@ class AutoKernelDispatcher(ABC):
         if best_backend is not None:
             cls._cache.put(key, best_backend)
         return best_backend
+
+    @classmethod
+    def dispatch(
+        cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
+    ) -> Any:
+        # 1. User specified backend (env or code) - highest priority
+        if user_backend_enum is not None and user_backend_enum in cls._backends:
+            backend_cls = cls._backends[user_backend_enum]
+            if backend_cls.can_handle(**kwargs):
+                return backend_cls.execute(**kwargs)
+
+        # 2. Auto tune
+        if BackendConfig.auto_tune_enabled():
+            backend_cls = cls.tune(**kwargs)
+            if backend_cls is not None:
+                return backend_cls.execute(**kwargs)
+
+        # 3. Default backend
+        default_backend_cls = cls._backends.get(default_backend_enum)
+        if default_backend_cls is not None and default_backend_cls.can_handle(**kwargs):
+            return default_backend_cls.execute(**kwargs)
+
+        # 4. Fallback: try all backends
+        for fallback_backend_cls in cls._backends.values():
+            if fallback_backend_cls.can_handle(**kwargs):
+                return fallback_backend_cls.execute(**kwargs)
+
+        raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
+

@@ -389,7 +389,7 @@ _GEMM_FP8_BACKENDS = {
 
 
 class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
-    _backends = [GEMMFP8HipBLASLtBackend, GEMMFP8CKBackend]
+    _backends = _GEMM_FP8_BACKENDS
     _cache = TuneCache(1024)
 
     @classmethod
@@ -411,7 +411,8 @@ def gemm_fp8_impl(
     backend: int,
     granularity: int,
 ) -> torch.Tensor:
-    backend_enum = BackendType(backend)
+    default_backend_enum = BackendType(backend)
+    user_backend_enum = BackendConfig.get_gemm_backend()
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -426,30 +427,7 @@ def gemm_fp8_impl(
         granularity=granularity_enum,
     )
 
-    # 1. User specified backend (env or code) - highest priority
-    user_backend = BackendConfig.get_gemm_backend()
-    if user_backend is not None and user_backend in _GEMM_FP8_BACKENDS:
-        backend_cls = _GEMM_FP8_BACKENDS[user_backend]
-        if backend_cls.can_handle(**kwargs):
-            return backend_cls.execute(**kwargs)
-
-    # 2. Auto tune
-    if BackendConfig.auto_tune_enabled():
-        backend_cls = GEMMFP8KernelDispatcher.tune(**kwargs)
-        if backend_cls is not None:
-            return backend_cls.execute(**kwargs)
-
-    # 3. Default backend (from parameter)
-    default_cls = _GEMM_FP8_BACKENDS.get(backend_enum)
-    if default_cls is not None and default_cls.can_handle(**kwargs):
-        return default_cls.execute(**kwargs)
-
-    # 4. Fallback: try all backends
-    for fallback_cls in _GEMM_FP8_BACKENDS.values():
-        if fallback_cls.can_handle(**kwargs):
-            return fallback_cls.execute(**kwargs)
-
-    raise ValueError("No compatible GEMM FP8 backend found")
+    return GEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
 @gemm_fp8_impl.register_fake
