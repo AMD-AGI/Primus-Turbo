@@ -14,8 +14,8 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
-    BackendConfig,
     BackendType,
+    GlobalBackendManager,
     KernelBackend,
     TuneCache,
 )
@@ -412,7 +412,7 @@ def gemm_fp8_impl(
     granularity: int,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(backend)
-    user_backend_enum = BackendConfig.get_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_gemm_backend()
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(

@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -25,8 +26,20 @@ torch.manual_seed(42)
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
-def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
-    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    print(
+        f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, backend={backend}, auto_tune={auto_tune}"
+    )
 
     device = "cuda:0"
 
@@ -78,6 +91,9 @@ def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
 
+    # Reset config and caches
+    GlobalBackendManager.reset()
+
 
 # n and k must be a multiple of 128
 # block_size must be 128
@@ -89,9 +105,20 @@ def test_gemm_fp8_ck(m, n, k, layout, format, dtype, granularity):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
 @pytest.mark.parametrize("block_size", [128])
-def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_size):
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_size, backend, auto_tune):
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
     print(
-        f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, granularity={granularity}, block_size={block_size}"
+        f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
+        f"granularity={granularity}, block_size={block_size}, backend={backend}, auto_tune={auto_tune}"
     )
 
     device = "cuda:0"
@@ -140,6 +167,9 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
 
+    # Reset config and caches
+    GlobalBackendManager.reset()
+
 
 @pytest.mark.parametrize("m", [256, 512, 1024])
 @pytest.mark.parametrize("n", [256, 352, 1024, 2048])
@@ -148,7 +178,13 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, granularity, block_s
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
     # NOTE: user need to ensure m, n and k are multiples of 16.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "Assume m, n and k are multiples of 16."
 
@@ -159,7 +195,14 @@ def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
     if not mxfp8_supported:
         pytest.skip(reason)
 
-    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}")
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    print(
+        f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
+        f"backend={backend}, auto_tune={auto_tune}"
+    )
 
     device = "cuda:0"
 
@@ -207,3 +250,6 @@ def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity):
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    # Reset config and caches
+    GlobalBackendManager.reset()

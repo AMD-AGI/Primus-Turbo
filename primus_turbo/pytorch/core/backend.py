@@ -8,13 +8,13 @@ import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from enum import Enum, auto
-from typing import Any, Dict, Hashable, Optional, Type
+from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
 __all__ = [
     "BackendType",
-    "BackendConfig",
+    "GlobalBackendManager",
     "KernelBackend",
     "TuneCache",
     "AutoKernelDispatcher",
@@ -28,9 +28,9 @@ class BackendType(Enum):
     TRITON = auto()
 
 
-class BackendConfig:
+class GlobalBackendManager:
     """
-    Backend configuration management.
+    Global Backend manager.
 
     Priority (high to low):
     1. Code settings - set_gemm_backend(), etc.
@@ -86,8 +86,15 @@ class BackendConfig:
             return cls._auto_tune
         return os.environ.get("PRIMUS_TURBO_AUTO_TUNE", "0") == "1"
 
+    @classmethod
+    def reset(cls) -> None:
+        """Reset all backend settings and clear all dispatcher caches."""
+        cls._gemm_backend = None
+        cls._grouped_gemm_backend = None
+        cls._auto_tune = None
+        AutoKernelDispatcher.clear_all_caches()
 
-# Kernel Backend
+
 class KernelBackend(ABC):
     @staticmethod
     @abstractmethod
@@ -145,6 +152,7 @@ class AutoKernelDispatcher(ABC):
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 50
     _profile_iters: int = 50
+    _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -152,6 +160,14 @@ class AutoKernelDispatcher(ABC):
             cls._backends = {}
         if "_cache" not in cls.__dict__:
             cls._cache = TuneCache()
+        AutoKernelDispatcher._subclasses.append(cls)
+
+    @classmethod
+    def clear_all_caches(cls) -> None:
+        """Clear caches for all dispatcher subclasses."""
+        for subclass in cls._subclasses:
+            if subclass._cache is not None:
+                subclass._cache.clear()
 
     @classmethod
     def make_key(cls, **kwargs) -> Hashable:
@@ -211,7 +227,7 @@ class AutoKernelDispatcher(ABC):
                 return backend_cls.execute(**kwargs)
 
         # 2. Auto tune
-        if BackendConfig.auto_tune_enabled():
+        if GlobalBackendManager.auto_tune_enabled():
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)
@@ -227,4 +243,3 @@ class AutoKernelDispatcher(ABC):
                 return fallback_backend_cls.execute(**kwargs)
 
         raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
-
