@@ -97,18 +97,13 @@ def update_out_and_lse(
 
 def ring_attn_fwd(
     process_group,
+    attn_func,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale,
-    dropout_p=0,
-    causal=False,
-    window_size=(-1, -1),
-    bias=None,
-    alibi_slopes=None,
-    return_lse=True,
-    return_softmax=True,
+    **kwargs,
 ):
+    arg_causal = kwargs.pop("causal", False)
     comm = RingComm(process_group)
 
     out = None
@@ -122,20 +117,13 @@ def ring_attn_fwd(
             next_v: torch.Tensor = comm.send_recv(v)
             comm.commit()
 
-        if not causal or step <= comm.rank:
-            block_out, block_lse, S_dmask, rng_state = attention_aiter_csrc_forward_impl(
+        if not arg_causal or step <= comm.rank:
+            block_out, block_lse, *results = attn_func(
                 q,
                 k,
                 v,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
-                causal=causal and step == 0,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                bias=bias,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax,
+                causal=arg_causal and step == 0,
+                **kwargs,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -146,30 +134,21 @@ def ring_attn_fwd(
 
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
-    return out, lse, S_dmask, rng_state
+    return out, lse, *results
 
 
 def ring_attn_bwd(
     process_group,
+    attn_func,
     dout,
     q,
     k,
     v,
     out,
     softmax_lse,
-    dbias,
-    dropout_p,
-    softmax_scale,
-    causal=False,
-    window_size=(-1, -1),
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    deterministic: bool = False,
-    rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
+    **kwargs,
 ):
-
+    arg_causal = kwargs.pop("causal", False)
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
@@ -187,31 +166,21 @@ def ring_attn_bwd(
             next_k = kv_comm.send_recv(k)
             next_v = kv_comm.send_recv(v)
             kv_comm.commit()
-        if step <= kv_comm.rank or not causal:
-            bwd_causal = causal and step == 0
+        if step <= kv_comm.rank or not arg_causal:
+            bwd_causal = arg_causal and step == 0
 
-            attention_aiter_csrc_backward_impl(
+            attn_func(
                 dout,
                 q,
                 k,
                 v,
                 out,
-                softmax_lse=softmax_lse,
+                softmax_lse,
                 dq=block_dq_buffer,
                 dk=block_dk_buffer,
                 dv=block_dv_buffer,
-                dbias=dbias,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
                 causal=bwd_causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                bias=bias,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                rng_state=rng_state,
-                is_v3_atomic_fp32=is_v3_atomic_fp32,
-                how_v3_bf16_cvt=how_v3_bf16_cvt,
+                **kwargs,
             )
 
             if dq is None:

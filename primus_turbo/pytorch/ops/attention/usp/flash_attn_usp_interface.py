@@ -3,6 +3,11 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (  # attention_aiter_csrc_backward_impl,
+    attention_aiter_csrc_backward_impl,
+    attention_aiter_csrc_forward_impl,
+)
+
 from .attention_ring import ring_attn_bwd, ring_attn_fwd
 
 
@@ -218,13 +223,15 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         assert dropout_p == 0.0
         out_padded, softmax_lse, S_dmask, rng_state = ring_attn_fwd(
             ring_group,
+            attention_aiter_csrc_forward_impl,
             q_local_heads,
             k_local_heads,
             v_local_heads,
-            softmax_scale,
+            softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
-            window_size=window_size,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=True,
@@ -299,23 +306,25 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
+            attention_aiter_csrc_backward_impl,
             dout_padded,
             q_local_heads,
             k_local_heads,
             v_local_heads,
             output_padded,
             softmax_lse,
-            dbias,
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.window_size,
-            ctx.bias,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state,
-            ctx.is_v3_atomic_fp32,
-            ctx.how_v3_bf16_cvt,
+            dbias=dbias,
+            dropout_p=ctx.dropout_p,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
+            bias=ctx.bias,
+            alibi_slopes=ctx.alibi_slopes,
+            deterministic=ctx.deterministic,
+            rng_state=rng_state,
+            is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
+            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
         )
 
         dq = dq[..., :d_qk]  # We could have padded the head dimension
