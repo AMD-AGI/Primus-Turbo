@@ -245,9 +245,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         )
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
-        if not trans_b:
-            b_scale_inv = b_scale_inv.transpose(-1, -2)
-
         out = gemm_fp8_impl(
             a_fp8_row,
             a_scale_inv_row,
@@ -296,7 +293,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             grad_out_scale_inv_row,
             False,
             b_fp8,
-            b_scale_inv.transpose(-1, -2),
+            b_scale_inv,
             not ctx.trans_b,
             ctx.out_dtype,
             False,
@@ -306,10 +303,10 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
         b_grad = gemm_fp8_impl(
             a_fp8_col,
-            a_scale_inv_col.transpose(-1, -2),
+            a_scale_inv_col,
             not ctx.trans_a,
             grad_out_fp8_col,
-            grad_out_scale_inv_col.transpose(-1, -2),
+            grad_out_scale_inv_col,
             False,
             ctx.out_dtype,
             ctx.trans_b,
