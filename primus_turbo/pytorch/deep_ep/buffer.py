@@ -151,7 +151,7 @@ class Buffer:
             # int64_t python list cast to uint8 tensor
             root_unique_id = torch.tensor(root_unique_id, dtype=torch.uint8)
 
-        self.runtime.sync(torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
+        self.runtime.sync(device_ids, torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
         assert self.runtime.is_available()
 
     def destroy(self):
