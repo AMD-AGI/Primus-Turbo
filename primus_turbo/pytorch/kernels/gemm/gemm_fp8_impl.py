@@ -10,7 +10,15 @@ import torch
 import triton
 from torch.library import custom_op, triton_op, wrap_triton
 
-from primus_turbo.pytorch.core.backend import BackendType, KernelBackend
+_torch_custom_op_wrapper = torch.library.custom_op
+
+from primus_turbo.pytorch.core.backend import (
+    AutoKernelDispatcher,
+    BackendConfig,
+    BackendType,
+    KernelBackend,
+    TuneCache,
+)
 from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     float8_e4m3,
@@ -380,6 +388,17 @@ _GEMM_FP8_BACKENDS = {
 }
 
 
+class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
+    _backends = [GEMMFP8HipBLASLtBackend, GEMMFP8CKBackend]
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp8_impl", mutates_args=(), device_types="cuda")
 def gemm_fp8_impl(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -389,24 +408,64 @@ def gemm_fp8_impl(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend: BackendType,
-    granularity: ScalingGranularity,
+    backend: int,
+    granularity: int,
 ) -> torch.Tensor:
+    backend_enum = BackendType(backend)
+    granularity_enum = ScalingGranularity(granularity)
 
-    # TODO: select backend by auto tune.
-    backend_cls = _GEMM_FP8_BACKENDS[backend]
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity_enum,
+    )
 
-    args = (a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, granularity)
-    try:
-        if backend_cls.can_handle(*args):
-            return backend_cls.execute(*args)
-        else:
-            for fallback_cls in _GEMM_FP8_BACKENDS.values():
-                if fallback_cls.can_handle(*args):
-                    return fallback_cls.execute(*args)
-            raise ValueError("No compatible GEMM FP8 backend found for the given arguments")
-    except Exception as e:
-        raise ValueError(f"GEMM FP8 Backend execution failed: {e}")
+    # 1. User specified backend (env or code) - highest priority
+    user_backend = BackendConfig.get_gemm_backend()
+    if user_backend is not None and user_backend in _GEMM_FP8_BACKENDS:
+        backend_cls = _GEMM_FP8_BACKENDS[user_backend]
+        if backend_cls.can_handle(**kwargs):
+            return backend_cls.execute(**kwargs)
+
+    # 2. Auto tune
+    if BackendConfig.auto_tune_enabled():
+        backend_cls = GEMMFP8KernelDispatcher.tune(**kwargs)
+        if backend_cls is not None:
+            return backend_cls.execute(**kwargs)
+
+    # 3. Default backend (from parameter)
+    default_cls = _GEMM_FP8_BACKENDS.get(backend_enum)
+    if default_cls is not None and default_cls.can_handle(**kwargs):
+        return default_cls.execute(**kwargs)
+
+    # 4. Fallback: try all backends
+    for fallback_cls in _GEMM_FP8_BACKENDS.values():
+        if fallback_cls.can_handle(**kwargs):
+            return fallback_cls.execute(**kwargs)
+
+    raise ValueError("No compatible GEMM FP8 backend found")
 
 
-# TODO gemm_fp8_impl_meta
+@gemm_fp8_impl.register_fake
+def gemm_fp8_impl_meta(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    backend: int,
+    granularity: int,
+) -> torch.Tensor:
+    m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
+    if trans_c:
+        m, n = n, m
+    return torch.empty(m, n, dtype=out_dtype, device=a.device)
