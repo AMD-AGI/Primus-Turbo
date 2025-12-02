@@ -140,16 +140,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
         a_dtype = FP8GemmRowFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmRowFunction.get_fp8_dtype(config.format, True)
 
-        # Pad K dimension to multiple of 128 if needed (to avoid CK padding bug in NT mode)
-        k_dim = a.shape[1]  # K dimension for a: (M, K)
-        pad_k = (128 - k_dim % 128) % 128
-        if pad_k > 0:
-            a = torch.nn.functional.pad(a, (0, pad_k))  # Pad K dimension
-            if trans_b:
-                b = torch.nn.functional.pad(b, (0, pad_k))  # b: (N, K), pad K
-            else:
-                b = torch.nn.functional.pad(b, (0, 0, 0, pad_k))  # b: (K, N), pad K
-
         a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, config.granularity, axis=-1)
         b_fp8_row, b_scale_inv_row = quantize_fp8(
             b, b_dtype, config.granularity, axis=(-1 if trans_b else -2)
@@ -178,8 +168,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
-        ctx.k_dim = k_dim  # Save original K dimension
-        ctx.pad_k = pad_k  # Save padding amount
 
         return out
 
@@ -206,10 +194,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
             granularity=ctx.config.granularity,
         )
 
-        # Crop padding from a_grad if it was padded in forward
-        if ctx.pad_k > 0:
-            a_grad = a_grad[:, : ctx.k_dim]  # Crop K dimension back to original
-
         grad_out_fp8_col, grad_out_scale_inv_col = quantize_fp8(
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-2
         )
@@ -227,13 +211,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
             backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
-
-        # Crop padding from b_grad if it was padded in forward
-        if ctx.pad_k > 0:
-            if ctx.trans_b:
-                b_grad = b_grad[:, : ctx.k_dim]  # b: (N, K), crop K
-            else:
-                b_grad = b_grad[: ctx.k_dim, :]  # b: (K, N), crop K
 
         return (a_grad, b_grad, None, None, None, None)
 
@@ -326,39 +303,20 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
-        # BGrad
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale_inv, rhs_scale_inv = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
 
         b_grad = gemm_fp8_impl(
-            lhs,
-            lhs_scale_inv.transpose(-1, -2),
+            a_fp8_col,
+            a_scale_inv_col.transpose(-1, -2),
             not ctx.trans_a,
-            rhs,
-            rhs_scale_inv.transpose(-1, -2),
+            grad_out_fp8_col,
+            grad_out_scale_inv_col.transpose(-1, -2),
             False,
             ctx.out_dtype,
-            False,
+            ctx.trans_b,
             backend=BackendType.CK,
             granularity=ctx.config.granularity,
         )
 
-        # b_grad = gemm_fp8_impl(
-        #     a_fp8_col,
-        #     a_scale_inv_col,
-        #     not ctx.trans_a,
-        #     grad_out_fp8_col,
-        #     grad_out_scale_inv_col,
-        #     False,
-        #     ctx.out_dtype,
-        #     ctx.trans_b,
-        #     backend=BackendType.CK,
-        #     granularity=ctx.config.granularity,
-        # )
         return a_grad, b_grad, None, None, None, None
 
 

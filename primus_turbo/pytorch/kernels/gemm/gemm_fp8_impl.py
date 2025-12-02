@@ -361,9 +361,6 @@ class GEMMFP8CKBackend(KernelBackend):
         if trans_c:
             lhs, rhs = b, a
             lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
-            if granularity == ScalingGranularity.BLOCKWISE:
-                lhs_scale_inv = lhs_scale_inv.transpose(-1, -2)
-                rhs_scale_inv = rhs_scale_inv.transpose(-1, -2)
             trans_lhs = not trans_b
             trans_rhs = not trans_a
         else:
