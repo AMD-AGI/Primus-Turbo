@@ -59,11 +59,13 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         )
         torch.manual_seed(42)
 
+        from yunchang import set_seq_parallel_pg
+
+        set_seq_parallel_pg(2, 2, self.rank, self.world_size)
+
     @skip_if_lt_x_gpu(2)
     def test_attention_with_cp(self):
         self._init_process()
-        cp_group = dist.group.WORLD
-        cp_stream = torch.cuda.Stream()
         dtype = torch.bfloat16
         device = torch.device("cuda", self.rank)
 
@@ -71,47 +73,27 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "batch": [2],
             "config": test_cases,
             "causal": [True, False],
-            "backend_type": ["ck", "triton"],
-            "cp_comm_type": ["a2a"],
-            "fp8": [True, False],
         }
 
-        for batch, config, causal, backend_type, cp_comm_type, fp8 in itertools.product(
-            *[test_params[k] for k in test_params]
-        ):
-            if backend_type == "ck" and fp8:
-                continue
+        for batch, config, causal in itertools.product(*[test_params[k] for k in test_params]):
 
-            if fp8:
-                func = pt.ops.attention_fp8_blockwise
-            else:
-                func = pt.ops.flash_attn_func
+            func = pt.ops.flash_attn_usp_func
 
             self.run_attn_with_cp(
                 func,
                 batch,
                 config,
                 causal,
-                backend_type,
-                cp_comm_type,
-                cp_group,
-                cp_stream,
+                dist.group.WORLD,
                 device,
                 dtype,
             )
-
         dist.destroy_process_group()
 
-    def run_attn_with_cp(
-        self, func, batch, config, causal, backend_type, cp_comm_type, cp_group, cp_stream, device, dtype
-    ):
-        if cp_comm_type == "a2a":
-            input_sharder = All2AllAttentionSharder()
-        else:
-            raise NotImplementedError()
+    def run_attn_with_cp(self, func, batch, config, causal, cp_group, device, dtype):
+        from yunchang.globals import PROCESS_GROUP
 
-        cp_param_bundle = {"cp_group": cp_group, "cp_stream": cp_stream, "cp_comm_type": cp_comm_type}
-
+        input_sharder = All2AllAttentionSharder()
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
             config.seqlen_q,
             config.seqlen_kv,
@@ -157,8 +139,8 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             deterministic=False,
             return_lse=False,
             return_attn_probs=False,
-            backend_type=backend_type,
-            cp_param_bundle=cp_param_bundle,
+            ulysses_group=PROCESS_GROUP.ULYSSES_PG,
+            ring_group=PROCESS_GROUP.RING_PG,
         )
         grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
