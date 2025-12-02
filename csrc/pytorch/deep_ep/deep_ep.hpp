@@ -108,7 +108,7 @@ public:
 
     torch::Stream get_comm_stream() const;
 
-    void sync(const torch::Tensor                &all_gathered_handles,
+    void sync(const std::vector<int64_t> &device_ids, const torch::Tensor &all_gathered_handles,
               const std::optional<torch::Tensor> &root_unique_id_opt);
 
     void destroy();
@@ -212,10 +212,4 @@ public:
     torch::Tensor get_next_low_latency_combine_buffer(int64_t num_max_dispatch_tokens_per_rank,
                                                       int64_t hidden, int64_t num_experts) const;
 };
-
-c10::intrusive_ptr<Buffer> make_buffer(std::string group_name, int64_t num_nvl_bytes,
-                                       int64_t num_rdma_bytes, bool low_latency_mode,
-                                       bool explicitly_destroy,
-                                       bool use_default_stream_as_comm_stream, bool available);
-
 } // namespace primus_turbo::pytorch::deep_ep

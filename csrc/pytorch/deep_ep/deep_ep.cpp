@@ -234,15 +234,15 @@ void Buffer::destroy() {
     available = false;
 }
 
-void Buffer::sync(const torch::Tensor                &all_gathered_handles,
+void Buffer::sync(const std::vector<int64_t> &device_ids, const torch::Tensor &all_gathered_handles,
                   const std::optional<torch::Tensor> &root_unique_id_opt) {
     PRIMUS_TURBO_CHECK(not is_available());
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
-        // PRIMUS_TURBO_CHECK(static_cast<size_t>(num_ranks) == device_ids.size());
-        // PRIMUS_TURBO_CHECK(device_ids.size() ==
-        //                    static_cast<size_t>(all_gathered_handles.sizes()[0]));
+        PRIMUS_TURBO_CHECK(static_cast<size_t>(num_ranks) == device_ids.size());
+        PRIMUS_TURBO_CHECK(device_ids.size() ==
+                           static_cast<size_t>(all_gathered_handles.sizes()[0]));
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             PRIMUS_TURBO_CHECK(all_gathered_handles[offset + i].nbytes() == HIP_IPC_HANDLE_SIZE);
             auto handle_str =
