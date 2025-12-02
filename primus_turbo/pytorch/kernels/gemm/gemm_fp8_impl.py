@@ -271,16 +271,7 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
     )
 
     @staticmethod
-    @lru_cache(maxsize=1)
-    def is_available() -> bool:
-        try:
-            torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def is_compatible(
+    def can_handle(
         a: torch.Tensor,
         a_scale_inv: torch.Tensor,
         trans_a: bool,
@@ -332,16 +323,7 @@ class GEMMFP8CKBackend(KernelBackend):
     SUPPORTED_DTYPES = _COMMON_SUPPORTED_DTYPES
 
     @staticmethod
-    @lru_cache(maxsize=1)
-    def is_available() -> bool:
-        try:
-            torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def is_compatible(
+    def can_handle(
         a: torch.Tensor,
         a_scale_inv: torch.Tensor,
         trans_a: bool,
@@ -420,11 +402,11 @@ def gemm_fp8_impl(
 
     args = (a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, granularity)
     try:
-        if backend_cls.is_compatible(*args):
+        if backend_cls.can_handle(*args):
             return backend_cls.execute(*args)
         else:
             for fallback_cls in _GEMM_FP8_BACKENDS.values():
-                if fallback_cls.is_compatible(*args):
+                if fallback_cls.can_handle(*args):
                     return fallback_cls.execute(*args)
             raise ValueError("No compatible GEMM FP8 backend found for the given arguments")
     except Exception as e:

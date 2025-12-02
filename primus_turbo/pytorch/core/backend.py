@@ -81,13 +81,8 @@ class BackendConfig:
 class KernelBackend(ABC):
     @staticmethod
     @abstractmethod
-    def is_available() -> bool:
-        raise NotImplementedError("is_available is not implemented")
-
-    @staticmethod
-    @abstractmethod
-    def is_compatible(**kwargs) -> bool:
-        raise NotImplementedError("is_compatible is not implemented")
+    def can_handle(**kwargs) -> bool:
+        raise NotImplementedError("can_handle is not implemented")
 
     @staticmethod
     @abstractmethod
