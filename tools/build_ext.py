@@ -544,43 +544,10 @@ def _filter_compile_arch_args(compile_args: list[str], arch: str) -> list[str]:
 def _select_base_build_ext():
     try:
         import torch  # noqa: F401
-        from torch.utils import cpp_extension as torch_cpp_ext
         from torch.utils.cpp_extension import BuildExtension as TorchBuildExtension
 
-        _orig_check = torch_cpp_ext.check_compiler_ok_for_platform
-
-        def _patched_check_compiler_ok_for_platform(compiler):
-            try:
-                return _orig_check(compiler)
-            except subprocess.CalledProcessError:
-                if isinstance(compiler, str) and "hipcc" in compiler:
-                    warnings.warn(
-                        "[Primus-Turbo BuildExtension] Ignoring hipcc -v failure during compiler check."
-                    )
-                    return True
-                raise
-
-        torch_cpp_ext.check_compiler_ok_for_platform = _patched_check_compiler_ok_for_platform
-
-        _orig_get = torch_cpp_ext.get_compiler_abi_compatibility_and_version
-
-        def _patched_get_compiler_abi_compatibility_and_version(compiler):
-            try:
-                return _orig_get(compiler)
-            except ValueError as exc:
-                if "0git" in str(exc):
-                    warnings.warn(
-                        "[Primus-Turbo BuildExtension] Detected hipcc version string '0git'. Treating it as valid."
-                    )
-                    return ("hipcc", "0git")
-                raise
-
-        torch_cpp_ext.get_compiler_abi_compatibility_and_version = (
-            _patched_get_compiler_abi_compatibility_and_version
-        )
-
         # Monkey patching
-        torch_cpp_ext._write_ninja_file = _write_ninja_file
+        torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
         return TorchBuildExtension
     except Exception:
         return BuildExtension

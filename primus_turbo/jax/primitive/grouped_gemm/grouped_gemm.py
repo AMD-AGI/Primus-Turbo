@@ -35,46 +35,9 @@ IMPL_TABLE[compute_group_offs_p] = partial(xla.apply_primitive, compute_group_of
 
 
 # ----------------------------------------
-# Helper function to compute workspace size
-# ----------------------------------------
-def get_ck_grouped_gemm_args_sizes(group_num):
-    """Get the workspace size needed for grouped_gemm CK kernel.
-
-    Args:
-        group_num: Number of groups (batch size)
-
-    Returns:
-        Required workspace size in bytes
-    """
-    # This matches the C++ implementation:
-    # group_num * sizeof(ck_tile::GemmTransKernelArg<>)
-    #
-    # GemmTransKernelArg contains:
-    # - UniversalGemmKernelArgs (contains pointers and dimensions)
-    # - 2 index_t fields (block_start, block_end)
-    #
-    # Conservative estimate based on CK structure:
-    # ~200 bytes per group for typical configuration
-    return group_num * 256  # Use 256 bytes to be safe
-
-
-def get_ck_grouped_gemm_fp8_args_sizes(group_num):
-    """Get the workspace size needed for grouped_gemm_fp8 CK kernel.
-
-    Args:
-        group_num: Number of groups (batch size)
-
-    Returns:
-        Required workspace size in bytes
-    """
-    # FP8 kernels use similar argument structures as regular grouped_gemm
-    return group_num * 256
-
-
-# ----------------------------------------
 # Step-3: Abstract eval
 # ----------------------------------------
-def _grouped_gemm_abstract_eval(a, b, group_lens, group_offs, workspace, transA, transB, num_cu):
+def _grouped_gemm_abstract_eval(a, b, group_lens, group_offs, transA, transB, num_cu):
     """Abstract evaluation for grouped_gemm.
 
     Args:
@@ -82,7 +45,6 @@ def _grouped_gemm_abstract_eval(a, b, group_lens, group_offs, workspace, transA,
         b: Input tensor B with shape [bs, k, n] or [bs, n, k] if transB
         group_lens: Group lengths tensor [bs]
         group_offs: Group offsets tensor [bs + 1]
-        workspace: Workspace buffer for CK kernel
         transA: Whether A is transposed
         transB: Whether B is transposed
         num_cu: Number of compute units
@@ -118,7 +80,7 @@ def _compute_group_offs_abstract_eval(group_lens):
 ABSTRACT_EVAL_TABLE[compute_group_offs_p] = _compute_group_offs_abstract_eval
 
 
-def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, workspace, transA, transB, num_cu):
+def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, transA, transB, num_cu):
     """Abstract evaluation for grouped_gemm_variable_k.
 
     Note: Only supports transA=True, transB=False
@@ -128,7 +90,6 @@ def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, workspa
         b: Input tensor B with shape [k, n]
         group_lens: Group lengths tensor [bs]
         group_offs: Group offsets tensor [bs + 1]
-        workspace: Workspace buffer for CK kernel
         transA: Must be True
         transB: Must be False
         num_cu: Number of compute units
@@ -173,5 +134,4 @@ __all__ = [
     "grouped_gemm_p",
     "grouped_gemm_variable_k_p",
     "compute_group_offs_p",
-    "get_ck_grouped_gemm_args_sizes",
 ]

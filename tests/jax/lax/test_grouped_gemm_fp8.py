@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import gc
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +16,6 @@ from primus_turbo.jax.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.jax.lax import grouped_gemm_fp8
-from primus_turbo.jax.lax.grouped_gemm import clear_gemm_workspace_cache
-from primus_turbo.jax.lax.grouped_gemm_fp8 import clear_workspace_cache
-from primus_turbo.jax.lax.quantization import clear_quantize_workspace_cache
 from tests.jax.ref.gemm_ref import generate_grouped_gemm_group_lens, grouped_gemm_ref
 from tests.jax.test_utils import compute_snr
 
@@ -30,22 +27,10 @@ jax.config.update("jax_enable_compilation_cache", True)
 jax.config.update("jax_cpu_enable_async_dispatch", True)
 
 
-@pytest.fixture(autouse=True)
-def cleanup_memory():
-    """Clean up GPU memory after each test to prevent OOM."""
-    yield
-    # Clear workspace caches to free GPU memory
-    clear_workspace_cache()
-    clear_gemm_workspace_cache()
-    clear_quantize_workspace_cache()
-    # Clear JAX caches and run garbage collection
-    jax.clear_caches()
-    gc.collect()
-
-
-# Generate test arrays (no caching to avoid OOM with many test combinations)
+# Cache test data generation
+@lru_cache(maxsize=256)
 def _get_cached_array(shape_tuple, dtype_str, seed):
-    """Generate arrays for test (no caching to prevent OOM)."""
+    """Cache generated arrays to avoid regenerating for each test."""
     shape = tuple(shape_tuple)
     dtype = jnp.bfloat16 if dtype_str == "bfloat16" else jnp.float16
     key = jax.random.PRNGKey(seed)
