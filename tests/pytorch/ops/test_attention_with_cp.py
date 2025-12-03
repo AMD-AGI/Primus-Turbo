@@ -7,6 +7,7 @@ import itertools
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
@@ -59,9 +60,8 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         )
         torch.manual_seed(42)
 
-        from yunchang import set_seq_parallel_pg
-
-        set_seq_parallel_pg(1, 4, self.rank, self.world_size)
+        # from yunchang import set_seq_parallel_pg
+        # set_seq_parallel_pg(2, 2, self.rank, self.world_size, True)
 
     @skip_if_lt_x_gpu(2)
     def test_attention_with_cp(self):
@@ -73,26 +73,36 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "batch": [2],
             "config": test_cases,
             "causal": [True, False],
-            "fp8": [False],
+            "fp8": [True, False],
+            "ulysses_degree": [1, 2, 4, 8],
         }
 
-        for batch, config, causal, fp8 in itertools.product(*[test_params[k] for k in test_params]):
-
+        for batch, config, causal, fp8, ulysses_degree in itertools.product(
+            *[test_params[k] for k in test_params]
+        ):
+            if self.world_size % ulysses_degree != 0:
+                continue
+            ring_degree = self.world_size // ulysses_degree
+            if fp8 and ring_degree != 1:
+                continue
             func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
-
             self.run_attn_with_cp(
                 func,
                 batch,
                 config,
                 causal,
-                dist.group.WORLD,
+                ulysses_degree,
+                ring_degree,
                 device,
                 dtype,
             )
         dist.destroy_process_group()
 
-    def run_attn_with_cp(self, func, batch, config, causal, cp_group, device, dtype):
-        from yunchang.globals import PROCESS_GROUP
+    def run_attn_with_cp(self, func, batch, config, causal, ulysses_degree, ring_degree, device, dtype):
+        cp_group = dist.group.WORLD
+        device_mesh = init_device_mesh("cuda", (ring_degree, ulysses_degree))
+        print(f"run_attn_with_cp, ring_degree={ring_degree}, ulysses_degree={ulysses_degree}")
+        # from yunchang.globals import PROCESS_GROUP
 
         input_sharder = All2AllAttentionSharder()
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
@@ -140,8 +150,10 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             deterministic=False,
             return_lse=False,
             return_attn_probs=False,
-            ulysses_group=PROCESS_GROUP.ULYSSES_PG,
-            ring_group=PROCESS_GROUP.RING_PG,
+            ulysses_group=device_mesh.get_group(1),
+            ring_group=device_mesh.get_group(0),
+            # ulysses_group=PROCESS_GROUP.ULYSSES_PG,
+            # ring_group=PROCESS_GROUP.RING_PG,
         )
         grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
