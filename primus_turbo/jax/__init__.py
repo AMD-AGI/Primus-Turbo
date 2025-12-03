@@ -7,6 +7,8 @@
 import jax
 from jax.interpreters import ad, batching, mlir
 
+# Import Turbo grouped GEMM module
+from primus_turbo.jax import modules
 from primus_turbo.jax._C import registrations
 from primus_turbo.jax.primitive import (
     ABSTRACT_EVAL_TABLE,
@@ -15,9 +17,6 @@ from primus_turbo.jax.primitive import (
     LOWERING_TABLE,
     TRANSPOSE_TABLE,
 )
-
-# Import Turbo grouped GEMM module
-from primus_turbo.jax import modules
 
 
 def initialize():

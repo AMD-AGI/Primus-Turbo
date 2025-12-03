@@ -62,9 +62,7 @@ def _grouped_gemm_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, 
 ABSTRACT_EVAL_TABLE[grouped_gemm_hipblaslt_p] = _grouped_gemm_hipblaslt_abstract_eval
 
 
-def _grouped_gemm_variable_k_hipblaslt_abstract_eval(
-    a, b, group_lens, group_offs, transA, transB, num_cu
-):
+def _grouped_gemm_variable_k_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, transB, num_cu):
     """Abstract evaluation for grouped_gemm_variable_k_hipblaslt.
 
     Note: Only supports transA=True, transB=False
@@ -95,9 +93,7 @@ def _grouped_gemm_variable_k_hipblaslt_abstract_eval(
     return ShapedArray((bs, m, n), a.dtype)
 
 
-ABSTRACT_EVAL_TABLE[grouped_gemm_variable_k_hipblaslt_p] = (
-    _grouped_gemm_variable_k_hipblaslt_abstract_eval
-)
+ABSTRACT_EVAL_TABLE[grouped_gemm_variable_k_hipblaslt_p] = _grouped_gemm_variable_k_hipblaslt_abstract_eval
 
 
 # ----------------------------------------
@@ -120,4 +116,3 @@ __all__ = [
     "grouped_gemm_hipblaslt_p",
     "grouped_gemm_variable_k_hipblaslt_p",
 ]
-

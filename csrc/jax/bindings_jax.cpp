@@ -32,10 +32,11 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, grouped_gemm, GroupedGemmHandler);
     REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k, GroupedGemmVariableKHandler);
     REGISTER_FFI_HANDLER(dict, compute_group_offs, ComputeGroupOffsHandler);
-    
+
     // Grouped GEMM (hipBLASLt backend)
     REGISTER_FFI_HANDLER(dict, grouped_gemm_hipblaslt, GroupedGemmHipblasltHandler);
-    REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k_hipblaslt, GroupedGemmVariableKHipblasltHandler);
+    REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k_hipblaslt,
+                         GroupedGemmVariableKHipblasltHandler);
 
     // Grouped GEMM FP8
     REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8, GroupedGemmFP8Handler);

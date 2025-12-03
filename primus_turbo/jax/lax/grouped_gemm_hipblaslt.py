@@ -8,11 +8,11 @@ from functools import partial
 
 import jax
 
+from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import compute_group_offs_p
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_hipblaslt import (
     grouped_gemm_hipblaslt_p,
     grouped_gemm_variable_k_hipblaslt_p,
 )
-from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import compute_group_offs_p
 
 __all__ = ["grouped_gemm_hipblaslt", "compute_group_offs"]
 
@@ -99,5 +99,3 @@ def _grouped_gemm_hipblaslt_bwd(transA, transB, num_cu, ctx, grad_c):
 
 
 grouped_gemm_hipblaslt.defvjp(_grouped_gemm_hipblaslt_fwd, _grouped_gemm_hipblaslt_bwd)
-
-
