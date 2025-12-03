@@ -61,7 +61,7 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
 
         from yunchang import set_seq_parallel_pg
 
-        set_seq_parallel_pg(2, 2, self.rank, self.world_size)
+        set_seq_parallel_pg(1, 4, self.rank, self.world_size)
 
     @skip_if_lt_x_gpu(2)
     def test_attention_with_cp(self):
@@ -73,11 +73,12 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "batch": [2],
             "config": test_cases,
             "causal": [True, False],
+            "fp8": [False],
         }
 
-        for batch, config, causal in itertools.product(*[test_params[k] for k in test_params]):
+        for batch, config, causal, fp8 in itertools.product(*[test_params[k] for k in test_params]):
 
-            func = pt.ops.flash_attn_usp_func
+            func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
 
             self.run_attn_with_cp(
                 func,
