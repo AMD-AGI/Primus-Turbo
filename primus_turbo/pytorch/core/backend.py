@@ -150,8 +150,8 @@ class AutoKernelDispatcher(ABC):
 
     _backends: Dict[BackendType, Type[KernelBackend]] = {}
     _cache: Optional[TuneCache] = None
-    _warmup_iters: int = 50
-    _profile_iters: int = 50
+    _warmup_iters: int = 10
+    _profile_iters: int = 20
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
     def __init_subclass__(cls, **kwargs):

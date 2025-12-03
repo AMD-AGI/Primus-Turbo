@@ -262,13 +262,13 @@ _HYBRID_SUPPORTED_DTYPES = (
 
 
 class GEMMFP8HipBLASLtBackend(KernelBackend):
-    SUPPORTED_GRANULARITIES = (
+    SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.MX_BLOCKWISE,
-    )
+    }
 
     # (a_dtype, b_dtype, c_dtype)
-    SUPPORTED_DTYPES = _COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     # (trans_a, trans_b, trans_c)
     SUPPORTED_LAYOUTS = (
@@ -327,7 +327,7 @@ class GEMMFP8CKBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = _COMMON_SUPPORTED_DTYPES
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
