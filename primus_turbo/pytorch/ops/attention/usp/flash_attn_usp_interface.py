@@ -1,171 +1,27 @@
-from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
+import torch.distributed as dist
 
-from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (  # attention_aiter_csrc_backward_impl,
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    ScalingGranularity,
+)
+from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_backward_impl,
     attention_aiter_csrc_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    attention_triton_backward_impl,
+    attention_triton_forward_impl,
+)
+from primus_turbo.pytorch.ops.attention.attention_utils import (
+    block_scaling_node,
+    get_p_scale,
+)
 
+from .attention_a2a_helper import get_attention_cp_a2a_helper
 from .attention_ring import ring_attn_bwd, ring_attn_fwd
-
-
-class AttentionCPA2AHelper:
-    """AttentionCPA2AHelper: a helper to transpose tensor for CP A2A"""
-
-    def __init__(self, b, s, h_q, h_kv, d_qk, d_v, seq_dim, n):
-        assert seq_dim == 1, "only_support bshd yet"
-        self.seq_dim = seq_dim
-
-        self.qkv_shape_traits = ((n, b, s, h_q, d_qk), (n, b, s, h_kv, d_qk), (n, b, s, h_kv, d_v))
-
-        self.o_shape_traits = (n, b, s, h_q, d_v)
-
-        self.combine_splits = (
-            b * s * h_q * d_qk // n // n,
-            b * s * h_kv * d_qk // n // n,
-            b * s * h_kv * d_v // n // n,
-        )
-
-    def combine_qkv_before_a2a(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Combine and reshape qkv before all2all
-
-        Args:
-            q (torch.Tensor): query tensor (b, s // n, h_q, d_qk)
-            k (torch.Tensor): key tensor (b, s // n, h_kv, d_qk)
-            v (torch.Tensor): value tensor (b, s // n, h_kv, d_v)
-
-        Returns:
-            qkv (torch.Tensor): qkv combined tensor (n, -1)
-        """
-        # [b, s // n, h, d] -> [b, s // n, n, h // n, d] -> [n, b, s // n, h // n, d] -> [n, -1]
-        q, k, v = (
-            x.view(b, s // n, n, h // n, d).movedim(-3, 0).contiguous().view(n, -1)
-            for x, (n, b, s, h, d) in zip((q, k, v), self.qkv_shape_traits)
-        )
-
-        qkv = torch.cat((q, k, v), dim=1).contiguous()
-        return qkv
-
-    def splits_qkv_after_a2a(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split and reshape qkv before all2all
-
-        Args:
-            qkv (torch.Tensor): qkv tensor of local heads (n, -1)
-
-        Returns:
-            q_local_heads, k_local_heads, v_local_heads (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): (b, s, h // n, d)
-        """
-        q, k, v = torch.split(qkv, self.combine_splits, dim=1)
-        # [n, b, s // n, h // n, d] -> [b, n, s // n, h // n, d] -> [b, s, h // n, d]
-        q, k, v = (
-            x.view(n, b, s // n, h // n, d).movedim(0, 1).contiguous().view(b, s, h // n, d)
-            for x, (n, b, s, h, d) in zip((q, k, v), self.qkv_shape_traits)
-        )
-        return q, k, v
-
-    def reshape_o_before_a2a(self, o: torch.Tensor) -> torch.Tensor:
-        """Reshape output before all2all
-
-        Args:
-            o (torch.Tensor): output of local heads (b, s, h // n, d)
-
-        Returns:
-            o_reshaped (torch.Tensor): (n, b, s // n, h // n, d)
-        """
-
-        # [b, s, h // n, d] -> [b, n, s // n, h // n, d] -> [n, b, s // n, h // n, d]
-        n, b, s, h, d = self.o_shape_traits
-        o = o.view(b, n, s // n, h // n, d).movedim(1, 0).contiguous()
-        return o
-
-    def reshape_o_after_a2a(self, o: torch.Tensor) -> torch.Tensor:
-        """Reshape output after all2all
-
-        Args:
-            o (torch.Tensor): output of local seq (n, b, s // n, h // n, d)
-
-        Returns:
-            o_reshaped (torch.Tensor): (b, s // n, h, d)
-        """
-        n, b, s, h, d = self.o_shape_traits
-        # [n, b, s // n, h // n, d] -> [b, s // n, n, h // n, d] -> [b, s // n, h, d]
-        o = o.movedim(0, -3).contiguous().view(b, s // n, h, d)
-
-        return o
-
-    def reshape_do_before_a2a(self, d_o: torch.Tensor) -> torch.Tensor:
-        """Reshape output grad before all2all
-
-        Args:
-            d_o (torch.Tensor): output grad of local seq (b, s // n, h, d)
-
-        Returns:
-            d_o_reshaped torch.Tensor: (n, b, s // n, h // n, d)
-        """
-        # [b, s // n, h, d] -> [b, s // n, n , h // n, d] -> [n, b, s // n, h // n, d]
-        n, b, s, h, d = self.o_shape_traits
-        d_o = d_o.view(b, s // n, n, h // n, d).movedim(-3, 0).contiguous()
-        return d_o
-
-    def reshape_do_after_a2a(self, d_o: torch.Tensor) -> torch.Tensor:
-        """Reshape output grad after all2all
-
-        Args:
-            d_o (torch.Tensor): output grad of local head (n, b, s // n, h // n, d)
-
-        Returns:
-            d_o_reshaped torch.Tensor: (b, s, h // n, d)
-        """
-        # [n, b, s // n, h // n, d] -> [b, n, s // n, h // n, d] -> [b, s, h // n, d]
-        n, b, s, h, d = self.o_shape_traits
-        d_o = d_o.movedim(0, 1).contiguous().view(b, s, h // n, d)
-        return d_o
-
-    def combine_dqkv_before_a2a(self, dq: torch.Tensor, dk: torch.Tensor, dv: torch.Tensor) -> torch.Tensor:
-        """Combine qkv tensor of local heads before a2a
-
-        Args:
-            dq (torch.Tensor): dq local heads (b, s, h // n, d)
-            dk (torch.Tensor): dk local heads (b, s, h // n, d)
-            dv (torch.Tensor): dv local heads (b, s, h // n, d)
-
-        Returns:
-            d_qkv torch.Tensor: dqkv of local heads (n, -1)
-        """
-
-        # [b, s, h // n, d] -> [b, n, s // n, h // n, d] -> [n, b, s // n, h // n, d] -> [n, -1]
-        dq, dk, dv = (
-            x.view(b, n, s // n, h // n, d).movedim(1, 0).contiguous().view(n, -1)
-            for x, (n, b, s, h, d) in zip((dq, dk, dv), self.qkv_shape_traits)
-        )
-        dqkv = torch.cat((dq, dk, dv), dim=1).contiguous()
-
-        return dqkv
-
-    def split_dqkv_after_a2a(self, dqkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Combine qkv tensor of local seq after a2a
-
-        Args:
-            dqkv (torch.Tensor): dqkv of local seq (n, -1)
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: dq, dk, dv of local seq (b, s // n, h, d)
-        """
-        # [n, b, s // n, h // n, d] -> [b, s // n, n, h // n, d] -> [b, s // n, h, d]
-        dq, dk, dv = torch.split(dqkv, self.combine_splits, dim=1)
-        dq, dk, dv = (
-            x.view(n, b, s // n, h // n, d).movedim(0, -3).contiguous().view(b, s // n, h, d)
-            for x, (n, b, s, h, d) in zip((dq, dk, dv), self.qkv_shape_traits)
-        )
-        return dq, dk, dv
-
-
-@lru_cache
-def get_attention_cp_a2a_helper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n):
-    attn_helper = AttentionCPA2AHelper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n)
-    return attn_helper
 
 
 class AttentionCKFunctionCPA2A(torch.autograd.Function):
@@ -223,6 +79,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         assert dropout_p == 0.0
         out_padded, softmax_lse, S_dmask, rng_state = ring_attn_fwd(
             ring_group,
+            q_local_heads.dtype,
             attention_aiter_csrc_forward_impl,
             q_local_heads,
             k_local_heads,
@@ -283,7 +140,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             softmax_lse,
             rng_state,
         ) = ctx.saved_tensors
-        attn_helper: AttentionCPA2AHelper = ctx.attn_helper
+        attn_helper = ctx.attn_helper
 
         dout = attn_helper.reshape_do_before_a2a(dout)
 
@@ -306,6 +163,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
+            dout_padded.dtype,
             attention_aiter_csrc_backward_impl,
             dout_padded,
             q_local_heads,
@@ -357,6 +215,187 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         )
 
 
+class AttentionTritonFunctionCPA2A(torch.autograd.Function):
+    """
+    QKV split by attention heads and a2a
+    Refer the paper `DeepSpeed Ulysses <https://arxiv.org/abs/2309.14509>` for detail.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        return_lse,
+        return_softmax,
+        is_grad,
+        use_fp8,
+        ulysses_group,
+        ring_group,
+    ):
+        assert bias is None
+        assert dist.get_world_size(ring_group) == 1
+
+        n = ulysses_group.size()
+        b, s, h_q, d_qk = q.shape
+        _, _, h_kv, d_v = v.shape
+        s = s * n
+        assert h_q % n == 0
+        assert h_kv % n == 0
+        # bshd only
+        seq_dim = 1
+        attn_helper = get_attention_cp_a2a_helper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n)
+
+        qkv = attn_helper.combine_qkv_before_a2a(q, k, v)
+        qkv_out = torch.empty_like(qkv)
+        torch.distributed.all_to_all_single(qkv_out, qkv, group=ulysses_group, async_op=False)
+        q_local_heads, k_local_heads, v_local_heads = attn_helper.splits_qkv_after_a2a(qkv_out)
+
+        q_local_heads, q_descale = block_scaling_node(q_local_heads, use_fp8=use_fp8)
+        k_local_heads, k_descale = block_scaling_node(k_local_heads, use_fp8=use_fp8)
+        v_local_heads, v_descale = block_scaling_node(v_local_heads, use_fp8=use_fp8)
+        p_scale = get_p_scale(use_fp8)
+
+        output_local_heads, softmax_lse, exp_scores = attention_triton_forward_impl(
+            q_local_heads,
+            k_local_heads,
+            v_local_heads,
+            p_scale,
+            q_descale,
+            k_descale,
+            v_descale,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            bias,
+            alibi_slopes,
+            return_softmax,
+            use_fp8,
+        )
+
+        # save_ctx for backward
+        if is_grad:
+            # q, k, v should be fp8 when set use_fp8 to True
+            ctx.save_for_backward(
+                q_local_heads,
+                k_local_heads,
+                v_local_heads,
+                output_local_heads,
+                softmax_lse,
+                alibi_slopes,
+                bias,
+                q_descale,
+                k_descale,
+                v_descale,
+            )
+            ctx.sm_scale = softmax_scale
+            ctx.p_scale = p_scale
+            ctx.causal = causal
+            ctx.use_fp8 = use_fp8
+            ctx.cu_seqlens_q = torch.tensor(0, device="cuda")
+            ctx.cu_seqlens_k = torch.tensor(0, device="cuda")
+            ctx.max_seqlens_q = q_local_heads.shape[1]
+            ctx.max_seqlens_k = k_local_heads.shape[1]
+            ctx.attn_helper = attn_helper
+            ctx.seq_dim = seq_dim
+            ctx.ulysses_group = ulysses_group
+
+        output_local_heads = attn_helper.reshape_o_before_a2a(output_local_heads)
+        output_local_tokens = torch.empty_like(output_local_heads)
+        torch.distributed.all_to_all_single(
+            output_local_tokens, output_local_heads, group=ulysses_group, async_op=False
+        )
+        output_local_tokens = attn_helper.reshape_o_after_a2a(output_local_tokens)
+
+        result = [output_local_tokens]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(exp_scores)
+        return result[0] if len(result) == 1 else tuple(result)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        (
+            q_local_heads,
+            k_local_heads,
+            v_local_heads,
+            output_local_heads,
+            softmax_lse,
+            alibi_slopes,
+            bias,
+            q_descale,
+            k_descale,
+            v_descale,
+        ) = ctx.saved_tensors
+        assert bias is None, "Currently bias is not supported by fa backward function."
+        assert dout.dtype is torch.bfloat16, f"dout should be bfloat16 but get {dout.dtype}"
+        attn_helper = ctx.attn_helper
+
+        dout = attn_helper.reshape_do_before_a2a(dout)
+        dout_local_heads = torch.empty_like(dout)
+        torch.distributed.all_to_all_single(dout_local_heads, dout, group=ctx.ulysses_group)
+        dout_local_heads = attn_helper.reshape_do_after_a2a(dout_local_heads)
+
+        dq_local_heads, dk_local_heads, dv_local_heads = attention_triton_backward_impl(
+            dout_local_heads,
+            q_local_heads,
+            k_local_heads,
+            v_local_heads,
+            output_local_heads,
+            q_descale,
+            k_descale,
+            v_descale,
+            ctx.p_scale,
+            softmax_lse,
+            None,
+            None,
+            None,
+            ctx.cu_seqlens_q,
+            ctx.cu_seqlens_k,
+            ctx.max_seqlens_q,
+            ctx.max_seqlens_k,
+            ctx.sm_scale,
+            ctx.causal,
+            -1,
+            -1,
+            alibi_slopes,
+            ctx.use_fp8,
+        )
+
+        dqkv = attn_helper.combine_dqkv_before_a2a(dq_local_heads, dk_local_heads, dv_local_heads)
+        dqkv_out = torch.empty_like(dqkv)
+        torch.distributed.all_to_all_single(dqkv_out, dqkv, group=ctx.ulysses_group)
+        dq_local_tokens, dk_local_tokens, dv_local_tokens = attn_helper.split_dqkv_after_a2a(dqkv_out)
+
+        return (
+            dq_local_tokens,
+            dk_local_tokens,
+            dv_local_tokens,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def flash_attn_usp_func(
     q,
     k,
@@ -373,6 +412,7 @@ def flash_attn_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
+    # TODO
     assert ulysses_group and ring_group
     return AttentionCKFunctionCPA2A.apply(
         q,
@@ -388,6 +428,61 @@ def flash_attn_usp_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        ulysses_group,
+        ring_group,
+    )
+
+
+def flash_attn_fp8_usp_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=True,
+    return_lse=False,
+    return_attn_probs=False,
+    fp8_config: Optional[Float8QuantConfig] = None,
+    ulysses_group=None,
+    ring_group=None,
+):
+    # TODO
+    assert ulysses_group and ring_group
+    # Default config: blockwise with block_size=64
+    if fp8_config is None:
+        fp8_config = Float8QuantConfig(
+            granularity=ScalingGranularity.BLOCKWISE,
+            block_size=64,
+        )
+
+    # Check if config is supported
+    if fp8_config.granularity != ScalingGranularity.BLOCKWISE:
+        raise ValueError(
+            f"flash_attn_fp8_func only supports BLOCKWISE granularity, " f"but got {fp8_config.granularity}"
+        )
+    if fp8_config.block_size != 64:
+        raise ValueError(
+            f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
+        )
+
+    return AttentionTritonFunctionCPA2A.apply(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        return_lse,
+        return_attn_probs,
+        torch.is_grad_enabled(),
+        True,
         ulysses_group,
         ring_group,
     )

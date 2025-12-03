@@ -4,11 +4,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (  # attention_aiter_csrc_backward_impl,
-    attention_aiter_csrc_backward_impl,
-    attention_aiter_csrc_forward_impl,
-)
-
 
 class RingComm:
     def __init__(self, process_group: dist.ProcessGroup):
@@ -97,6 +92,7 @@ def update_out_and_lse(
 
 def ring_attn_fwd(
     process_group,
+    output_dtype,
     attn_func,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -132,13 +128,14 @@ def ring_attn_fwd(
             k = next_k
             v = next_v
 
-    out = out.to(q.dtype)
+    out = out.to(output_dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse, *results
 
 
 def ring_attn_bwd(
     process_group,
+    output_dtype,
     attn_func,
     dout,
     q,
@@ -210,4 +207,4 @@ def ring_attn_bwd(
 
     d_kv_comm.wait()
 
-    return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype)
+    return dq.to(output_dtype), next_dk.to(output_dtype), next_dv.to(output_dtype)
