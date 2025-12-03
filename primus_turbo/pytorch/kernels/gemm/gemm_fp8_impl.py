@@ -408,10 +408,10 @@ def gemm_fp8_impl(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend: int,
     granularity: int,
+    default_backend: int,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(backend)
+    default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_gemm_backend()
     granularity_enum = ScalingGranularity(granularity)
 
@@ -440,8 +440,8 @@ def gemm_fp8_impl_meta(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend: int,
     granularity: int,
+    default_backend: int,
 ) -> torch.Tensor:
     m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
     if trans_c:

@@ -206,11 +206,11 @@ class AutoKernelDispatcher(ABC):
             if backend.can_handle(**kwargs):
                 try:
                     cur_time = cls.profile(backend, **kwargs)
-                    if cur_time < best_time:
-                        best_time = cur_time
-                        best_backend = backend
                 except Exception:
-                    continue
+                    cur_time = float("inf")
+                if cur_time < best_time:
+                    best_time = cur_time
+                    best_backend = backend
 
         if best_backend is not None:
             cls._cache.put(key, best_backend)
