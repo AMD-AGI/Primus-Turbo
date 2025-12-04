@@ -138,10 +138,8 @@ void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *
 // ============================================================================
 
 ffi::Error GroupedGemmHipblasltFFI(hipStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-                                   ffi::AnyBuffer batch_sizes,
-                                   ffi::AnyBuffer group_offs, // Added to match signature
-                                   ffi::Result<ffi::AnyBuffer> c, bool trans_a, bool trans_b,
-                                   int64_t num_cu) {
+                                   ffi::AnyBuffer batch_sizes, ffi::AnyBuffer group_offs,
+                                   ffi::Result<ffi::AnyBuffer> c, bool trans_a, bool trans_b) {
     // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
@@ -185,8 +183,7 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
                                             ffi::AnyBuffer group_offs,     // [num_experts + 1]
                                             ffi::Result<ffi::AnyBuffer> c, // [num_experts, m, n]
                                             bool                        trans_a, // must be True
-                                            bool                        trans_b, // must be False
-                                            int64_t                     num_cu) {
+                                            bool                        trans_b) {                      // must be False
     // Check constraint: only supports trans_a=True, trans_b=False
     if (!trans_a || trans_b) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -278,8 +275,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmHipblasltHandler, GroupedGemmHipblasltF
                                   .Arg<ffi::AnyBuffer>() // group_offs
                                   .Ret<ffi::AnyBuffer>() // c
                                   .Attr<bool>("transA")
-                                  .Attr<bool>("transB")
-                                  .Attr<int64_t>("num_cu"));
+                                  .Attr<bool>("transB"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmVariableKHipblasltHandler,
                               GroupedGemmVariableKHipblasltFFI,
@@ -291,7 +287,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmVariableKHipblasltHandler,
                                   .Arg<ffi::AnyBuffer>() // group_offs
                                   .Ret<ffi::AnyBuffer>() // c
                                   .Attr<bool>("transA")
-                                  .Attr<bool>("transB")
-                                  .Attr<int64_t>("num_cu"));
+                                  .Attr<bool>("transB"));
 
 } // namespace primus_turbo::jax

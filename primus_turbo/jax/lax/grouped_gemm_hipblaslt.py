@@ -29,8 +29,8 @@ def compute_group_offs(group_lens):
     return compute_group_offs_p.bind(group_lens)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
-def grouped_gemm_hipblaslt(a, b, group_lens, group_offs=None, transA=False, transB=False, num_cu=-1):
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5))
+def grouped_gemm_hipblaslt(a, b, group_lens, group_offs=None, transA=False, transB=False):
     """Grouped GEMM with hipBLASLt backend and automatic differentiation support.
 
     Args:
@@ -40,7 +40,6 @@ def grouped_gemm_hipblaslt(a, b, group_lens, group_offs=None, transA=False, tran
         group_offs: Group offsets tensor [bs + 1]. If None, computed internally from group_lens
         transA: Whether A is transposed
         transB: Whether B is transposed
-        num_cu: Number of compute units
 
     Returns:
         Output tensor with shape [m, n]
@@ -48,29 +47,25 @@ def grouped_gemm_hipblaslt(a, b, group_lens, group_offs=None, transA=False, tran
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)
 
-    return grouped_gemm_hipblaslt_p.bind(
-        a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu
-    )
+    return grouped_gemm_hipblaslt_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB)
 
 
 # Ref: https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html
 # Input : same input signature as the underlying primal function
 # Output: out, ctx
-def _grouped_gemm_hipblaslt_fwd(a, b, group_lens, group_offs, transA, transB, num_cu):
+def _grouped_gemm_hipblaslt_fwd(a, b, group_lens, group_offs, transA, transB):
     """Internal forward pass that saves values for backward."""
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)
 
-    c = grouped_gemm_hipblaslt_p.bind(
-        a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu
-    )
+    c = grouped_gemm_hipblaslt_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB)
     ctx = (a, b, group_lens, group_offs)
     return c, ctx
 
 
 # input: nondiff_argnums, ctx, grad
 # output: input grad
-def _grouped_gemm_hipblaslt_bwd(transA, transB, num_cu, ctx, grad_c):
+def _grouped_gemm_hipblaslt_bwd(transA, transB, ctx, grad_c):
     """Backward pass for grouped GEMM with hipBLASLt backend.
 
     Computes gradients with respect to inputs a and b.
@@ -78,9 +73,7 @@ def _grouped_gemm_hipblaslt_bwd(transA, transB, num_cu, ctx, grad_c):
     a, b, group_lens, group_offs = ctx
 
     # grad_a = grad_c @ b.T (or b if transB)
-    grad_a = grouped_gemm_hipblaslt_p.bind(
-        grad_c, b, group_lens, group_offs, transA=False, transB=not transB, num_cu=num_cu
-    )
+    grad_a = grouped_gemm_hipblaslt_p.bind(grad_c, b, group_lens, group_offs, transA=False, transB=not transB)
 
     # grad_b = a.T @ grad_c (variable_k version)
     # For transB=True: Forward is C = A @ B.T, so grad_B = grad_C.T @ A
@@ -91,7 +84,7 @@ def _grouped_gemm_hipblaslt_bwd(transA, transB, num_cu, ctx, grad_c):
         lhs, rhs = a.T, grad_c.T  # Transpose both!
 
     grad_b = grouped_gemm_variable_k_hipblaslt_p.bind(
-        lhs, rhs, group_lens, group_offs, transA=True, transB=False, num_cu=num_cu
+        lhs, rhs, group_lens, group_offs, transA=True, transB=False
     )
 
     # group_lens, group_offs don't have gradients

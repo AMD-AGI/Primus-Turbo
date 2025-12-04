@@ -35,7 +35,7 @@ IMPL_TABLE[grouped_gemm_variable_k_hipblaslt_p] = partial(
 # ----------------------------------------
 # Step-3: Abstract eval
 # ----------------------------------------
-def _grouped_gemm_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, transB, num_cu):
+def _grouped_gemm_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, transB):
     """Abstract evaluation for grouped_gemm_hipblaslt.
 
     Args:
@@ -45,7 +45,6 @@ def _grouped_gemm_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, 
         group_offs: Group offsets tensor [bs + 1]
         transA: Whether A is transposed
         transB: Whether B is transposed
-        num_cu: Number of compute units
 
     Returns:
         Output tensor with shape [m, n]
@@ -62,7 +61,7 @@ def _grouped_gemm_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, 
 ABSTRACT_EVAL_TABLE[grouped_gemm_hipblaslt_p] = _grouped_gemm_hipblaslt_abstract_eval
 
 
-def _grouped_gemm_variable_k_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, transB, num_cu):
+def _grouped_gemm_variable_k_hipblaslt_abstract_eval(a, b, group_lens, group_offs, transA, transB):
     """Abstract evaluation for grouped_gemm_variable_k_hipblaslt.
 
     Note: Only supports transA=True, transB=False
@@ -74,7 +73,6 @@ def _grouped_gemm_variable_k_hipblaslt_abstract_eval(a, b, group_lens, group_off
         group_offs: Group offsets tensor [bs + 1]
         transA: Must be True
         transB: Must be False
-        num_cu: Number of compute units
 
     Returns:
         Output tensor with shape [bs, m, n]

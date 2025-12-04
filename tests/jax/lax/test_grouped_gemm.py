@@ -104,8 +104,7 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("balance", [False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("reduce_num_cu", [0, 16])
-def test_grouped_gemm_hipblaslt(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
+def test_grouped_gemm_hipblaslt(B, M, N_K, dtype, balance, trans_b):
     """Test grouped GEMM hipBLASLt forward and backward pass."""
     N, K = N_K
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance)
@@ -120,12 +119,9 @@ def test_grouped_gemm_hipblaslt(B, M, N_K, dtype, balance, trans_b, reduce_num_c
     a_ref = a  # Using cached immutable data
     b_ref = b
 
-    # Compute num_cu
-    num_cu = -1 if reduce_num_cu == 0 else reduce_num_cu
-
     #######################################
     # Forward
-    out = grouped_gemm_hipblaslt(a, b, group_lens, transB=trans_b, num_cu=num_cu)
+    out = grouped_gemm_hipblaslt(a, b, group_lens, transB=trans_b)
 
     # Reference uses float32 for faster computation
     a_ref_f32 = a_ref.astype(jnp.float32)
@@ -137,7 +133,7 @@ def test_grouped_gemm_hipblaslt(B, M, N_K, dtype, balance, trans_b, reduce_num_c
     assert out_snr > 20, f"out_snr too low: {out_snr:.2f} dB"
 
     def loss_fn(a, b):
-        return jnp.sum(grouped_gemm_hipblaslt(a, b, group_lens, transB=trans_b, num_cu=num_cu))
+        return jnp.sum(grouped_gemm_hipblaslt(a, b, group_lens, transB=trans_b))
 
     def loss_fn_ref(a, b):
         return jnp.sum(grouped_gemm_ref(a, b, group_lens, trans_b=trans_b))
