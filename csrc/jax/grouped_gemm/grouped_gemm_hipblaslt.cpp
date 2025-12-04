@@ -3,14 +3,15 @@
 // See LICENSE for license information.
 //
 // Grouped GEMM hipBLASLt Implementation
-// Simpler alternative to CK-based implementation with full JIT support
+// Uses primus_turbo::hipblaslt_gemm_impl for better performance
 
 #include "../extensions.h"
+#include "primus_turbo/gemm.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
 #include <mutex>
 
 #define NUM_STREAM 4
@@ -24,29 +25,32 @@
         }                                                                                          \
     } while (0)
 
-#define HIPBLAS_CHECK(cmd)                                                                         \
+#define HIPBLASLT_CHECK(cmd)                                                                       \
     do {                                                                                           \
         hipblasStatus_t status = (cmd);                                                            \
         if (status != HIPBLAS_STATUS_SUCCESS) {                                                    \
-            std::fprintf(stderr, "hipBLAS error %d at %s:%d\n", status, __FILE__, __LINE__);       \
+            std::fprintf(stderr, "hipBLASLt error %d at %s:%d\n", status, __FILE__, __LINE__);     \
             std::abort();                                                                          \
         }                                                                                          \
     } while (0)
 
 namespace primus_turbo::jax {
 
-// Global hipBLAS state for hipBLASLt backend
-static hipblasHandle_t g_hipblaslt_handle[NUM_STREAM];
-static hipStream_t     g_hipblaslt_stream[NUM_STREAM];
-static hipEvent_t      g_hipblaslt_event[NUM_STREAM];
-static std::once_flag  g_hipblaslt_once_flag;
+// Global hipBLASLt state
+static hipblasLtHandle_t g_hipblaslt_handle[NUM_STREAM];
+static hipStream_t       g_hipblaslt_stream[NUM_STREAM];
+static hipEvent_t        g_hipblaslt_event[NUM_STREAM];
+static void             *g_hipblaslt_workspace[NUM_STREAM];
+static int64_t           g_hipblaslt_workspace_size = 0;
+static std::once_flag    g_hipblaslt_once_flag;
 
 void init_hipblaslt() {
+    g_hipblaslt_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
     for (int i = 0; i < NUM_STREAM; i++) {
         HIP_CHECK(hipStreamCreateWithFlags(&g_hipblaslt_stream[i], hipStreamNonBlocking));
-        HIPBLAS_CHECK(hipblasCreate(&g_hipblaslt_handle[i]));
-        HIPBLAS_CHECK(hipblasSetStream(g_hipblaslt_handle[i], g_hipblaslt_stream[i]));
+        HIPBLASLT_CHECK(hipblasLtCreate(&g_hipblaslt_handle[i]));
         HIP_CHECK(hipEventCreate(&g_hipblaslt_event[i]));
+        HIP_CHECK(hipMalloc(&g_hipblaslt_workspace[i], g_hipblaslt_workspace_size));
     }
 }
 
@@ -70,25 +74,29 @@ inline void hipblaslt_current_wait_streams(hipStream_t current_stream) {
     }
 }
 
-void HipblasltGemm(hipblasHandle_t handle, void *a, int64_t a_rows, int64_t a_cols, bool trans_a,
-                   void *b, int64_t b_rows, int64_t b_cols, bool trans_b, void *c, int64_t c_rows,
-                   int64_t c_cols, hipDataType dtype = HIP_R_16BF, int64_t lda_override = -1,
-                   int64_t ldb_override = -1) {
-    int m = trans_b ? b_rows : b_cols;
-    int k = trans_b ? b_cols : b_rows;
-    int n = trans_a ? a_cols : a_rows;
+// Helper function using hipblaslt_gemm_impl
+// Row-major: a[m,k], b[b_rows,b_cols], c[m,n]
+// trans_b: if true, b is [n,k] (transposed), else b is [k,n]
+void HipblasltGemm(hipblasLtHandle_t handle, hipStream_t stream, void *workspace,
+                   int64_t workspace_size, void *a, int64_t m, int64_t k, void *b, int64_t b_rows,
+                   int64_t b_cols, bool trans_b, void *c, int64_t n, hipDataType dtype,
+                   int64_t lda_override = -1, int64_t ldb_override = -1) {
+    // Row-major to col-major conversion: C = A @ B => C^T = B^T @ A^T
+    // We swap A and B and their transposes
+    int64_t lda = (lda_override >= 0) ? lda_override : k;
+    int64_t ldb = (ldb_override >= 0) ? ldb_override : b_cols;
+    int64_t ldc = n;
 
-    // Leading dimension is the physical stride in memory (row-major)
-    int lda = (lda_override >= 0) ? lda_override : a_cols;
-    int ldb = (ldb_override >= 0) ? ldb_override : b_cols;
+    // hipblaslt expects col-major, but we have row-major
+    // For row-major C[m,n] = A[m,k] @ B[k,n]:
+    //   col-major equivalent: C^T[n,m] = B^T[n,k] @ A^T[k,m]
+    // So we call hipblaslt with (B, A) and swap dimensions
+    hipblasOperation_t trans_a_op = HIPBLAS_OP_N; // A is not transposed (row-major)
+    hipblasOperation_t trans_b_op = trans_b ? HIPBLAS_OP_T : HIPBLAS_OP_N;
 
-    hipblasOperation_t transpose_a = trans_a ? HIPBLAS_OP_T : HIPBLAS_OP_N;
-    hipblasOperation_t transpose_b = trans_b ? HIPBLAS_OP_T : HIPBLAS_OP_N;
-
-    float alpha = 1.0f, beta = 0.0f;
-    HIPBLAS_CHECK(hipblasGemmEx(handle, transpose_b, transpose_a, m, n, k, &alpha, b, dtype, ldb, a,
-                                dtype, lda, &beta, c, dtype, c_cols, HIPBLAS_COMPUTE_32F,
-                                HIPBLAS_GEMM_DEFAULT));
+    primus_turbo::hipblaslt_gemm_impl(b, dtype, ldb, nullptr, trans_b_op, a, dtype, lda, nullptr,
+                                      trans_a_op, c, dtype, ldc, n, m, k, workspace, workspace_size,
+                                      false, HIPBLASLT_MATMUL_MATRIX_SCALE_END, handle, stream);
 }
 
 void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *batch_sizes,
@@ -113,8 +121,9 @@ void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *
 
         int stream_idx = i % NUM_STREAM;
 
-        HipblasltGemm(g_hipblaslt_handle[stream_idx], a, m, k, false, b, b_rows, b_cols, trans_b, c,
-                      m, n, dtype);
+        HipblasltGemm(g_hipblaslt_handle[stream_idx], g_hipblaslt_stream[stream_idx],
+                      g_hipblaslt_workspace[stream_idx], g_hipblaslt_workspace_size, a, m, k, b,
+                      b_rows, b_cols, trans_b, c, n, dtype);
 
         a += m * k * elem_size;
         b += b_rows * b_cols * elem_size;
@@ -169,16 +178,15 @@ ffi::Error GroupedGemmHipblasltFFI(hipStream_t stream, ffi::AnyBuffer a, ffi::An
 }
 
 // Variable K Grouped GEMM FFI Handler (Hipblaslt Backend)
-ffi::Error GroupedGemmVariableKHipblasltFFI(
-    hipStream_t                 stream,
-    ffi::AnyBuffer              a,           // [m, total_k]
-    ffi::AnyBuffer              b,           // [n, total_k]
-    ffi::AnyBuffer              batch_sizes, // [num_experts]
-    ffi::AnyBuffer              group_offs,  // [num_experts + 1] - Added to match signature
-    ffi::Result<ffi::AnyBuffer> c,           // [num_experts, m, n]
-    bool                        trans_a,     // must be True
-    bool                        trans_b,     // must be False
-    int64_t                     num_cu) {
+ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
+                                            ffi::AnyBuffer a,              // [m, total_k]
+                                            ffi::AnyBuffer b,              // [n, total_k]
+                                            ffi::AnyBuffer batch_sizes,    // [num_experts]
+                                            ffi::AnyBuffer group_offs,     // [num_experts + 1]
+                                            ffi::Result<ffi::AnyBuffer> c, // [num_experts, m, n]
+                                            bool                        trans_a, // must be True
+                                            bool                        trans_b, // must be False
+                                            int64_t                     num_cu) {
     // Check constraint: only supports trans_a=True, trans_b=False
     if (!trans_a || trans_b) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -236,30 +244,21 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(
         int stream_idx = i % NUM_STREAM;
 
         // Row-major memory layout with TRANSPOSED inputs:
-        // a: [M, total_tokens], element a[row, col] at offset (row * total_tokens + col) *
-        // elem_size b: [N, total_tokens], element b[row, col] at offset (row * total_tokens + col)
-        // * elem_size
-        //
-        // To access COLUMN slice [:, start:start+k_i]:
-        // - First element a[0, start] is at offset: start * elem_size
-        // - First element b[0, start] is at offset: start * elem_size
-        // - Leading dimension (stride between rows): total_tokens
-        //
+        // a: [M, total_tokens], b: [N, total_tokens]
         // We want to compute: c[i] = a_sub @ b_sub.T
         // where a_sub = a[:, start:start+k_i] is [M, k_i]
         //       b_sub = b[:, start:start+k_i] is [N, k_i]
         //       c[i] = a_sub @ b_sub.T = [M, k_i] @ [k_i, N] = [M, N]
-        HipblasltGemm(g_hipblaslt_handle[stream_idx],
-                      a_ptr + start * elem_size,     // Pointer to a[0, start]
-                      M, k_i, false,                 // a_sub: [M, k_i], no transpose
-                      b_ptr + start * elem_size,     // Pointer to b[0, start]
-                      N, k_i, true,                  // b_sub: [N, k_i], transpose it to [k_i, N]
-                      c_ptr + i * M * N * elem_size, // Output c[i]: [M, N]
-                      M, N,
-                      dtype,        // datatype (float16 or bfloat16)
-                      total_tokens, // lda: physical row stride in memory for a
-                      total_tokens  // ldb: physical row stride in memory for b
-        );
+        HipblasltGemm(g_hipblaslt_handle[stream_idx], g_hipblaslt_stream[stream_idx],
+                      g_hipblaslt_workspace[stream_idx], g_hipblaslt_workspace_size,
+                      a_ptr + start * elem_size, // a_sub: [M, k_i]
+                      M, k_i,
+                      b_ptr + start * elem_size,     // b_sub: [N, k_i]
+                      N, k_i, true,                  // transpose b_sub to [k_i, N]
+                      c_ptr + i * M * N * elem_size, // output c[i]: [M, N]
+                      N, dtype,
+                      total_tokens,  // lda: physical row stride for a
+                      total_tokens); // ldb: physical row stride for b
 
         start += k_i;
     }
