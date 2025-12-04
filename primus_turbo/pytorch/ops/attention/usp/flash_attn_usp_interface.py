@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from typing import Optional
 
 import torch
@@ -239,7 +245,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
         ring_group,
     ):
         assert bias is None
-        assert dist.get_world_size(ring_group) == 1
+        assert dist.get_world_size(ring_group) == 1, "currently ring attention not supported for fp8"
 
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
@@ -410,7 +416,6 @@ def flash_attn_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    # TODO
     assert ulysses_group and ring_group
     return AttentionCKFunctionCPA2A.apply(
         q,
@@ -448,8 +453,8 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    # TODO
     assert ulysses_group and ring_group
+
     # Default config: blockwise with block_size=64
     if fp8_config is None:
         fp8_config = Float8QuantConfig(

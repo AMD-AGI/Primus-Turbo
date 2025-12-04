@@ -1,3 +1,15 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+
+# Portions of this file are derived from feifeibear/long-context-attention,
+# licensed under the Apache License, Version 2.0.
+# Original author: feifeibear (Jiarui Fang), Copyright 2024.
+# Modifications to the imported portions have been made by Li, Mou.
+#
+###############################################################################
+
 from typing import Optional, Tuple
 
 import torch
@@ -77,8 +89,6 @@ def update_out_and_lse(
         if slice_ is not None:
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
 
-        # TODO (limou):
-        # avoid dtype conversion if ring_degree == 1
         out = block_out.to(torch.float32)
         lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
     elif slice_ is not None:
@@ -198,8 +208,6 @@ def ring_attn_bwd(
             )
 
             if dq is None:
-                # TODO (limou):
-                # avoid dtype conversion if ring_degree == 1
                 dq = block_dq_buffer.to(torch.float32)
                 dk = block_dk_buffer.to(torch.float32)
                 dv = block_dv_buffer.to(torch.float32)

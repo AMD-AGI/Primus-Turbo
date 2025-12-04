@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 import itertools
 
 import torch
@@ -23,12 +24,9 @@ from tests.pytorch.ref.attention_ref import (
 from tests.pytorch.test_utils import compute_snr
 
 test_cases = [
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=192, head_dim_v=128),
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
 ]
 
@@ -97,7 +95,11 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
 
     def run_attn_with_cp(self, func, batch, config, causal, ulysses_degree, ring_degree, device, dtype):
         cp_group = dist.group.WORLD
-        device_mesh = init_device_mesh("cuda", (ring_degree, ulysses_degree))
+        device_mesh = init_device_mesh(
+            "cuda",
+            (ring_degree, ulysses_degree),
+            mesh_dim_names=("ring", "ulysses"),
+        )
 
         input_sharder = All2AllAttentionSharder()
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
@@ -145,8 +147,8 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             deterministic=False,
             return_lse=False,
             return_attn_probs=False,
-            ulysses_group=device_mesh.get_group(1),
-            ring_group=device_mesh.get_group(0),
+            ulysses_group=device_mesh["ulysses"].get_group(),
+            ring_group=device_mesh["ring"].get_group(),
         )
         grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)

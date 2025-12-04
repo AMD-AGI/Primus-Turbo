@@ -9,9 +9,11 @@ from typing import Optional
 import torch
 
 from primus_turbo.pytorch.core.low_precision import Float8QuantConfig
-from primus_turbo.pytorch.ops.attention.flash_attn_interface import (
+from primus_turbo.pytorch.ops.attention import (
     flash_attn_fp8_func,
+    flash_attn_fp8_usp_func,
     flash_attn_func,
+    flash_attn_usp_func,
 )
 
 __all__ = ["TurboAttention"]
@@ -29,6 +31,8 @@ class TurboAttention(torch.nn.Module):
         return_lse=False,
         return_attn_probs=False,
         fp8_config: Optional[Float8QuantConfig] = None,
+        ulysses_group=None,
+        ring_group=None,
     ):
         super().__init__()
 
@@ -41,11 +45,10 @@ class TurboAttention(torch.nn.Module):
         self.return_attn_probs = return_attn_probs
         self.deterministic = deterministic
         self.fp8_config = fp8_config
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
 
-        if self.fp8_config is not None:
-            self.attention_fn = flash_attn_fp8_func
-        else:
-            self.attention_fn = flash_attn_func
+        self.attention_fn = self.get_attention_func()
 
     def forward(
         self,
@@ -67,4 +70,18 @@ class TurboAttention(torch.nn.Module):
         )
         if self.fp8_config is not None:
             kwargs["fp8_config"] = self.fp8_config
+
+        if self.ulysses_group is not None:
+            kwargs["ulysses_group"] = self.ulysses_group
+            kwargs["ring_group"] = self.ring_group
+
         return self.attention_fn(q, k, v, **kwargs)
+
+    def get_attention_func(self):
+        if self.fp8_config is not None:
+            if self.ulysses_group is not None:
+                return flash_attn_fp8_usp_func
+            return flash_attn_fp8_func
+        if self.ulysses_group is not None:
+            return flash_attn_usp_func
+        return flash_attn_func
