@@ -8,6 +8,10 @@
 
 namespace primus_turbo::pytorch {
 
+//==================================================================
+//  CK Grouped GEMM Meta
+//==================================================================
+
 at::Tensor grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                              at::Tensor &group_offs, const bool transA, const bool transB,
                              c10::optional<int64_t> num_cu) {
@@ -37,23 +41,6 @@ at::Tensor grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_sca
     return output;
 }
 
-at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const bool transA,
-                                       const bool transB) {
-    const int64_t m = a.size(0);
-    const int64_t n = transB ? b.size(1) : b.size(2);
-    return at::empty({m, n}, a.options().device(at::kMeta));
-}
-
-at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,
-                                                  at::Tensor &group_lens, at::Tensor &group_offs,
-                                                  const bool transA, const bool transB) {
-    const int64_t num_experts = group_lens.numel();
-    const int64_t M           = a.size(0);
-    const int64_t N           = b.size(0);
-    return at::empty({num_experts, M, N}, a.options().device(at::kMeta));
-}
-
 at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                             at::Tensor &b_scales, at::Tensor &group_lens,
                                             at::Tensor &group_offs, const bool transA,
@@ -65,6 +52,26 @@ at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Te
     const int64_t n      = transB ? b.size(0) : b.size(1);
     at::Tensor    output = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kMeta));
     return output;
+}
+
+//==================================================================
+//  hipBLASLt Grouped GEMM Meta
+//==================================================================
+at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                                       at::Tensor &group_offs, const bool transA,
+                                       const bool transB) {
+    const int64_t m = a.size(0);
+    const int64_t n = transB ? b.size(1) : b.size(2);
+    return at::empty({m, n}, a.options().device(at::kMeta));
+}
+
+at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,
+                                                  at::Tensor &group_lens, at::Tensor &group_offs,
+                                                  const bool transA, const bool transB) {
+    const int64_t bs = group_lens.numel();
+    const int64_t m  = transA ? a.size(1) : a.size(0);
+    const int64_t n  = transB ? b.size(0) : b.size(1);
+    return at::empty({bs, m, n}, a.options().device(at::kMeta));
 }
 
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens) {
