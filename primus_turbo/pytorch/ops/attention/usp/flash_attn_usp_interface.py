@@ -79,7 +79,6 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         assert dropout_p == 0.0
         out_padded, softmax_lse, S_dmask, rng_state = ring_attn_fwd(
             ring_group,
-            q_local_heads.dtype,
             attention_aiter_csrc_forward_impl,
             q_local_heads,
             k_local_heads,
@@ -163,7 +162,6 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
-            dout_padded.dtype,
             attention_aiter_csrc_backward_impl,
             dout_padded,
             q_local_heads,

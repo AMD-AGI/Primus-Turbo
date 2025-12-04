@@ -92,13 +92,15 @@ def update_out_and_lse(
 
 def ring_attn_fwd(
     process_group,
-    output_dtype,
     attn_func,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     **kwargs,
 ):
+    if dist.get_world_size(process_group) == 1:
+        return attn_func(q, k, v, **kwargs)
+
     arg_causal = kwargs.pop("causal", False)
     comm = RingComm(process_group)
 
@@ -121,6 +123,7 @@ def ring_attn_fwd(
                 causal=arg_causal and step == 0,
                 **kwargs,
             )
+            output_dtype = block_out.dtype
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
@@ -135,7 +138,6 @@ def ring_attn_fwd(
 
 def ring_attn_bwd(
     process_group,
-    output_dtype,
     attn_func,
     dout,
     q,
@@ -145,15 +147,30 @@ def ring_attn_bwd(
     softmax_lse,
     **kwargs,
 ):
+    block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    block_dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    block_dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+
+    if dist.get_world_size(process_group) == 1:
+        attn_func(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq=block_dq_buffer,
+            dk=block_dk_buffer,
+            dv=block_dv_buffer,
+            **kwargs,
+        )
+        return block_dq_buffer.to(dout.dtype), block_dk_buffer.to(dout.dtype), block_dv_buffer.to(dout.dtype)
+
     arg_causal = kwargs.pop("causal", False)
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
     next_dk, next_dv = None, None
-
-    block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    block_dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    block_dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
     next_dk, next_dv = None, None
     next_k, next_v = None, None
@@ -207,4 +224,4 @@ def ring_attn_bwd(
 
     d_kv_comm.wait()
 
-    return dq.to(output_dtype), next_dk.to(output_dtype), next_dv.to(output_dtype)
+    return dq.to(dout.dtype), next_dk.to(dout.dtype), next_dv.to(dout.dtype)

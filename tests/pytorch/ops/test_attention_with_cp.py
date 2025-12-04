@@ -60,9 +60,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         )
         torch.manual_seed(42)
 
-        # from yunchang import set_seq_parallel_pg
-        # set_seq_parallel_pg(2, 2, self.rank, self.world_size, True)
-
     @skip_if_lt_x_gpu(2)
     def test_attention_with_cp(self):
         self._init_process()
@@ -101,8 +98,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
     def run_attn_with_cp(self, func, batch, config, causal, ulysses_degree, ring_degree, device, dtype):
         cp_group = dist.group.WORLD
         device_mesh = init_device_mesh("cuda", (ring_degree, ulysses_degree))
-        print(f"run_attn_with_cp, ring_degree={ring_degree}, ulysses_degree={ulysses_degree}")
-        # from yunchang.globals import PROCESS_GROUP
 
         input_sharder = All2AllAttentionSharder()
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
@@ -152,8 +147,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             return_attn_probs=False,
             ulysses_group=device_mesh.get_group(1),
             ring_group=device_mesh.get_group(0),
-            # ulysses_group=PROCESS_GROUP.ULYSSES_PG,
-            # ring_group=PROCESS_GROUP.RING_PG,
         )
         grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
