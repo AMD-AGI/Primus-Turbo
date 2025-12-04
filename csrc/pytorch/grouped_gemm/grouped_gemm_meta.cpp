@@ -4,7 +4,7 @@
 
 #include <torch/extension.h>
 
-#include "../extensions.h"
+#include "pytorch/extensions.h"
 
 namespace primus_turbo::pytorch {
 
@@ -35,6 +35,23 @@ at::Tensor grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_sca
     const int64_t n      = transB ? b.size(1) : b.size(2);
     at::Tensor    output = at::empty({m, n}, at::dtype(out_dtype).device(at::kMeta));
     return output;
+}
+
+at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                                       at::Tensor &group_offs, const bool transA,
+                                       const bool transB) {
+    const int64_t m = a.size(0);
+    const int64_t n = transB ? b.size(1) : b.size(2);
+    return at::empty({m, n}, a.options().device(at::kMeta));
+}
+
+at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,
+                                                  at::Tensor &group_lens, at::Tensor &group_offs,
+                                                  const bool transA, const bool transB) {
+    const int64_t num_experts = group_lens.numel();
+    const int64_t M           = a.size(0);
+    const int64_t N           = b.size(0);
+    return at::empty({num_experts, M, N}, a.options().device(at::kMeta));
 }
 
 at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,

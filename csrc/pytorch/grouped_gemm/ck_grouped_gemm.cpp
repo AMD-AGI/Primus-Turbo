@@ -2,10 +2,11 @@
 //
 // See LICENSE for license information.
 
-#include "primus_turbo/grouped_gemm.h"
-#include "../extensions.h"
-#include "../type_traits.h"
+#include "pytorch/extensions.h"
+#include "pytorch/type_traits.h"
+
 #include "primus_turbo/arch.h"
+#include "primus_turbo/grouped_gemm.h"
 
 namespace primus_turbo::pytorch {
 
