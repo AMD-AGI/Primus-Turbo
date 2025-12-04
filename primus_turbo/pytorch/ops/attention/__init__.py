@@ -1,3 +1,2 @@
-from .attention import flash_attn_func as flash_attn_func_v1
 from .flash_attn_interface import flash_attn_fp8_func, flash_attn_func
 from .usp import flash_attn_fp8_usp_func, flash_attn_usp_func
