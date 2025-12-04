@@ -79,6 +79,7 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
                 continue
             ring_degree = self.world_size // ulysses_degree
             if fp8 and ring_degree != 1:
+                # Ring attention is currently not supported for FP8
                 continue
             func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
             self.run_attn_with_cp(

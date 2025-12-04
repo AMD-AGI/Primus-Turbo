@@ -245,7 +245,9 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
         ring_group,
     ):
         assert bias is None
-        assert dist.get_world_size(ring_group) == 1, "currently ring attention not supported for fp8"
+        assert (
+            dist.get_world_size(ring_group) == 1
+        ), "currently ring attention not supported for fp8, since triton implementation does not use the standard flash attention interface"
 
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
@@ -416,7 +418,9 @@ def flash_attn_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    assert ulysses_group and ring_group
+    assert (
+        ulysses_group and ring_group
+    ), "ulysses_group and ring_group must be set while calling usp attention"
     return AttentionCKFunctionCPA2A.apply(
         q,
         k,
@@ -453,7 +457,9 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    assert ulysses_group and ring_group
+    assert (
+        ulysses_group and ring_group
+    ), "ulysses_group and ring_group must be set while calling usp attention"
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
