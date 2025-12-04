@@ -11,7 +11,13 @@
 ###############################################################################
 
 
-from primus_turbo.pytorch._C.deep_ep import Config
+import torch
 
 from .buffer import Buffer
+from .fake_cpp_cls import FakeBuffer, FakeConfig, FakeEventHandle
 from .utils import EventOverlap
+
+Config = torch.classes.primus_turbo_cpp_extension.Config
+
+
+__all__ = ["Buffer", "EventOverlap", "Config"]

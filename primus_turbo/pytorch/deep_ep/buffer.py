@@ -17,10 +17,11 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
-from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
+from .utils import EventHandle, EventOverlap, check_nvlink_connections
 
-from .utils import EventOverlap, check_nvlink_connections
+Config = torch.classes.primus_turbo_cpp_extension.Config
+
+__all__ = ["Buffer", "Config"]
 
 
 class Buffer:
@@ -83,7 +84,8 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
-        self.runtime = deep_ep_cpp.Buffer(
+
+        self.runtime = torch.classes.primus_turbo_cpp_extension.Buffer(
             self.rank,
             self.group_size,
             num_nvl_bytes,
@@ -105,8 +107,8 @@ class Buffer:
             None,
         ] * self.group_size
         local_ipc_handle = self.runtime.get_local_ipc_handle()
-        dist.all_gather_object(ipc_handles, local_ipc_handle, group)
-
+        # uint8 tensor cast to int64_t python list
+        dist.all_gather_object(ipc_handles, local_ipc_handle.tolist(), group)
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
@@ -137,14 +139,19 @@ class Buffer:
             if (low_latency_mode and self.rank == 0) or (
                 not low_latency_mode and self.runtime.get_rdma_rank() == 0
             ):
-                root_unique_id = self.runtime.get_local_nvshmem_unique_id()
+                root_unique_id = self.runtime.get_local_nvshmem_unique_id().tolist()
+            # uint8 tensor cast to int64_t python list
             dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
             root_unique_id = nvshmem_unique_ids[
                 0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)
             ]
 
         # Make CPP runtime available
-        self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+        if root_unique_id is not None:
+            # int64_t python list cast to uint8 tensor
+            root_unique_id = torch.tensor(root_unique_id, dtype=torch.uint8)
+
+        self.runtime.sync(device_ids, torch.tensor(ipc_handles, dtype=torch.uint8), root_unique_id)
         assert self.runtime.is_available()
 
     def destroy(self):
@@ -157,10 +164,6 @@ class Buffer:
 
         self.runtime.destroy()
         self.runtime = None
-
-    @staticmethod
-    def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -200,7 +203,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(
+        return torch.classes.primus_turbo_cpp_extension.Buffer.get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 

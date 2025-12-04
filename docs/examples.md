@@ -319,8 +319,7 @@ def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                          num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                          is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
                          previous_event=previous_event, async_finish=True,
-                         allocate_on_comm_stream=True,
-                         num_recv_tokens_per_expert_as_cuda=num_recv_tokens_per_expert_as_cuda,)
+                         allocate_on_comm_stream=True)
     # For event management, please refer to the docs of the `EventOverlap` class
     return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
 

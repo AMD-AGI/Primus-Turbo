@@ -10,10 +10,10 @@
 
 #include "primus_turbo/macros.h"
 #include <ATen/hip/HIPContext.h>
-
+#include <torch/custom_class.h>
 namespace primus_turbo::pytorch::deep_ep {
 
-struct EventHandle {
+struct EventHandle : torch::CustomClassHolder {
     std::shared_ptr<torch::Event> event;
 
     EventHandle() {
