@@ -7,6 +7,8 @@
 import jax
 from jax.interpreters import ad, batching, mlir
 
+# Import Turbo grouped GEMM module
+from primus_turbo.jax import modules
 from primus_turbo.jax._C import registrations
 from primus_turbo.jax.primitive import (
     ABSTRACT_EVAL_TABLE,
@@ -43,3 +45,9 @@ def initialize():
     # print("[Primus-Turbo/Jax] : primitive_batchers")
     # for primitive, func in BATCHING_TABLE.items():
     #     batching.primitive_batchers[primitive] = func
+
+
+# Export Turbo grouped GEMM API
+__all__ = [
+    "modules",
+]
