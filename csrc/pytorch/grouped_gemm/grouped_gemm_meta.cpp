@@ -4,7 +4,7 @@
 
 #include <torch/extension.h>
 
-#include "../extensions.h"
+#include "pytorch/extensions.h"
 
 namespace primus_turbo::pytorch {
 
@@ -37,7 +37,7 @@ at::Tensor grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_sca
     return output;
 }
 
-at::Tensor grouped_gemm_hipblaslt_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA,
                                        const bool transB) {
     const int64_t m = a.size(0);
@@ -45,7 +45,7 @@ at::Tensor grouped_gemm_hipblaslt_meta(at::Tensor &a, at::Tensor &b, at::Tensor 
     return at::empty({m, n}, a.options().device(at::kMeta));
 }
 
-at::Tensor grouped_gemm_variable_k_hipblaslt_meta(at::Tensor &a, at::Tensor &b,
+at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,
                                                   at::Tensor &group_lens, at::Tensor &group_offs,
                                                   const bool transA, const bool transB) {
     const int64_t num_experts = group_lens.numel();

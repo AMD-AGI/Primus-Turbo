@@ -5,15 +5,16 @@
 // Grouped GEMM hipBLASLt Implementation for PyTorch
 // Uses primus_turbo::hipblaslt_gemm_impl for better performance
 
-#include "../extensions.h"
-#include "../type_traits.h"
-#include "primus_turbo/gemm.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <mutex>
+
+#include "primus_turbo/gemm.h"
+#include "pytorch/extensions.h"
+#include "pytorch/type_traits.h"
 
 #define NUM_STREAM 4
 
@@ -149,19 +150,19 @@ void HipblasltGroupedGemmImpl(void *a_ptr, void *b_ptr, void *c_ptr, const int64
 // PyTorch API
 // ============================================================================
 
-at::Tensor grouped_gemm_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB) {
     auto out_dtype = a.scalar_type();
 
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()),
-                       "grouped_gemm_hipblaslt only supports float16 and bfloat16");
+                       "hipblaslt_grouped_gemm only supports float16 and bfloat16");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()),
-                       "grouped_gemm_hipblaslt only supports float16 and bfloat16");
+                       "hipblaslt_grouped_gemm only supports float16 and bfloat16");
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
-    PRIMUS_TURBO_CHECK(!transA, "grouped_gemm_hipblaslt does not support transA=True");
+    PRIMUS_TURBO_CHECK(!transA, "hipblaslt_grouped_gemm does not support transA=True");
 
     // Get dimensions
     const int64_t bs = b.size(0);
@@ -188,21 +189,21 @@ at::Tensor grouped_gemm_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &grou
     return c;
 }
 
-at::Tensor grouped_gemm_variable_k_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                              at::Tensor &group_offs, const bool transA,
                                              const bool transB) {
     auto out_dtype = a.scalar_type();
 
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()),
-                       "grouped_gemm_variable_k_hipblaslt only supports float16 and bfloat16");
+                       "hipblaslt_grouped_gemm_variable_k only supports float16 and bfloat16");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()),
-                       "grouped_gemm_variable_k_hipblaslt only supports float16 and bfloat16");
+                       "hipblaslt_grouped_gemm_variable_k only supports float16 and bfloat16");
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
     PRIMUS_TURBO_CHECK(transA && !transB,
-                       "grouped_gemm_variable_k_hipblaslt only supports transA=True, transB=False");
+                       "hipblaslt_grouped_gemm_variable_k only supports transA=True, transB=False");
 
     ensure_hipblaslt_initialized();
 

@@ -126,18 +126,18 @@ at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Te
                                             const std::string     &granularity,
                                             c10::optional<int64_t> num_cu);
 
-at::Tensor grouped_gemm_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB);
 
-at::Tensor grouped_gemm_hipblaslt_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA,
                                        const bool transB);
 
-at::Tensor grouped_gemm_variable_k_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+at::Tensor hipblaslt_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                              at::Tensor &group_offs, const bool transA,
                                              const bool transB);
 
-at::Tensor grouped_gemm_variable_k_hipblaslt_meta(at::Tensor &a, at::Tensor &b,
+at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,
                                                   at::Tensor &group_lens, at::Tensor &group_offs,
                                                   const bool transA, const bool transB);
 
