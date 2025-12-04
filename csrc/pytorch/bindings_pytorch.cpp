@@ -46,9 +46,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
     m.def("grouped_gemm_hipblaslt(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
-          "bool transA, bool transB, int? num_cu=None) -> Tensor");
+          "bool transA, bool transB) -> Tensor");
     m.def("grouped_gemm_variable_k_hipblaslt(Tensor a, Tensor b, Tensor group_lens, "
-          "Tensor group_offs, bool transA, bool transB, int? num_cu=None) -> Tensor");
+          "Tensor group_offs, bool transA, bool transB) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {

@@ -139,7 +139,6 @@ class GroupedGemmHipblasltFunc(torch.autograd.Function):
             group_offs,
             trans_a=False,
             trans_b=trans_b,
-            num_cu=num_cu,
         )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
@@ -157,18 +156,21 @@ class GroupedGemmHipblasltFunc(torch.autograd.Function):
             group_offs,
             trans_a=False,
             trans_b=not ctx.trans_b,
-            num_cu=ctx.num_cu,
         )
 
         lhs, rhs = (grad_out, a) if ctx.trans_b else (a, grad_out)
+
+        # Transpose to match variable_k's expected input format
+        lhs_t = lhs.t().contiguous()  # [M, total_tokens] format
+        rhs_t = rhs.t().contiguous()  # [N, total_tokens] format
+
         grad_b = grouped_gemm_variable_k_hipblaslt_csrc_impl(
-            lhs,
-            rhs,
+            lhs_t,
+            rhs_t,
             group_lens,
             group_offs,
             trans_a=True,
             trans_b=False,
-            num_cu=ctx.num_cu,
         )
         return grad_a, grad_b, None, None, None, None
 

@@ -150,8 +150,7 @@ void HipblasltGroupedGemmImpl(void *a_ptr, void *b_ptr, void *c_ptr, const int64
 // ============================================================================
 
 at::Tensor grouped_gemm_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                  at::Tensor &group_offs, const bool transA, const bool transB,
-                                  c10::optional<int64_t> num_cu) {
+                                  at::Tensor &group_offs, const bool transA, const bool transB) {
     auto out_dtype = a.scalar_type();
 
     // Check
@@ -191,7 +190,7 @@ at::Tensor grouped_gemm_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &grou
 
 at::Tensor grouped_gemm_variable_k_hipblaslt(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                              at::Tensor &group_offs, const bool transA,
-                                             const bool transB, c10::optional<int64_t> num_cu) {
+                                             const bool transB) {
     auto out_dtype = a.scalar_type();
 
     // Check
