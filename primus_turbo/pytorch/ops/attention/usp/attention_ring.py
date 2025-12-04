@@ -182,7 +182,6 @@ def ring_attn_bwd(
     dq, dk, dv = None, None, None
     next_dk, next_dv = None, None
 
-    next_dk, next_dv = None, None
     next_k, next_v = None, None
 
     for step in range(kv_comm.world_size):
