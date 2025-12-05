@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 
@@ -42,7 +42,7 @@ def check_fp8_support() -> Tuple[bool, str]:
     )
 
 
-def check_fp4_support() -> Tuple[bool, str]:
+def check_mxfp4_support() -> Tuple[bool, str]:
     """Return if fp4 support is available"""
     if get_device_compute_capability() >= (9, 5):
         return True, ""
@@ -68,7 +68,7 @@ def check_mxfp8_support() -> Tuple[bool, str]:
         return True, ""
     return (
         False,
-        "Device compute capability gfx950 or higher required for FP8 execution.",
+        "Device compute capability gfx950 or higher required for MXFP8 execution.",
     )
 
 
@@ -97,8 +97,18 @@ class Format(Enum):
     E2M1_X2 = auto()
     HYBRID = auto()
 
+class ScaleDtype(Enum):
+    """
+    Supported FP8/FP4 Scale data type.
+    """
+
+
 
 class ScalingGranularity(Enum):
+    """
+    Supported FP8/FP4 scaling granularity.
+    """
+
     TENSORWISE = auto()
     ROWWISE = auto()
     BLOCKWISE = auto()
@@ -106,6 +116,10 @@ class ScalingGranularity(Enum):
 
 
 class ScalingStrategy(Enum):
+    """
+    Supported FP8/FP4 scaling strategy.
+    """
+
     DYNAMIC = auto()
     # DELAYED_SCALING = auto() # TODO: undetermined
 
@@ -128,20 +142,30 @@ class Float8QuantConfig:
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
 
 
+class Float4ScalingRecipe(Enum):
+    """
+    Supported FP4 scaling recipe.
+    """
+    USE_2D_BLOCK = auto()
+    USE_HADAMARD_TRANSFORM = auto()
+    USE_SR = auto()
+
 @dataclass
 class Float4QuantConfig:
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
-    block_size: Optional[int] = None
+    block_size: int = 32
+    fwd_a_scaling_recipe: List[Float4ScalingRecipe] = []
+    fwd_b_scaling_recipe: List[Float4ScalingRecipe] = []
+    bwd_a_quantize_recipe: List[Float4ScalingRecipe] = []
+    bwd_b_quantize_recipe: List[Float4ScalingRecipe] = []
+    bwd_grad_quantize_recipe: List[Float4ScalingRecipe] = []
 
     def __post_init__(self):
         assert (
             self.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
-
-        if self.block_size is None:
-            self.block_size = 32
 
         mx_support_block_size = [32]
         assert (

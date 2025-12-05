@@ -98,13 +98,14 @@ def dequantize_fp8(
 
 
 def quantize_fp4(
-    x: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
     out_dtype: torch.dtype,
     granularity: ScalingGranularity,
     *,
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize
     """

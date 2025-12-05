@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import triton
@@ -17,6 +17,12 @@ from primus_turbo.triton.quantization.quant_blockwise import (
 from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
+)
+from primus_turbo.triton.quantization.quantization_mxfp8 import (
+    quantize_mxfp4_kernel,
+)
+from primus_turbo.pytorch.core.low_precision import (
+    Float4ScalingRecipe
 )
 
 
@@ -281,3 +287,58 @@ def dequantize_mxfp8_impl(
     )
 
     return y
+
+
+def quantize_mxfp4_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    padding_align_size: Optional[int] = None,
+    a_scaling_recipe: Optional[List[Float4ScalingRecipe]] = None,
+    b_scaling_recipe: Optional[List[Float4ScalingRecipe]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert a.is_contiguous(), "The A tensor must be contiguous."
+    assert a.dim() == 2, "The A must be 2D tensor."
+    assert b.is_contiguous(), "The B tensor must be contiguous."
+    assert b.dim() == 2, "The B must be 2D tensor."
+    assert axis in (1), "The axis must be 1."
+    assert out_dtype == torch.float4_e2m1fn_x2, f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
+    assert a.size(1) == b.size(1), "The last dimension of A and B tensor must be equal."
+
+    m, k = a.size()
+    n, _ = b.size()
+
+    padded_k = k
+    if padding_align_size is not None:
+        padded_k += padding_size(k, padding_align_size)
+    
+    assert (
+        padded_k % block_size == 0
+    ), f"The last dimension of the A/B tensor must be divisible by the block size but got {k} % {block_size} != 0."
+
+    scale_m, scale_n = m,n
+    scale_k = padded_k // block_size 
+    if Float4ScalingRecipe.USE_2D_BLOCK in a_scaling_recipe:
+        assert m % block_size == 0, f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {m} % {block_size} != 0."
+        scale_m = scale_m // block_size
+
+    if Float4ScalingRecipe.USE_2D_BLOCK in b_scaling_recipe:
+        assert n % block_size == 0, f"The first dimension of the B tensor must be divisible by the block size when use 2D block but got {m} % {block_size} != 0."
+        scale_n = scale_n // block_size
+
+    fp4_pack = torch.empty((m + n, padded_k), dtype=out_dtype, device=a.device)
+    scale_inv_a = torch.empty(scale_m, scale_k, dtype=torch.uint8, device=a.device)
+    scale_inv_b = torch.empty(scale_n, scale_k, dtype=torch.uint8, device=b.device)
+
+    BLOCK_X = 64
+    BLOCK_Y = 64
+    GROUP_Y = block_size
+    max_fp8 = torch.finfo(out_dtype).max
+    grid = lambda META: (
+        triton.cdiv(m, META["BLOCK_Y"]) * triton.cdiv(padded_k, META["BLOCK_X"]),
+    )
+
+
+    return fp4_pack, scale_inv_a, scale_inv_b
