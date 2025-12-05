@@ -276,7 +276,7 @@ def flash_attn_func(
     window_size=(-1, -1),
     bias=None,
     alibi_slopes=None,
-    deterministic=True,
+    deterministic=False,
     return_lse=False,
     return_attn_probs=False,
 ):
@@ -307,7 +307,7 @@ def flash_attn_fp8_func(
     window_size=(-1, -1),
     bias=None,
     alibi_slopes=None,
-    deterministic=True,
+    deterministic=False,
     return_lse=False,
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
