@@ -65,23 +65,37 @@ def quantize_mxfp4_kernel(
             # (MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE)
             x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask, other=0.0).to(tl.float32)
 
-            # Row-wise
-            subwarp_amax = tl.max(tl.abs(x_chunk), axis=-1, keep_dims=True)
+            if USE_2D_BLOCK:
+                # Block-wise
+                subwarp_amax = tl.max(tl.abs(x_chunk), axis=None, keep_dims=True)
+            else:
+                # Row-wise
+                subwarp_amax = tl.max(tl.abs(x_chunk), axis=-1, keep_dims=True)
+
             biased_exponent = float_to_e8m0(subwarp_amax * max_norm_rcp)
 
-            scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-            scale_inv_store_offsets = (
-                offsets_Y[:, None] * stride_scale_inv_row
-            ) + scale_offset_X * stride_scale_inv_col
-            scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+            if USE_2D_BLOCK:
+                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+                scale_inv_store_offsets = (
+                    offsets_Y[:, None] * stride_scale_inv_row
+                ) + scale_offset_X * stride_scale_inv_col
+                scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+            else:
+                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+                scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
+                scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_row  + scale_offset_X * stride_scale_inv_col
+                scale_inv_store_mask = scale_offset_Y < scale_n_rows & (scale_offset_X < scale_n_cols)
+
             tl.store(
                 scale_inv_ptr + scale_inv_store_offsets,
                 biased_exponent,
                 mask=scale_inv_store_mask,
             )
 
-            block_inverse_scale_rowwise = exp2f_rcp(biased_exponent)
-            y_chunk_scaled = x_chunk * block_inverse_scale_rowwise
+            block_inverse_scale = exp2f_rcp(biased_exponent)
+            y_chunk_scaled = x_chunk * block_inverse_scale
+
+            
 
             store_mask = (offsets_Y < padded_n_rows)[:, None] & (offsets_X < padded_n_cols)[None, :]
             y_ptr_current_chunk = (

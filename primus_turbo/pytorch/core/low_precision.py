@@ -97,11 +97,14 @@ class Format(Enum):
     E2M1_X2 = auto()
     HYBRID = auto()
 
+
 class ScaleDtype(Enum):
     """
     Supported FP8/FP4 Scale data type.
     """
 
+    FP32 = auto()
+    E8M0 = auto()
 
 
 class ScalingGranularity(Enum):
@@ -124,11 +127,22 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
+class Float4ScalingRecipe(Enum):
+    """
+    Supported FP4 scaling recipe.
+    """
+    
+    USE_2D_BLOCK = auto()
+    USE_HADAMARD_TRANSFORM = auto()
+    USE_SR = auto()
+
+
 @dataclass
 class Float8QuantConfig:
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
 
     def __post_init__(self):
@@ -141,21 +155,18 @@ class Float8QuantConfig:
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
 
+            mx_support_scale_dtype = ScaleDtype.E8M0
+            assert (self.scale_dtype == mx_support_scale_dtype), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
 
-class Float4ScalingRecipe(Enum):
-    """
-    Supported FP4 scaling recipe.
-    """
-    USE_2D_BLOCK = auto()
-    USE_HADAMARD_TRANSFORM = auto()
-    USE_SR = auto()
 
 @dataclass
 class Float4QuantConfig:
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: int = 32
+    # scaling recipe
     fwd_a_scaling_recipe: List[Float4ScalingRecipe] = []
     fwd_b_scaling_recipe: List[Float4ScalingRecipe] = []
     bwd_a_quantize_recipe: List[Float4ScalingRecipe] = []
@@ -172,3 +183,6 @@ class Float4QuantConfig:
             self.block_size in mx_support_block_size
         ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+
+        mx_support_scale_dtype = ScaleDtype.E8M0
+        assert (self.scale_dtype == mx_support_scale_dtype), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"

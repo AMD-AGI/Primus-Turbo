@@ -18,11 +18,12 @@ from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
 )
-from primus_turbo.triton.quantization.quantization_mxfp8 import (
+from primus_turbo.triton.quantization.quantization_mxfp4 import (
     quantize_mxfp4_kernel,
 )
 from primus_turbo.pytorch.core.low_precision import (
-    Float4ScalingRecipe
+    Float4ScalingRecipe,
+    check_mxfp4_support,
 )
 
 
@@ -290,55 +291,73 @@ def dequantize_mxfp8_impl(
 
 
 def quantize_mxfp4_impl(
-    a: torch.Tensor,
-    b: torch.Tensor,
+    x: torch.Tensor,
     out_dtype: torch.dtype,
     axis: int,
     block_size: int,
     padding_align_size: Optional[int] = None,
-    a_scaling_recipe: Optional[List[Float4ScalingRecipe]] = None,
-    b_scaling_recipe: Optional[List[Float4ScalingRecipe]] = None,
+    scaling_recipe: Optional[List[Float4ScalingRecipe]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert a.is_contiguous(), "The A tensor must be contiguous."
-    assert a.dim() == 2, "The A must be 2D tensor."
-    assert b.is_contiguous(), "The B tensor must be contiguous."
-    assert b.dim() == 2, "The B must be 2D tensor."
+    # NOTE: quantize fp4 kernel use the ISA which only avaiable on cnda4.
+    mxfp4_support, reason = check_mxfp4_support()
+    assert mxfp4_support, reason
+
+    assert x.is_contiguous(), "The A tensor must be contiguous."
+    assert x.dim() == 2, "The A must be 2D tensor."
     assert axis in (1), "The axis must be 1."
     assert out_dtype == torch.float4_e2m1fn_x2, f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
-    assert a.size(1) == b.size(1), "The last dimension of A and B tensor must be equal."
 
-    m, k = a.size()
-    n, _ = b.size()
+    num_rows, row_length = x.size()
 
-    padded_k = k
+    padded_num_rows, padded_row_length = num_rows, row_length
     if padding_align_size is not None:
-        padded_k += padding_size(k, padding_align_size)
-    
-    assert (
-        padded_k % block_size == 0
-    ), f"The last dimension of the A/B tensor must be divisible by the block size but got {k} % {block_size} != 0."
+        padded_row_length += padding_size(row_length, padding_align_size)
 
-    scale_m, scale_n = m,n
-    scale_k = padded_k // block_size 
-    if Float4ScalingRecipe.USE_2D_BLOCK in a_scaling_recipe:
-        assert m % block_size == 0, f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {m} % {block_size} != 0."
+    assert (
+        padded_row_length % block_size == 0
+    ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
+    
+    scale_m, scale_n = padded_num_rows, padded_row_length // block_size
+    if Float4ScalingRecipe.USE_2D_BLOCK in scaling_recipe:
+        assert num_rows % block_size == 0, f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {m} % {block_size} != 0."
         scale_m = scale_m // block_size
 
-    if Float4ScalingRecipe.USE_2D_BLOCK in b_scaling_recipe:
-        assert n % block_size == 0, f"The first dimension of the B tensor must be divisible by the block size when use 2D block but got {m} % {block_size} != 0."
-        scale_n = scale_n // block_size
-
-    fp4_pack = torch.empty((m + n, padded_k), dtype=out_dtype, device=a.device)
-    scale_inv_a = torch.empty(scale_m, scale_k, dtype=torch.uint8, device=a.device)
-    scale_inv_b = torch.empty(scale_n, scale_k, dtype=torch.uint8, device=b.device)
+    y = torch.empty((padded_num_rows, padded_row_length/2), dtype=torch.uint8, device=x.device)
+    scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
 
     BLOCK_X = 64
     BLOCK_Y = 64
     GROUP_Y = block_size
     max_fp8 = torch.finfo(out_dtype).max
     grid = lambda META: (
-        triton.cdiv(m, META["BLOCK_Y"]) * triton.cdiv(padded_k, META["BLOCK_X"]),
+        triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
+    )
+    quantize_mxfp4_kernel[grid](
+        x,
+        y,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        num_rows,
+        row_length,
+        padded_num_rows,
+        padded_row_length,
+        scale_inv,
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        scale_m,
+        scale_n,
+        max_fp8,
+        BLOCK_X,
+        BLOCK_Y,
+        GROUP_Y,
+        Float4ScalingRecipe.USE_2D_BLOCK in scaling_recipe,
+        Float4ScalingRecipe.USE_SR in scaling_recipe,
+        block_size,
     )
 
+    y = y.view(torch.float4_e2m1fn_x2)
+    scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
 
-    return fp4_pack, scale_inv_a, scale_inv_b
+    return y, scale_inv
