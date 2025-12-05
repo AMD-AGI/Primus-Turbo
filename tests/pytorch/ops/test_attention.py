@@ -7,12 +7,12 @@
 import pytest
 import torch
 
-import primus_turbo.pytorch as pt
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
+from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func
 from primus_turbo.pytorch.ops.attention.attention_utils import block_scaling_node
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
@@ -29,7 +29,6 @@ test_cases = [
     AttnConfig(
         seqlen_q=1024, seqlen_kv=1024, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128
     ),
-    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     # begin regression tests for https://ontrack-internal.amd.com/browse/SWDEV-548136
     AttnConfig(
@@ -42,11 +41,10 @@ test_cases = [
 
 
 @pytest.mark.parametrize("batch", [1, 2, 3, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("backend_type", ["triton", "ck"])
-def test_attention_16bit(batch, dtype, config, causal, backend_type):
+def test_attention_16bit(batch, dtype, config, causal):
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -57,29 +55,27 @@ def test_attention_16bit(batch, dtype, config, causal, backend_type):
         config.head_dim_v,
     )
 
-    if head_dim_qk == 192 and causal is False:
-        pytest.skip()
-
     print(
-        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Backend={backend_type}"
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}"
     )
 
     q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
     k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
     v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
 
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
     key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
     value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
+    grad_out = torch.randn(o_layout, device=device, dtype=dtype)
     query_ref = query.clone().detach().requires_grad_()
     key_ref = key.clone().detach().requires_grad_()
     value_ref = value.clone().detach().requires_grad_()
 
     sm_scale = query.shape[-1] ** (-0.5)
     o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
-    loss_ref = o_ref.mean()
-    loss_ref.backward()
-    o = pt.ops.flash_attn_func(
+    o_ref.backward(grad_out)
+    o = flash_attn_func(
         query,
         key,
         value,
@@ -92,11 +88,10 @@ def test_attention_16bit(batch, dtype, config, causal, backend_type):
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
-        backend_type=backend_type,
     )
+    o.backward(grad_out)
 
-    loss = o.mean()
-    loss.backward()
+    torch.cuda.synchronize()
 
     out_snr = compute_snr(o_ref, o)
     query_grad_snr = compute_snr(query_ref.grad, query.grad)
@@ -105,22 +100,17 @@ def test_attention_16bit(batch, dtype, config, causal, backend_type):
     print(f"{out_snr:.2f}", f"{query_grad_snr:.2f}", f"{key_grad_snr:.2f}", f"{value_grad_snr:.2f}")
 
     assert out_snr > 40, "out_snr too low"
-    if config == test_cases[9]:
-        # lower the SNR threshold for this specific case
-        assert query_grad_snr > 12, "query_grad_snr too low"
-    else:
-        assert query_grad_snr > 15, "query_grad_snr too low"
-    assert key_grad_snr > 20, "key_grad_snr too low"
+    assert query_grad_snr > 40, "query_grad_snr too low"
+    assert key_grad_snr > 40, "key_grad_snr too low"
     assert value_grad_snr > 40, "value_grad_snr too low"
 
 
 @pytest.mark.parametrize("batch", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("backend_type", ["triton"])
-def test_attention_fp8(batch, config, causal, backend_type):
+def test_attention_fp8(batch, dtype, config, causal):
     device = "cuda"
-    dtype = torch.bfloat16
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
         config.seqlen_kv,
@@ -130,26 +120,27 @@ def test_attention_fp8(batch, config, causal, backend_type):
         config.head_dim_v,
     )
 
-    if head_dim_qk == 192 and head_dim_v == 128 and not causal:
-        # DQ snr a little bit low, skip
-        return
+    print(
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}"
+    )
 
     q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
     k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
     v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
 
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
     key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
     value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
+    grad_out = torch.randn(o_layout, device=device, dtype=dtype)
     query_ref = query.clone().detach().requires_grad_()
     key_ref = key.clone().detach().requires_grad_()
     value_ref = value.clone().detach().requires_grad_()
 
     sm_scale = query.shape[-1] ** (-0.5)
     o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
-    loss_ref = o_ref.mean()
-    loss_ref.backward()
-    o = pt.ops.attention_fp8_blockwise(
+    o_ref.backward(grad_out)
+    o = flash_attn_fp8_func(
         query,
         key,
         value,
@@ -162,25 +153,19 @@ def test_attention_fp8(batch, config, causal, backend_type):
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
-        backend_type=backend_type,
     )
-
-    loss = o.mean()
-    loss.backward()
+    o.backward(grad_out)
+    torch.cuda.synchronize()
 
     out_snr = compute_snr(o_ref, o)
     query_grad_snr = compute_snr(query_ref.grad, query.grad)
     key_grad_snr = compute_snr(key_ref.grad, key.grad)
     value_grad_snr = compute_snr(value_ref.grad, value.grad)
-    print(out_snr, query_grad_snr, key_grad_snr, value_grad_snr)
+    print(f"{out_snr:.2f}", f"{query_grad_snr:.2f}", f"{key_grad_snr:.2f}", f"{value_grad_snr:.2f}")
     assert out_snr > 20, "out_snr too low"
-    if config == test_cases[9]:
-        # lower the SNR threshold for this specific case
-        assert query_grad_snr > 12, "query_grad_snr too low"
-    else:
-        assert query_grad_snr > 15, "query_grad_snr too low"
-    assert key_grad_snr > 15, "key_grad_snr too low"
-    assert value_grad_snr > 15, "value_grad_snr too low"
+    assert query_grad_snr > 20, "query_grad_snr too low"
+    assert key_grad_snr > 20, "key_grad_snr too low"
+    assert value_grad_snr > 20, "value_grad_snr too low"
 
 
 @pytest.mark.parametrize("batch", [4])
@@ -188,7 +173,7 @@ def test_attention_fp8(batch, config, causal, backend_type):
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_fp8_with_sparse_do(batch, config, causal):
     # regression test for https://ontrack-internal.amd.com/browse/SWDEV-548136
-    device = torch.device("cuda")
+    device = "cuda"
     torch.manual_seed(1234)
 
     dtype = torch.bfloat16

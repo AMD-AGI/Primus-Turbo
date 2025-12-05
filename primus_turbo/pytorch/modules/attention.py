@@ -8,7 +8,13 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.ops.attention import attention_fp8_blockwise, flash_attn_func
+from primus_turbo.pytorch.core.low_precision import Float8QuantConfig
+from primus_turbo.pytorch.ops.attention import (
+    flash_attn_fp8_func,
+    flash_attn_fp8_usp_func,
+    flash_attn_func,
+    flash_attn_usp_func,
+)
 
 __all__ = ["TurboAttention"]
 
@@ -19,17 +25,16 @@ class TurboAttention(torch.nn.Module):
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
-        window_size=(-1, -1),  # -1 means infinite context window
+        window_size=(-1, -1),
         alibi_slopes=None,
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
-        use_fp8=False,
-        backend_type: str = "ck",  # 'ck', 'triton'
+        fp8_config: Optional[Float8QuantConfig] = None,
+        ulysses_group=None,
+        ring_group=None,
     ):
         super().__init__()
-
-        assert not (use_fp8 and backend_type == "ck"), "When use_fp8 is True, attention_type cannot be 'ck'."
 
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
@@ -39,14 +44,11 @@ class TurboAttention(torch.nn.Module):
         self.return_lse = return_lse
         self.return_attn_probs = return_attn_probs
         self.deterministic = deterministic
-        self.backend_type = backend_type
+        self.fp8_config = fp8_config
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
 
-        if backend_type == "ck" and use_fp8 == False:
-            self.attention_fn = flash_attn_func
-        elif backend_type == "triton":
-            self.attention_fn = attention_fp8_blockwise
-        else:
-            raise ValueError(f"Unknown flash_attn_func type: {backend_type}")
+        self.attention_fn = self.get_attention_func()
 
     def forward(
         self,
@@ -55,10 +57,7 @@ class TurboAttention(torch.nn.Module):
         v: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        return self.attention_fn(
-            q,
-            k,
-            v,
+        kwargs = dict(
             dropout_p=self.dropout_p,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
@@ -68,5 +67,21 @@ class TurboAttention(torch.nn.Module):
             deterministic=self.deterministic,
             return_lse=self.return_lse,
             return_attn_probs=self.return_attn_probs,
-            backend_type=self.backend_type,
         )
+        if self.fp8_config is not None:
+            kwargs["fp8_config"] = self.fp8_config
+
+        if self.ulysses_group is not None:
+            kwargs["ulysses_group"] = self.ulysses_group
+            kwargs["ring_group"] = self.ring_group
+
+        return self.attention_fn(q, k, v, **kwargs)
+
+    def get_attention_func(self):
+        if self.fp8_config is not None:
+            if self.ulysses_group is not None:
+                return flash_attn_fp8_usp_func
+            return flash_attn_fp8_func
+        if self.ulysses_group is not None:
+            return flash_attn_usp_func
+        return flash_attn_func
