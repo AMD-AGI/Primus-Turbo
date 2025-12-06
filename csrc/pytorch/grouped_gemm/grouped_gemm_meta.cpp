@@ -60,9 +60,9 @@ at::Tensor grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Te
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA,
                                        const bool transB) {
-    const int64_t m = a.size(0);
+    const int64_t m = transA ? a.size(1) : a.size(0);
     const int64_t n = transB ? b.size(1) : b.size(2);
-    return at::empty({m, n}, a.options().device(at::kMeta));
+    return at::empty(std::vector<int64_t>{m, n}, a.options().device(at::kMeta));
 }
 
 at::Tensor hipblaslt_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b,

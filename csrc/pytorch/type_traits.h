@@ -6,16 +6,17 @@
 
 #include "ck_tile/core.hpp"
 #include "primus_turbo/dtype.h"
+#include <hipblaslt/hipblaslt.h>
 #include <torch/extension.h>
 
 namespace primus_turbo::pytorch {
 
 using namespace primus_turbo::dtype;
 
-// ************************************************
-/**
- *  DataType Mapping : at::ScalarType -> CK-Tile Type
- */
+//==================================================================
+//  DataType Mapping : at::ScalarType -> CK-Tile Type
+//==================================================================
+
 template <at::ScalarType scalar_type> struct TorchToCKTileType;
 
 template <> struct TorchToCKTileType<at::kFloat8_e4m3fnuz> {
@@ -45,7 +46,31 @@ template <> struct TorchToCKTileType<at::kBFloat16> {
 template <> struct TorchToCKTileType<at::kFloat> {
     using type = float32;
 };
-// ************************************************
+
+//==================================================================
+//  DataType Mapping : at::ScalarType -> HipBLASLt Type
+//==================================================================
+
+static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
+    switch (t) {
+    case at::kHalf:
+        return HIP_R_16F;
+    case at::kFloat:
+        return HIP_R_32F;
+    case at::kBFloat16:
+        return HIP_R_16BF;
+    case at::kFloat8_e4m3fnuz:
+        return HIP_R_8F_E4M3_FNUZ;
+    case at::kFloat8_e4m3fn:
+        return HIP_R_8F_E4M3;
+    case at::kFloat8_e5m2fnuz:
+        return HIP_R_8F_E5M2_FNUZ;
+    case at::kFloat8_e5m2:
+        return HIP_R_8F_E5M2;
+    default:
+        PRIMUS_TURBO_ERROR("Invalid type");
+    }
+}
 
 static inline bool is_16bit_floating_point_dtype(at::ScalarType dtype) {
     return dtype == at::kHalf || dtype == at::kBFloat16;

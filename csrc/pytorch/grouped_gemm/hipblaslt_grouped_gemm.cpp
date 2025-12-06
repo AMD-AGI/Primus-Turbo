@@ -76,19 +76,6 @@ inline void hipblaslt_current_wait_streams(hipStream_t current_stream) {
     }
 }
 
-static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
-    switch (t) {
-    case at::kHalf:
-        return HIP_R_16F;
-    case at::kFloat:
-        return HIP_R_32F;
-    case at::kBFloat16:
-        return HIP_R_16BF;
-    default:
-        PRIMUS_TURBO_ERROR("Invalid type for hipblaslt grouped gemm");
-    }
-}
-
 // Helper function using hipblaslt_gemm_impl
 // Row-major: a[m,k], b[b_rows,b_cols], c[m,n]
 // trans_b: if true, b is [n,k] (transposed), else b is [k,n]
