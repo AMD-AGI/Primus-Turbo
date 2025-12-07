@@ -6,7 +6,13 @@
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, KernelBackend
+from primus_turbo.pytorch.core.backend import (
+    AutoKernelDispatcher,
+    BackendType,
+    GlobalBackendManager,
+    KernelBackend,
+    TuneCache,
+)
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -166,6 +172,39 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
 }
 
 
+class GroupedGEMMKernelDispatcher(AutoKernelDispatcher):
+    _backends = _GROUPED_GEMM_BACKENDS
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, num_cu, **kwargs):
+
+        def get_grouped_gemm_logical_shape(a, b, trans_a, trans_b):
+            bs = b.shape[0]
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            k = a.shape[0] if trans_a else a.shape[1]
+            return bs, m, n, k
+
+        bs, m, n, k = get_grouped_gemm_logical_shape(a, b, trans_a, trans_b)
+        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c
+        return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, False)
+
+
+class GroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
+    _backends = _GROUPED_GEMM_VARIABLE_K_BACKENDS
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, **kwargs):
+        bs = group_lens.shape[0]
+        m = a.shape[1] if trans_a else a.shape[0]
+        n = b.shape[-2] if trans_b else b.shape[-1]
+        if trans_c:
+            m, n = n, m
+        return (bs, m, n, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c)
+
+
 _torch_custom_op_wrapper = torch.library.custom_op
 
 
@@ -187,7 +226,7 @@ def grouped_gemm_impl(
     assert trans_a == False
 
     default_backend_enum = BackendType(default_backend)
-    backend_cls = _GROUPED_GEMM_BACKENDS.get(default_backend_enum, None)
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
 
     kwargs = dict(
         a=a,
@@ -199,7 +238,7 @@ def grouped_gemm_impl(
         num_cu=num_cu,
     )
 
-    return backend_cls.execute(**kwargs)
+    return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_variable_k_impl", mutates_args=(), device_types="cuda")
@@ -221,7 +260,7 @@ def grouped_gemm_variable_k_impl(
     assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
 
     default_backend_enum = BackendType(default_backend)
-    backend_cls = _GROUPED_GEMM_VARIABLE_K_BACKENDS.get(default_backend_enum, None)
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
 
     kwargs = dict(
         a=a,
@@ -233,7 +272,7 @@ def grouped_gemm_variable_k_impl(
         trans_c=trans_c,
         num_cu=num_cu,
     )
-    return backend_cls.execute(**kwargs)
+    return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
 @grouped_gemm_impl.register_fake

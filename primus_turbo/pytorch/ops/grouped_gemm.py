@@ -43,7 +43,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=trans_b,
                 num_cu=num_cu,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=BackendType.CK.value,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
@@ -68,7 +68,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=not ctx.trans_b,
                 num_cu=ctx.num_cu,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=BackendType.CK.value,
             )
 
             grad_b = grouped_gemm_variable_k_impl(
@@ -80,7 +80,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_b=False,
                 trans_c=ctx.trans_b,
                 num_cu=ctx.num_cu,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=BackendType.CK.value,
             )
         return grad_a, grad_b, None, None, None, None
 
