@@ -83,9 +83,7 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
-      - name: Run unit tests
-        env:
-          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
           if [ -d "${{ env.UT_LOG_PATH }}" ]; then
@@ -95,7 +93,14 @@ jobs:
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
-          pytest -v tests/pytorch --log-cli-level=INFO
+      - name: Run single-GPU tests (parallel)
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/pytorch -n 8 --log-cli-level=INFO
+      - name: Run distributed tests
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/pytorch --dist-only --log-cli-level=INFO
 
   unittest-jax-gfx942:
     needs: code-lint
