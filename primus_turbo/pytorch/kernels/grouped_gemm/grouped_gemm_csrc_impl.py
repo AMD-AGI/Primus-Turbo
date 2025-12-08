@@ -62,8 +62,11 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
     ) -> bool:
-        # TODO: add more checks
-        return True
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= trans_a == True and trans_b == False
+        return supported
 
     @staticmethod
     def execute(
@@ -98,8 +101,11 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         trans_b: bool,
         num_cu: int | None,
     ) -> bool:
-        # TODO: add more checks
-        return True
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= trans_a == False
+        return supported
 
     @staticmethod
     def execute(
@@ -131,8 +137,11 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
     ) -> bool:
-        # TODO: add more checks
-        return True
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= trans_a == True and trans_b == False
+        return supported
 
     @staticmethod
     def execute(
@@ -219,12 +228,6 @@ def grouped_gemm_impl(
     num_cu: int | None,
     default_backend: int,
 ) -> torch.Tensor:
-    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
-    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
-    assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
-    assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
-    assert trans_a == False
-
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
 
@@ -253,12 +256,6 @@ def grouped_gemm_variable_k_impl(
     num_cu: int | None,
     default_backend: int,
 ) -> torch.Tensor:
-    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
-    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
-    assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
-    assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
-    assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
-
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
 
@@ -288,6 +285,10 @@ def grouped_gemm_impl_meta(
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
+    assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
+    assert trans_a == False
+
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=a.dtype)
@@ -305,6 +306,12 @@ def grouped_gemm_variable_k_impl_meta(
     num_cu: int | None,
     default_backend: int,
 ) -> torch.Tensor:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
+    assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
+    assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
+
     bs = group_lens.shape[0]
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
