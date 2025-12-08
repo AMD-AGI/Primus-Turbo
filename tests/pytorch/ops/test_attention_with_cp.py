@@ -5,6 +5,7 @@
 ###############################################################################
 
 import itertools
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -16,7 +17,6 @@ from torch.testing._internal.common_distributed import (
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 
 import primus_turbo.pytorch as pt
-from primus_turbo.pytorch.ops.attention.attention_utils import All2AllAttentionSharder
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
@@ -29,6 +29,17 @@ test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=192, head_dim_v=128),
     AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
 ]
+
+
+def shard_cp_input(input_tensors: List[torch.Tensor], cp_group, seq_dim=1) -> List[torch.Tensor]:
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
+
+    output_list = []
+    for t in input_tensors:
+        output_list.append(t.chunk(cp_size, seq_dim)[cp_rank].contiguous())
+
+    return output_list
 
 
 @instantiate_parametrized_tests
@@ -102,7 +113,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             mesh_dim_names=("ring", "ulysses"),
         )
 
-        input_sharder = All2AllAttentionSharder()
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
             config.seqlen_q,
             config.seqlen_kv,
@@ -127,13 +137,11 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
 
         grad_ref = torch.randn(*o_ref.shape, device=device, dtype=dtype)
         o_ref.backward(grad_ref)
-        o_ref, dq_ref, dk_ref, dv_ref = input_sharder.shard_cp_input(
+        o_ref, dq_ref, dk_ref, dv_ref = shard_cp_input(
             [o_ref, query_ref.grad, key_ref.grad, value_ref.grad], cp_group
         )
 
-        query_local_token, key_local_token, value_local_token = input_sharder.shard_cp_input(
-            [query, key, value], cp_group
-        )
+        query_local_token, key_local_token, value_local_token = shard_cp_input([query, key, value], cp_group)
 
         o = func(
             query_local_token,
@@ -151,10 +159,10 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             ulysses_group=device_mesh["ulysses"].get_group(),
             ring_group=device_mesh["ring"].get_group(),
         )
-        grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
+        grad = shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
 
-        dq, dk, dv = input_sharder.shard_cp_input([query.grad, key.grad, value.grad], cp_group)
+        dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group)
         out_snr = compute_snr(o_ref, o)
         query_grad_snr = compute_snr(dq_ref, dq)
         key_grad_snr = compute_snr(dk_ref, dk)

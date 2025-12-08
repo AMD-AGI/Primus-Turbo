@@ -59,25 +59,22 @@ import os
 import torch
 import primus_turbo.pytorch as turbo
 
+from torch.distributed.device_mesh import init_device_mesh
+
 dtype = torch.bfloat16
 
-rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
-torch.distributed.init_process_group(
-    backend='nccl',
-    world_size=world_size,
-    rank=rank,
-)
 
-cp_group = torch.distributed.group.WORLD
-cp_param_bundle = {
-    "cp_group": cp_group,
-    "cp_comm_type": "a2a"
-}
+ulysses_degree = 4
+ring_degree = 2
+device_mesh = init_device_mesh(
+    "cuda",
+    (ring_degree, ulysses_degree),
+    mesh_dim_names=("ring", "ulysses"))
 
 B = 4
 S = 4096
@@ -89,7 +86,12 @@ k = torch.randn((B, S, H, D), dtype=dtype, device=device)
 v = torch.randn((B, S, H, D), dtype=dtype, device=device)
 softmax_scale = q.shape[-1] ** (-0.5)
 
-o = turbo.ops.flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True, cp_param_bundle=cp_param_bundle)
+o = turbo.ops.flash_attn_usp_func(q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        ulysses_group=device_mesh["ulysses"].get_group(),
+        ring_group=device_mesh["ring"].get_group())
 
 torch.distributed.destroy_process_group()
 # run with torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12355 this_code.py

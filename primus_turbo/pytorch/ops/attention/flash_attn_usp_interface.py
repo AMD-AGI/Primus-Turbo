@@ -26,8 +26,8 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
     get_p_scale,
 )
 
-from .attention_a2a_helper import get_attention_cp_a2a_helper
-from .attention_ring import ring_attn_bwd, ring_attn_fwd
+from .usp.attention_a2a_helper import get_attention_cp_a2a_helper
+from .usp.attention_ring import ring_attn_bwd, ring_attn_fwd
 
 
 class AttentionCKFunctionCPA2A(torch.autograd.Function):
