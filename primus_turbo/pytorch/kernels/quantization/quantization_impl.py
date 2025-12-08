@@ -11,6 +11,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.triton.quantization.quant_blockwise import (
+    quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
 )
@@ -18,6 +19,10 @@ from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
 )
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
 
 
 def quantize_fp8_tensorwise_impl(
@@ -112,6 +117,81 @@ def quant_fp8_blockwise_impl_meta(
     scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8, x_scales
+
+
+@triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
+def quant_fp8_blockwise_for_weight_impl(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantization for fp8 blockwise (weight).
+
+    Quantizes a 2D or 3D weight tensor using blockwise scales along both axes.
+    Assumes `w` is contiguous and 2D or 3D.
+
+    Returns:
+        w_fp8: FP8-quantized weight tensor.
+        w_scales: Per-block scale tensor in float32.
+    """
+
+    assert w.dim() in (2, 3)
+    if not w.is_contiguous():
+        w = w.contiguous()
+
+    ori_dims = w.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w.shape
+        w = w.unsqueeze(0)
+    else:
+        B, M, N = w.shape
+    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (B, ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    grid = (B, triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_for_weight_kernel)[grid](
+        w,
+        w_fp8,
+        w_scales,
+        M,
+        N,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+
+    if ori_dims == 2:
+        w_fp8 = w_fp8.squeeze(0)
+        w_scales = w_scales.squeeze(0)
+    return w_fp8, w_scales
+
+
+@quant_fp8_blockwise_for_weight_impl.register_fake
+def quant_fp8_blockwise_for_weight_impl_meta(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert w.dim() in (2, 3)
+    ori_dims = w.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w.shape
+        w = w.unsqueeze(0)
+    else:
+        B, M, N = w.shape
+    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (B, ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    if ori_dims == 2:
+        w_fp8 = w_fp8.squeeze(0)
+        w_scales = w_scales.squeeze(0)
+    return w_fp8, w_scales
 
 
 def quant_fp8_blockwise_segment_m_impl(

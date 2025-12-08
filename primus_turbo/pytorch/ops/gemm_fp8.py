@@ -17,11 +17,9 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
-    gemm_fp8_impl,
-    quant_fp8_blockwise_for_weight_impl,
-)
+from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
