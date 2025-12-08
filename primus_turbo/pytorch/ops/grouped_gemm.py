@@ -6,10 +6,11 @@
 
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_csrc_impl import (
-    grouped_gemm_csrc_impl,
-    grouped_gemm_variable_k_csrc_impl,
+    grouped_gemm_impl,
+    grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
@@ -34,7 +35,7 @@ class GroupedGemmFunc(torch.autograd.Function):
             b_2d = b.squeeze(0)
             out = gemm_impl(a, False, b_2d, trans_b, a.dtype, False)
         else:
-            out = grouped_gemm_csrc_impl(
+            out = grouped_gemm_impl(
                 a,
                 b,
                 group_lens,
@@ -42,6 +43,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=trans_b,
                 num_cu=num_cu,
+                default_backend=BackendType.CK.value,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
@@ -58,7 +60,7 @@ class GroupedGemmFunc(torch.autograd.Function):
             grad_a = gemm_impl(grad_out, False, b_2d, not ctx.trans_b, a.dtype, ctx.trans_a)
             grad_b = gemm_impl(a, True, grad_out, False, b.dtype, ctx.trans_b).view(b.size())
         else:
-            grad_a = grouped_gemm_csrc_impl(
+            grad_a = grouped_gemm_impl(
                 grad_out,
                 b,
                 group_lens,
@@ -66,17 +68,19 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=not ctx.trans_b,
                 num_cu=ctx.num_cu,
+                default_backend=BackendType.CK.value,
             )
 
-            lhs, rhs = (grad_out, a) if ctx.trans_b else (a, grad_out)
-            grad_b = grouped_gemm_variable_k_csrc_impl(
-                lhs,
-                rhs,
+            grad_b = grouped_gemm_variable_k_impl(
+                a,
+                grad_out,
                 group_lens,
                 group_offs,
-                trans_a=True,
+                trans_a=not ctx.trans_a,
                 trans_b=False,
+                trans_c=ctx.trans_b,
                 num_cu=ctx.num_cu,
+                default_backend=BackendType.CK.value,
             )
         return grad_a, grad_b, None, None, None, None
 

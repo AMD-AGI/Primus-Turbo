@@ -15,9 +15,11 @@ namespace primus_turbo {
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);
 std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
 
-template <typename AType, typename BType, typename CType> struct CKGroupedGemmParams {
-    void *args_ptr = nullptr;
+//==================================================================
+//  Grouped GEMM Params
+//==================================================================
 
+template <typename AType, typename BType, typename CType> struct GroupedGemmParams {
     const AType *a_ptr = nullptr;
     const BType *b_ptr = nullptr;
     CType       *c_ptr = nullptr;
@@ -37,30 +39,20 @@ template <typename AType, typename BType, typename CType> struct CKGroupedGemmPa
     uint32_t    num_cu = 0;
 };
 
-template <typename AType, typename BType, typename CType, typename ACCType>
-struct CKGroupedGemmFP8Params {
+template <typename AType, typename BType, typename CType>
+struct CKGroupedGemmParams : public GroupedGemmParams<AType, BType, CType> {
     void *args_ptr = nullptr;
+};
 
-    const AType   *a_ptr  = nullptr;
-    const BType   *b_ptr  = nullptr;
-    CType         *c_ptr  = nullptr;
+template <typename AType, typename BType, typename CType, typename ACCType>
+struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> {
     const ACCType *aq_ptr = nullptr;
     const ACCType *bq_ptr = nullptr;
-
-    const int64_t *group_lens_ptr = nullptr;
-    const int64_t *group_offs_ptr = nullptr;
-
-    bool transA = false;
-    bool transB = false;
-
-    int32_t group_num = 0;
-    int32_t m         = 0;
-    int32_t n         = 0;
-    int32_t k         = 0;
-
-    hipStream_t stream = nullptr;
-    uint32_t    num_cu = 0;
 };
+
+//==================================================================
+//  CK Grouped GEMM
+//==================================================================
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
 void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params);
@@ -77,6 +69,13 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           ck_tile::QuantType QuantMode>
 void ck_grouped_gemm_fp8_variable_k(
     const CKGroupedGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
+
+//==================================================================
+//  hipBLASLt Grouped GEMM
+//==================================================================
+
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
+void hipblaslt_grouped_gemm(const GroupedGemmParams<ADataType, BDataType, CDataType> &params);
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
