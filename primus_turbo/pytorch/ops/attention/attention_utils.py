@@ -4,9 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from abc import ABC
-from typing import List
-
 import torch
 
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
@@ -64,30 +61,3 @@ def get_p_scale(use_fp8: bool):
         p_scale = 1.0
 
     return p_scale
-
-
-class AttentionSharder(ABC):
-    """AttentionSharder Interface"""
-
-    def shard_cp_input(self, input_tensors: List[torch.Tensor], cp_group) -> List[torch.Tensor]:
-        """
-        Shard input from whole seq to specific cp rank, the implementation differ from different cp-comm type
-
-        Inputs:
-            input_tensors: tensors to shard as [Q, K, V]
-            cp_groups: cp communication process group
-        """
-
-
-class All2AllAttentionSharder(AttentionSharder):
-    """All2All AttentionSharder Impl"""
-
-    def shard_cp_input(self, input_tensors: List[torch.Tensor], cp_group, seq_dim=1) -> List[torch.Tensor]:
-        cp_size = cp_group.size()
-        cp_rank = cp_group.rank()
-
-        output_list = []
-        for t in input_tensors:
-            output_list.append(t.chunk(cp_size, seq_dim)[cp_rank].contiguous())
-
-        return output_list

@@ -33,6 +33,10 @@ Primus-Turbo uses or references the following third-party projects:
    - License: BSD License
    - Repository: https://github.com/pytorch/torchtitan.git
 
+3. long-context-attention
+   - License: Apache License 2.0
+   - Repository: https://github.com/feifeibear/long-context-attention.git
+
 Please comply with the respective licenses of these third-party projects when using or distributing Primus.
 
 --------------------------------------------------------------------------------

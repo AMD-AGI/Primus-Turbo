@@ -9,6 +9,10 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_backward_impl,
@@ -18,19 +22,15 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
-from primus_turbo.pytorch.ops.attention.attention_cp_dispatcher import (
-    dispatch_attention_cp_functions,
-)
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     block_scaling_node,
     get_p_scale,
 )
 
-__all__ = ["flash_attn_func", "attention_fp8_blockwise"]
+__all__ = ["flash_attn_func", "flash_attn_fp8_func"]
 
 
-class AttentionCKFunction(torch.autograd.Function):
-
+class AiterFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def _resolve_is_v3_atomic_fp32(is_v3_atomic_fp32: Optional[bool]) -> bool:
         if is_v3_atomic_fp32 in [True, False]:
@@ -59,15 +59,17 @@ class AttentionCKFunction(torch.autograd.Function):
     ):
         # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
         # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
-        is_v3_atomic_fp32 = AttentionCKFunction._resolve_is_v3_atomic_fp32(is_v3_atomic_fp32)
+        is_v3_atomic_fp32 = AiterFlashAttnFunc._resolve_is_v3_atomic_fp32(is_v3_atomic_fp32)
 
         # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
         if get_device_compute_capability() >= (9, 5):
             how_v3_bf16_cvt = 0
 
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+
         head_size_q_og = q.size(3)
         head_size_v_og = v.size(3)
         if head_size_q_og % 8 != 0:
@@ -161,7 +163,7 @@ class AttentionCKFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None
 
 
-class AttentionTritonFunction(torch.autograd.Function):
+class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -271,122 +273,63 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1),
     bias=None,
     alibi_slopes=None,
-    deterministic=True,
+    deterministic=False,
     return_lse=False,
     return_attn_probs=False,
-    backend_type: str = "ck",  # 'ck', 'triton'
-    cp_param_bundle=None,
 ):
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-
-    if cp_param_bundle is not None:  # CP
-        assert "cp_group" in cp_param_bundle
-        assert "cp_comm_type" in cp_param_bundle
-        return dispatch_attention_cp_functions(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-            backend_type,
-            False,
-            cp_param_bundle["cp_group"],
-            cp_param_bundle["cp_comm_type"],
-        )
-
-    if backend_type == "ck":
-        return AttentionCKFunction.apply(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-        )
-    elif backend_type == "triton":
-        return AttentionTritonFunction.apply(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-            False,
-        )
-    else:
-        raise NotImplementedError(f"backend_type {backend_type} not supported")
+    return AiterFlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        torch.is_grad_enabled(),
+    )
 
 
-def attention_fp8_blockwise(
+def flash_attn_fp8_func(
     q,
     k,
     v,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1),
     bias=None,
     alibi_slopes=None,
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
-    backend_type: str = "triton",  # for now 'triton' only
-    cp_param_bundle=None,
+    fp8_config: Optional[Float8QuantConfig] = None,
 ):
-    assert backend_type == "triton", "attention_fp8_blockwise only support triton backend"
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-
-    if cp_param_bundle is not None:  # CP
-
-        assert "cp_group" in cp_param_bundle
-        assert "cp_comm_type" in cp_param_bundle
-        return dispatch_attention_cp_functions(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            torch.is_grad_enabled(),
-            backend_type,
-            True,
-            cp_param_bundle["cp_group"],
-            cp_param_bundle["cp_comm_type"],
+    # Default config: blockwise with block_size=64
+    if fp8_config is None:
+        fp8_config = Float8QuantConfig(
+            granularity=ScalingGranularity.BLOCKWISE,
+            block_size=64,
         )
 
-    return AttentionTritonFunction.apply(
+    # Check if config is supported
+    if fp8_config.granularity != ScalingGranularity.BLOCKWISE:
+        raise ValueError(
+            f"flash_attn_fp8_func only supports BLOCKWISE granularity, " f"but got {fp8_config.granularity}"
+        )
+    if fp8_config.block_size != 64:
+        raise ValueError(
+            f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
+        )
+
+    return TritonFlashAttnFunc.apply(
         q,
         k,
         v,
