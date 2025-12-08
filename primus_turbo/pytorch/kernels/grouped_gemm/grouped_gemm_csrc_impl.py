@@ -32,7 +32,7 @@ class GroupedGEMMCKBackend(KernelBackend):
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
-        supported &= trans_a == False
+        supported &= not trans_a
         return supported
 
     @staticmethod
@@ -65,7 +65,7 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
-        supported &= trans_a == True and trans_b == False
+        supported &= trans_a and not trans_b
         return supported
 
     @staticmethod
@@ -104,7 +104,7 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
-        supported &= trans_a == False
+        supported &= not trans_a
         return supported
 
     @staticmethod
@@ -140,7 +140,7 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
-        supported &= trans_a == True and trans_b == False
+        supported &= trans_a and not trans_b
         return supported
 
     @staticmethod
@@ -287,7 +287,7 @@ def grouped_gemm_impl_meta(
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
     assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
     assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
-    assert trans_a == False
+    assert trans_a == False, "Only trans_a=False is supported."
 
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
@@ -310,7 +310,7 @@ def grouped_gemm_variable_k_impl_meta(
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
     assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
     assert b.dtype in [torch.float16, torch.bfloat16], f"b must be float16 or bfloat16, got {b.dtype}"
-    assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
+    assert trans_a and not trans_b, "Only trans_a=True and trans_b=False are supported."
 
     bs = group_lens.shape[0]
     m = a.shape[1] if trans_a else a.shape[0]
