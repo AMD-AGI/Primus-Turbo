@@ -43,7 +43,10 @@ Note: JAX support is under active development. Optim support is planned but not 
 Use the pre-built AMD ROCm image:
 ```
 # PyTorch Ecosystem
-rocm/primus:v25.10
+## For GFX942
+rocm/primus:v25.9_gfx942
+## For GFX950
+rocm/primus:v25.9_gfx950
 
 # JAX Ecosystem
 rocm/jax-training:maxtext-v25.9
