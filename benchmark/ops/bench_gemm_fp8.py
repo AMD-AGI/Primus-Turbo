@@ -17,6 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.ops import gemm_fp8
 
 ModelConfigs = {
+    # Llama 2 Series
     "llama2-7b": {
         "seqlen": 4096,
         "hidden_size": 4096,
@@ -33,6 +34,7 @@ ModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
     },
+    # Llama 3.1 Series
     "llama3.1-8b": {
         "seqlen": 8192,
         "hidden_size": 4096,
@@ -41,7 +43,15 @@ ModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
     },
-    "llama3.1-405B": {
+    "llama3.1-70b": {
+        "seqlen": 8192,
+        "hidden_size": 8192,
+        "intermediate_size": 28672,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    },
+    "llama3.1-405b": {
         "seqlen": 8192,
         "hidden_size": 16384,
         "intermediate_size": 53248,
@@ -49,8 +59,32 @@ ModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
     },
+    # Qwen2 Series
+    "qwen2-7b": {
+        "seqlen": 32768,
+        "hidden_size": 3584,
+        "intermediate_size": 18944,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+    },
+    "qwen2-72b": {
+        "seqlen": 32768,
+        "hidden_size": 8192,
+        "intermediate_size": 29568,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    },
+    "qwen2.5-32b": {
+        "seqlen": 32768,
+        "hidden_size": 5120,
+        "intermediate_size": 27648,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    },
 }
-
 
 def gen_gemm_test_cases(model_config):
     seq = model_config["seqlen"]
