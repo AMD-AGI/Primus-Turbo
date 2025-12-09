@@ -33,6 +33,7 @@ class TurboAttention(torch.nn.Module):
         fp8_config: Optional[Float8QuantConfig] = None,
         ulysses_group=None,
         ring_group=None,
+        **kwargs,  # currently forward compatibility with Primus
     ):
         super().__init__()
 
