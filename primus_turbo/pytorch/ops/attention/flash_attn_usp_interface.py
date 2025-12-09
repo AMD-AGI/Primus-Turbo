@@ -417,7 +417,6 @@ def flash_attn_usp_func(
     return_attn_probs=False,
     ulysses_group=None,
     ring_group=None,
-    **kwargs,
 ):
     assert (
         ulysses_group and ring_group
@@ -457,7 +456,6 @@ def flash_attn_fp8_usp_func(
     fp8_config: Optional[Float8QuantConfig] = None,
     ulysses_group=None,
     ring_group=None,
-    **kwargs,
 ):
     assert (
         ulysses_group and ring_group

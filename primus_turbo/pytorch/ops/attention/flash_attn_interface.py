@@ -279,7 +279,6 @@ def flash_attn_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
-    **kwargs,
 ):
     return AiterFlashAttnFunc.apply(
         q,
@@ -312,7 +311,6 @@ def flash_attn_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
-    **kwargs,
 ):
     # Default config: blockwise with block_size=64
     if fp8_config is None:
