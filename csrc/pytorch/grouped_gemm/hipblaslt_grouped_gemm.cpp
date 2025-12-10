@@ -13,6 +13,7 @@
 #include <mutex>
 
 #include "primus_turbo/gemm.h"
+#include "primus_turbo/grouped_gemm.h"
 #include "pytorch/extensions.h"
 #include "pytorch/type_traits.h"
 
@@ -37,6 +38,32 @@
     } while (0)
 
 namespace primus_turbo::pytorch {
+
+template <typename AType, typename BType, typename CType>
+inline HipblasltGroupedGemmParams<AType, BType, CType>
+make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
+                                   const at::Tensor &group_lens, const at::Tensor &group_offs,
+                                   bool transA, bool transB, int32_t group_num, int32_t m,
+                                   int32_t n, int32_t k, hipStream_t stream, at::Tensor workspace) {
+    HipblasltGroupedGemmParams<AType, BType, CType> params;
+    params.a_ptr          = reinterpret_cast<const AType *>(a.data_ptr());
+    params.b_ptr          = reinterpret_cast<const BType *>(b.data_ptr());
+    params.c_ptr          = reinterpret_cast<CType *>(c.data_ptr());
+    params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+    params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+    params.transA         = transA;
+    params.transB         = transB;
+    params.group_num      = group_num;
+    params.m              = m;
+    params.n              = n;
+    params.k              = k;
+    params.stream         = stream;
+    params.a_shape        = a.sizes().vec();
+    params.b_shape        = b.sizes().vec();
+    params.c_shape        = c.sizes().vec();
+    params.workspace      = workspace.data_ptr();
+    return params;
+}
 
 // Global hipBLASLt state
 static hipblasLtHandle_t g_hipblaslt_handle[NUM_STREAM];
@@ -172,6 +199,24 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
     HipblasltGroupedGemmImpl(a.data_ptr(), b.data_ptr(), c.data_ptr(),
                              group_lens.data_ptr<int64_t>(), bs, k, n, b_rows, b_cols, transB,
                              stream, dtype);
+
+    // *************************
+    // *************************
+    // auto          handle = at::cuda::getCurrentCUDABlasLtHandle();
+    // const int64_t workspace_size =
+    //     primus_turbo::get_hipblaslt_grouped_gemm_workspace_size(group_lens.numel());
+    // at::Tensor workspace = at::empty(
+    //     {workspace_size}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
+
+    // if (a.dtype() == at::kHalf) {
+    //     using Type  = float16;
+    //     auto params = make_hipblaslt_grouped_gemm_params<Type, Type, Type>(
+    //         a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k, stream, workspace);
+    //     hipblaslt_grouped_gemm<Type, Type, Type>(params, handle);
+    // }
+
+    // *************************
+    // *************************
 
     return c;
 }

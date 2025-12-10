@@ -15,6 +15,8 @@ namespace primus_turbo {
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);
 std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
 
+std::int64_t get_hipblaslt_grouped_gemm_workspace_size(const int64_t group_num);
+
 //==================================================================
 //  Grouped GEMM Params
 //==================================================================
@@ -50,6 +52,14 @@ struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> 
     const ACCType *bq_ptr = nullptr;
 };
 
+template <typename AType, typename BType, typename CType>
+struct HipblasltGroupedGemmParams : public GroupedGemmParams<AType, BType, CType> {
+    std::vector<int64_t> a_shape;
+    std::vector<int64_t> b_shape;
+    std::vector<int64_t> c_shape;
+    void                *workspace = nullptr;
+};
+
 //==================================================================
 //  CK Grouped GEMM
 //==================================================================
@@ -75,7 +85,9 @@ void ck_grouped_gemm_fp8_variable_k(
 //==================================================================
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
-void hipblaslt_grouped_gemm(const GroupedGemmParams<ADataType, BDataType, CDataType> &params);
+void hipblaslt_grouped_gemm(
+    const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params,
+    hipblasLtHandle_t                                                  handle);
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
