@@ -36,41 +36,91 @@
 
 namespace primus_turbo::jax {
 
-// Global hipBLASLt state
-static hipblasLtHandle_t g_hipblaslt_handle[NUM_STREAM];
-static hipStream_t       g_hipblaslt_stream[NUM_STREAM];
-static hipEvent_t        g_hipblaslt_event[NUM_STREAM];
-static void             *g_hipblaslt_workspace[NUM_STREAM];
-static int64_t           g_hipblaslt_workspace_size = 0;
-static std::once_flag    g_hipblaslt_once_flag;
+// Maximum number of GPUs supported
+#define MAX_GPUS 16
 
-void init_hipblaslt() {
-    g_hipblaslt_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+// Per-GPU hipBLASLt state
+struct PerGPUHipblasltState {
+    hipblasLtHandle_t handle[NUM_STREAM];
+    hipStream_t       stream[NUM_STREAM];
+    hipEvent_t        event[NUM_STREAM];
+    void             *workspace[NUM_STREAM];
+    bool              initialized = false;
+};
+
+static PerGPUHipblasltState g_hipblaslt_state[MAX_GPUS];
+static int64_t              g_hipblaslt_workspace_size = 0;
+static std::mutex           g_hipblaslt_mutex;
+
+// Get current GPU device ID from stream
+inline int get_device_from_stream(hipStream_t stream) {
+    int device_id = 0;
+    // hipStreamGetDevice is available in ROCm
+    hipError_t err = hipStreamGetDevice(stream, &device_id);
+    if (err != hipSuccess) {
+        // Fallback: get current device
+        hipGetDevice(&device_id);
+    }
+    return device_id;
+}
+
+void init_hipblaslt_for_device(int device_id) {
+    if (device_id < 0 || device_id >= MAX_GPUS) {
+        std::fprintf(stderr, "Invalid device_id %d (max %d)\n", device_id, MAX_GPUS);
+        std::abort();
+    }
+
+    PerGPUHipblasltState &state = g_hipblaslt_state[device_id];
+    if (state.initialized) {
+        return;
+    }
+
+    // Set current device before creating resources
+    HIP_CHECK(hipSetDevice(device_id));
+
+    if (g_hipblaslt_workspace_size == 0) {
+        g_hipblaslt_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+    }
+
     for (int i = 0; i < NUM_STREAM; i++) {
-        HIP_CHECK(hipStreamCreateWithFlags(&g_hipblaslt_stream[i], hipStreamNonBlocking));
-        HIPBLASLT_CHECK(hipblasLtCreate(&g_hipblaslt_handle[i]));
-        HIP_CHECK(hipEventCreate(&g_hipblaslt_event[i]));
-        HIP_CHECK(hipMalloc(&g_hipblaslt_workspace[i], g_hipblaslt_workspace_size));
+        HIP_CHECK(hipStreamCreateWithFlags(&state.stream[i], hipStreamNonBlocking));
+        HIPBLASLT_CHECK(hipblasLtCreate(&state.handle[i]));
+        HIP_CHECK(hipEventCreate(&state.event[i]));
+        HIP_CHECK(hipMalloc(&state.workspace[i], g_hipblaslt_workspace_size));
+    }
+
+    state.initialized = true;
+}
+
+inline PerGPUHipblasltState &ensure_hipblaslt_initialized(hipStream_t stream) {
+    int device_id = get_device_from_stream(stream);
+
+    if (!g_hipblaslt_state[device_id].initialized) {
+        std::lock_guard<std::mutex> lock(g_hipblaslt_mutex);
+        // Double-check after acquiring lock
+        if (!g_hipblaslt_state[device_id].initialized) {
+            init_hipblaslt_for_device(device_id);
+        }
+    }
+
+    return g_hipblaslt_state[device_id];
+}
+
+inline void hipblaslt_streams_wait_current(PerGPUHipblasltState &state,
+                                           hipStream_t           current_stream) {
+    HIP_CHECK(hipEventRecord(state.event[0], current_stream));
+    for (int s = 0; s < NUM_STREAM; s++) {
+        HIP_CHECK(hipStreamWaitEvent(state.stream[s], state.event[0]));
     }
 }
 
-inline void ensure_hipblaslt_initialized() {
-    std::call_once(g_hipblaslt_once_flag, init_hipblaslt);
-}
-
-inline void hipblaslt_streams_wait_current(hipStream_t current_stream) {
-    HIP_CHECK(hipEventRecord(g_hipblaslt_event[0], current_stream));
+inline void hipblaslt_current_wait_streams(PerGPUHipblasltState &state,
+                                           hipStream_t           current_stream) {
     for (int s = 0; s < NUM_STREAM; s++) {
-        HIP_CHECK(hipStreamWaitEvent(g_hipblaslt_stream[s], g_hipblaslt_event[0]));
-    }
-}
-
-inline void hipblaslt_current_wait_streams(hipStream_t current_stream) {
-    for (int s = 0; s < NUM_STREAM; s++) {
-        HIP_CHECK(hipEventRecord(g_hipblaslt_event[s], g_hipblaslt_stream[s]));
+        HIP_CHECK(hipEventRecord(state.event[s], state.stream[s]));
     }
     for (int s = 0; s < NUM_STREAM; s++) {
-        HIP_CHECK(hipStreamWaitEvent(current_stream, g_hipblaslt_event[s]));
+        HIP_CHECK(hipStreamWaitEvent(current_stream, state.event[s]));
     }
 }
 
@@ -102,14 +152,14 @@ void HipblasltGemm(hipblasLtHandle_t handle, hipStream_t stream, void *workspace
 void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *batch_sizes,
                           int64_t num_experts, int64_t k, int64_t n, int64_t b_rows, int64_t b_cols,
                           bool trans_b, hipStream_t stream, hipDataType dtype = HIP_R_16BF) {
-    ensure_hipblaslt_initialized();
+    PerGPUHipblasltState &state = ensure_hipblaslt_initialized(stream);
 
     size_t elem_size = 2; // Both float16 and bfloat16 are 2 bytes
     char  *a         = reinterpret_cast<char *>(a_ptr);
     char  *b         = reinterpret_cast<char *>(b_ptr);
     char  *c         = reinterpret_cast<char *>(c_ptr);
 
-    hipblaslt_streams_wait_current(stream);
+    hipblaslt_streams_wait_current(state, stream);
 
     for (int64_t i = 0; i < num_experts; ++i) {
         int64_t m = batch_sizes[i];
@@ -121,16 +171,16 @@ void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *
 
         int stream_idx = i % NUM_STREAM;
 
-        HipblasltGemm(g_hipblaslt_handle[stream_idx], g_hipblaslt_stream[stream_idx],
-                      g_hipblaslt_workspace[stream_idx], g_hipblaslt_workspace_size, a, m, k, b,
-                      b_rows, b_cols, trans_b, c, n, dtype);
+        HipblasltGemm(state.handle[stream_idx], state.stream[stream_idx],
+                      state.workspace[stream_idx], g_hipblaslt_workspace_size, a, m, k, b, b_rows,
+                      b_cols, trans_b, c, n, dtype);
 
         a += m * k * elem_size;
         b += b_rows * b_cols * elem_size;
         c += m * n * elem_size;
     }
 
-    hipblaslt_current_wait_streams(stream);
+    hipblaslt_current_wait_streams(state, stream);
 }
 
 // ============================================================================
@@ -213,7 +263,7 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
     const int32_t total_tokens = static_cast<int32_t>(a.dimensions()[1]);
     const int32_t N            = static_cast<int32_t>(b.dimensions()[0]);
 
-    ensure_hipblaslt_initialized();
+    PerGPUHipblasltState &state = ensure_hipblaslt_initialized(stream);
 
     // Determine datatype
     hipDataType dtype = (a.element_type() == ffi::F16) ? HIP_R_16F : HIP_R_16BF;
@@ -225,7 +275,7 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
 
     const int64_t *batch_sizes_ptr = batch_sizes.typed_data<int64_t>();
 
-    hipblaslt_streams_wait_current(stream);
+    hipblaslt_streams_wait_current(state, stream);
 
     int64_t start = 0;
     for (int32_t i = 0; i < num_experts; ++i) {
@@ -246,8 +296,8 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
         // where a_sub = a[:, start:start+k_i] is [M, k_i]
         //       b_sub = b[:, start:start+k_i] is [N, k_i]
         //       c[i] = a_sub @ b_sub.T = [M, k_i] @ [k_i, N] = [M, N]
-        HipblasltGemm(g_hipblaslt_handle[stream_idx], g_hipblaslt_stream[stream_idx],
-                      g_hipblaslt_workspace[stream_idx], g_hipblaslt_workspace_size,
+        HipblasltGemm(state.handle[stream_idx], state.stream[stream_idx],
+                      state.workspace[stream_idx], g_hipblaslt_workspace_size,
                       a_ptr + start * elem_size, // a_sub: [M, k_i]
                       M, k_i,
                       b_ptr + start * elem_size,     // b_sub: [N, k_i]
@@ -260,7 +310,7 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
         start += k_i;
     }
 
-    hipblaslt_current_wait_streams(stream);
+    hipblaslt_current_wait_streams(state, stream);
 
     return ffi::Error::Success();
 }
