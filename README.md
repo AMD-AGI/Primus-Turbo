@@ -15,11 +15,12 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ## 🧩 Primus Product Matrix
 
-|    Module      | Role | Key Features | Dependencies / Integration  |
-|----------------|------|--------------|-----------------------------|
-| [**Primus-LM**](https://github.com/AMD-AGI/Primus)         | End-to-end training framework | - Supports multiple training backends (Megatron, TorchTitan, etc.)<br>- Provides high-performance, scalable distributed training<br>- Deeply integrates with Primus-Turbo and Primus-SaFE | - Can invoke Primus-Turbo kernels and modules<br>- Runs on top of Primus-SaFE for stable scheduling |
-| [**Primus-Turbo**](https://github.com/AMD-AGI/Primus-Turbo)         | High-performance operators & modules | - Provides common LLM training operators (FlashAttention, GEMM, Collectives, GroupedGemm, etc.)<br>- Modular design, directly pluggable into Primus-LM<br>- Optimized for different architectures and precisions | - Built on [**AITER**](https://github.com/ROCm/aiter), [**CK**](https://github.com/ROCm/composable_kernel), [**hipBLASLt**](https://github.com/ROCm/hipBLASLt), [**Triton**](https://github.com/ROCm/triton)  and other operator libraries<br>- Can be enabled via configuration inside Primus-LM |
-| [**Primus-SaFE**](https://github.com/AMD-AGI/Primus-SaFE)         | Stability & platform layer | - Cluster sanity check and benchmarking<br>- Kubernetes scheduling with topology awareness<br>- Fault tolerance<br>- Stability enhancements | - Building a training platform based on the K8s and Slurm ecosystem |
+|     Module     | Role | Key Features |
+|----------------|------|--------------|
+| [**Primus-LM**](https://github.com/AMD-AGI/Primus)           | E2E training framework | - Supports multiple training backends (Megatron, TorchTitan, etc.)<br>- Provides high-performance, scalable distributed training<br>- Deeply integrates with Primus-Turbo and Primus-SaFE |
+| [**Primus-Turbo**](https://github.com/AMD-AGI/Primus-Turbo)  | High-performance operators & modules | - Supports core training operators and modules (FlashAttention, GEMM, GroupedGemm, DeepEP etc.)<br>- Integrates multiple high-performance backends (e.g., CK, hipBLASLt, AITER) <br>- High performance and easy to integrate |
+| [**Primus-SaFE**](https://github.com/AMD-AGI/Primus-SaFE)    | Stability & platform layer | - Cluster sanity check and benchmarking<br>- Kubernetes scheduling with topology awareness<br>- Fault tolerance<br>- Stability enhancements |
+
 
 
 ## 📦 Quick Start
@@ -32,7 +33,6 @@ Note: JAX support is under active development. Optim support is planned but not 
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
 
 
-
 #### Hardware
 | Architecture | Supported GPUs      |
 | -------------| --------------------|
@@ -41,17 +41,14 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ### 2. Docker (Recommended)
 Use the pre-built AMD ROCm image:
-
-**PyTorch Ecosystem**
 ```
-# For GFX942
+# PyTorch Ecosystem
+## For GFX942
 rocm/primus:v25.9_gfx942
-# For GFX950
+## For GFX950
 rocm/primus:v25.9_gfx950
-```
 
-**JAX Ecosystem**
-```
+# JAX Ecosystem
 rocm/jax-training:maxtext-v25.9
 ```
 
