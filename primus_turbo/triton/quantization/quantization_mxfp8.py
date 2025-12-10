@@ -60,25 +60,30 @@ def float_to_e8m0_triton(val: tl.float32) -> tl.uint8:
 def quantize_mxfp8_kernel(
     x_ptr,
     y_ptr,
-    stride_row,
-    stride_col,
+    stride_x_row,
+    stride_x_col,
+    stride_y_row,
+    stride_y_col,
     n_rows,
     n_cols,
+    padded_n_rows,
+    padded_n_cols,
     scale_inv_ptr,
     stride_scale_inv_row,
     stride_scale_inv_col,
-    scale_M,
-    scale_N,
+    scale_n_rows,
+    scale_n_cols,
     max_fp8: tl.constexpr,
     BLOCK_X: tl.constexpr,
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
+    TRANS: tl.constexpr,
     MXFP8_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    num_pid_along_Y = tl.cdiv(n_rows, BLOCK_Y)
-    num_pid_along_X = tl.cdiv(n_cols, BLOCK_X)
+    num_pid_along_Y = tl.cdiv(padded_n_rows, BLOCK_Y)
+    num_pid_along_X = tl.cdiv(padded_n_cols, BLOCK_X)
     num_pid_in_group = GROUP_Y * num_pid_along_X
 
     group_id = pid // num_pid_in_group
@@ -97,42 +102,74 @@ def quantize_mxfp8_kernel(
         offsets_Y = global_offset_Y_base + chunk_id_y * MXFP8_BLOCK_SIZE + tl.arange(0, MXFP8_BLOCK_SIZE)
         for chunk_id_x in range(0, num_chunks_in_block_X):
             offsets_X = global_offset_X_base + chunk_id_x * MXFP8_BLOCK_SIZE + tl.arange(0, MXFP8_BLOCK_SIZE)
-            x_ptr_current_chunk = x_ptr + offsets_Y[:, None] * stride_row + offsets_X[None, :] * stride_col
-            mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+            x_ptr_current_chunk = (
+                x_ptr + offsets_Y[:, None] * stride_x_row + offsets_X[None, :] * stride_x_col
+            )
+            load_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
             # (MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
-            x_chunk = tl.load(x_ptr_current_chunk, mask=mask, other=0.0).to(tl.float32)
+            x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask, other=0.0).to(tl.float32)
 
-            # Rowwise
-            subwarp_amax_rowwise = tl.max(tl.abs(x_chunk), axis=-1, keep_dims=True)
-            biased_exponent_rowwise = float_to_e8m0_triton(subwarp_amax_rowwise * max_norm_rcp)
+            if not TRANS:
+                # Row-wise
+                subwarp_amax_rowwise = tl.max(tl.abs(x_chunk), axis=-1, keep_dims=True)
+                biased_exponent_rowwise = float_to_e8m0_triton(subwarp_amax_rowwise * max_norm_rcp)
 
-            scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-            scale_inv_store_offsets = (
-                offsets_Y[:, None] * stride_scale_inv_row
-            ) + scale_offset_X * stride_scale_inv_col
-            scale_inv_store_mask = (offsets_Y < scale_M)[:, None] & (scale_offset_X < scale_N)
-            tl.store(
-                scale_inv_ptr + scale_inv_store_offsets,
-                biased_exponent_rowwise,
-                mask=scale_inv_store_mask,
-            )
+                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+                scale_inv_store_offsets = (
+                    offsets_Y[:, None] * stride_scale_inv_row
+                ) + scale_offset_X * stride_scale_inv_col
+                scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+                tl.store(
+                    scale_inv_ptr + scale_inv_store_offsets,
+                    biased_exponent_rowwise,
+                    mask=scale_inv_store_mask,
+                )
 
-            block_inverse_scale_rowwise = exp2f_rcp_triton(biased_exponent_rowwise)
-            y_chunk_scaled = x_chunk * block_inverse_scale_rowwise
-            y_ptr_current_chunk = y_ptr + offsets_Y[:, None] * stride_row + offsets_X[None, :] * stride_col
-            tl.store(
-                y_ptr_current_chunk,
-                y_chunk_scaled.to(y_ptr.type.element_ty),
-                mask=mask,
-            )
+                block_inverse_scale_rowwise = exp2f_rcp_triton(biased_exponent_rowwise)
+                y_chunk_scaled = x_chunk * block_inverse_scale_rowwise
+
+                store_mask = (offsets_Y < padded_n_rows)[:, None] & (offsets_X < padded_n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_row + offsets_X[None, :] * stride_y_col
+                )
+                tl.store(
+                    y_ptr_current_chunk,
+                    y_chunk_scaled.to(y_ptr.type.element_ty),
+                    mask=store_mask,
+                )
+            else:
+                # Col-wise
+                subwarp_amax_colwise = tl.max(tl.abs(x_chunk), axis=0, keep_dims=True)
+                biased_exponent_colwise = float_to_e8m0_triton(subwarp_amax_colwise * max_norm_rcp)
+
+                scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
+                scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_col + (
+                    offsets_X[None, :] * stride_scale_inv_row
+                )
+                scale_inv_store_mask = (scale_offset_Y < scale_n_rows) & (offsets_X < scale_n_cols)[None, :]
+                tl.store(
+                    scale_inv_ptr + scale_inv_store_offsets,
+                    biased_exponent_colwise,
+                    mask=scale_inv_store_mask,
+                )
+
+                block_inverse_scale_colwise = exp2f_rcp_triton(biased_exponent_colwise)
+                y_chunk_scaled = x_chunk * block_inverse_scale_colwise
+                store_mask = (offsets_Y < padded_n_rows)[:, None] & (offsets_X < padded_n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_col + offsets_X[None, :] * stride_y_row
+                )
+                tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)
 
 
 @triton.jit
 def dequantize_mxfp8_kernel(
     x_ptr,
     y_ptr,
-    stride_row,
-    stride_col,
+    stride_x_row,
+    stride_x_col,
+    stride_y_row,
+    stride_y_col,
     n_rows,
     n_cols,
     scale_inv_ptr,
@@ -143,6 +180,7 @@ def dequantize_mxfp8_kernel(
     BLOCK_X: tl.constexpr,
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
+    TRANS: tl.constexpr,
     MXFP8_BLOCK_SIZE: tl.constexpr,
 ):
 
@@ -167,20 +205,34 @@ def dequantize_mxfp8_kernel(
         offsets_Y = global_offset_Y_base + chunk_id_y * MXFP8_BLOCK_SIZE + tl.arange(0, MXFP8_BLOCK_SIZE)
         for chunk_id_x in range(0, num_chunks_in_block_X):
             offsets_X = global_offset_X_base + chunk_id_x * MXFP8_BLOCK_SIZE + tl.arange(0, MXFP8_BLOCK_SIZE)
-            x_ptr_current_chunk = x_ptr + offsets_Y[:, None] * stride_row + offsets_X[None, :] * stride_col
-            mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
-            x_chunk = tl.load(x_ptr_current_chunk, mask=mask)
+            x_ptr_current_chunk = (
+                x_ptr + offsets_Y[:, None] * stride_x_row + offsets_X[None, :] * stride_x_col
+            )
+            load_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+            x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask)
 
             scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-            scale_inv_store_offsets = (
+            scale_inv_load_offsets = (
                 offsets_Y[:, None] * stride_scale_inv_row
             ) + scale_offset_X * stride_scale_inv_col
-            scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+            scale_inv_load_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
 
             biased_exponent = tl.load(
-                scale_inv_ptr + scale_inv_store_offsets, mask=scale_inv_store_mask, other=127
+                scale_inv_ptr + scale_inv_load_offsets, mask=scale_inv_load_mask, other=127
             )
+
             block_scale = tl.exp2(biased_exponent.to(tl.float32) - 127)
             y_chunk_scaled = x_chunk.to(tl.float32) * block_scale
-            y_ptr_current_chunk = y_ptr + offsets_Y[:, None] * stride_row + offsets_X[None, :] * stride_col
-            tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=mask)
+
+            if not TRANS:
+                store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_row + offsets_X[None, :] * stride_y_col
+                )
+                tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)
+            else:
+                store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_col + offsets_X[None, :] * stride_y_row
+                )
+                tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)

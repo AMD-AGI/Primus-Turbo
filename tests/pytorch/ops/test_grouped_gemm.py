@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.ops import grouped_gemm
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -24,7 +25,19 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
-def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
+        pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
+
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
     device = "cuda"
     props = torch.cuda.get_device_properties(device)
     num_cu = props.multi_processor_count - reduce_num_cu
@@ -55,14 +68,17 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
 
     out_snr = compute_snr(out_ref, out)
     print(f"Out-SNR: {out_snr:.2f} dB")
-    assert out_snr > 20, "out_snr too low"
+    assert out_snr > 50, "out_snr too low"
 
     a_grad_snr = compute_snr(a_ref.grad, a.grad)
     print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
-    assert a_grad_snr > 20, "a_grad_snr too low"
+    assert a_grad_snr > 50, "a_grad_snr too low"
 
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
-    assert b_grad_snr > 20, "b_grad_snr too low"
+    assert b_grad_snr > 50, "b_grad_snr too low"
     torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
+
+    # Reset config and caches
+    GlobalBackendManager.reset()

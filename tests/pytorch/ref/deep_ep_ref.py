@@ -357,8 +357,6 @@ def tune_and_verify_intranode(
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
 
-    num_experts // num_ranks
-
     num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = buffer.get_dispatch_layout(
         topk_idx, num_experts
     )

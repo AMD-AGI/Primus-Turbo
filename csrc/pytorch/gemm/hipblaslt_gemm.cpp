@@ -9,27 +9,6 @@
 
 namespace primus_turbo::pytorch {
 
-static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
-    switch (t) {
-    case at::kHalf:
-        return HIP_R_16F;
-    case at::kFloat:
-        return HIP_R_32F;
-    case at::kBFloat16:
-        return HIP_R_16BF;
-    case at::kFloat8_e4m3fnuz:
-        return HIP_R_8F_E4M3_FNUZ;
-    case at::kFloat8_e4m3fn:
-        return HIP_R_8F_E4M3;
-    case at::kFloat8_e5m2fnuz:
-        return HIP_R_8F_E5M2_FNUZ;
-    case at::kFloat8_e5m2:
-        return HIP_R_8F_E5M2;
-    default:
-        PRIMUS_TURBO_ERROR("Invalid type");
-    }
-}
-
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
                           bool transB, bool transC) {
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(A.scalar_type()));

@@ -10,7 +10,20 @@ import torch
 import triton
 from torch.library import custom_op, triton_op, wrap_triton
 
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+_torch_custom_op_wrapper = torch.library.custom_op
+
+from primus_turbo.pytorch.core.backend import (
+    AutoKernelDispatcher,
+    BackendType,
+    GlobalBackendManager,
+    KernelBackend,
+    TuneCache,
+)
+from primus_turbo.pytorch.core.low_precision import (
+    ScalingGranularity,
+    float8_e4m3,
+    float8_e5m2,
+)
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_nn_kernel,
     gemm_fp8_blockwise_nt_kernel,
@@ -233,6 +246,159 @@ def gemm_fp8_blockwise_impl_meta(
     return c
 
 
+_COMMON_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e4m3, torch.float16),
+    (float8_e4m3, float8_e4m3, torch.bfloat16),
+    (float8_e5m2, float8_e5m2, torch.float16),
+    (float8_e5m2, float8_e5m2, torch.bfloat16),
+)
+
+_HYBRID_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e5m2, torch.float16),
+    (float8_e4m3, float8_e5m2, torch.bfloat16),
+    (float8_e5m2, float8_e4m3, torch.float16),
+    (float8_e5m2, float8_e4m3, torch.bfloat16),
+)
+
+
+class GEMMFP8HipBLASLtBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    # (a_dtype, b_dtype, c_dtype)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+
+    # (trans_a, trans_b, trans_c)
+    SUPPORTED_LAYOUTS = (
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+    )
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        # check ScalingGranularity
+        supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
+        # check dtype
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8HipBLASLtBackend.SUPPORTED_DTYPES
+
+        # TODO:
+        # check layout
+        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8HipBLASLtBackend.SUPPORTED_LAYOUTS
+        # TODO:
+        # check shape
+
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
+            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        )
+
+
+class GEMMFP8CKBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        # check ScalingGranularity
+        supported &= granularity in GEMMFP8CKBackend.SUPPORTED_GRANULARITIES
+        # check dtype
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8CKBackend.SUPPORTED_DTYPES
+
+        # TODO: check layout
+        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8CKBackend.SUPPORTED_LAYOUTS
+
+        # TODO: check shape
+
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
+            trans_lhs = not trans_b
+            trans_rhs = not trans_a
+        else:
+            lhs, rhs = a, b
+            lhs_scale_inv, rhs_scale_inv = a_scale_inv, b_scale_inv
+            trans_lhs = trans_a
+            trans_rhs = trans_b
+
+        return torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8(
+            lhs, rhs, lhs_scale_inv, rhs_scale_inv, trans_lhs, trans_rhs, out_dtype, granularity.name
+        )
+
+
+_GEMM_FP8_BACKENDS = {
+    BackendType.HIPBLASLT: GEMMFP8HipBLASLtBackend,
+    BackendType.CK: GEMMFP8CKBackend,
+}
+
+
+class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
+    _backends = _GEMM_FP8_BACKENDS
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp8_impl", mutates_args=(), device_types="cuda")
 def gemm_fp8_impl(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -242,18 +408,42 @@ def gemm_fp8_impl(
     trans_b: bool,
     out_dtype: torch.dtype,
     trans_c: bool,
-    backend: str = "hipblaslt",
-    granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
+    granularity: int,
+    default_backend: int,
 ) -> torch.Tensor:
-    assert backend in ("hipblaslt", "ck"), f"Unsupported backend: {backend}"
+    default_backend_enum = BackendType(default_backend)
+    user_backend_enum = GlobalBackendManager.get_gemm_backend()
+    granularity_enum = ScalingGranularity(granularity)
 
-    if backend == "hipblaslt":
-        out = torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
-        )
-    elif backend == "ck":
-        out = torch.ops.primus_turbo_cpp_extension.ck_gemm_fp8(
-            a, b, a_scale_inv, b_scale_inv, trans_a, trans_b, out_dtype, granularity.name
-        )
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity_enum,
+    )
 
-    return out
+    return GEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+
+
+@gemm_fp8_impl.register_fake
+def gemm_fp8_impl_meta(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    default_backend: int,
+) -> torch.Tensor:
+    m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
+    if trans_c:
+        m, n = n, m
+    return torch.empty(m, n, dtype=out_dtype, device=a.device)

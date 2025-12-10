@@ -54,7 +54,7 @@ jobs:
 
   unittest-pytorch-gfx942:
     needs: code-lint
-    runs-on: primus-turbo-runner-pytorch-gfx942
+    runs-on: turbo-pt-gfx942-259-t6dv9
     steps:
       - run: echo "🎉 Begin Primus-Turbo PyTorch Framework Unit Test."
       - name: Change owner
@@ -99,7 +99,7 @@ jobs:
 
   unittest-jax-gfx942:
     needs: code-lint
-    runs-on: primus-turbo-runner-jax-gfx942
+    runs-on: turbo-jax-gfx942-259-kzptx
     steps:
       - run: echo "🎉 Begin Primus-Turbo JAX Framework Unit-Test."
       - name: Change owner

@@ -3,10 +3,13 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 import itertools
+from typing import List
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
@@ -14,7 +17,6 @@ from torch.testing._internal.common_distributed import (
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 
 import primus_turbo.pytorch as pt
-from primus_turbo.pytorch.ops.attention.attention_utils import All2AllAttentionSharder
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
@@ -22,14 +24,22 @@ from tests.pytorch.ref.attention_ref import (
 from tests.pytorch.test_utils import compute_snr
 
 test_cases = [
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=192, head_dim_v=128),
-    # AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
 ]
+
+
+def shard_cp_input(input_tensors: List[torch.Tensor], cp_group, seq_dim=1) -> List[torch.Tensor]:
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
+
+    output_list = []
+    for t in input_tensors:
+        output_list.append(t.chunk(cp_size, seq_dim)[cp_rank].contiguous())
+
+    return output_list
 
 
 @instantiate_parametrized_tests
@@ -62,8 +72,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     def test_attention_with_cp(self):
         self._init_process()
-        cp_group = dist.group.WORLD
-        cp_stream = torch.cuda.Stream()
         dtype = torch.bfloat16
         device = torch.device("cuda", self.rank)
 
@@ -71,46 +79,39 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "batch": [2],
             "config": test_cases,
             "causal": [True, False],
-            "backend_type": ["ck", "triton"],
-            "cp_comm_type": ["a2a"],
             "fp8": [True, False],
+            "ulysses_degree": [1, 2, 4, 8],
         }
 
-        for batch, config, causal, backend_type, cp_comm_type, fp8 in itertools.product(
+        for batch, config, causal, fp8, ulysses_degree in itertools.product(
             *[test_params[k] for k in test_params]
         ):
-            if backend_type == "ck" and fp8:
+            if self.world_size % ulysses_degree != 0:
                 continue
-
-            if fp8:
-                func = pt.ops.attention_fp8_blockwise
-            else:
-                func = pt.ops.flash_attn_func
-
+            ring_degree = self.world_size // ulysses_degree
+            if fp8 and ring_degree != 1:
+                # Ring attention is currently not supported for FP8
+                continue
+            func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
             self.run_attn_with_cp(
                 func,
                 batch,
                 config,
                 causal,
-                backend_type,
-                cp_comm_type,
-                cp_group,
-                cp_stream,
+                ulysses_degree,
+                ring_degree,
                 device,
                 dtype,
             )
-
         dist.destroy_process_group()
 
-    def run_attn_with_cp(
-        self, func, batch, config, causal, backend_type, cp_comm_type, cp_group, cp_stream, device, dtype
-    ):
-        if cp_comm_type == "a2a":
-            input_sharder = All2AllAttentionSharder()
-        else:
-            raise NotImplementedError()
-
-        cp_param_bundle = {"cp_group": cp_group, "cp_stream": cp_stream, "cp_comm_type": cp_comm_type}
+    def run_attn_with_cp(self, func, batch, config, causal, ulysses_degree, ring_degree, device, dtype):
+        cp_group = dist.group.WORLD
+        device_mesh = init_device_mesh(
+            "cuda",
+            (ring_degree, ulysses_degree),
+            mesh_dim_names=("ring", "ulysses"),
+        )
 
         seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
             config.seqlen_q,
@@ -136,13 +137,11 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
 
         grad_ref = torch.randn(*o_ref.shape, device=device, dtype=dtype)
         o_ref.backward(grad_ref)
-        o_ref, dq_ref, dk_ref, dv_ref = input_sharder.shard_cp_input(
+        o_ref, dq_ref, dk_ref, dv_ref = shard_cp_input(
             [o_ref, query_ref.grad, key_ref.grad, value_ref.grad], cp_group
         )
 
-        query_local_token, key_local_token, value_local_token = input_sharder.shard_cp_input(
-            [query, key, value], cp_group
-        )
+        query_local_token, key_local_token, value_local_token = shard_cp_input([query, key, value], cp_group)
 
         o = func(
             query_local_token,
@@ -157,13 +156,13 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             deterministic=False,
             return_lse=False,
             return_attn_probs=False,
-            backend_type=backend_type,
-            cp_param_bundle=cp_param_bundle,
+            ulysses_group=device_mesh["ulysses"].get_group(),
+            ring_group=device_mesh["ring"].get_group(),
         )
-        grad = input_sharder.shard_cp_input([grad_ref], cp_group)[0]
+        grad = shard_cp_input([grad_ref], cp_group)[0]
         o.backward(grad)
 
-        dq, dk, dv = input_sharder.shard_cp_input([query.grad, key.grad, value.grad], cp_group)
+        dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group)
         out_snr = compute_snr(o_ref, o)
         query_grad_snr = compute_snr(dq_ref, dq)
         key_grad_snr = compute_snr(dk_ref, dk)

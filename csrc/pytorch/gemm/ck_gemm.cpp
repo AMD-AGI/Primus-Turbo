@@ -63,11 +63,15 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
         PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
     }
 
+    if (granularity == "BLOCKWISE") {
+        a_scales = transA ? a_scales.transpose(-1, -2) : a_scales;
+        b_scales = !transB ? b_scales.transpose(-1, -2) : b_scales;
+    }
+
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();
-
-    at::Tensor c      = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
-    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor c         = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
+    auto       stream    = at::cuda::getCurrentCUDAStream();
 
     if (a.dtype() == at::kFloat8_e4m3fnuz || a.dtype() == at::kFloat8_e4m3fn) {
         using AType = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;
