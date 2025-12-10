@@ -52,14 +52,13 @@ static PerGPUHipblasltState g_hipblaslt_state[MAX_GPUS];
 static int64_t              g_hipblaslt_workspace_size = 0;
 static std::mutex           g_hipblaslt_mutex;
 
-// Get current GPU device ID from stream
+// Get GPU device ID from stream using hipStreamGetDevice
 inline int get_device_from_stream(hipStream_t stream) {
-    int device_id = 0;
-    // hipStreamGetDevice is available in ROCm
-    hipError_t err = hipStreamGetDevice(stream, &device_id);
+    int        device_id = 0;
+    hipError_t err       = hipStreamGetDevice(stream, &device_id);
     if (err != hipSuccess) {
-        // Fallback: get current device
-        hipGetDevice(&device_id);
+        // Fallback to current device if stream query fails
+        HIP_CHECK(hipGetDevice(&device_id));
     }
     return device_id;
 }
@@ -75,8 +74,13 @@ void init_hipblaslt_for_device(int device_id) {
         return;
     }
 
-    // Set current device before creating resources
-    HIP_CHECK(hipSetDevice(device_id));
+    // Caller should have already set device via hipSetDevice
+    // Just verify and set if needed
+    int current_device = 0;
+    HIP_CHECK(hipGetDevice(&current_device));
+    if (current_device != device_id) {
+        HIP_CHECK(hipSetDevice(device_id));
+    }
 
     if (g_hipblaslt_workspace_size == 0) {
         g_hipblaslt_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
@@ -90,6 +94,7 @@ void init_hipblaslt_for_device(int device_id) {
     }
 
     state.initialized = true;
+    // Do NOT restore device - caller manages device context
 }
 
 inline PerGPUHipblasltState &ensure_hipblaslt_initialized(hipStream_t stream) {
@@ -152,6 +157,14 @@ void HipblasltGemm(hipblasLtHandle_t handle, hipStream_t stream, void *workspace
 void HipblasltGroupedGemm(void *a_ptr, void *b_ptr, void *c_ptr, const int64_t *batch_sizes,
                           int64_t num_experts, int64_t k, int64_t n, int64_t b_rows, int64_t b_cols,
                           bool trans_b, hipStream_t stream, hipDataType dtype = HIP_R_16BF) {
+    // Get device from stream and set it
+    int device_id = get_device_from_stream(stream);
+    HIP_CHECK(hipSetDevice(device_id));
+
+    // Synchronize device to ensure all previous operations are complete
+    HIP_CHECK(hipDeviceSynchronize());
+
+    // Get per-GPU state
     PerGPUHipblasltState &state = ensure_hipblaslt_initialized(stream);
 
     size_t elem_size = 2; // Both float16 and bfloat16 are 2 bytes
@@ -263,6 +276,14 @@ ffi::Error GroupedGemmVariableKHipblasltFFI(hipStream_t    stream,
     const int32_t total_tokens = static_cast<int32_t>(a.dimensions()[1]);
     const int32_t N            = static_cast<int32_t>(b.dimensions()[0]);
 
+    // Get device from stream and set it
+    int device_id = get_device_from_stream(stream);
+    HIP_CHECK(hipSetDevice(device_id));
+
+    // Synchronize device to ensure all previous operations are complete
+    HIP_CHECK(hipDeviceSynchronize());
+
+    // Get per-GPU state
     PerGPUHipblasltState &state = ensure_hipblaslt_initialized(stream);
 
     // Determine datatype

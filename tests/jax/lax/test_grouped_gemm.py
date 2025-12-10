@@ -292,3 +292,114 @@ def test_grouped_gemm_hipblaslt_multi_gpu_sequential():
 
     assert all_passed, "Some devices failed"
     print("[Multi-GPU Sequential Test] SUCCESS - All devices passed")
+
+
+@pytest.mark.skipif(get_num_devices() < 2, reason="Need at least 2 GPUs for multi-GPU test")
+def test_grouped_gemm_hipblaslt_multi_gpu_training_simulation():
+    """
+    Simulate a training scenario with multiple iterations on multiple GPUs.
+    This test is designed to reproduce Memory access fault errors that may occur
+    during actual training when hipBLASLt resources are used across multiple GPUs.
+    """
+    num_devices = get_num_devices()
+    num_iterations = 10
+    print(f"\n[Training Simulation] Running {num_iterations} iterations on {num_devices} GPUs")
+
+    # Test parameters similar to Mixtral 8x7B
+    B = 16  # num_experts
+    M = 4096  # tokens
+    N = 2048
+    K = 2048
+    dtype = jnp.bfloat16
+
+    # pmap function for parallel execution
+    def gemm_step(a, b, group_lens):
+        # Forward pass
+        out1 = grouped_gemm_hipblaslt(a, b, group_lens, transB=False)
+        # Another forward (simulating second expert layer)
+        out2 = grouped_gemm_hipblaslt(out1, b, group_lens, transB=True)
+        return out2
+
+    for iteration in range(num_iterations):
+        # Generate different group lengths for each iteration (simulating dynamic routing)
+        key = jax.random.PRNGKey(iteration * 1000)
+        group_lens = generate_grouped_gemm_group_lens(B, M, balance=False)
+        total_tokens = sum(group_lens)
+
+        # Create input data
+        key1, key2 = jax.random.split(key)
+        a = jax.random.normal(key1, (total_tokens, K), dtype=dtype)
+        b = jax.random.normal(key2, (B, K, N), dtype=dtype)
+
+        # Replicate across devices
+        a_replicated = jnp.stack([a] * num_devices)
+        b_replicated = jnp.stack([b] * num_devices)
+
+        # Create pmap function with static group_lens
+        @jax.pmap
+        def pmap_gemm(a, b):
+            out1 = grouped_gemm_hipblaslt(a, b, group_lens, transB=False)
+            out2 = grouped_gemm_hipblaslt(out1, b, group_lens, transB=True)
+            return out2
+
+        try:
+            out = pmap_gemm(a_replicated, b_replicated)
+            jax.block_until_ready(out)
+            print(
+                f"[Training Simulation] Iteration {iteration}: output shape {out.shape}, "
+                f"group_lens sum={total_tokens}"
+            )
+        except Exception as e:
+            print(f"[Training Simulation] Iteration {iteration} FAILED: {e}")
+            raise
+
+    print(f"[Training Simulation] SUCCESS - All {num_iterations} iterations passed")
+
+
+@pytest.mark.skipif(get_num_devices() < 2, reason="Need at least 2 GPUs for multi-GPU test")
+def test_grouped_gemm_hipblaslt_multi_gpu_interleaved():
+    """
+    Test interleaved GPU usage pattern - alternating between different GPUs.
+    This pattern can trigger memory access faults if device contexts are not handled correctly.
+    """
+    num_devices = get_num_devices()
+    num_rounds = 5
+    print(f"\n[Interleaved Test] Running {num_rounds} rounds on {num_devices} GPUs")
+
+    B = 16
+    M = 2048
+    N = 2048
+    K = 2048
+    dtype = jnp.bfloat16
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False)
+    total_tokens = sum(group_lens)
+
+    devices = jax.devices()[:num_devices]
+
+    for round_idx in range(num_rounds):
+        print(f"[Interleaved Test] Round {round_idx}")
+
+        # Interleave: device 0, device 1, device 0, device 1, ...
+        for step in range(num_devices * 2):
+            device_idx = step % num_devices
+            device = devices[device_idx]
+
+            key = jax.random.PRNGKey(round_idx * 1000 + step)
+            key1, key2 = jax.random.split(key)
+
+            with jax.default_device(device):
+                a = jax.random.normal(key1, (total_tokens, K), dtype=dtype)
+                b = jax.random.normal(key2, (B, K, N), dtype=dtype)
+
+                try:
+                    out = grouped_gemm_hipblaslt(a, b, group_lens, transB=False)
+                    jax.block_until_ready(out)
+                except Exception as e:
+                    print(
+                        f"[Interleaved Test] Round {round_idx}, Step {step}, "
+                        f"Device {device_idx} FAILED: {e}"
+                    )
+                    raise
+
+    print(f"[Interleaved Test] SUCCESS - All rounds passed")
