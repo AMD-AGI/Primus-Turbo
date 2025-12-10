@@ -1,0 +1,116 @@
+Starting FP8 GEMM benchmark for all 96 shapes (testing ALL kernels per layout)...
+Each layout has ~60 kernels to test
+
+[1/96] llama2-7b M=4096 K=4096 N=12288 Layout=rcr
+  -> Best: 924.13 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[2/96] llama2-7b M=4096 K=12288 N=4096 Layout=rrr
+  -> Best: 894.40 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[3/96] llama2-7b M=12288 K=4096 N=4096 Layout=crr
+  -> Best: 532.14 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[4/96] llama2-7b M=4096 K=4096 N=4096 Layout=rcr
+  -> Best: 898.87 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[5/96] llama2-7b M=4096 K=4096 N=4096 Layout=rrr
+  -> Best: 848.46 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[6/96] llama2-7b M=4096 K=4096 N=4096 Layout=crr
+  -> Best: 513.70 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[7/96] llama2-7b M=4096 K=4096 N=22016 Layout=rcr
+  -> Best: 980.71 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[8/96] llama2-7b M=4096 K=22016 N=4096 Layout=rrr
+  -> Best: 911.25 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[9/96] llama2-7b M=22016 K=4096 N=4096 Layout=crr
+  -> Best: 561.23 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[10/96] llama2-7b M=4096 K=11008 N=4096 Layout=rcr
+  -> Best: 974.72 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x64_2x2x1_16x16x32) [tested 39 kernels]
+[11/96] llama2-7b M=4096 K=4096 N=11008 Layout=rrr
+  -> Best: 783.49 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[12/96] llama2-7b M=4096 K=4096 N=11008 Layout=crr
+  -> Best: 474.02 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[13/96] llama2-70b M=4096 K=8192 N=10240 Layout=rcr
+  -> Best: 908.28 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x128x128_2x2x1_32x32x32) [tested 39 kernels]
+[14/96] llama2-70b M=4096 K=10240 N=8192 Layout=rrr
+  -> Best: 895.65 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[15/96] llama2-70b M=10240 K=4096 N=8192 Layout=crr
+  -> Best: 538.23 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[16/96] llama2-70b M=4096 K=8192 N=8192 Layout=rcr
+  -> Best: 980.82 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[17/96] llama2-70b M=4096 K=8192 N=8192 Layout=rrr
+  -> Best: 882.27 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[18/96] llama2-70b M=8192 K=4096 N=8192 Layout=crr
+  -> Best: 540.22 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[19/96] llama2-70b M=4096 K=8192 N=57344 Layout=rcr
+  -> Best: 1037.30 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[20/96] llama2-70b M=4096 K=57344 N=8192 Layout=rrr
+  -> Best: 854.53 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[21/96] llama2-70b M=57344 K=4096 N=8192 Layout=crr
+  -> Best: 561.80 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[22/96] llama2-70b M=4096 K=28672 N=8192 Layout=rcr
+  -> Best: 1018.75 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[23/96] llama2-70b M=4096 K=8192 N=28672 Layout=rrr
+  -> Best: 941.13 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[24/96] llama2-70b M=8192 K=4096 N=28672 Layout=crr
+  -> Best: 566.32 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[25/96] llama3.1-8b M=8192 K=4096 N=6144 Layout=rcr
+  -> Best: 921.55 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[26/96] llama3.1-8b M=8192 K=6144 N=4096 Layout=rrr
+  -> Best: 859.97 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[27/96] llama3.1-8b M=6144 K=8192 N=4096 Layout=crr
+  -> Best: 418.76 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[28/96] llama3.1-8b M=8192 K=4096 N=4096 Layout=rcr
+  -> Best: 891.45 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[29/96] llama3.1-8b M=8192 K=4096 N=4096 Layout=rrr
+  -> Best: 828.81 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[30/96] llama3.1-8b M=4096 K=8192 N=4096 Layout=crr
+  -> Best: 531.42 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[31/96] llama3.1-8b M=8192 K=4096 N=28672 Layout=rcr
+  -> Best: 1001.51 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[32/96] llama3.1-8b M=8192 K=28672 N=4096 Layout=rrr
+  -> Best: 851.53 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[33/96] llama3.1-8b M=28672 K=8192 N=4096 Layout=crr
+  -> Best: 583.61 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[34/96] llama3.1-8b M=8192 K=14336 N=4096 Layout=rcr
+  -> Best: 1026.01 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[35/96] llama3.1-8b M=8192 K=4096 N=14336 Layout=rrr
+  -> Best: 914.17 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[36/96] llama3.1-8b M=4096 K=8192 N=14336 Layout=crr
+  -> Best: 595.48 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[37/96] llama3.1-70b M=8192 K=8192 N=10240 Layout=rcr
+  -> Best: 1003.61 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[38/96] llama3.1-70b M=8192 K=10240 N=8192 Layout=rrr
+  -> Best: 900.06 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[39/96] llama3.1-70b M=10240 K=8192 N=8192 Layout=crr
+  -> Best: 541.83 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[40/96] llama3.1-70b M=8192 K=8192 N=8192 Layout=rcr
+  -> Best: 999.89 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[41/96] llama3.1-70b M=8192 K=8192 N=8192 Layout=rrr
+  -> Best: 886.76 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[42/96] llama3.1-70b M=8192 K=8192 N=8192 Layout=crr
+  -> Best: 547.86 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[43/96] llama3.1-70b M=8192 K=8192 N=57344 Layout=rcr
+  -> Best: 1038.02 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[44/96] llama3.1-70b M=8192 K=57344 N=8192 Layout=rrr
+  -> Best: 805.80 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[45/96] llama3.1-70b M=57344 K=8192 N=8192 Layout=crr
+  -> Best: 543.09 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[46/96] llama3.1-70b M=8192 K=28672 N=8192 Layout=rcr
+  -> Best: 978.40 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[47/96] llama3.1-70b M=8192 K=8192 N=28672 Layout=rrr
+  -> Best: 942.86 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[48/96] llama3.1-70b M=8192 K=8192 N=28672 Layout=crr
+  -> Best: 560.29 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[49/96] llama3.1-405b M=8192 K=16384 N=18432 Layout=rcr
+  -> Best: 1051.75 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[50/96] llama3.1-405b M=8192 K=18432 N=16384 Layout=rrr
+  -> Best: 946.04 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[51/96] llama3.1-405b M=18432 K=8192 N=16384 Layout=crr
+  -> Best: 560.01 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[52/96] llama3.1-405b M=8192 K=16384 N=16384 Layout=rcr
+  -> Best: 1057.88 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[53/96] llama3.1-405b M=8192 K=16384 N=16384 Layout=rrr
+  -> Best: 950.57 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[54/96] llama3.1-405b M=16384 K=8192 N=16384 Layout=crr
+  -> Best: 563.64 TFLOPS (benchmark_gemm_fp8_crr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x16) [tested 40 kernels]
+[55/96] llama3.1-405b M=8192 K=16384 N=106496 Layout=rcr
+  -> Best: 1038.73 TFLOPS (benchmark_gemm_fp8_rcr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 39 kernels]
+[56/96] llama3.1-405b M=8192 K=106496 N=16384 Layout=rrr
+  -> Best: 892.62 TFLOPS (benchmark_gemm_fp8_rrr_compv3_cshuffle_intrawave_False_False_False_False_256x256x128_2x2x1_32x32x32) [tested 36 kernels]
+[57/96] llama3.1-405b M=106496 K=8192 N=16384 Layout=crr
