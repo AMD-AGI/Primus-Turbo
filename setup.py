@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import platform
 import re
@@ -27,6 +28,11 @@ SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
 ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # -------------------------------------
+
+
+def is_package_installed(package_name):
+    """Check if a package is installed in the current Python environment."""
+    return importlib.util.find_spec(package_name) is not None
 
 
 def all_files_in_dir(path, name_extensions=None):
@@ -305,9 +311,18 @@ if __name__ == "__main__":
     # Entry points and Install Requires
     entry_points = {}
     install_requires = [
-        "aiter @ git+https://github.com/ROCm/aiter.git@a25cb58ee4ee97cb5ad4b426b648a8e66103d706",
         "hip-python",
     ]
+
+    # Conditionally add aiter if not already installed
+    if not is_package_installed("aiter"):
+        print("[Primus-Turbo Setup] aiter not found, will be installed automatically.")
+        install_requires.append(
+            "aiter @ git+https://github.com/ROCm/aiter.git@a25cb58ee4ee97cb5ad4b426b648a8e66103d706"
+        )
+    else:
+        print("[Primus-Turbo Setup] aiter already installed, skipping.")
+
     if BUILD_JAX:
         entry_points["jax_plugins"] = ["primus_turbo = primus_turbo.jax"]
 

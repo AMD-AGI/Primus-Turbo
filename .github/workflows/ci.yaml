@@ -93,6 +93,7 @@ jobs:
             rm -rf "${{ env.UT_LOG_PATH }}"
           fi
           unset AITER_ASM_DIR
+          pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
           pytest -v tests/pytorch --log-cli-level=INFO
