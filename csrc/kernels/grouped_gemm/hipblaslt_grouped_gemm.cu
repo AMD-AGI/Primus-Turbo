@@ -13,28 +13,28 @@
 
 namespace primus_turbo {
 
+static constexpr size_t kMaxNumStreams = 4;
+
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size(const int64_t group_num) {
-    return group_num * get_hipblaslt_workspace_size_in_byte();
+    return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
 }
 
-template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
 class HipblasltGroupedGemm {
 public:
     HipblasltGroupedGemm() {
-        printf("Init HipblasltGroupedGemm\n");
         PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&sync_event_));
 
         handles_[0]         = nullptr;
         compute_streams_[0] = nullptr;
-        for (size_t i = 0; i < kDefaultInitKmaxNumStream; ++i) {
+        for (size_t i = 0; i < kMaxNumStreams; ++i) {
             if (i > 0) {
                 PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
                 PRIMUS_TURBO_CHECK_HIP(
                     hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
-                // PRIMUS_TURBO_CHECK_HIPBLAS(hipblasSetStream(handles_[i], compute_streams_[i]));
             }
             PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&hipblaslt_events_[i]));
         }
+        workspaces_.resize(kMaxNumStreams);
     }
 
     ~HipblasltGroupedGemm() {
@@ -42,19 +42,16 @@ public:
             (void) hipEventDestroy(sync_event_);
         }
 
-        for (size_t i = 0; i < kDefaultInitKmaxNumStream; ++i) {
+        for (size_t i = 0; i < kMaxNumStreams; ++i) {
             if (i > 0) {
                 (void) hipStreamDestroy(compute_streams_[i]);
                 (void) hipblasLtDestroy(handles_[i]);
             }
             (void) hipEventDestroy(hipblaslt_events_[i]);
         }
-        printf("Destroy HipblasltGroupedGemm\n");
     }
 
-    void check(const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params) {
-        printf("HipblasltGroupedGemm::check\n");
-
+    void check(const HipblasltGroupedGemmParams &params) {
         PRIMUS_TURBO_CHECK(params.a_shape.size() == 2);
         if (params.transA) {
             // For a * grad_c = grad_b
@@ -73,30 +70,82 @@ public:
         }
     }
 
-    void run(const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params,
-             hipblasLtHandle_t                                                  handle) {
+    void run(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+        if (pre_sync) {
+            PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
+        }
+
+        // Check
         check(params);
+        // Compute arguments
         compute_args(params);
-        printf("HipblasltGroupedGemm::run\n");
+
+        const size_t num_gemms{gemm_ptrs_.size()};
+        const size_t num_stream_used{std::min<size_t>(kMaxNumStreams, num_gemms)};
+
+        if (num_gemms > 0) {
+            // wait for current stream to finish
+            PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
+
+            for (size_t s = 0; s < num_stream_used; ++s) {
+                auto stream = (s == 0) ? params.stream : compute_streams_[s];
+                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, sync_event_, 0));
+            }
+
+            // TODO: compute gemms
+            for (size_t idx = 0; idx < num_gemms; ++idx) {
+                const auto stream_idx = kMaxNumStreams ? idx % kMaxNumStreams : 0;
+                auto       stream = stream_idx == 0 ? params.stream : compute_streams_[stream_idx];
+                auto       handle = stream_idx == 0 ? params.handle : handles_[stream_idx];
+                auto       workspace = workspaces_[stream_idx];
+                // clang-format off
+                hipblaslt_gemm_impl(
+                    gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
+                    nullptr,
+                    params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                    gemm_ptrs_[idx].a_ptr, params.a_type, rows_a_[idx], cols_a_[idx], ld_a_[idx],
+                    nullptr,
+                    params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                    gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
+                    workspace, get_hipblaslt_workspace_size_in_byte(),
+                    false,
+                    HIPBLASLT_MATMUL_MATRIX_SCALE_END,
+                    handle,
+                    stream
+                );
+                // clang-format on
+            }
+
+            // record events on compute streams
+            for (size_t s = 0; s < num_stream_used; ++s) {
+                auto stream = (s == 0) ? params.stream : compute_streams_[s];
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], stream));
+            }
+
+            // wait for all compute streams to finish
+            for (size_t s = 0; s < num_stream_used; ++s) {
+                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
+            }
+        }
     }
 
 private:
     struct GemmPtr {
-        const ADataType *a_ptr;
-        const BDataType *b_ptr;
-        CDataType       *c_ptr;
+        const void *a_ptr = nullptr;
+        const void *b_ptr = nullptr;
+        void       *c_ptr = nullptr;
     };
 
-    void compute_args(const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params) {
+    void compute_args(const HipblasltGroupedGemmParams &params) {
 
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
             valid_group_num += params.group_lens_ptr[i] > 0 ? 1 : 0;
         }
 
-        const ADataType *a_ptr = params.a_ptr;
-        const BDataType *b_ptr = params.b_ptr;
-        CDataType       *c_ptr = params.c_ptr;
+        const char *a_ptr = static_cast<const char *>(params.a_ptr);
+        const char *b_ptr = static_cast<const char *>(params.b_ptr);
+        char       *c_ptr = static_cast<char *>(params.c_ptr);
         gemm_ptrs_.resize(valid_group_num);
         ld_a_.resize(valid_group_num);
         ld_b_.resize(valid_group_num);
@@ -130,18 +179,23 @@ private:
             rows_c_[write_idx] = params.transA ? get_dim(params.c_shape, -2) : len;
             cols_c_[write_idx] = get_dim(params.c_shape, -1);
             // advance the pointers
-            a_ptr += rows_a_[write_idx] * cols_a_[write_idx];
-            b_ptr += rows_b_[write_idx] * cols_b_[write_idx];
-            c_ptr += rows_c_[write_idx] * cols_c_[write_idx];
+            a_ptr += rows_a_[write_idx] * cols_a_[write_idx] * hipblaslt_dtype_bytes(params.a_type);
+            b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);
+            c_ptr += rows_c_[write_idx] * cols_c_[write_idx] * hipblaslt_dtype_bytes(params.c_type);
             write_idx++;
+        }
+
+        char *workspace_ptr = static_cast<char *>(params.workspace);
+        for (size_t i = 0; i < kMaxNumStreams; ++i) {
+            workspaces_[i] = workspace_ptr + i * get_hipblaslt_workspace_size_in_byte();
         }
 
         // For grad_b, if the group len is 0, set the local memory to 0
         for (size_t i = 0; i < params.group_num; ++i) {
             if (params.transA && params.group_lens_ptr[i] == 0) {
-                PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(gemm_ptrs_[i].c_ptr, 0,
-                                                      rows_c_[i] * cols_c_[i] * sizeof(CDataType),
-                                                      params.stream));
+                PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+                    gemm_ptrs_[i].c_ptr, 0,
+                    rows_c_[i] * cols_c_[i] * hipblaslt_dtype_bytes(params.c_type), params.stream));
             }
         }
     }
@@ -153,14 +207,11 @@ private:
         return shape.at(idx);
     }
 
-    //
-    static constexpr size_t kDefaultInitKmaxNumStream{4};
-
     // Handles, events, streams, heuristic, epilogue
-    hipblasLtHandle_t   handles_[kDefaultInitKmaxNumStream];
+    hipblasLtHandle_t   handles_[kMaxNumStreams];
     hipEvent_t          sync_event_{nullptr};
-    hipStream_t         compute_streams_[kDefaultInitKmaxNumStream];
-    hipEvent_t          hipblaslt_events_[kDefaultInitKmaxNumStream];
+    hipStream_t         compute_streams_[kMaxNumStreams];
+    hipEvent_t          hipblaslt_events_[kMaxNumStreams];
     hipblasLtEpilogue_t epilogue_{HIPBLASLT_EPILOGUE_DEFAULT};
 
     // Gemm Pointers
@@ -183,17 +234,9 @@ private:
     std::vector<int64_t> cols_c_;
 };
 
-template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
-void hipblaslt_grouped_gemm(
-    const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params,
-    hipblasLtHandle_t                                                  handle) {
-    static HipblasltGroupedGemm<ADataType, BDataType, CDataType, AccDataType> instance;
-    instance.run(params, handle);
-    printf("HHHH hipblaslt_grouped_gemm\n");
+void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+    static HipblasltGroupedGemm instance;
+    instance.run(params, pre_sync);
 }
-
-template void hipblaslt_grouped_gemm<dtype::float16, dtype::float16, dtype::float16>(
-    const HipblasltGroupedGemmParams<dtype::float16, dtype::float16, dtype::float16> &params,
-    hipblasLtHandle_t                                                                 handle);
 
 } // namespace primus_turbo

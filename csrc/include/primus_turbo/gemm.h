@@ -10,7 +10,33 @@
 #include <stdexcept>
 namespace primus_turbo {
 
-// *************** HipBlasLt ***************
+//==================================================================
+//  HipBLASLt Type Utils
+//==================================================================
+
+inline size_t hipblaslt_dtype_bytes(hipDataType dtype) {
+    switch (dtype) {
+    case HIP_R_64F:
+        return 8;
+    case HIP_R_32F:
+        return 4;
+    case HIP_R_16F:
+    case HIP_R_16BF:
+        return 2;
+    case HIP_R_8F_E4M3_FNUZ:
+    case HIP_R_8F_E5M2_FNUZ:
+    case HIP_R_8F_E4M3:
+    case HIP_R_8F_E5M2:
+        return 1;
+    default:
+        throw std::runtime_error("Unsupported hipDataType");
+    }
+}
+
+//==================================================================
+//  HipBLASLt GEMM
+//==================================================================
+
 int64_t get_hipblaslt_workspace_size_in_byte();
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
@@ -22,7 +48,10 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
                          const bool use_fp8, const hipblasLtMatmulMatrixScale_t scale_mode,
                          hipblasLtHandle_t handle, hipStream_t stream);
-// *****************************************
+
+//==================================================================
+//  CK GEMM
+//==================================================================
 
 template <typename AType, typename BType, typename CType, typename ACCType = float>
 struct CKGemmFP8Params {

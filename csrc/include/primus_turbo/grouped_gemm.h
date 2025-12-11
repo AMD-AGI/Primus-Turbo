@@ -52,12 +52,31 @@ struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> 
     const ACCType *bq_ptr = nullptr;
 };
 
-template <typename AType, typename BType, typename CType>
-struct HipblasltGroupedGemmParams : public GroupedGemmParams<AType, BType, CType> {
+struct HipblasltGroupedGemmParams {
+    const void          *a_ptr = nullptr;
+    hipDataType          a_type;
     std::vector<int64_t> a_shape;
+
+    const void          *b_ptr = nullptr;
+    hipDataType          b_type;
     std::vector<int64_t> b_shape;
+
+    void                *c_ptr = nullptr;
+    hipDataType          c_type;
     std::vector<int64_t> c_shape;
-    void                *workspace = nullptr;
+
+    const int64_t    *group_lens_ptr = nullptr;
+    const int64_t    *group_offs_ptr = nullptr;
+    bool              transA         = false;
+    bool              transB         = false;
+    int32_t           group_num      = 0;
+    int32_t           m              = 0;
+    int32_t           n              = 0;
+    int32_t           k              = 0;
+    hipStream_t       stream         = nullptr;
+    uint32_t          num_cu         = 0;
+    void             *workspace      = nullptr;
+    hipblasLtHandle_t handle         = nullptr;
 };
 
 //==================================================================
@@ -84,10 +103,7 @@ void ck_grouped_gemm_fp8_variable_k(
 //  hipBLASLt Grouped GEMM
 //==================================================================
 
-template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
-void hipblaslt_grouped_gemm(
-    const HipblasltGroupedGemmParams<ADataType, BDataType, CDataType> &params,
-    hipblasLtHandle_t                                                  handle);
+void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync);
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
