@@ -92,21 +92,11 @@ def test_gemm_mxfp4(m, n, k, layout, format, dtype, granularity, backend, auto_t
     config = Float4QuantConfig(
         granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
     )
-    config.scaling_recipe["a_fwd"] = Float4ScalingRecipe(
-        use_2d_block=False, use_hadamard_transform=False, use_sr=False
-    )
-    config.scaling_recipe["b_fwd"] = Float4ScalingRecipe(
-        use_2d_block=True, use_hadamard_transform=False, use_sr=False
-    )
-    config.scaling_recipe["grad_bwd"] = Float4ScalingRecipe(
-        use_2d_block=False, use_hadamard_transform=True, use_sr=True
-    )
-    config.scaling_recipe["a_bwd"] = Float4ScalingRecipe(
-        use_2d_block=False, use_hadamard_transform=False, use_sr=False
-    )
-    config.scaling_recipe["b_bwd"] = Float4ScalingRecipe(
-        use_2d_block=True, use_hadamard_transform=True, use_sr=True
-    )
+    config.scaling_recipe["a_fwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["b_fwd"] = Float4ScalingRecipe(use_2d_block=True, use_sr=False)
+    config.scaling_recipe["grad_bwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=True)
+    config.scaling_recipe["a_bwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["b_bwd"] = Float4ScalingRecipe(use_2d_block=True, use_sr=True)
     print(config)
     c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
     c.backward(torch.ones_like(c))
