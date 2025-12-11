@@ -147,16 +147,35 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
+    PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "ROWWISE" ||
+                           granularity == "BLOCKWISE",
+                       "granularity must be 'TENSORWISE', 'ROWWISE', or 'BLOCKWISE'");
 
     // Determine output tensor size based on transA and transB
     const int64_t bs = b.size(0);
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(1) : b.size(2);
     const int64_t k  = transA ? a.size(0) : a.size(1);
+
+    // For BLOCKWISE (ABQuantGrouped), check alignment requirements
+    if (granularity == "BLOCKWISE" && !transA) {
+        PRIMUS_TURBO_CHECK(k % 128 == 0,
+                           "For BLOCKWISE granularity, k must be a multiple of 128, got k=", k);
+        PRIMUS_TURBO_CHECK(n % 128 == 0,
+                           "For BLOCKWISE granularity, n must be a multiple of 128, got n=", n);
+        PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
+    }
+
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_fp8_args_sizes(group_lens.numel());
     at::Tensor    args_tensor =
         at::empty({args_sizes}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
+
+    // Handle scale tensor transpose for BLOCKWISE
+    if (granularity == "BLOCKWISE") {
+        a_scales = transA ? a_scales.transpose(-1, -2) : a_scales;
+        b_scales = !transB ? b_scales.transpose(-1, -2) : b_scales;
+    }
 
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();
@@ -174,22 +193,28 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             if (granularity == "TENSORWISE")
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::TensorQuant>(params);
-            else
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::RowColQuant>(params);
+                    primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                    params);
+            else if (granularity == "ROWWISE")
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
+                    params);
+            else // BLOCKWISE
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
+                    params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             if (granularity == "TENSORWISE")
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::TensorQuant>(params);
-            else
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::RowColQuant>(params);
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                    params);
+            else if (granularity == "ROWWISE")
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
+                    params);
+            else // BLOCKWISE
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
+                    params);
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
         }
@@ -203,22 +228,28 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             if (granularity == "TENSORWISE")
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::TensorQuant>(params);
-            else
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::RowColQuant>(params);
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                    params);
+            else if (granularity == "ROWWISE")
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
+                    params);
+            else // BLOCKWISE
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
+                    params);
         } else if (out_dtype == at::kHalf) {
             using CType = typename TorchToCKTileType<at::kHalf>::type;
             auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                 args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                 transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
             if (granularity == "TENSORWISE")
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::TensorQuant>(params);
-            else
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::RowColQuant>(params);
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                    params);
+            else if (granularity == "ROWWISE")
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
+                    params);
+            else // BLOCKWISE
+            primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
+                    params);
         } else {
             PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e5m2");
         }
