@@ -113,6 +113,8 @@ def quantize_mxfp4_kernel(
                 randval, _, _, _ = generate_randval_4x(
                     MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE // 2, philox_seed, philox_offset
                 )
+                # Pack two float32 values (x_chunk0 and x_chunk1) into a single 64-bit value.
+                # This is required for the stochastic rounding instruction, which expects the two values packed.
                 x_chunk = (x_chunk1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x_chunk0.to(
                     tl.uint32, bitcast=True
                 )
