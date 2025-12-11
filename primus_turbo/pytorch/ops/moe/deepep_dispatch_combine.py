@@ -18,8 +18,8 @@ __all__ = [
     "set_buffer_config",
     "DeepEPDispatch",
     "DeepEPCombine",
-    "deepep_dispatch",
-    "deepep_combine",
+    "moe_dispatch",
+    "moe_combine",
 ]
 
 _buffer = None
@@ -239,7 +239,7 @@ class DeepEPCombine(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-def deepep_dispatch(
+def moe_dispatch(
     x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     token_indices: torch.Tensor,
     token_probs: torch.Tensor,
@@ -273,7 +273,7 @@ def deepep_dispatch(
     )
 
 
-def deepep_combine(
+def moe_combine(
     x,
     group,
     handle,
