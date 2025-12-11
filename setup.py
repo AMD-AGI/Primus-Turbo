@@ -312,6 +312,8 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "hip-python",
+        "uccl.ep @ git+https://github.com/uccl-project/uccl.git@integrate-uccl-ep#subdirectory=ep",
+        "deep_ep @ git+https://github.com/uccl-project/uccl.git@integrate-uccl-ep#subdirectory=ep/deep_ep_wrapper",
     ]
 
     # Conditionally add aiter if not already installed
