@@ -15,12 +15,11 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.12"]
-    env:
-      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci
     steps:
-      - run: echo "🎉 Begin Primus-Turbo Python Lint."
-      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
-      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
+      - name: Print job info
+        run: |
+          echo "🎉 Begin Primus-Turbo Python Lint."
+          echo "🐧 Running on ${{ runner.os }}, branch: ${{ github.ref }}"
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory /github/workspace
       - name: Set up Python ${{ matrix.python-version }}
@@ -55,6 +54,8 @@ jobs:
   unittest-pytorch-gfx942:
     needs: code-lint
     runs-on: turbo-pt-gfx942-259-t6dv9
+    env:
+      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci/pytorch
     steps:
       - run: echo "🎉 Begin Primus-Turbo PyTorch Framework Unit Test."
       - name: Change owner
@@ -83,9 +84,7 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
-      - name: Run unit tests
-        env:
-          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
           if [ -d "${{ env.UT_LOG_PATH }}" ]; then
@@ -96,11 +95,20 @@ jobs:
           pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
-          pytest -v tests/pytorch --log-cli-level=INFO
+      - name: Run single-GPU tests (parallel)
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/pytorch -n 8 --log-cli-level=INFO
+      - name: Run distributed tests
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/pytorch --dist-only --log-cli-level=INFO
 
   unittest-jax-gfx942:
     needs: code-lint
     runs-on: turbo-jax-gfx942-259-kzptx
+    env:
+      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci/jax
     steps:
       - run: echo "🎉 Begin Primus-Turbo JAX Framework Unit-Test."
       - name: Change owner
@@ -129,9 +137,7 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
-      - name: Run unit tests
-        env:
-          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
           if [ -d "${{ env.UT_LOG_PATH }}" ]; then
@@ -139,7 +145,9 @@ jobs:
             rm -rf "${{ env.UT_LOG_PATH }}"
           fi
           unset AITER_ASM_DIR
-          # pip3 install torch==2.10.0.dev20251021+rocm7.0 --index-url https://download.pytorch.org/whl/nightly/
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
-          pytest -v tests/jax --log-cli-level=INFO
+      - name: Run unit tests
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/jax --log-cli-level=INFO
