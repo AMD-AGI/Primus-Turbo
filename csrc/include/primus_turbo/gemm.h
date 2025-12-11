@@ -13,14 +13,15 @@ namespace primus_turbo {
 // *************** HipBlasLt ***************
 int64_t get_hipblaslt_workspace_size_in_byte();
 
-void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t lda,
-                         const void *scaleA_inv, hipblasOperation_t transA, const void *B,
-                         const hipDataType B_type, const int64_t ldb, const void *scaleB_inv,
-                         hipblasOperation_t transB, void *D, const hipDataType D_type,
-                         const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
-                         void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
-                         hipStream_t stream);
+void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
+                         const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
+                         hipblasOperation_t transA, const void *B, const hipDataType B_type,
+                         const int64_t rows_b, const int64_t cols_b, const int64_t ldb,
+                         const void *scaleB_inv, hipblasOperation_t transB, void *D,
+                         const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
+                         const int64_t ldd, void *workspace, const int64_t workspace_size,
+                         const bool use_fp8, const hipblasLtMatmulMatrixScale_t scale_mode,
+                         hipblasLtHandle_t handle, hipStream_t stream);
 // *****************************************
 
 template <typename AType, typename BType, typename CType, typename ACCType = float>
