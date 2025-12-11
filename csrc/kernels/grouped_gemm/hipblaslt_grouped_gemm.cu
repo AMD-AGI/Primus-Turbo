@@ -162,6 +162,17 @@ private:
         int write_idx = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
             int64_t len = params.group_lens_ptr[i];
+
+            // For grad_b (transA), if the group len is 0, set the output memory to 0
+            // c shape is [group_num, k, n], so each group's c size is k * n
+            if (params.transA && len == 0) {
+                int64_t c_rows_t = get_dim(params.c_shape, -1);
+                int64_t c_cols_t = get_dim(params.c_shape, -2);
+                int64_t c_size_t = c_rows_t * c_cols_t * hipblaslt_dtype_bytes(params.c_type);
+                PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(c_ptr, 0, c_size_t, params.stream));
+                c_ptr += c_size_t;
+            }
+
             if (len == 0)
                 continue;
 
@@ -190,15 +201,6 @@ private:
         char *workspace_ptr = static_cast<char *>(params.workspace);
         for (size_t i = 0; i < kMaxNumStreams; ++i) {
             workspaces_[i] = workspace_ptr + i * get_hipblaslt_workspace_size_in_byte();
-        }
-
-        // For grad_b, if the group len is 0, set the local memory to 0
-        for (size_t i = 0; i < params.group_num; ++i) {
-            if (params.transA && params.group_lens_ptr[i] == 0) {
-                PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
-                    gemm_ptrs_[i].c_ptr, 0,
-                    rows_c_[i] * cols_c_[i] * hipblaslt_dtype_bytes(params.c_type), params.stream));
-            }
         }
     }
 
