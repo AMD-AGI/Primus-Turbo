@@ -23,9 +23,9 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const hipDataType B_type, const int64_t ldb, const void *scaleB_inv,
                          hipblasOperation_t transB, void *D, const hipDataType D_type,
                          const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
-                         void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
-                         hipStream_t stream) {
+                         void *workspace, const int64_t workspace_size,
+                         const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
+                         hipblasLtHandle_t handle, hipStream_t stream) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
@@ -47,7 +47,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
         operation_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 
-    if (use_fp8) {
+    if (use_low_precision) {
         if (scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0) {
             PRIMUS_TURBO_CHECK(
                 is_gfx950(),

@@ -506,6 +506,7 @@ def gemm_fp8(
         - TENSORWISE
         - ROWWISE
         - BLOCKWISE
+        - MX_BLOCKWISE
 
     FP8 Format (config.format):
         - E4M3
@@ -528,7 +529,7 @@ def gemm_fp8(
     """
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
-        out_dtype = torch.result_type(a, b)
+        out_dtype = torch.bfloat16
 
     if config is None:
         config = Float8QuantConfig()

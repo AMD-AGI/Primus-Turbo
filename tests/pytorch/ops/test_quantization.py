@@ -9,8 +9,12 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity
-from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp8
+from primus_turbo.pytorch.core.low_precision import (
+    Float4ScalingRecipe,
+    ScalingGranularity,
+)
+from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
+from primus_turbo.pytorch.ops.quantization import dequantize_fp4
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
 
@@ -114,7 +118,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.ones((B, M, N), device="cuda", dtype=orig_dtype)
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
     x.detach().clone()
 
     row_length = x.size(-1)
@@ -164,3 +168,61 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
     )
 
     torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "dest_dtype",
+    [
+        turbo.float4_e2m1fn_x2,
+    ],
+)
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("axis", [1])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+@pytest.mark.parametrize("use_sr", [True, False])
+@pytest.mark.parametrize("use_2d_block", [True, False])
+def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_sr, use_2d_block):
+    # NOTE: Fix seed and offset for reproducibility
+    PHILOX_SEED = 42
+    PHILOX_OFFSET = 0
+
+    scaling_recipe = Float4ScalingRecipe(
+        use_2d_block=use_2d_block,
+        use_sr=use_sr,
+        philox_seed=PHILOX_SEED,
+        philox_offset=PHILOX_OFFSET,
+    )
+
+    MX_BLOCK_SIZE = 32
+    torch.manual_seed(42)
+
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+    x.detach().clone()
+
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+
+    x_fp4, x_scale_inv = quantize_fp4(
+        x_2d,
+        dest_dtype,
+        granularity=granularity,
+        axis=axis,
+        block_size=MX_BLOCK_SIZE,
+        scaling_recipe=scaling_recipe,
+    )
+
+    # check quantize and dequantize precision
+    out = dequantize_fp4(
+        x_fp4,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=axis,
+        scale_inv=x_scale_inv,
+        scaling_recipe=scaling_recipe,
+    )
+
+    torch.testing.assert_close(x_2d, out, **get_tolerances(dest_dtype))

@@ -11,6 +11,7 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 from primus_turbo.pytorch.ops import gemm_fp8
@@ -227,7 +228,9 @@ def test_gemm_mxfp8(m, n, k, layout, format, dtype, granularity, backend, auto_t
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
-    config = Float8QuantConfig(granularity=granularity, format=format, block_size=32)
+    config = Float8QuantConfig(
+        granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
+    )
     print(config)
     c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
     c.backward(grad_c)
