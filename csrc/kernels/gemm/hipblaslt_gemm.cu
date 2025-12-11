@@ -33,9 +33,9 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     hipblasLtEpilogue_t         epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
     hipblasComputeType_t        gemm_compute_type = HIPBLAS_COMPUTE_32F;
 
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&A_desc, A_type, cols_a, rows_a, lda));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&B_desc, B_type, cols_b, rows_b, ldb));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, cols_d, rows_d, ldd));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&A_desc, A_type, rows_a, cols_a, lda));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&B_desc, B_type, rows_b, cols_b, ldb));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, rows_d, cols_d, ldd));
 
     PRIMUS_TURBO_CHECK_HIPBLAS(
         hipblasLtMatmulDescCreate(&operation_desc, gemm_compute_type, HIP_R_32F));

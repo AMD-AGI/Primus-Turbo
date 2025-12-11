@@ -1,9 +1,6 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
 // See LICENSE for license information.
-//
-// Grouped GEMM hipBLASLt Implementation for PyTorch
-// Uses primus_turbo::hipblaslt_gemm_impl for better performance
 
 #include <cstdint>
 #include <cstdio>
@@ -48,15 +45,9 @@ make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at:
     return params;
 }
 
-// ============================================================================
-// PyTorch API
-// ============================================================================
-
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB,
                                   const bool pre_sync) {
-    auto out_dtype = a.scalar_type();
-
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()),
                        "hipblaslt_grouped_gemm only supports float16 and bfloat16");
@@ -70,13 +61,13 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
     at::Tensor c;
     if (transA) {
         const int64_t bs = group_lens.numel();
-        const int64_t m  = transA ? a.size(1) : a.size(0);
+        const int64_t m  = a.size(1);
         const int64_t n  = transB ? b.size(0) : b.size(1);
-        c                = at::empty({bs, m, n}, at::dtype(out_dtype).device(a.device()));
+        c                = at::empty({bs, m, n}, a.options());
     } else {
-        const int64_t m = transA ? a.size(1) : a.size(0);
+        const int64_t m = a.size(0);
         const int64_t n = transB ? b.size(1) : b.size(2);
-        c               = at::empty({m, n}, at::dtype(out_dtype).device(a.device()));
+        c               = at::empty({m, n}, a.options());
     }
 
     const int64_t workspace_size =

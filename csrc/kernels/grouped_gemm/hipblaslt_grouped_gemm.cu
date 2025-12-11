@@ -138,6 +138,8 @@ private:
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
+        // TODO(xiaobochen): group_lens_ptr is device pointer, but host can access
+        // it directly on MI300/MI350. Need to investigate why this works.
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
             valid_group_num += params.group_lens_ptr[i] > 0 ? 1 : 0;
@@ -172,12 +174,12 @@ private:
             ld_b_[write_idx] = get_dim(params.b_shape, -1);
             ld_c_[write_idx] = get_dim(params.c_shape, -1);
             // rows and cols of matrices
-            rows_a_[write_idx] = len;
-            cols_a_[write_idx] = get_dim(params.a_shape, -1);
-            rows_b_[write_idx] = params.transA ? len : get_dim(params.b_shape, -2);
-            cols_b_[write_idx] = get_dim(params.b_shape, -1);
-            rows_c_[write_idx] = params.transA ? get_dim(params.c_shape, -2) : len;
-            cols_c_[write_idx] = get_dim(params.c_shape, -1);
+            rows_a_[write_idx] = get_dim(params.a_shape, -1);
+            cols_a_[write_idx] = len;
+            rows_b_[write_idx] = get_dim(params.b_shape, -1);
+            cols_b_[write_idx] = params.transA ? len : get_dim(params.b_shape, -2);
+            rows_c_[write_idx] = get_dim(params.c_shape, -1);
+            cols_c_[write_idx] = params.transA ? get_dim(params.c_shape, -2) : len;
             // advance the pointers
             a_ptr += rows_a_[write_idx] * cols_a_[write_idx] * hipblaslt_dtype_bytes(params.a_type);
             b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);

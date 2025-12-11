@@ -33,12 +33,12 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
     const int64_t n = transB ? B.size(0) : B.size(1);
 
     // rows/cols
-    const int64_t rows_a = transA ? k : m;
-    const int64_t cols_a = transA ? m : k;
-    const int64_t rows_b = transB ? n : k;
-    const int64_t cols_b = transB ? k : n;
-    const int64_t rows_d = m;
-    const int64_t cols_d = n;
+    const int64_t rows_a = transA ? m : k;
+    const int64_t cols_a = transA ? k : m;
+    const int64_t rows_b = transB ? k : n;
+    const int64_t cols_b = transB ? n : k;
+    const int64_t rows_d = n;
+    const int64_t cols_d = m;
 
     // NOTE: The leading dimension is col-major.
     int64_t lda, ldb, ldd;
@@ -146,12 +146,12 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     const int64_t n = transB ? B.size(0) : B.size(1);
 
     // rows/cols
-    const int64_t rows_a = transA ? k : m;
-    const int64_t cols_a = transA ? m : k;
-    const int64_t rows_b = transB ? n : k;
-    const int64_t cols_b = transB ? k : n;
-    const int64_t rows_d = m;
-    const int64_t cols_d = n;
+    const int64_t rows_a = transA ? m : k;
+    const int64_t cols_a = transA ? k : m;
+    const int64_t rows_b = transB ? k : n;
+    const int64_t cols_b = transB ? n : k;
+    const int64_t rows_d = n;
+    const int64_t cols_d = m;
 
     // NOTE: The leading dimension is col-major.
     int64_t lda, ldb, ldd;

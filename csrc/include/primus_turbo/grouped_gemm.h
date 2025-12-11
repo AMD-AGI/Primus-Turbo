@@ -70,11 +70,7 @@ struct HipblasltGroupedGemmParams {
     bool              transA         = false;
     bool              transB         = false;
     int32_t           group_num      = 0;
-    int32_t           m              = 0;
-    int32_t           n              = 0;
-    int32_t           k              = 0;
     hipStream_t       stream         = nullptr;
-    uint32_t          num_cu         = 0;
     void             *workspace      = nullptr;
     hipblasLtHandle_t handle         = nullptr;
 };
