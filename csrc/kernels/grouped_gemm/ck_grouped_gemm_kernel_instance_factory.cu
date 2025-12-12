@@ -106,7 +106,7 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
                          std::is_same_v<ADataType, ck_tile::fp8_t>) {
         // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
         if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
-            using TileConfig = GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1;
+            using TileConfig = GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType,
                                                             CDataType, ALayout, BLayout, CLayout,
                                                             TileConfig, QuantMode, AccDataType>;
