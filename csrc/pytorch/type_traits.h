@@ -67,6 +67,8 @@ static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
         return HIP_R_8F_E5M2_FNUZ;
     case at::kFloat8_e5m2:
         return HIP_R_8F_E5M2;
+    case at::kFloat4_e2m1fn_x2:
+        return HIP_R_4F_E2M1;
     default:
         PRIMUS_TURBO_ERROR("Invalid type");
     }
@@ -79,6 +81,10 @@ static inline bool is_16bit_floating_point_dtype(at::ScalarType dtype) {
 static inline bool is_8bit_floating_point_dtype(at::ScalarType dtype) {
     return dtype == at::kFloat8_e4m3fnuz || dtype == at::kFloat8_e4m3fn ||
            dtype == at::kFloat8_e5m2fnuz || dtype == at::kFloat8_e5m2;
+}
+
+static inline bool is_4bit_floating_point_dtype(at::ScalarType dtype) {
+    return dtype == at::kFloat4_e2m1fn_x2;
 }
 
 static inline bool is_floating_point_dtype(at::ScalarType dtype) {

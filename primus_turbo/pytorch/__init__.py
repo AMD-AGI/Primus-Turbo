@@ -8,3 +8,4 @@ from primus_turbo.pytorch.core import low_precision
 
 float8_e4m3 = low_precision.float8_e4m3
 float8_e5m2 = low_precision.float8_e5m2
+float4_e2m1fn_x2 = low_precision.float4_e2m1fn_x2

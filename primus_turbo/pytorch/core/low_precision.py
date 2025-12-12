@@ -4,9 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -42,7 +42,7 @@ def check_fp8_support() -> Tuple[bool, str]:
     )
 
 
-def check_fp4_support() -> Tuple[bool, str]:
+def check_mxfp4_support() -> Tuple[bool, str]:
     """Return if fp4 support is available"""
     if get_device_compute_capability() >= (9, 5):
         return True, ""
@@ -68,7 +68,7 @@ def check_mxfp8_support() -> Tuple[bool, str]:
         return True, ""
     return (
         False,
-        "Device compute capability gfx950 or higher required for FP8 execution.",
+        "Device compute capability gfx950 or higher required for MXFP8 execution.",
     )
 
 
@@ -81,6 +81,10 @@ try:
     else:
         float8_e4m3 = torch.float8_e4m3fnuz
         float8_e5m2 = torch.float8_e5m2fnuz
+    if check_mxfp4_support()[0]:
+        float4_e2m1fn_x2 = torch.float4_e2m1fn_x2
+    else:
+        float4_e2m1fn_x2 = None
 except AttributeError:
     raise RuntimeError("Your PyTorch build does not support FP8 types.")
 
@@ -98,7 +102,20 @@ class Format(Enum):
     HYBRID = auto()
 
 
+class ScaleDtype(Enum):
+    """
+    Supported FP8/FP4 Scale data type.
+    """
+
+    FP32 = auto()
+    E8M0 = auto()
+
+
 class ScalingGranularity(Enum):
+    """
+    Supported FP8/FP4 scaling granularity.
+    """
+
     TENSORWISE = auto()
     ROWWISE = auto()
     BLOCKWISE = auto()
@@ -106,8 +123,24 @@ class ScalingGranularity(Enum):
 
 
 class ScalingStrategy(Enum):
+    """
+    Supported FP8/FP4 scaling strategy.
+    """
+
     DYNAMIC = auto()
     # DELAYED_SCALING = auto() # TODO: undetermined
+
+
+@dataclass
+class Float4ScalingRecipe:
+    """
+    Supported FP4 scaling recipe.
+    """
+
+    use_2d_block: bool = False
+    use_sr: bool = False
+    philox_seed: Optional[int] = None
+    philox_offset: Optional[int] = None
 
 
 @dataclass
@@ -115,6 +148,7 @@ class Float8QuantConfig:
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
 
     def __post_init__(self):
@@ -127,24 +161,43 @@ class Float8QuantConfig:
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
 
+            mx_support_scale_dtype = ScaleDtype.E8M0
+            assert (
+                self.scale_dtype == mx_support_scale_dtype
+            ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+
 
 @dataclass
 class Float4QuantConfig:
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
-    block_size: Optional[int] = None
+    scale_dtype: ScaleDtype = ScaleDtype.FP32
+    block_size: int = 32
+
+    # scaling recipe
+    scaling_recipe: Dict[str, Float4ScalingRecipe] = field(
+        default_factory=lambda: {
+            "a_fwd": Float4ScalingRecipe(),
+            "b_fwd": Float4ScalingRecipe(),
+            "grad_bwd": Float4ScalingRecipe(),
+            "a_bwd": Float4ScalingRecipe(),
+            "b_bwd": Float4ScalingRecipe(),
+        }
+    )
 
     def __post_init__(self):
         assert (
             self.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
 
-        if self.block_size is None:
-            self.block_size = 32
-
         mx_support_block_size = [32]
         assert (
             self.block_size in mx_support_block_size
         ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+
+        mx_support_scale_dtype = ScaleDtype.E8M0
+        assert (
+            self.scale_dtype == mx_support_scale_dtype
+        ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"

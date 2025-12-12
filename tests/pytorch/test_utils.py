@@ -23,6 +23,8 @@ def get_tolerances(dtype):
         return dict(rtol=1e-2, atol=1e-2)
     elif is_fp8_dtype(dtype):
         return dict(rtol=1e-1, atol=1e-1)
+    elif dtype == torch.float4_e2m1fn_x2:
+        return dict(rtol=0.5, atol=0.5)
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
 

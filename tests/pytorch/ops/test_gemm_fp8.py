@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+
 import pytest
 import torch
 
@@ -11,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
     check_mxfp8_support,
 )
@@ -70,7 +72,10 @@ def _run_gemm_fp8_test(
 
     # Config + FWD + BWD
     if block_size is not None:
-        config = Float8QuantConfig(granularity=granularity, format=format, block_size=block_size)
+        scale_dtype = ScaleDtype.E8M0 if granularity == ScalingGranularity.MX_BLOCKWISE else ScaleDtype.FP32
+        config = Float8QuantConfig(
+            granularity=granularity, format=format, block_size=block_size, scale_dtype=scale_dtype
+        )
     else:
         config = Float8QuantConfig(granularity=granularity, format=format)
     print(config)
