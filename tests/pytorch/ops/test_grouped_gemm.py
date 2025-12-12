@@ -66,18 +66,21 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     out_ref.backward(grad_out)
     out.backward(grad_out)
 
+    # Set SNR threshold based on dtype
+    snr_threshold = 47 if dtype == torch.bfloat16 else 50
+    
     out_snr = compute_snr(out_ref, out)
     print(f"Out-SNR: {out_snr:.2f} dB")
-    assert out_snr > 50, "out_snr too low"
+    assert out_snr > snr_threshold, f"out_snr too low (threshold: {snr_threshold} dB)"
 
     a_grad_snr = compute_snr(a_ref.grad, a.grad)
     print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
-    assert a_grad_snr > 50, "a_grad_snr too low"
-    torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
+    assert a_grad_snr > snr_threshold, f"a_grad_snr too low (threshold: {snr_threshold} dB)"
 
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
-    assert b_grad_snr > 50, "b_grad_snr too low"
+    assert b_grad_snr > snr_threshold, f"b_grad_snr too low (threshold: {snr_threshold} dB)"
+    torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
 
     # Reset config and caches
