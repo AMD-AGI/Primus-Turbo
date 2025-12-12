@@ -12,6 +12,7 @@ import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
     Float4ScalingRecipe,
     ScalingGranularity,
+    check_mxfp4_support,
 )
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import dequantize_fp4
@@ -185,6 +186,11 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
 @pytest.mark.parametrize("use_sr", [True, False])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_sr, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
     # NOTE: Fix seed and offset for reproducibility
     PHILOX_SEED = 42
     PHILOX_OFFSET = 0
