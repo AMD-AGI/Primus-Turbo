@@ -66,7 +66,7 @@ __global__ void compute_grouped_gemm_fp8_args(
     } else if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
         // A scale shape: [total_M, QK_A], strideAQ = QK_A
         // B scale shape: [B, QK_B, N/128], offset by group_id * QK_B * (N/128)
-        const ck_tile::index_t BQN = (n + 127) / 128;
+        const ck_tile::index_t BQN           = (n + 127) / 128;
         args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_offs_ptr[group_id] * strideAQ;
         args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * QK_B * BQN;
     }
