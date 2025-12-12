@@ -68,7 +68,7 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     # Set SNR threshold based on dtype
     snr_threshold = 47 if dtype == torch.bfloat16 else 50
-    
+
     out_snr = compute_snr(out_ref, out)
     print(f"Out-SNR: {out_snr:.2f} dB")
     assert out_snr > snr_threshold, f"out_snr too low (threshold: {snr_threshold} dB)"
