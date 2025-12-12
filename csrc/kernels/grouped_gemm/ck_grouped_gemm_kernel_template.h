@@ -195,8 +195,8 @@ public:
     // Select appropriate quantization group sizes based on A layout for ABQuantGrouped
     // A is always 1D quantization: <1, 1, 128>
     // B quantization depends on A's layout:
-    //   - When A is RowMajor (R+C or R+R): B uses 2D quantization <1, 128, 128>
-    //   - When A is ColMajor (C+R): B uses 1D quantization <1, 1, 128>
+    //   - When A is RowMajor (RowMajor+ColMajor or RowMajor+RowMajor): B uses 2D quantization <1, 128, 128>
+    //   - When A is ColMajor (ColMajor+RowMajor layout combination): B uses 1D quantization <1, 1, 128>
     using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
     using BQuantGroupSize = std::conditional_t<
         std::is_same_v<ALayout, RowMajor>,
