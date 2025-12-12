@@ -25,13 +25,13 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ## 📦 Quick Start
 
-### 1. Dependencies
+### Requirements
+
 #### Software
 - ROCm >= 6.4
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
-
 
 #### Hardware
 | Architecture | Supported GPUs      |
@@ -39,9 +39,11 @@ Note: JAX support is under active development. Optim support is planned but not 
 | GFX942       | ✅MI300X, ✅MI325X |
 | GFX950       | ✅MI350X, ✅MI355X |
 
-### 2. Docker (Recommended)
+### 1. Installation
+
+#### Docker (Recommended)
 Use the pre-built AMD ROCm image:
-```
+```bash
 # PyTorch Ecosystem
 ## For GFX942
 rocm/primus:v25.9_gfx942
@@ -52,15 +54,11 @@ rocm/primus:v25.9_gfx950
 rocm/jax-training:maxtext-v25.9
 ```
 
-### 3. Install from Source
-#### Clone Repository
-```
+#### Install from Source
+```bash
 git clone https://github.com/AMD-AGI/Primus-Turbo.git --recursive
 cd Primus-Turbo
-```
 
-#### User Install
-```
 pip3 install -r requirements.txt
 pip3 install --no-build-isolation .
 
@@ -68,21 +66,40 @@ pip3 install --no-build-isolation .
 GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
 ```
 
-#### Developer Install (editable mode)
-```
+### 2. Development
+
+For contributors, use editable mode (`-e`) so that code changes take effect immediately without reinstalling.
+
+```bash
+git clone https://github.com/AMD-AGI/Primus-Turbo.git --recursive
+cd Primus-Turbo
+
 pip3 install -r requirements.txt
 pip3 install --no-build-isolation -e . -v
 
 # (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
 GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
 
-# (Optional) Set PRIMUS_TURBO_FRAMEWORK environment variable to compile for a specific framework (PYTORCH or JAX). Defaults to PYTORCH.
+# (Optional) Set PRIMUS_TURBO_FRAMEWORK to compile for a specific framework.
+# Supported values: PYTORCH (default), JAX.
 # For example, to compile for JAX:
 PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
 ```
 
-### 4. Build & Deploy Wheel
+### 3. Testing
+
+```bash
+# Single-process mode (runs all tests)
+pytest tests/pytorch/
+
+# Multi-process mode (need both commands for full coverage)
+pytest tests/pytorch/ -n 8        # single-GPU tests in parallel
+pytest tests/pytorch/ --dist-only # distributed tests (skipped by -n)
 ```
+
+### 4. Packaging
+
+```bash
 pip3 install -r requirements.txt
 python3 -m build --wheel --no-isolation
 pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl

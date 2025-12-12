@@ -221,10 +221,19 @@ class AutoKernelDispatcher(ABC):
         cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
-        if user_backend_enum is not None and user_backend_enum in cls._backends:
+        if user_backend_enum is not None:
+            if user_backend_enum not in cls._backends:
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
+                    f"Available backends: {[b.name for b in cls._backends.keys()]}"
+                )
             backend_cls = cls._backends[user_backend_enum]
-            if backend_cls.can_handle(**kwargs):
-                return backend_cls.execute(**kwargs)
+            if not backend_cls.can_handle(**kwargs):
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs. "
+                    f"Please check input constraints or choose a different backend."
+                )
+            return backend_cls.execute(**kwargs)
 
         # 2. Auto tune
         if GlobalBackendManager.auto_tune_enabled():
