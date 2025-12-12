@@ -18,25 +18,24 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
     }
 }
 
-void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t lda,
-                         const void *scaleA_inv, hipblasOperation_t transA, const void *B,
-                         const hipDataType B_type, const int64_t ldb, const void *scaleB_inv,
-                         hipblasOperation_t transB, void *D, const hipDataType D_type,
-                         const int64_t ldd, const int64_t m, const int64_t n, const int64_t k,
-                         void *workspace, const int64_t workspace_size, const bool use_fp8,
-                         hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
-                         hipStream_t stream) {
+void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
+                         const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
+                         hipblasOperation_t transA, const void *B, const hipDataType B_type,
+                         const int64_t rows_b, const int64_t cols_b, const int64_t ldb,
+                         const void *scaleB_inv, hipblasOperation_t transB, void *D,
+                         const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
+                         const int64_t ldd, void *workspace, const int64_t workspace_size,
+                         const bool use_fp8, hipblasLtMatmulMatrixScale_t scale_mode,
+                         hipblasLtHandle_t handle, hipStream_t stream) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
     hipblasLtEpilogue_t         epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
     hipblasComputeType_t        gemm_compute_type = HIPBLAS_COMPUTE_32F;
 
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(
-        &A_desc, A_type, transA == HIPBLAS_OP_N ? m : k, transA == HIPBLAS_OP_N ? k : m, lda));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(
-        &B_desc, B_type, transB == HIPBLAS_OP_N ? k : n, transB == HIPBLAS_OP_N ? n : k, ldb));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, m, n, ldd));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&A_desc, A_type, rows_a, cols_a, lda));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&B_desc, B_type, rows_b, cols_b, ldb));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, rows_d, cols_d, ldd));
 
     PRIMUS_TURBO_CHECK_HIPBLAS(
         hipblasLtMatmulDescCreate(&operation_desc, gemm_compute_type, HIP_R_32F));

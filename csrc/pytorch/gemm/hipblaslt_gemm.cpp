@@ -32,6 +32,14 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
     const int64_t k = transA ? A.size(0) : A.size(1);
     const int64_t n = transB ? B.size(0) : B.size(1);
 
+    // rows/cols
+    const int64_t rows_a = transA ? m : k;
+    const int64_t cols_a = transA ? k : m;
+    const int64_t rows_b = transB ? k : n;
+    const int64_t cols_b = transB ? n : k;
+    const int64_t rows_d = n;
+    const int64_t cols_d = m;
+
     // NOTE: The leading dimension is col-major.
     int64_t lda, ldb, ldd;
     if (!transA && transB) { // NT
@@ -71,14 +79,16 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
     // NOTE: hipblaslt expects tensor in col-major but torch Tensor is in row-major.
     // Swapping A&B that are essentially computing C^T = B^T @ A^T.
     hipblaslt_gemm_impl(
-        static_cast<const void *>(B.data_ptr()), B_type, ldb,
+        static_cast<const void *>(B.data_ptr()), B_type,
+        rows_b, cols_b, ldb,
         nullptr,
         trans_operation_B,
-        static_cast<const void *>(A.data_ptr()), A_type, lda,
+        static_cast<const void *>(A.data_ptr()), A_type,
+        rows_a, cols_a, lda,
         nullptr,
         trans_operation_A,
-        static_cast<void *>(C.data_ptr()), C_type, ldd,
-        n, m, k,
+        static_cast<void *>(C.data_ptr()), C_type,
+        rows_d, cols_d, ldd,
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         false,
         HIPBLASLT_MATMUL_MATRIX_SCALE_END,
@@ -135,6 +145,14 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     const int64_t k = transA ? A.size(0) : A.size(1);
     const int64_t n = transB ? B.size(0) : B.size(1);
 
+    // rows/cols
+    const int64_t rows_a = transA ? m : k;
+    const int64_t cols_a = transA ? k : m;
+    const int64_t rows_b = transB ? k : n;
+    const int64_t cols_b = transB ? n : k;
+    const int64_t rows_d = n;
+    const int64_t cols_d = m;
+
     // NOTE: The leading dimension is col-major.
     int64_t lda, ldb, ldd;
     if (!transA && transB) { // NT
@@ -187,14 +205,16 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     // NOTE: hipblaslt expects tensor in col-major but torch Tensor is in row-major.
     // Swapping A&B that are essentially computing C^T = B^T @ A^T.
     hipblaslt_gemm_impl(
-        static_cast<const void *>(B.data_ptr()), B_type, ldb,
+        static_cast<const void *>(B.data_ptr()), B_type,
+        rows_b, cols_b, ldb,
         static_cast<const void*>(scaleB_inv.data_ptr()),
         trans_operation_B,
-        static_cast<const void *>(A.data_ptr()), A_type, lda,
+        static_cast<const void *>(A.data_ptr()), A_type,
+        rows_a, cols_a, lda,
         static_cast<const void*>(scaleA_inv.data_ptr()),
         trans_operation_A,
-        static_cast<void *>(C.data_ptr()), C_type, ldd,
-        n, m, k,
+        static_cast<void *>(C.data_ptr()), C_type,
+        rows_d, cols_d, ldd,
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         use_fp8,
         scale_mode,

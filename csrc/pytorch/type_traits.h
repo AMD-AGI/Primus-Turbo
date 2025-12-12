@@ -51,7 +51,7 @@ template <> struct TorchToCKTileType<at::kFloat> {
 //  DataType Mapping : at::ScalarType -> HipBLASLt Type
 //==================================================================
 
-static hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
+static inline hipDataType get_hipblaslt_dtype(const at::ScalarType t) {
     switch (t) {
     case at::kHalf:
         return HIP_R_16F;

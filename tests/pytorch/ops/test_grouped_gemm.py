@@ -44,7 +44,7 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     N, K = N_K
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(B, M, N, K, dtype, balance, trans_b, num_cu)
+    print(B, M, N, K, dtype, balance, trans_b, num_cu, backend, auto_tune)
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
@@ -73,11 +73,11 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     a_grad_snr = compute_snr(a_ref.grad, a.grad)
     print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
     assert a_grad_snr > 50, "a_grad_snr too low"
+    torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
 
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > 50, "b_grad_snr too low"
-    torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
 
     # Reset config and caches
