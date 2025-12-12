@@ -49,6 +49,63 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool transA, bool transB) -> Tensor");
     m.def("hipblaslt_grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, "
           "Tensor group_offs, bool transA, bool transB) -> Tensor");
+
+    // ********* DeepEP *********
+    m.class_<deep_ep::Config>("Config")
+        .def(torch::init<int64_t, int64_t, int64_t, int64_t, int64_t>(),
+             "DeepEP config constructor",
+             {torch::arg("num_sms") = DEFAULT_NUM_CU,
+              torch::arg("num_max_nvl_chunked_send_tokens") =
+                  DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
+              torch::arg("num_max_nvl_chunked_recv_tokens") =
+                  DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
+              torch::arg("num_max_rdma_chunked_send_tokens") =
+                  DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
+              torch::arg("num_max_rdma_chunked_recv_tokens") =
+                  DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS})
+        .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
+        .def("__obj_flatten__",
+             [](c10::intrusive_ptr<deep_ep::Config> self)
+                 -> std::tuple<std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+                               std::tuple<std::string, int64_t>, std::tuple<std::string, int64_t>,
+                               std::tuple<std::string, int64_t>> {
+                 return std::make_tuple(std::make_tuple("num_sms", self->num_sms),
+                                        std::make_tuple("num_max_nvl_chunked_send_tokens",
+                                                        self->num_max_nvl_chunked_send_tokens),
+                                        std::make_tuple("num_max_nvl_chunked_recv_tokens",
+                                                        self->num_max_nvl_chunked_recv_tokens),
+                                        std::make_tuple("num_max_rdma_chunked_send_tokens",
+                                                        self->num_max_rdma_chunked_send_tokens),
+                                        std::make_tuple("num_max_rdma_chunked_recv_tokens",
+                                                        self->num_max_rdma_chunked_recv_tokens));
+             });
+
+    m.class_<deep_ep::EventHandle>("EventHandle")
+        .def(torch::init<>())
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
+        .def("__obj_flatten__",
+             [](c10::intrusive_ptr<deep_ep::EventHandle> self) { return std::make_tuple(); });
+
+    m.class_<deep_ep::Buffer>("Buffer")
+        .def(torch::init<int64_t, int64_t, int64_t, int64_t, bool, bool, bool>())
+        .def("is_available", &deep_ep::Buffer::is_available)
+        .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
+        .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
+        .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
+        .def("get_local_device_id", &deep_ep::Buffer::get_local_device_id)
+        .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
+        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
+        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
+        .def("sync", &deep_ep::Buffer::sync)
+        .def("destroy", &deep_ep::Buffer::destroy)
+        .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
+        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+        .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
+        .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
+        .def("internode_combine", &deep_ep::Buffer::internode_combine)
+        .def("__obj_flatten__", &deep_ep::Buffer::get_state);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -107,50 +164,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](const std::string &group_name, const std::vector<int64_t> &shape,
            c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
         py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
-
-    // ********* DeepEP *********
-    auto deep_ep_module =
-        m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");
-    pybind11::class_<primus_turbo::deep_ep::Config>(deep_ep_module, "Config")
-        .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = DEFAULT_NUM_CU,
-             py::arg("num_max_nvl_chunked_send_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
-             py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
-             py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
-             py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
-        .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
-        .def("get_rdma_buffer_size_hint",
-             &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);
-
-    deep_ep_module.def("get_low_latency_rdma_size_hint",
-                       &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
-
-    pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
-        .def(pybind11::init<>())
-        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
-
-    pybind11::class_<deep_ep::Buffer>(deep_ep_module, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
-        .def("is_available", &deep_ep::Buffer::is_available)
-        .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
-        .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
-        .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
-        .def("get_local_device_id", &deep_ep::Buffer::get_local_device_id)
-        .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
-        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
-        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
-        .def("sync", &deep_ep::Buffer::sync)
-        .def("destroy", &deep_ep::Buffer::destroy)
-        .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
-        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
-        .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
-        .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
-        .def("internode_combine", &deep_ep::Buffer::internode_combine)
-        .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
-        .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
-        .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
-        .def("get_next_low_latency_combine_buffer",
-             &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     // ********* Runtime *********
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
