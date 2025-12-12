@@ -219,7 +219,7 @@ def build_kernels_extension():
         include_dirs=include_dirs,
         sources=kernels_sources,
         library_dirs=library_dirs,
-        libraries=["hipblaslt"],
+        libraries=["hipblas", "hipblaslt"],
         **extra_flags,
     )
 
