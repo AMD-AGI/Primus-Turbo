@@ -124,6 +124,25 @@ def get_offload_archs():
     return offload_arch_list, macro_arch_list
 
 
+def check_hip_compiler_flag(flag):
+    """Check if the HIP compiler supports a given flag."""
+    import tempfile
+
+    hipcc = _join_rocm_home("bin", "hipcc")
+    with tempfile.NamedTemporaryFile(suffix=".cpp", delete=True) as f:
+        f.write(b"int main() { return 0; }\n")
+        f.flush()
+        try:
+            result = subprocess.run(
+                [hipcc, flag, "-c", f.name, "-o", "/dev/null"],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+
 def get_common_flags():
     arch = platform.machine().lower()
     extra_link_args = [
@@ -152,13 +171,15 @@ def get_common_flags():
         "-mllvm",
         "-enable-post-misched=0",
         "-mllvm",
-        "-amdgpu-coerce-illegal-types=1",
-        "-mllvm",
         "-amdgpu-early-inline-all=true",
         "-mllvm",
         "-amdgpu-function-calls=false",
         "-std=c++20",
     ]
+
+    # Check and add optional compiler flags (for ROCm version compatibility)
+    if check_hip_compiler_flag("-mllvm -amdgpu-coerce-illegal-types=1"):
+        nvcc_flags.extend(["-mllvm", "-amdgpu-coerce-illegal-types=1"])
 
     # Device Archs
     offload_arch_list, macro_arch_list = get_offload_archs()
