@@ -4,6 +4,7 @@
 ###############################################################################
 
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product
@@ -113,6 +114,9 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
             store=store,
         )
         torch.manual_seed(42 + self.rank)
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["LOCAL_WORLD_SIZE"] = str(self.world_size)
+        os.environ["LOCAL_RANK"] = str(self.rank)
 
     def test_token_dispatcher_dropless(self):
         self._init_process()
