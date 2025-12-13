@@ -206,13 +206,16 @@ class GroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, **kwargs):
+    def make_key(
+        cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, maybe_pre_sync, **kwargs
+    ):
         bs = group_lens.shape[0]
         m = a.shape[1] if trans_a else a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
+        k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        return (bs, m, n, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c)
+        return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c, maybe_pre_sync)
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
