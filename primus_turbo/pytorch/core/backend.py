@@ -26,6 +26,7 @@ class BackendType(Enum):
     HIPBLASLT = auto()
     AITER = auto()
     TRITON = auto()
+    UCCL = auto()
 
 
 class GlobalBackendManager:

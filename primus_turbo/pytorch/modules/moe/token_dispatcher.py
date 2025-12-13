@@ -14,6 +14,9 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.deep_ep import Config
+from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+    set_buffer_global_config,
+)
 
 
 class TokenDispatcher:
@@ -157,9 +160,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.deepep_num_worst_tokens = deepep_num_worst_tokens
 
-        turbo.ops.set_buffer_config(
+        set_buffer_global_config(
             num_use_cu=deepep_num_use_cu,
-            use_comm_stream=deepep_use_comm_stream,
             autotune_config=deepep_autotune_config,
         )
 
@@ -204,7 +206,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             token_probs = token_probs.float()  # downcast or upcast
 
         hidden_states, dispatched_indices, dispatched_probs, tokens_per_expert, handle = (
-            turbo.ops.deepep_dispatch(
+            turbo.ops.moe_dispatch(
                 hidden_states,
                 token_indices=self.token_indices,
                 token_probs=token_probs,
@@ -269,7 +271,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         return hidden_states
 
     def _exec_combine(self, hidden_states):
-        hidden_states = turbo.ops.deepep_combine(
+        hidden_states = turbo.ops.moe_combine(
             hidden_states,
             self.tp_ep_group,
             self.handle,
