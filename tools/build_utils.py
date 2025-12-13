@@ -125,6 +125,7 @@ def HIPExtension(name, sources, *args, **kwargs):
         includes=[os.path.join(build_dir, "*")],
         extra_files=[os.path.abspath(s) for s in sources],
         show_detailed=True,
+        custom_map_list="/wekafs/huangzhen/Primus-Turbo/tools/deep_ep_hipifiy_mapping.json",
         is_pytorch_extension=True,
         hipify_extra_files_only=True,
     )

@@ -1,12 +1,13 @@
+#include "configs.cuh"
+#include "exception.cuh"
 #include "launch.cuh"
-#include "primus_turbo/deep_ep/configs.h"
 
-namespace primus_turbo::deep_ep {
+namespace deep_ep {
 
 namespace layout {
 
 template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
-__global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
+__global__ void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                                     int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                                     bool *is_token_in_rank, int num_tokens, int num_topk,
                                     int num_ranks, int num_experts) {
@@ -22,10 +23,10 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
 #pragma unroll
         for (int i = 0; i < kNumExpertsPerSM; ++i)
             num_tokens_per_expert_per_thread[thread_id][i] = 0;
-#pragma unroll 2
+#pragma unroll
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx = topk_idx + i * num_topk;
-#pragma unroll 2
+#pragma unroll
             for (int j = 0, expert_idx; j < num_topk; ++j) {
                 expert_idx = static_cast<int>(shifted_topk_idx[j]);
                 if (expert_begin_idx <= expert_idx and expert_idx < expert_end_idx)
@@ -35,7 +36,7 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
         __syncthreads();
 
         // Sum up
-        PRIMUS_TURBO_STATIC_CHECK(kNumExpertsPerSM <= kNumThreads, "Too many experts per SM");
+        EP_STATIC_ASSERT(kNumExpertsPerSM <= kNumThreads, "Too many experts per SM");
         if (expert_begin_idx + thread_id < expert_end_idx) {
             int sum = 0;
 #pragma unroll
@@ -47,8 +48,7 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
     }
 
     if (num_tokens_per_rdma_rank != nullptr)
-        PRIMUS_TURBO_DEVICE_CHECK(num_ranks % NUM_MAX_NVL_PEERS == 0 and
-                                  num_ranks > NUM_MAX_NVL_PEERS);
+        EP_DEVICE_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0 and num_ranks > NUM_MAX_NVL_PEERS);
 
     // Count rank statistics
     constexpr int  kNumRDMARanksPerSM = kNumRanksPerSM / NUM_MAX_NVL_PEERS;
@@ -71,11 +71,11 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
 #pragma unroll
         for (int i = 0; i < kNumRDMARanksPerSM; ++i)
             num_tokens_per_rdma_rank_per_thread[thread_id][i] = 0;
-#pragma unroll 2
+#pragma unroll
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx           = topk_idx + i * num_topk;
             int  is_in_rank[kNumRanksPerSM] = {0}, is_in_rdma_rank[kNumRDMARanksPerSM] = {0};
-#pragma unroll 2
+#pragma unroll
             for (int j = 0, expert_idx, rank_idx; j < num_topk; ++j) {
                 expert_idx = static_cast<int>(shifted_topk_idx[j]);
                 if (expert_begin <= expert_idx and expert_idx < expert_end) {
@@ -86,20 +86,20 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
             }
 
             auto shifted_is_token_in_rank = is_token_in_rank + i * num_ranks;
-#pragma unroll 2
+#pragma unroll
             for (int j = 0; j + rank_begin_idx < rank_end_idx; ++j) {
                 shifted_is_token_in_rank[j + rank_begin_idx] = (is_in_rank[j] > 0);
                 num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0);
             }
 
-#pragma unroll 2
+#pragma unroll
             for (int j = 0; j + rdma_rank_begin_idx < rdma_rank_end_idx; ++j)
                 num_tokens_per_rdma_rank_per_thread[thread_id][j] += (is_in_rdma_rank[j] > 0);
         }
         __syncthreads();
 
         // Sum up
-        PRIMUS_TURBO_STATIC_CHECK(kNumRanksPerSM <= kNumThreads, "Too many ranks per SM");
+        EP_STATIC_ASSERT(kNumRanksPerSM <= kNumThreads, "Too many ranks per SM");
         if (rank_begin_idx + thread_id < rank_end_idx) {
             int sum = 0;
 #pragma unroll
@@ -119,23 +119,21 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
     }
 }
 
-void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
+void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                          int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                          bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
-                         int num_experts, hipStream_t stream) {
+                         int num_experts, cudaStream_t stream) {
     constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
     int           num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) +
                   (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
-    PRIMUS_TURBO_STATIC_CHECK(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0,
-                              "Invalid number of ranks per SM");
+    EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");
 
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    LAUNCH_KERNEL_NON_COOPERATIVE(
-        &cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>), topk_idx,
-        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
-        num_tokens, num_topk, num_ranks, num_experts);
+    LAUNCH_KERNEL(&cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
+                  topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
+                  is_token_in_rank, num_tokens, num_topk, num_ranks, num_experts);
 }
 
 } // namespace layout
 
-} // namespace primus_turbo::deep_ep
+} // namespace deep_ep

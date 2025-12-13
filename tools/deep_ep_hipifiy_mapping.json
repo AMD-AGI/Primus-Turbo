@@ -1,0 +1,24 @@
+{
+    "custom_map": {
+        "nvshmem.h": "rocshmem/rocshmem.hpp",
+        "nvshmem_team_t": "rocshmem::rocshmem_team_t",
+        "nvshmem_team_config_t": "rocshmem::rocshmem_team_config_t",
+        "nvshmemx_uniqueid_t": "rocshmem::rocshmem_uniqueid_t",
+        "nvshmemx_get_uniqueid": "rocshmem::rocshmem_get_uniqueid",
+        "nvshmemx_init_attr_t": "rocshmem::rocshmem_init_attr_t",
+        "nvshmemx_init_attr": "rocshmem::rocshmem_init_attr",
+        "nvshmemx_init_attr_uniqueid_args": "rocshmem::rocshmem_init_attr_uniqueid_args",
+        "nvshmemx_init_attr_mpi_comm_args": "rocshmem::rocshmem_init_attr_mpi_comm_args",
+        "nvshmem_team_split_strided": "rocshmem::rocshmem_team_split_strided",
+        "nvshmem_align": "rocshmem::rocshmem_malloc",
+        "nvshmem_barrier_all": "rocshmem::rocshmem_barrier_all",
+        "nvshmem_free": "rocshmem::rocshmem_free",
+        "nvshmem_my_pe": "rocshmem::rocshmem_my_pe",
+        "nvshmem_finalize": "rocshmem::rocshmem_finalize",
+        "nvshmem_team_destroy": "rocshmem::rocshmem_team_destroy",
+        "NVSHMEM_TEAM_INVALID": "rocshmem::ROCSHMEM_TEAM_INVALID",
+        "nvshmemx_set_attr_uniqueid_args": "rocshmem::rocshmem_set_attr_uniqueid_args",
+        "NVSHMEMX_INIT_WITH_UNIQUEID": "rocshmem::ROCSHMEM_INIT_WITH_UNIQUEID",
+        "EP_STATIC_ASSERT": "PRIMUS_TURBO_STATIC_CHECK"
+    }
+}
