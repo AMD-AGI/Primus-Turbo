@@ -163,7 +163,7 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
                            "For BLOCKWISE granularity, k must be a multiple of 128, got k=", k);
         PRIMUS_TURBO_CHECK(n % 128 == 0,
                            "For BLOCKWISE granularity, n must be a multiple of 128, got n=", n);
-        PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
+        PRIMUS_TURBO_CHECK(k >= 128, "For BLOCKWISE granularity, k must be at least 128");
     }
 
     // Alloc args workspace
@@ -339,7 +339,7 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
                            "For BLOCKWISE granularity, m must be a multiple of 128, got m=", m);
         PRIMUS_TURBO_CHECK(n % 128 == 0,
                            "For BLOCKWISE granularity, n must be a multiple of 128, got n=", n);
-        PRIMUS_TURBO_CHECK(k > 128, "For BLOCKWISE granularity, k must be greater than 128");
+        PRIMUS_TURBO_CHECK(k >= 128, "For BLOCKWISE granularity, k must be at least 128");
     }
 
     // Alloc args workspace

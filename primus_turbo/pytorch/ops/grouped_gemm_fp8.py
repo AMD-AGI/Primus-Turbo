@@ -60,30 +60,34 @@ def _pad_for_blockwise_variable_k(
         padded_group_lens: New group lengths (each padded to multiple of block_size)
         padded_group_offs: New group offsets (all aligned to block_size)
     """
-    B = group_lens.shape[0]
     device = tensor.device
     dtype = tensor.dtype
+    total_K, width = tensor.shape
 
     # Calculate padded group_lens (each group K padded to multiple of block_size)
     padded_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
 
     # Calculate new group_offs
-    padded_group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    padded_group_offs = torch.zeros_like(group_offs)
     padded_group_offs[1:] = torch.cumsum(padded_group_lens, dim=0)
 
     total_padded_K = padded_group_offs[-1].item()
-    _, width = tensor.shape
 
-    # Create padded tensor (initialized to zeros)
+    # Create padded tensor (zeros for padding regions)
     padded_tensor = torch.zeros(total_padded_K, width, dtype=dtype, device=device)
 
-    # Copy data from original tensor to padded tensor using vectorized operations
-    for i in range(B):
-        src_start = group_offs[i].item()
-        src_end = group_offs[i + 1].item()
-        dst_start = padded_group_offs[i].item()
-        length = src_end - src_start
-        padded_tensor[dst_start : dst_start + length] = tensor[src_start:src_end]
+    # Compute cumulative padding before each group
+    cumulative_padding = padded_group_offs[:-1] - group_offs[:-1]  # [B]
+
+    # Create row indices and find group assignment using searchsorted
+    row_indices = torch.arange(total_K, device=device, dtype=torch.int64)
+    group_ids = torch.searchsorted(group_offs[1:], row_indices, right=True)
+
+    # Calculate destination indices: src_idx + cumulative_padding[group_id]
+    dst_indices = row_indices + cumulative_padding[group_ids]
+
+    # Scatter source rows to destination (fully vectorized)
+    padded_tensor[dst_indices] = tensor
 
     return padded_tensor, padded_group_lens, padded_group_offs
 
@@ -149,17 +153,15 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        if not grad_out.is_contiguous():
-            grad_out = grad_out.contiguous()
 
         a, b_fp8, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
-
+        block_size = ctx.config.block_size
         grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
         a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
 
         # Quantize grad_out in row-wise for dgrad
         grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
-            grad_out, grad_out_dtype, axis=1, block_size=ctx.config.block_size
+            grad_out, grad_out_dtype, axis=1, block_size=block_size
         )
 
         # grad_a: grad_out @ b^T
@@ -178,7 +180,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         )
 
         # For grad_b, we need col-wise quantization with padding for alignment
-        block_size = ctx.config.block_size
         needs_padding = _needs_padding_for_blockwise(group_offs, block_size)
 
         if needs_padding:
