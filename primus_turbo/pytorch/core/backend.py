@@ -43,6 +43,7 @@ class GlobalBackendManager:
 
     _gemm_backend: Optional[BackendType] = None
     _grouped_gemm_backend: Optional[BackendType] = None
+    _moe_dispatch_combine_backend: Optional[BackendType] = None
     _auto_tune: Optional[bool] = None
 
     @classmethod
@@ -76,6 +77,16 @@ class GlobalBackendManager:
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend
         backend = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_BACKEND")
+        if backend:
+            return BackendType[backend.upper()]
+        return None
+
+    @classmethod
+    def get_moe_dispatch_combine_backend(cls) -> Optional[BackendType]:
+        """Get the MoE dispatch combine backend configuration. Returns None if not set."""
+        if cls._moe_dispatch_combine_backend is not None:
+            return cls._moe_dispatch_combine_backend
+        backend = os.environ.get("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND")
         if backend:
             return BackendType[backend.upper()]
         return None

@@ -40,7 +40,7 @@ class MoEDispatch(torch.autograd.Function):
             group,
             None,
             topk_idx=token_indices,
-            token_weight=token_probs,
+            token_weights=token_probs,
             num_experts=num_experts,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,

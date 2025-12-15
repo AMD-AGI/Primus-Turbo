@@ -12,7 +12,13 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.pytorch.deep_ep as turbo_ep
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    AutoKernelDispatcher,
+    BackendType,
+    GlobalBackendManager,
+    KernelBackend,
+    TuneCache,
+)
 
 BufferType = Union[turbo_ep.Buffer, uccl_ep.Buffer]
 ConfigType = Union[turbo_ep.Config, uccl_ep.Config]
@@ -34,17 +40,6 @@ def get_hidden_bytes(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) 
     """
     inp = x if isinstance(x, torch.Tensor) else x[0]
     return inp.size(1) * max(inp.element_size(), 2)
-
-
-def get_backend_classes(
-    backend: Optional[BackendType] = None,
-) -> Tuple[BufferType, EventOverlapType, EventHandleType]:
-    if backend is None:
-        return turbo_ep.Buffer, turbo_ep.utils.EventOverlap, turbo_ep.utils.EventHandle
-    elif backend == BackendType.UCCL:
-        return uccl_ep.Buffer, uccl_ep.EventOverlap, uccl_ep.EventHandle
-    else:
-        raise ValueError(f"Invalid backend: {backend.name}")
 
 
 def set_buffer_global_config(
@@ -202,34 +197,157 @@ def _moe_combine_multiple_backends_impl(
     return combined_x, combined_topk_weights
 
 
+class MoEDispatchDefaultBackend(KernelBackend):
+    @staticmethod
+    def can_handle(**kwargs):
+        return True
+
+    @staticmethod
+    def execute(**kwargs):
+        group = kwargs.get("group")
+        x = kwargs.get("x")
+        buffer = get_buffer(group, get_hidden_bytes(x), turbo_ep.Buffer, {})
+        return _moe_dispatch_multiple_backends_impl(
+            buffer=buffer,
+            EventOverlapClass=turbo_ep.utils.EventOverlap,
+            EventHandleClass=turbo_ep.utils.EventHandle,
+            **kwargs,
+        )
+
+
+class MoEDispatchUCCLBackend(KernelBackend):
+    @staticmethod
+    def can_handle(**kwargs):
+        num_worst_tokens = kwargs.get("num_worst_tokens", 0)
+        group = kwargs.get("group")
+
+        if group.size() >= 32:
+            # uccl support for ep64 coming soon
+            return False
+
+        if group.size() > 8 and num_worst_tokens != 0:
+            # uccl not support num_worst_tokens > 0 for internode_dispatch, coming soon
+            return False
+
+        return True
+
+    @staticmethod
+    def execute(**kwargs):
+        group = kwargs.pop("group")
+        x = kwargs.get("x")
+        buffer = get_buffer(group, get_hidden_bytes(x), uccl_ep.Buffer, {})
+        return _moe_dispatch_multiple_backends_impl(
+            buffer=buffer,
+            EventOverlapClass=uccl_ep.EventOverlap,
+            EventHandleClass=uccl_ep.EventHandle,
+            **kwargs,
+        )
+
+
+class MoECombineDefaultBackend(KernelBackend):
+    @staticmethod
+    def can_handle(**kwargs):
+        return True
+
+    @staticmethod
+    def execute(**kwargs):
+        group = kwargs.pop("group")
+        x = kwargs.get("x")
+        buffer = get_buffer(group, get_hidden_bytes(x), uccl_ep.Buffer, {})
+        return _moe_combine_multiple_backends_impl(
+            buffer=buffer,
+            EventOverlapClass=uccl_ep.EventOverlap,
+            EventHandleClass=uccl_ep.EventHandle,
+            **kwargs,
+        )
+
+
+class MoECombineUCCLBackend(KernelBackend):
+    @staticmethod
+    def can_handle(**kwargs):
+        return True
+
+    @staticmethod
+    def execute(**kwargs):
+        group = kwargs.pop("group")
+        x = kwargs.get("x")
+        buffer = get_buffer(group, get_hidden_bytes(x), uccl_ep.Buffer, {})
+        return _moe_combine_multiple_backends_impl(
+            buffer=buffer,
+            EventOverlapClass=uccl_ep.EventOverlap,
+            EventHandleClass=uccl_ep.EventHandle,
+            **kwargs,
+        )
+
+
+class MoEDispatchKernelDispatcher(AutoKernelDispatcher):
+    _backends = {
+        None: MoEDispatchDefaultBackend,
+        BackendType.UCCL: MoEDispatchUCCLBackend,
+    }
+
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, **kwargs):
+        x = kwargs.get("x")
+        num_experts = kwargs.get("num_experts")
+        topk_idx = kwargs.get("topk_idx")
+        if isinstance(x, tuple):
+            x = x[0]
+
+        assert x.dim == 2
+        num_tokens, hidden_size = x.shape
+
+        num_topk = -1
+        if topk_idx is not None:
+            num_topk = topk_idx.shape[1]
+
+        return (num_tokens, hidden_size, num_experts, num_topk)
+
+
+class MoECombineKernelDispatcher(AutoKernelDispatcher):
+    _backends = {
+        None: MoECombineDefaultBackend,
+        BackendType.UCCL: MoECombineUCCLBackend,
+    }
+
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, **kwargs):
+        x = kwargs.get("x")
+        if isinstance(x, tuple):
+            x = x[0]
+        return x.shape[-1]
+
+
 def moe_dispatch_impl(
     x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     group: dist.ProcessGroup,
     handle: Optional[Tuple] = None,
     topk_idx: Optional[torch.Tensor] = None,
-    token_weight: Optional[torch.Tensor] = None,
+    token_weights: Optional[torch.Tensor] = None,
     num_experts: Optional[int] = None,
     async_finish=False,
     allocate_on_comm_stream=False,
     num_worst_tokens=0,
     default_backend: Optional[BackendType] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
-    BuferCls, EventOverlapCls, EventHandleCls = get_backend_classes(default_backend)
-    buffer = get_buffer(group, get_hidden_bytes(x), BuferCls, {})
 
-    return _moe_dispatch_multiple_backends_impl(
-        buffer,
-        EventOverlapCls,
-        EventHandleCls,
-        x,
-        handle,
-        topk_idx,
-        token_weight,
-        num_experts,
-        async_finish,
-        allocate_on_comm_stream,
-        num_worst_tokens,
+    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend()
+    kwargs = dict(
+        group=group,
+        x=x,
+        handle=handle,
+        topk_idx=topk_idx,
+        token_weights=token_weights,
+        num_experts=num_experts,
+        async_finish=async_finish,
+        allocate_on_comm_stream=allocate_on_comm_stream,
+        num_worst_tokens=num_worst_tokens,
     )
+    return MoEDispatchKernelDispatcher.dispatch(default_backend, user_backend, **kwargs)
 
 
 def moe_combine_impl(
@@ -241,15 +359,13 @@ def moe_combine_impl(
     allocate_on_comm_stream: bool = False,
     default_backend: Optional[BackendType] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    BuferCls, EventOverlapCls, EventHandleCls = get_backend_classes(default_backend)
-    buffer = get_buffer(group, get_hidden_bytes(x), BuferCls, {})
-    return _moe_combine_multiple_backends_impl(
-        buffer,
-        EventOverlapCls,
-        EventHandleCls,
-        x,
-        handle,
-        topk_weights,
-        async_finish,
-        allocate_on_comm_stream,
+    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend()
+    kwargs = dict(
+        group=group,
+        x=x,
+        handle=handle,
+        topk_weights=topk_weights,
+        async_finish=async_finish,
+        allocate_on_comm_stream=allocate_on_comm_stream,
     )
+    return MoECombineKernelDispatcher.dispatch(default_backend, user_backend, **kwargs)
