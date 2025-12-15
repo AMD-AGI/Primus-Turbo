@@ -3,11 +3,13 @@
 // See LICENSE for license information.
 
 #pragma once
+
 #include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <stdexcept>
+
 namespace primus_turbo {
 
 //==================================================================
@@ -46,8 +48,9 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const void *scaleB_inv, hipblasOperation_t transB, void *D,
                          const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
-                         const bool use_fp8, const hipblasLtMatmulMatrixScale_t scale_mode,
-                         hipblasLtHandle_t handle, hipStream_t stream);
+                         const bool                         use_low_precision,
+                         const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
+                         hipStream_t stream);
 
 //==================================================================
 //  CK GEMM

@@ -10,10 +10,18 @@ import torch
 import triton
 from torch.library import triton_op, wrap_triton
 
+from primus_turbo.pytorch.core.low_precision import (
+    Float4ScalingRecipe,
+    check_mxfp4_support,
+)
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
+)
+from primus_turbo.triton.quantization.quantization_mxfp4 import (
+    dequantize_mxfp4_kernel,
+    quantize_mxfp4_kernel,
 )
 from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
@@ -278,7 +286,6 @@ def quantize_mxfp8_impl(
     BLOCK_X = 64
     BLOCK_Y = 64
     GROUP_Y = block_size
-    max_fp8 = torch.finfo(out_dtype).max
     grid = lambda META: (
         triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
     )
@@ -298,7 +305,6 @@ def quantize_mxfp8_impl(
         scale_stride_N,
         scale_M,
         scale_N,
-        max_fp8,
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
@@ -318,6 +324,10 @@ def dequantize_mxfp8_impl(
     assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
     assert axis in (0, 1), "The axis must be 0 or 1."
+    SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+    assert (
+        out_dtype in SUPPORTED_OUT_DTYPES
+    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
     trans = axis == 0
 
@@ -357,6 +367,155 @@ def dequantize_mxfp8_impl(
         BLOCK_Y,
         GROUP_Y,
         trans,
+        block_size,
+    )
+
+    return y
+
+
+def quantize_mxfp4_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    padding_align_size: Optional[int] = None,
+    scaling_recipe: Optional[Float4ScalingRecipe] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # NOTE: quantize fp4 kernel use the ISA which only avaiable on cdna4.
+    mxfp4_support, reason = check_mxfp4_support()
+    assert mxfp4_support, reason
+
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() == 2, "The A must be 2D tensor."
+    assert axis in (1,), "The axis must be 1."
+    assert (
+        out_dtype == torch.float4_e2m1fn_x2
+    ), f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
+
+    scaling_recipe = Float4ScalingRecipe() if scaling_recipe is None else scaling_recipe
+
+    num_rows, row_length = x.size()
+
+    padded_num_rows, padded_row_length = num_rows, row_length
+    if padding_align_size is not None:
+        padded_row_length += padding_size(row_length, padding_align_size)
+
+    assert (
+        padded_row_length % block_size == 0
+    ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
+
+    scale_m, scale_n = padded_num_rows, padded_row_length // block_size
+    if scaling_recipe.use_2d_block:
+        assert (
+            num_rows % block_size == 0
+        ), f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
+        scale_m = scale_m // block_size
+
+    philox_seed, philox_offset = scaling_recipe.philox_seed, scaling_recipe.philox_offset
+    if scaling_recipe.use_sr:
+        if philox_seed is None:
+            philox_seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
+        if philox_offset is None:
+            philox_offset = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
+
+    # NOTE: y is packed in last dimension
+    y = torch.empty((padded_num_rows, padded_row_length // 2), dtype=torch.uint8, device=x.device)
+    scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
+
+    BLOCK_X = 64
+    BLOCK_Y = 64
+    GROUP_Y = block_size
+    grid = lambda META: (
+        triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
+    )
+    quantize_mxfp4_kernel[grid](
+        x,
+        y,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        num_rows,
+        row_length,
+        padded_num_rows,
+        padded_row_length,
+        scale_inv,
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        scale_m,
+        scale_n,
+        philox_seed,
+        philox_offset,
+        BLOCK_X,
+        BLOCK_Y,
+        GROUP_Y,
+        scaling_recipe.use_2d_block,
+        scaling_recipe.use_sr,
+        block_size,
+    )
+
+    y = y.view(torch.float4_e2m1fn_x2)
+    scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
+
+    return y, scale_inv
+
+
+def dequantize_mxfp4_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    scale_inv: torch.Tensor,
+    scaling_recipe: Optional[Float4ScalingRecipe] = None,
+) -> torch.Tensor:
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() == 2, "The x must be 2D tensor."
+    assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
+    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
+    assert axis in (1,), "The axis must be 1."
+    assert x.dtype == torch.float4_e2m1fn_x2, f"The x dtype must be torch.float4_e2m1fn_x2 but got {x.dtype}."
+    SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+    assert (
+        out_dtype in SUPPORTED_OUT_DTYPES
+    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+
+    scaling_recipe = Float4ScalingRecipe() if scaling_recipe is None else scaling_recipe
+
+    # NOTE: x is packed in last dimension
+    num_rows, packed_row_length = x.size()
+    row_length = packed_row_length * 2
+    assert (
+        row_length % block_size == 0
+    ), "The last dimension of the x tensor must be divisible by the block size."
+
+    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
+    scale_inv = scale_inv.view(torch.uint8)
+
+    scale_m, scale_n = scale_inv.size()
+    y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
+
+    BLOCK_X = 64
+    BLOCK_Y = 64
+    GROUP_Y = 4
+    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
+    dequantize_mxfp4_kernel[grid](
+        x.view(torch.uint8),
+        y,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        num_rows,
+        row_length,
+        scale_inv,
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        scale_m,
+        scale_n,
+        BLOCK_X,
+        BLOCK_Y,
+        GROUP_Y,
+        scaling_recipe.use_2d_block,
         block_size,
     )
 

@@ -504,6 +504,7 @@ def gemm_fp8(
         - TENSORWISE
         - ROWWISE
         - BLOCKWISE
+        - MX_BLOCKWISE
 
     FP8 Format (config.format):
         - E4M3
