@@ -15,7 +15,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     check_mxfp4_support,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
+    GEMMFP4HipBLASLtBackend,
+    gemm_fp4_impl,
+)
 from primus_turbo.pytorch.ops.quantization import quantize_fp4
 
 __all__ = ["gemm_fp4"]
@@ -28,10 +31,6 @@ def replicate_scale_inv(scale_inv: torch.Tensor, block_size: int):
 
 
 class FP4GemmMXFunction(torch.autograd.Function):
-
-    HIPBLASLT_M_MULTIPLE = 16
-    HIPBLASLT_N_MULTIPLE = 16
-    HIPBLASLT_K_MULTIPLE = 128
 
     @staticmethod
     def get_fp4_dtype(format: Format):
@@ -53,18 +52,9 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
-        assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert (
-            trans_a == False and trans_b == True
-        ), "MXFP4 GEMM only supports trans_a=False and trans_b=True."
-        assert (
-            a.size(0) % __class__.HIPBLASLT_M_MULTIPLE == 0
-            and b.size(0) % __class__.HIPBLASLT_N_MULTIPLE == 0
-        ), f"MXFP4 requires M are multiples of {__class__.HIPBLASLT_M_MULTIPLE} and N are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
-        assert (
-            a.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
-            and b.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
-        ), f"MXFP4 requires K are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
+            config.granularity == ScalingGranularity.MX_BLOCKWISE
+        ), "MXFP4 only supports MX_BLOCKWISE granularity"
 
         a_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
@@ -79,7 +69,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             config.granularity,
             block_size=config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=config.scaling_recipe["a_fwd"],
         )
 
@@ -89,7 +79,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             config.granularity,
             block_size=config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=config.scaling_recipe["b_fwd"],
         )
 
@@ -145,7 +135,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
         )
 
         grad_out_t = grad_out.T.contiguous()
@@ -155,7 +145,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
         )
 
@@ -166,7 +156,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
         )
         b_t = b.T.contiguous()
@@ -176,7 +166,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             axis=1,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
         )
 
@@ -279,7 +269,7 @@ def gemm_fp4(
     """
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
-        out_dtype = torch.bfloat16
+        out_dtype = torch.result_type(a, b)
 
     if config is None:
         config = Float4QuantConfig()

@@ -54,11 +54,11 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
     # (trans_a, trans_b, trans_c)
-    SUPPORTED_LAYOUTS = (
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-    )
+    SUPPORTED_LAYOUTS = ((False, True, False),)
+
+    HIPBLASLT_M_MULTIPLE = 16
+    HIPBLASLT_N_MULTIPLE = 16
+    HIPBLASLT_K_MULTIPLE = 128
 
     @staticmethod
     def can_handle(
@@ -77,12 +77,19 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         supported &= granularity in GEMMFP4HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP4HipBLASLtBackend.SUPPORTED_DTYPES
+        supported &= (trans_a, trans_b, trans_c) in GEMMFP4HipBLASLtBackend.SUPPORTED_LAYOUTS
 
-        # TODO:
-        # check layout
-        # supported &= (trans_a, trans_b, trans_c) in GEMMFP4HipBLASLtBackend.SUPPORTED_LAYOUTS
-        # TODO:
-        # check shape
+        # check dimension
+        supported &= (
+            a.size(0) % GEMMFP4HipBLASLtBackend.HIPBLASLT_M_MULTIPLE == 0
+            and b.size(0) % GEMMFP4HipBLASLtBackend.HIPBLASLT_N_MULTIPLE == 0
+        )
+
+        # NOTE: The k dim is packed for FP4. So it need to multiply 2.
+        supported &= (
+            a.size(1) * 2 % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0
+            and b.size(1) * 2 % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0
+        )
 
         return supported
 

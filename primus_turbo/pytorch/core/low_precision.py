@@ -135,6 +135,11 @@ class ScalingStrategy(Enum):
 class Float4ScalingRecipe:
     """
     Supported FP4 scaling recipe.
+
+    - use_2d_block: Whether to use 2D block in quantization.
+    - use_sr: Whether to use stochastic rounding in quantization.
+    - philox_seed: The philox generator's seed for the stochastic rounding.
+    - philox_offset: The philox generator's offset for the stochastic rounding.
     """
 
     use_2d_block: bool = False
@@ -175,14 +180,14 @@ class Float4QuantConfig:
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: int = 32
 
-    # scaling recipe
+    # Default scaling recipe. Assume b is weight. Reference: https://arxiv.org/pdf/2509.25149
     scaling_recipe: Dict[str, Float4ScalingRecipe] = field(
         default_factory=lambda: {
             "a_fwd": Float4ScalingRecipe(),
-            "b_fwd": Float4ScalingRecipe(),
-            "grad_bwd": Float4ScalingRecipe(),
+            "b_fwd": Float4ScalingRecipe(use_2d_block=True),
+            "grad_bwd": Float4ScalingRecipe(use_sr=True),
             "a_bwd": Float4ScalingRecipe(),
-            "b_bwd": Float4ScalingRecipe(),
+            "b_bwd": Float4ScalingRecipe(use_2d_block=True, use_sr=True),
         }
     )
 
