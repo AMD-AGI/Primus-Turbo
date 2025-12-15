@@ -10,7 +10,7 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
-    Float4ScalingRecipe,
+    MXScalingRecipe,
     ScalingGranularity,
     check_mxfp4_support,
 )
@@ -112,7 +112,8 @@ def test_quantize_fp8_rowwise(
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("padding_align_size", [None, 128])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_size, granularity):
+@pytest.mark.parametrize("use_2d_block", [True, False])
+def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_size, granularity, use_2d_block):
     def padding_size(n: int, padding_align_size: int) -> int:
         return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
@@ -154,6 +155,10 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
     else:
         x_2d_ref = x_2d
 
+    scaling_recipe = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+    )
+
     x_fp8, x_scale_inv = quantize_fp8(
         x_2d,
         dest_dtype,
@@ -161,11 +166,18 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
         axis=axis,
         block_size=MX_BLOCK_SIZE,
         padding_align_size=padding_align_size,
+        scaling_recipe=scaling_recipe,
     )
 
     # check quantize and dequantize precision
     out = dequantize_fp8(
-        x_fp8, orig_dtype, granularity=granularity, block_size=MX_BLOCK_SIZE, axis=axis, scale_inv=x_scale_inv
+        x_fp8,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=axis,
+        scale_inv=x_scale_inv,
+        scaling_recipe=scaling_recipe,
     )
 
     torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
@@ -195,7 +207,7 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     PHILOX_SEED = 42
     PHILOX_OFFSET = 0
 
-    scaling_recipe = Float4ScalingRecipe(
+    scaling_recipe = MXScalingRecipe(
         use_2d_block=use_2d_block,
         use_sr=use_sr,
         philox_seed=PHILOX_SEED,

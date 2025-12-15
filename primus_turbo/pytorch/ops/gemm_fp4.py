@@ -24,12 +24,6 @@ from primus_turbo.pytorch.ops.quantization import quantize_fp4
 __all__ = ["gemm_fp4"]
 
 
-def replicate_scale_inv(scale_inv: torch.Tensor, block_size: int):
-    scale_m = scale_inv.size(0) * block_size
-
-    return scale_inv.unsqueeze(1).expand(-1, block_size, -1).reshape(scale_m, -1)
-
-
 class FP4GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
@@ -81,18 +75,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=config.scaling_recipe["b_fwd"],
-        )
-
-        # replicate scale_inv for 2D block
-        a_scale_inv = (
-            replicate_scale_inv(a_scale_inv, config.block_size)
-            if config.scaling_recipe["a_fwd"].use_2d_block
-            else a_scale_inv
-        )
-        b_scale_inv = (
-            replicate_scale_inv(b_scale_inv, config.block_size)
-            if config.scaling_recipe["b_fwd"].use_2d_block
-            else b_scale_inv
         )
 
         # NT layout
@@ -170,18 +152,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
         )
 
-        # replicate scale_inv for 2D block
-        grad_out_scale_inv = (
-            replicate_scale_inv(grad_out_scale_inv, ctx.config.block_size)
-            if ctx.config.scaling_recipe["grad_bwd"].use_2d_block
-            else grad_out_scale_inv
-        )
-        b_t_scale_inv = (
-            replicate_scale_inv(b_t_scale_inv, ctx.config.block_size)
-            if ctx.config.scaling_recipe["b_bwd"].use_2d_block
-            else b_t_scale_inv
-        )
-
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
         grad_a = gemm_fp4_impl(
             grad_out_fp4,
@@ -194,18 +164,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.HIPBLASLT.value,
-        )
-
-        # replicate scale_inv for 2D block
-        grad_out_t_scale_inv = (
-            replicate_scale_inv(grad_out_t_scale_inv, ctx.config.block_size)
-            if ctx.config.scaling_recipe["grad_bwd"].use_2d_block
-            else grad_out_t_scale_inv
-        )
-        a_t_scale_inv = (
-            replicate_scale_inv(a_t_scale_inv, ctx.config.block_size)
-            if ctx.config.scaling_recipe["a_bwd"].use_2d_block
-            else a_t_scale_inv
         )
 
         # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.

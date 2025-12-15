@@ -35,6 +35,7 @@ def quantize_mxfp8_kernel(
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
     TRANS: tl.constexpr,
+    USE_2D_BLOCK: tl.constexpr,
     MXFP8_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -65,10 +66,18 @@ def quantize_mxfp8_kernel(
             # (MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
             x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask, other=0.0).to(tl.float32)
 
+            if USE_2D_BLOCK:
+                biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+            else:
+                if not TRANS:
+                    # Row-wise
+                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
+                else:
+                    # Col-wise
+                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
+
             if not TRANS:
                 # Row-wise
-                biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
-
                 scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
                 scale_inv_store_offsets = (
                     offsets_Y[:, None] * stride_scale_inv_row
@@ -94,8 +103,6 @@ def quantize_mxfp8_kernel(
                 )
             else:
                 # Col-wise
-                biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
-
                 scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
                 scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_col + (
                     offsets_X[None, :] * stride_scale_inv_row

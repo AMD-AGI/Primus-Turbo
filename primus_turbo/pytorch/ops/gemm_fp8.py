@@ -368,6 +368,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=config.scaling_recipe["a_fwd"],
         )
         b_fp8, b_scale_inv = quantize_fp8(
             b,
@@ -376,6 +377,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=config.scaling_recipe["b_fwd"],
         )
 
         # NT layout
@@ -417,6 +419,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
         )
         grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
             grad_out,
@@ -425,6 +428,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=0,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
         )
 
         # TODO(ruibin): cache a_t and b_t for backward pass
@@ -435,6 +439,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=0,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
         )
         b_t_fp8, b_t_scale_inv = quantize_fp8(
             b,
@@ -443,6 +448,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=0,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
