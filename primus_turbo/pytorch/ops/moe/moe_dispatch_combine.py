@@ -110,17 +110,36 @@ def moe_dispatch(
     allocate_on_comm_stream=False,
     num_worst_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
-    """Perform fused dispatch operation if deep_ep is available.
+    """
+    MoE dispatch operation: distributes input tokens to their assigned experts.
+
+    This function is the first stage of MoE forward pass, routing tokens to the experts
+    they have been assigned to based on the router's decisions.
+    Supports autograd; the backward pass calls moe_combine to gather gradients.
 
     Args:
-        x: Input tensor [num_tokens, hidden_size]
-        token_indices: Token routing indices [num_tokens, topk]
-        token_probs: Token routing probabilities [num_tokens, topk]
-        num_experts: Number of experts
-        group: Process group
-        num_worst_tokens: set num_worst_token for deepep dispatch which can elimite host sync
+        x: Input tensor of shape (num_tokens, hidden_size), or a tuple
+           (hidden_states, auxiliary_states) for mixed-precision scenarios.
+        token_indices: Token-to-expert mapping indices of shape (num_tokens, top_k),
+                       indicating which top-k experts each token is routed to.
+        token_probs: Routing probabilities/weights of shape (num_tokens, top_k),
+                     representing the weight assigned to each expert for each token.
+        num_experts: Total number of experts.
+        group: Distributed communication group for cross-device/node All-to-All communication.
+        async_finish: Whether to enable async completion mode, allowing communication
+                      to overlap with computation. Defaults to False.
+        allocate_on_comm_stream: Whether to allocate memory on the communication stream,
+                                 which can optimize memory access patterns. Defaults to False.
+        num_worst_tokens: Number of low-quality tokens to drop (for load balancing optimization).
+                          Defaults to 0.
+
     Returns:
-        Result of FusedDispatch
+        A tuple containing:
+            - recv_x: Dispatched token tensor received by this rank, to be processed by local experts.
+            - recv_token_indices: Received token index information.
+            - recv_token_probs: Received token probability weights.
+            - tokens_per_expert: Statistics of token count received by each expert.
+            - handle: Communication handle that must be passed to moe_combine to complete the combine operation.
     """
     return MoEDispatch.apply(
         x,
@@ -141,15 +160,29 @@ def moe_combine(
     async_finish=False,
     allocate_on_comm_stream=False,
 ) -> torch.Tensor:
-    """Perform fused combine operation if deep_ep is available.
+    """
+    MoE combine operation: merges expert outputs back to the original token order.
+
+    This function is the final stage of MoE forward pass. After all experts have completed
+    their computations, it collects and combines the outputs scattered across different devices
+    back to their original token positions.
+    Supports autograd; the backward pass calls moe_dispatch to distribute gradients.
 
     Args:
-        x: Input tensor
-        group: Process group
-        handle: Communication handle
+        x: Expert output tensor, shape depends on the number of tokens processed by local experts.
+        group: Distributed communication group for cross-device/node All-to-All communication.
+               Must be the same communication group used in moe_dispatch.
+        handle: Communication handle from moe_dispatch, containing metadata from the dispatch stage
+                used to correctly route outputs back to their original positions.
+        async_finish: Whether to enable async completion mode, allowing communication
+                      to overlap with computation. Defaults to False.
+        allocate_on_comm_stream: Whether to allocate memory on the communication stream,
+                                 which can optimize memory access patterns. Defaults to False.
 
     Returns:
-        Result of FusedCombine
+        torch.Tensor: Combined output tensor with the same shape as the input x to moe_dispatch,
+                      i.e., (num_tokens, hidden_size). Each token's output is the weighted sum
+                      of outputs from the experts it was routed to (weights from token_probs).
     """
     return MoECombine.apply(
         x,
