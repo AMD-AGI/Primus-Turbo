@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "extensions.h"
+#include "ffi.h"
 #include <pybind11/pybind11.h>
 
 #define REGISTER_FFI_HANDLER(dict, name, fn) dict[#name] = ::primus_turbo::jax::EncapsulateFFI(fn);
@@ -47,6 +48,21 @@ pybind11::dict Registrations() {
 
 PYBIND11_MODULE(_C, m) {
     m.def("registrations", &Registrations);
+
+    // DType enum
+    pybind11::enum_<DType>(m, "DType", pybind11::module_local())
+        .value("kByte", DType::kByte)
+        .value("kInt16", DType::kInt16)
+        .value("kInt32", DType::kInt32)
+        .value("kInt64", DType::kInt64)
+        .value("kFloat32", DType::kFloat32)
+        .value("kFloat16", DType::kFloat16)
+        .value("kBFloat16", DType::kBFloat16)
+        .value("kFloat8E4M3FN", DType::kFloat8E4M3FN)
+        .value("kFloat8E4M3FNUZ", DType::kFloat8E4M3FNUZ)
+        .value("kFloat8E5M2", DType::kFloat8E5M2)
+        .value("kFloat8E5M2FNUZ", DType::kFloat8E5M2FNUZ)
+        .value("kFloat8E8M0", DType::kFloat8E8M0);
 }
 
 } // namespace primus_turbo::jax

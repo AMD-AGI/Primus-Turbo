@@ -8,6 +8,10 @@ import functools
 from typing import Tuple
 
 import jax
+import jax.numpy as jnp
+from jax import dtypes
+
+from primus_turbo.jax._C import DType as TurboDType
 
 
 @functools.lru_cache
@@ -35,3 +39,25 @@ def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
 def get_device_compute_capability(device_id: int = 0) -> Tuple[int, int]:
     """Get compute capability of specified GPU or current default GPU."""
     return _get_device_compute_capability(device_id)
+
+
+def jax_dtype_to_turbo_dtype(jax_dtype):
+    """Convert JAX dtype to Primus-Turbo DType."""
+    jax_dtype = dtypes.canonicalize_dtype(jax_dtype)
+
+    converter = {
+        jnp.float32.dtype: TurboDType.kFloat32,
+        jnp.float16.dtype: TurboDType.kFloat16,
+        jnp.bfloat16.dtype: TurboDType.kBFloat16,
+        jnp.int32.dtype: TurboDType.kInt32,
+        jnp.int64.dtype: TurboDType.kInt64,
+        jnp.float8_e4m3fn.dtype: TurboDType.kFloat8E4M3FN,
+        jnp.float8_e4m3fnuz.dtype: TurboDType.kFloat8E4M3FNUZ,
+        jnp.float8_e5m2.dtype: TurboDType.kFloat8E5M2,
+        jnp.float8_e5m2fnuz.dtype: TurboDType.kFloat8E5M2FNUZ,
+    }
+
+    if jax_dtype not in converter:
+        raise ValueError(f"Unsupported {jax_dtype=}")
+
+    return converter[jax_dtype]
