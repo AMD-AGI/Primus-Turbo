@@ -559,6 +559,13 @@ BaseBuildExtension = _select_base_build_ext()
 class TurboBuildExt(BaseBuildExtension):
     KERNEL_EXT_NAME = "libprimus_turbo_kernels"
 
+    def initialize_options(self):
+        super().initialize_options()
+        if self.build_temp is None:
+            self.build_temp = os.path.abspath("build/temp")
+        if self.build_lib is None:
+            self.build_lib = os.path.abspath("build/lib")
+
     def get_ext_filename(self, ext_name: str) -> str:
         filename = super().get_ext_filename(ext_name)
         if ext_name == self.KERNEL_EXT_NAME:
