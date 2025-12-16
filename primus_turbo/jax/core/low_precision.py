@@ -4,13 +4,13 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import functools
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Tuple
 
-import jax
 import jax.numpy as jnp
+
+from primus_turbo.jax.core.utils import get_device_compute_capability
 
 __all__ = [
     "float8_e4m3",
@@ -21,34 +21,6 @@ __all__ = [
     "Float8QuantConfig",
     "Float4QuantConfig",
 ]
-
-
-@functools.lru_cache
-def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
-    """Get compute capability for a specific device."""
-    devices = jax.devices("gpu")
-    if device_id >= len(devices):
-        raise ValueError(f"Device {device_id} not found")
-
-    device = devices[device_id]
-    # For AMD GPUs, parse the device kind (e.g., "gfx942" -> (9, 4, 2))
-    device_kind = device.device_kind
-
-    # Extract gfx version (e.g., "gfx942" -> "942")
-    if device_kind.startswith("gfx"):
-        gfx_version = device_kind[3:]
-        if len(gfx_version) >= 2:
-            major = int(gfx_version[0])
-            minor = int(gfx_version[1])
-            return (major, minor)
-
-    # Default fallback
-    return (0, 0)
-
-
-def get_device_compute_capability(device_id: int = 0) -> Tuple[int, int]:
-    """Get compute capability of specified GPU or current default GPU."""
-    return _get_device_compute_capability(device_id)
 
 
 def is_fp8_dtype(dtype):
