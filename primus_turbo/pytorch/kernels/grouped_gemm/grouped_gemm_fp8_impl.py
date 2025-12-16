@@ -41,7 +41,7 @@ def grouped_gemm_fp8_csrc_impl(
     ], f"b must be float8, got {b.dtype}"
     assert trans_a == False
 
-    return torch.ops.primus_turbo_cpp_extension.grouped_gemm_fp8(
+    return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_fp8(
         a,
         b,
         a_scales,
@@ -81,7 +81,7 @@ def grouped_gemm_fp8_variable_k_csrc_impl(
     ], f"b must be float8, got {b.dtype}"
     assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
 
-    return torch.ops.primus_turbo_cpp_extension.grouped_gemm_fp8_variable_k(
+    return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_fp8_variable_k(
         a,
         b,
         a_scales,
