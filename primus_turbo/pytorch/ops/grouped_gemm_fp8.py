@@ -142,22 +142,60 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             num_cu=num_cu,
         )
 
-        ctx.save_for_backward(a, b_fp8, b_scale_inv, group_lens, group_offs)
+        needs_padding = _needs_padding_for_blockwise(group_offs, config.block_size)
+        if needs_padding:
+            # Pad tensors to align group boundaries to block_size
+            a_padded, padded_group_lens, padded_group_offs = _pad_for_blockwise_variable_k(
+                a, group_lens, group_offs, config.block_size
+            )
+            # Quantize padded tensors
+            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
+                a_padded, a_dtype, axis=0, block_size=config.block_size
+            )
+            var_k_group_lens = padded_group_lens
+            var_k_group_offs = padded_group_offs
+        else:
+            # No padding needed, use original tensors
+            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
+                a, a_dtype, axis=0, block_size=config.block_size
+            )
+            var_k_group_lens = group_lens
+            var_k_group_offs = group_offs
+
+        ctx.save_for_backward(
+            a_fp8_col,
+            a_scale_inv_col,
+            b_fp8,
+            b_scale_inv,
+            group_lens,
+            group_offs,
+            var_k_group_lens,
+            var_k_group_offs,
+        )
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.needs_padding = needs_padding
 
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
 
-        a, b_fp8, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
+        (
+            a_fp8_col,
+            a_scale_inv_col,
+            b_fp8,
+            b_scale_inv,
+            group_lens,
+            group_offs,
+            var_k_group_lens,
+            var_k_group_offs,
+        ) = ctx.saved_tensors
         block_size = ctx.config.block_size
         grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
-        a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
 
         # Quantize grad_out in row-wise for dgrad
         grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
@@ -180,33 +218,19 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         )
 
         # For grad_b, we need col-wise quantization with padding for alignment
-        needs_padding = _needs_padding_for_blockwise(group_offs, block_size)
-
-        if needs_padding:
-            # Pad tensors to align group boundaries to block_size
-            a_padded, padded_group_lens, padded_group_offs = _pad_for_blockwise_variable_k(
-                a, group_lens, group_offs, block_size
-            )
+        if ctx.needs_padding:
+            # Pad grad_out to align group boundaries to block_size
             grad_out_padded, _, _ = _pad_for_blockwise_variable_k(
                 grad_out, group_lens, group_offs, block_size
-            )
-            # Quantize padded tensors
-            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
-                a_padded, a_dtype, axis=0, block_size=block_size
             )
             grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_impl(
                 grad_out_padded, grad_out_dtype, axis=0, block_size=block_size
             )
-            var_k_group_lens = padded_group_lens
-            var_k_group_offs = padded_group_offs
         else:
             # No padding needed, use original tensors
-            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(a, a_dtype, axis=0, block_size=block_size)
             grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_impl(
                 grad_out, grad_out_dtype, axis=0, block_size=block_size
             )
-            var_k_group_lens = group_lens
-            var_k_group_offs = group_offs
 
         lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
         lhs_scale, rhs_scale = (
