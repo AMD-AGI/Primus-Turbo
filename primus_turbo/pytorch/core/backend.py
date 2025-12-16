@@ -204,10 +204,13 @@ class AutoKernelDispatcher(ABC):
         best_time = float("inf")
         for backend in cls._backends.values():
             if backend.can_handle(**kwargs):
+                torch.cuda.synchronize()
                 try:
                     cur_time = cls.profile(backend, **kwargs)
                 except Exception:
                     cur_time = float("inf")
+                finally:
+                    torch.cuda.synchronize()
                 if cur_time < best_time:
                     best_time = cur_time
                     best_backend = backend
