@@ -5,6 +5,7 @@
 #include "extensions.h"
 #include "ffi.h"
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #define REGISTER_FFI_HANDLER(dict, name, fn) dict[#name] = ::primus_turbo::jax::EncapsulateFFI(fn);
 
@@ -63,6 +64,8 @@ PYBIND11_MODULE(_C, m) {
         .value("kFloat8E5M2", DType::kFloat8E5M2)
         .value("kFloat8E5M2FNUZ", DType::kFloat8E5M2FNUZ)
         .value("kFloat8E8M0", DType::kFloat8E8M0);
+
+    m.def("get_ck_grouped_gemm_workspace_size", &GetCKGroupedGemmWorkspaceSize);
 }
 
 } // namespace primus_turbo::jax

@@ -8,6 +8,10 @@
 
 namespace primus_turbo::jax {
 
+int64_t GetCKGroupedGemmWorkspaceSize(int32_t group_num) {
+    return get_ck_grouped_gemm_args_sizes(group_num);
+}
+
 // Get the number of compute units for grouped GEMM
 inline uint32_t get_grouped_gemm_num_cu(cudaStream_t stream, int64_t num_cu) {
     int device_id = 0;
@@ -72,32 +76,27 @@ inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_grouped_gemm
 // Grouped GEMM FFI Handler
 ffi::Error GroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
                           ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                          ffi::Result<ffi::AnyBuffer> c, bool transA, bool transB, int64_t num_cu) {
-    // Check input types
+                          ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
+                          bool transA, bool transB, int64_t num_cu) {
+    // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
-
     if (group_lens.element_type() != ffi::S64 || group_offs.element_type() != ffi::S64) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
 
     // Get dimensions
-    const int32_t group_num = static_cast<int32_t>(b.dimensions()[0]); // group_num == batch size
+    const int32_t group_num = static_cast<int32_t>(b.dimensions()[0]);
     const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
     const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
     const int32_t n         = transB ? b.dimensions()[1] : b.dimensions()[2];
 
-    // Allocate args workspace on GPU
-    const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_num);
-    void         *args_ptr   = nullptr;
-    hipMalloc(&args_ptr, args_sizes);
+    void *args_ptr = workspace->untyped_data();
 
-    // Get num_cu
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
-    // Call implementation based on dtype
     if (a.element_type() == ffi::F16) {
         using DataType = ck_tile::half_t;
         auto params    = make_ck_grouped_gemm_params<DataType, DataType, DataType>(
@@ -111,49 +110,39 @@ ffi::Error GroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer 
             num_cu_val);
         ck_grouped_gemm<DataType, DataType, DataType>(params);
     } else {
-        hipFree(args_ptr);
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "GroupedGemm only supports float16 and bfloat16");
     }
 
-    hipFree(args_ptr);
     return ffi::Error::Success();
 }
 
 // Grouped GEMM Variable K FFI Handler
 ffi::Error GroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
                                    ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                                   ffi::Result<ffi::AnyBuffer> c, bool transA, bool transB,
+                                   ffi::Result<ffi::AnyBuffer> c,
+                                   ffi::Result<ffi::AnyBuffer> workspace, bool transA, bool transB,
                                    int64_t num_cu) {
-    // Check input types
+    // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
-
     if (group_lens.element_type() != ffi::S64 || group_offs.element_type() != ffi::S64) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
-
-    // Only support transA=True, transB=False
     if (!transA || transB) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "grouped_gemm_variable_k only supports transA=True, transB=False");
     }
 
-    // Get dimensions
-    // For variable_k with transA=True, transB=False:
-    // a: [k, m] (will be transposed), b: [k, n]
-    // PyTorch logic: m = transA ? a.size(1) : a.size(0)
+    // a[k, m] * [k, n] -> [bs, m, n]
     const int32_t group_num = static_cast<int32_t>(group_lens.element_count());
-    const int32_t m         = a.dimensions()[1]; // transA=True, so m is a.dim[1]
-    const int32_t k         = a.dimensions()[0]; // transA=True, so k is a.dim[0]
-    const int32_t n         = b.dimensions()[1]; // transB=False, so n is b.dim[1]
+    const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
+    const int32_t n         = transB ? b.dimensions()[0] : b.dimensions()[1];
+    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
 
-    // Allocate args workspace on GPU
-    const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_num);
-    void         *args_ptr   = nullptr;
-    hipMalloc(&args_ptr, args_sizes);
+    void *args_ptr = workspace->untyped_data();
 
     // Get num_cu
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
@@ -172,12 +161,10 @@ ffi::Error GroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::A
             num_cu_val);
         ck_grouped_gemm_variable_k<DataType, DataType, DataType>(params);
     } else {
-        hipFree(args_ptr);
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "GroupedGemm only supports float16 and bfloat16");
     }
 
-    hipFree(args_ptr);
     return ffi::Error::Success();
 }
 
@@ -483,7 +470,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmHandler, GroupedGemmFFI,
                                   .Arg<ffi::AnyBuffer>()                    // b
                                   .Arg<ffi::AnyBuffer>()                    // group_lens
                                   .Arg<ffi::AnyBuffer>()                    // group_offs
-                                  .Ret<ffi::AnyBuffer>()                    // c
+                                  .Ret<ffi::AnyBuffer>()                    // c (output)
+                                  .Ret<ffi::AnyBuffer>()                    // workspace
                                   .Attr<bool>("transA")                     // transA
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu
@@ -503,7 +491,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmVariableKHandler, GroupedGemmVariableKF
                                   .Arg<ffi::AnyBuffer>()                    // b
                                   .Arg<ffi::AnyBuffer>()                    // group_lens
                                   .Arg<ffi::AnyBuffer>()                    // group_offs
-                                  .Ret<ffi::AnyBuffer>()                    // c
+                                  .Ret<ffi::AnyBuffer>()                    // c (output)
+                                  .Ret<ffi::AnyBuffer>()                    // workspace
                                   .Attr<bool>("transA")                     // transA
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu

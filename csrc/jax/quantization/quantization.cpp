@@ -3,7 +3,8 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/quantization.h"
-#include "../extensions.h"
+#include "jax/extensions.h"
+#include "jax/ffi.h"
 #include "primus_turbo/reduce.h"
 
 namespace primus_turbo::jax {

@@ -48,7 +48,8 @@ def grouped_gemm(a, b, group_lens, group_offs=None, transA=False, transB=False, 
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)
 
-    return grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
+    output, _ = grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
+    return output
 
 
 # Ref: https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html
@@ -59,7 +60,7 @@ def _grouped_gemm_fwd(a, b, group_lens, group_offs, transA, transB, num_cu):
     if group_offs is None:
         group_offs = compute_group_offs(group_lens)
 
-    c = grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
+    c, _ = grouped_gemm_p.bind(a, b, group_lens, group_offs, transA=transA, transB=transB, num_cu=num_cu)
     ctx = (a, b, group_lens, group_offs)
     return c, ctx
 
@@ -74,7 +75,7 @@ def _grouped_gemm_bwd(transA, transB, num_cu, ctx, grad_c):
     a, b, group_lens, group_offs = ctx
 
     # grad_a = grad_c @ b.T (or b if transB)
-    grad_a = grouped_gemm_p.bind(
+    grad_a, _ = grouped_gemm_p.bind(
         grad_c, b, group_lens, group_offs, transA=False, transB=not transB, num_cu=num_cu
     )
 
@@ -85,7 +86,7 @@ def _grouped_gemm_bwd(transA, transB, num_cu, ctx, grad_c):
     else:
         lhs, rhs = a, grad_c
 
-    grad_b = grouped_gemm_variable_k_p.bind(
+    grad_b, _ = grouped_gemm_variable_k_p.bind(
         lhs, rhs, group_lens, group_offs, transA=True, transB=False, num_cu=num_cu
     )
 
