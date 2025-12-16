@@ -47,7 +47,7 @@ class GroupedGEMMCKBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> torch.Tensor:
-        return torch.ops.primus_turbo_cpp_extension.grouped_gemm(
+        return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm(
             a, b, group_lens, group_offs, trans_a, trans_b, num_cu
         )
 
@@ -89,7 +89,7 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             trans_lhs, trans_rhs = trans_a, trans_b
-        return torch.ops.primus_turbo_cpp_extension.grouped_gemm_variable_k(
+        return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_variable_k(
             lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, num_cu
         )
 
