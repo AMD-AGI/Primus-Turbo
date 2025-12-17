@@ -15,7 +15,7 @@ from tests.jax.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref_fwd_bwd,
 )
-from tests.jax.test_utils import assert_close, compute_snr, get_tolerances
+from tests.jax.test_utils import assert_allclose, compute_snr, get_tolerances
 
 
 @pytest.mark.parametrize("B", [16, 32])
@@ -50,11 +50,10 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     # Reference
     out_ref, grad_a_ref, grad_b_ref = grouped_gemm_ref_fwd_bwd(a, b, group_lens, trans_b=trans_b)
 
-    # Check
     tol = get_tolerances(dtype)
-    assert_close(out, out_ref, **tol)
-    assert_close(grad_a, grad_a_ref, **tol)
-    assert_close(grad_b, grad_b_ref, **tol)
+    assert_allclose(out, out_ref, **tol)
+    assert_allclose(grad_a, grad_a_ref, **tol)
+    assert_allclose(grad_b, grad_b_ref, **tol)
     assert compute_snr(out_ref, out) > 50
     assert compute_snr(grad_a_ref, grad_a) > 50
     assert compute_snr(grad_b_ref, grad_b) > 50

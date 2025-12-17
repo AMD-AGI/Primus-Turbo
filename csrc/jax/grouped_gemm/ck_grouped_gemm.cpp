@@ -2,9 +2,9 @@
 //
 // See LICENSE for license information.
 
-#include "primus_turbo/grouped_gemm.h"
 #include "../extensions.h"
 #include "primus_turbo/arch.h"
+#include "primus_turbo/grouped_gemm.h"
 
 namespace primus_turbo::jax {
 
@@ -209,7 +209,8 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
                              ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
                              ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
                              ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
-                             bool transA, bool transB, int64_t num_cu, std::string_view granularity) {
+                             bool transA, bool transB, int64_t num_cu,
+                             std::string_view granularity) {
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
