@@ -50,11 +50,6 @@ def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, 
     # Get FP8 dtype
     a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
 
     # Quantize a and b (auto-scale)
     a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, ScalingGranularity.TENSORWISE)
@@ -72,7 +67,7 @@ def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, 
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="TENSORWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
     return out
 
@@ -82,11 +77,6 @@ def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, conf
     # Get FP8 dtype
     a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
 
     # Quantize a and b (auto-scale)
     a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, ScalingGranularity.TENSORWISE)
@@ -104,7 +94,7 @@ def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, conf
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="TENSORWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
 
     # Save for backward (don't save dtype - not a JAX type)
@@ -123,9 +113,6 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
     grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ScalingGranularity.TENSORWISE)
 
     # Compute grad_a: grad_out @ b.T (or grad_out @ b if trans_b)
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(a.dtype, "float16")
-
     grad_a, _ = grouped_gemm_fp8_p.bind(
         grad_out_fp8,
         b_fp8,
@@ -137,7 +124,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
         transB=not trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="TENSORWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
 
     # Compute grad_b: a.T @ grad_out (variable_k version)
@@ -147,9 +134,6 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
     else:
         lhs, rhs = a_fp8, grad_out_fp8
         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
-
-    dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
 
     grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
         lhs,
@@ -162,7 +146,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
         transB=False,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="TENSORWISE",
-        out_dtype_str=out_dtype_str_b,
+        out_dtype=b.dtype,
     )
 
     return grad_a, grad_b
@@ -182,11 +166,6 @@ def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num
     # Get FP8 dtype
     a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
 
     # Quantize a and b (row-wise)
     a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-1)
@@ -206,7 +185,7 @@ def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
     return out
 
@@ -216,11 +195,6 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
     # Get FP8 dtype
     a_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
     b_dtype = float8_e4m3 if config.format == Format.E4M3 else float8_e5m2
-    out_dtype = a.dtype
-
-    # Convert dtype to string for FFI
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(out_dtype, "float16")
 
     # Quantize a and b (row-wise for forward)
     a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-1)
@@ -239,7 +213,7 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
         transB=trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
 
     # Quantize a and b (col-wise for backward)
@@ -266,9 +240,6 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
     )
 
     # Compute grad_a
-    dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str = dtype_map.get(a.dtype, "float16")
-
     grad_a, _ = grouped_gemm_fp8_p.bind(
         grad_out_fp8_row,
         b_fp8_col,
@@ -280,7 +251,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
         transB=not trans_b,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="ROWWISE",
-        out_dtype_str=out_dtype_str,
+        out_dtype=a.dtype,
     )
 
     # Quantize grad_out (col-wise for grad_b)
@@ -296,9 +267,6 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
         lhs, rhs = a_fp8_col, grad_out_fp8_col
         lhs_scale, rhs_scale = a_scale_inv_col, grad_out_scale_inv_col
 
-    dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
-    out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
-
     grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
@@ -310,7 +278,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
         transB=False,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="ROWWISE",
-        out_dtype_str=out_dtype_str_b,
+        out_dtype=b.dtype,
     )
 
     return grad_a, grad_b

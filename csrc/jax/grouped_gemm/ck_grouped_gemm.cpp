@@ -209,8 +209,7 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
                              ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
                              ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
                              ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
-                             bool transA, bool transB, int64_t num_cu, std::string_view granularity,
-                             std::string_view out_dtype_str) {
+                             bool transA, bool transB, int64_t num_cu, std::string_view granularity) {
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -303,8 +302,7 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
                                       ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
                                       ffi::Result<ffi::AnyBuffer> c,
                                       ffi::Result<ffi::AnyBuffer> workspace, bool transA,
-                                      bool transB, int64_t num_cu, std::string_view granularity,
-                                      std::string_view out_dtype_str) {
+                                      bool transB, int64_t num_cu, std::string_view granularity) {
     // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
@@ -506,7 +504,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8Handler, GroupedGemmFP8FFI,
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu
                                   .Attr<std::string_view>("granularity")    // granularity
-                                  .Attr<std::string_view>("out_dtype_str")  // out_dtype_str
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler, GroupedGemmFP8VariableKFFI,
@@ -524,7 +521,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler, GroupedGemmFP8Vari
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu
                                   .Attr<std::string_view>("granularity")    // granularity
-                                  .Attr<std::string_view>("out_dtype_str")  // out_dtype_str
 );
 
 } // namespace primus_turbo::jax
