@@ -151,7 +151,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
     dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
 
-    grad_b = grouped_gemm_fp8_variable_k_p.bind(
+    grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
         lhs_scale,
@@ -299,7 +299,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
     dtype_map_b = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str_b = dtype_map_b.get(b.dtype, "float16")
 
-    grad_b = grouped_gemm_fp8_variable_k_p.bind(
+    grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
         lhs_scale,

@@ -16,6 +16,21 @@ int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num) {
     return get_ck_grouped_gemm_fp8_args_sizes(group_num);
 }
 
+// Align size to 128 bytes for optimal GPU memory access
+constexpr int64_t kWorkspaceAlignment = 128;
+
+inline int64_t align_size(int64_t size) {
+    return (size + kWorkspaceAlignment - 1) / kWorkspaceAlignment * kWorkspaceAlignment;
+}
+
+// Workspace size for FP8 Variable K: args + aq_expanded + bq_expanded (all aligned)
+int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num, int32_t m, int32_t n) {
+    int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
+    int64_t aq_size   = align_size(static_cast<int64_t>(group_num) * m * sizeof(float));
+    int64_t bq_size   = align_size(static_cast<int64_t>(group_num) * n * sizeof(float));
+    return args_size + aq_size + bq_size;
+}
+
 // Get the number of compute units for grouped GEMM
 inline uint32_t get_grouped_gemm_num_cu(cudaStream_t stream, int64_t num_cu) {
     int device_id = 0;
@@ -286,10 +301,11 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
 ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
                                       ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
                                       ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                                      ffi::Result<ffi::AnyBuffer> c, bool transA, bool transB,
-                                      int64_t num_cu, std::string_view granularity,
+                                      ffi::Result<ffi::AnyBuffer> c,
+                                      ffi::Result<ffi::AnyBuffer> workspace, bool transA,
+                                      bool transB, int64_t num_cu, std::string_view granularity,
                                       std::string_view out_dtype_str) {
-    // Check input types
+    // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -298,8 +314,6 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
-
-    // Only support transA=True, transB=False
     if (!transA || transB) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "grouped_gemm_fp8_variable_k only supports transA=True, transB=False");
@@ -311,10 +325,14 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
     const int32_t k         = a.dimensions()[0];
     const int32_t n         = b.dimensions()[1]; // transB=False
 
-    // Allocate args workspace on GPU
-    const int64_t args_sizes = get_ck_grouped_gemm_fp8_args_sizes(group_num);
-    void         *args_ptr   = nullptr;
-    hipMalloc(&args_ptr, args_sizes);
+    // Workspace layout: [args | aq_expanded | bq_expanded] (all aligned to 128 bytes)
+    const int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
+    const int64_t aq_size   = align_size(static_cast<int64_t>(group_num) * m * sizeof(float));
+
+    uint8_t *ws_ptr          = workspace->typed_data<uint8_t>();
+    void    *args_ptr        = ws_ptr;
+    float   *aq_expanded_ptr = reinterpret_cast<float *>(ws_ptr + args_size);
+    float   *bq_expanded_ptr = reinterpret_cast<float *>(ws_ptr + args_size + aq_size);
 
     // Get num_cu
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
@@ -322,10 +340,6 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
     // CRITICAL FIX: CK kernel expects scales to be [bs, m] and [bs, n]!
     // PyTorch does: a_scales.reshape({1, 1}).expand({bs, m})
     // We need to expand scalar scales to [bs, m] and [bs, n]
-
-    float *aq_expanded_ptr, *bq_expanded_ptr;
-    hipMalloc(&aq_expanded_ptr, group_num * m * sizeof(float));
-    hipMalloc(&bq_expanded_ptr, group_num * n * sizeof(float));
 
     const float *a_scale_data = a_scales.typed_data<float>();
     const float *b_scale_data = b_scales.typed_data<float>();
@@ -399,9 +413,6 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
         } else {
-            hipFree(aq_expanded_ptr);
-            hipFree(bq_expanded_ptr);
-            hipFree(args_ptr);
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
         }
@@ -433,23 +444,14 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
         } else {
-            hipFree(args_ptr);
-            hipFree(aq_expanded_ptr);
-            hipFree(bq_expanded_ptr);
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
         }
     } else {
-        hipFree(args_ptr);
-        hipFree(aq_expanded_ptr);
-        hipFree(bq_expanded_ptr);
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "GroupedGemmFP8 only supports fp8 e4m3 and e5m2");
     }
 
-    hipFree(args_ptr);
-    hipFree(aq_expanded_ptr);
-    hipFree(bq_expanded_ptr);
     return ffi::Error::Success();
 }
 
@@ -517,6 +519,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler, GroupedGemmFP8Vari
                                   .Arg<ffi::AnyBuffer>()                    // group_lens
                                   .Arg<ffi::AnyBuffer>()                    // group_offs
                                   .Ret<ffi::AnyBuffer>()                    // c
+                                  .Ret<ffi::AnyBuffer>()                    // workspace
                                   .Attr<bool>("transA")                     // transA
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu

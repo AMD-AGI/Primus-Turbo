@@ -12,7 +12,10 @@ from jax.core import ShapedArray
 from jax.extend.core import Primitive
 from jax.interpreters import xla
 
-from primus_turbo.jax._C import get_ck_grouped_gemm_fp8_workspace_size
+from primus_turbo.jax._C import (
+    get_ck_grouped_gemm_fp8_variable_k_workspace_size,
+    get_ck_grouped_gemm_fp8_workspace_size,
+)
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE
 
 # ----------------------------------------
@@ -22,7 +25,7 @@ grouped_gemm_fp8_p = Primitive("grouped_gemm_fp8")
 grouped_gemm_fp8_p.multiple_results = True
 
 grouped_gemm_fp8_variable_k_p = Primitive("grouped_gemm_fp8_variable_k")
-grouped_gemm_fp8_variable_k_p.multiple_results = False
+grouped_gemm_fp8_variable_k_p.multiple_results = True
 
 
 # ----------------------------------------
@@ -68,7 +71,12 @@ def _grouped_gemm_fp8_variable_k_abstract_eval(
     dtype_map = {"float16": jnp.float16, "bfloat16": jnp.bfloat16}
     out_dtype = dtype_map.get(out_dtype_str, jnp.bfloat16)
 
-    return ShapedArray((bs, m, n), out_dtype)
+    ws_size = get_ck_grouped_gemm_fp8_variable_k_workspace_size(bs, m, n)
+
+    out_aval = ShapedArray((bs, m, n), out_dtype)
+    ws_aval = ShapedArray((ws_size,), jnp.uint8)
+
+    return (out_aval, ws_aval)
 
 
 ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_abstract_eval
