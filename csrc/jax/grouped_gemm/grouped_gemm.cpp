@@ -12,6 +12,10 @@ int64_t GetCKGroupedGemmWorkspaceSize(int32_t group_num) {
     return get_ck_grouped_gemm_args_sizes(group_num);
 }
 
+int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num) {
+    return get_ck_grouped_gemm_fp8_args_sizes(group_num);
+}
+
 // Get the number of compute units for grouped GEMM
 inline uint32_t get_grouped_gemm_num_cu(cudaStream_t stream, int64_t num_cu) {
     int device_id = 0;
@@ -189,34 +193,25 @@ ffi::Error ComputeGroupOffsFFI(cudaStream_t stream, ffi::AnyBuffer group_lens,
 ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
                              ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
                              ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                             ffi::Result<ffi::AnyBuffer> c, bool transA, bool transB,
-                             int64_t num_cu, std::string_view granularity,
+                             ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
+                             bool transA, bool transB, int64_t num_cu, std::string_view granularity,
                              std::string_view out_dtype_str) {
-    // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
-
     if (group_lens.element_type() != ffi::S64 || group_offs.element_type() != ffi::S64) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
 
-    // Get dimensions
     const int32_t group_num = static_cast<int32_t>(b.dimensions()[0]);
     const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
     const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
     const int32_t n         = transB ? b.dimensions()[1] : b.dimensions()[2];
 
-    // Allocate args workspace on GPU
-    const int64_t args_sizes = get_ck_grouped_gemm_fp8_args_sizes(group_num);
-    void         *args_ptr   = nullptr;
-    hipMalloc(&args_ptr, args_sizes);
-
-    // Get num_cu
+    void    *args_ptr   = workspace->untyped_data();
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
-    // Call implementation based on dtype
     if (a.element_type() == ffi::F8E4M3FNUZ || a.element_type() == ffi::F8E4M3FN) {
         using AType             = ck_tile::fp8_t;
         using BType             = ck_tile::fp8_t;
@@ -245,7 +240,6 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
         } else {
-            hipFree(args_ptr);
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
         }
@@ -277,17 +271,14 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
         } else {
-            hipFree(args_ptr);
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
         }
     } else {
-        hipFree(args_ptr);
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "GroupedGemmFP8 only supports fp8 e4m3 and e5m2");
     }
 
-    hipFree(args_ptr);
     return ffi::Error::Success();
 }
 
@@ -508,6 +499,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8Handler, GroupedGemmFP8FFI,
                                   .Arg<ffi::AnyBuffer>()                    // group_lens
                                   .Arg<ffi::AnyBuffer>()                    // group_offs
                                   .Ret<ffi::AnyBuffer>()                    // c
+                                  .Ret<ffi::AnyBuffer>()                    // workspace
                                   .Attr<bool>("transA")                     // transA
                                   .Attr<bool>("transB")                     // transB
                                   .Attr<int64_t>("num_cu")                  // num_cu

@@ -61,7 +61,7 @@ def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, 
     b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
 
     # Forward pass
-    out = grouped_gemm_fp8_p.bind(
+    out, _ = grouped_gemm_fp8_p.bind(
         a_fp8,
         b_fp8,
         a_scale_inv,
@@ -93,7 +93,7 @@ def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, conf
     b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
 
     # Forward pass
-    out = grouped_gemm_fp8_p.bind(
+    out, _ = grouped_gemm_fp8_p.bind(
         a_fp8,
         b_fp8,
         a_scale_inv,
@@ -126,7 +126,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
     dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str = dtype_map.get(a.dtype, "float16")
 
-    grad_a = grouped_gemm_fp8_p.bind(
+    grad_a, _ = grouped_gemm_fp8_p.bind(
         grad_out_fp8,
         b_fp8,
         grad_out_scale_inv,
@@ -195,7 +195,7 @@ def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num
     )
 
     # Forward pass
-    out = grouped_gemm_fp8_p.bind(
+    out, _ = grouped_gemm_fp8_p.bind(
         a_fp8_row,
         b_fp8_row,
         a_scale_inv_row,
@@ -228,7 +228,7 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
         b, b_dtype, ScalingGranularity.ROWWISE, axis=(-1 if trans_b else -2)
     )
     # Forward pass
-    out = grouped_gemm_fp8_p.bind(
+    out, _ = grouped_gemm_fp8_p.bind(
         a_fp8_row,
         b_fp8_row,
         a_scale_inv_row,
@@ -240,7 +240,7 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
         num_cu=num_cu if num_cu is not None else -1,
         granularity="ROWWISE",
         out_dtype_str=out_dtype_str,
-    ).astype(out_dtype)
+    )
 
     # Quantize a and b (col-wise for backward)
     a_fp8_col, a_scale_inv_col = quantize_fp8(a, a_dtype, ScalingGranularity.ROWWISE, axis=-2)
@@ -269,7 +269,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
     dtype_map = {jnp.float16: "float16", jnp.bfloat16: "bfloat16", jnp.float32: "float32"}
     out_dtype_str = dtype_map.get(a.dtype, "float16")
 
-    grad_a = grouped_gemm_fp8_p.bind(
+    grad_a, _ = grouped_gemm_fp8_p.bind(
         grad_out_fp8_row,
         b_fp8_col,
         grad_out_scale_inv_row,

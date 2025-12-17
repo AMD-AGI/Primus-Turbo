@@ -66,6 +66,7 @@ PYBIND11_MODULE(_C, m) {
         .value("kFloat8E8M0", DType::kFloat8E8M0);
 
     m.def("get_ck_grouped_gemm_workspace_size", &GetCKGroupedGemmWorkspaceSize);
+    m.def("get_ck_grouped_gemm_fp8_workspace_size", &GetCKGroupedGemmFP8WorkspaceSize);
 }
 
 } // namespace primus_turbo::jax

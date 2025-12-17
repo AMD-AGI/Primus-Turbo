@@ -8,47 +8,39 @@ import jax
 import jax.numpy as jnp
 
 
-def grouped_gemm_ref(a, b, group_lens, trans_b=True):
-    """Reference implementation of grouped GEMM using JAX ops."""
-    group_lens_np = jnp.array(group_lens)
+def _grouped_gemm_ref_impl(a, b, group_lens_tuple, trans_b):
     out = []
     start = 0
-    for i in range(len(group_lens_np)):
-        size = int(group_lens_np[i])
-        rhs = b[i, :, :].T if trans_b else b[i, :, :]
-        out.append(a[start : start + size, :] @ rhs)
+    for i, size in enumerate(group_lens_tuple):
+        rhs = b[i].T if trans_b else b[i]
+        out.append(a[start : start + size] @ rhs)
         start += size
     return jnp.concatenate(out, axis=0)
 
 
-def grouped_gemm_variable_k_ref(a, b, group_lens, trans_a=True, trans_b=False):
-    """Reference implementation of grouped GEMM with variable K."""
-    assert trans_a == True and trans_b == False, "Only trans_a=True and trans_b=False are supported."
-    group_lens_np = jnp.array(group_lens)
-    B = len(group_lens_np)
-    M = a.shape[1]
-    N = b.shape[1]
-    out = jnp.zeros((B, M, N), dtype=a.dtype)
-    start = 0
-    for i in range(B):
-        size = int(group_lens_np[i])
-        a_tmp = a[start : start + size, :].T
-        b_tmp = b[start : start + size, :]
-        out_tmp = a_tmp @ b_tmp
-        out = out.at[i].set(out_tmp)
-        start += size
-    return out
+def _grouped_gemm_ref_fwd_bwd_impl(a, b, group_lens_tuple, trans_b):
+    def loss_fn(a, b):
+        out = _grouped_gemm_ref_impl(a, b, group_lens_tuple, trans_b)
+        return jnp.sum(out), out
+
+    (_, out), (grad_a, grad_b) = jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)(a, b)
+    return out, grad_a, grad_b
+
+
+_grouped_gemm_ref_fwd_bwd_jit = jax.jit(_grouped_gemm_ref_fwd_bwd_impl, static_argnums=(2, 3))
+
+
+def grouped_gemm_ref_fwd_bwd(a, b, group_lens, trans_b=True):
+    group_lens_tuple = tuple(int(x) for x in group_lens)
+    return _grouped_gemm_ref_fwd_bwd_jit(a, b, group_lens_tuple, trans_b)
 
 
 def generate_grouped_gemm_group_lens(b, m, balance=True):
-    """Generate group lengths."""
     if balance:
         return jnp.full((b,), m, dtype=jnp.int64)
-    else:
-        key = jax.random.PRNGKey(42)
-        dist = 0.2 + 0.8 * jax.random.uniform(key, (b,))
-        dist = dist / dist.sum()
-        group_lens = (dist * b * m).astype(jnp.int64)
-        error = b * m - group_lens.sum()
-        group_lens = group_lens.at[-1].add(error)
-        return group_lens
+    key = jax.random.PRNGKey(42)
+    dist = 0.2 + 0.8 * jax.random.uniform(key, (b,))
+    dist = dist / dist.sum()
+    group_lens = (dist * b * m).astype(jnp.int64)
+    group_lens = group_lens.at[-1].add(b * m - group_lens.sum())
+    return group_lens

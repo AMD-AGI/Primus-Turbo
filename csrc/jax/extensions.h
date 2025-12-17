@@ -30,6 +30,7 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8Handler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler);
 
 int64_t GetCKGroupedGemmWorkspaceSize(int32_t group_num);
+int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num);
 
 //==================================================================
 //  Quantization

@@ -84,3 +84,17 @@ def compute_snr(x: jnp.ndarray, y: jnp.ndarray):
     noise_power = jnp.linalg.norm(x - y) ** 2
     snr = 10 * jnp.log10(signal_power / (noise_power + 1e-12))
     return float(snr)
+
+
+def assert_close(actual, expected, rtol=1e-5, atol=1e-8):
+    """Assert two arrays are close, similar to torch.testing.assert_close."""
+    actual = jnp.asarray(actual).astype(jnp.float32)
+    expected = jnp.asarray(expected).astype(jnp.float32)
+    diff = jnp.abs(actual - expected)
+    tol = atol + rtol * jnp.abs(expected)
+    max_diff = float(jnp.max(diff))
+    max_tol = float(jnp.max(tol))
+    if not jnp.all(diff <= tol):
+        raise AssertionError(
+            f"Arrays not close: max_diff={max_diff:.6e}, max_tol={max_tol:.6e}, " f"rtol={rtol}, atol={atol}"
+        )
