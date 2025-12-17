@@ -40,6 +40,8 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(QuantizeFP8TensorwiseHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(DequantizeFP8TensorwiseHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(QuantizeFP8RowwiseHandler);
 
+int64_t GetQuantizeFP8TensorwiseWorkspaceSize(int64_t n);
+
 //==================================================================
 //  DeepEP
 //==================================================================

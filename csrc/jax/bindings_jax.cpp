@@ -69,6 +69,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("get_ck_grouped_gemm_fp8_workspace_size", &GetCKGroupedGemmFP8WorkspaceSize);
     m.def("get_ck_grouped_gemm_fp8_variable_k_workspace_size",
           &GetCKGroupedGemmFP8VariableKWorkspaceSize);
+
+    // Quantization workspace sizes
+    m.def("get_quantize_fp8_tensorwise_workspace_size", &GetQuantizeFP8TensorwiseWorkspaceSize);
 }
 
 } // namespace primus_turbo::jax
