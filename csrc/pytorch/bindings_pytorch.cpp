@@ -73,9 +73,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm);
     m.impl("ck_grouped_gemm_variable_k", ck_grouped_gemm_variable_k);
+    m.impl("ck_grouped_gemm_variable_k_2", ck_grouped_gemm_variable_k_2);
     m.impl("ck_grouped_gemm_fp8", ck_grouped_gemm_fp8);
     m.impl("ck_grouped_gemm_fp8_variable_k", ck_grouped_gemm_fp8_variable_k);
-    m.impl("ck_grouped_gemm_fp8_variable_k_2", ck_grouped_gemm_fp8_variable_k_2);
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
 }

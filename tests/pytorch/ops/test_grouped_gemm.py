@@ -85,3 +85,17 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     # Reset config and caches
     GlobalBackendManager.reset()
+
+
+if __name__ == "__main__":
+    test_grouped_gemm_func(
+        B=1,
+        M=128,
+        N_K=(2048, 1536),
+        dtype=torch.bfloat16,
+        balance=True,
+        trans_b=True,
+        reduce_num_cu=0,
+        backend=BackendType.CK,
+        auto_tune=False,
+    )
