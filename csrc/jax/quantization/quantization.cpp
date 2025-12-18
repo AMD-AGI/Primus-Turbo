@@ -8,6 +8,9 @@
 #include "jax/utils.h"
 #include "primus_turbo/reduce.h"
 
+#include <functional>
+#include <numeric>
+
 namespace primus_turbo::jax {
 
 using namespace primus_turbo::dtype;
@@ -29,17 +32,16 @@ inline void compute_scale_inv_gpu(const float *scale, float *scale_inv, int64_t 
                        n);
 }
 
-// TODO: Check correctness
 float get_float8_max(ffi::DataType dtype) {
-    if (dtype == ffi::F8E4M3FN) {
+    switch (dtype) {
+    case ffi::F8E4M3FN:
         return 448.0f;
-    } else if (dtype == ffi::F8E4M3FNUZ) {
+    case ffi::F8E4M3FNUZ:
         return 240.0f;
-    } else if (dtype == ffi::F8E5M2) {
+    case ffi::F8E5M2:
+    case ffi::F8E5M2FNUZ:
         return 57344.0f;
-    } else if (dtype == ffi::F8E5M2FNUZ) {
-        return 57344.0f;
-    } else {
+    default:
         return 1.0f;
     }
 }
@@ -60,18 +62,45 @@ int64_t GetQuantizeFP8TensorwiseWorkspaceSize(int64_t n) {
     return amax_size + reduce_ws_size + scale_size;
 }
 
+// Workspace size for rowwise quantization (when scale is not provided)
+int64_t GetQuantizeFP8RowwiseWorkspaceSize(const std::vector<int64_t> &shape, int64_t axis) {
+    int64_t ndim         = static_cast<int64_t>(shape.size());
+    int64_t valid_axis   = (axis >= 0) ? axis : ndim + axis;
+    bool    is_row_major = (valid_axis == ndim - 1);
+
+    if (is_row_major) {
+        // Row-major: workspace = [temp_scale (aligned)]
+        int64_t n = 1;
+        for (auto dim : shape)
+            n *= dim;
+        int64_t outer_len = n / shape[valid_axis];
+        return align_size(outer_len * sizeof(float));
+    } else {
+        // Col-major: workspace = [amax (aligned) | reduce_ws (aligned) | temp_scale (aligned)]
+        int64_t B = 1, M = shape[valid_axis], N = 1;
+        for (int64_t i = 0; i < valid_axis; ++i)
+            B *= shape[i];
+        for (int64_t i = valid_axis + 1; i < ndim; ++i)
+            N *= shape[i];
+
+        const int64_t amax_size      = align_size(B * N * sizeof(float));
+        const int64_t reduce_ws_size = align_size(get_reduce_col_workspace_sizes<float>(B, M, N));
+        const int64_t scale_size     = align_size(B * N * sizeof(float));
+        return amax_size + reduce_ws_size + scale_size;
+    }
+}
+
 // Helper to compute BMN dimensions for rowwise quantization
-inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &input_shape, int64_t axis,
+inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, int64_t axis,
                                              int64_t &B, int64_t &M, int64_t &N) {
-    B = 1;
-    for (int64_t i = 0; i < axis; ++i) {
-        B *= input_shape[i];
-    }
-    M = input_shape[axis];
-    N = 1;
-    for (size_t i = axis + 1; i < input_shape.size(); ++i) {
-        N *= input_shape[i];
-    }
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    auto          prod = [&](int64_t start, int64_t end) {
+        return std::accumulate(shape.begin() + start, shape.begin() + end, int64_t{1},
+                                        std::multiplies<int64_t>());
+    };
+    B = prod(0, axis);
+    M = shape[axis];
+    N = prod(axis + 1, ndim);
 }
 
 // Tensorwise Quantize FP8 FFI
@@ -150,7 +179,8 @@ ffi::Error DequantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input,
 ffi::Error QuantizeFP8RowwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64_t axis,
                                  ffi::Buffer<ffi::DataType::F32>              scale_opt,
                                  ffi::Result<ffi::AnyBuffer>                  output,
-                                 ffi::Result<ffi::Buffer<ffi::DataType::F32>> scale_inv_out) {
+                                 ffi::Result<ffi::Buffer<ffi::DataType::F32>> scale_inv_out,
+                                 ffi::Result<ffi::AnyBuffer>                  workspace) {
 
     auto                 input_shape = input.dimensions();
     std::vector<int64_t> shape_vec(input_shape.begin(), input_shape.end());
@@ -213,14 +243,8 @@ ffi::Error QuantizeFP8RowwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64
             const int64_t inner_len     = input_shape[valid_axis];
             const int64_t outer_len_val = input.element_count() / inner_len;
 
-            // The kernel writes to scale_ptr in auto-scale mode (PreComputeScale=false)
-            // Allocate a temporary buffer for it
-            float     *temp_scale = nullptr;
-            hipError_t alloc_err  = hipMalloc(&temp_scale, outer_len_val * sizeof(float));
-            if (alloc_err != hipSuccess) {
-                return ffi::Error(ffi::ErrorCode::kInternal,
-                                  "Failed to allocate temp scale buffer");
-            }
+            // Use workspace for temp_scale
+            float *temp_scale = reinterpret_cast<float *>(workspace->untyped_data());
 
             FFI_TYPE_SWITCH_FP16_BF16_FP32(input_dtype, FType, {
                 FFI_TYPE_SWITCH_FP8(output_dtype, QType, {
@@ -229,45 +253,28 @@ ffi::Error QuantizeFP8RowwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64
                         reinterpret_cast<QType *>(output_buf), outer_len_val, inner_len, stream);
                 });
             });
-
-            hipFree(temp_scale);
         } else {
             // Col-major: requires reduce-col to compute amax, then compute scale
             int64_t B, M, N;
             compute_quantize_fp8_rowwise_bmn(shape_vec, valid_axis, B, M, N);
 
-            // Allocate amax buffer (same shape as scale_inv)
-            float     *amax_ptr       = nullptr;
-            hipError_t amax_alloc_err = hipMalloc(&amax_ptr, B * N * sizeof(float));
-            if (amax_alloc_err != hipSuccess) {
-                return ffi::Error(ffi::ErrorCode::kInternal, "Failed to allocate amax buffer");
-            }
+            // Workspace layout: [amax (aligned) | reduce_workspace (aligned) | temp_scale
+            // (aligned)]
+            const int64_t amax_size = align_size(B * N * sizeof(float));
+            const int64_t reduce_ws_size =
+                align_size(get_reduce_col_workspace_sizes<float>(B, M, N));
 
-            // Allocate workspace for reduce
-            const int64_t ws_size       = get_reduce_col_workspace_sizes<float>(B, M, N);
-            void         *workspace_ptr = nullptr;
-            hipError_t    ws_alloc_err  = hipMalloc(&workspace_ptr, ws_size);
-            if (ws_alloc_err != hipSuccess) {
-                hipFree(amax_ptr);
-                return ffi::Error(ffi::ErrorCode::kInternal, "Failed to allocate workspace");
-            }
+            uint8_t *ws_ptr        = workspace->typed_data<uint8_t>();
+            float   *amax_ptr      = reinterpret_cast<float *>(ws_ptr);
+            void    *reduce_ws_ptr = ws_ptr + amax_size;
+            float   *temp_scale    = reinterpret_cast<float *>(ws_ptr + amax_size + reduce_ws_size);
 
             // Step 1: Reduce-Col to compute amax
             FFI_TYPE_SWITCH_FP16_BF16_FP32(input_dtype, InT, {
                 reduce_col<InT, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
                                               reinterpret_cast<const InT *>(input_buf), amax_ptr, B,
-                                              M, N, ws_size, workspace_ptr, stream);
+                                              M, N, reduce_ws_size, reduce_ws_ptr, stream);
             });
-
-            // Allocate temp_scale buffer
-            float     *temp_scale      = nullptr;
-            hipError_t scale_alloc_err = hipMalloc(&temp_scale, B * N * sizeof(float));
-            if (scale_alloc_err != hipSuccess) {
-                hipFree(amax_ptr);
-                hipFree(workspace_ptr);
-                return ffi::Error(ffi::ErrorCode::kInternal,
-                                  "Failed to allocate temp scale buffer");
-            }
 
             // Step 2: Compute scale from amax
             float fp8_max = get_float8_max(output_dtype);
@@ -282,11 +289,6 @@ ffi::Error QuantizeFP8RowwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64
                         reinterpret_cast<QType *>(output_buf), B, M, N, stream);
                 });
             });
-
-            // Cleanup
-            hipFree(amax_ptr);
-            hipFree(workspace_ptr);
-            hipFree(temp_scale);
         }
     }
 
@@ -320,6 +322,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(QuantizeFP8RowwiseHandler, QuantizeFP8RowwiseFFI,
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()  // scale_opt
                                   .Ret<ffi::AnyBuffer>()                   // output (fp8)
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()  // scale_inv
+                                  .Ret<ffi::AnyBuffer>()                   // workspace
 );
 
 } // namespace primus_turbo::jax

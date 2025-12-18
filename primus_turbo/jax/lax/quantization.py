@@ -38,7 +38,8 @@ def quantize_fp8(
     elif granularity == ScalingGranularity.ROWWISE:
         if axis is None:
             raise ValueError("axis must be specified for rowwise FP8 quantization")
-        return quantize_fp8_rowwise_p.bind(x, scale_opt, out_dtype=out_dtype, axis=axis)
+        x_q, scale_inv, _ = quantize_fp8_rowwise_p.bind(x, scale_opt, out_dtype=out_dtype, axis=axis)
+        return x_q, scale_inv
 
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

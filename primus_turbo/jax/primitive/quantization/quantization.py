@@ -12,7 +12,10 @@ from jax.core import ShapedArray
 from jax.extend.core import Primitive
 from jax.interpreters import xla
 
-from primus_turbo.jax._C import get_quantize_fp8_tensorwise_workspace_size
+from primus_turbo.jax._C import (
+    get_quantize_fp8_rowwise_workspace_size,
+    get_quantize_fp8_tensorwise_workspace_size,
+)
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE
 
 __all__ = [
@@ -67,9 +70,17 @@ ABSTRACT_EVAL_TABLE[dequantize_fp8_tensorwise_p] = _dequantize_fp8_tensorwise_ab
 
 
 def _quantize_fp8_rowwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype, axis):
+    valid_axis = axis if axis >= 0 else len(input_aval.shape) + axis
     scale_inv_shape = list(input_aval.shape)
-    scale_inv_shape[axis] = 1
-    return (ShapedArray(input_aval.shape, out_dtype), ShapedArray(tuple(scale_inv_shape), jnp.float32))
+    scale_inv_shape[valid_axis] = 1
+
+    ws_size = get_quantize_fp8_rowwise_workspace_size(list(input_aval.shape), axis)
+
+    return (
+        ShapedArray(input_aval.shape, out_dtype),
+        ShapedArray(tuple(scale_inv_shape), jnp.float32),
+        ShapedArray((ws_size,), jnp.uint8),
+    )
 
 
 ABSTRACT_EVAL_TABLE[quantize_fp8_rowwise_p] = _quantize_fp8_rowwise_abstract_eval
