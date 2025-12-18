@@ -86,12 +86,15 @@ PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
 ### 3. Testing
 
 ```bash
-# Single-process mode (runs all tests)
-pytest tests/pytorch/
-
-# Multi-process mode (need both commands for full coverage)
+# PyTorch tests
+pytest tests/pytorch/             # single-process mode (runs all tests)
 pytest tests/pytorch/ -n 8        # single-GPU tests in parallel
-pytest tests/pytorch/ --dist-only # distributed tests (skipped by -n)
+pytest tests/pytorch/ --dist-only # multi-GPU tests only
+
+# JAX tests
+pytest tests/jax/                 # single-process mode (runs all tests)
+pytest tests/jax/ -n 8            # single-GPU tests in parallel
+pytest tests/jax/ --dist-only     # multi-GPU tests only
 ```
 
 ### 4. Packaging
