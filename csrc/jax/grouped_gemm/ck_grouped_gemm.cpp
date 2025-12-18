@@ -23,12 +23,10 @@ inline int64_t align_size(int64_t size) {
     return (size + kWorkspaceAlignment - 1) / kWorkspaceAlignment * kWorkspaceAlignment;
 }
 
-// Workspace size for FP8 Variable K: args + aq_expanded + bq_expanded (all aligned)
+// Workspace size for FP8 Variable K: args only (aligned)
 int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num, int32_t m, int32_t n) {
     int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
-    int64_t aq_size   = align_size(static_cast<int64_t>(group_num) * m * sizeof(float));
-    int64_t bq_size   = align_size(static_cast<int64_t>(group_num) * n * sizeof(float));
-    return args_size + aq_size + bq_size;
+    return args_size;
 }
 
 // Get the number of compute units for grouped GEMM
@@ -324,64 +322,14 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
     const int32_t k         = a.dimensions()[0];
     const int32_t n         = b.dimensions()[1]; // transB=False
 
-    // Workspace layout: [args | aq_expanded | bq_expanded] (all aligned to 128 bytes)
+    // Workspace layout: [args] (aligned to 128 bytes)
     const int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
-    const int64_t aq_size   = align_size(static_cast<int64_t>(group_num) * m * sizeof(float));
 
-    uint8_t *ws_ptr          = workspace->typed_data<uint8_t>();
-    void    *args_ptr        = ws_ptr;
-    float   *aq_expanded_ptr = reinterpret_cast<float *>(ws_ptr + args_size);
-    float   *bq_expanded_ptr = reinterpret_cast<float *>(ws_ptr + args_size + aq_size);
+    uint8_t *ws_ptr   = workspace->typed_data<uint8_t>();
+    void    *args_ptr = ws_ptr;
 
     // Get num_cu
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
-
-    // CRITICAL FIX: CK kernel expects scales to be [bs, m] and [bs, n]!
-    // PyTorch does: a_scales.reshape({1, 1}).expand({bs, m})
-    // We need to expand scalar scales to [bs, m] and [bs, n]
-
-    const float *a_scale_data = a_scales.typed_data<float>();
-    const float *b_scale_data = b_scales.typed_data<float>();
-
-    if (granularity == "TENSORWISE") {
-        // Tensorwise: scalar scale -> expand to [bs, m] and [bs, n]
-        float a_scale_val, b_scale_val;
-        hipMemcpy(&a_scale_val, a_scale_data, sizeof(float), hipMemcpyDeviceToHost);
-        hipMemcpy(&b_scale_val, b_scale_data, sizeof(float), hipMemcpyDeviceToHost);
-
-        std::vector<float> aq_host(group_num * m, a_scale_val);
-        std::vector<float> bq_host(group_num * n, b_scale_val);
-        hipMemcpy(aq_expanded_ptr, aq_host.data(), group_num * m * sizeof(float),
-                  hipMemcpyHostToDevice);
-        hipMemcpy(bq_expanded_ptr, bq_host.data(), group_num * n * sizeof(float),
-                  hipMemcpyHostToDevice);
-    } else {
-        // Rowwise: [m] -> [bs, m], [n] -> [bs, n]
-        for (int64_t bs_idx = 0; bs_idx < group_num; bs_idx++) {
-            hipMemcpy(aq_expanded_ptr + bs_idx * m, a_scale_data, m * sizeof(float),
-                      hipMemcpyDeviceToDevice);
-            hipMemcpy(bq_expanded_ptr + bs_idx * n, b_scale_data, n * sizeof(float),
-                      hipMemcpyDeviceToDevice);
-        }
-    }
-
-    // Manually create XLA_FFI_Buffer structs for expanded scales
-    XLA_FFI_Buffer a_scales_expanded_buf, b_scales_expanded_buf;
-
-    a_scales_expanded_buf.data  = aq_expanded_ptr;
-    a_scales_expanded_buf.dtype = XLA_FFI_DataType_F32;
-    int64_t aq_dims[2]          = {group_num, m};
-    a_scales_expanded_buf.dims  = aq_dims;
-    a_scales_expanded_buf.rank  = 2;
-
-    b_scales_expanded_buf.data  = bq_expanded_ptr;
-    b_scales_expanded_buf.dtype = XLA_FFI_DataType_F32;
-    int64_t bq_dims[2]          = {group_num, n};
-    b_scales_expanded_buf.dims  = bq_dims;
-    b_scales_expanded_buf.rank  = 2;
-
-    ffi::AnyBuffer a_scales_expanded(&a_scales_expanded_buf);
-    ffi::AnyBuffer b_scales_expanded(&b_scales_expanded_buf);
 
     // Call implementation based on dtype
     if (a.element_type() == ffi::F8E4M3FNUZ || a.element_type() == ffi::F8E4M3FN) {
@@ -392,8 +340,8 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
         if (out_dtype == ffi::F16) {
             using CType = ck_tile::half_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
-                args_ptr, a, b, c, a_scales_expanded, b_scales_expanded, group_lens, group_offs,
-                transA, transB, group_num, m, n, k, stream, num_cu_val);
+                args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
+                group_num, m, n, k, stream, num_cu_val);
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
@@ -403,8 +351,8 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
-                args_ptr, a, b, c, a_scales_expanded, b_scales_expanded, group_lens, group_offs,
-                transA, transB, group_num, m, n, k, stream, num_cu_val);
+                args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
+                group_num, m, n, k, stream, num_cu_val);
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
@@ -423,8 +371,8 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
         if (out_dtype == ffi::F16) {
             using CType = ck_tile::half_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
-                args_ptr, a, b, c, a_scales_expanded, b_scales_expanded, group_lens, group_offs,
-                transA, transB, group_num, m, n, k, stream, num_cu_val);
+                args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
+                group_num, m, n, k, stream, num_cu_val);
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
@@ -434,8 +382,8 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
-                args_ptr, a, b, c, a_scales_expanded, b_scales_expanded, group_lens, group_offs,
-                transA, transB, group_num, m, n, k, stream, num_cu_val);
+                args_ptr, a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB,
+                group_num, m, n, k, stream, num_cu_val);
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);

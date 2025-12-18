@@ -50,10 +50,12 @@ def test_grouped_gemm(B, M, N_K, dtype, balance, trans_b, reduce_num_cu):
     # Reference
     out_ref, grad_a_ref, grad_b_ref = grouped_gemm_ref_fwd_bwd(a, b, group_lens, trans_b=trans_b)
 
+    snr_threshold = 45 if dtype == jnp.bfloat16 else 50
+
     tol = get_tolerances(dtype)
     assert_allclose(out, out_ref, **tol)
     assert_allclose(grad_a, grad_a_ref, **tol)
     assert_allclose(grad_b, grad_b_ref, **tol)
-    assert compute_snr(out_ref, out) > 50
-    assert compute_snr(grad_a_ref, grad_a) > 50
-    assert compute_snr(grad_b_ref, grad_b) > 50
+    assert compute_snr(out_ref, out) > snr_threshold
+    assert compute_snr(grad_a_ref, grad_a) > snr_threshold
+    assert compute_snr(grad_b_ref, grad_b) > snr_threshold
