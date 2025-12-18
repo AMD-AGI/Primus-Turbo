@@ -85,6 +85,10 @@ void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
 void ck_grouped_gemm_variable_k(const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params);
 
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
+void ck_grouped_gemm_variable_k_2(
+    const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params);
+
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           ck_tile::QuantType QuantMode>
 void ck_grouped_gemm_fp8(

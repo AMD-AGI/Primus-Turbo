@@ -367,6 +367,51 @@ void ck_grouped_gemm_variable_k(
     }
 }
 
+template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
+void ck_grouped_gemm_variable_k_2(
+    const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params) {
+    const ck_tile::index_t k_batch = 1;
+    const bool             splitk  = k_batch > 1;
+
+    const ck_tile::index_t strideA = params.transA ? params.m : params.k;
+    const ck_tile::index_t strideB = params.transB ? params.k : params.n;
+    const ck_tile::index_t strideC = params.m;
+
+    {
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
+        const int grids   = (params.group_num + threads - 1) / threads;
+        compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
+            <<<grids, threads, 0, params.stream>>>(
+                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
+                params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
+                params.transA, params.transB, params.group_num, params.m, params.n, strideA,
+                strideB, strideC, k_batch);
+    }
+
+    const auto stream_cfg = ck_tile::stream_config{params.stream};
+    using CLayout         = ColMajor;
+    std::unique_ptr<CKGroupedGemmRunnerInterFace> runner;
+    if (params.transA && !params.transB) { // TN
+        using ALayout = RowMajor;
+        using BLayout = ColMajor;
+        runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
+                                              BLayout, CLayout, ck_tile::QuantType::TensorQuant>(
+            params.group_num, params.m, params.n, params.k);
+    } else {
+        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
+    }
+    runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
+
+    // Postprocess
+    {
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
+        const int grids   = (params.group_num + threads - 1) / threads;
+        grouped_gemm_variable_k_postprocess<CDataType><<<grids, threads, 0, params.stream>>>(
+            params.c_ptr, params.group_lens_ptr, params.group_offs_ptr, params.group_num, params.m,
+            params.n);
+    }
+}
+
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           ck_tile::QuantType QuantMode>
 void ck_grouped_gemm_fp8_variable_k(

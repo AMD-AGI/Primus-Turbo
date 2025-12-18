@@ -309,6 +309,55 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
     return c;
 }
 
+at::Tensor ck_grouped_gemm_variable_k_2(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                                        at::Tensor &group_offs, const bool transA,
+                                        const bool transB, c10::optional<int64_t> num_cu) {
+    // TODO: output datatype
+    auto out_dtype = a.scalar_type();
+    printf("test3\r\n");
+    // Check
+    PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()));
+    PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()));
+    PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
+    PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
+    PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
+
+    // Alloc args workspace
+    const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
+    at::Tensor    args_tensor =
+        at::empty({args_sizes}, at::TensorOptions().dtype(at::kByte).device(group_lens.device()));
+
+    // Determine output tensor size based on transA and transB
+    const int64_t bs = group_lens.numel();
+    const int64_t m  = transA ? a.size(1) : a.size(0);
+    const int64_t n  = transB ? b.size(0) : b.size(1);
+    const int64_t k  = transA ? a.size(0) : a.size(1);
+    at::Tensor    c  = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kCUDA));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (a.dtype() == at::kHalf) {
+        using AType = typename TorchToCKTileType<at::kHalf>::type;
+        using BType = AType;
+        using CType = AType;
+        auto params = make_ck_groued_gemm_params<AType, BType, CType>(
+            args_tensor.data_ptr(), b, a, c, group_lens, group_offs, transA, transB, bs, n, m, k,
+            stream, get_grouped_gemm_num_cu(num_cu));
+        primus_turbo::ck_grouped_gemm_variable_k_2<AType, BType, CType>(params);
+    } else if (a.dtype() == at::kBFloat16) {
+        using AType = typename TorchToCKTileType<at::kBFloat16>::type;
+        using BType = AType;
+        using CType = AType;
+        auto params = make_ck_groued_gemm_params<AType, BType, CType>(
+            args_tensor.data_ptr(), b, a, c, group_lens, group_offs, transA, transB, bs, n, m, k,
+            stream, get_grouped_gemm_num_cu(num_cu));
+        primus_turbo::ck_grouped_gemm_variable_k_2<AType, BType, CType>(params);
+    } else {
+        PRIMUS_TURBO_CHECK(false, "GroupedGemm only support float16 and bfloat16");
+    }
+
+    return c;
+}
+
 at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                           at::Tensor &b_scales, at::Tensor &group_lens,
                                           at::Tensor &group_offs, const bool transA,

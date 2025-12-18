@@ -41,6 +41,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool transB, int? num_cu=None) -> Tensor");
     m.def("ck_grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
           "bool transA, bool transB, int? num_cu=None) -> Tensor");
+    m.def("ck_grouped_gemm_variable_k_2(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
+          "bool transA, bool transB, int? num_cu=None) -> Tensor");
     m.def("ck_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
@@ -73,6 +75,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("ck_grouped_gemm_variable_k", ck_grouped_gemm_variable_k);
     m.impl("ck_grouped_gemm_fp8", ck_grouped_gemm_fp8);
     m.impl("ck_grouped_gemm_fp8_variable_k", ck_grouped_gemm_fp8_variable_k);
+    m.impl("ck_grouped_gemm_fp8_variable_k_2", ck_grouped_gemm_fp8_variable_k_2);
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
 }
@@ -95,6 +98,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm_meta);
     m.impl("ck_grouped_gemm_variable_k", ck_grouped_gemm_variable_k_meta);
+    m.impl("ck_grouped_gemm_variable_k_2", ck_grouped_gemm_variable_k_2_meta);
     m.impl("ck_grouped_gemm_fp8", ck_grouped_gemm_fp8_meta);
     m.impl("ck_grouped_gemm_fp8_variable_k", ck_grouped_gemm_fp8_variable_k_meta);
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
