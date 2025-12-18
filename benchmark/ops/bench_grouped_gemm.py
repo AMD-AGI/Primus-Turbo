@@ -155,7 +155,7 @@ if __name__ == "__main__":
     dsv2_test_cases = generate_deepseekv2_test_cases()
     dsv3_test_cases = generate_deepseekv3_test_cases()
     grok_v2_test_cases = generate_grok_v2_test_cases()
-    test_cases = dsv2_lite_test_cases + dsv2_test_cases + dsv3_test_cases + grok_v2_test_cases
+    test_cases = dsv3_test_cases
 
     import pandas as pd
     from tabulate import tabulate

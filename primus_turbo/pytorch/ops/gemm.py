@@ -43,8 +43,10 @@ class GemmFunction(torch.autograd.Function):
 
         # BGrad
         # grad_b = a^T * grad_out
-        grad_b = gemm_impl(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
-
+        # grad_b = gemm_impl(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
+        # print(f"grad_b: {grad_b}")
+        grad_b = gemm_impl(grad_out, True, a, ctx.trans_a, b.dtype, not ctx.trans_b)
+        # print(f"grad_b_2: {grad_b_2}")
         return grad_a, grad_b, None, None, None
 
 

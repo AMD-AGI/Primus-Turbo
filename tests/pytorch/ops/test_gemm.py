@@ -64,3 +64,7 @@ def test_gemm(m, n, k, layout, dtype):
     c.backward(grad_c)
     torch.testing.assert_close(a.grad, a_ref.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b.grad, b_ref.grad, **get_tolerances(dtype))
+
+
+if __name__ == "__main__":
+    test_gemm(m=1024, n=2048, k=4096, layout="NT", dtype=torch.float16)
