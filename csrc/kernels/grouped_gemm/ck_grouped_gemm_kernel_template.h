@@ -300,6 +300,7 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
 
 #define APPLY_CK_GG_ALL_LAYOUT(MACRO, A, B, C, TileCfg)   \
     MACRO(A, B, C, RowMajor, ColMajor, RowMajor, TileCfg) \
+    MACRO(A, B, C, RowMajor, ColMajor, ColMajor, TileCfg) \
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, TileCfg) \
     MACRO(A, B, C, ColMajor, RowMajor, RowMajor, TileCfg)
 
@@ -316,6 +317,8 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
 #define APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
@@ -324,6 +327,7 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
 // Macro for ABQuantGrouped only (for configs with M_Warp=1, N_Warp=4)
 #define APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
 
@@ -332,6 +336,9 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, ColMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\

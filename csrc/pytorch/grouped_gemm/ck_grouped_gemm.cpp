@@ -265,7 +265,7 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
                                       c10::optional<int64_t> num_cu) {
     // TODO: output datatype
     auto out_dtype = a.scalar_type();
-
+    printf("test2\r\n");
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()));
