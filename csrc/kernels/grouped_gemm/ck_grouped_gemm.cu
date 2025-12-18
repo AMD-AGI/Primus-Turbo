@@ -52,16 +52,23 @@ __global__ void compute_grouped_gemm_fp8_args(
     const int64_t *group_lens_ptr, const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
     const ck_tile::index_t n, const ck_tile::index_t k, const ck_tile::index_t strideA,
     const ck_tile::index_t strideB, const ck_tile::index_t strideC, const ck_tile::index_t strideAQ,
-    const ck_tile::index_t strideBQ, const ck_tile::index_t k_batch) {
+    const ck_tile::index_t strideBQ, const ck_tile::index_t QK_A, const ck_tile::index_t QK_B,
+    const ck_tile::index_t k_batch) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
-    if (QuantMode == ck_tile::QuantType::TensorQuant) {
+    if constexpr (QuantMode == ck_tile::QuantType::TensorQuant) {
         args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
         args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
-    } else if (QuantMode == ck_tile::QuantType::RowColQuant) {
+    } else if constexpr (QuantMode == ck_tile::QuantType::RowColQuant) {
         args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_offs_ptr[group_id];
         args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * n;
+    } else if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+        // A scale shape: [total_M, QK_A], strideAQ = QK_A
+        // B scale shape: [B, QK_B, N/128], offset by group_id * QK_B * (N/128)
+        const ck_tile::index_t BQN           = (n + 127) / 128;
+        args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_offs_ptr[group_id] * strideAQ;
+        args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * QK_B * BQN;
     }
     args_ptr[group_id].group_karg.a_ptr     = a_ptr + group_offs_ptr[group_id] * k;
     args_ptr[group_id].group_karg.b_ptr     = b_ptr + group_id * n * k;
@@ -69,6 +76,8 @@ __global__ void compute_grouped_gemm_fp8_args(
     args_ptr[group_id].group_karg.M         = group_lens_ptr[group_id];
     args_ptr[group_id].group_karg.N         = n;
     args_ptr[group_id].group_karg.K         = k;
+    args_ptr[group_id].group_karg.QK_A      = QK_A;
+    args_ptr[group_id].group_karg.QK_B      = QK_B;
     args_ptr[group_id].group_karg.stride_A  = strideA;
     args_ptr[group_id].group_karg.stride_B  = strideB;
     args_ptr[group_id].group_karg.stride_AQ = strideAQ;
@@ -157,11 +166,30 @@ void ck_grouped_gemm_fp8(
     const ck_tile::index_t k_batch = 1;
     const bool             splitk  = k_batch > 1;
 
-    const ck_tile::index_t strideA  = params.transA ? params.m : params.k;
-    const ck_tile::index_t strideB  = params.transB ? params.k : params.n;
-    const ck_tile::index_t strideC  = params.n;
-    const ck_tile::index_t strideAQ = 1;
-    const ck_tile::index_t strideBQ = 1;
+    const ck_tile::index_t strideA = params.transA ? params.m : params.k;
+    const ck_tile::index_t strideB = params.transB ? params.k : params.n;
+    const ck_tile::index_t strideC = params.n;
+
+    // Calculate proper strides and QK values for quantization scales
+    ck_tile::index_t strideAQ, strideBQ, QK_A, QK_B;
+    if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+        // A scale shape: (M, AQK), AQLayout is RowMajor, AQK = K / 128
+        const ck_tile::index_t AQK = (params.k + 127) / 128;
+        QK_A                       = AQK;
+        strideAQ                   = AQK;
+
+        // B scale shape: (BQK, BQN), BQLayout is ColumnMajor, BQK = K / 128, BQN = N / 128
+        const ck_tile::index_t BQK = (params.k + 127) / 128;
+        QK_B                       = BQK;
+        strideBQ                   = BQK;
+    } else {
+        // For RowColQuant and TensorQuant, QK_A and QK_B should be 1
+        QK_A     = 1;
+        QK_B     = 1;
+        strideAQ = 1;
+        strideBQ = 1;
+    }
+
     // Setting args
     {
         const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
@@ -171,7 +199,7 @@ void ck_grouped_gemm_fp8(
                 reinterpret_cast<ck_tile::QuantGemmTransKernelArg *>(params.args_ptr), params.a_ptr,
                 params.b_ptr, params.c_ptr, params.aq_ptr, params.bq_ptr, params.group_lens_ptr,
                 params.group_offs_ptr, params.group_num, params.n, params.k, strideA, strideB,
-                strideC, strideAQ, strideBQ, k_batch);
+                strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch);
     }
 
     const auto stream_cfg = ck_tile::stream_config{params.stream};
@@ -232,29 +260,39 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     const bool transB, const ck_tile::index_t group_num, const ck_tile::index_t m,
     const ck_tile::index_t n, const ck_tile::index_t strideA, const ck_tile::index_t strideB,
     const ck_tile::index_t strideC, const ck_tile::index_t strideAQ,
-    const ck_tile::index_t strideBQ, const ck_tile::index_t k_batch) {
+    const ck_tile::index_t strideBQ, const ck_tile::index_t QK_A, const ck_tile::index_t QK_B,
+    const ck_tile::index_t k_batch) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
 
     const int64_t strideAK = transA ? m : 1;
     const int64_t strideBK = transB ? 1 : n;
-    if (QuantMode == ck_tile::QuantType::TensorQuant) {
+    if constexpr (QuantMode == ck_tile::QuantType::TensorQuant) {
         args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
         args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
-    } else if (QuantMode == ck_tile::QuantType::RowColQuant) {
-        args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_id * m;
-        ;
-        args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * n;
+    } else if constexpr (QuantMode == ck_tile::QuantType::RowColQuant) {
+        // For variable_k with RowColQuant: a_scales is per-row, b_scales is per-column
+        // A scale: offset by m (each group has m rows)
+        // B scale: offset by n (each group has n columns)
+        args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
+        args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
+    } else if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+        // A scale shape: [M, K/128], B scale shape: [N, K/128]
+        // Each group starts at different K position, offset by K block index
+        const ck_tile::index_t k_block_offset = group_offs_ptr[group_id] / 128;
+        args_ptr[group_id].group_karg.aq_ptr  = aq_ptr + k_block_offset;
+        args_ptr[group_id].group_karg.bq_ptr  = bq_ptr + k_block_offset;
     }
+    // Set data pointers with group offsets
     args_ptr[group_id].group_karg.a_ptr     = a_ptr + group_offs_ptr[group_id] * strideAK;
     args_ptr[group_id].group_karg.b_ptr     = b_ptr + group_offs_ptr[group_id] * strideBK;
-    args_ptr[group_id].group_karg.aq_ptr    = aq_ptr + group_id * m;
-    args_ptr[group_id].group_karg.bq_ptr    = bq_ptr + group_id * n;
     args_ptr[group_id].group_karg.c_ptr     = c_ptr + group_id * m * n;
     args_ptr[group_id].group_karg.M         = m;
     args_ptr[group_id].group_karg.N         = n;
     args_ptr[group_id].group_karg.K         = group_lens_ptr[group_id];
+    args_ptr[group_id].group_karg.QK_A      = QK_A;
+    args_ptr[group_id].group_karg.QK_B      = QK_B;
     args_ptr[group_id].group_karg.stride_A  = strideA;
     args_ptr[group_id].group_karg.stride_B  = strideB;
     args_ptr[group_id].group_karg.stride_AQ = strideAQ;
@@ -336,11 +374,28 @@ void ck_grouped_gemm_fp8_variable_k(
     const ck_tile::index_t k_batch = 1;
     const bool             splitk  = k_batch > 1;
 
-    const ck_tile::index_t strideA  = params.transA ? params.m : params.k;
-    const ck_tile::index_t strideB  = params.transB ? params.k : params.n;
-    const ck_tile::index_t strideC  = params.n;
-    const ck_tile::index_t strideAQ = 1;
-    const ck_tile::index_t strideBQ = 1;
+    const ck_tile::index_t strideA = params.transA ? params.m : params.k;
+    const ck_tile::index_t strideB = params.transB ? params.k : params.n;
+    const ck_tile::index_t strideC = params.n;
+
+    // Calculate proper strides and QK values for quantization scales
+    ck_tile::index_t strideAQ, strideBQ, QK_A, QK_B;
+    if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+        // For variable_k (TN layout): A is ColMajor, B is RowMajor
+        // After transpose in Python: A scale shape [M, K/128], B scale shape [N, K/128]
+        // Both have K/128 columns (one per 128-element K block)
+        const ck_tile::index_t QK = (params.k + 127) / 128;
+        QK_A                      = QK;
+        strideAQ                  = QK;
+        QK_B                      = QK;
+        strideBQ                  = QK;
+    } else {
+        // For RowColQuant and TensorQuant, QK_A and QK_B should be 1
+        QK_A     = 1;
+        QK_B     = 1;
+        strideAQ = 1;
+        strideBQ = 1;
+    }
 
     {
         const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
@@ -350,7 +405,7 @@ void ck_grouped_gemm_fp8_variable_k(
             reinterpret_cast<ck_tile::QuantGemmTransKernelArg *>(params.args_ptr), params.a_ptr,
             params.b_ptr, params.c_ptr, params.aq_ptr, params.bq_ptr, params.group_lens_ptr,
             params.group_offs_ptr, params.transA, params.transB, params.group_num, params.m,
-            params.n, strideA, strideB, strideC, strideAQ, strideBQ, k_batch);
+            params.n, strideA, strideB, strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch);
     }
 
     const auto stream_cfg = ck_tile::stream_config{params.stream};
@@ -419,6 +474,24 @@ template void ck_grouped_gemm_fp8<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloa
                                   ck_tile::QuantType::RowColQuant>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float>
         &params);
+// fp8 * fp8 -> fp16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
+                                  ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * bf8 -> fp16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float,
+                                  ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * fp8 -> bf16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float,
+                                  ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
+        &params);
+// bf8 * bf8 -> bf16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float,
+                                  ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float>
+        &params);
 // ck_grouped_gemm_variable_k explicit instantiation.
 // fp16 * fp16 -> fp16
 template void ck_grouped_gemm_variable_k<ck_tile::half_t, ck_tile::half_t, ck_tile::half_t>(
@@ -459,6 +532,24 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::bf8_t, ck_
         &params);
 template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t,
                                              float, ck_tile::QuantType::RowColQuant>(
+    const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float>
+        &params);
+// fp8 * fp8 -> fp16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8_variable_k<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
+                                             ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * bf8 -> fp16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float,
+                                             ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * fp8 -> bf16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8_variable_k<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t,
+                                             float, ck_tile::QuantType::ABQuantGrouped>(
+    const CKGroupedGemmFP8Params<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
+        &params);
+// bf8 * bf8 -> bf16 (ABQuantGrouped/blockwise)
+template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t,
+                                             float, ck_tile::QuantType::ABQuantGrouped>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float>
         &params);
 template void compute_group_offs<int64_t>(const int64_t *group_lens_ptr, int64_t *group_offs_ptr,

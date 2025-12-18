@@ -192,17 +192,50 @@ public:
         true
     >;
 
-    using QuantGemmProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<
-        ADataType,
-        BDataType,
-        AccDataType,
-        AccDataType,
-        GemmShape,
-        GemmUniversalTraits
+    // Select appropriate quantization group sizes based on A layout for ABQuantGrouped
+    // A is always 1D quantization: <1, 1, 128>
+    // B quantization depends on A's layout:
+    //   - When A is RowMajor (RowMajor+ColMajor or RowMajor+RowMajor): B uses 2D quantization <1, 128, 128>
+    //   - When A is ColMajor (ColMajor+RowMajor layout combination): B uses 1D quantization <1, 1, 128>
+    using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
+    using BQuantGroupSize = std::conditional_t<
+        std::is_same_v<ALayout, RowMajor>,
+        ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>,  // A is RowMajor: B uses 2D
+        ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>>;   // A is ColMajor: B uses 1D
+
+    // Select appropriate Problem and Pipeline based on QuantMode
+    // For RowColQuant and TensorQuant, use GemmRowColTensorQuantPipelineProblem + GemmPipelineAgBgCrCompV3
+    // For ABQuantGrouped, use GemmABQuantPipelineProblem + ABQuantGemmPipelineAgBgCrCompV3
+    using QuantGemmProblem = std::conditional_t<
+        QuantMode == ck_tile::QuantType::RowColQuant || QuantMode == ck_tile::QuantType::TensorQuant,
+        ck_tile::GemmRowColTensorQuantPipelineProblem<
+            ADataType,
+            BDataType,
+            AccDataType,
+            AccDataType,
+            GemmShape,
+            GemmUniversalTraits
+        >,
+        ck_tile::GemmABQuantPipelineProblem<
+            ADataType,           // ADataType
+            AccDataType,         // AQDataType
+            BDataType,           // BDataType
+            AccDataType,         // BQDataType
+            AccDataType,         // CDataType (accumulator)
+            GemmShape,           // BlockGemmShape
+            GemmUniversalTraits, // Traits
+            AQuantGroupSize,     // AQuantGroupSize: 1D <1, 1, 128>
+            BQuantGroupSize,     // BQuantGroupSize: 2D <1, 128, 128> or 1D <1, 1, 128>
+            false                // TransposeC
+        >
     >;
 
-    // V3
-    using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>;
+    // V3: Select appropriate Pipeline based on QuantMode
+    using GemmPipeline = std::conditional_t<
+        QuantMode == ck_tile::QuantType::RowColQuant || QuantMode == ck_tile::QuantType::TensorQuant,
+        ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>,
+        ck_tile::ABQuantGemmPipelineAgBgCrCompV3<QuantGemmProblem>
+    >;
 
     static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
@@ -279,13 +312,32 @@ class CKQuantGroupedGemmRunnerWithArch : public CKQuantGroupedGemmRunner<
     template class CKQuantGroupedGemmRunner<A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;               \
     template class CKQuantGroupedGemmRunnerWithArch<ARCH, A, B, C, AL, BL, CL, TileCfg, QuantMode, float>;
 
-#define APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
+// Macro for RowColQuant and TensorQuant only (for configs with M_Warp=2, N_Warp=2)
+#define APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
     MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)
+
+// Macro for ABQuantGrouped only (for configs with M_Warp=1, N_Warp=4)
+#define APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
+
+// Full macro including all quant modes (only for configs with M_Warp=1, N_Warp=4)
+#define APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(MACRO, ARCH, A, B, C, TileCfg)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, ColMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, RowMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)\
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::RowColQuant)   \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::TensorQuant)   \
+    MACRO(ARCH, A, B, C, ColMajor, RowMajor, RowMajor, TileCfg, ck_tile::QuantType::ABQuantGrouped)
 
 // ***********************************************************************************
 #if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
@@ -306,44 +358,56 @@ APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::b
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1)
 
 // FP8_E4M3 * FP8_E4M3 = BF16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1)
 
 // FP8_E5M2 * FP8_E5M2 = FP16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1)
 
 // FP8_E5M2 * FP8_E5M2 = BF16
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1)
+
 #endif
 
 // ***********************************************************************************
 #ifdef PRIMUS_TURBO_GFX950
 // FP8_E4M3 * FP8_E4M3 = FP16
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+// For 2x2x1 configs: RowColQuant and TensorQuant
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+// For 1x4x1 config: ABQuantGrouped
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
 
 // FP8_E4M3 * FP8_E4M3 = BF16
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
 
 // FP8_E5M2 * FP8_E5M2 = FP16
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
 
 // FP8_E5M2 * FP8_E5M2 = BF16
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
-APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+
 #endif
 
 // clang-format on
