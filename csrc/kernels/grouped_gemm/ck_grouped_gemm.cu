@@ -547,6 +547,16 @@ ck_grouped_gemm_variable_k<ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bf
     const CKGroupedGemmParams<ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t>
         &params);
 
+// ck_grouped_gemm_variable_k_2 explicit instantiation.
+// fp16 * fp16 -> fp16
+template void ck_grouped_gemm_variable_k_2<ck_tile::half_t, ck_tile::half_t, ck_tile::half_t>(
+    const CKGroupedGemmParams<ck_tile::half_t, ck_tile::half_t, ck_tile::half_t> &params);
+// bf16 * bf16 -> bf16
+template void
+ck_grouped_gemm_variable_k_2<ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t>(
+    const CKGroupedGemmParams<ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t>
+        &params);
+
 // fp8 * fp8 -> fp16
 template void ck_grouped_gemm_fp8_variable_k<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
                                              ck_tile::QuantType::TensorQuant>(

@@ -89,7 +89,7 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
 if __name__ == "__main__":
     test_grouped_gemm_func(
-        B=1,
+        B=2,
         M=128,
         N_K=(2048, 1536),
         dtype=torch.bfloat16,
