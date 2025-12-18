@@ -20,8 +20,8 @@ from primus_turbo.jax.core.low_precision import (
 from primus_turbo.jax.lax.quantization import quantize_fp8
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm import compute_group_offs_p
 from primus_turbo.jax.primitive.grouped_gemm.grouped_gemm_fp8 import (
-    grouped_gemm_fp8_p,
-    grouped_gemm_fp8_variable_k_p,
+    ck_grouped_gemm_fp8_p,
+    ck_grouped_gemm_fp8_variable_k_p,
 )
 
 __all__ = ["grouped_gemm_fp8"]
@@ -56,7 +56,7 @@ def _grouped_gemm_fp8_tensorwise(a, b, group_lens, group_offs, trans_b, config, 
     b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
 
     # Forward pass
-    out, _ = grouped_gemm_fp8_p.bind(
+    out, _ = ck_grouped_gemm_fp8_p.bind(
         a_fp8,
         b_fp8,
         a_scale_inv,
@@ -83,7 +83,7 @@ def _grouped_gemm_fp8_tensorwise_fwd(a, b, group_lens, group_offs, trans_b, conf
     b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, ScalingGranularity.TENSORWISE)
 
     # Forward pass
-    out, _ = grouped_gemm_fp8_p.bind(
+    out, _ = ck_grouped_gemm_fp8_p.bind(
         a_fp8,
         b_fp8,
         a_scale_inv,
@@ -113,7 +113,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
     grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ScalingGranularity.TENSORWISE)
 
     # Compute grad_a: grad_out @ b.T (or grad_out @ b if trans_b)
-    grad_a, _ = grouped_gemm_fp8_p.bind(
+    grad_a, _ = ck_grouped_gemm_fp8_p.bind(
         grad_out_fp8,
         b_fp8,
         grad_out_scale_inv,
@@ -135,7 +135,7 @@ def _grouped_gemm_fp8_tensorwise_bwd(group_lens, group_offs, trans_b, config, nu
         lhs, rhs = a_fp8, grad_out_fp8
         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
 
-    grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
+    grad_b, _ = ck_grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
         lhs_scale,
@@ -174,7 +174,7 @@ def _grouped_gemm_fp8_rowwise(a, b, group_lens, group_offs, trans_b, config, num
     )
 
     # Forward pass
-    out, _ = grouped_gemm_fp8_p.bind(
+    out, _ = ck_grouped_gemm_fp8_p.bind(
         a_fp8_row,
         b_fp8_row,
         a_scale_inv_row,
@@ -202,7 +202,7 @@ def _grouped_gemm_fp8_rowwise_fwd(a, b, group_lens, group_offs, trans_b, config,
         b, b_dtype, ScalingGranularity.ROWWISE, axis=(-1 if trans_b else -2)
     )
     # Forward pass
-    out, _ = grouped_gemm_fp8_p.bind(
+    out, _ = ck_grouped_gemm_fp8_p.bind(
         a_fp8_row,
         b_fp8_row,
         a_scale_inv_row,
@@ -240,7 +240,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
     )
 
     # Compute grad_a
-    grad_a, _ = grouped_gemm_fp8_p.bind(
+    grad_a, _ = ck_grouped_gemm_fp8_p.bind(
         grad_out_fp8_row,
         b_fp8_col,
         grad_out_scale_inv_row,
@@ -267,7 +267,7 @@ def _grouped_gemm_fp8_rowwise_bwd(group_lens, group_offs, trans_b, config, num_c
         lhs, rhs = a_fp8_col, grad_out_fp8_col
         lhs_scale, rhs_scale = a_scale_inv_col, grad_out_scale_inv_col
 
-    grad_b, _ = grouped_gemm_fp8_variable_k_p.bind(
+    grad_b, _ = ck_grouped_gemm_fp8_variable_k_p.bind(
         lhs,
         rhs,
         lhs_scale,

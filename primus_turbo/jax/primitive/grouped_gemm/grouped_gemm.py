@@ -18,11 +18,11 @@ from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING
 # ----------------------------------------
 # Step-1: Primitive Define
 # ----------------------------------------
-grouped_gemm_p = Primitive("grouped_gemm")
-grouped_gemm_p.multiple_results = True
+ck_grouped_gemm_p = Primitive("ck_grouped_gemm")
+ck_grouped_gemm_p.multiple_results = True
 
-grouped_gemm_variable_k_p = Primitive("grouped_gemm_variable_k")
-grouped_gemm_variable_k_p.multiple_results = True
+ck_grouped_gemm_variable_k_p = Primitive("ck_grouped_gemm_variable_k")
+ck_grouped_gemm_variable_k_p.multiple_results = True
 
 compute_group_offs_p = Primitive("compute_group_offs")
 compute_group_offs_p.multiple_results = False
@@ -31,8 +31,8 @@ compute_group_offs_p.multiple_results = False
 # ----------------------------------------
 # Step-2: Impl
 # ----------------------------------------
-IMPL_TABLE[grouped_gemm_p] = partial(xla.apply_primitive, grouped_gemm_p)
-IMPL_TABLE[grouped_gemm_variable_k_p] = partial(xla.apply_primitive, grouped_gemm_variable_k_p)
+IMPL_TABLE[ck_grouped_gemm_p] = partial(xla.apply_primitive, ck_grouped_gemm_p)
+IMPL_TABLE[ck_grouped_gemm_variable_k_p] = partial(xla.apply_primitive, ck_grouped_gemm_variable_k_p)
 IMPL_TABLE[compute_group_offs_p] = partial(xla.apply_primitive, compute_group_offs_p)
 
 
@@ -54,7 +54,7 @@ def _grouped_gemm_abstract_eval(a, b, group_lens, group_offs, transA, transB, nu
     return (out_aval, ws_aval)
 
 
-ABSTRACT_EVAL_TABLE[grouped_gemm_p] = _grouped_gemm_abstract_eval
+ABSTRACT_EVAL_TABLE[ck_grouped_gemm_p] = _grouped_gemm_abstract_eval
 
 
 def _compute_group_offs_abstract_eval(group_lens):
@@ -81,15 +81,15 @@ def _grouped_gemm_variable_k_abstract_eval(a, b, group_lens, group_offs, transA,
     return (out_aval, ws_aval)
 
 
-ABSTRACT_EVAL_TABLE[grouped_gemm_variable_k_p] = _grouped_gemm_variable_k_abstract_eval
+ABSTRACT_EVAL_TABLE[ck_grouped_gemm_variable_k_p] = _grouped_gemm_variable_k_abstract_eval
 
 
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
-LOWERING_TABLE[grouped_gemm_p] = jax.ffi.ffi_lowering("grouped_gemm")
+LOWERING_TABLE[ck_grouped_gemm_p] = jax.ffi.ffi_lowering("ck_grouped_gemm")
 
-LOWERING_TABLE[grouped_gemm_variable_k_p] = jax.ffi.ffi_lowering("grouped_gemm_variable_k")
+LOWERING_TABLE[ck_grouped_gemm_variable_k_p] = jax.ffi.ffi_lowering("ck_grouped_gemm_variable_k")
 
 LOWERING_TABLE[compute_group_offs_p] = jax.ffi.ffi_lowering("compute_group_offs")
 
@@ -101,7 +101,7 @@ LOWERING_TABLE[compute_group_offs_p] = jax.ffi.ffi_lowering("compute_group_offs"
 
 
 __all__ = [
-    "grouped_gemm_p",
-    "grouped_gemm_variable_k_p",
+    "ck_grouped_gemm_p",
+    "ck_grouped_gemm_variable_k_p",
     "compute_group_offs_p",
 ]

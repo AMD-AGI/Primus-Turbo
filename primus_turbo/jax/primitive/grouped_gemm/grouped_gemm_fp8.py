@@ -21,18 +21,18 @@ from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING
 # ----------------------------------------
 # Step-1: Primitive Define
 # ----------------------------------------
-grouped_gemm_fp8_p = Primitive("grouped_gemm_fp8")
-grouped_gemm_fp8_p.multiple_results = True
+ck_grouped_gemm_fp8_p = Primitive("ck_grouped_gemm_fp8")
+ck_grouped_gemm_fp8_p.multiple_results = True
 
-grouped_gemm_fp8_variable_k_p = Primitive("grouped_gemm_fp8_variable_k")
-grouped_gemm_fp8_variable_k_p.multiple_results = True
+ck_grouped_gemm_fp8_variable_k_p = Primitive("ck_grouped_gemm_fp8_variable_k")
+ck_grouped_gemm_fp8_variable_k_p.multiple_results = True
 
 
 # ----------------------------------------
 # Step-2: Impl
 # ----------------------------------------
-IMPL_TABLE[grouped_gemm_fp8_p] = partial(xla.apply_primitive, grouped_gemm_fp8_p)
-IMPL_TABLE[grouped_gemm_fp8_variable_k_p] = partial(xla.apply_primitive, grouped_gemm_fp8_variable_k_p)
+IMPL_TABLE[ck_grouped_gemm_fp8_p] = partial(xla.apply_primitive, ck_grouped_gemm_fp8_p)
+IMPL_TABLE[ck_grouped_gemm_fp8_variable_k_p] = partial(xla.apply_primitive, ck_grouped_gemm_fp8_variable_k_p)
 
 
 # ----------------------------------------
@@ -53,7 +53,7 @@ def _grouped_gemm_fp8_abstract_eval(
     return (out_aval, ws_aval)
 
 
-ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_p] = _grouped_gemm_fp8_abstract_eval
+ABSTRACT_EVAL_TABLE[ck_grouped_gemm_fp8_p] = _grouped_gemm_fp8_abstract_eval
 
 
 def _grouped_gemm_fp8_variable_k_abstract_eval(
@@ -73,7 +73,7 @@ def _grouped_gemm_fp8_variable_k_abstract_eval(
     return (out_aval, ws_aval)
 
 
-ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_abstract_eval
+ABSTRACT_EVAL_TABLE[ck_grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_abstract_eval
 
 
 # ----------------------------------------
@@ -81,17 +81,17 @@ ABSTRACT_EVAL_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_
 # ----------------------------------------
 def _grouped_gemm_fp8_lowering(ctx, *args, **kwargs):
     kwargs.pop("out_dtype", None)
-    return jax.ffi.ffi_lowering("grouped_gemm_fp8")(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("ck_grouped_gemm_fp8")(ctx, *args, **kwargs)
 
 
 def _grouped_gemm_fp8_variable_k_lowering(ctx, *args, **kwargs):
     kwargs.pop("out_dtype", None)
-    return jax.ffi.ffi_lowering("grouped_gemm_fp8_variable_k")(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("ck_grouped_gemm_fp8_variable_k")(ctx, *args, **kwargs)
 
 
-LOWERING_TABLE[grouped_gemm_fp8_p] = _grouped_gemm_fp8_lowering
+LOWERING_TABLE[ck_grouped_gemm_fp8_p] = _grouped_gemm_fp8_lowering
 
-LOWERING_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_lowering
+LOWERING_TABLE[ck_grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_lowering
 
 
 # ----------------------------------------
@@ -101,6 +101,6 @@ LOWERING_TABLE[grouped_gemm_fp8_variable_k_p] = _grouped_gemm_fp8_variable_k_low
 
 
 __all__ = [
-    "grouped_gemm_fp8_p",
-    "grouped_gemm_fp8_variable_k_p",
+    "ck_grouped_gemm_fp8_p",
+    "ck_grouped_gemm_fp8_variable_k_p",
 ]

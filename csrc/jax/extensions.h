@@ -22,12 +22,12 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormBwdHandler);
 //==================================================================
 //  Grouped GEMM
 //==================================================================
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmHandler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmVariableKHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmVariableKHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ComputeGroupOffsHandler);
 
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8Handler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8Handler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8VariableKHandler);
 
 int64_t GetCKGroupedGemmWorkspaceSize(int32_t group_num);
 int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num);

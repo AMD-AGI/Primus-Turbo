@@ -93,10 +93,10 @@ inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_grouped_gemm
 }
 
 // Grouped GEMM FFI Handler
-ffi::Error GroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-                          ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                          ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
-                          bool transA, bool transB, int64_t num_cu) {
+ffi::Error CKGroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+                            ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
+                            ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
+                            bool transA, bool transB, int64_t num_cu) {
     // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
@@ -137,11 +137,11 @@ ffi::Error GroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer 
 }
 
 // Grouped GEMM Variable K FFI Handler
-ffi::Error GroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-                                   ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                                   ffi::Result<ffi::AnyBuffer> c,
-                                   ffi::Result<ffi::AnyBuffer> workspace, bool transA, bool transB,
-                                   int64_t num_cu) {
+ffi::Error CKGroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+                                     ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
+                                     ffi::Result<ffi::AnyBuffer> c,
+                                     ffi::Result<ffi::AnyBuffer> workspace, bool transA,
+                                     bool transB, int64_t num_cu) {
     // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
@@ -205,12 +205,12 @@ ffi::Error ComputeGroupOffsFFI(cudaStream_t stream, ffi::AnyBuffer group_lens,
 }
 
 // Grouped GEMM FP8 FFI Handler
-ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-                             ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
-                             ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                             ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
-                             bool transA, bool transB, int64_t num_cu,
-                             std::string_view granularity) {
+ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+                               ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
+                               ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
+                               ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
+                               bool transA, bool transB, int64_t num_cu,
+                               std::string_view granularity) {
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -298,12 +298,12 @@ ffi::Error GroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuff
 }
 
 // Grouped GEMM FP8 Variable K FFI Handler
-ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-                                      ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
-                                      ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
-                                      ffi::Result<ffi::AnyBuffer> c,
-                                      ffi::Result<ffi::AnyBuffer> workspace, bool transA,
-                                      bool transB, int64_t num_cu, std::string_view granularity) {
+ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+                                        ffi::AnyBuffer a_scales, ffi::AnyBuffer b_scales,
+                                        ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
+                                        ffi::Result<ffi::AnyBuffer> c,
+                                        ffi::Result<ffi::AnyBuffer> workspace, bool transA,
+                                        bool transB, int64_t num_cu, std::string_view granularity) {
     // Check
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
@@ -455,7 +455,7 @@ ffi::Error GroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi
 }
 
 // Register FFI handlers
-XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmHandler, GroupedGemmFFI,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(CKGroupedGemmHandler, CKGroupedGemmFFI,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                    // a
@@ -476,7 +476,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ComputeGroupOffsHandler, ComputeGroupOffsFFI,
                                   .Ret<ffi::AnyBuffer>()                    // group_offs
 );
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmVariableKHandler, GroupedGemmVariableKFFI,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(CKGroupedGemmVariableKHandler, CKGroupedGemmVariableKFFI,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                    // a
@@ -490,7 +490,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmVariableKHandler, GroupedGemmVariableKF
                                   .Attr<int64_t>("num_cu")                  // num_cu
 );
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8Handler, GroupedGemmFP8FFI,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(CKGroupedGemmFP8Handler, CKGroupedGemmFP8FFI,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                    // a
@@ -507,7 +507,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8Handler, GroupedGemmFP8FFI,
                                   .Attr<std::string_view>("granularity")    // granularity
 );
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler, GroupedGemmFP8VariableKFFI,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(CKGroupedGemmFP8VariableKHandler, CKGroupedGemmFP8VariableKFFI,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                    // a
