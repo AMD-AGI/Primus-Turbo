@@ -65,7 +65,7 @@ def _grouped_gemm_fp8_variable_k_abstract_eval(
     m = a.shape[1]
     n = b.shape[1]
 
-    ws_size = get_ck_grouped_gemm_fp8_variable_k_workspace_size(bs, m, n)
+    ws_size = get_ck_grouped_gemm_fp8_variable_k_workspace_size(bs)
 
     out_aval = ShapedArray((bs, m, n), out_dtype)
     ws_aval = ShapedArray((ws_size,), jnp.uint8)

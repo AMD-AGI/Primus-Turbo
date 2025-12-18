@@ -16,17 +16,9 @@ int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num) {
     return get_ck_grouped_gemm_fp8_args_sizes(group_num);
 }
 
-// Align size to 128 bytes for optimal GPU memory access
-constexpr int64_t kWorkspaceAlignment = 128;
-
-inline int64_t align_size(int64_t size) {
-    return (size + kWorkspaceAlignment - 1) / kWorkspaceAlignment * kWorkspaceAlignment;
-}
-
-// Workspace size for FP8 Variable K: args only (aligned)
-int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num, int32_t m, int32_t n) {
-    int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
-    return args_size;
+// Workspace size for FP8 Variable K: args only
+int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num) {
+    return get_ck_grouped_gemm_fp8_args_sizes(group_num);
 }
 
 // Get the number of compute units for grouped GEMM
@@ -95,7 +87,7 @@ ffi::Error CKGroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffe
                             ffi::AnyBuffer group_lens, ffi::AnyBuffer group_offs,
                             ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
                             bool transA, bool transB, int64_t num_cu) {
-    // Check
+    // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -107,11 +99,10 @@ ffi::Error CKGroupedGemmFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffe
     // Get dimensions
     const int32_t group_num = static_cast<int32_t>(b.dimensions()[0]);
     const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
-    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
     const int32_t n         = transB ? b.dimensions()[1] : b.dimensions()[2];
+    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
 
-    void *args_ptr = workspace->untyped_data();
-
+    void    *args_ptr   = workspace->untyped_data();
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
     if (a.element_type() == ffi::F16) {
@@ -140,7 +131,7 @@ ffi::Error CKGroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi:
                                      ffi::Result<ffi::AnyBuffer> c,
                                      ffi::Result<ffi::AnyBuffer> workspace, bool transA,
                                      bool transB, int64_t num_cu) {
-    // Check
+    // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -148,20 +139,20 @@ ffi::Error CKGroupedGemmVariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, ffi:
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
+
+    // Check transpose flags
     if (!transA || transB) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "grouped_gemm_variable_k only supports transA=True, transB=False");
     }
 
-    // a[k, m] * [k, n] -> [bs, m, n]
+    // Get dimensions: a[k, m] * b[k, n] -> c[bs, m, n]
     const int32_t group_num = static_cast<int32_t>(group_lens.element_count());
     const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
     const int32_t n         = transB ? b.dimensions()[0] : b.dimensions()[1];
     const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
 
-    void *args_ptr = workspace->untyped_data();
-
-    // Get num_cu
+    void    *args_ptr   = workspace->untyped_data();
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
     // Call implementation based on dtype
@@ -209,6 +200,7 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
                                ffi::Result<ffi::AnyBuffer> c, ffi::Result<ffi::AnyBuffer> workspace,
                                bool transA, bool transB, int64_t num_cu,
                                std::string_view granularity) {
+    // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
@@ -217,10 +209,17 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
                           "group_lens and group_offs must be int64");
     }
 
+    // Check granularity (JAX only supports TENSORWISE and ROWWISE)
+    if (granularity != "TENSORWISE" && granularity != "ROWWISE") {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "granularity must be 'TENSORWISE' or 'ROWWISE'");
+    }
+
+    // Get dimensions
     const int32_t group_num = static_cast<int32_t>(b.dimensions()[0]);
     const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
-    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
     const int32_t n         = transB ? b.dimensions()[1] : b.dimensions()[2];
+    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
 
     void    *args_ptr   = workspace->untyped_data();
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
@@ -302,33 +301,34 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
                                         ffi::Result<ffi::AnyBuffer> c,
                                         ffi::Result<ffi::AnyBuffer> workspace, bool transA,
                                         bool transB, int64_t num_cu, std::string_view granularity) {
-    // Check
+    // Check input types
     if (a.element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "a and b dtype mismatch");
     }
-
     if (group_lens.element_type() != ffi::S64 || group_offs.element_type() != ffi::S64) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "group_lens and group_offs must be int64");
     }
+
+    // Check transpose flags
     if (!transA || transB) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "grouped_gemm_fp8_variable_k only supports transA=True, transB=False");
     }
 
-    // Get dimensions
+    // Check granularity (JAX only supports TENSORWISE and ROWWISE)
+    if (granularity != "TENSORWISE" && granularity != "ROWWISE") {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "granularity must be 'TENSORWISE' or 'ROWWISE'");
+    }
+
+    // Get dimensions: a[k, m] * b[k, n] -> c[bs, m, n]
     const int32_t group_num = static_cast<int32_t>(group_lens.element_count());
-    const int32_t m         = a.dimensions()[1]; // transA=True
-    const int32_t k         = a.dimensions()[0];
-    const int32_t n         = b.dimensions()[1]; // transB=False
+    const int32_t m         = transA ? a.dimensions()[1] : a.dimensions()[0];
+    const int32_t n         = transB ? b.dimensions()[0] : b.dimensions()[1];
+    const int32_t k         = transA ? a.dimensions()[0] : a.dimensions()[1];
 
-    // Workspace layout: [args] (aligned to 128 bytes)
-    const int64_t args_size = align_size(get_ck_grouped_gemm_fp8_args_sizes(group_num));
-
-    uint8_t *ws_ptr   = workspace->typed_data<uint8_t>();
-    void    *args_ptr = ws_ptr;
-
-    // Get num_cu
+    void    *args_ptr   = workspace->untyped_data();
     uint32_t num_cu_val = get_grouped_gemm_num_cu(stream, num_cu);
 
     // Call implementation based on dtype

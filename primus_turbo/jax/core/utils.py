@@ -41,9 +41,9 @@ def get_device_compute_capability(device_id: int = 0) -> Tuple[int, int]:
     return _get_device_compute_capability(device_id)
 
 
-def jax_dtype_to_turbo_dtype(jax_dtype):
-    """Convert JAX dtype to Primus-Turbo DType."""
-    jax_dtype = dtypes.canonicalize_dtype(jax_dtype)
+def jnp_dtype_to_turbo_dtype(jnp_dtype):
+    """Convert JAX NumPy dtype to Primus-Turbo DType."""
+    jnp_dtype = dtypes.canonicalize_dtype(jnp_dtype)
 
     converter = {
         jnp.float32.dtype: TurboDType.kFloat32,
@@ -57,7 +57,7 @@ def jax_dtype_to_turbo_dtype(jax_dtype):
         jnp.float8_e5m2fnuz.dtype: TurboDType.kFloat8E5M2FNUZ,
     }
 
-    if jax_dtype not in converter:
-        raise ValueError(f"Unsupported {jax_dtype=}")
+    if jnp_dtype not in converter:
+        raise ValueError(f"Unsupported {jnp_dtype=}")
 
-    return converter[jax_dtype]
+    return converter[jnp_dtype]
