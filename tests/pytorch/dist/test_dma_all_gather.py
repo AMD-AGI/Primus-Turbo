@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import (
@@ -82,14 +83,11 @@ class AllGatherTestCase(MultiProcessTestCase):
         output_tensor_ref = torch.ones([num_elems * self.world_size], dtype=dtype, device=self.device)
 
         with get_profiler_context() as prof:
-            for i in range(33):
+            for i in range(64):
                 dist.all_gather_into_tensor(output_tensor_ref, input_tensor)
                 dma_all_gather_into_tensor(output_tensor, input_tensor)
                 if prof:
                     prof.step()
-                # torch.cuda.synchronize()
-                # import time
-                # time.sleep(3600)
 
         torch.testing.assert_close(output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
 
