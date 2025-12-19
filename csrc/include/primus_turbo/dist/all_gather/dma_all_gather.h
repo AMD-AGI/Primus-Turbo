@@ -14,6 +14,8 @@
 #include <memory>
 #include <thread>
 
+#define SYNC_WITH_IPC_EVENT 0
+
 namespace {
 void reusable_barrier(std::atomic<int> &barrier, std::atomic<int> &sense, size_t n) {
 
@@ -49,9 +51,11 @@ struct AllGatherShmStruct {
     std::atomic<int> barrier;
     std::atomic<int> sense;
 
-    hipIpcMemHandle_t   buffer_mem_handles[MAX_DEVICES_PER_NODE];
+    hipIpcMemHandle_t buffer_mem_handles[MAX_DEVICES_PER_NODE];
+#if SYNC_WITH_IPC_EVENT == 1
     hipIpcEventHandle_t sync_event_handles[MAX_DEVICES_PER_NODE];
     hipIpcEventHandle_t exit_event_handles[MAX_DEVICES_PER_NODE];
+#endif
 };
 
 uintptr_t create_allgather_shared_handle(const std::string &shm_name, size_t group_rank,
@@ -129,7 +133,7 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming));
                 copy_events[i] = copy_event;
             }
-
+#if SYNC_WITH_IPC_EVENT == 1
             hipEvent_t local_sync_event = nullptr;
             PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(
                 &local_sync_event, hipEventDisableTiming | hipEventInterprocess));
@@ -165,7 +169,10 @@ public:
                         hipIpcOpenEventHandle(&exit_events[i], shm->exit_event_handles[i]));
                 }
             }
-
+#else
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event, hipEventDisableTiming));
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&exit_event, hipEventDisableTiming));
+#endif
             PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&entry_event, hipEventDisableTiming));
         }
         void finalize(AllGatherShmStruct *shm) {
@@ -174,7 +181,7 @@ public:
             // hip_ipc_close_memhandle
             //   buffer_mem_ptrs
             //   recv_buffer
-
+#if SYNC_WITH_IPC_EVENT == 1
             if (exit_events[group_rank] != nullptr) {
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_events[group_rank]));
                 exit_events[group_rank] = nullptr;
@@ -183,6 +190,16 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(sync_events[group_rank]));
                 sync_events[group_rank] = nullptr;
             }
+#else
+            if (exit_event != nullptr) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(exit_event));
+                exit_event = nullptr;
+            }
+            if (sync_event != nullptr) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(sync_event));
+                sync_event = nullptr;
+            }
+#endif
             if (entry_event != nullptr) {
                 PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(entry_event));
                 entry_event = nullptr;
@@ -204,12 +221,17 @@ public:
 
         hipStream_t copy_streams[MAX_DEVICES_PER_NODE]{};
         hipEvent_t  copy_events[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t  sync_events[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t  exit_events[MAX_DEVICES_PER_NODE]{};
-        hipEvent_t  entry_event{nullptr};
-        void       *buffer_mem_ptrs[MAX_DEVICES_PER_NODE]{};
-        void       *source_buffer{nullptr};
-        size_t      source_buffer_size{0};
+#if SYNC_WITH_IPC_EVENT == 1
+        hipEvent_t sync_events[MAX_DEVICES_PER_NODE]{};
+        hipEvent_t exit_events[MAX_DEVICES_PER_NODE]{};
+#else
+        hipEvent_t sync_event{nullptr};
+        hipEvent_t exit_event{nullptr};
+#endif
+        hipEvent_t entry_event{nullptr};
+        void      *buffer_mem_ptrs[MAX_DEVICES_PER_NODE]{};
+        void      *source_buffer{nullptr};
+        size_t     source_buffer_size{0};
     };
 
     uintptr_t get_allgather_shared_handle() const { return allgather_shared_handle_; }

@@ -51,13 +51,45 @@ class AllGatherTestCase(MultiProcessTestCase):
     ) -> None:
         self._init_process()
 
+        def get_profiler_context():
+            ENABLE_PROFILER = False
+            if not ENABLE_PROFILER or self.rank != 0:
+                from contextlib import nullcontext
+
+                return nullcontext()
+            schedule = torch.profiler.schedule(
+                wait=5,
+                warmup=5,
+                active=2,
+                repeat=1,
+            )
+            profiler = torch.profiler.profile(
+                schedule=schedule,
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join("./profile_results/")),
+            )
+            return profiler
+
         num_elems = 16 * 1024 * 1024
         input_tensor = torch.full([num_elems], self.rank, dtype=dtype, device=self.device)
         output_tensor = torch.zeros([num_elems * self.world_size], dtype=dtype, device=self.device)
         output_tensor_ref = torch.ones([num_elems * self.world_size], dtype=dtype, device=self.device)
 
-        dist.all_gather_into_tensor(output_tensor_ref, input_tensor)
-        dma_all_gather_into_tensor(output_tensor, input_tensor)
+        with get_profiler_context() as prof:
+            for i in range(33):
+                dist.all_gather_into_tensor(output_tensor_ref, input_tensor)
+                dma_all_gather_into_tensor(output_tensor, input_tensor)
+                if prof:
+                    prof.step()
+                # torch.cuda.synchronize()
+                # import time
+                # time.sleep(3600)
 
         torch.testing.assert_close(output_tensor, output_tensor_ref, rtol=1e-5, atol=1e-5)
 
