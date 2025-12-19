@@ -314,7 +314,7 @@ at::Tensor ck_grouped_gemm_variable_k_2(at::Tensor &a, at::Tensor &b, at::Tensor
                                         const bool transB, c10::optional<int64_t> num_cu) {
     // TODO: output datatype
     auto out_dtype = a.scalar_type();
-    printf("test3\r\n");
+    // printf("test5\r\n");
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()));
@@ -332,7 +332,7 @@ at::Tensor ck_grouped_gemm_variable_k_2(at::Tensor &a, at::Tensor &b, at::Tensor
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(0) : b.size(1);
     const int64_t k  = transA ? a.size(0) : a.size(1);
-    at::Tensor    c  = at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kCUDA));
+    at::Tensor    c  = at::empty({bs, n, m}, at::dtype(out_dtype).device(at::kCUDA));
 
     auto stream = at::cuda::getCurrentCUDAStream();
     if (a.dtype() == at::kHalf) {
@@ -340,7 +340,7 @@ at::Tensor ck_grouped_gemm_variable_k_2(at::Tensor &a, at::Tensor &b, at::Tensor
         using BType = AType;
         using CType = AType;
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
-            args_tensor.data_ptr(), b, a, c, group_lens, group_offs, transA, transB, bs, n, m, k,
+            args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
         primus_turbo::ck_grouped_gemm_variable_k_2<AType, BType, CType>(params);
     } else if (a.dtype() == at::kBFloat16) {
@@ -348,7 +348,7 @@ at::Tensor ck_grouped_gemm_variable_k_2(at::Tensor &a, at::Tensor &b, at::Tensor
         using BType = AType;
         using CType = AType;
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
-            args_tensor.data_ptr(), b, a, c, group_lens, group_offs, transA, transB, bs, n, m, k,
+            args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
         primus_turbo::ck_grouped_gemm_variable_k_2<AType, BType, CType>(params);
     } else {

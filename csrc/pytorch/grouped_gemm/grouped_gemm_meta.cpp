@@ -60,7 +60,7 @@ at::Tensor ck_grouped_gemm_variable_k_2_meta(at::Tensor &a, at::Tensor &b, at::T
     const int64_t bs = group_lens.numel();
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(0) : b.size(1);
-    return at::empty({bs, m, n}, a.options().device(at::kMeta));
+    return at::empty({bs, n, m}, a.options().device(at::kMeta));
 }
 
 //==================================================================

@@ -249,6 +249,25 @@ __global__ void compute_grouped_gemm_variable_k_args(
     args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
     args_ptr[group_id].group_karg.stride_E     = strideC;
     args_ptr[group_id].group_karg.k_batch      = k_batch;
+
+    // // Debug print only from the first thread (group_id == 0)
+    // if (group_id == 0) {
+    //     printf("compute_grouped_gemm_variable_k_args begin\r\n");
+    //     printf("a_ptr: %p\r\n", a_ptr);
+    //     printf("b_ptr: %p\r\n", b_ptr);
+    //     printf("c_ptr: %p\r\n", c_ptr);
+    //     printf("group_id: %lld\r\n", group_id);
+    //     printf("group_lens_ptr[0]: %lld\r\n", group_lens_ptr[0]);
+    //     printf("group_offs_ptr[0]: %lld\r\n", group_offs_ptr[0]);
+    //     printf("strideAK: %lld\r\n", strideAK);
+    //     printf("strideBK: %lld\r\n", strideBK);
+    //     printf("strideA: %d\r\n", strideA);
+    //     printf("strideB: %d\r\n", strideB);
+    //     printf("strideC: %d\r\n", strideC);
+    //     printf("m: %d, n: %d\r\n", m, n);
+    //     printf("transA: %d, transB: %d\r\n", transA, transB);
+    //     printf("compute_grouped_gemm_variable_k_args end\r\n");
+    // }
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
@@ -387,18 +406,17 @@ void ck_grouped_gemm_variable_k_2(
                 params.transA, params.transB, params.group_num, params.m, params.n, strideA,
                 strideB, strideC, k_batch);
     }
-
     const auto stream_cfg = ck_tile::stream_config{params.stream};
     using CLayout         = ColMajor;
     std::unique_ptr<CKGroupedGemmRunnerInterFace> runner;
     if (params.transA && !params.transB) { // TN
-        using ALayout = RowMajor;
-        using BLayout = ColMajor;
+        using ALayout = ColMajor;
+        using BLayout = RowMajor;
         runner = get_ck_grouped_gemm_instance<ADataType, BDataType, CDataType, AccDataType, ALayout,
                                               BLayout, CLayout, ck_tile::QuantType::TensorQuant>(
             params.group_num, params.m, params.n, params.k);
     } else {
-        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
+        PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK_2 only support TN");
     }
     runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
 

@@ -55,34 +55,29 @@ class GroupedGemmFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         a, b, group_lens, group_offs = ctx.saved_tensors
-        if len(group_lens) == 1:
-            assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
-            b_2d = b.squeeze(0)
-            grad_a = gemm_impl(grad_out, False, b_2d, not ctx.trans_b, a.dtype, ctx.trans_a)
-            grad_b = gemm_impl(a, True, grad_out, False, b.dtype, ctx.trans_b).view(b.size())
-        else:
-            grad_a = grouped_gemm_impl(
-                grad_out,
-                b,
-                group_lens,
-                group_offs,
-                trans_a=False,
-                trans_b=not ctx.trans_b,
-                num_cu=ctx.num_cu,
-                default_backend=BackendType.CK.value,
-            )
 
-            grad_b = grouped_gemm_variable_k_impl(
-                a,
-                grad_out,
-                group_lens,
-                group_offs,
-                trans_a=not ctx.trans_a,
-                trans_b=False,
-                trans_c=ctx.trans_b,
-                num_cu=ctx.num_cu,
-                default_backend=BackendType.CK.value,
-            )
+        grad_a = grouped_gemm_impl(
+            grad_out,
+            b,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=not ctx.trans_b,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
+        )
+
+        grad_b = grouped_gemm_variable_k_impl(
+            a,
+            grad_out,
+            group_lens,
+            group_offs,
+            trans_a=not ctx.trans_a,
+            trans_b=False,
+            trans_c=ctx.trans_b,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
+        )
         return grad_a, grad_b, None, None, None, None
 
 

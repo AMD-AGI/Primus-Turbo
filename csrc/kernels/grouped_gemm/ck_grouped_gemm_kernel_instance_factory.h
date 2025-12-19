@@ -26,19 +26,16 @@ get_ck_grouped_gemm_instance(const ck_tile::index_t group_num,
 #define APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(MACRO, A, B, C) \
     MACRO(A, B, C, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::RowColQuant)                  \
     MACRO(A, B, C, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::TensorQuant)                  \
-    MACRO(A, B, C, RowMajor, ColMajor, ColMajor, ck_tile::QuantType::RowColQuant)                  \
-    MACRO(A, B, C, RowMajor, ColMajor, ColMajor, ck_tile::QuantType::TensorQuant)                  \
+    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::RowColQuant)                  \
+    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::TensorQuant)                  \
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)                  \
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)                  \
     MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::RowColQuant)                  \
     MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::TensorQuant)                  \
-    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::RowColQuant)                  \
-    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::TensorQuant)                  \
     MACRO(A, B, C, RowMajor, ColMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)               \
-    MACRO(A, B, C, RowMajor, ColMajor, ColMajor, ck_tile::QuantType::ABQuantGrouped)               \
+    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::ABQuantGrouped)               \
     MACRO(A, B, C, RowMajor, RowMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)               \
-    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)               \
-    MACRO(A, B, C, ColMajor, RowMajor, ColMajor, ck_tile::QuantType::ABQuantGrouped)
+    MACRO(A, B, C, ColMajor, RowMajor, RowMajor, ck_tile::QuantType::ABQuantGrouped)
 
 // FP16 * FP16 = FP16
 APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE_EXTERN, ck_tile::half_t, ck_tile::half_t, ck_tile::half_t)
