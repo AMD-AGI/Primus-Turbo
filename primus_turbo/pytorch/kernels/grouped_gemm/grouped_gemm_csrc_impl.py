@@ -92,9 +92,9 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         # debug1 = torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_variable_k(
         #     lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, num_cu
         # )
-        # print("lhs.shape: ", lhs.shape)
-        # print("rhs.shape: ", rhs.shape)
-        # print("group_offs: ", group_offs)
+        print("lhs.shape: ", lhs.shape)
+        print("rhs.shape: ", rhs.shape)
+        print("group_offs: ", group_offs)
         debug2 = torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_variable_k_2(
             rhs, lhs, group_lens, group_offs, not trans_rhs, not trans_lhs, num_cu
         )
