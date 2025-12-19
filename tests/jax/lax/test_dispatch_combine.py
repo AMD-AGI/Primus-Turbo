@@ -13,6 +13,7 @@ from jax.sharding import PartitionSpec
 
 from primus_turbo.jax.lax.moe import get_dispatch_config, moe_combine, moe_dispatch
 from primus_turbo.jax.primitive.moe.moe_dispatch import moe_dispatch_p
+from tests.jax.test_utils import skip_if_lt_x_gpu
 
 key = jax.random.PRNGKey(123)
 
@@ -165,10 +166,12 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
     )
 
 
+@pytest.mark.multigpu
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("hidden", [7168])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("num_experts", [256])
+@skip_if_lt_x_gpu(2)
 def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
     """Test MoE dispatch/combine.
 
@@ -234,10 +237,12 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
         check_combine(base, ref, diff_threshold)
 
 
+@pytest.mark.multigpu
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("hidden", [7168])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("num_experts", [256])
+@skip_if_lt_x_gpu(2)
 def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts):
 
     @jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))

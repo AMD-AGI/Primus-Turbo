@@ -22,9 +22,8 @@ import pytest
 # Assign each xdist worker to a separate GPU
 _worker_id = os.environ.get("PYTEST_XDIST_WORKER")
 if _worker_id is not None:
-    _num_gpus = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "8"))
+    _num_gpus = 8  # TODO: hardcode.
     _gpu_id = int(_worker_id.replace("gw", "")) % _num_gpus
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(_gpu_id)
     os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
 
 
@@ -50,7 +49,9 @@ def pytest_collection_modifyitems(config, items):
 
 
 def _is_distributed_test(item):
-    """Check if test is a MultiProcessTestCase (requires multiple GPUs)."""
-    if not hasattr(item, "cls") or item.cls is None:
-        return False
-    return any(cls.__name__ == "MultiProcessTestCase" for cls in item.cls.__mro__)
+    """Check if test requires multiple GPUs."""
+    if item.get_closest_marker("multigpu"):
+        return True
+    if hasattr(item, "cls") and item.cls is not None:
+        return any(cls.__name__ == "MultiProcessTestCase" for cls in item.cls.__mro__)
+    return False

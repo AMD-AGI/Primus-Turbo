@@ -4,28 +4,48 @@
 
 #pragma once
 
+#include "ffi.h"
 #include "primus_turbo/common.h"
+#include <vector>
 #include <xla/ffi/api/ffi.h>
 
 namespace ffi = xla::ffi;
 
 namespace primus_turbo::jax {
 
+//==================================================================
+//  RMSNorm
+//==================================================================
 XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormBwdHandler);
 
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmHandler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmVariableKHandler);
+//==================================================================
+//  Grouped GEMM
+//==================================================================
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmVariableKHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ComputeGroupOffsHandler);
 
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8Handler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(GroupedGemmFP8VariableKHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8Handler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8VariableKHandler);
 
+int64_t GetCKGroupedGemmWorkspaceSize(int32_t group_num);
+int64_t GetCKGroupedGemmFP8WorkspaceSize(int32_t group_num);
+int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num);
+
+//==================================================================
+//  Quantization
+//==================================================================
 XLA_FFI_DECLARE_HANDLER_SYMBOL(QuantizeFP8TensorwiseHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(DequantizeFP8TensorwiseHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(QuantizeFP8RowwiseHandler);
 
-/* DeepEP */
+int64_t GetQuantizeFP8TensorwiseWorkspaceSize(int64_t n);
+int64_t GetQuantizeFP8RowwiseWorkspaceSize(const std::vector<int64_t> &shape, int64_t axis);
+
+//==================================================================
+//  DeepEP
+//==================================================================
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoEDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECachedDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECombineHandler);

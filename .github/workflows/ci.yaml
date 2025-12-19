@@ -147,7 +147,11 @@ jobs:
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
-      - name: Run unit tests
+      - name: Run single-GPU tests (parallel)
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
-        run: pytest -v tests/jax --log-cli-level=INFO
+        run: pytest -v tests/jax -n 8 --log-cli-level=INFO
+      - name: Run distributed tests
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: pytest -v tests/jax --dist-only --log-cli-level=INFO

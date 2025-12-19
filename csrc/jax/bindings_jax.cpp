@@ -3,7 +3,9 @@
 // See LICENSE for license information.
 
 #include "extensions.h"
+#include "ffi.h"
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #define REGISTER_FFI_HANDLER(dict, name, fn) dict[#name] = ::primus_turbo::jax::EncapsulateFFI(fn);
 
@@ -29,13 +31,13 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, moe_combine, MoECombineHandler);
 
     // Grouped GEMM
-    REGISTER_FFI_HANDLER(dict, grouped_gemm, GroupedGemmHandler);
-    REGISTER_FFI_HANDLER(dict, grouped_gemm_variable_k, GroupedGemmVariableKHandler);
+    REGISTER_FFI_HANDLER(dict, ck_grouped_gemm, CKGroupedGemmHandler);
+    REGISTER_FFI_HANDLER(dict, ck_grouped_gemm_variable_k, CKGroupedGemmVariableKHandler);
     REGISTER_FFI_HANDLER(dict, compute_group_offs, ComputeGroupOffsHandler);
 
     // Grouped GEMM FP8
-    REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8, GroupedGemmFP8Handler);
-    REGISTER_FFI_HANDLER(dict, grouped_gemm_fp8_variable_k, GroupedGemmFP8VariableKHandler);
+    REGISTER_FFI_HANDLER(dict, ck_grouped_gemm_fp8, CKGroupedGemmFP8Handler);
+    REGISTER_FFI_HANDLER(dict, ck_grouped_gemm_fp8_variable_k, CKGroupedGemmFP8VariableKHandler);
 
     // FP8 Quantization
     REGISTER_FFI_HANDLER(dict, quantize_fp8_tensorwise, QuantizeFP8TensorwiseHandler);
@@ -47,6 +49,29 @@ pybind11::dict Registrations() {
 
 PYBIND11_MODULE(_C, m) {
     m.def("registrations", &Registrations);
+
+    // DType enum
+    pybind11::enum_<DType>(m, "DType", pybind11::module_local())
+        .value("kByte", DType::kByte)
+        .value("kInt16", DType::kInt16)
+        .value("kInt32", DType::kInt32)
+        .value("kInt64", DType::kInt64)
+        .value("kFloat32", DType::kFloat32)
+        .value("kFloat16", DType::kFloat16)
+        .value("kBFloat16", DType::kBFloat16)
+        .value("kFloat8E4M3FN", DType::kFloat8E4M3FN)
+        .value("kFloat8E4M3FNUZ", DType::kFloat8E4M3FNUZ)
+        .value("kFloat8E5M2", DType::kFloat8E5M2)
+        .value("kFloat8E5M2FNUZ", DType::kFloat8E5M2FNUZ)
+        .value("kFloat8E8M0", DType::kFloat8E8M0);
+
+    m.def("get_ck_grouped_gemm_workspace_size", &GetCKGroupedGemmWorkspaceSize);
+    m.def("get_ck_grouped_gemm_fp8_workspace_size", &GetCKGroupedGemmFP8WorkspaceSize);
+    m.def("get_ck_grouped_gemm_fp8_variable_k_workspace_size",
+          &GetCKGroupedGemmFP8VariableKWorkspaceSize);
+
+    m.def("get_quantize_fp8_tensorwise_workspace_size", &GetQuantizeFP8TensorwiseWorkspaceSize);
+    m.def("get_quantize_fp8_rowwise_workspace_size", &GetQuantizeFP8RowwiseWorkspaceSize);
 }
 
 } // namespace primus_turbo::jax

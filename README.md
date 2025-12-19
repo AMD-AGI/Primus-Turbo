@@ -9,9 +9,10 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 Note: JAX support is under active development. Optim support is planned but not yet available.
 
 ## 🚀 What's New
-- **[2025/12/1]** 🔥[Efficient MoE Pre-training at Scale on 1K AMD GPUs with TorchTitan.](https://pytorch.org/blog/efficient-moe-pre-training-at-scale-with-torchtitan/)
-- **[2025/9/19]** [Primus-Turbo introduction blog.](https://rocm.blogs.amd.com/software-tools-optimization/primus-large-models/README.html)
-- **[2025/9/11]** Primus-Turbo initial release, version v0.1.0.
+- **[2025/12/16]** 🔥[MoE Training Best Practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html)
+- **[2025/12/01]** 🔥[Efficient MoE Pre-training at Scale on 1K AMD GPUs with TorchTitan.](https://pytorch.org/blog/efficient-moe-pre-training-at-scale-with-torchtitan/)
+- **[2025/09/19]** [Primus-Turbo introduction blog.](https://rocm.blogs.amd.com/software-tools-optimization/primus-large-models/README.html)
+- **[2025/09/11]** Primus-Turbo initial release, version v0.1.0.
 
 ## 🧩 Primus Product Matrix
 
@@ -85,13 +86,21 @@ PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
 
 ### 3. Testing
 
+**Option 1: Single-process mode (slow but simple)**
 ```bash
-# Single-process mode (runs all tests)
-pytest tests/pytorch/
+pytest tests/pytorch/    # run all PyTorch tests
+pytest tests/jax/        # run all JAX tests
+```
 
-# Multi-process mode (need both commands for full coverage)
-pytest tests/pytorch/ -n 8        # single-GPU tests in parallel
-pytest tests/pytorch/ --dist-only # distributed tests (skipped by -n)
+**Option 2: Multi-process mode (faster)**
+```bash
+# PyTorch tests
+pytest tests/pytorch/ -n 8        # single-GPU tests (parallel)
+pytest tests/pytorch/ --dist-only # multi-GPU tests
+
+# JAX tests
+pytest tests/jax/ -n 8            # single-GPU tests (parallel)
+pytest tests/jax/ --dist-only     # multi-GPU tests
 ```
 
 ### 4. Packaging
