@@ -24,7 +24,7 @@ int64_t GetCKGroupedGemmFP8VariableKWorkspaceSize(int32_t group_num) {
 // Get the number of compute units for grouped GEMM
 inline uint32_t get_grouped_gemm_num_cu(cudaStream_t stream, int64_t num_cu) {
     int device_id = 0;
-    hipStreamGetDevice(stream, &device_id);
+    PRIMUS_TURBO_CHECK_HIP(hipStreamGetDevice(stream, &device_id));
     int32_t cus        = get_multi_processor_count(device_id);
     int32_t num_cu_val = num_cu;
     return num_cu_val <= 0 ? uint32_t(cus) : uint32_t(std::min(num_cu_val, cus));
@@ -237,9 +237,12 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
                     params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
@@ -248,9 +251,12 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
                     params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -268,9 +274,12 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
                     params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
@@ -279,9 +288,12 @@ ffi::Error CKGroupedGemmFP8FFI(cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBu
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
                     params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
                     params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -345,9 +357,12 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
@@ -356,9 +371,12 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
@@ -376,9 +394,12 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else if (out_dtype == ffi::BF16) {
             using CType = ck_tile::bf16_t;
             auto params = make_ck_grouped_gemm_fp8_params<AType, BType, CType, float>(
@@ -387,9 +408,12 @@ ffi::Error CKGroupedGemmFP8VariableKFFI(cudaStream_t stream, ffi::AnyBuffer a, f
             if (granularity == "TENSORWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::TensorQuant>(params);
-            else
+            else if (granularity == "ROWWISE")
                 ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                ck_tile::QuantType::RowColQuant>(params);
+            else
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                                  "granularity must be 'TENSORWISE' or 'ROWWISE'");
         } else {
             return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                               "GroupedGemmFP8 output must be float16 or bfloat16");
