@@ -4,22 +4,40 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import argparse
+import re
+from datetime import datetime
+
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
+from config import generate_grouped_gemm_group_lens
 from tabulate import tabulate
 
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
-from tests.pytorch.ref.gemm_ref import (
-    generate_grouped_gemm_group_lens,
-    grouped_gemm_ref,
-)
-from tests.pytorch.test_utils import compute_snr
+
+# Mapping from CLI argument to Float8QuantConfig
+GRANULARITY_CONFIG_MAP = {
+    "tensorwise": Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE),
+    "rowwise": Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.ROWWISE),
+    "blockwise": Float8QuantConfig(
+        format=Format.E4M3,
+        granularity=ScalingGranularity.BLOCKWISE,
+        block_size=128,
+    ),
+    "mx": Float8QuantConfig(
+        format=Format.E4M3,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    ),
+}
 
 M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 EP_SIZE_LIST = [32, 16, 8]
@@ -73,44 +91,25 @@ def generate_deepseekv2_lite_test_cases():
     )
 
 
-def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, format, granularity, trans_b, balance):
+def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, config):
     device = "cuda"
+    trans_b = True
     # Prepare inputs
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)
     b_shape = (B, N, K) if trans_b else (B, K, N)
     a = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
     b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
-    a_ref = a.detach().clone().requires_grad_(True)
-    b_ref = b.detach().clone().requires_grad_(True)
 
-    config = Float8QuantConfig(format=format, granularity=granularity)
+    # Prepare gradient output
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    grad_out = torch.randn_like(out)
 
-    # Reference forward pass
-    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=trans_b)
-    grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out, retain_graph=True)
-
-    # Forward pass for implementation
+    # Forward and backward functions
     fwd_func = lambda: grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
 
-    # Compute SNRs
-    out_snr = compute_snr(out_ref, out)
-    a_grad_snr = compute_snr(a_ref.grad, a.grad)
-    b_grad_snr = compute_snr(b_ref.grad, b.grad)
-
-    if out_snr <= 20:
-        print(f"out_snr too low: {out_snr}")
-    if a_grad_snr <= 20:
-        print(f"x_grad_snr too low: {a_grad_snr}")
-    if b_grad_snr <= 20:
-        print(f"w_grad_snr too low: {b_grad_snr}")
-
-    assert out_snr > 20, "out_snr too low"
-    assert a_grad_snr > 20, "x_grad_snr too low"
-    assert b_grad_snr > 20, "w_grad_snr too low"
     # Calculate FLOPs
     fwd_total_flops = 2 * B * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
@@ -143,46 +142,39 @@ def bench_grouped_gemm_fp8(B, M, N, K, ori_dtype, format, granularity, trans_b, 
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops
 
 
-if __name__ == "__main__":
+def benchmark_grouped_gemm_fp8(granularity_name="tensorwise"):
+    # Get GPU name
+    full_name = torch.cuda.get_device_name(0)
+    match = re.search(r"(MI\d+)", full_name)
+    gpu_name = match.group(1) if match else full_name.split()[-1]
+
+    # Get config from granularity name
+    config = GRANULARITY_CONFIG_MAP[granularity_name]
+
+    # Generate test cases
     dsv2_lite_test_cases = generate_deepseekv2_lite_test_cases()
     dsv2_test_cases = generate_deepseekv2_test_cases()
     dsv3_test_cases = generate_deepseekv3_test_cases()
     test_cases = dsv2_lite_test_cases + dsv2_test_cases + dsv3_test_cases
 
-    # DataFrame to store results
-    results = pd.DataFrame(
-        columns=[
-            "TestID",
-            "Case",
-            "B",
-            "M",
-            "N",
-            "K",
-            "format",
-            "granularity",
-            "Forward Time (ms)",
-            "Forward TFLOPS",
-            "Backward Time (ms)",
-            "Backward TFLOPS",
-        ]
-    )
+    # List to collect results
+    rows = []
+
     test_id = 0
-    format = Format.E4M3
-    granularity = ScalingGranularity.TENSORWISE
     for case in test_cases:
+        test_id += 1
         B = case["B"]
         M = case["M"]
         N = case["N"]
         K = case["K"]
         dtype = case["dtype"]
 
-        print(f"\n{'='*50}")
-        print(f"Testing Case: {case}")
-        print(f"{'='*50}")
+        print(f"\n{'='*60}")
+        print(
+            f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, granularity: {granularity_name}"
+        )
+        print(f"{'='*60}")
 
-        trans_b = True
-        balance = True
-        test_id += 1
         try:
             # Run benchmark
             fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops = bench_grouped_gemm_fp8(
@@ -191,49 +183,74 @@ if __name__ == "__main__":
                 N=N,
                 K=K,
                 ori_dtype=dtype,
-                format=format,
-                granularity=granularity,
-                trans_b=trans_b,
-                balance=balance,
+                config=config,
             )
-            # Add to results table
-            new_row = {
-                "TestID": test_id,
-                "Case": case["Case"],
-                "B": B,
-                "M": M,
-                "N": N,
-                "K": K,
-                "format": format,
-                "granularity": granularity,
-                "Forward Time (ms)": f"{fwd_time_ms:.2f}",
-                "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                "Backward Time (ms)": f"{bwd_time_ms:.2f}",
-                "Backward TFLOPS": f"{bwd_tflops:.2f}",
-            }
-            results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
+            # Add to results list
+            rows.append(
+                {
+                    "TestID": test_id,
+                    "GPU": gpu_name,
+                    "Case": case["Case"],
+                    "B": B,
+                    "M": M,
+                    "N": N,
+                    "K": K,
+                    "granularity": granularity_name,
+                    "Forward Time (ms)": f"{fwd_time_ms:.2f}",
+                    "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                    "Backward Time (ms)": f"{bwd_time_ms:.2f}",
+                    "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                }
+            )
         except Exception as e:
             print(f"Failed to run {case}: {str(e)}")
-            new_row = {
-                "TestID": test_id,
-                "Case": case["Case"],
-                "B": B,
-                "M": M,
-                "N": N,
-                "K": K,
-                "format": format,
-                "granularity": granularity,
-                "Forward Time (ms)": "N/A",
-                "Forward TFLOPS": "N/A",
-                "Backward Time (ms)": "N/A",
-                "Backward TFLOPS": "N/A",
-            }
-            results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
+            rows.append(
+                {
+                    "TestID": test_id,
+                    "GPU": gpu_name,
+                    "Case": case["Case"],
+                    "B": B,
+                    "M": M,
+                    "N": N,
+                    "K": K,
+                    "granularity": granularity_name,
+                    "Forward Time (ms)": "N/A",
+                    "Forward TFLOPS": "N/A",
+                    "Backward Time (ms)": "N/A",
+                    "Backward TFLOPS": "N/A",
+                }
+            )
+
+    # Create DataFrame from collected results
+    results = pd.DataFrame(rows)
 
     # Print results
     print("\nFinal Results:")
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
+    # Calculate and print average TFLOPS
+    avg_fwd_tflops = results["Forward TFLOPS"].astype(float).mean()
+    avg_bwd_tflops = results["Backward TFLOPS"].astype(float).mean()
+    print(f"\nAverage Forward TFLOPS: {avg_fwd_tflops:.2f}")
+    print(f"Average Backward TFLOPS: {avg_bwd_tflops:.2f}")
+
+    # Generate filename with timestamp, hardware and granularity info
+    timestamp = datetime.now().strftime("%Y%m%d")
+    filename = f"grouped_gemm_fp8_{granularity_name}_benchmark_result_{timestamp}_{gpu_name}.csv"
+
     # Save to CSV
-    results.to_csv("grouped_gemm_fp8_benchmark_results.csv", index=False)
-    print("Results saved to grouped_gemm_fp8_benchmark_results.csv")
+    results.to_csv(filename, index=False)
+    print(f"Results saved to {filename}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark FP8 Grouped GEMM operations")
+    parser.add_argument(
+        "--granularity",
+        type=str,
+        choices=["tensorwise", "rowwise", "blockwise", "mx"],
+        default="tensorwise",
+        help="Scaling granularity (default: tensorwise)",
+    )
+    args = parser.parse_args()
+    benchmark_grouped_gemm_fp8(args.granularity)

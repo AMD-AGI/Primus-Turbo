@@ -6,6 +6,8 @@
 
 """Shared configurations for benchmark scripts."""
 
+import torch
+
 ModelConfigs = {
     "llama2-7b": {
         "seqlen": 4096,
@@ -71,3 +73,15 @@ def gen_gemm_test_cases(model_config):
     gemm_shape_list.append([seq, hidden_size, intermediate_size])
     return gemm_shape_list
 
+
+def generate_grouped_gemm_group_lens(b, m, balance: bool = True):
+    """Generate group lengths for grouped GEMM."""
+    if balance:
+        return torch.full((b,), m, dtype=torch.int64)
+    else:
+        dist = 0.2 + 0.8 * torch.rand(b)
+        dist /= dist.sum()
+        group_lens = (dist * b * m).to(torch.int64)
+        error = b * m - group_lens.sum()
+        group_lens[-1] += error
+        return group_lens
