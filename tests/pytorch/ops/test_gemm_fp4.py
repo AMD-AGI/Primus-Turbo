@@ -10,8 +10,8 @@ import torch
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
-    Float4ScalingRecipe,
     Format,
+    MXScalingRecipe,
     ScaleDtype,
     ScalingGranularity,
 )
@@ -41,7 +41,7 @@ torch.manual_seed(42)
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False, True])
-def test_gemm_mxfp4(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
+def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
@@ -92,11 +92,11 @@ def test_gemm_mxfp4(m, n, k, layout, format, dtype, granularity, backend, auto_t
     config = Float4QuantConfig(
         granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
     )
-    config.scaling_recipe["a_fwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_fwd"] = Float4ScalingRecipe(use_2d_block=True, use_sr=False)
-    config.scaling_recipe["grad_bwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=True)
-    config.scaling_recipe["a_bwd"] = Float4ScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_bwd"] = Float4ScalingRecipe(use_2d_block=True, use_sr=True)
+    config.scaling_recipe["a_fwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["b_fwd"] = MXScalingRecipe(use_2d_block=True, use_sr=False)
+    config.scaling_recipe["grad_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=True)
+    config.scaling_recipe["a_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["b_bwd"] = MXScalingRecipe(use_2d_block=True, use_sr=True)
     print(config)
     c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
     c.backward(torch.ones_like(c))

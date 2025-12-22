@@ -68,31 +68,20 @@ def quantize_mxfp4_kernel(
 
             if not USE_2D_BLOCK:
                 biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
-                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-                scale_inv_store_offsets = (
-                    offsets_Y[:, None] * stride_scale_inv_row
-                ) + scale_offset_X * stride_scale_inv_col
-                scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
-
-                tl.store(
-                    scale_inv_ptr + scale_inv_store_offsets,
-                    biased_exponent,
-                    mask=scale_inv_store_mask,
-                )
             else:
                 biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
-                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-                scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
-                scale_inv_store_offsets = (
-                    scale_offset_Y * stride_scale_inv_row + scale_offset_X * stride_scale_inv_col
-                )
-                scale_inv_store_mask = (scale_offset_Y < scale_n_rows) & (scale_offset_X < scale_n_cols)
 
-                tl.store(
-                    scale_inv_ptr + scale_inv_store_offsets,
-                    tl.max(biased_exponent),
-                    mask=scale_inv_store_mask,
-                )
+            scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+            scale_inv_store_offsets = (
+                offsets_Y[:, None] * stride_scale_inv_row
+            ) + scale_offset_X * stride_scale_inv_col
+            scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+
+            tl.store(
+                scale_inv_ptr + scale_inv_store_offsets,
+                biased_exponent,
+                mask=scale_inv_store_mask,
+            )
 
             scale = (biased_exponent.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             x_chunk0, x_chunk1 = tl.split(x_chunk.reshape(MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE // 2, 2))
@@ -166,7 +155,6 @@ def dequantize_mxfp4_kernel(
     BLOCK_X: tl.constexpr,
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
-    USE_2D_BLOCK: tl.constexpr,
     MXFP4_BLOCK_SIZE: tl.constexpr,
 ):
 
@@ -202,20 +190,11 @@ def dequantize_mxfp4_kernel(
             load_mask = (offsets_Y < n_rows)[:, None] & (x_offsets_X < n_cols // 2)[None, :]
             x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask)
 
-            if not USE_2D_BLOCK:
-                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-                scale_inv_load_offsets = (
-                    offsets_Y[:, None] * stride_scale_inv_row
-                ) + scale_offset_X * stride_scale_inv_col
-                scale_inv_load_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
-
-            else:
-                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-                scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
-                scale_inv_load_offsets = (
-                    scale_offset_Y * stride_scale_inv_row + scale_offset_X * stride_scale_inv_col
-                )
-                scale_inv_load_mask = (scale_offset_Y < scale_n_rows) & (scale_offset_X < scale_n_cols)
+            scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+            scale_inv_load_offsets = (
+                offsets_Y[:, None] * stride_scale_inv_row
+            ) + scale_offset_X * stride_scale_inv_col
+            scale_inv_load_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
 
             biased_exponent = tl.load(
                 scale_inv_ptr + scale_inv_load_offsets, mask=scale_inv_load_mask, other=127

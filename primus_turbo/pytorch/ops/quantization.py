@@ -8,10 +8,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.pytorch.core.low_precision import (
-    Float4ScalingRecipe,
-    ScalingGranularity,
-)
+from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, ScalingGranularity
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -37,6 +34,7 @@ def quantize_fp8(
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -61,7 +59,7 @@ def quantize_fp8(
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
         assert scale is None, "The scale is not supported for MXFP8 quantization"
 
-        return quantize_mxfp8_impl(x, out_dtype, axis, block_size, padding_align_size)
+        return quantize_mxfp8_impl(x, out_dtype, axis, block_size, padding_align_size, scaling_recipe)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -74,6 +72,7 @@ def dequantize_fp8(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ):
     """
     FP8 DeQuantize
@@ -111,7 +110,7 @@ def quantize_fp4(
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
-    scaling_recipe: Optional[Float4ScalingRecipe] = None,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize
@@ -141,7 +140,7 @@ def dequantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
-    scaling_recipe: Optional[Float4ScalingRecipe] = None,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> torch.Tensor:
     """
     FP4 DeQuantize
@@ -156,6 +155,6 @@ def dequantize_fp4(
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
 
-        return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv, scaling_recipe)
+        return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

@@ -132,14 +132,14 @@ class ScalingStrategy(Enum):
 
 
 @dataclass
-class Float4ScalingRecipe:
+class MXScalingRecipe:
     """
-    Supported FP4 scaling recipe.
+    Supported MXFP8/MXFP4 scaling recipe.
 
-    - use_2d_block: Whether to use 2D block in quantization.
-    - use_sr: Whether to use stochastic rounding in quantization.
-    - philox_seed: The philox generator's seed for the stochastic rounding.
-    - philox_offset: The philox generator's offset for the stochastic rounding.
+    - use_2d_block: Whether to use 2D block in quantization. Available in MXFP8 and MXFP4.
+    - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
+    - philox_seed: The philox generator's seed for the stochastic rounding. Available in MXFP4.
+    - philox_offset: The philox generator's offset for the stochastic rounding. Available in MXFP4.
     """
 
     use_2d_block: bool = False
@@ -155,6 +155,17 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+
+    # Default scaling recipe. Assume b is weight.
+    scaling_recipe: Dict[str, MXScalingRecipe] = field(
+        default_factory=lambda: {
+            "a_fwd": MXScalingRecipe(),
+            "b_fwd": MXScalingRecipe(use_2d_block=True),
+            "grad_bwd": MXScalingRecipe(),
+            "a_bwd": MXScalingRecipe(),
+            "b_bwd": MXScalingRecipe(use_2d_block=True),
+        }
+    )
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
@@ -181,13 +192,13 @@ class Float4QuantConfig:
     block_size: int = 32
 
     # Default scaling recipe. Assume b is weight. Reference: https://arxiv.org/pdf/2509.25149
-    scaling_recipe: Dict[str, Float4ScalingRecipe] = field(
+    scaling_recipe: Dict[str, MXScalingRecipe] = field(
         default_factory=lambda: {
-            "a_fwd": Float4ScalingRecipe(),
-            "b_fwd": Float4ScalingRecipe(use_2d_block=True),
-            "grad_bwd": Float4ScalingRecipe(use_sr=True),
-            "a_bwd": Float4ScalingRecipe(),
-            "b_bwd": Float4ScalingRecipe(use_2d_block=True, use_sr=True),
+            "a_fwd": MXScalingRecipe(),
+            "b_fwd": MXScalingRecipe(use_2d_block=True),
+            "grad_bwd": MXScalingRecipe(use_sr=True),
+            "a_bwd": MXScalingRecipe(),
+            "b_bwd": MXScalingRecipe(use_2d_block=True, use_sr=True),
         }
     )
 

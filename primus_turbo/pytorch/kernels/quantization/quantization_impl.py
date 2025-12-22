@@ -10,10 +10,7 @@ import torch
 import triton
 from torch.library import triton_op, wrap_triton
 
-from primus_turbo.pytorch.core.low_precision import (
-    Float4ScalingRecipe,
-    check_mxfp4_support,
-)
+from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, check_mxfp4_support
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
@@ -245,12 +242,15 @@ def quantize_mxfp8_impl(
     axis: int,
     block_size: int,
     padding_align_size: Optional[int] = None,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The x must be 2D tensor."
     assert axis in (0, 1), "The axis must be 0 or 1."
 
     num_rows, row_length = x.size()
+
+    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
 
     trans = axis == 0
 
@@ -263,10 +263,15 @@ def quantize_mxfp8_impl(
             padded_row_length % block_size == 0
         ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
 
-        scale_M, scale_N = padded_num_rows, padded_row_length // block_size
+        if scaling_recipe.use_2d_block:
+            assert (
+                num_rows % block_size == 0
+            ), f"The first dimension of the x tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
+
+        scale_m, scale_n = padded_num_rows, padded_row_length // block_size
 
         y = torch.empty((padded_num_rows, padded_row_length), dtype=out_dtype, device=x.device)
-        scale_inv = torch.empty(scale_M, scale_N, dtype=torch.uint8, device=x.device)
+        scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
     else:
         padded_num_rows, padded_row_length = num_rows, row_length
         if padding_align_size is not None:
@@ -276,10 +281,15 @@ def quantize_mxfp8_impl(
             padded_num_rows % block_size == 0
         ), f"The first dimension of the x tensor must be divisible by the block size but got {padded_num_rows} % {block_size} != 0."
 
-        scale_M, scale_N = padded_num_rows // block_size, padded_row_length
+        if scaling_recipe.use_2d_block:
+            assert (
+                padded_row_length % block_size == 0
+            ), f"The last dimension of the x tensor must be divisible by the block size when use 2D block but got {padded_row_length} % {block_size} != 0."
+
+        scale_m, scale_n = padded_num_rows // block_size, padded_row_length
 
         y = torch.empty((padded_row_length, padded_num_rows), dtype=out_dtype, device=x.device)
-        scale_inv = torch.empty(scale_N, scale_M, dtype=torch.uint8, device=x.device)
+        scale_inv = torch.empty(scale_n, scale_m, dtype=torch.uint8, device=x.device)
 
     scale_stride_M, scale_stride_N = scale_inv.stride(0), scale_inv.stride(1)
 
@@ -303,12 +313,13 @@ def quantize_mxfp8_impl(
         scale_inv,
         scale_stride_M,
         scale_stride_N,
-        scale_M,
-        scale_N,
+        scale_m,
+        scale_n,
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
         trans,
+        scaling_recipe.use_2d_block,
         block_size,
     )
     scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
@@ -339,7 +350,7 @@ def dequantize_mxfp8_impl(
     # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
     scale_inv = scale_inv.view(torch.uint8)
 
-    scale_M, scale_N = scale_inv.size()
+    scale_m, scale_n = scale_inv.size()
     if not trans:
         y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
     else:
@@ -361,8 +372,8 @@ def dequantize_mxfp8_impl(
         scale_inv,
         scale_inv.stride(0),
         scale_inv.stride(1),
-        scale_M,
-        scale_N,
+        scale_m,
+        scale_n,
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
@@ -379,7 +390,7 @@ def quantize_mxfp4_impl(
     axis: int,
     block_size: int,
     padding_align_size: Optional[int] = None,
-    scaling_recipe: Optional[Float4ScalingRecipe] = None,
+    scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # NOTE: quantize fp4 kernel use the ISA which only avaiable on cdna4.
     mxfp4_support, reason = check_mxfp4_support()
@@ -392,7 +403,7 @@ def quantize_mxfp4_impl(
         out_dtype == torch.float4_e2m1fn_x2
     ), f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
 
-    scaling_recipe = Float4ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
 
     num_rows, row_length = x.size()
 
@@ -409,7 +420,6 @@ def quantize_mxfp4_impl(
         assert (
             num_rows % block_size == 0
         ), f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
-        scale_m = scale_m // block_size
 
     philox_seed, philox_offset = scaling_recipe.philox_seed, scaling_recipe.philox_offset
     if scaling_recipe.use_sr:
@@ -466,7 +476,6 @@ def dequantize_mxfp4_impl(
     axis: int,
     block_size: int,
     scale_inv: torch.Tensor,
-    scaling_recipe: Optional[Float4ScalingRecipe] = None,
 ) -> torch.Tensor:
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The x must be 2D tensor."
@@ -478,8 +487,6 @@ def dequantize_mxfp4_impl(
     assert (
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
-
-    scaling_recipe = Float4ScalingRecipe() if scaling_recipe is None else scaling_recipe
 
     # NOTE: x is packed in last dimension
     num_rows, packed_row_length = x.size()
@@ -515,7 +522,6 @@ def dequantize_mxfp4_impl(
         BLOCK_X,
         BLOCK_Y,
         GROUP_Y,
-        scaling_recipe.use_2d_block,
         block_size,
     )
 
