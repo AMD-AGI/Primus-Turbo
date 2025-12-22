@@ -27,6 +27,7 @@ class BackendType(Enum):
     AITER = auto()
     TRITON = auto()
     UCCL = auto()
+    TURBO = auto()
 
 
 class GlobalBackendManager:
@@ -86,7 +87,7 @@ class GlobalBackendManager:
         """Get the MoE dispatch combine backend configuration. Returns None if not set."""
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend
-        backend = os.environ.get("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND")
+        backend = os.getenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", BackendType.TURBO.name)
         if backend:
             return BackendType[backend.upper()]
         return None
