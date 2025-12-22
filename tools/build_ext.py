@@ -558,13 +558,13 @@ BaseBuildExtension = _select_base_build_ext()
 
 class TurboBuildExt(BaseBuildExtension):
     KERNEL_EXT_NAME = "libprimus_turbo_kernels"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    def initialize_options(self):
-        super().initialize_options()
-        if self.build_temp is None:
-            self.build_temp = os.path.abspath("build/temp")
-        if self.build_lib is None:
-            self.build_lib = os.path.abspath("build/lib")
+    def finalize_options(self):
+        super().finalize_options()
+        if self.inplace:
+            self.build_temp = str(self.PROJECT_ROOT / "build" / "temp")
+            self.build_lib = str(self.PROJECT_ROOT / "build" / "lib")
 
     def get_ext_filename(self, ext_name: str) -> str:
         filename = super().get_ext_filename(ext_name)
