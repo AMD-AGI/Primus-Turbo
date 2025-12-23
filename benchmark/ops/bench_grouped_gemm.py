@@ -14,7 +14,7 @@ import torch.utils.benchmark as benchmark
 from config import generate_grouped_gemm_group_lens
 from tabulate import tabulate
 
-from primus_turbo.pytorch.ops import grouped_gemm
+import primus_turbo.pytorch as turbo
 
 
 def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
@@ -129,7 +129,7 @@ def generate_grok_v2_test_cases():
     )
 
 
-def bench_grouped_gemm(B, M, N, K, dtype):
+def profile_grouped_gemm(B, M, N, K, dtype):
     device = "cuda"
     # Prepare inputs
     x = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
@@ -137,14 +137,14 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)
 
     # Prepare gradient output
-    out = grouped_gemm(x, w, group_lens, trans_b=True)
+    out = turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
     grad_out = torch.randn_like(out)
 
     # Correctness check
     correct = check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype)
 
     # Forward and backward functions
-    fwd_func = lambda: grouped_gemm(x, w, group_lens, trans_b=True)
+    fwd_func = lambda: turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -212,7 +212,7 @@ def benchmark_grouped_gemm(output_csv=None):
 
         try:
             # Run benchmark
-            fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = bench_grouped_gemm(
+            fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm(
                 B=B,
                 M=M,
                 N=N,

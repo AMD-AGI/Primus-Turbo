@@ -93,7 +93,11 @@ def _generate_moe_test_cases(
     }
 
     for ep in EP_SIZE_LIST:
+        if n_routed_experts % ep != 0:
+            continue
         B = n_routed_experts // ep
+        if B < 1:
+            continue
         for M in M_SIZE_LIST:
             for name, (N, K) in shapes_dict.items():
                 for dtype in [torch.bfloat16]:
@@ -125,6 +129,13 @@ def generate_deepseekv2_test_cases():
 def generate_deepseekv2_lite_test_cases():
     return _generate_moe_test_cases(
         "DSV2-Lite", n_routed_experts=64, moe_intermediate_size=1408, hidden_size=2048
+    )
+
+
+def generate_grok_v2_test_cases():
+    # https://huggingface.co/xai-org/grok-2/blob/main/config.json
+    return _generate_moe_test_cases(
+        "Grok-V2", n_routed_experts=8, moe_intermediate_size=16384, hidden_size=8192
     )
 
 
@@ -178,6 +189,7 @@ def benchmark_grouped_gemm_fp8(granularity_name="tensorwise", output_csv=None):
         generate_deepseekv2_lite_test_cases()
         + generate_deepseekv2_test_cases()
         + generate_deepseekv3_test_cases()
+        + generate_grok_v2_test_cases()
     )
 
     rows = []

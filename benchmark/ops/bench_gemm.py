@@ -14,7 +14,7 @@ import torch.utils.benchmark as benchmark
 from config import MBS_LIST, ModelConfigs, gen_gemm_test_cases
 from tabulate import tabulate
 
-from primus_turbo.pytorch.ops import gemm
+import primus_turbo.pytorch as turbo
 
 
 def gemm_ref(a, b, trans_b=True):
@@ -67,14 +67,14 @@ def profile_gemm(M, N, K, dtype, trans_b):
     b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
 
     # Prepare gradient output
-    out = gemm(a, b, trans_b=trans_b)
+    out = turbo.ops.gemm(a, b, trans_b=trans_b)
     grad_out = torch.randn_like(out)
 
     # Correctness check
     correct = check_gemm_correctness(a, b, out, grad_out, trans_b, dtype)
 
     # Forward and backward functions
-    fwd_func = lambda: gemm(a, b, trans_b=trans_b)
+    fwd_func = lambda: turbo.ops.gemm(a, b, trans_b=trans_b)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
