@@ -14,13 +14,13 @@ import torch.utils.benchmark as benchmark
 from config import MBS_LIST, ModelConfigs, gen_gemm_test_cases
 from tabulate import tabulate
 
+import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScaleDtype,
     ScalingGranularity,
 )
-import primus_turbo.pytorch as turbo
 
 GRANULARITY_CONFIG_MAP = {
     "tensorwise": Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE),
@@ -71,7 +71,9 @@ def check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, fp8_format):
 
     correct = all(snr > snr_threshold for snr in [out_snr, da_snr, db_snr])
     status = "PASS" if correct else "FAIL"
-    print(f"Correctness Check: {status} (out={out_snr:.1f}, da={da_snr:.1f}, db={db_snr:.1f}) threshold={snr_threshold}")
+    print(
+        f"Correctness Check: {status} (out={out_snr:.1f}, da={da_snr:.1f}, db={db_snr:.1f}) threshold={snr_threshold}"
+    )
 
     return correct
 
@@ -134,28 +136,32 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
                 K = shape[2]
 
                 print(f"\n{'='*60}")
-                print(f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
-                      f"M: {M}, N: {N}, K: {K}, granularity: {granularity_name}")
+                print(
+                    f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
+                    f"M: {M}, N: {N}, K: {K}, granularity: {granularity_name}"
+                )
                 print(f"{'='*60}")
 
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
                     M, N, K, ori_dtype, config, trans_b
                 )
-                rows.append({
-                    "TestID": test_id,
-                    "GPU": gpu_name,
-                    "Case": model_name,
-                    "MBS": MBS,
-                    "M": M,
-                    "N": N,
-                    "K": K,
-                    "Granularity": granularity_name,
-                    "Check": "PASS" if correct else "FAIL",
-                    "Forward Time (ms)": f"{fwd_time_ms:.2f}",
-                    "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                    "Backward Time (ms)": f"{bwd_time_ms:.2f}",
-                    "Backward TFLOPS": f"{bwd_tflops:.2f}",
-                })
+                rows.append(
+                    {
+                        "TestID": test_id,
+                        "GPU": gpu_name,
+                        "Case": model_name,
+                        "MBS": MBS,
+                        "M": M,
+                        "N": N,
+                        "K": K,
+                        "Granularity": granularity_name,
+                        "Check": "PASS" if correct else "FAIL",
+                        "Forward Time (ms)": f"{fwd_time_ms:.2f}",
+                        "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                        "Backward Time (ms)": f"{bwd_time_ms:.2f}",
+                        "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                    }
+                )
 
     results = pd.DataFrame(rows)
     print("\nFinal Results:")
@@ -186,7 +192,8 @@ if __name__ == "__main__":
         help="Scaling granularity (default: tensorwise)",
     )
     parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         type=str,
         default=None,
         help="Output CSV filename. Default: gemm_fp8_{granularity}_benchmark_result_{date}_{gpu}.csv",
