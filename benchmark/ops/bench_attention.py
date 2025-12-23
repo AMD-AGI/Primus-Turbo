@@ -4,329 +4,288 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import argparse
+import os
+import re
+from datetime import datetime
+
+# Disable FP32 atomic for better performance
+os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
+
+import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from flash_attn import flash_attn_func
+from tabulate import tabulate
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-import primus_turbo.pytorch as pt
-from tests.pytorch.ref.attention_ref import (
-    AttnConfig,
-    attention_vanilla_forward_pytorch_ref_impl,
-)
-from tests.pytorch.test_utils import compute_snr
+import primus_turbo.pytorch as turbo
 
-test_cases_turbo = [
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=16, num_head_kv=16, head_dim_qk=192, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(
-        seqlen_q=4096, seqlen_kv=4096, num_head_q=128, num_head_kv=128, head_dim_qk=192, head_dim_v=128
-    ),
+# PyTorch SDPA backends for reference implementation
+ATTN_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
 ]
 
-test_cases_flash_attn = [
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=32, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
-    AttnConfig(seqlen_q=4096, seqlen_kv=4096, num_head_q=48, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+# Benchmark configurations
+SEQLEN_LIST = [4096, 8192]
+BATCH_LIST = [1, 2, 4]
+
+# (num_head_q, num_head_kv, head_dim_qk, head_dim_v)
+TEST_CASES = [
+    (32, 8, 128, 128),  # GQA 4:1
+    (32, 32, 128, 128),  # MHA
+    (64, 8, 128, 128),  # GQA 8:1
+    (64, 64, 128, 128),  # MHA
+    (64, 64, 192, 128),  # MLA
 ]
 
 
-def bench_turbo_attention(batch, config, causal: bool, backend_type: str, use_fp8: bool, test_backward: bool):
-    device = "cuda"
-    dtype = torch.bfloat16
-    seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
-        config.seqlen_q,
-        config.seqlen_kv,
-        config.num_head_q,
-        config.num_head_kv,
-        config.head_dim_qk,
-        config.head_dim_v,
-    )
-    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+def attention_ref(q, k, v, sm_scale, causal):
+    """Reference attention using PyTorch's scaled_dot_product_attention."""
+    num_heads = q.shape[2]
+    n_kv_heads = k.shape[2]
+    n_rep = num_heads // n_kv_heads
 
-    query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
-    key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
-    value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
-    query_ref = query.clone().detach().requires_grad_()
-    key_ref = key.clone().detach().requires_grad_()
-    value_ref = value.clone().detach().requires_grad_()
+    # BSHD -> BHSD
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
 
-    sm_scale = query.shape[-1] ** (-0.5)
-
-    o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
-    if use_fp8 == False:
-        fn_forward = lambda: pt.ops.flash_attn_func(
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            bias=None,
-            alibi_slopes=None,
-            deterministic=False,
-            return_lse=False,
-            return_attn_probs=False,
-            backend_type=backend_type,
-        )
-    else:
-        fn_forward = lambda: pt.ops.flash_attn_fp8_func(
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            bias=None,
-            alibi_slopes=None,
-            deterministic=False,
-            return_lse=False,
-            return_attn_probs=False,
+    with sdpa_kernel(ATTN_BACKENDS):
+        o_ref = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
         )
 
-    # Forward pass
-    o = fn_forward()
-    grad_output = torch.randn_like(o)
+    # BHSD -> BSHD
+    return o_ref.transpose(1, 2)
 
-    # Backward pass for reference
-    o_ref.backward(grad_output, retain_graph=True)
-    # Backward pass for implementation
-    o.backward(grad_output, retain_graph=True)
+
+def compute_snr(x: torch.Tensor, y: torch.Tensor):
+    """Compute Signal-to-Noise Ratio. x is reference."""
+    x, y = x.float(), y.float()
+    signal_power = torch.norm(x).pow(2)
+    noise_power = torch.norm(x - y).pow(2)
+    return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
+
+
+def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out, use_fp8):
+    """Check correctness of attention forward and backward against PyTorch reference."""
+    # Backward pass
+    o_ref.backward(grad_out, retain_graph=True)
+    o.backward(grad_out, retain_graph=True)
 
     # Compute SNRs
     out_snr = compute_snr(o_ref, o)
-    query_grad_snr = compute_snr(query_ref.grad, query.grad)
-    key_grad_snr = compute_snr(key_ref.grad, key.grad)
-    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+    dq_snr = compute_snr(q_ref.grad, q.grad)
+    dk_snr = compute_snr(k_ref.grad, k.grad)
+    dv_snr = compute_snr(v_ref.grad, v.grad)
 
-    # Verify SNRs meet requirements
-    assert out_snr > 20, "out_snr too low"
-    assert query_grad_snr > 15, "query_grad_snr too low"
-    assert key_grad_snr > 15, "key_grad_snr too low"
-    assert value_grad_snr > 15, "value_grad_snr too low"
+    # SNR thresholds: bf16 requires higher SNR (40), fp8 allows lower (20)
+    threshold = 20 if use_fp8 else 40
 
-    # Calculate FLOPs
-    total_flops = (
-        2 * batch * seqlen_q * seqlen_kv * num_head_q * head_dim_qk
-        + 2 * batch * seqlen_q * seqlen_kv * num_head_q * head_dim_v
+    correct = all(snr > threshold for snr in [out_snr, dq_snr, dk_snr, dv_snr])
+    status = "PASS" if correct else "FAIL"
+    print(
+        f"Correctness Check: {status} (out={out_snr:.1f}, dq={dq_snr:.1f}, dk={dk_snr:.1f}, dv={dv_snr:.1f})"
     )
-    if causal:
-        total_flops //= 2
 
-    if test_backward:
-        # Re-run forward pass to get fresh output
-        o = fn_forward()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        total_flops *= 2.5  # Approximate factor for backward pass
-    else:
-        fn = fn_forward
+    # Reset gradients
+    q.grad = None
+    k.grad = None
+    v.grad = None
 
-    # Warmup
-    warmup = 5
-    for _ in range(warmup):
-        _ = fn()
-    torch.cuda.synchronize()
-
-    # Benchmark
-    timer = benchmark.Timer(
-        stmt="fn()",
-        globals={"fn": fn},
-    )
-    measurement = timer.timeit(100)
-    mean_time_ms = measurement.mean * 1e3
-    flops_per_sec = total_flops / (mean_time_ms * 1e-3) / 1e12  # TFLOPs/s
-
-    print(f"Mean time: {mean_time_ms:.3f} ms | TFLOPS: {flops_per_sec:.2f}")
-    return mean_time_ms, flops_per_sec, total_flops
+    return correct
 
 
-def bench_flash_attention(batch, config, causal: bool, backend_type: str, use_fp8: bool, test_backward: bool):
+def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8):
+    """Profile attention forward and backward performance."""
     device = "cuda"
     dtype = torch.bfloat16
-    seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
-        config.seqlen_q,
-        config.seqlen_kv,
-        config.num_head_q,
-        config.num_head_kv,
-        config.head_dim_qk,
-        config.head_dim_v,
-    )
-    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
 
-    query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
-    key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
-    value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
-    sm_scale = query.shape[-1] ** (-0.5)
+    # Create tensors
+    q = torch.randn((batch, seqlen, num_head_q, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn((batch, seqlen, num_head_kv, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn((batch, seqlen, num_head_kv, head_dim_v), device=device, dtype=dtype, requires_grad=True)
+    q_ref = q.clone().detach().requires_grad_()
+    k_ref = k.clone().detach().requires_grad_()
+    v_ref = v.clone().detach().requires_grad_()
 
-    fn_forward = lambda: flash_attn_func(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=(-1, -1),
-        alibi_slopes=None,
-        deterministic=False,
-        return_attn_probs=False,
-    )
+    sm_scale = head_dim_qk ** (-0.5)
 
-    # Forward pass
-    o = fn_forward()
-    grad_output = torch.randn_like(o)
+    # Reference forward
+    o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal)
 
-    # Backward pass for implementation
-    o.backward(grad_output, retain_graph=True)
+    # Define forward function
+    if use_fp8:
+        fwd_func = lambda: turbo.ops.flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=(-1, -1),
+            bias=None,
+            alibi_slopes=None,
+            deterministic=False,
+            return_lse=False,
+            return_attn_probs=False,
+        )
+    else:
+        fwd_func = lambda: turbo.ops.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=(-1, -1),
+            bias=None,
+            alibi_slopes=None,
+            deterministic=False,
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    # Forward pass and correctness check
+    out = fwd_func()
+    grad_out = torch.randn_like(out)
+    correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
+
+    # Prepare benchmark functions
+    out = fwd_func()
+    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
+    bwd_func()
 
     # Calculate FLOPs
-    total_flops = (
-        2 * batch * seqlen_q * seqlen_kv * num_head_q * head_dim_qk
-        + 2 * batch * seqlen_q * seqlen_kv * num_head_q * head_dim_v
-    )
+    fwd_flops = 2 * batch * seqlen * seqlen * num_head_q * (head_dim_qk + head_dim_v)
     if causal:
-        total_flops //= 2
-
-    if test_backward:
-        # Re-run forward pass to get fresh output
-        o = fn_forward()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        total_flops *= 2.5  # Approximate factor for backward pass
-    else:
-        fn = fn_forward
+        fwd_flops //= 2
+    bwd_flops = fwd_flops * 2.5
 
     # Warmup
-    warmup = 5
-    for _ in range(warmup):
-        _ = fn()
+    for _ in range(20):
+        fwd_func()
+        bwd_func()
     torch.cuda.synchronize()
 
     # Benchmark
-    timer = benchmark.Timer(
-        stmt="fn()",
-        globals={"fn": fn},
-    )
-    measurement = timer.timeit(100)
-    mean_time_ms = measurement.mean * 1e3
-    flops_per_sec = total_flops / (mean_time_ms * 1e-3) / 1e12  # TFLOPs/s
+    fwd_time = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func}).timeit(100).mean * 1e3
+    bwd_time = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func}).timeit(100).mean * 1e3
+    fwd_tflops = fwd_flops / (fwd_time * 1e-3) / 1e12
+    bwd_tflops = bwd_flops / (bwd_time * 1e-3) / 1e12
 
-    print(f"Mean time: {mean_time_ms:.3f} ms | TFLOPS: {flops_per_sec:.2f}")
-    return mean_time_ms, flops_per_sec, total_flops
+    print(f"Forward  Mean time: {fwd_time:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+    print(f"Backward Mean time: {bwd_time:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
+
+    return fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct
+
+
+def benchmark_attention(output_csv=None, use_fp8=False):
+    """Run attention benchmark."""
+    # Get GPU name
+    full_name = torch.cuda.get_device_name(0)
+    match = re.search(r"(MI\d+)", full_name)
+    gpu_name = match.group(1) if match else full_name.split()[-1]
+
+    rows = []
+    test_id = 0
+    total_tests = 2 * len(SEQLEN_LIST) * len(BATCH_LIST) * len(TEST_CASES)
+    print(f"Total tests: {total_tests}, FP8: {use_fp8}")
+
+    for causal in [False, True]:
+        for num_head_q, num_head_kv, head_dim_qk, head_dim_v in TEST_CASES:
+            for seqlen in SEQLEN_LIST:
+                for batch in BATCH_LIST:
+                    test_id += 1
+
+                    print(f"\n{'='*60}")
+                    print(
+                        f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
+                        f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
+                        f"causal={causal}, fp8={use_fp8}"
+                    )
+                    print(f"{'='*60}")
+
+                    row = {
+                        "TestID": test_id,
+                        "GPU": gpu_name,
+                        "Batch": batch,
+                        "SeqLen": seqlen,
+                        "num_head_q": num_head_q,
+                        "num_head_kv": num_head_kv,
+                        "head_dim_qk": head_dim_qk,
+                        "head_dim_v": head_dim_v,
+                        "Causal": causal,
+                    }
+
+                    try:
+                        fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
+                            batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
+                        )
+                        row.update(
+                            {
+                                "Check": "PASS" if correct else "FAIL",
+                                "Forward Time (ms)": f"{fwd_time:.2f}",
+                                "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                                "Backward Time (ms)": f"{bwd_time:.2f}",
+                                "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                            }
+                        )
+                    except Exception as e:
+                        print(f"Failed: {str(e)}")
+                        row.update(
+                            {
+                                "Check": "ERROR",
+                                "Forward Time (ms)": "Failed",
+                                "Forward TFLOPS": "N/A",
+                                "Backward Time (ms)": "Failed",
+                                "Backward TFLOPS": "N/A",
+                            }
+                        )
+
+                    rows.append(row)
+
+    # Create DataFrame
+    results = pd.DataFrame(rows)
+
+    # Print results
+    print("\nFinal Results:")
+    print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
+
+    # Print average TFLOPS
+    valid_results = results[results["Forward TFLOPS"] != "N/A"]
+    if not valid_results.empty:
+        avg_fwd = valid_results["Forward TFLOPS"].astype(float).mean()
+        avg_bwd = valid_results["Backward TFLOPS"].astype(float).mean()
+        print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
+        print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
+
+    # Save to CSV
+    if output_csv:
+        filename = output_csv
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d")
+        prefix = "attention_fp8_benchmark_result" if use_fp8 else "attention_benchmark_result"
+        filename = f"{prefix}_{timestamp}_{gpu_name}.csv"
+    results.to_csv(filename, index=False)
+    print(f"Results saved to {filename}")
 
 
 if __name__ == "__main__":
-    import pandas as pd
-    from tabulate import tabulate
-
-    def run_benchmark(bench_func, test_cases, test_configs):
-        # DataFrame to store results
-        results = pd.DataFrame(
-            columns=[
-                "Test id",
-                "Causal",
-                "Backend",
-                "FP8",
-                "Test Backward",
-                "num_head_q",
-                "num_head_kv",
-                "head_dim_qk",
-                "head_dim_v",
-                "Time (ms)",
-                "TFLOPS",
-            ]
-        )
-        test_id = 0
-        for test_case in test_cases:
-            print(f"\n{'='*50}")
-            print(f"Testing config: {test_case}")
-            print(f"{'='*50}")
-            for config in test_configs:
-                test_id += 1
-                try:
-                    # Run benchmark
-                    time_ms, tflops, _ = bench_func(
-                        batch=4,
-                        config=test_case,
-                        causal=config["causal"],
-                        backend_type=config["backend"],
-                        use_fp8=config["fp8"],
-                        test_backward=config["test_backward"],
-                    )
-
-                    # Add to results table
-                    new_row = {
-                        "Test id": test_id,
-                        "Causal": config["causal"],
-                        "Backend": config["backend"],
-                        "FP8": config["fp8"],
-                        "Test Backward": config["test_backward"],
-                        "Time (ms)": f"{time_ms:.2f}",
-                        "TFLOPS": f"{tflops:.2f}",
-                        "num_head_q": test_case.num_head_q,
-                        "num_head_kv": test_case.num_head_kv,
-                        "head_dim_qk": test_case.head_dim_qk,
-                        "head_dim_v": test_case.head_dim_v,
-                    }
-                    results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
-
-                except Exception as e:
-                    print(f"Failed to run {config}: {str(e)}")
-                    new_row = {
-                        "Test id": test_id,
-                        "Causal": config["causal"],
-                        "Backend": config["backend"],
-                        "FP8": config["fp8"],
-                        "Test Backward": config["test_backward"],
-                        "Time (ms)": "Failed",
-                        "TFLOPS": "N/A",
-                        "num_head_q": test_case.num_head_q,
-                        "num_head_kv": test_case.num_head_kv,
-                        "head_dim_qk": test_case.head_dim_qk,
-                        "head_dim_v": test_case.head_dim_v,
-                    }
-                    results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
-
-        return results
-
-    # Define test configurations
-    test_configs_turbo = [
-        {"causal": False, "backend": "ck", "fp8": False, "test_backward": False},
-        {"causal": True, "backend": "ck", "fp8": False, "test_backward": False},
-        {"causal": False, "backend": "ck", "fp8": False, "test_backward": True},
-        {"causal": True, "backend": "ck", "fp8": False, "test_backward": True},
-        {"causal": False, "backend": "triton", "fp8": True, "test_backward": False},
-        {"causal": True, "backend": "triton", "fp8": True, "test_backward": False},
-        {"causal": False, "backend": "triton", "fp8": True, "test_backward": True},
-        {"causal": True, "backend": "triton", "fp8": True, "test_backward": True},
-    ]
-    # Run benchmarks with bench_turbo_attention
-    aiter_results = run_benchmark(bench_turbo_attention, test_cases_turbo, test_configs_turbo)
-    print("\nFinal AIter Results:")
-    print(tabulate(aiter_results, headers="keys", tablefmt="grid", showindex=False))
-    aiter_results.to_csv("aiter_attention_benchmark_results.csv", index=False)
-    print("AITer results saved to aiter_attention_benchmark_results.csv")
-
-    test_configs_flash_attn = [
-        {"causal": False, "backend": "ck", "fp8": False, "test_backward": False},
-        {"causal": True, "backend": "ck", "fp8": False, "test_backward": False},
-        {"causal": False, "backend": "ck", "fp8": False, "test_backward": True},
-        {"causal": True, "backend": "ck", "fp8": False, "test_backward": True},
-    ]
-    # Run benchmarks with bench_flash_attention
-    flash_results = run_benchmark(bench_flash_attention, test_cases_flash_attn, test_configs_flash_attn)
-    print("\nFinal Flash Attention Results:")
-    print(tabulate(flash_results, headers="keys", tablefmt="grid", showindex=False))
-    flash_results.to_csv("flash_attention_benchmark_results.csv", index=False)
-    print("Flash Attention results saved to flash_attention_benchmark_results.csv")
+    parser = argparse.ArgumentParser(description="Benchmark Attention operations")
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output CSV filename. Default: attention[_fp8]_benchmark_result_{date}_{gpu}.csv",
+    )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        help="Enable FP8 attention benchmark (default: disabled)",
+    )
+    args = parser.parse_args()
+    benchmark_attention(output_csv=args.output, use_fp8=args.fp8)
