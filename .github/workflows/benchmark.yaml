@@ -5,9 +5,14 @@ on:
   schedule:
     - cron: '0 0 * * *'
 
+env:
+  BENCHMARK_ROOT_DIR: /wekafs/primus_turbo/benchmark
+
 jobs:
   benchmark-pytorch-gfx942:
-    runs-on: turbo-pt-bench-gfx942-259-lrv82
+    runs-on: turbo-pt-bench-gfx942-2510-vsskr
+    env:
+      GPU_NAME: MI325  # Change this to your GPU model
     steps:
       - run: echo "🎉 Begin Primus-Turbo Benchmark."
       - name: Change owner
@@ -29,13 +34,53 @@ jobs:
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
-      - name: Run GEMM Benchmark
-        continue-on-error: true
+      - name: Create benchmark output directory
         run: |
-          PYTHONPATH=. python3 benchmark/ops/bench_gemm.py
-      # - name: Run Grouped GEMM Benchmark
-      #   run: |
-      #     python benchmark/ops/bench_grouped_gemm.py
-      # - name: Run Attention Benchmark
-      #   run: |
-      #     python benchmark/ops/bench_attention.py
+          BENCHMARK_DATE=$(date +%Y%m%d)
+          BENCHMARK_OUTPUT_DIR="${BENCHMARK_ROOT_DIR}/${BENCHMARK_DATE}/${GPU_NAME}"
+          mkdir -p "${BENCHMARK_OUTPUT_DIR}"
+          echo "BENCHMARK_OUTPUT_DIR=${BENCHMARK_OUTPUT_DIR}" >> $GITHUB_ENV
+      - name: Run Attention Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_attention.py -o "${BENCHMARK_OUTPUT_DIR}/attention_benchmark.csv"
+      - name: Run Attention FP8 Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_attention.py --fp8 -o "${BENCHMARK_OUTPUT_DIR}/attention_fp8_benchmark.csv"
+      - name: Run GEMM Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/gemm_benchmark.csv"
+      - name: Run GEMM FP8 Tensorwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_tensorwise_benchmark.csv"
+      - name: Run GEMM FP8 Rowwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_gemm_fp8.py --granularity rowwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_rowwise_benchmark.csv"
+      - name: Run GEMM FP8 Blockwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_gemm_fp8.py --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_blockwise_benchmark.csv"
+      - name: Run GEMM FP8 MX Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_gemm_fp8.py --granularity mx -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_mx_benchmark.csv"
+      - name: Run Grouped GEMM Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_grouped_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_benchmark.csv"
+      - name: Run Grouped GEMM FP8 Tensorwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_benchmark.csv"
+      - name: Run Grouped GEMM FP8 Rowwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity rowwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_rowwise_benchmark.csv"
+      - name: Run Grouped GEMM FP8 Blockwise Benchmark
+        timeout-minutes: 30
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_blockwise_benchmark.csv"
