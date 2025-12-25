@@ -139,7 +139,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=out_dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
         )
@@ -215,7 +215,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.CK.value,
         )
@@ -302,7 +302,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=out_dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
         )
@@ -341,7 +341,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.CK.value,
         )
@@ -416,7 +416,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=a.dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
         )
@@ -446,7 +446,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.CK.value,
         )

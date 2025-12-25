@@ -96,10 +96,12 @@ jobs:
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
       - name: Run single-GPU tests (parallel)
+        timeout-minutes: 120
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
         run: pytest -v tests/pytorch -n 8 --log-cli-level=INFO
       - name: Run distributed tests
+        timeout-minutes: 120
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
         run: pytest -v tests/pytorch --dist-only --log-cli-level=INFO
@@ -148,10 +150,12 @@ jobs:
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
       - name: Run single-GPU tests (parallel)
+        timeout-minutes: 120
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
         run: pytest -v tests/jax -n 8 --log-cli-level=INFO
       - name: Run distributed tests
+        timeout-minutes: 120
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
         run: pytest -v tests/jax --dist-only --log-cli-level=INFO
