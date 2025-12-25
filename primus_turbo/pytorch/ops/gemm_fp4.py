@@ -120,34 +120,31 @@ class FP4GemmMXFunction(torch.autograd.Function):
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
         )
 
-        grad_out_t = grad_out.T.contiguous()
         grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
-            grad_out_t,
+            grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
         )
 
-        a_t = a.T.contiguous()
         a_t_fp4, a_t_scale_inv = quantize_fp4(
-            a_t,
+            a,
             ctx.a_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
         )
-        b_t = b.T.contiguous()
         b_t_fp4, b_t_scale_inv = quantize_fp4(
-            b_t,
+            b,
             ctx.b_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
         )
