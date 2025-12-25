@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -19,6 +20,26 @@ from tests.pytorch.ref.gemm_ref import (
 )
 from tests.pytorch.test_utils import compute_snr
 
+torch.manual_seed(42)
+
+# Common test parameters
+B_VALUES = [1, 2, 3, 8, 16, 32, 64]
+M_VALUES = [128, 256, 512, 1024, 2048, 4096, 8192]
+NK_VALUES = [
+    (2048, 1536),
+    (2048, 1408),
+    (1408, 2048),
+    (2816, 2048),
+    (3072, 5120),
+    (5120, 1536),
+    (4096, 7168),
+    (7168, 2048),
+]
+ORI_DTYPE_VALUES = [torch.bfloat16, torch.float16]
+FORMAT_VALUES = [Format.E4M3, Format.E5M2]
+TRANS_B_VALUES = [True, False]
+BALANCE_VALUES = [True, False]
+
 
 def _check_hit_int32_limit(B, M, N, K):
     a_elems = B * M * K
@@ -27,43 +48,44 @@ def _check_hit_int32_limit(B, M, N, K):
     return max(a_elems, out_elems, b_elems) >= 2**31
 
 
-@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32, 64])
-@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048, 4096, 8192])
-@pytest.mark.parametrize(
-    "NK",
-    [
-        (2048, 1536),
-        (2048, 1408),
-        (1408, 2048),
-        (2816, 2048),
-        (3072, 5120),
-        (5120, 1536),
-        (4096, 7168),
-        (7168, 2048),
-    ],
-)
-@pytest.mark.parametrize("ori_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize(
-    "granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE, ScalingGranularity.BLOCKWISE]
-)
-@pytest.mark.parametrize("block_size", [None, 128])
-@pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("balance", [True, False])
-def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, block_size, trans_b, balance):
-    N, K = NK
-    device = "cuda:0"
+def _run_grouped_gemm_fp8_test(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    ori_dtype: torch.dtype,
+    format: Format,
+    granularity: ScalingGranularity,
+    trans_b: bool,
+    balance: bool,
+    block_size: int | None = None,
+    backend: BackendType | None = None,
+    auto_tune: bool = False,
+):
+    """Common test logic for grouped_gemm_fp8 with different scaling granularities."""
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
-    if granularity == ScalingGranularity.BLOCKWISE and block_size == None:
+    # Skip invalid granularity/block_size combinations
+    if granularity == ScalingGranularity.BLOCKWISE and block_size is None:
         pytest.skip("BLOCKWISE granularity requires block_size to be set.")
-    if granularity != ScalingGranularity.BLOCKWISE and block_size != None:
+    if granularity != ScalingGranularity.BLOCKWISE and block_size is not None:
         pytest.skip("Only BLOCKWISE granularity supports block_size.")
     if _check_hit_int32_limit(B, M, N, K):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    device = "cuda:0"
+
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
     print(
-        f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, granularity={granularity}, block_size={block_size}, trans_b={trans_b}, balance={balance}"
+        f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
+        f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
+        f"balance={balance}, backend={backend}, auto_tune={auto_tune}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
@@ -72,18 +94,25 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, block_size, 
     b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
     a_ref = a.detach().clone().requires_grad_(True)
     b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
 
     # Ref
     out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b)
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out)
+    torch.cuda.synchronize()
 
     # Turbo
     config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
     out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     out.backward(grad_out)
 
-    # Check
+    # Check Shape
+    assert out.shape == out_ref.shape
+    assert a.grad.shape == a_ref.grad.shape
+    assert b.grad.shape == b_ref.grad.shape
+
+    # Check Results
     snr_threshold = 25 if format == Format.E4M3 else 20
 
     out_snr = compute_snr(out_ref, out)
@@ -97,3 +126,74 @@ def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, block_size, 
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    # Reset config and caches
+    GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.ROWWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
+    N, K = NK
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        block_size=block_size,
+    )
