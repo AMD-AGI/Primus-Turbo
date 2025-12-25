@@ -40,10 +40,12 @@ Note: JAX support is under active development. Optim support is planned but not 
 | GFX942       | ✅MI300X, ✅MI325X |
 | GFX950       | ✅MI350X, ✅MI355X |
 
+> See [AMD GPU Architecture](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html#supported-gpus) to find the architecture for your GPU.
+
 ### 1. Installation
 
 #### Docker (Recommended)
-Use the pre-built AMD ROCm image:
+Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm/primus/tags):
 ```bash
 # PyTorch Ecosystem
 rocm/primus:v25.10
