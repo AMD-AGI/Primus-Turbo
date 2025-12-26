@@ -333,7 +333,6 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "hip-python",
-        "uccl_ep @ git+https://github.com/uccl-project/uccl.git@integrate-uccl-ep#subdirectory=ep",
     ]
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
