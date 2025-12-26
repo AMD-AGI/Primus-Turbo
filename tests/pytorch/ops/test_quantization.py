@@ -193,7 +193,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [32, 64, 256, 1024])
 @pytest.mark.parametrize("N", [32, 64, 256, 1024])
-@pytest.mark.parametrize("axis", [1])
+@pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_sr", [True, False])
 @pytest.mark.parametrize("use_2d_block", [True, False])

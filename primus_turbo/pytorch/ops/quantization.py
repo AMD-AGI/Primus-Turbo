@@ -118,7 +118,7 @@ def quantize_fp4(
     NOTE:
         For MXFP4 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 1 means along row direction. The MXFP4 only supports axis is 1 currently.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
             5. The scaling recipe is used to control the quantization behavior.
@@ -148,7 +148,7 @@ def dequantize_fp4(
     NOTE:
         For MXFP4 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of de-quantization. The 1 means along row direction. The MXFP4 only supports axis is 1 currently.
+            2. The axis means direction of de-quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The scaling recipe is used to control the de-quantization behavior.
     """
