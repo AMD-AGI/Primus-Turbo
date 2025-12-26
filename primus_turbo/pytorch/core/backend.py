@@ -12,6 +12,13 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
+try:
+    HAVE_DEEP_EP = True
+    import deep_ep  # fmt: skip
+except ImportError:
+    HAVE_DEEP_EP = False
+
+
 __all__ = [
     "BackendType",
     "GlobalBackendManager",
@@ -26,7 +33,7 @@ class BackendType(Enum):
     HIPBLASLT = auto()
     AITER = auto()
     TRITON = auto()
-    UCCL = auto()
+    DEEP_EP = auto()
     TURBO = auto()
 
 
@@ -87,8 +94,14 @@ class GlobalBackendManager:
         """Get the MoE dispatch combine backend configuration. Returns None if not set."""
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend
-        backend = os.getenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", BackendType.TURBO.name)
+        backend = os.getenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+
         if backend:
+            backend_type = BackendType[backend.upper()]
+            if backend_type == BackendType.DEEP_EP:
+                assert (
+                    HAVE_DEEP_EP
+                ), "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
             return BackendType[backend.upper()]
         return None
 
