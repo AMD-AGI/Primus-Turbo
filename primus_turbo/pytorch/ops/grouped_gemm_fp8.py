@@ -18,7 +18,7 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
     grouped_gemm_fp8_impl,
-    grouped_gemm_fp8_variable_k_csrc_impl,
+    grouped_gemm_fp8_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
@@ -235,25 +235,20 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
                 grad_out, grad_out_dtype, axis=0, block_size=block_size
             )
 
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
-
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8_col,
+            grad_out_fp8_col,
+            a_scale_inv_col,
+            grad_out_scale_inv_col,
             var_k_group_lens,
             var_k_group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -351,25 +346,20 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-2
         )
 
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
-
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8_col,
+            grad_out_fp8_col,
+            a_scale_inv_col,
+            grad_out_scale_inv_col,
             group_lens,
             group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -452,22 +442,20 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         )
 
         # For grad_b
-        lhs, rhs = (grad_out_fp8, a_fp8) if ctx.trans_b else (a_fp8, grad_out_fp8)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv, a_scale_inv) if ctx.trans_b else (a_scale_inv, grad_out_scale_inv)
-        )
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8,
+            grad_out_fp8,
+            a_scale_inv,
+            grad_out_scale_inv,
             group_lens,
             group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -502,8 +490,3 @@ def grouped_gemm_fp8(
         return GroupedGemmFP8BlockFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
-
-
-"""
-TODO: MXFP8, MXFP4
-"""
