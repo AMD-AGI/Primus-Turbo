@@ -92,11 +92,11 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     config = Float4QuantConfig(
         granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
     )
-    config.scaling_recipe["a_fwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_fwd"] = MXScalingRecipe(use_2d_block=True, use_sr=False)
-    config.scaling_recipe["grad_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=True)
-    config.scaling_recipe["a_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_bwd"] = MXScalingRecipe(use_2d_block=True, use_sr=True)
+    config.scaling_recipe["a"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["b"] = MXScalingRecipe(use_2d_block=True, use_sr=False)
+    config.scaling_recipe["grad_out"] = MXScalingRecipe(use_2d_block=False, use_sr=True)
+    config.scaling_recipe["grad_a"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
+    config.scaling_recipe["grad_b"] = MXScalingRecipe(use_2d_block=True, use_sr=True, use_rht=True)
     print(config)
     c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
     c.backward(torch.ones_like(c))

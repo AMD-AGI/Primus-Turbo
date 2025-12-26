@@ -19,6 +19,7 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
     GEMMFP4HipBLASLtBackend,
     gemm_fp4_impl,
 )
+from primus_turbo.pytorch.ops.hardmard_transform import apply_random_hadamard_transform
 from primus_turbo.pytorch.ops.quantization import quantize_fp4
 
 __all__ = ["gemm_fp4"]
@@ -64,7 +65,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["a_fwd"],
+            scaling_recipe=config.scaling_recipe["a"],
         )
 
         b_fp4, b_scale_inv = quantize_fp4(
@@ -74,7 +75,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["b_fwd"],
+            scaling_recipe=config.scaling_recipe["b"],
         )
 
         # NT layout
@@ -110,6 +111,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
         )
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
+        grad_out_t = grad_out.T.contiguous()
+        a_t = a.T.contiguous()
+        b_t = b.T.contiguous()
+
+        if ctx.config.scaling_recipe["grad_a"].use_rht:
+            grad_out = apply_random_hadamard_transform(grad_out, ctx.config.block_size)
 
         grad_out_fp4, grad_out_scale_inv = quantize_fp4(
             grad_out,
@@ -120,33 +127,43 @@ class FP4GemmMXFunction(torch.autograd.Function):
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
         )
 
+        if ctx.config.scaling_recipe["grad_b"].use_rht:
+            grad_out_t = apply_random_hadamard_transform(grad_out_t, ctx.config.block_size)
+
         grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
-            grad_out,
+            grad_out_t,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=0,
+            axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
+            scaling_recipe=ctx.config.scaling_recipe["grad_out"],
         )
 
+        if ctx.config.scaling_recipe["grad_b"].use_rht:
+            a_t = apply_random_hadamard_transform(a_t, ctx.config.block_size)
+
         a_t_fp4, a_t_scale_inv = quantize_fp4(
-            a,
+            a_t,
             ctx.a_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=0,
+            axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
+            scaling_recipe=ctx.config.scaling_recipe["grad_a"],
         )
+
+        if ctx.config.scaling_recipe["grad_a"].use_rht:
+            b_t = apply_random_hadamard_transform(b_t, ctx.config.block_size)
+
         b_t_fp4, b_t_scale_inv = quantize_fp4(
-            b,
+            b_t,
             ctx.b_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=0,
+            axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
+            scaling_recipe=ctx.config.scaling_recipe["grad_b"],
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.

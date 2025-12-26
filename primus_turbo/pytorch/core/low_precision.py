@@ -140,12 +140,14 @@ class MXScalingRecipe:
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - philox_seed: The philox generator's seed for the stochastic rounding. Available in MXFP4.
     - philox_offset: The philox generator's offset for the stochastic rounding. Available in MXFP4.
+    - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     """
 
     use_2d_block: bool = False
     use_sr: bool = False
     philox_seed: Optional[int] = None
     philox_offset: Optional[int] = None
+    use_rht: bool = False
 
 
 @dataclass
@@ -159,11 +161,11 @@ class Float8QuantConfig:
     # Default scaling recipe. Assume b is weight.
     scaling_recipe: Dict[str, MXScalingRecipe] = field(
         default_factory=lambda: {
-            "a_fwd": MXScalingRecipe(),
-            "b_fwd": MXScalingRecipe(use_2d_block=True),
-            "grad_bwd": MXScalingRecipe(),
-            "a_bwd": MXScalingRecipe(),
-            "b_bwd": MXScalingRecipe(use_2d_block=True),
+            "a": MXScalingRecipe(),
+            "b": MXScalingRecipe(use_2d_block=True),
+            "grad_out": MXScalingRecipe(),
+            "grad_a": MXScalingRecipe(),
+            "grad_b": MXScalingRecipe(use_2d_block=True),
         }
     )
 
@@ -194,11 +196,11 @@ class Float4QuantConfig:
     # Default scaling recipe. Assume b is weight. Reference: https://arxiv.org/pdf/2509.25149
     scaling_recipe: Dict[str, MXScalingRecipe] = field(
         default_factory=lambda: {
-            "a_fwd": MXScalingRecipe(),
-            "b_fwd": MXScalingRecipe(use_2d_block=True),
-            "grad_bwd": MXScalingRecipe(use_sr=True),
-            "a_bwd": MXScalingRecipe(),
-            "b_bwd": MXScalingRecipe(use_2d_block=True, use_sr=True),
+            "a": MXScalingRecipe(),
+            "b": MXScalingRecipe(use_2d_block=True),
+            "grad_out": MXScalingRecipe(use_sr=True),
+            "grad_a": MXScalingRecipe(),
+            "grad_b": MXScalingRecipe(use_2d_block=True, use_sr=True),
         }
     )
 
@@ -217,3 +219,9 @@ class Float4QuantConfig:
         assert (
             self.scale_dtype == mx_support_scale_dtype
         ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+
+        assert (
+            not self.scaling_recipe["a"].use_rht
+            and not self.scaling_recipe["b"].use_rht
+            and not self.scaling_recipe["grad_out"].use_rht
+        ), "use_rht = True is only availabe for grad_a and grad_b."
