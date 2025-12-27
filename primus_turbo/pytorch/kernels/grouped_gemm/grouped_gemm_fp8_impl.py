@@ -356,6 +356,10 @@ class GroupedGEMMFP8VariableKKernelDispatcher(AutoKernelDispatcher):
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
 
 
+_torch_custom_op_wrapper = torch.library.custom_op
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_impl", mutates_args=(), device_types="cuda")
 def grouped_gemm_fp8_impl(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -393,6 +397,9 @@ def grouped_gemm_fp8_impl(
     return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_fp8_variable_k_impl", mutates_args=(), device_types="cuda"
+)
 def grouped_gemm_fp8_variable_k_impl(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -435,3 +442,69 @@ def grouped_gemm_fp8_variable_k_impl(
 def grouped_gemm_compute_offs(group_lens: torch.Tensor) -> torch.Tensor:
     group_offs = torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(group_lens)
     return group_offs
+
+
+@grouped_gemm_fp8_impl.register_fake
+def grouped_gemm_fp8_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    maybe_pre_sync: bool = False,
+) -> torch.Tensor:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+    assert trans_a == False, "Only trans_a=False is supported."
+
+    m = a.shape[1] if trans_a else a.shape[0]
+    n = b.shape[-2] if trans_b else b.shape[-1]
+    return torch.empty((m, n), device=a.device, dtype=out_dtype)
+
+
+@grouped_gemm_fp8_variable_k_impl.register_fake
+def grouped_gemm_fp8_variable_k_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    maybe_pre_sync: bool = False,
+) -> torch.Tensor:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+    assert trans_a and not trans_b, "Only trans_a=True and trans_b=False are supported."
+
+    bs = group_lens.shape[0]
+    m = a.shape[1] if trans_a else a.shape[0]
+    n = b.shape[-2] if trans_b else b.shape[-1]
+    if trans_c:
+        m, n = n, m
+    return torch.empty((bs, m, n), device=a.device, dtype=out_dtype)
