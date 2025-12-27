@@ -53,11 +53,13 @@ struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> 
 };
 
 struct HipblasltGroupedGemmParams {
-    const void          *a_ptr = nullptr;
+    const void          *a_ptr       = nullptr;
+    const void          *a_scale_ptr = nullptr;
     hipDataType          a_type;
     std::vector<int64_t> a_shape;
 
-    const void          *b_ptr = nullptr;
+    const void          *b_ptr       = nullptr;
+    const void          *b_scale_ptr = nullptr;
     hipDataType          b_type;
     std::vector<int64_t> b_shape;
 
@@ -65,14 +67,18 @@ struct HipblasltGroupedGemmParams {
     hipDataType          c_type;
     std::vector<int64_t> c_shape;
 
-    const int64_t    *group_lens_ptr = nullptr;
-    const int64_t    *group_offs_ptr = nullptr;
-    bool              transA         = false;
-    bool              transB         = false;
-    int32_t           group_num      = 0;
-    hipStream_t       stream         = nullptr;
-    void             *workspace      = nullptr;
-    hipblasLtHandle_t handle         = nullptr;
+    const int64_t *group_lens_ptr = nullptr;
+    const int64_t *group_offs_ptr = nullptr;
+    bool           transA         = false;
+    bool           transB         = false;
+    int32_t        group_num      = 0;
+    hipStream_t    stream         = nullptr;
+    void          *workspace      = nullptr;
+
+    bool use_low_precision = false;
+
+    hipblasLtHandle_t            handle     = nullptr;
+    hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_END;
 };
 
 //==================================================================

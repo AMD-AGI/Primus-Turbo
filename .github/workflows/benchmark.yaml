@@ -100,15 +100,29 @@ jobs:
         env:
           PRIMUS_TURBO_AUTO_TUNE: "1"
         run: python3 benchmark/ops/bench_grouped_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_autotune_benchmark.csv"
-      - name: "[3.4] Run Grouped GEMM FP8 Tensorwise Benchmark"
+      - name: "[3.4] Run Grouped GEMM FP8 Tensorwise Benchmark (HIPBLASLT Backend)"
         timeout-minutes: 30
         continue-on-error: true
-        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_benchmark.csv"
-      - name: "[3.5] Run Grouped GEMM FP8 Rowwise Benchmark"
+        env:
+          PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "HIPBLASLT"
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv"
+      - name: "[3.5] Run Grouped GEMM FP8 Tensorwise Benchmark (CK Backend)"
+        timeout-minutes: 30
+        continue-on-error: true
+        env:
+          PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "CK"
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_ck_benchmark.csv"
+      - name: "[3.6] Run Grouped GEMM FP8 Tensorwise Benchmark (AutoTune)"
+        timeout-minutes: 30
+        continue-on-error: true
+        env:
+          PRIMUS_TURBO_AUTO_TUNE: "1"
+        run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_autotune_benchmark.csv"
+      - name: "[3.7] Run Grouped GEMM FP8 Rowwise Benchmark"
         timeout-minutes: 30
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity rowwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_rowwise_benchmark.csv"
-      - name: "[3.6] Run Grouped GEMM FP8 Blockwise Benchmark"
+      - name: "[3.8] Run Grouped GEMM FP8 Blockwise Benchmark"
         timeout-minutes: 30
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_blockwise_benchmark.csv"

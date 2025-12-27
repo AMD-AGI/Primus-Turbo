@@ -7,6 +7,7 @@ from typing import Union
 
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -16,8 +17,8 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
-    grouped_gemm_fp8_csrc_impl,
-    grouped_gemm_fp8_variable_k_csrc_impl,
+    grouped_gemm_fp8_impl,
+    grouped_gemm_fp8_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
@@ -128,7 +129,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         )
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
-        out = grouped_gemm_fp8_csrc_impl(
+        out = grouped_gemm_fp8_impl(
             a_fp8_row,
             b_fp8,
             a_scale_inv_row,
@@ -138,8 +139,9 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=out_dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         needs_padding = _needs_padding_for_blockwise(group_offs, config.block_size)
@@ -203,7 +205,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         )
 
         # grad_a: grad_out @ b^T
-        grad_a = grouped_gemm_fp8_csrc_impl(
+        grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8_row,
             b_fp8,
             grad_out_scale_inv_row,
@@ -213,8 +215,9 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         # For grad_b, we need col-wise quantization with padding for alignment
@@ -232,25 +235,20 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
                 grad_out, grad_out_dtype, axis=0, block_size=block_size
             )
 
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
-
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8_col,
+            grad_out_fp8_col,
+            a_scale_inv_col,
+            grad_out_scale_inv_col,
             var_k_group_lens,
             var_k_group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -289,7 +287,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
         b_fp8_row, b_scale_inv_row = quantize_fp8(
             b, b_dtype, config.granularity, axis=(-1 if trans_b else -2)
         )
-        out = grouped_gemm_fp8_csrc_impl(
+        out = grouped_gemm_fp8_impl(
             a_fp8_row,
             b_fp8_row,
             a_scale_inv_row,
@@ -299,8 +297,9 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=out_dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         # we need a/b do col quant for backward.
@@ -327,7 +326,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-1
         )
 
-        grad_a = grouped_gemm_fp8_csrc_impl(
+        grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8_row,
             b_fp8_col,
             grad_out_scale_inv_row,
@@ -337,8 +336,9 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         # For grad_b
@@ -346,25 +346,20 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-2
         )
 
-        lhs, rhs = (grad_out_fp8_col, a_fp8_col) if ctx.trans_b else (a_fp8_col, grad_out_fp8_col)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv_col, a_scale_inv_col)
-            if ctx.trans_b
-            else (a_scale_inv_col, grad_out_scale_inv_col)
-        )
-
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8_col,
+            grad_out_fp8_col,
+            a_scale_inv_col,
+            grad_out_scale_inv_col,
             group_lens,
             group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -401,7 +396,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
         b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
 
-        out = grouped_gemm_fp8_csrc_impl(
+        out = grouped_gemm_fp8_impl(
             a_fp8,
             b_fp8,
             a_scale_inv,
@@ -411,8 +406,10 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_b,
             out_dtype=a.dtype,
-            granularity=config.granularity,
+            granularity=config.granularity.value,
             num_cu=num_cu,
+            default_backend=BackendType.CK.value,
+            maybe_pre_sync=True,
         )
 
         ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs)
@@ -430,7 +427,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         # For grad_a
         grad_out_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(ctx.config.format, False)
         grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
-        grad_a = grouped_gemm_fp8_csrc_impl(
+        grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8,
             b_fp8,
             grad_out_scale_inv,
@@ -440,27 +437,26 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         # For grad_b
-        lhs, rhs = (grad_out_fp8, a_fp8) if ctx.trans_b else (a_fp8, grad_out_fp8)
-        lhs_scale, rhs_scale = (
-            (grad_out_scale_inv, a_scale_inv) if ctx.trans_b else (a_scale_inv, grad_out_scale_inv)
-        )
-        grad_b = grouped_gemm_fp8_variable_k_csrc_impl(
-            lhs,
-            rhs,
-            lhs_scale,
-            rhs_scale,
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            a_fp8,
+            grad_out_fp8,
+            a_scale_inv,
+            grad_out_scale_inv,
             group_lens,
             group_offs,
-            trans_a=True,
+            trans_a=not ctx.trans_a,
             trans_b=False,
+            trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity,
+            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
+            default_backend=BackendType.CK.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -495,8 +491,3 @@ def grouped_gemm_fp8(
         return GroupedGemmFP8BlockFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
-
-
-"""
-TODO: MXFP8, MXFP4
-"""

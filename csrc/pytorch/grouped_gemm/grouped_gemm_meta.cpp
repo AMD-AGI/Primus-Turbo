@@ -72,6 +72,23 @@ at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor 
     }
 }
 
+at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                           at::Tensor &b_scales, at::Tensor &group_lens,
+                                           at::Tensor &group_offs, const bool transA,
+                                           const bool transB, at::ScalarType out_dtype,
+                                           const std::string &granularity, const bool pre_sync) {
+    if (transA) {
+        const int64_t bs = group_lens.numel();
+        const int64_t m  = a.size(1);
+        const int64_t n  = transB ? b.size(0) : b.size(1);
+        return at::empty({bs, m, n}, at::dtype(out_dtype).device(at::kMeta));
+    } else {
+        const int64_t m = a.size(0);
+        const int64_t n = transB ? b.size(1) : b.size(2);
+        return at::empty({m, n}, at::dtype(out_dtype).device(at::kMeta));
+    }
+}
+
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens) {
     at::Tensor group_offs = at::empty({group_lens.numel() + 1}, group_lens.options());
     return group_offs;
