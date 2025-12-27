@@ -409,6 +409,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
+            maybe_pre_sync=True,
         )
 
         ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs)

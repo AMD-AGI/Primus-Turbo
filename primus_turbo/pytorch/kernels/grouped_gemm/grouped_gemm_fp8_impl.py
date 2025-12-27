@@ -159,9 +159,138 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFP8HipblasltBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8HipblasltBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        maybe_pre_sync: bool = False,
+    ):
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            out_dtype,
+            granularity.name,
+            maybe_pre_sync,
+        )
+
+
+class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
+        supported &= trans_a and not trans_b
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        maybe_pre_sync: bool = False,
+    ):
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+            trans_lhs, trans_rhs = not trans_b, not trans_a
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+            trans_lhs, trans_rhs = trans_a, trans_b
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_lens,
+            group_offs,
+            trans_lhs,
+            trans_rhs,
+            out_dtype,
+            granularity.name,
+            maybe_pre_sync,
+        )
+
+
 class GroupedGEMMFP8KernelDispatcher(AutoKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8CKBackend,
+        BackendType.HIPBLASLT: GroupedGEMMFP8HipblasltBackend,
     }
     _cache = TuneCache(1024)
 
@@ -196,6 +325,7 @@ class GroupedGEMMFP8KernelDispatcher(AutoKernelDispatcher):
 class GroupedGEMMFP8VariableKKernelDispatcher(AutoKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8VariableKCKBackend,
+        BackendType.HIPBLASLT: GroupedGEMMFP8VariableKHipblasltBackend,
     }
     _cache = TuneCache(1024)
 

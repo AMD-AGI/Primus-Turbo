@@ -138,7 +138,17 @@ def _run_grouped_gemm_fp8_test(
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance):
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
+
+    # TODO(xiaobochen-amd): When auto tune is enabled and M < 512 (e.g. 128 or 256), autotune hangs on
+    # hipblaslt backend in some cases. Root cause not yet identified, further investigation needed.
+    # Note: This hang only occurs when running via pytest with auto_tune enabled and M < 512;
+    # standalone execution works fine. This issue is observed on MI325, but MI355 works normally.
+    if backend is None and auto_tune and M < 512:
+        pytest.skip("autotune with small M hangs on hipblaslt backend")
+
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
@@ -150,6 +160,8 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
         granularity=ScalingGranularity.TENSORWISE,
         trans_b=trans_b,
         balance=balance,
+        backend=backend,
+        auto_tune=auto_tune,
     )
 
 

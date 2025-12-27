@@ -92,7 +92,6 @@ public:
                 PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, sync_event_, 0));
             }
 
-            // TODO: compute gemms
             for (size_t idx = 0; idx < num_gemms; ++idx) {
                 const auto stream_idx = kMaxNumStreams ? idx % kMaxNumStreams : 0;
                 auto       stream = stream_idx == 0 ? params.stream : compute_streams_[stream_idx];
@@ -101,15 +100,15 @@ public:
                 // clang-format off
                 hipblaslt_gemm_impl(
                     gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
-                    nullptr,
+                    gemm_ptrs_[idx].b_scale_ptr,
                     params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                     gemm_ptrs_[idx].a_ptr, params.a_type, rows_a_[idx], cols_a_[idx], ld_a_[idx],
-                    nullptr,
+                    gemm_ptrs_[idx].a_scale_ptr,
                     params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                     gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
                     workspace, get_hipblaslt_workspace_size_in_byte(),
-                    false,
-                    HIPBLASLT_MATMUL_MATRIX_SCALE_END,
+                    params.use_low_precision,
+                    params.scale_mode,
                     handle,
                     stream
                 );
@@ -131,9 +130,11 @@ public:
 
 private:
     struct GemmPtr {
-        const void *a_ptr = nullptr;
-        const void *b_ptr = nullptr;
-        void       *c_ptr = nullptr;
+        const void *a_ptr       = nullptr;
+        const void *a_scale_ptr = nullptr;
+        const void *b_ptr       = nullptr;
+        const void *b_scale_ptr = nullptr;
+        void       *c_ptr       = nullptr;
     };
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
@@ -180,6 +181,12 @@ private:
             gemm_ptrs_[write_idx].a_ptr = a_ptr;
             gemm_ptrs_[write_idx].b_ptr = b_ptr;
             gemm_ptrs_[write_idx].c_ptr = c_ptr;
+            if (params.use_low_precision) {
+                // TODO(xiaobochen): support variable scale mode
+                gemm_ptrs_[write_idx].a_scale_ptr = params.a_scale_ptr;
+                gemm_ptrs_[write_idx].b_scale_ptr = params.b_scale_ptr;
+            }
+
             // leading dimension
             ld_a_[write_idx] = get_dim(params.a_shape, -1);
             ld_b_[write_idx] = get_dim(params.b_shape, -1);
