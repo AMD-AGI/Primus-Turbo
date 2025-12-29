@@ -22,7 +22,10 @@
 
 namespace primus_turbo::pytorch {
 
-/* Quantization */
+//==================================================================
+//  Quantization
+//==================================================================
+
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
                                                 c10::optional<at::Tensor> scale_opt);
@@ -46,7 +49,9 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
 
-/* GEMM */
+//==================================================================
+//  GEMM
+//==================================================================
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
                           bool transB, bool transC);
@@ -83,7 +88,11 @@ at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
 std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
                                             const std::vector<int64_t> &shape,
                                             c10::ScalarType             dtype);
-/* Normalization */
+
+//==================================================================
+//  Normalization
+//==================================================================
+
 at::Tensor rmsnorm_fwd(const at::Tensor &input, const at::Tensor &gamma, const double eps);
 
 at::Tensor rmsnorm_fwd_meta(const at::Tensor &input, const at::Tensor &gamma, const double eps);
@@ -94,7 +103,10 @@ std::vector<at::Tensor> rmsnorm_bwd(const at::Tensor &input, const at::Tensor &g
 std::vector<at::Tensor> rmsnorm_bwd_meta(const at::Tensor &input, const at::Tensor &gamma,
                                          const at::Tensor &grad_output, const double eps);
 
-/* Grouped Gemm */
+//==================================================================
+//  Grouped GEMM
+//==================================================================
+
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
                            c10::optional<int64_t> num_cu);
@@ -144,11 +156,26 @@ at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor 
                                        at::Tensor &group_offs, const bool transA, const bool transB,
                                        const bool pre_sync);
 
+at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                      at::Tensor &b_scales, at::Tensor &group_lens,
+                                      at::Tensor &group_offs, const bool transA, const bool transB,
+                                      at::ScalarType out_dtype, const std::string &granularity,
+                                      const bool pre_sync);
+
+at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                           at::Tensor &b_scales, at::Tensor &group_lens,
+                                           at::Tensor &group_offs, const bool transA,
+                                           const bool transB, at::ScalarType out_dtype,
+                                           const std::string &granularity, const bool pre_sync);
+
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 
-/* Runtime */
+//==================================================================
+//  Runtime
+//==================================================================
+
 int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint32_t> &cu_masks);
 
 void destroy_stream(const int device_id, const int64_t stream_ptr);
