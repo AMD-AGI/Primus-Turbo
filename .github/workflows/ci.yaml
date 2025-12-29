@@ -98,9 +98,10 @@ jobs:
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 90
+          timeout_minutes: 65
           max_attempts: 2
-          command: pytest -v tests/pytorch -n 8 --log-cli-level=INFO
+          # --kill-after=60: send SIGTERM first, then SIGKILL after 60s if still running
+          command: timeout --kill-after=60 60m pytest -v tests/pytorch -n 8 --log-cli-level=INFO
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests

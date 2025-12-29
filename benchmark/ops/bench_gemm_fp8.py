@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import MBS_LIST, ModelConfigs, gen_gemm_test_cases
+from config import BATCH_SIZE_LIST, DenseModelConfigs, gen_gemm_test_cases
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
@@ -126,9 +126,9 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
     test_id = 0
     ori_dtype = torch.bfloat16
     trans_b = True
-    for model_name, model_config in ModelConfigs.items():
+    for model_name, model_config in DenseModelConfigs.items():
         test_cases = gen_gemm_test_cases(model_config)
-        for MBS in MBS_LIST:
+        for MBS in BATCH_SIZE_LIST:
             for shape in test_cases:
                 test_id += 1
                 M = shape[0] * MBS
@@ -142,26 +142,46 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
                 )
                 print(f"{'='*60}")
 
-                fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
-                    M, N, K, ori_dtype, config, trans_b
-                )
-                rows.append(
-                    {
-                        "TestID": test_id,
-                        "GPU": gpu_name,
-                        "Case": model_name,
-                        "MBS": MBS,
-                        "M": M,
-                        "N": N,
-                        "K": K,
-                        "Granularity": granularity_name,
-                        "Check": "PASS" if correct else "FAIL",
-                        "Forward Time (ms)": f"{fwd_time_ms:.2f}",
-                        "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                        "Backward Time (ms)": f"{bwd_time_ms:.2f}",
-                        "Backward TFLOPS": f"{bwd_tflops:.2f}",
-                    }
-                )
+                try:
+                    fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
+                        M, N, K, ori_dtype, config, trans_b
+                    )
+                    rows.append(
+                        {
+                            "TestID": test_id,
+                            "GPU": gpu_name,
+                            "Case": model_name,
+                            "MBS": MBS,
+                            "M": M,
+                            "N": N,
+                            "K": K,
+                            "Granularity": granularity_name,
+                            "Check": "PASS" if correct else "FAIL",
+                            "Forward Time (ms)": f"{fwd_time_ms:.2f}",
+                            "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                            "Backward Time (ms)": f"{bwd_time_ms:.2f}",
+                            "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                        }
+                    )
+                except Exception as e:
+                    print(f"Failed: {str(e)}")
+                    rows.append(
+                        {
+                            "TestID": test_id,
+                            "GPU": gpu_name,
+                            "Case": model_name,
+                            "MBS": MBS,
+                            "M": M,
+                            "N": N,
+                            "K": K,
+                            "Granularity": granularity_name,
+                            "Check": "ERROR",
+                            "Forward Time (ms)": "ERROR",
+                            "Forward TFLOPS": "0.00",
+                            "Backward Time (ms)": "ERROR",
+                            "Backward TFLOPS": "0.00",
+                        }
+                    )
 
     results = pd.DataFrame(rows)
     print("\nFinal Results:")

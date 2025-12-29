@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import generate_grouped_gemm_group_lens
+from config import gen_grouped_gemm_group_lens, gen_grouped_gemm_test_cases
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
@@ -66,75 +66,12 @@ def check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype):
     return fwd_correct and bwd_x_correct and bwd_w_correct
 
 
-M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
-EP_SIZE_LIST = [32, 16, 8]
-
-
-def _generate_moe_test_cases(
-    name_prefix: str,
-    n_routed_experts: int,
-    moe_intermediate_size: int,
-    hidden_size: int,
-):
-    test_cases = []
-    shapes_dict = {
-        f"{name_prefix}-GateUP": (2 * moe_intermediate_size, hidden_size),
-        f"{name_prefix}-Down": (hidden_size, moe_intermediate_size),
-    }
-
-    for ep in EP_SIZE_LIST:
-        if n_routed_experts % ep != 0:
-            continue
-        B = n_routed_experts // ep
-        if B < 1:
-            continue
-        for M in M_SIZE_LIST:
-            for name, (N, K) in shapes_dict.items():
-                for dtype in [torch.bfloat16]:
-                    test_cases.append(
-                        {
-                            "Case": name,
-                            "B": B,
-                            "M": M,
-                            "N": N,
-                            "K": K,
-                            "dtype": dtype,
-                        }
-                    )
-    return test_cases
-
-
-def generate_deepseekv3_test_cases():
-    return _generate_moe_test_cases(
-        "DSV3", n_routed_experts=256, moe_intermediate_size=2048, hidden_size=7168
-    )
-
-
-def generate_deepseekv2_test_cases():
-    return _generate_moe_test_cases(
-        "DSV2", n_routed_experts=160, moe_intermediate_size=1536, hidden_size=5120
-    )
-
-
-def generate_deepseekv2_lite_test_cases():
-    return _generate_moe_test_cases(
-        "DSV2-Lite", n_routed_experts=64, moe_intermediate_size=1408, hidden_size=2048
-    )
-
-
-def generate_grok_v2_test_cases():
-    # https://huggingface.co/xai-org/grok-2/blob/main/config.json
-    return _generate_moe_test_cases(
-        "Grok-V2", n_routed_experts=8, moe_intermediate_size=16384, hidden_size=8192
-    )
-
-
 def profile_grouped_gemm(B, M, N, K, dtype):
     device = "cuda"
     # Prepare inputs
     x = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
     w = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)
+    group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
 
     # Prepare gradient output
     out = turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
@@ -188,11 +125,7 @@ def benchmark_grouped_gemm(output_csv=None):
     gpu_name = match.group(1) if match else full_name.split()[-1]
 
     # Generate test cases
-    dsv2_lite_test_cases = generate_deepseekv2_lite_test_cases()
-    dsv2_test_cases = generate_deepseekv2_test_cases()
-    dsv3_test_cases = generate_deepseekv3_test_cases()
-    grok_v2_test_cases = generate_grok_v2_test_cases()
-    test_cases = dsv2_lite_test_cases + dsv2_test_cases + dsv3_test_cases + grok_v2_test_cases
+    test_cases = gen_grouped_gemm_test_cases()
 
     # List to collect results
     rows = []
@@ -250,10 +183,10 @@ def benchmark_grouped_gemm(output_csv=None):
                     "N": N,
                     "K": K,
                     "Check": "ERROR",
-                    "Forward Time (ms)": "Failed",
-                    "Forward TFLOPS": "N/A",
-                    "Backward Time (ms)": "Failed",
-                    "Backward TFLOPS": "N/A",
+                    "Forward Time (ms)": "ERROR",
+                    "Forward TFLOPS": "0.00",
+                    "Backward Time (ms)": "ERROR",
+                    "Backward TFLOPS": "0.00",
                 }
             )
 

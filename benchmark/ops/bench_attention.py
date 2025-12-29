@@ -15,6 +15,7 @@ os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
+from config import BATCH_SIZE_LIST, gen_attention_test_cases
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -25,19 +26,6 @@ ATTN_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
-]
-
-# Benchmark configurations
-SEQLEN_LIST = [4096, 8192]
-BATCH_LIST = [1, 2, 4]
-
-# (num_head_q, num_head_kv, head_dim_qk, head_dim_v)
-TEST_CASES = [
-    (32, 8, 128, 128),  # GQA 4:1
-    (32, 32, 128, 128),  # MHA
-    (64, 8, 128, 128),  # GQA 8:1
-    (64, 64, 128, 128),  # MHA
-    (64, 64, 192, 128),  # MLA
 ]
 
 
@@ -189,63 +177,70 @@ def benchmark_attention(output_csv=None, use_fp8=False):
     match = re.search(r"(MI\d+)", full_name)
     gpu_name = match.group(1) if match else full_name.split()[-1]
 
+    # Generate test cases from config
+    test_cases = gen_attention_test_cases()
+
     rows = []
     test_id = 0
-    total_tests = 2 * len(SEQLEN_LIST) * len(BATCH_LIST) * len(TEST_CASES)
+    total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
     print(f"Total tests: {total_tests}, FP8: {use_fp8}")
 
     for causal in [False, True]:
-        for num_head_q, num_head_kv, head_dim_qk, head_dim_v in TEST_CASES:
-            for seqlen in SEQLEN_LIST:
-                for batch in BATCH_LIST:
-                    test_id += 1
+        for case in test_cases:
+            num_head_q = case["num_head_q"]
+            num_head_kv = case["num_head_kv"]
+            head_dim_qk = case["head_dim_qk"]
+            head_dim_v = case["head_dim_v"]
+            seqlen = case["seqlen"]
+            for batch in BATCH_SIZE_LIST:
+                test_id += 1
 
-                    print(f"\n{'='*60}")
-                    print(
-                        f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
-                        f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
-                        f"causal={causal}, fp8={use_fp8}"
+                print(f"\n{'='*60}")
+                print(
+                    f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
+                    f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
+                    f"causal={causal}, fp8={use_fp8}"
+                )
+                print(f"{'='*60}")
+
+                row = {
+                    "TestID": test_id,
+                    "GPU": gpu_name,
+                    "Batch": batch,
+                    "SeqLen": seqlen,
+                    "num_head_q": num_head_q,
+                    "num_head_kv": num_head_kv,
+                    "head_dim_qk": head_dim_qk,
+                    "head_dim_v": head_dim_v,
+                    "Causal": causal,
+                }
+
+                try:
+                    fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
+                        batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
                     )
-                    print(f"{'='*60}")
+                    row.update(
+                        {
+                            "Check": "PASS" if correct else "FAIL",
+                            "Forward Time (ms)": f"{fwd_time:.2f}",
+                            "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                            "Backward Time (ms)": f"{bwd_time:.2f}",
+                            "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                        }
+                    )
+                except Exception as e:
+                    print(f"Failed: {str(e)}")
+                    row.update(
+                        {
+                            "Check": "ERROR",
+                            "Forward Time (ms)": "ERROR",
+                            "Forward TFLOPS": "0.00",
+                            "Backward Time (ms)": "ERROR",
+                            "Backward TFLOPS": "0.00",
+                        }
+                    )
 
-                    row = {
-                        "TestID": test_id,
-                        "GPU": gpu_name,
-                        "Batch": batch,
-                        "SeqLen": seqlen,
-                        "num_head_q": num_head_q,
-                        "num_head_kv": num_head_kv,
-                        "head_dim_qk": head_dim_qk,
-                        "head_dim_v": head_dim_v,
-                        "Causal": causal,
-                    }
-
-                    try:
-                        fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
-                            batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
-                        )
-                        row.update(
-                            {
-                                "Check": "PASS" if correct else "FAIL",
-                                "Forward Time (ms)": f"{fwd_time:.2f}",
-                                "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                                "Backward Time (ms)": f"{bwd_time:.2f}",
-                                "Backward TFLOPS": f"{bwd_tflops:.2f}",
-                            }
-                        )
-                    except Exception as e:
-                        print(f"Failed: {str(e)}")
-                        row.update(
-                            {
-                                "Check": "ERROR",
-                                "Forward Time (ms)": "Failed",
-                                "Forward TFLOPS": "N/A",
-                                "Backward Time (ms)": "Failed",
-                                "Backward TFLOPS": "N/A",
-                            }
-                        )
-
-                    rows.append(row)
+                rows.append(row)
 
     # Create DataFrame
     results = pd.DataFrame(rows)
@@ -255,12 +250,10 @@ def benchmark_attention(output_csv=None, use_fp8=False):
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
     # Print average TFLOPS
-    valid_results = results[results["Forward TFLOPS"] != "N/A"]
-    if not valid_results.empty:
-        avg_fwd = valid_results["Forward TFLOPS"].astype(float).mean()
-        avg_bwd = valid_results["Backward TFLOPS"].astype(float).mean()
-        print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
-        print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
+    avg_fwd = results["Forward TFLOPS"].astype(float).mean()
+    avg_bwd = results["Backward TFLOPS"].astype(float).mean()
+    print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
+    print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
 
     # Save to CSV
     if output_csv:
