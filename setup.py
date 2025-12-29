@@ -3,6 +3,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -28,6 +29,49 @@ SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
 ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # -------------------------------------
+
+
+def get_submodule_folders():
+    """Parse .gitmodules and return list of submodule paths."""
+    gitmodules_path = os.path.join(PROJECT_ROOT, ".gitmodules")
+    if not os.path.exists(gitmodules_path):
+        return []
+    with open(gitmodules_path) as f:
+        return [
+            os.path.join(PROJECT_ROOT, line.split("=")[1].strip())
+            for line in f
+            if line.strip().startswith("path")
+        ]
+
+
+def check_submodules():
+    """Check and initialize git submodules if needed."""
+    submodule_folders = get_submodule_folders()
+    if not submodule_folders:
+        return
+
+    for folder in submodule_folders:
+        if not os.path.isdir(folder) or not os.listdir(folder):
+            try:
+                print("[Primus-Turbo] Initializing git submodules...")
+                subprocess.run(
+                    ["git", "submodule", "sync", "--recursive"],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "submodule", "update", "--init", "--recursive"],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                )
+            except Exception as e:
+                print(f"[Primus-Turbo] Failed to initialize submodules: {e}")
+                print(
+                    "[Primus-Turbo] Please run: git submodule sync && git submodule update --init --recursive"
+                )
+                sys.exit(1)
+            return
+    print("[Primus-Turbo] Submodules already initialized.")
 
 
 def is_package_installed(package_name):
@@ -319,6 +363,9 @@ def build_jax_extension():
 
 
 if __name__ == "__main__":
+    # Initialize submodules
+    check_submodules()
+
     # set cxx
     setup_cxx_env()
 
