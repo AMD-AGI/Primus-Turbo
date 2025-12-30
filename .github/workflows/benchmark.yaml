@@ -41,89 +41,89 @@ jobs:
           mkdir -p "${BENCHMARK_OUTPUT_DIR}"
           echo "BENCHMARK_OUTPUT_DIR=${BENCHMARK_OUTPUT_DIR}" >> $GITHUB_ENV
       - name: "[1.1] Run Attention Benchmark"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_attention.py -o "${BENCHMARK_OUTPUT_DIR}/attention_benchmark.csv"
       - name: "[1.2] Run Attention FP8 Benchmark"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_attention.py --fp8 -o "${BENCHMARK_OUTPUT_DIR}/attention_fp8_benchmark.csv"
       - name: "[2.1] Run GEMM Benchmark (Hipblaslt Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/gemm_hipblaslt_benchmark.csv"
       - name: "[2.2] Run GEMM FP8 Tensorwise Benchmark (Hipblaslt Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GEMM_BACKEND: "HIPBLASLT"
         run: python3 benchmark/ops/bench_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_tensorwise_hipblaslt_benchmark.csv"
       - name: "[2.3] Run GEMM FP8 Tensorwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GEMM_BACKEND: "CK"
         run: python3 benchmark/ops/bench_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_tensorwise_ck_benchmark.csv"
       - name: "[2.4] Run GEMM FP8 Tensorwise Benchmark (AutoTune Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_AUTO_TUNE: "1"
         run: python3 benchmark/ops/bench_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_tensorwise_autotune_benchmark.csv"
       - name: "[2.5] Run GEMM FP8 Rowwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_gemm_fp8.py --granularity rowwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_rowwise_ck_benchmark.csv"
       - name: "[2.6] Run GEMM FP8 Blockwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_gemm_fp8.py --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_blockwise_ck_benchmark.csv"
       # - name: Run GEMM FP8 MX Benchmark
-      #   timeout-minutes: 30
+      #   timeout-minutes: 60
       #   continue-on-error: true
       #   run: python3 benchmark/ops/bench_gemm_fp8.py --granularity mx -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_mx_benchmark.csv"
       - name: "[3.1] Run Grouped GEMM Benchmark (Hipblaslt Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "HIPBLASLT"
         run: python3 benchmark/ops/bench_grouped_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_hipblaslt_benchmark.csv"
       - name: "[3.2] Run Grouped GEMM Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "CK"
         run: python3 benchmark/ops/bench_grouped_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_ck_benchmark.csv"
       - name: "[3.3] Run Grouped GEMM Benchmark (AutoTune Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_AUTO_TUNE: "1"
         run: python3 benchmark/ops/bench_grouped_gemm.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_autotune_benchmark.csv"
       - name: "[3.4] Run Grouped GEMM FP8 Tensorwise Benchmark (Hipblaslt Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "HIPBLASLT"
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv"
       - name: "[3.5] Run Grouped GEMM FP8 Tensorwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_GROUPED_GEMM_BACKEND: "CK"
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_ck_benchmark.csv"
       - name: "[3.6] Run Grouped GEMM FP8 Tensorwise Benchmark (AutoTune Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         env:
           PRIMUS_TURBO_AUTO_TUNE: "1"
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity tensorwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_tensorwise_autotune_benchmark.csv"
       - name: "[3.7] Run Grouped GEMM FP8 Rowwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity rowwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_rowwise_ck_benchmark.csv"
       - name: "[3.8] Run Grouped GEMM FP8 Blockwise Benchmark (CK Backend)"
-        timeout-minutes: 30
+        timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_fp8.py --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_blockwise_ck_benchmark.csv"
       - name: "Generate Summary Report"
