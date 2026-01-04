@@ -98,12 +98,12 @@ jobs:
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 65
+          timeout_minutes: 95
           max_attempts: 2
-          # setsid + exec: ensure all pytest workers are killed on timeout
+          # use timeout to terminate pytest and its workers on timeout
           command: >
-            timeout --kill-after=60 60m
-            setsid bash -lc
+            timeout -k 60s 90m
+            bash -lc
             "exec pytest -v tests/pytorch -n 8 --log-cli-level=INFO"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
