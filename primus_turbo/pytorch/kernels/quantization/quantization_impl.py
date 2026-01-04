@@ -11,7 +11,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, check_mxfp4_support
-from primus_turbo.pytorch.ops.hardmard_transform import get_rht_matrix
+from primus_turbo.pytorch.ops.hadamard_transform import get_rht_matrix
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
