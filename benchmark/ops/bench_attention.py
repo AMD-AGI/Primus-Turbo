@@ -9,15 +9,23 @@ import os
 import re
 from datetime import datetime
 
-# Disable FP32 atomic for better performance
-os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
-
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
 from config import BATCH_SIZE_LIST, gen_attention_test_cases
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+# Disable FP32 atomic for better performance on gfx950
+def _is_gfx950():
+    """Check if current GPU is gfx950 using torch."""
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 9 and props.minor == 5
+
+
+if _is_gfx950():
+    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
 import primus_turbo.pytorch as turbo
 
