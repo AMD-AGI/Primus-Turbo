@@ -11,7 +11,13 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import BATCH_SIZE_LIST, DenseModelConfigs, gen_gemm_test_cases
+from config import (
+    BATCH_SIZE_LIST,
+    DenseModelConfigs,
+    compute_snr,
+    gemm_ref,
+    gen_gemm_test_cases,
+)
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
@@ -37,18 +43,6 @@ GRANULARITY_CONFIG_MAP = {
         scale_dtype=ScaleDtype.E8M0,
     ),
 }
-
-
-def compute_snr(ref, actual):
-    """Compute Signal-to-Noise Ratio (SNR) in dB."""
-    err = ref.to(torch.float64) - actual.to(torch.float64)
-    return 20 * torch.log10(ref.to(torch.float64).norm() / err.norm()).item()
-
-
-def gemm_ref(a, b, trans_b=True):
-    """Reference GEMM using PyTorch native matmul."""
-    b_mat = b.T if trans_b else b
-    return a @ b_mat
 
 
 def check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, fp8_format):

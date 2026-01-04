@@ -4,8 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+"""PyTorch GEMM Baseline Benchmark."""
+
 import argparse
-import re
 from datetime import datetime
 
 import pandas as pd
@@ -15,30 +16,24 @@ from config import (
     BATCH_SIZE_LIST,
     DenseModelConfigs,
     check_allclose,
-    gemm_ref,
     gen_gemm_test_cases,
+    get_platform_info,
 )
 from tabulate import tabulate
 
-import primus_turbo.pytorch as turbo
 
-
-def check_gemm_correctness(a, b, out, grad_out, trans_b, dtype):
-    """Check correctness of GEMM forward and backward against PyTorch reference."""
-    # Forward check
-    out_ref = gemm_ref(a.detach(), b.detach(), trans_b=trans_b)
+def check_gemm_correctness(a, b, out, grad_out, dtype):
+    out_ref = a.detach() @ b.detach().T
     fwd_correct = check_allclose(out.detach(), out_ref, dtype)
 
-    # Backward check
     a_ref = a.detach().clone().requires_grad_()
     b_ref = b.detach().clone().requires_grad_()
-    out_ref = gemm_ref(a_ref, b_ref, trans_b=trans_b)
+    out_ref = a_ref @ b_ref.T
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
     bwd_a_correct = check_allclose(a.grad, a_ref.grad, dtype)
     bwd_b_correct = check_allclose(b.grad, b_ref.grad, dtype)
 
-    # Reset gradients
     a.grad = None
     b.grad = None
 
@@ -48,45 +43,30 @@ def check_gemm_correctness(a, b, out, grad_out, trans_b, dtype):
     return fwd_correct and bwd_a_correct and bwd_b_correct
 
 
-def profile_gemm(M, N, K, dtype, trans_b):
+def profile_gemm(M, N, K, dtype):
     device = "cuda"
-    b_shape = (N, K) if trans_b else (K, N)
     a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((N, K), dtype=dtype, device=device, requires_grad=True)
 
-    # Prepare gradient output
-    out = turbo.ops.gemm(a, b, trans_b=trans_b)
+    out = a @ b.T
     grad_out = torch.randn_like(out)
+    correct = check_gemm_correctness(a, b, out, grad_out, dtype)
 
-    # Correctness check
-    correct = check_gemm_correctness(a, b, out, grad_out, trans_b, dtype)
-
-    # Forward and backward functions
-    fwd_func = lambda: turbo.ops.gemm(a, b, trans_b=trans_b)
+    fwd_func = lambda: a @ b.T
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
 
-    # Calculate FLOPs
     fwd_total_flops = 2 * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
-    # Warmup
-    warmup = 20
-    for _ in range(warmup):
+    for _ in range(20):
         fwd_func()
         bwd_func()
     torch.cuda.synchronize()
 
-    # Benchmark
-    fwd_timer = benchmark.Timer(
-        stmt="fn()",
-        globals={"fn": fwd_func},
-    )
-    bwd_timer = benchmark.Timer(
-        stmt="fn()",
-        globals={"fn": bwd_func},
-    )
+    fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
+    bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
     fwd_measurement = fwd_timer.timeit(100)
     bwd_measurement = bwd_timer.timeit(100)
 
@@ -100,18 +80,11 @@ def profile_gemm(M, N, K, dtype, trans_b):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_gemm(output_csv=None):
-    # Get GPU name
-    full_name = torch.cuda.get_device_name(0)
-    match = re.search(r"(MI\d+)", full_name)
-    gpu_name = match.group(1) if match else full_name.split()[-1]
-
-    # List to collect results
+def benchmark_gemm_torch(output_csv=None):
+    platform, gpu_name = get_platform_info()
     rows = []
-
     test_id = 0
     dtype = torch.bfloat16
-    trans_b = True
     for model_name, model_config in DenseModelConfigs.items():
         test_cases = gen_gemm_test_cases(model_config)
         for MBS in BATCH_SIZE_LIST:
@@ -129,12 +102,11 @@ def benchmark_gemm(output_csv=None):
                 print(f"{'='*60}")
 
                 try:
-                    fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm(
-                        M, N, K, dtype, trans_b
-                    )
+                    fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm(M, N, K, dtype)
                     rows.append(
                         {
                             "TestID": test_id,
+                            "Platform": platform,
                             "GPU": gpu_name,
                             "Case": model_name,
                             "MBS": MBS,
@@ -153,6 +125,7 @@ def benchmark_gemm(output_csv=None):
                     rows.append(
                         {
                             "TestID": test_id,
+                            "Platform": platform,
                             "GPU": gpu_name,
                             "Case": model_name,
                             "MBS": MBS,
@@ -185,7 +158,7 @@ def benchmark_gemm(output_csv=None):
         filename = output_csv
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
-        filename = f"gemm_benchmark_result_{timestamp}_{gpu_name}.csv"
+        filename = f"gemm_torch_benchmark_{timestamp}_{gpu_name}.csv"
 
     # Save to CSV
     results.to_csv(filename, index=False)
@@ -193,13 +166,13 @@ def benchmark_gemm(output_csv=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark GEMM operations")
+    parser = argparse.ArgumentParser(description="Benchmark PyTorch GEMM (Baseline)")
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Output CSV filename. If not specified, uses default naming: gemm_benchmark_result_{date}_{gpu}.csv",
+        help="Output CSV filename. Default: gemm_torch_benchmark_{date}_{gpu}.csv",
     )
     args = parser.parse_args()
-    benchmark_gemm(output_csv=args.output)
+    benchmark_gemm_torch(output_csv=args.output)

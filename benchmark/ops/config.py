@@ -6,7 +6,74 @@
 
 """Shared configurations for benchmark scripts."""
 
+import re
+
 import torch
+
+###############################################################################
+# Platform Detection
+###############################################################################
+
+
+def get_platform_info():
+    """Detect the current platform (CUDA/ROCm) and return device info."""
+    device_name = torch.cuda.get_device_name(0)
+
+    if "AMD" in device_name or "MI" in device_name or "Radeon" in device_name:
+        platform = "ROCm"
+        match = re.search(r"(MI\d+[A-Za-z]*)", device_name)
+        gpu_name = match.group(1) if match else device_name.split()[-1]
+    else:
+        platform = "CUDA"
+        match = re.search(r"(H100|A100|A10|V100|RTX \d+|Tesla [A-Z]\d+)", device_name)
+        gpu_name = match.group(1) if match else device_name.split()[-1]
+
+    return platform, gpu_name
+
+
+def check_allclose(out, out_ref, dtype, rtol=None, atol=None):
+    """Check if two tensors are close within tolerance."""
+    if rtol is None or atol is None:
+        if dtype == torch.float32:
+            rtol, atol = 1e-4, 1e-4
+        elif dtype == torch.float16:
+            rtol, atol = 1e-2, 1e-2
+        else:  # bfloat16
+            rtol, atol = 1e-2, 1e-2
+    return torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+def compute_snr(ref, actual):
+    """Compute Signal-to-Noise Ratio (SNR) in dB."""
+    ref_f64 = ref.to(torch.float64)
+    actual_f64 = actual.to(torch.float64)
+    signal_power = ref_f64.norm().pow(2)
+    noise_power = (ref_f64 - actual_f64).norm().pow(2)
+    return 10 * torch.log10(signal_power / (noise_power + 1e-12)).item()
+
+
+###############################################################################
+# Reference Implementations
+###############################################################################
+
+
+def gemm_ref(a, b, trans_b=True):
+    """Reference GEMM using PyTorch native matmul."""
+    b_mat = b.T if trans_b else b
+    return a @ b_mat
+
+
+def grouped_gemm_ref(a, b, group_lens, trans_b=True):
+    """Reference grouped GEMM using PyTorch native matmul."""
+    group_lens_cpu = group_lens.cpu().numpy()
+    out = []
+    start = 0
+    for i, size in enumerate(group_lens_cpu):
+        rhs = b[i, :, :].t() if trans_b else b[i, :, :]
+        out.append(a[start : start + size, :] @ rhs)
+        start += size
+    return torch.cat(out)
+
 
 ###############################################################################
 # Model Configurations

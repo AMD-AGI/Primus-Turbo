@@ -11,7 +11,12 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import gen_grouped_gemm_group_lens, gen_grouped_gemm_test_cases
+from config import (
+    compute_snr,
+    gen_grouped_gemm_group_lens,
+    gen_grouped_gemm_test_cases,
+    grouped_gemm_ref,
+)
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
@@ -30,24 +35,6 @@ GRANULARITY_CONFIG_MAP = {
         block_size=128,
     ),
 }
-
-
-def compute_snr(ref, actual):
-    """Compute Signal-to-Noise Ratio (SNR) in dB."""
-    err = ref.to(torch.float64) - actual.to(torch.float64)
-    return 20 * torch.log10(ref.to(torch.float64).norm() / err.norm()).item()
-
-
-def grouped_gemm_ref(a, b, group_lens, trans_b=True):
-    """Reference grouped GEMM using PyTorch native matmul."""
-    outputs = []
-    offset = 0
-    for i, glen in enumerate(group_lens.tolist()):
-        a_slice = a[offset : offset + glen]
-        b_mat = b[i].T if trans_b else b[i]
-        outputs.append(a_slice @ b_mat)
-        offset += glen
-    return torch.cat(outputs, dim=0)
 
 
 def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, trans_b, fp8_format):

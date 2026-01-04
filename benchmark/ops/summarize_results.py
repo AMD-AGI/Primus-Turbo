@@ -14,15 +14,18 @@ from tabulate import tabulate
 # Benchmark results: Op -> Backend -> csv filename
 BENCHMARK_TABLES = {
     "Attention": {
+        "PyTorch": "attention_torch_benchmark.csv",
         "Aiter/CK": "attention_benchmark.csv",
     },
     "Attention-FP8": {
         "Triton": "attention_fp8_benchmark.csv",
     },
     "GEMM": {
+        "PyTorch": "gemm_torch_benchmark.csv",
         "Hipblaslt": "gemm_hipblaslt_benchmark.csv",
     },
     "GEMM-FP8-Tensorwise": {
+        "PyTorch": "gemm_fp8_tensorwise_torch_benchmark.csv",
         "Hipblaslt": "gemm_fp8_tensorwise_hipblaslt_benchmark.csv",
         "CK": "gemm_fp8_tensorwise_ck_benchmark.csv",
         "AutoTune": "gemm_fp8_tensorwise_autotune_benchmark.csv",
@@ -38,6 +41,7 @@ BENCHMARK_TABLES = {
         "Hipblaslt": "gemm_mxfp8_hipblaslt_benchmark.csv",
     },
     "Grouped-GEMM": {
+        "PyTorch": "grouped_gemm_torch_benchmark.csv",
         "Hipblaslt": "grouped_gemm_hipblaslt_benchmark.csv",
         "CK": "grouped_gemm_ck_benchmark.csv",
         "AutoTune": "grouped_gemm_autotune_benchmark.csv",
