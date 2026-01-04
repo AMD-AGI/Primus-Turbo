@@ -103,7 +103,7 @@ def quantize_mxfp4_kernel(
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
 
             if not TRANS:
-                # Row-wsie
+                # Row-wise
                 scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
                 scale_inv_store_offsets = (
                     offsets_Y[:, None] * stride_scale_inv_row
