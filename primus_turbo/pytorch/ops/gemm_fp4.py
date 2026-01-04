@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Format,
+    MXScalingRecipe,
     ScalingGranularity,
     check_mxfp4_support,
 )
@@ -25,6 +26,9 @@ __all__ = ["gemm_fp4"]
 
 
 class FP4GemmMXFunction(torch.autograd.Function):
+    """
+    MXFP4 scaling recipe reference: https://arxiv.org/pdf/2509.25149
+    """
 
     @staticmethod
     def get_fp4_dtype(format: Format):
@@ -36,10 +40,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        trans_activation: bool,
+        trans_weight: bool,
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
     ):
@@ -50,40 +54,48 @@ class FP4GemmMXFunction(torch.autograd.Function):
             config.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "MXFP4 only supports MX_BLOCKWISE granularity"
 
-        a_dtype = FP4GemmMXFunction.get_fp4_dtype(
+        activation_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
         )
-        b_dtype = FP4GemmMXFunction.get_fp4_dtype(
+        weight_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
         )
 
-        a_fp4, a_scale_inv = quantize_fp4(
-            a,
-            a_dtype,
+        activation_fp4, activation_scale_inv = quantize_fp4(
+            activation,
+            activation_dtype,
             config.granularity,
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["a_fwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=False,
+            ),
         )
 
-        b_fp4, b_scale_inv = quantize_fp4(
-            b,
-            b_dtype,
+        weight_fp4, weight_scale_inv = quantize_fp4(
+            weight,
+            weight_dtype,
             config.granularity,
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["b_fwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=False,
+            ),
         )
 
         # NT layout
         out = gemm_fp4_impl(
-            a_fp4,
-            a_scale_inv,
+            activation_fp4,
+            activation_scale_inv,
             False,
-            b_fp4,
-            b_scale_inv,
+            weight_fp4,
+            weight_scale_inv,
             True,
             out_dtype,
             False,
@@ -91,20 +103,20 @@ class FP4GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        ctx.save_for_backward(a, b)
+        ctx.save_for_backward(activation, weight)
 
-        ctx.trans_a = trans_a
-        ctx.trans_b = trans_b
+        ctx.trans_activation = trans_activation
+        ctx.trans_weight = trans_weight
         ctx.out_dtype = out_dtype
         ctx.config = config
-        ctx.a_fp4_dtype = a_fp4.dtype
-        ctx.b_fp4_dtype = b_fp4.dtype
+        ctx.activation_fp4_dtype = activation_fp4.dtype
+        ctx.weight_fp4_dtype = weight_fp4.dtype
 
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a, b = ctx.saved_tensors
+        activation, weight = ctx.saved_tensors
         grad_out_dtype = FP4GemmMXFunction.get_fp4_dtype(
             ctx.config.format,
         )
@@ -118,47 +130,62 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=True,
+                use_rht=False,
+            ),
         )
 
-        grad_out_t = grad_out.T.contiguous()
         grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
-            grad_out_t,
+            grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=True,
+                use_rht=True,
+            ),
         )
 
-        a_t = a.T.contiguous()
-        a_t_fp4, a_t_scale_inv = quantize_fp4(
-            a_t,
-            ctx.a_fp4_dtype,
+        activation_t_fp4, activation_t_scale_inv = quantize_fp4(
+            activation,
+            ctx.activation_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+            ),
         )
-        b_t = b.T.contiguous()
-        b_t_fp4, b_t_scale_inv = quantize_fp4(
-            b_t,
-            ctx.b_fp4_dtype,
+
+        weight_t_fp4, weight_t_scale_inv = quantize_fp4(
+            weight,
+            ctx.weight_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+                use_sr=True,
+                use_rht=False,
+            ),
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
-        grad_a = gemm_fp4_impl(
+        grad_activation = gemm_fp4_impl(
             grad_out_fp4,
             grad_out_scale_inv,
             False,
-            b_t_fp4,
-            b_t_scale_inv,
+            weight_t_fp4,
+            weight_t_scale_inv,
             True,
             ctx.out_dtype,
             False,
@@ -167,12 +194,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
         )
 
         # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
-        grad_b = gemm_fp4_impl(
+        grad_weight = gemm_fp4_impl(
             grad_out_t_fp4,
             grad_out_t_scale_inv,
             False,
-            a_t_fp4,
-            a_t_scale_inv,
+            activation_t_fp4,
+            activation_t_scale_inv,
             True,
             ctx.out_dtype,
             False,
@@ -180,14 +207,14 @@ class FP4GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        return grad_a, grad_b, None, None, None, None
+        return grad_activation, grad_weight, None, None, None, None
 
 
 def gemm_fp4(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    trans_a: bool = False,
-    trans_b: bool = False,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    trans_activation: bool = False,
+    trans_weight: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float4QuantConfig, None] = None,
 ) -> torch.Tensor:
@@ -197,10 +224,10 @@ def gemm_fp4(
     to accelerate training and inference.
 
     Args:
-        a: Input matrix A with shape (M, K), must be 2D tensor
-        b: Input matrix B with shape (K, N) or (N, K), must be 2D tensor
-        trans_a: Whether to transpose matrix A
-        trans_b: Whether to transpose matrix B, if True B shape is (N, K)
+        activation: Input matrix activation with shape (M, K), must be 2D tensor
+        weight: Input matrix weight with shape (K, N) or (N, K), must be 2D tensor
+        trans_activation: Whether to transpose matrix activation
+        trans_weight: Whether to transpose matrix weight, if True weight shape is (N, K)
         out_dtype: Output data type, defaults to None (auto-inferred)
         config: FP4 quantization config
 
@@ -216,23 +243,23 @@ def gemm_fp4(
     Example::
 
         >>> # Basic usage
-        >>> a = torch.randn(128, 512, device='cuda')
-        >>> b = torch.randn(512, 256, device='cuda')
-        >>> out = gemm_fp4(a, b)
+        >>> activation = torch.randn(128, 512, device='cuda')
+        >>> weight = torch.randn(512, 256, device='cuda')
+        >>> out = gemm_fp4(activation, weight)
         >>>
         >>> # ROWWISE quantization
         >>> config = Float4QuantConfig()
-        >>> out = gemm_fp4(a, b, trans_b=True, config=config)
+        >>> out = gemm_fp4(activation, weight, trans_weight=True, config=config)
 
     """
-    assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
+    assert activation.ndim == 2 and weight.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
-        out_dtype = torch.result_type(a, b)
+        out_dtype = torch.result_type(activation, weight)
 
     if config is None:
         config = Float4QuantConfig()
 
-    args = (a, b, trans_a, trans_b, out_dtype, config)
+    args = (activation, weight, trans_activation, trans_weight, out_dtype, config)
 
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP4GemmMXFunction.apply(*args)

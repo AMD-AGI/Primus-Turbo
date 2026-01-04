@@ -4,9 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -140,12 +140,14 @@ class MXScalingRecipe:
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - philox_seed: The philox generator's seed for the stochastic rounding. Available in MXFP4.
     - philox_offset: The philox generator's offset for the stochastic rounding. Available in MXFP4.
+    - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     """
 
     use_2d_block: bool = False
     use_sr: bool = False
     philox_seed: Optional[int] = None
     philox_offset: Optional[int] = None
+    use_rht: bool = False
 
 
 @dataclass
@@ -155,17 +157,6 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
-
-    # Default scaling recipe. Assume b is weight.
-    scaling_recipe: Dict[str, MXScalingRecipe] = field(
-        default_factory=lambda: {
-            "a_fwd": MXScalingRecipe(),
-            "b_fwd": MXScalingRecipe(use_2d_block=True),
-            "grad_bwd": MXScalingRecipe(),
-            "a_bwd": MXScalingRecipe(),
-            "b_bwd": MXScalingRecipe(use_2d_block=True),
-        }
-    )
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
@@ -190,17 +181,6 @@ class Float4QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: int = 32
-
-    # Default scaling recipe. Assume b is weight. Reference: https://arxiv.org/pdf/2509.25149
-    scaling_recipe: Dict[str, MXScalingRecipe] = field(
-        default_factory=lambda: {
-            "a_fwd": MXScalingRecipe(),
-            "b_fwd": MXScalingRecipe(use_2d_block=True),
-            "grad_bwd": MXScalingRecipe(use_sr=True),
-            "a_bwd": MXScalingRecipe(),
-            "b_bwd": MXScalingRecipe(use_2d_block=True, use_sr=True),
-        }
-    )
 
     def __post_init__(self):
         assert (

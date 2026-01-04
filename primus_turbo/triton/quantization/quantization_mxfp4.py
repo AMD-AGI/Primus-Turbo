@@ -29,13 +29,17 @@ def quantize_mxfp4_kernel(
     stride_scale_inv_col,
     scale_n_rows,
     scale_n_cols,
+    hadamard_matrix_ptr,
+    hadamard_matrix_size,
     philox_seed,
     philox_offset,
     BLOCK_X: tl.constexpr,
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
+    TRANS: tl.constexpr,
     USE_2D_BLOCK: tl.constexpr,
     USE_SR: tl.constexpr,
+    USE_RHT: tl.constexpr,
     MXFP4_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -55,6 +59,22 @@ def quantize_mxfp4_kernel(
     num_chunks_in_block_Y = BLOCK_Y // MXFP4_BLOCK_SIZE
     num_chunks_in_block_X = BLOCK_X // MXFP4_BLOCK_SIZE
 
+    if USE_RHT:
+        # NOTE: Hadamard matrix is 2D matrix whose the rows and columns are the same size and both are the power of 2.
+        tl.device_assert(
+            hadamard_matrix_size == MXFP4_BLOCK_SIZE, "Hadamard matrix size must be equal to MXFP4_BLOCK_SIZE"
+        )
+        offset_hadamard_matrix_x = tl.arange(0, MXFP4_BLOCK_SIZE)
+        offset_hadamard_matrix_y = tl.arange(0, MXFP4_BLOCK_SIZE)
+        hadamard_matrix = tl.load(
+            hadamard_matrix_ptr
+            + offset_hadamard_matrix_y[:, None] * MXFP4_BLOCK_SIZE
+            + offset_hadamard_matrix_x[None, :]
+        ).to(tl.float32)
+
+        if TRANS:
+            hadamard_matrix_t = tl.trans(hadamard_matrix, (1, 0))
+
     for chunk_id_y in range(0, num_chunks_in_block_Y):
         offsets_Y = global_offset_Y_base + chunk_id_y * MXFP4_BLOCK_SIZE + tl.arange(0, MXFP4_BLOCK_SIZE)
         for chunk_id_x in range(0, num_chunks_in_block_X):
@@ -66,24 +86,56 @@ def quantize_mxfp4_kernel(
             # (MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE)
             x_chunk = tl.load(x_ptr_current_chunk, mask=load_mask, other=0.0).to(tl.float32)
 
-            if not USE_2D_BLOCK:
-                biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
-            else:
+            if USE_RHT:
+                if not TRANS:
+                    x_chunk = tl.dot(x_chunk, hadamard_matrix)
+                else:
+                    x_chunk = tl.dot(hadamard_matrix_t, x_chunk)
+
+            if USE_2D_BLOCK:
                 biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+            else:
+                if not TRANS:
+                    # Row-wise
+                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
+                else:
+                    # Col-wise
+                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
 
-            scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
-            scale_inv_store_offsets = (
-                offsets_Y[:, None] * stride_scale_inv_row
-            ) + scale_offset_X * stride_scale_inv_col
-            scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
+            if not TRANS:
+                # Row-wsie
+                scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
+                scale_inv_store_offsets = (
+                    offsets_Y[:, None] * stride_scale_inv_row
+                ) + scale_offset_X * stride_scale_inv_col
+                scale_inv_store_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
 
-            tl.store(
-                scale_inv_ptr + scale_inv_store_offsets,
-                biased_exponent,
-                mask=scale_inv_store_mask,
-            )
+                tl.store(
+                    scale_inv_ptr + scale_inv_store_offsets,
+                    biased_exponent,
+                    mask=scale_inv_store_mask,
+                )
+            else:
+                # Col-wise
+                scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
+                scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_col + (
+                    offsets_X[None, :] * stride_scale_inv_row
+                )
+                scale_inv_store_mask = (scale_offset_Y < scale_n_rows) & (offsets_X < scale_n_cols)[None, :]
+                tl.store(
+                    scale_inv_ptr + scale_inv_store_offsets,
+                    biased_exponent,
+                    mask=scale_inv_store_mask,
+                )
+
+                # NOTE: Transpose x chunk to Row-wise because of ISA requirement
+                x_chunk = tl.trans(x_chunk, (1, 0))
 
             scale = (biased_exponent.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            if TRANS:
+                # NOTE: Transpose scale to Row-wise because of x_chunk is Row-wise
+                scale = tl.trans(scale, (1, 0))
+
             x_chunk0, x_chunk1 = tl.split(x_chunk.reshape(MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE // 2, 2))
 
             if not USE_SR:
@@ -121,20 +173,44 @@ def quantize_mxfp4_kernel(
 
             y_chunk_scaled = (y_chunk_scaled & 0x00FF).to(y_ptr.type.element_ty)
 
-            y_offsets_X = (
-                pid_n.to(tl.int64) * BLOCK_X // 2
-                + chunk_id_x * MXFP4_BLOCK_SIZE // 2
-                + tl.arange(0, MXFP4_BLOCK_SIZE // 2)
-            )
-            store_mask = (offsets_Y < padded_n_rows)[:, None] & (y_offsets_X < padded_n_cols // 2)[None, :]
-            y_ptr_current_chunk = (
-                y_ptr + offsets_Y[:, None] * stride_y_row + y_offsets_X[None, :] * stride_y_col
-            )
-            tl.store(
-                y_ptr_current_chunk,
-                y_chunk_scaled,
-                mask=store_mask,
-            )
+            if not TRANS:
+                y_offsets_X = (
+                    pid_n.to(tl.int64) * BLOCK_X // 2
+                    + chunk_id_x * MXFP4_BLOCK_SIZE // 2
+                    + tl.arange(0, MXFP4_BLOCK_SIZE // 2)
+                )
+                store_mask = (offsets_Y < padded_n_rows)[:, None] & (y_offsets_X < padded_n_cols // 2)[
+                    None, :
+                ]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_row + y_offsets_X[None, :] * stride_y_col
+                )
+                tl.store(
+                    y_ptr_current_chunk,
+                    y_chunk_scaled,
+                    mask=store_mask,
+                )
+            else:
+                # Transpose y chunk to Col-wise
+                y_chunk_scaled = tl.trans(y_chunk_scaled, (1, 0)).reshape(
+                    MXFP4_BLOCK_SIZE // 2, MXFP4_BLOCK_SIZE
+                )
+                y_offsets_Y = (
+                    pid_m.to(tl.int64) * BLOCK_Y // 2
+                    + chunk_id_y * MXFP4_BLOCK_SIZE // 2
+                    + tl.arange(0, MXFP4_BLOCK_SIZE // 2)
+                )
+                store_mask = (y_offsets_Y < padded_n_rows // 2)[:, None] & (offsets_X < padded_n_cols)[
+                    None, :
+                ]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_X[None, :] * stride_y_row + y_offsets_Y[:, None] * stride_y_col
+                )
+                tl.store(
+                    y_ptr_current_chunk,
+                    y_chunk_scaled,
+                    mask=store_mask,
+                )
 
 
 @triton.jit
@@ -155,6 +231,7 @@ def dequantize_mxfp4_kernel(
     BLOCK_X: tl.constexpr,
     BLOCK_Y: tl.constexpr,
     GROUP_Y: tl.constexpr,
+    TRANS: tl.constexpr,
     MXFP4_BLOCK_SIZE: tl.constexpr,
 ):
 
@@ -247,8 +324,15 @@ def dequantize_mxfp4_kernel(
 
             y_chunk_scaled = tl.join(y_chunk0, y_chunk1).reshape(MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE)
 
-            store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
-            y_ptr_current_chunk = (
-                y_ptr + offsets_Y[:, None] * stride_y_row + offsets_X[None, :] * stride_y_col
-            )
-            tl.store(y_ptr_current_chunk, y_chunk_scaled, mask=store_mask)
+            if not TRANS:
+                store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_row + offsets_X[None, :] * stride_y_col
+                )
+                tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)
+            else:
+                store_mask = (offsets_Y < n_rows)[:, None] & (offsets_X < n_cols)[None, :]
+                y_ptr_current_chunk = (
+                    y_ptr + offsets_Y[:, None] * stride_y_col + offsets_X[None, :] * stride_y_row
+                )
+                tl.store(y_ptr_current_chunk, y_chunk_scaled.to(y_ptr.type.element_ty), mask=store_mask)

@@ -11,7 +11,6 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Format,
-    MXScalingRecipe,
     ScaleDtype,
     ScalingGranularity,
 )
@@ -67,24 +66,24 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
 
     device = "cuda:0"
 
-    trans_a = layout[0] == "T"
-    trans_b = layout[1] == "T"
+    trans_act = layout[0] == "T"
+    trans_w = layout[1] == "T"
 
-    a_shape = (m, k) if not trans_a else (k, m)
-    b_shape = (k, n) if not trans_b else (n, k)
+    act_shape = (m, k) if not trans_act else (k, m)
+    w_shape = (k, n) if not trans_w else (n, k)
 
-    a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    act = torch.randn(act_shape, dtype=dtype, device=device, requires_grad=True)
+    w = torch.randn(w_shape, dtype=dtype, device=device, requires_grad=True)
 
-    a_ref = a.detach().clone().requires_grad_()
-    b_ref = b.detach().clone().requires_grad_()
+    act_ref = act.detach().clone().requires_grad_()
+    w_ref = w.detach().clone().requires_grad_()
     torch.cuda.synchronize()
 
     # Ref
-    a_mat = a_ref.T if trans_a else a_ref
-    b_mat = b_ref.T if trans_b else b_ref
-    c_ref = a_mat @ b_mat
-    c_ref.backward(torch.ones_like(c_ref))
+    act_mat = act_ref.T if trans_act else act_ref
+    w_mat = w_ref.T if trans_w else w_ref
+    out_ref = act_mat @ w_mat
+    out_ref.backward(torch.ones_like(out_ref))
     torch.cuda.synchronize()
 
     # Config + FWD + BWD
@@ -92,33 +91,27 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     config = Float4QuantConfig(
         granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
     )
-    config.scaling_recipe["a_fwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_fwd"] = MXScalingRecipe(use_2d_block=True, use_sr=False)
-    config.scaling_recipe["grad_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=True)
-    config.scaling_recipe["a_bwd"] = MXScalingRecipe(use_2d_block=False, use_sr=False)
-    config.scaling_recipe["b_bwd"] = MXScalingRecipe(use_2d_block=True, use_sr=True)
-    print(config)
-    c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
+    c = gemm_fp4(act, w, trans_act, trans_w, dtype, config)
     c.backward(torch.ones_like(c))
 
     # Check Shape
-    assert c.shape == c_ref.shape
-    assert a.grad.shape == a_ref.grad.shape
-    assert b.grad.shape == b_ref.grad.shape
+    assert c.shape == out_ref.shape
+    assert act.grad.shape == act_ref.grad.shape
+    assert w.grad.shape == w_ref.grad.shape
 
     snr_threshold = 10
     # Check Results
-    c_snr = compute_snr(c_ref, c)
-    print(f"C-SNR: {c_snr:.2f} dB")
-    assert c_snr > snr_threshold, "c_snr too low"
+    out_snr = compute_snr(out_ref, c)
+    print(f"Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > snr_threshold, "out_snr too low"
 
-    a_grad_snr = compute_snr(a_ref.grad, a.grad)
-    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
-    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+    act_grad_snr = compute_snr(act_ref.grad, act.grad)
+    print(f"Activation Grad-SNR: {act_grad_snr:.2f} dB")
+    assert act_grad_snr > snr_threshold, "act_grad_snr too low"
 
-    b_grad_snr = compute_snr(b_ref.grad, b.grad)
-    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
-    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+    w_grad_snr = compute_snr(w_ref.grad, w.grad)
+    print(f"Weight Grad-SNR: {w_grad_snr:.2f} dB")
+    assert w_grad_snr > snr_threshold, "w_grad_snr too low"
 
     # Reset config and caches
     GlobalBackendManager.reset()
