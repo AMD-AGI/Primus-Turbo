@@ -4,7 +4,10 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""PyTorch GEMM Baseline Benchmark (BF16 and FP8 with torchao)."""
+"""TransformerEngine GEMM Baseline Benchmark.
+
+Reference: https://github.com/ROCm/TransformerEngine/blob/dev/benchmarks/linear/benchmark_grouped_linear.py
+"""
 
 import argparse
 from datetime import datetime
@@ -12,6 +15,7 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
+import transformer_engine as te
 from config import (
     BATCH_SIZE_LIST,
     DenseModelConfigs,
@@ -22,122 +26,106 @@ from config import (
     get_platform_info,
 )
 from tabulate import tabulate
+from transformer_engine.common.recipe import (
+    Float8BlockScaling,
+    Float8CurrentScaling,
+    Format,
+    MXFP8BlockScaling,
+)
 
-# FP8 imports (optional, only needed for fp8 mode)
-try:
-    from torchao.float8 import Float8LinearConfig
-    from torchao.float8.float8_linear import matmul_with_hp_or_float8_args
-    from torchao.float8.float8_training_tensor import LinearMMConfig, ScaledMMConfig
-
-    FP8_AVAILABLE = True
-
-    # Default config for FP8 GEMM (use_fast_accum=False for fp32 accumulation)
-    DEFAULT_MM_CONFIG = LinearMMConfig(
-        ScaledMMConfig(emulate=False, use_fast_accum=False, fp8_output=False, pad_inner_dim=False),
-        ScaledMMConfig(emulate=False, use_fast_accum=False, fp8_output=False, pad_inner_dim=False),
-        ScaledMMConfig(emulate=False, use_fast_accum=False, fp8_output=False, pad_inner_dim=False),
-    )
-    DEFAULT_CONFIG = Float8LinearConfig()
-except ImportError:
-    FP8_AVAILABLE = False
-
-gemm_fp8_compiled = None
+# FP8 recipe mapping (similar to Turbo's GRANULARITY_CONFIG_MAP)
+FP8_RECIPE_MAP = {
+    "tensorwise": Float8CurrentScaling(fp8_format=Format.E4M3),
+    "blockwise": Float8BlockScaling(fp8_format=Format.E4M3),
+    "mx": MXFP8BlockScaling(fp8_format=Format.E4M3),
+}
 
 
-def _gemm_fp8_impl(a, b):
-    """FP8 GEMM implementation using torchao."""
-    return matmul_with_hp_or_float8_args.apply(a, b.t(), DEFAULT_MM_CONFIG, DEFAULT_CONFIG)
+def check_gemm_te_correctness(layer, x, grad_out, dtype):
+    """Check correctness of TE Linear forward and backward (BF16)."""
+    out = layer(x)
 
-
-def get_compiled_gemm_fp8():
-    """Get a compiled FP8 GEMM function."""
-    global gemm_fp8_compiled
-    torch._dynamo.reset()
-    torch._functorch.config.donated_buffer = False
-    gemm_fp8_compiled = torch.compile(_gemm_fp8_impl)
-    return gemm_fp8_compiled
-
-
-def check_gemm_correctness(a, b, out, grad_out, dtype):
-    """Check correctness of BF16 GEMM forward and backward."""
-    out_ref = a.detach() @ b.detach().T
+    out_ref = gemm_ref(x.detach(), layer.weight.detach(), trans_b=True)
     fwd_correct = check_allclose(out.detach(), out_ref, dtype)
 
-    a_ref = a.detach().clone().requires_grad_()
-    b_ref = b.detach().clone().requires_grad_()
-    out_ref = a_ref @ b_ref.T
+    x_ref = x.detach().clone().requires_grad_()
+    out_ref = x_ref @ layer.weight.detach().T
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
-    bwd_a_correct = check_allclose(a.grad, a_ref.grad, dtype)
-    bwd_b_correct = check_allclose(b.grad, b_ref.grad, dtype)
+    bwd_correct = check_allclose(x.grad, x_ref.grad, dtype)
 
-    a.grad = None
-    b.grad = None
+    x.grad = None
+    layer.zero_grad()
 
-    correct = fwd_correct and bwd_a_correct and bwd_b_correct
+    correct = fwd_correct and bwd_correct
     status = "PASS" if correct else "FAIL"
-    print(f"Correctness Check: {status} (fwd={fwd_correct}, bwd_a={bwd_a_correct}, bwd_b={bwd_b_correct})")
+    print(f"Correctness Check: {status} (fwd={fwd_correct}, bwd={bwd_correct})")
 
     return correct
 
 
-def check_gemm_fp8_correctness(a, b, out, grad_out):
-    """Check correctness of FP8 GEMM forward and backward using SNR."""
+def check_gemm_te_fp8_correctness(layer, x, grad_out, fp8_recipe):
+    """Check correctness of TE Linear forward and backward (FP8) using SNR."""
     snr_threshold = 20
 
-    out_ref = gemm_ref(a.detach(), b.detach(), trans_b=True)
+    with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+        out = layer(x)
+
+    out_ref = gemm_ref(x.detach(), layer.weight.detach(), trans_b=True)
     out_snr = compute_snr(out_ref, out.detach())
 
-    a_ref = a.detach().clone().requires_grad_()
-    b_ref = b.detach().clone().requires_grad_()
-    out_ref = gemm_ref(a_ref, b_ref, trans_b=True)
+    x_ref = x.detach().clone().requires_grad_()
+    out_ref = x_ref @ layer.weight.detach().T
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
-    da_snr = compute_snr(a_ref.grad, a.grad)
-    db_snr = compute_snr(b_ref.grad, b.grad)
+    dx_snr = compute_snr(x_ref.grad, x.grad)
 
-    a.grad = None
-    b.grad = None
+    x.grad = None
+    layer.zero_grad()
 
-    correct = all(snr > snr_threshold for snr in [out_snr, da_snr, db_snr])
+    correct = all(snr > snr_threshold for snr in [out_snr, dx_snr])
     status = "PASS" if correct else "FAIL"
-    print(
-        f"Correctness Check: {status} (out={out_snr:.1f}, da={da_snr:.1f}, db={db_snr:.1f}) threshold={snr_threshold}"
-    )
+    print(f"Correctness Check: {status} (out={out_snr:.1f}, dx={dx_snr:.1f}) threshold={snr_threshold}")
 
     return correct
 
 
-def profile_gemm(M, N, K, dtype):
-    """Profile BF16 GEMM using native PyTorch."""
+def profile_gemm_te(M, N, K, dtype):
+    """Profile BF16 GEMM using TE Linear."""
     device = "cuda"
-    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn((N, K), dtype=dtype, device=device, requires_grad=True)
 
-    out = a @ b.T
+    x = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    layer = te.pytorch.Linear(K, N, bias=False, params_dtype=dtype).to(device)
+
+    out = layer(x)
     grad_out = torch.randn_like(out)
-    correct = check_gemm_correctness(a, b, out, grad_out, dtype)
 
-    fwd_func = lambda: a @ b.T
-    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
-    out = fwd_func()
-    bwd_func()
+    correct = check_gemm_te_correctness(layer, x, grad_out, dtype)
+
+    def fwd_func():
+        return layer(x)
+
+    def fwd_bwd_func():
+        out = layer(x)
+        out.backward(grad_out)
 
     fwd_total_flops = 2 * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
     for _ in range(20):
-        fwd_func()
-        bwd_func()
+        fwd_bwd_func()
     torch.cuda.synchronize()
 
     fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
-    bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
     fwd_measurement = fwd_timer.timeit(100)
-    bwd_measurement = bwd_timer.timeit(100)
+
+    fwd_bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_bwd_func})
+    fwd_bwd_measurement = fwd_bwd_timer.timeit(100)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
-    bwd_mean_time_ms = bwd_measurement.mean * 1e3
+    fwd_bwd_mean_time_ms = fwd_bwd_measurement.mean * 1e3
+    bwd_mean_time_ms = fwd_bwd_mean_time_ms - fwd_mean_time_ms
+
     fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
     bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
     print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
@@ -146,38 +134,45 @@ def profile_gemm(M, N, K, dtype):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def profile_gemm_fp8(M, N, K, dtype):
-    """Profile FP8 GEMM using torchao."""
+def profile_gemm_te_fp8(M, N, K, dtype, fp8_recipe):
+    """Profile FP8 GEMM using TE Linear with fp8_autocast."""
     device = "cuda"
-    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn((N, K), dtype=dtype, device=device, requires_grad=True)
 
-    compiled_fn = get_compiled_gemm_fp8()
+    x = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    layer = te.pytorch.Linear(K, N, bias=False, params_dtype=dtype).to(device)
 
-    out = compiled_fn(a, b)
+    with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+        out = layer(x)
     grad_out = torch.randn_like(out)
-    correct = check_gemm_fp8_correctness(a, b, out, grad_out)
 
-    fwd_func = lambda: compiled_fn(a, b)
-    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
-    out = fwd_func()
-    bwd_func()
+    correct = check_gemm_te_fp8_correctness(layer, x, grad_out, fp8_recipe)
+
+    def fwd_func():
+        with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            return layer(x)
+
+    def fwd_bwd_func():
+        with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            out = layer(x)
+        out.backward(grad_out)
 
     fwd_total_flops = 2 * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
     for _ in range(20):
-        fwd_func()
-        bwd_func()
+        fwd_bwd_func()
     torch.cuda.synchronize()
 
     fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
-    bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
     fwd_measurement = fwd_timer.timeit(100)
-    bwd_measurement = bwd_timer.timeit(100)
+
+    fwd_bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_bwd_func})
+    fwd_bwd_measurement = fwd_bwd_timer.timeit(100)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
-    bwd_mean_time_ms = bwd_measurement.mean * 1e3
+    fwd_bwd_mean_time_ms = fwd_bwd_measurement.mean * 1e3
+    bwd_mean_time_ms = fwd_bwd_mean_time_ms - fwd_mean_time_ms
+
     fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
     bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
     print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
@@ -186,13 +181,11 @@ def profile_gemm_fp8(M, N, K, dtype):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_gemm_torch(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+def benchmark_gemm_te(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
-    if is_fp8 and not FP8_AVAILABLE:
-        print("Error: torchao is not available for FP8 benchmarking")
-        return
+    fp8_recipe = FP8_RECIPE_MAP.get(granularity_name) if is_fp8 else None
 
     rows = []
     test_id = 0
@@ -214,19 +207,16 @@ def benchmark_gemm_torch(dtype_name="bf16", granularity_name="tensorwise", outpu
                         f"M: {M}, N: {N}, K: {K}, dtype: fp8, granularity: {granularity_name}"
                     )
                 else:
-                    print(
-                        f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
-                        f"M: {M}, N: {N}, K: {K}, dtype: bf16"
-                    )
+                    print(f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, M: {M}, N: {N}, K: {K}")
                 print(f"{'='*60}")
 
                 try:
                     if is_fp8:
-                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
-                            M, N, K, dtype
+                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_te_fp8(
+                            M, N, K, dtype, fp8_recipe
                         )
                     else:
-                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm(
+                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_te(
                             M, N, K, dtype
                         )
 
@@ -255,7 +245,10 @@ def benchmark_gemm_torch(dtype_name="bf16", granularity_name="tensorwise", outpu
                     rows.append(row)
 
                 except Exception as e:
+                    import traceback
+
                     print(f"Failed: {str(e)}")
+                    traceback.print_exc()
                     row = {
                         "TestID": test_id,
                         "Platform": platform,
@@ -294,15 +287,15 @@ def benchmark_gemm_torch(dtype_name="bf16", granularity_name="tensorwise", outpu
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
         if is_fp8:
-            filename = f"gemm_torch_fp8_{granularity_name}_{timestamp}_{gpu_name}.csv"
+            filename = f"gemm_te_fp8_{granularity_name}_{timestamp}_{gpu_name}.csv"
         else:
-            filename = f"gemm_torch_bf16_{timestamp}_{gpu_name}.csv"
+            filename = f"gemm_te_bf16_{timestamp}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark PyTorch GEMM Baseline (BF16 and FP8)")
+    parser = argparse.ArgumentParser(description="Benchmark TransformerEngine GEMM (Linear)")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -313,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--granularity",
         type=str,
-        choices=["tensorwise"],
+        choices=["tensorwise", "blockwise", "mx"],
         default="tensorwise",
         help="FP8 scaling granularity (only used when dtype=fp8, default: tensorwise)",
     )
@@ -325,4 +318,4 @@ if __name__ == "__main__":
         help="Output CSV filename",
     )
     args = parser.parse_args()
-    benchmark_gemm_torch(dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output)
+    benchmark_gemm_te(dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output)

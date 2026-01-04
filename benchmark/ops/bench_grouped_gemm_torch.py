@@ -23,12 +23,12 @@ from tabulate import tabulate
 
 
 def check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype):
-    out_ref = grouped_gemm_ref(x.detach(), w.detach(), group_lens)
+    out_ref = grouped_gemm_ref(x.detach(), w.detach(), group_lens, trans_b=True)
     fwd_correct = check_allclose(out.detach(), out_ref, dtype)
 
     x_ref = x.detach().clone().requires_grad_()
     w_ref = w.detach().clone().requires_grad_()
-    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens)
+    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens, trans_b=True)
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
     bwd_x_correct = check_allclose(x.grad, x_ref.grad, dtype)
@@ -95,7 +95,7 @@ def benchmark_grouped_gemm_torch(output_csv=None):
         dtype = case["dtype"]
 
         print(f"\n{'='*60}")
-        print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: {dtype}")
+        print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16")
         print(f"{'='*60}")
 
         try:
@@ -116,6 +116,7 @@ def benchmark_grouped_gemm_torch(output_csv=None):
                     "M": M,
                     "N": N,
                     "K": K,
+                    "Dtype": "bf16",
                     "Check": "PASS" if correct else "FAIL",
                     "Forward Time (ms)": f"{fwd_time_ms:.2f}",
                     "Forward TFLOPS": f"{fwd_tflops:.2f}",
@@ -136,6 +137,7 @@ def benchmark_grouped_gemm_torch(output_csv=None):
                     "M": M,
                     "N": N,
                     "K": K,
+                    "Dtype": "bf16",
                     "Check": "ERROR",
                     "Forward Time (ms)": "ERROR",
                     "Forward TFLOPS": "0.00",

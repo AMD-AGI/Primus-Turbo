@@ -22,10 +22,12 @@ BENCHMARK_TABLES = {
     },
     "GEMM": {
         "PyTorch": "gemm_torch_benchmark.csv",
+        "TE": "gemm_te_benchmark.csv",
         "Hipblaslt": "gemm_hipblaslt_benchmark.csv",
     },
     "GEMM-FP8-Tensorwise": {
         "PyTorch": "gemm_fp8_tensorwise_torch_benchmark.csv",
+        "TE": "gemm_fp8_tensorwise_te_benchmark.csv",
         "Hipblaslt": "gemm_fp8_tensorwise_hipblaslt_benchmark.csv",
         "CK": "gemm_fp8_tensorwise_ck_benchmark.csv",
         "AutoTune": "gemm_fp8_tensorwise_autotune_benchmark.csv",
@@ -42,11 +44,13 @@ BENCHMARK_TABLES = {
     },
     "Grouped-GEMM": {
         "PyTorch": "grouped_gemm_torch_benchmark.csv",
+        "TE": "grouped_gemm_te_benchmark.csv",
         "Hipblaslt": "grouped_gemm_hipblaslt_benchmark.csv",
         "CK": "grouped_gemm_ck_benchmark.csv",
         "AutoTune": "grouped_gemm_autotune_benchmark.csv",
     },
     "Grouped-GEMM-FP8-Tensorwise": {
+        "TE": "grouped_gemm_fp8_tensorwise_te_benchmark.csv",
         "Hipblaslt": "grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv",
         "CK": "grouped_gemm_fp8_tensorwise_ck_benchmark.csv",
         "AutoTune": "grouped_gemm_fp8_tensorwise_autotune_benchmark.csv",

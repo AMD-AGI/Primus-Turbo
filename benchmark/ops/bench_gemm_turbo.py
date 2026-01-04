@@ -4,8 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+"""Primus-Turbo GEMM Benchmark (BF16 and FP8)."""
+
 import argparse
-import re
 from datetime import datetime
 
 import pandas as pd
@@ -14,9 +15,11 @@ import torch.utils.benchmark as benchmark
 from config import (
     BATCH_SIZE_LIST,
     DenseModelConfigs,
+    check_allclose,
     compute_snr,
     gemm_ref,
     gen_gemm_test_cases,
+    get_platform_info,
 )
 from tabulate import tabulate
 
@@ -43,6 +46,29 @@ GRANULARITY_CONFIG_MAP = {
         scale_dtype=ScaleDtype.E8M0,
     ),
 }
+
+
+def check_gemm_correctness(a, b, out, grad_out, trans_b, dtype):
+    """Check correctness of BF16 GEMM forward and backward."""
+    out_ref = gemm_ref(a.detach(), b.detach(), trans_b=trans_b)
+    fwd_correct = check_allclose(out.detach(), out_ref, dtype)
+
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+    out_ref = gemm_ref(a_ref, b_ref, trans_b=trans_b)
+    out_ref.backward(grad_out)
+    out.backward(grad_out, retain_graph=True)
+    bwd_a_correct = check_allclose(a.grad, a_ref.grad, dtype)
+    bwd_b_correct = check_allclose(b.grad, b_ref.grad, dtype)
+
+    a.grad = None
+    b.grad = None
+
+    correct = fwd_correct and bwd_a_correct and bwd_b_correct
+    status = "PASS" if correct else "FAIL"
+    print(f"Correctness Check: {status} (fwd={fwd_correct}, bwd_a={bwd_a_correct}, bwd_b={bwd_b_correct})")
+
+    return correct
 
 
 def check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, fp8_format):
@@ -72,11 +98,51 @@ def check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, fp8_format):
     return correct
 
 
-def profile_gemm_fp8(M, N, K, ori_dtype, config, trans_b):
+def profile_gemm(M, N, K, dtype, trans_b):
+    """Profile BF16 GEMM."""
     device = "cuda"
     b_shape = (N, K) if trans_b else (K, N)
-    a = torch.randn((M, K), dtype=ori_dtype, device=device, requires_grad=True)
-    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+
+    out = turbo.ops.gemm(a, b, trans_b=trans_b)
+    grad_out = torch.randn_like(out)
+    correct = check_gemm_correctness(a, b, out, grad_out, trans_b, dtype)
+
+    fwd_func = lambda: turbo.ops.gemm(a, b, trans_b=trans_b)
+    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
+    out = fwd_func()
+    bwd_func()
+
+    fwd_total_flops = 2 * M * N * K
+    bwd_total_flops = 2 * fwd_total_flops
+
+    for _ in range(20):
+        fwd_func()
+        bwd_func()
+    torch.cuda.synchronize()
+
+    fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
+    bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
+    fwd_measurement = fwd_timer.timeit(100)
+    bwd_measurement = bwd_timer.timeit(100)
+
+    fwd_mean_time_ms = fwd_measurement.mean * 1e3
+    bwd_mean_time_ms = bwd_measurement.mean * 1e3
+    fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
+    bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
+    print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+    print(f"Backward Mean time: {bwd_mean_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
+
+    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
+
+
+def profile_gemm_fp8(M, N, K, dtype, config, trans_b):
+    """Profile FP8 GEMM."""
+    device = "cuda"
+    b_shape = (N, K) if trans_b else (K, N)
+    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
 
     out = turbo.ops.gemm_fp8(a, b, trans_b=trans_b, config=config)
     grad_out = torch.randn_like(out)
@@ -110,16 +176,17 @@ def profile_gemm_fp8(M, N, K, ori_dtype, config, trans_b):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
-    full_name = torch.cuda.get_device_name(0)
-    match = re.search(r"(MI\d+)", full_name)
-    gpu_name = match.group(1) if match else full_name.split()[-1]
-    config = GRANULARITY_CONFIG_MAP[granularity_name]
+def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+    platform, gpu_name = get_platform_info()
+
+    is_fp8 = dtype_name == "fp8"
+    config = GRANULARITY_CONFIG_MAP[granularity_name] if is_fp8 else None
 
     rows = []
     test_id = 0
-    ori_dtype = torch.bfloat16
+    dtype = torch.bfloat16
     trans_b = True
+
     for model_name, model_config in DenseModelConfigs.items():
         test_cases = gen_gemm_test_cases(model_config)
         for MBS in BATCH_SIZE_LIST:
@@ -130,26 +197,43 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
                 K = shape[2]
 
                 print(f"\n{'='*60}")
-                print(
-                    f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
-                    f"M: {M}, N: {N}, K: {K}, granularity: {granularity_name}"
-                )
+                if is_fp8:
+                    print(
+                        f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
+                        f"M: {M}, N: {N}, K: {K}, dtype: fp8, granularity: {granularity_name}"
+                    )
+                else:
+                    print(
+                        f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
+                        f"M: {M}, N: {N}, K: {K}, dtype: bf16"
+                    )
                 print(f"{'='*60}")
 
                 try:
-                    fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
-                        M, N, K, ori_dtype, config, trans_b
-                    )
-                    rows.append(
+                    if is_fp8:
+                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
+                            M, N, K, dtype, config, trans_b
+                        )
+                    else:
+                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm(
+                            M, N, K, dtype, trans_b
+                        )
+
+                    row = {
+                        "TestID": test_id,
+                        "Platform": platform,
+                        "GPU": gpu_name,
+                        "Case": model_name,
+                        "MBS": MBS,
+                        "M": M,
+                        "N": N,
+                        "K": K,
+                        "Dtype": dtype_name,
+                    }
+                    if is_fp8:
+                        row["Granularity"] = granularity_name
+                    row.update(
                         {
-                            "TestID": test_id,
-                            "GPU": gpu_name,
-                            "Case": model_name,
-                            "MBS": MBS,
-                            "M": M,
-                            "N": N,
-                            "K": K,
-                            "Granularity": granularity_name,
                             "Check": "PASS" if correct else "FAIL",
                             "Forward Time (ms)": f"{fwd_time_ms:.2f}",
                             "Forward TFLOPS": f"{fwd_tflops:.2f}",
@@ -157,18 +241,25 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
                             "Backward TFLOPS": f"{bwd_tflops:.2f}",
                         }
                     )
+                    rows.append(row)
+
                 except Exception as e:
                     print(f"Failed: {str(e)}")
-                    rows.append(
+                    row = {
+                        "TestID": test_id,
+                        "Platform": platform,
+                        "GPU": gpu_name,
+                        "Case": model_name,
+                        "MBS": MBS,
+                        "M": M,
+                        "N": N,
+                        "K": K,
+                        "Dtype": dtype_name,
+                    }
+                    if is_fp8:
+                        row["Granularity"] = granularity_name
+                    row.update(
                         {
-                            "TestID": test_id,
-                            "GPU": gpu_name,
-                            "Case": model_name,
-                            "MBS": MBS,
-                            "M": M,
-                            "N": N,
-                            "K": K,
-                            "Granularity": granularity_name,
                             "Check": "ERROR",
                             "Forward Time (ms)": "ERROR",
                             "Forward TFLOPS": "0.00",
@@ -176,6 +267,7 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
                             "Backward TFLOPS": "0.00",
                         }
                     )
+                    rows.append(row)
 
     results = pd.DataFrame(rows)
     print("\nFinal Results:")
@@ -190,27 +282,36 @@ def benchmark_gemm_fp8(granularity_name="tensorwise", output_csv=None):
         filename = output_csv
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
-        filename = f"gemm_fp8_{granularity_name}_benchmark_result_{timestamp}_{gpu_name}.csv"
-
+        if is_fp8:
+            filename = f"gemm_turbo_fp8_{granularity_name}_{timestamp}_{gpu_name}.csv"
+        else:
+            filename = f"gemm_turbo_bf16_{timestamp}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark FP8 GEMM operations")
+    parser = argparse.ArgumentParser(description="Benchmark Primus-Turbo GEMM operations")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["bf16", "fp8"],
+        default="bf16",
+        help="Data type: bf16 or fp8 (default: bf16)",
+    )
     parser.add_argument(
         "--granularity",
         type=str,
         choices=["tensorwise", "rowwise", "blockwise", "mx"],
         default="tensorwise",
-        help="Scaling granularity (default: tensorwise)",
+        help="FP8 scaling granularity (only used when dtype=fp8, default: tensorwise)",
     )
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Output CSV filename. Default: gemm_fp8_{granularity}_benchmark_result_{date}_{gpu}.csv",
+        help="Output CSV filename",
     )
     args = parser.parse_args()
-    benchmark_gemm_fp8(granularity_name=args.granularity, output_csv=args.output)
+    benchmark_gemm_turbo(dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output)

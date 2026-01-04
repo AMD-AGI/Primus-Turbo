@@ -6,13 +6,17 @@
 
 import argparse
 import os
-import re
 from datetime import datetime
 
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import BATCH_SIZE_LIST, compute_snr, gen_attention_test_cases
+from config import (
+    BATCH_SIZE_LIST,
+    compute_snr,
+    gen_attention_test_cases,
+    get_platform_info,
+)
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -172,10 +176,7 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
 
 def benchmark_attention(output_csv=None, use_fp8=False):
     """Run attention benchmark."""
-    # Get GPU name
-    full_name = torch.cuda.get_device_name(0)
-    match = re.search(r"(MI\d+)", full_name)
-    gpu_name = match.group(1) if match else full_name.split()[-1]
+    platform, gpu_name = get_platform_info()
 
     # Generate test cases from config
     test_cases = gen_attention_test_cases()
@@ -205,6 +206,7 @@ def benchmark_attention(output_csv=None, use_fp8=False):
 
                 row = {
                     "TestID": test_id,
+                    "Platform": platform,
                     "GPU": gpu_name,
                     "Batch": batch,
                     "SeqLen": seqlen,
