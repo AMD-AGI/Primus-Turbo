@@ -6,18 +6,30 @@
 
 import argparse
 import os
-import re
 from datetime import datetime
-
-# Disable FP32 atomic for better performance
-os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
-from config import BATCH_SIZE_LIST, gen_attention_test_cases
+from config import (
+    BATCH_SIZE_LIST,
+    compute_snr,
+    gen_attention_test_cases,
+    get_platform_info,
+)
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+# Disable FP32 atomic for better performance on gfx950
+def _is_gfx950():
+    """Check if current GPU is gfx950 using torch."""
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 9 and props.minor == 5
+
+
+if _is_gfx950():
+    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
 import primus_turbo.pytorch as turbo
 
@@ -47,14 +59,6 @@ def attention_ref(q, k, v, sm_scale, causal):
 
     # BHSD -> BSHD
     return o_ref.transpose(1, 2)
-
-
-def compute_snr(x: torch.Tensor, y: torch.Tensor):
-    """Compute Signal-to-Noise Ratio. x is reference."""
-    x, y = x.float(), y.float()
-    signal_power = torch.norm(x).pow(2)
-    noise_power = torch.norm(x - y).pow(2)
-    return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
 
 
 def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out, use_fp8):
@@ -172,10 +176,7 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
 
 def benchmark_attention(output_csv=None, use_fp8=False):
     """Run attention benchmark."""
-    # Get GPU name
-    full_name = torch.cuda.get_device_name(0)
-    match = re.search(r"(MI\d+)", full_name)
-    gpu_name = match.group(1) if match else full_name.split()[-1]
+    platform, gpu_name = get_platform_info()
 
     # Generate test cases from config
     test_cases = gen_attention_test_cases()
@@ -205,6 +206,7 @@ def benchmark_attention(output_csv=None, use_fp8=False):
 
                 row = {
                     "TestID": test_id,
+                    "Platform": platform,
                     "GPU": gpu_name,
                     "Batch": batch,
                     "SeqLen": seqlen,
