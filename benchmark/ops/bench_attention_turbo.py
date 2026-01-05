@@ -6,17 +6,30 @@
 
 import argparse
 import os
-import re
 from datetime import datetime
-
-# Disable FP32 atomic for better performance
-os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
 import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
+from config import (
+    BATCH_SIZE_LIST,
+    compute_snr,
+    gen_attention_test_cases,
+    get_platform_info,
+)
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+# Disable FP32 atomic for better performance on gfx950
+def _is_gfx950():
+    """Check if current GPU is gfx950 using torch."""
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 9 and props.minor == 5
+
+
+if _is_gfx950():
+    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
 import primus_turbo.pytorch as turbo
 
@@ -25,19 +38,6 @@ ATTN_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
-]
-
-# Benchmark configurations
-SEQLEN_LIST = [4096, 8192]
-BATCH_LIST = [1, 2, 4]
-
-# (num_head_q, num_head_kv, head_dim_qk, head_dim_v)
-TEST_CASES = [
-    (32, 8, 128, 128),  # GQA 4:1
-    (32, 32, 128, 128),  # MHA
-    (64, 8, 128, 128),  # GQA 8:1
-    (64, 64, 128, 128),  # MHA
-    (64, 64, 192, 128),  # MLA
 ]
 
 
@@ -59,14 +59,6 @@ def attention_ref(q, k, v, sm_scale, causal):
 
     # BHSD -> BSHD
     return o_ref.transpose(1, 2)
-
-
-def compute_snr(x: torch.Tensor, y: torch.Tensor):
-    """Compute Signal-to-Noise Ratio. x is reference."""
-    x, y = x.float(), y.float()
-    signal_power = torch.norm(x).pow(2)
-    noise_power = torch.norm(x - y).pow(2)
-    return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
 
 
 def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out, use_fp8):
@@ -184,68 +176,73 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
 
 def benchmark_attention(output_csv=None, use_fp8=False):
     """Run attention benchmark."""
-    # Get GPU name
-    full_name = torch.cuda.get_device_name(0)
-    match = re.search(r"(MI\d+)", full_name)
-    gpu_name = match.group(1) if match else full_name.split()[-1]
+    platform, gpu_name = get_platform_info()
+
+    # Generate test cases from config
+    test_cases = gen_attention_test_cases()
 
     rows = []
     test_id = 0
-    total_tests = 2 * len(SEQLEN_LIST) * len(BATCH_LIST) * len(TEST_CASES)
+    total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
     print(f"Total tests: {total_tests}, FP8: {use_fp8}")
 
     for causal in [False, True]:
-        for num_head_q, num_head_kv, head_dim_qk, head_dim_v in TEST_CASES:
-            for seqlen in SEQLEN_LIST:
-                for batch in BATCH_LIST:
-                    test_id += 1
+        for case in test_cases:
+            num_head_q = case["num_head_q"]
+            num_head_kv = case["num_head_kv"]
+            head_dim_qk = case["head_dim_qk"]
+            head_dim_v = case["head_dim_v"]
+            seqlen = case["seqlen"]
+            for batch in BATCH_SIZE_LIST:
+                test_id += 1
 
-                    print(f"\n{'='*60}")
-                    print(
-                        f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
-                        f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
-                        f"causal={causal}, fp8={use_fp8}"
+                print(f"\n{'='*60}")
+                print(
+                    f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
+                    f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
+                    f"causal={causal}, fp8={use_fp8}"
+                )
+                print(f"{'='*60}")
+
+                row = {
+                    "TestID": test_id,
+                    "Platform": platform,
+                    "GPU": gpu_name,
+                    "Batch": batch,
+                    "SeqLen": seqlen,
+                    "num_head_q": num_head_q,
+                    "num_head_kv": num_head_kv,
+                    "head_dim_qk": head_dim_qk,
+                    "head_dim_v": head_dim_v,
+                    "Causal": causal,
+                }
+
+                try:
+                    fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
+                        batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
                     )
-                    print(f"{'='*60}")
+                    row.update(
+                        {
+                            "Check": "PASS" if correct else "FAIL",
+                            "Forward Time (ms)": f"{fwd_time:.2f}",
+                            "Forward TFLOPS": f"{fwd_tflops:.2f}",
+                            "Backward Time (ms)": f"{bwd_time:.2f}",
+                            "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                        }
+                    )
+                except Exception as e:
+                    print(f"Failed: {str(e)}")
+                    row.update(
+                        {
+                            "Check": "ERROR",
+                            "Forward Time (ms)": "ERROR",
+                            "Forward TFLOPS": "0.00",
+                            "Backward Time (ms)": "ERROR",
+                            "Backward TFLOPS": "0.00",
+                        }
+                    )
 
-                    row = {
-                        "TestID": test_id,
-                        "GPU": gpu_name,
-                        "Batch": batch,
-                        "SeqLen": seqlen,
-                        "num_head_q": num_head_q,
-                        "num_head_kv": num_head_kv,
-                        "head_dim_qk": head_dim_qk,
-                        "head_dim_v": head_dim_v,
-                        "Causal": causal,
-                    }
-
-                    try:
-                        fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
-                            batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
-                        )
-                        row.update(
-                            {
-                                "Check": "PASS" if correct else "FAIL",
-                                "Forward Time (ms)": f"{fwd_time:.2f}",
-                                "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                                "Backward Time (ms)": f"{bwd_time:.2f}",
-                                "Backward TFLOPS": f"{bwd_tflops:.2f}",
-                            }
-                        )
-                    except Exception as e:
-                        print(f"Failed: {str(e)}")
-                        row.update(
-                            {
-                                "Check": "ERROR",
-                                "Forward Time (ms)": "Failed",
-                                "Forward TFLOPS": "N/A",
-                                "Backward Time (ms)": "Failed",
-                                "Backward TFLOPS": "N/A",
-                            }
-                        )
-
-                    rows.append(row)
+                rows.append(row)
 
     # Create DataFrame
     results = pd.DataFrame(rows)
@@ -255,12 +252,10 @@ def benchmark_attention(output_csv=None, use_fp8=False):
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
     # Print average TFLOPS
-    valid_results = results[results["Forward TFLOPS"] != "N/A"]
-    if not valid_results.empty:
-        avg_fwd = valid_results["Forward TFLOPS"].astype(float).mean()
-        avg_bwd = valid_results["Backward TFLOPS"].astype(float).mean()
-        print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
-        print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
+    avg_fwd = results["Forward TFLOPS"].astype(float).mean()
+    avg_bwd = results["Backward TFLOPS"].astype(float).mean()
+    print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
+    print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
 
     # Save to CSV
     if output_csv:
