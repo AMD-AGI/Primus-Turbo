@@ -1,6 +1,6 @@
 #pragma once
-#include "configs.cuh"
-#include "util.hpp"
+#include "port.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
 #include <atomic>
 
 #ifndef DISABLE_AGGRESSIVE_ATOMIC
@@ -82,7 +82,6 @@ __device__ __forceinline__ void grid_sync(T *bar_ptr, int num_participants) {
     __syncthreads();
 }
 } // namespace amd
-#endif
 
 __forceinline__ __device__ int get_lane_id() {
     int lane_id;
@@ -560,23 +559,8 @@ __device__ __forceinline__ int atomic_add_release_global(int const *ptr, int val
     return ret;
 }
 
-__device__ __forceinline__ uint32_t elect_one_sync(int lane_id) {
-    uint32_t pred = 0;
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    return lane_id == 0;
-#else
-    asm volatile("{\n"
-                 ".reg .b32 %%rx;\n"
-                 ".reg .pred %%px;\n"
-                 "      elect.sync %%rx|%%px, %2;\n"
-                 "@%%px mov.s32 %1, 1;\n"
-                 "      mov.s32 %0, %%rx;\n"
-                 "}\n"
-                 : "+r"(lane_id), "+r"(pred)
-                 : "r"(WARP_MASK));
-#endif
-    return pred;
+__device__ __forceinline__ uint32_t elect_one_sync() {
+    return __lane_id() == 0;
 }
 
 __device__ __forceinline__ int ld_acquire_global(int const *ptr) {
@@ -768,6 +752,14 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
         }
     }
     __syncthreads();
+}
+
+template <typename dtype_t> __host__ __device__ constexpr dtype_t align_up(dtype_t a, dtype_t b) {
+    return ceil_div<dtype_t>(a, b) * b;
+}
+
+template <typename dtype_t> __host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
+    return a / b * b;
 }
 
 __forceinline__ __device__ void get_channel_task_range(int num_tokens, int num_sms, int sm_id,

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "configs.cuh"
-#include "exception.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
 
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(sms, threads, stream)                                                  \
@@ -23,16 +23,7 @@
     } while (0)
 #endif
 
-#ifndef SET_SHARED_MEMORY_FOR_TMA
-#ifndef DISABLE_SM90_FEATURES
-#define SET_SHARED_MEMORY_FOR_TMA(kernel)                                                          \
-    EP_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,       \
-                                        smem_size) == cudaSuccess);                                \
-    cfg.dynamicSmemBytes = smem_size;
-#else
 #define SET_SHARED_MEMORY_FOR_TMA(kernel) void()
-#endif
-#endif
 
 #define SWITCH_RANKS(case_macro)                                                                   \
     switch (num_ranks) {                                                                           \

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "configs.cuh"
-#include "exception.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
 
-namespace deep_ep {
+namespace primus_turbo::deep_ep {
 
 template <typename dtype_t> struct Buffer {
 private:
@@ -129,4 +129,4 @@ public:
     }
 };
 
-} // namespace deep_ep
+} // namespace primus_turbo::deep_ep

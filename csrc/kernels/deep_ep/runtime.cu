@@ -1,17 +1,17 @@
 #include <cstring>
 #include <vector>
 
-#include "configs.cuh"
-#include "exception.cuh"
 #include "launch.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
 #include "utils.cuh"
 
-#ifndef DISABLE_NVSHMEM
+#ifndef DISABLE_ROCSHMEM
 #include "ibgda_device.cuh"
 #include "nvshmem.h"
 #endif
 
-namespace deep_ep {
+namespace primus_turbo::deep_ep {
 
 namespace intranode {
 
@@ -33,7 +33,7 @@ void barrier(int **barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t st
 
 namespace internode {
 
-#ifndef DISABLE_NVSHMEM
+#ifndef DISABLE_ROCSHMEM
 nvshmem_team_t        cpu_rdma_team = NVSHMEM_TEAM_INVALID;
 nvshmem_team_config_t cpu_rdma_team_config;
 
@@ -91,4 +91,4 @@ void finalize() {
 
 } // namespace internode
 
-} // namespace deep_ep
+} // namespace primus_turbo::deep_ep

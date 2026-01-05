@@ -200,6 +200,8 @@ def build_kernels_extension():
     ]
     library_dirs = []
 
+    extra_flags["custom_map_list"] = PROJECT_ROOT / "tools" / "custom_hipify_mappings.json"
+
     if ROCSHMEM_LIBRARY is None:
         extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
         extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
@@ -213,6 +215,9 @@ def build_kernels_extension():
             or "--hip-link" in ROCSHMEM_LIBRARY.extra_link_args
         ):
             extra_flags["extra_compile_args"]["nvcc"] += ["-fgpu-rdc"]
+
+    extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_SM90_FEATURES")
+    extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_SM90_FEATURES")
 
     return HIPExtension(
         name="libprimus_turbo_kernels",

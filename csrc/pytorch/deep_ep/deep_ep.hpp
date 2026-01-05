@@ -1,26 +1,63 @@
-/*
- * Copyright (c) 2025 DeepSeek. All rights reserved.
- *
- * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
- *
- * See LICENSE for license information.
- */
-
 #pragma once
+
+// Forcibly disable NDEBUG
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+
 #include <tuple>
 #include <vector>
 
-#include "primus_turbo/deep_ep/config.hpp"
-#include "primus_turbo/deep_ep/configs.h"
-
 #include "event.hpp"
+#include "primus_turbo/deep_ep/config.hpp"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
+
+#ifndef TORCH_EXTENSION_NAME
+#define TORCH_EXTENSION_NAME deep_ep_cpp
+#endif
+
+namespace shared_memory {
+
+struct MemHandle {
+    cudaIpcMemHandle_t inner;
+    size_t             size;
+};
+
+constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
+
+class SharedMemoryAllocator {
+public:
+    SharedMemoryAllocator(bool use_fabric);
+    void malloc(void **ptr, size_t size);
+    void free(void *ptr);
+    void get_mem_handle(MemHandle *mem_handle, void *ptr);
+    void open_mem_handle(void **ptr, MemHandle *mem_handle);
+    void close_mem_handle(void *ptr);
+
+private:
+    bool use_fabric;
+};
+} // namespace shared_memory
+
 namespace primus_turbo::pytorch::deep_ep {
 
+using namespace primus_turbo::deep_ep;
+
+// using primus_turbo::deep_ep::Config;
+// using primus_turbo::deep_ep::get_low_latency_rdma_size_hint;
+// using primus_turbo::deep_ep::LowLatencyBuffer;
+// using primus_turbo::deep_ep::LowLatencyLayout;
+// using primus_turbo::deep_ep::ceil_div;
+// using primus_turbo::deep_ep::align_up;
+// using primus_turbo::deep_ep::align_down;
+// using primus_turbo::deep_ep::topk_idx_t;
 struct Buffer {
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
 private:
     // Low-latency mode buffer
@@ -36,15 +73,20 @@ private:
     int64_t num_rdma_bytes;
     void   *rdma_buffer_ptr = nullptr;
 
+    // Shrink mode buffer
+    bool enable_shrink   = false;
+    int *mask_buffer_ptr = nullptr;
+    int *sync_buffer_ptr = nullptr;
+
     // Device info and communication
-    int               device_id;
-    int               num_device_sms;
-    int               rank, rdma_rank, nvl_rank;
-    int               num_ranks, num_rdma_ranks, num_nvl_ranks;
-    hipIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+    int                      device_id;
+    int                      num_device_sms;
+    int                      rank, rdma_rank, nvl_rank;
+    int                      num_ranks, num_rdma_ranks, num_nvl_ranks;
+    shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    at::hip::HIPStreamMasqueradingAsCUDA comm_stream;
+    at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -73,11 +115,11 @@ private:
     volatile int *moe_recv_rdma_counter        = nullptr;
     int          *moe_recv_rdma_counter_mapped = nullptr;
 
-    bool use_default_stream_as_comm_stream = false;
+    shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
     Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
-           bool low_latency_mode, bool explicitly_destroy, bool use_default_stream_as_comm_stream);
+           bool low_latency_mode, bool explicitly_destroy, bool enable_shrink, bool use_fabric);
 
     ~Buffer() noexcept(false);
 
@@ -126,8 +168,7 @@ public:
                        int                                 cached_num_recv_tokens,
                        const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
                        const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
-                       int expert_alignment, int num_worst_tokens,
-                       const primus_turbo::deep_ep::Config &config,
+                       int expert_alignment, int num_worst_tokens, const Config &config,
                        std::optional<EventHandle> &previous_event, bool async,
                        bool allocate_on_comm_stream);
 
@@ -137,8 +178,7 @@ public:
                       const std::optional<torch::Tensor> &bias_1, const torch::Tensor &src_idx,
                       const torch::Tensor &rank_prefix_matrix,
                       const torch::Tensor &channel_prefix_matrix, const torch::Tensor &send_head,
-                      const primus_turbo::deep_ep::Config &config,
-                      std::optional<EventHandle> &previous_event, bool async,
+                      const Config &config, std::optional<EventHandle> &previous_event, bool async,
                       bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
@@ -158,8 +198,7 @@ public:
                        const std::optional<torch::Tensor> &cached_recv_rdma_rank_prefix_sum,
                        const std::optional<torch::Tensor> &cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor> &cached_recv_gbl_rank_prefix_sum,
-                       int expert_alignment, int num_worst_tokens,
-                       const primus_turbo::deep_ep::Config &config,
+                       int expert_alignment, int num_worst_tokens, const Config &config,
                        std::optional<EventHandle> &previous_event, bool async,
                        bool allocate_on_comm_stream);
 
@@ -169,11 +208,9 @@ public:
         const std::optional<torch::Tensor> &bias_0, const std::optional<torch::Tensor> &bias_1,
         const torch::Tensor &src_meta, const torch::Tensor &is_combined_token_in_rank,
         const torch::Tensor &rdma_channel_prefix_matrix, const torch::Tensor &rdma_rank_prefix_sum,
-        const torch::Tensor                &gbl_channel_prefix_matrix,
-        const std::optional<torch::Tensor> &gbl_rank_prefix_sum,
-        const torch::Tensor &combined_rdma_head, const torch::Tensor &combined_nvl_head,
-        const primus_turbo::deep_ep::Config &config, std::optional<EventHandle> &previous_event,
-        bool async, bool allocate_on_comm_stream);
+        const torch::Tensor &gbl_channel_prefix_matrix, const torch::Tensor &combined_rdma_head,
+        const torch::Tensor &combined_nvl_head, const Config &config,
+        std::optional<EventHandle> &previous_event, bool async, bool allocate_on_comm_stream);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden,
                                   int num_experts);
@@ -197,6 +234,12 @@ public:
 
     torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                                       int hidden, int num_experts) const;
+
+    void low_latency_update_mask_buffer(int rank_to_mask, bool mask);
+
+    void low_latency_query_mask_buffer(const torch::Tensor &mask_status);
+
+    void low_latency_clean_mask_buffer();
 };
 
 } // namespace primus_turbo::pytorch::deep_ep

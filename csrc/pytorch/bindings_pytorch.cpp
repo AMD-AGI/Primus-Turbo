@@ -107,25 +107,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ********* DeepEP *********
     auto deep_ep_module =
         m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");
-    pybind11::class_<primus_turbo::deep_ep::Config>(deep_ep_module, "Config")
-        .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = DEFAULT_NUM_CU,
-             py::arg("num_max_nvl_chunked_send_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
-             py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
-             py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
-             py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
-        .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
-        .def("get_rdma_buffer_size_hint",
-             &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);
-
-    deep_ep_module.def("get_low_latency_rdma_size_hint",
-                       &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
+    pybind11::class_<deep_ep::Config>(deep_ep_module, "Config")
+        .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = 32,
+             py::arg("num_max_nvl_chunked_send_tokens")  = 6,
+             py::arg("num_max_nvl_chunked_recv_tokens")  = 256,
+             py::arg("num_max_rdma_chunked_send_tokens") = 6,
+             py::arg("num_max_rdma_chunked_recv_tokens") = 256)
+        .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
+    deep_ep_module.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
     pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(deep_ep_module, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
@@ -145,9 +142,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
+        .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
+        .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
+        .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
         .def("get_next_low_latency_combine_buffer",
              &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
+    deep_ep_module.def("is_sm90_compiled", []() -> bool { return true; });
+    deep_ep_module.attr("topk_idx_t") = py::reinterpret_borrow<py::object>(
+        (PyObject *) torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
     // ********* Runtime *********
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);

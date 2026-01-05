@@ -1,8 +1,8 @@
-#include "configs.cuh"
-#include "exception.cuh"
 #include "launch.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
 
-namespace deep_ep {
+namespace primus_turbo::deep_ep {
 
 namespace layout {
 
@@ -136,4 +136,4 @@ void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
 
 } // namespace layout
 
-} // namespace deep_ep
+} // namespace primus_turbo::deep_ep

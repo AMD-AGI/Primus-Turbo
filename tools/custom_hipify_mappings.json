@@ -19,6 +19,7 @@
         "NVSHMEM_TEAM_INVALID": "rocshmem::ROCSHMEM_TEAM_INVALID",
         "nvshmemx_set_attr_uniqueid_args": "rocshmem::rocshmem_set_attr_uniqueid_args",
         "NVSHMEMX_INIT_WITH_UNIQUEID": "rocshmem::ROCSHMEM_INIT_WITH_UNIQUEID",
-        "EP_STATIC_ASSERT": "PRIMUS_TURBO_STATIC_CHECK"
+        "nv_bfloat162": "hip_bfloat162",
+        "nv_bfloat16" : "hip_bfloat16"
     }
 }

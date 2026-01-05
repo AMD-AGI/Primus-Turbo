@@ -4,7 +4,7 @@
 
 #include "configs.cuh"
 
-namespace deep_ep {
+namespace primus_turbo::deep_ep {
 
 // Intranode runtime
 namespace intranode {
@@ -164,4 +164,4 @@ void clean_mask_buffer(int *mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 } // namespace internode_ll
 
-} // namespace deep_ep
+} // namespace primus_turbo::deep_ep

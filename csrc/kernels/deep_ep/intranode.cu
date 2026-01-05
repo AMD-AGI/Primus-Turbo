@@ -1,10 +1,10 @@
 #include "buffer.cuh"
-#include "configs.cuh"
-#include "exception.cuh"
 #include "launch.cuh"
+#include "primus_turbo/deep_ep/configs.cuh"
+#include "primus_turbo/deep_ep/exception.cuh"
 #include "utils.cuh"
 
-namespace deep_ep {
+namespace primus_turbo::deep_ep {
 
 namespace intranode {
 
@@ -769,7 +769,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
+            sync_barrier<true>(send_rank_id, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
@@ -791,7 +791,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             warp_channel_head_idx[recv_warp_id][lane_id] = 0;
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
-        asm volatile("bar.sync 0, %0;" ::"r"(kNumThreads));
+        sync_barrier<true>(0, kNumThreads);
 
         if (thread_id < WARP_SIZE) {
             int *channel_head_idx_ptr =
@@ -900,9 +900,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 #endif
 
                 // Reduce data with pipeline
-                constexpr int kNumStages = 8;
-                EP_STATIC_ASSERT(kNumStages * WARP_SIZE * sizeof(int4) <= kNumTMABytesPerWarp,
-                                 "Invalid count");
 #pragma unroll
                 for (int i = lane_id; i < hidden_int4; i += WARP_SIZE) {
                     // Read bias
@@ -1008,7 +1005,7 @@ void combine(cudaDataType_t type, void *recv_x, float *recv_topk_weights, const 
              int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
              int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_send_tokens,
              int num_recv_buffer_tokens) {
-    constexpr int kNumThreads         = 768;
+    constexpr int kNumThreads         = 1024;
     constexpr int kNumTMABytesPerWarp = 4096;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / WARP_SIZE);
@@ -1041,4 +1038,4 @@ void combine(cudaDataType_t type, void *recv_x, float *recv_topk_weights, const 
 
 } // namespace intranode
 
-} // namespace deep_ep
+} // namespace primus_turbo::deep_ep
