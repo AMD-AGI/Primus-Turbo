@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Format,
+    MXScalingRecipe,
     ScalingGranularity,
     check_mxfp4_support,
 )
@@ -25,6 +26,9 @@ __all__ = ["gemm_fp4"]
 
 
 class FP4GemmMXFunction(torch.autograd.Function):
+    """
+    MXFP4 scaling recipe reference: https://arxiv.org/pdf/2509.25149
+    """
 
     @staticmethod
     def get_fp4_dtype(format: Format):
@@ -64,7 +68,11 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["a_fwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=False,
+            ),
         )
 
         b_fp4, b_scale_inv = quantize_fp4(
@@ -74,7 +82,11 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=config.scaling_recipe["b_fwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=False,
+            ),
         )
 
         # NT layout
@@ -118,38 +130,53 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=True,
+                use_rht=False,
+            ),
         )
 
-        grad_out_t = grad_out.T.contiguous()
         grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
-            grad_out_t,
+            grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["grad_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=True,
+                use_rht=True,
+            ),
         )
 
-        a_t = a.T.contiguous()
         a_t_fp4, a_t_scale_inv = quantize_fp4(
-            a_t,
+            a,
             ctx.a_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["a_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+            ),
         )
-        b_t = b.T.contiguous()
+
         b_t_fp4, b_t_scale_inv = quantize_fp4(
-            b_t,
+            b,
             ctx.b_fp4_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            axis=0,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=ctx.config.scaling_recipe["b_bwd"],
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+                use_sr=True,
+                use_rht=False,
+            ),
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
@@ -197,10 +224,10 @@ def gemm_fp4(
     to accelerate training and inference.
 
     Args:
-        a: Input matrix A with shape (M, K), must be 2D tensor
-        b: Input matrix B with shape (K, N) or (N, K), must be 2D tensor
-        trans_a: Whether to transpose matrix A
-        trans_b: Whether to transpose matrix B, if True B shape is (N, K)
+        a: Input matrix a with shape (M, K), must be 2D tensor. The A matrix should be activaton.
+        b: Input matrix b with shape (K, N) or (N, K), must be 2D tensor. The B matrix should be weight.
+        trans_a: Whether to transpose matrix a
+        trans_b: Whether to transpose matrix b, if True b shape is (N, K)
         out_dtype: Output data type, defaults to None (auto-inferred)
         config: FP4 quantization config
 

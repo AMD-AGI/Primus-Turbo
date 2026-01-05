@@ -11,6 +11,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, check_mxfp4_support
+from primus_turbo.pytorch.ops.hadamard_transform import get_rht_matrix
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
@@ -398,28 +399,56 @@ def quantize_mxfp4_impl(
 
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The A must be 2D tensor."
-    assert axis in (1,), "The axis must be 1."
+    assert axis in (
+        0,
+        1,
+    ), "The axis must be 0 or 1."
     assert (
         out_dtype == torch.float4_e2m1fn_x2
     ), f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
 
     scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
 
+    trans = axis == 0
+
     num_rows, row_length = x.size()
 
-    padded_num_rows, padded_row_length = num_rows, row_length
-    if padding_align_size is not None:
-        padded_row_length += padding_size(row_length, padding_align_size)
+    if not trans:
+        padded_num_rows, padded_row_length = num_rows, row_length
+        if padding_align_size is not None:
+            padded_row_length += padding_size(row_length, padding_align_size)
 
-    assert (
-        padded_row_length % block_size == 0
-    ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
-
-    scale_m, scale_n = padded_num_rows, padded_row_length // block_size
-    if scaling_recipe.use_2d_block:
         assert (
-            num_rows % block_size == 0
-        ), f"The first dimension of the A tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
+            padded_row_length % block_size == 0
+        ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
+
+        if scaling_recipe.use_2d_block:
+            assert (
+                num_rows % block_size == 0
+            ), f"The first dimension of the x tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
+
+        scale_m, scale_n = padded_num_rows, padded_row_length // block_size
+
+        y = torch.empty((padded_num_rows, padded_row_length // 2), dtype=torch.uint8, device=x.device)
+        scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
+    else:
+        padded_num_rows, padded_row_length = num_rows, row_length
+        if padding_align_size is not None:
+            padded_num_rows += padding_size(num_rows, padding_align_size)
+
+        assert (
+            padded_num_rows % block_size == 0
+        ), f"The first dimension of the x tensor must be divisible by the block size but got {padded_num_rows} % {block_size} != 0."
+
+        if scaling_recipe.use_2d_block:
+            assert (
+                padded_row_length % block_size == 0
+            ), f"The last dimension of the x tensor must be divisible by the block size when use 2D block but got {padded_row_length} % {block_size} != 0."
+
+        scale_m, scale_n = padded_num_rows // block_size, padded_row_length
+
+        y = torch.empty((padded_row_length, padded_num_rows // 2), dtype=torch.uint8, device=x.device)
+        scale_inv = torch.empty(scale_n, scale_m, dtype=torch.uint8, device=x.device)
 
     philox_seed, philox_offset = scaling_recipe.philox_seed, scaling_recipe.philox_offset
     if scaling_recipe.use_sr:
@@ -428,9 +457,8 @@ def quantize_mxfp4_impl(
         if philox_offset is None:
             philox_offset = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
 
-    # NOTE: y is packed in last dimension
-    y = torch.empty((padded_num_rows, padded_row_length // 2), dtype=torch.uint8, device=x.device)
-    scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
+    if scaling_recipe.use_rht:
+        hadamard_matrix = get_rht_matrix(x.dtype, x.device)
 
     BLOCK_X = 64
     BLOCK_Y = 64
@@ -454,14 +482,18 @@ def quantize_mxfp4_impl(
         scale_inv.stride(1),
         scale_m,
         scale_n,
+        hadamard_matrix if scaling_recipe.use_rht else None,
+        hadamard_matrix.size(0) if scaling_recipe.use_rht else 0,
         philox_seed,
         philox_offset,
-        BLOCK_X,
-        BLOCK_Y,
-        GROUP_Y,
-        scaling_recipe.use_2d_block,
-        scaling_recipe.use_sr,
-        block_size,
+        BLOCK_X=BLOCK_X,
+        BLOCK_Y=BLOCK_Y,
+        GROUP_Y=GROUP_Y,
+        TRANS=trans,
+        USE_2D_BLOCK=scaling_recipe.use_2d_block,
+        USE_SR=scaling_recipe.use_sr,
+        USE_RHT=scaling_recipe.use_rht,
+        MXFP4_BLOCK_SIZE=block_size,
     )
 
     y = y.view(torch.float4_e2m1fn_x2)
@@ -481,16 +513,21 @@ def dequantize_mxfp4_impl(
     assert x.dim() == 2, "The x must be 2D tensor."
     assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
-    assert axis in (1,), "The axis must be 1."
+    assert axis in (
+        0,
+        1,
+    ), "The axis must be 0 or 1."
     assert x.dtype == torch.float4_e2m1fn_x2, f"The x dtype must be torch.float4_e2m1fn_x2 but got {x.dtype}."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
     assert (
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
+    trans = axis == 0
+
+    num_rows, row_length = x.size()
     # NOTE: x is packed in last dimension
-    num_rows, packed_row_length = x.size()
-    row_length = packed_row_length * 2
+    row_length = row_length * 2
     assert (
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."
@@ -499,7 +536,10 @@ def dequantize_mxfp4_impl(
     scale_inv = scale_inv.view(torch.uint8)
 
     scale_m, scale_n = scale_inv.size()
-    y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
+    if not trans:
+        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
+    else:
+        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
 
     BLOCK_X = 64
     BLOCK_Y = 64
@@ -519,10 +559,11 @@ def dequantize_mxfp4_impl(
         scale_inv.stride(1),
         scale_m,
         scale_n,
-        BLOCK_X,
-        BLOCK_Y,
-        GROUP_Y,
-        block_size,
+        BLOCK_X=BLOCK_X,
+        BLOCK_Y=BLOCK_Y,
+        GROUP_Y=GROUP_Y,
+        TRANS=trans,
+        MXFP4_BLOCK_SIZE=block_size,
     )
 
     return y
