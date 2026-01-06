@@ -9,3 +9,4 @@ expecttest
 pytest
 pytest-xdist
 setuptools==69.5.1
+scipy
