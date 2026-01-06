@@ -30,7 +30,7 @@ ATTN_BACKENDS = [
 
 
 def attention_torch(q, k, v, sm_scale, causal, enable_gqa):
-    with sdpa_kernel(ATTN_BACKENDS):
+    with sdpa_kernel(ATTN_BACKENDS, set_priority=True):
         out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=causal, scale=sm_scale, enable_gqa=enable_gqa
         )
