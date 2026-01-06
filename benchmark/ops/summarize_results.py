@@ -135,12 +135,8 @@ def get_avg_tflops(data_dir, csv_filename, expected_gpu=None, expected_platform=
     return fwd_tflops if not pd.isna(fwd_tflops) else 0, bwd_tflops if not pd.isna(bwd_tflops) else 0
 
 
-def parse_gpus(gpu_str):
-    return [g.strip() for g in gpu_str.strip().split("+")]
-
-
-def generate_summary_table(data_dir, date_str, gpu_str, output_file=None):
-    gpus_to_process = parse_gpus(gpu_str)
+def generate_summary_table(data_dir, date_str, gpus, output_file=None):
+    gpus_to_process = gpus if isinstance(gpus, list) else [gpus]
 
     summary_data = []
     idx = 1
@@ -187,13 +183,13 @@ def generate_summary_table(data_dir, date_str, gpu_str, output_file=None):
                 idx += 1
 
     if not summary_data:
-        print(f"\nWarning: No benchmark data found for GPU: {gpu_str}")
+        print(f"\nWarning: No benchmark data found for GPU: {', '.join(gpus_to_process)}")
         return pd.DataFrame()
 
     summary_df = pd.DataFrame(summary_data)
 
     print(f"\n{'='*80}")
-    print(f"  Summary Table - GPU: {gpu_str}")
+    print(f"  Summary Table - GPU: {', '.join(gpus_to_process)}")
     print(f"{'='*80}\n")
     print(tabulate(summary_df, headers="keys", tablefmt="grid", showindex=False))
 
@@ -212,9 +208,9 @@ def parse_args():
     parser.add_argument(
         "--gpu",
         type=str,
-        default="MI325+H200",
-        choices=["MI325", "MI325+H200"],
-        help="GPU(s) to summarize (default: MI325+H200)",
+        nargs="+",
+        default=["MI325", "H200"],
+        help="GPU(s) to summarize (default: MI325 H200)",
     )
     parser.add_argument(
         "--date", type=str, default=None, help="Date string for the summary table (default: today)"
