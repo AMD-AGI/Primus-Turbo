@@ -184,6 +184,64 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+@pytest.mark.parametrize("use_2d_block", [True, False])
+def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    MX_BLOCK_SIZE = 32
+    torch.manual_seed(42)
+
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+    x.detach().clone()
+
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+
+    scaling_recipe = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+        with_trans=True,
+    )
+
+    x_fp8_rowwise, x_scale_inv_rowwise, x_fp8_colwise, x_scale_inv_colwise = quantize_fp8(
+        x_2d,
+        dest_dtype,
+        granularity=granularity,
+        axis=0,
+        block_size=MX_BLOCK_SIZE,
+        scaling_recipe=scaling_recipe,
+    )
+
+    # check quantize and dequantize precision
+    out_rowwise = dequantize_fp8(
+        x_fp8_rowwise,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=1,
+        scale_inv=x_scale_inv_rowwise,
+        scaling_recipe=scaling_recipe,
+    )
+    out_colwise = dequantize_fp8(
+        x_fp8_colwise,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=0,
+        scale_inv=x_scale_inv_colwise,
+        scaling_recipe=scaling_recipe,
+    )
+
+    torch.testing.assert_close(x_2d, out_rowwise, **get_tolerances(dest_dtype))
+    torch.testing.assert_close(x_2d, out_colwise, **get_tolerances(dest_dtype))
+
+    if use_2d_block:
+        torch.testing.assert_close(out_rowwise, out_colwise, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "dest_dtype",
     [

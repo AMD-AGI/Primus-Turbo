@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -244,21 +244,32 @@ def quantize_mxfp8_impl(
     block_size: int,
     padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The x must be 2D tensor."
-    assert axis in (0, 1), "The axis must be 0 or 1."
+    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
+
+    if not scaling_recipe.with_trans:
+        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
 
     num_rows, row_length = x.size()
 
-    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
+    use_rowwise = axis == 1
+    use_colwise = axis == 0
+    if scaling_recipe.with_trans:
+        use_rowwise, use_colwise = True, True
 
-    trans = axis == 0
+    y_rowwise, y_colwise = None, None
+    scale_inv_rowwise, scale_inv_colwise = None, None
 
-    if not trans:
+    num_rows_padding_size, row_length_padding_size = 0, 0
+    if padding_align_size is not None:
+        num_rows_padding_size = padding_size(num_rows, padding_align_size)
+        row_length_padding_size = padding_size(row_length, padding_align_size)
+
+    if use_rowwise:
         padded_num_rows, padded_row_length = num_rows, row_length
-        if padding_align_size is not None:
-            padded_row_length += padding_size(row_length, padding_align_size)
+        padded_row_length += row_length_padding_size
 
         assert (
             padded_row_length % block_size == 0
@@ -269,14 +280,57 @@ def quantize_mxfp8_impl(
                 num_rows % block_size == 0
             ), f"The first dimension of the x tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
 
-        scale_m, scale_n = padded_num_rows, padded_row_length // block_size
+        scale_inv_rowwise_n_rows, scale_inv_rowwise_n_cols = padded_num_rows, padded_row_length // block_size
 
-        y = torch.empty((padded_num_rows, padded_row_length), dtype=out_dtype, device=x.device)
-        scale_inv = torch.empty(scale_m, scale_n, dtype=torch.uint8, device=x.device)
-    else:
+        y_rowwise = torch.empty((padded_num_rows, padded_row_length), dtype=out_dtype, device=x.device)
+        scale_inv_rowwise = torch.empty(
+            scale_inv_rowwise_n_rows, scale_inv_rowwise_n_cols, dtype=torch.uint8, device=x.device
+        )
+
+        if row_length_padding_size > 0 or num_rows_padding_size > 0:
+            BLOCK_X = 64
+            BLOCK_Y = 64
+            GROUP_Y = block_size
+            grid = lambda META: (
+                triton.cdiv(padded_num_rows, META["BLOCK_Y"])
+                * triton.cdiv(padded_row_length, META["BLOCK_X"]),
+            )
+            quantize_mxfp8_kernel[grid](
+                x,
+                y_rowwise,
+                None,
+                x.stride(0),
+                x.stride(1),
+                y_rowwise.stride(0),
+                y_rowwise.stride(1),
+                None,
+                None,
+                num_rows,
+                row_length,
+                padded_num_rows,
+                padded_row_length,
+                scale_inv_rowwise,
+                scale_inv_colwise,
+                scale_inv_rowwise.stride(0),
+                scale_inv_rowwise.stride(1),
+                None,
+                None,
+                scale_inv_rowwise_n_rows,
+                scale_inv_rowwise_n_cols,
+                None,
+                None,
+                BLOCK_X=BLOCK_X,
+                BLOCK_Y=BLOCK_Y,
+                GROUP_Y=GROUP_Y,
+                USE_ROWWISE=use_rowwise,
+                USE_COLWISE=False,
+                USE_2D_BLOCK=scaling_recipe.use_2d_block,
+                MXFP8_BLOCK_SIZE=block_size,
+            )
+
+    if use_colwise:
         padded_num_rows, padded_row_length = num_rows, row_length
-        if padding_align_size is not None:
-            padded_num_rows += padding_size(num_rows, padding_align_size)
+        padded_num_rows += num_rows_padding_size
 
         assert (
             padded_num_rows % block_size == 0
@@ -287,45 +341,101 @@ def quantize_mxfp8_impl(
                 padded_row_length % block_size == 0
             ), f"The last dimension of the x tensor must be divisible by the block size when use 2D block but got {padded_row_length} % {block_size} != 0."
 
-        scale_m, scale_n = padded_num_rows // block_size, padded_row_length
+        scale_inv_colwise_n_rows, scale_inv_colwise_n_cols = padded_num_rows // block_size, padded_row_length
 
-        y = torch.empty((padded_row_length, padded_num_rows), dtype=out_dtype, device=x.device)
-        scale_inv = torch.empty(scale_n, scale_m, dtype=torch.uint8, device=x.device)
+        y_colwise = torch.empty((padded_row_length, padded_num_rows), dtype=out_dtype, device=x.device)
+        scale_inv_colwise = torch.empty(
+            scale_inv_colwise_n_cols, scale_inv_colwise_n_rows, dtype=torch.uint8, device=x.device
+        )
 
-    scale_stride_M, scale_stride_N = scale_inv.stride(0), scale_inv.stride(1)
+        if num_rows_padding_size > 0 or row_length_padding_size > 0:
+            BLOCK_X = 64
+            BLOCK_Y = 64
+            GROUP_Y = block_size
+            grid = lambda META: (
+                triton.cdiv(padded_num_rows, META["BLOCK_Y"])
+                * triton.cdiv(padded_row_length, META["BLOCK_X"]),
+            )
+            quantize_mxfp8_kernel[grid](
+                x,
+                None,
+                y_colwise,
+                x.stride(0),
+                x.stride(1),
+                None,
+                None,
+                y_colwise.stride(0),
+                y_colwise.stride(1),
+                num_rows,
+                row_length,
+                padded_num_rows,
+                padded_row_length,
+                scale_inv_rowwise,
+                scale_inv_colwise,
+                None,
+                None,
+                scale_inv_colwise.stride(0),
+                scale_inv_colwise.stride(1),
+                None,
+                None,
+                scale_inv_colwise_n_rows,
+                scale_inv_colwise_n_cols,
+                BLOCK_X=BLOCK_X,
+                BLOCK_Y=BLOCK_Y,
+                GROUP_Y=GROUP_Y,
+                USE_ROWWISE=False,
+                USE_COLWISE=use_colwise,
+                USE_2D_BLOCK=scaling_recipe.use_2d_block,
+                MXFP8_BLOCK_SIZE=block_size,
+            )
 
-    BLOCK_X = 64
-    BLOCK_Y = 64
-    GROUP_Y = block_size
-    grid = lambda META: (
-        triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
-    )
-    quantize_mxfp8_kernel[grid](
-        x,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        num_rows,
-        row_length,
-        padded_num_rows,
-        padded_row_length,
-        scale_inv,
-        scale_stride_M,
-        scale_stride_N,
-        scale_m,
-        scale_n,
-        BLOCK_X,
-        BLOCK_Y,
-        GROUP_Y,
-        trans,
-        scaling_recipe.use_2d_block,
-        block_size,
-    )
-    scale_inv = scale_inv.view(dtype=torch.float8_e8m0fnu)
+    if num_rows_padding_size == 0 and row_length_padding_size == 0:
+        BLOCK_X = 64
+        BLOCK_Y = 64
+        GROUP_Y = block_size
+        grid = lambda META: (
+            triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),
+        )
+        quantize_mxfp8_kernel[grid](
+            x,
+            y_rowwise,
+            y_colwise,
+            x.stride(0),
+            x.stride(1),
+            y_rowwise.stride(0) if y_rowwise is not None else None,
+            y_rowwise.stride(1) if y_rowwise is not None else None,
+            y_colwise.stride(0) if y_colwise is not None else None,
+            y_colwise.stride(1) if y_colwise is not None else None,
+            num_rows,
+            row_length,
+            num_rows,
+            row_length,
+            scale_inv_rowwise,
+            scale_inv_colwise,
+            scale_inv_rowwise.stride(0) if scale_inv_rowwise is not None else None,
+            scale_inv_rowwise.stride(1) if scale_inv_rowwise is not None else None,
+            scale_inv_colwise.stride(0) if scale_inv_colwise is not None else None,
+            scale_inv_colwise.stride(1) if scale_inv_colwise is not None else None,
+            scale_inv_rowwise_n_rows if scale_inv_rowwise is not None else None,
+            scale_inv_rowwise_n_cols if scale_inv_rowwise is not None else None,
+            scale_inv_colwise_n_rows if scale_inv_colwise is not None else None,
+            scale_inv_colwise_n_cols if scale_inv_colwise is not None else None,
+            BLOCK_X=BLOCK_X,
+            BLOCK_Y=BLOCK_Y,
+            GROUP_Y=GROUP_Y,
+            USE_ROWWISE=use_rowwise,
+            USE_COLWISE=use_colwise,
+            USE_2D_BLOCK=scaling_recipe.use_2d_block,
+            MXFP8_BLOCK_SIZE=block_size,
+        )
 
-    return y, scale_inv
+    return_list = []
+    if use_rowwise:
+        return_list += [y_rowwise, scale_inv_rowwise.view(dtype=torch.float8_e8m0fnu)]
+    if use_colwise:
+        return_list += [y_colwise, scale_inv_colwise.view(dtype=torch.float8_e8m0fnu)]
+
+    return tuple(return_list)
 
 
 def dequantize_mxfp8_impl(
@@ -341,7 +451,7 @@ def dequantize_mxfp8_impl(
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    trans = axis == 0
+    use_rowwise = axis == 1
 
     num_rows, row_length = x.size()
     assert (
@@ -352,7 +462,7 @@ def dequantize_mxfp8_impl(
     scale_inv = scale_inv.view(torch.uint8)
 
     scale_m, scale_n = scale_inv.size()
-    if not trans:
+    if use_rowwise:
         y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
     else:
         y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
@@ -375,11 +485,11 @@ def dequantize_mxfp8_impl(
         scale_inv.stride(1),
         scale_m,
         scale_n,
-        BLOCK_X,
-        BLOCK_Y,
-        GROUP_Y,
-        trans,
-        block_size,
+        BLOCK_X=BLOCK_X,
+        BLOCK_Y=BLOCK_Y,
+        GROUP_Y=GROUP_Y,
+        USE_ROWWISE=use_rowwise,
+        MXFP8_BLOCK_SIZE=block_size,
     )
 
     return y

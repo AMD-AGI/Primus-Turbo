@@ -25,6 +25,7 @@ from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
+    Float4QuantConfig,
     Float8QuantConfig,
     Format,
     ScaleDtype,
@@ -39,8 +40,14 @@ GRANULARITY_CONFIG_MAP = {
         granularity=ScalingGranularity.BLOCKWISE,
         block_size=128,
     ),
-    "mx": Float8QuantConfig(
+    "mxfp8": Float8QuantConfig(
         format=Format.E4M3,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    ),
+    "mxfp4": Float4QuantConfig(
+        format=Format.E2M1_X2,
         granularity=ScalingGranularity.MX_BLOCKWISE,
         block_size=32,
         scale_dtype=ScaleDtype.E8M0,
@@ -71,10 +78,8 @@ def check_gemm_correctness(a, b, out, grad_out, trans_b, dtype):
     return correct
 
 
-def check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, fp8_format):
-    """Check correctness of FP8 GEMM forward and backward using SNR."""
-    snr_threshold = 25 if fp8_format == Format.E4M3 else 20
-
+def check_gemm_correctness_by_snr(a, b, out, grad_out, trans_b, snr_threshold):
+    """Check correctness of GEMM forward and backward using SNR."""
     out_ref = gemm_ref(a.detach(), b.detach(), trans_b=trans_b)
     out_snr = compute_snr(out_ref, out.detach())
 
@@ -146,9 +151,50 @@ def profile_gemm_fp8(M, N, K, dtype, config, trans_b):
 
     out = turbo.ops.gemm_fp8(a, b, trans_b=trans_b, config=config)
     grad_out = torch.randn_like(out)
-    correct = check_gemm_fp8_correctness(a, b, out, grad_out, trans_b, config.format)
+    fp8_snr_threshold = 25 if config.format == Format.E4M3 else 20
+    correct = check_gemm_correctness_by_snr(a, b, out, grad_out, trans_b, fp8_snr_threshold)
 
     fwd_func = lambda: turbo.ops.gemm_fp8(a, b, trans_b=trans_b, config=config)
+    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
+    out = fwd_func()
+    bwd_func()
+
+    fwd_total_flops = 2 * M * N * K
+    bwd_total_flops = 2 * fwd_total_flops
+
+    for _ in range(20):
+        fwd_func()
+        bwd_func()
+    torch.cuda.synchronize()
+
+    fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
+    bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
+    fwd_measurement = fwd_timer.timeit(100)
+    bwd_measurement = bwd_timer.timeit(100)
+
+    fwd_mean_time_ms = fwd_measurement.mean * 1e3
+    bwd_mean_time_ms = bwd_measurement.mean * 1e3
+    fwd_tflops = fwd_total_flops / (fwd_mean_time_ms * 1e-3) / 1e12
+    bwd_tflops = bwd_total_flops / (bwd_mean_time_ms * 1e-3) / 1e12
+    print(f"Forward  Mean time: {fwd_mean_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+    print(f"Backward Mean time: {bwd_mean_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
+
+    return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
+
+
+def profile_gemm_fp4(M, N, K, dtype, config, trans_b):
+    """Profile FP4 GEMM."""
+    device = "cuda"
+    b_shape = (N, K) if trans_b else (K, N)
+    a = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+
+    out = turbo.ops.gemm_fp4(a, b, trans_b=trans_b, config=config)
+    grad_out = torch.randn_like(out)
+    fp4_snr_threshold = 10
+    correct = check_gemm_correctness_by_snr(a, b, out, grad_out, trans_b, fp4_snr_threshold)
+
+    fwd_func = lambda: turbo.ops.gemm_fp4(a, b, trans_b=trans_b, config=config)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -180,7 +226,19 @@ def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", outpu
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
-    config = GRANULARITY_CONFIG_MAP[granularity_name] if is_fp8 else None
+    is_fp4 = dtype_name == "fp4"
+
+    if is_fp8:
+        assert granularity_name in [
+            "tensorwise",
+            "rowwise",
+            "blockwise",
+            "mxfp8",
+        ], "FP8 only supports granularity: tensorwise, rowwise, blockwise or mxfp8"
+    if is_fp4:
+        assert granularity_name in ["mxfp4"], "FP4 only supports granularity: mxfp4"
+
+    config = GRANULARITY_CONFIG_MAP[granularity_name] if is_fp8 or is_fp4 else None
 
     rows = []
     test_id = 0
@@ -202,6 +260,11 @@ def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", outpu
                         f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
                         f"M: {M}, N: {N}, K: {K}, dtype: fp8, granularity: {granularity_name}"
                     )
+                elif is_fp4:
+                    print(
+                        f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
+                        f"M: {M}, N: {N}, K: {K}, dtype: fp4, granularity: {granularity_name}"
+                    )
                 else:
                     print(
                         f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
@@ -212,6 +275,10 @@ def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", outpu
                 try:
                     if is_fp8:
                         fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp8(
+                            M, N, K, dtype, config, trans_b
+                        )
+                    elif is_fp4:
+                        fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_gemm_fp4(
                             M, N, K, dtype, config, trans_b
                         )
                     else:
@@ -295,16 +362,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["bf16", "fp8"],
+        choices=["bf16", "fp8", "fp4"],
         default="bf16",
-        help="Data type: bf16 or fp8 (default: bf16)",
+        help="Data type: bf16, fp8 or fp4 (default: bf16)",
     )
     parser.add_argument(
         "--granularity",
         type=str,
-        choices=["tensorwise", "rowwise", "blockwise", "mx"],
+        choices=["tensorwise", "rowwise", "blockwise", "mxfp8", "mxfp4"],
         default="tensorwise",
-        help="FP8 scaling granularity (only used when dtype=fp8, default: tensorwise)",
+        help="FP8 scaling granularity (only used when dtype=fp8 or fp4, default: tensorwise)",
     )
     parser.add_argument(
         "--output",

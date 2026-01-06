@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -35,7 +35,7 @@ def quantize_fp8(
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     FP8 Quantize
 
@@ -48,6 +48,7 @@ def quantize_fp8(
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
+            5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when scaling_recipe.with_trans is True.
     """
     if granularity == ScalingGranularity.TENSORWISE:
         return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
