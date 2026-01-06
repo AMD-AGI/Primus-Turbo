@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    MXScalingRecipe,
     ScalingGranularity,
     check_mxfp8_support,
     float8_e4m3,
@@ -376,6 +377,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=config.block_size,
             axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+            ),
         )
 
         # NT layout
@@ -443,6 +447,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             axis=0,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+            ),
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
