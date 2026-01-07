@@ -38,8 +38,11 @@ jobs:
       - name: Create benchmark output directory
         run: |
           BENCHMARK_DATE=$(date +%Y%m%d)
-          BENCHMARK_OUTPUT_DIR="${BENCHMARK_ROOT_DIR}/${BENCHMARK_DATE}/${GPU_NAME}"
+          BENCHMARK_DATE_DIR="${BENCHMARK_ROOT_DIR}/${BENCHMARK_DATE}"
+          BENCHMARK_OUTPUT_DIR="${BENCHMARK_DATE_DIR}/${GPU_NAME}"
           mkdir -p "${BENCHMARK_OUTPUT_DIR}"
+          mkdir -p "${BENCHMARK_DATE_DIR}/H200"
+          echo "BENCHMARK_DATE_DIR=${BENCHMARK_DATE_DIR}" >> $GITHUB_ENV
           echo "BENCHMARK_OUTPUT_DIR=${BENCHMARK_OUTPUT_DIR}" >> $GITHUB_ENV
       - name: "[1.1] Run Attention Benchmark (PyTorch Baseline)"
         timeout-minutes: 60
@@ -159,7 +162,16 @@ jobs:
         timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_turbo.py --dtype fp8 --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_blockwise_ck_benchmark.csv"
+      - name: "Copy H200 benchmark data"
+        run: |
+          H200_LATEST_DIR="${BENCHMARK_ROOT_DIR}/H200/latest"
+          H200_OUTPUT_DIR="${BENCHMARK_DATE_DIR}/H200"
+          if [ -d "${H200_LATEST_DIR}" ]; then
+            cp -v ${H200_LATEST_DIR}/*.csv "${H200_OUTPUT_DIR}/" || true
+          else
+            echo "Warning: H200 latest directory not found: ${H200_LATEST_DIR}"
+          fi
       - name: "Generate Summary Report"
         run: |
           BENCHMARK_DATE=$(date +%Y-%m-%d)
-          python3 benchmark/ops/summarize_results.py --data-dir "${BENCHMARK_OUTPUT_DIR}" --date "${BENCHMARK_DATE}" -o "${BENCHMARK_OUTPUT_DIR}/summary.csv"
+          python3 benchmark/ops/summarize_results.py --data-dir "${BENCHMARK_DATE_DIR}" --gpu MI325 H200 --date "${BENCHMARK_DATE}" -o "${BENCHMARK_DATE_DIR}/summary_mi325.csv"
