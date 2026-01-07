@@ -44,7 +44,8 @@ def quantize_mxfp8_kernel(
     GROUP_Y: tl.constexpr,
     USE_ROWWISE: tl.constexpr,
     USE_COLWISE: tl.constexpr,
-    USE_2D_BLOCK: tl.constexpr,
+    ROWWISE_USE_2D_BLOCK: tl.constexpr,
+    COLWISE_USE_2D_BLOCK: tl.constexpr,
     MXFP8_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -80,7 +81,7 @@ def quantize_mxfp8_kernel(
                 tl.device_assert(scale_inv_rowwise_ptr is not None)
                 tl.device_assert(y_rowwise_ptr is not None)
 
-                if USE_2D_BLOCK:
+                if ROWWISE_USE_2D_BLOCK:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
                 else:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
@@ -118,7 +119,7 @@ def quantize_mxfp8_kernel(
                 tl.device_assert(scale_inv_colwise_ptr is not None)
                 tl.device_assert(y_colwise_ptr is not None)
 
-                if USE_2D_BLOCK:
+                if COLWISE_USE_2D_BLOCK:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
                 else:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)

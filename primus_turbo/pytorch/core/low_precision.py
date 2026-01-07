@@ -141,7 +141,6 @@ class MXScalingRecipe:
     - philox_seed: The philox generator's seed for the stochastic rounding. Available in MXFP4.
     - philox_offset: The philox generator's offset for the stochastic rounding. Available in MXFP4.
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
-    - with_trans: Whether to output additional transposed tensor. Available in MXFP8 and MXFP4.
     """
 
     use_2d_block: bool = False
@@ -149,7 +148,6 @@ class MXScalingRecipe:
     philox_seed: Optional[int] = None
     philox_offset: Optional[int] = None
     use_rht: bool = False
-    with_trans: bool = False
 
 
 @dataclass

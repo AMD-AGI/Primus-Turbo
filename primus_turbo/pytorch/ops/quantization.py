@@ -34,7 +34,9 @@ def quantize_fp8(
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
+    with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     FP8 Quantize
@@ -45,22 +47,40 @@ def quantize_fp8(
 
         For MXFP8 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the scaling_recipe.with_trans must be True.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
             3. The block size must be 32.
             4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
-            5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when scaling_recipe.with_trans is True.
+            5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.TENSORWISE:
+        assert with_trans is False, "The with_trans must be False for tensorwise FP8 quantization"
+        assert (
+            scaling_recipe_for_trans is None
+        ), "The scaling_recipe_for_trans must be None for tensorwise FP8 quantization"
+
         return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
     elif granularity == ScalingGranularity.ROWWISE:
         assert axis is not None, "The axis must be specified for rowwise FP8 quantization"
+        assert with_trans is False, "The with_trans must be False for rowwise FP8 quantization"
+        assert (
+            scaling_recipe_for_trans is None
+        ), "The scaling_recipe_for_trans must be None for tensorwise FP8 quantization"
 
         return quantize_fp8_rowwise_impl(x, out_dtype, axis, scale)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
         assert scale is None, "The scale is not supported for MXFP8 quantization"
 
-        return quantize_mxfp8_impl(x, out_dtype, axis, block_size, padding_align_size, scaling_recipe)
+        return quantize_mxfp8_impl(
+            x,
+            out_dtype,
+            axis,
+            block_size,
+            padding_align_size,
+            with_trans,
+            scaling_recipe,
+            scaling_recipe_for_trans,
+        )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -111,24 +131,35 @@ def quantize_fp4(
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
+    with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     FP4 Quantize
 
     NOTE:
         For MXFP4 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
             3. The block size must be 32.
             4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
-            5. The scaling recipe is used to control the quantization behavior.
+            5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert scale is None, "The scale is not supported for MXFP4 quantization"
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
 
-        return quantize_mxfp4_impl(x, out_dtype, axis, block_size, padding_align_size, scaling_recipe)
+        return quantize_mxfp4_impl(
+            x,
+            out_dtype,
+            axis,
+            block_size,
+            padding_align_size,
+            with_trans,
+            scaling_recipe,
+            scaling_recipe_for_trans,
+        )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -151,7 +182,6 @@ def dequantize_fp4(
             1. The x must be 2D tensor.
             2. The axis means direction of de-quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
-            4. The scaling recipe is used to control the de-quantization behavior.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
