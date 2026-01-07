@@ -251,9 +251,10 @@ def quantize_mxfp8_impl(
     assert x.dim() == 2, "The x must be 2D tensor."
 
     scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
-    scaling_recipe_for_trans = (
-        MXScalingRecipe() if with_trans and scaling_recipe_for_trans is None else scaling_recipe_for_trans
-    )
+    if with_trans:
+        scaling_recipe_for_trans = MXScalingRecipe()
+    else:
+        scaling_recipe_for_trans = scaling_recipe
 
     if not with_trans:
         assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
@@ -521,9 +522,10 @@ def quantize_mxfp4_impl(
     assert mxfp4_support, reason
 
     scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
-    scaling_recipe_for_trans = (
-        MXScalingRecipe() if with_trans and scaling_recipe_for_trans is None else scaling_recipe_for_trans
-    )
+    if with_trans:
+        scaling_recipe_for_trans = MXScalingRecipe()
+    else:
+        scaling_recipe_for_trans = scaling_recipe
 
     if not with_trans:
         assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
