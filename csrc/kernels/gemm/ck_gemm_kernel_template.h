@@ -96,12 +96,11 @@ public:
                            ck_tile::GemmPipelineAgBgCrCompV3<QuantGemmProblem>,
                            ck_tile::ABQuantGemmPipelineAgBgCrCompV3<QuantGemmProblem>>;
 
-    static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<ck_tile::CShuffleEpilogueProblem<
         ADataType, BDataType, ck_tile::tuple<>, AccDataType, CDataType, ck_tile::tuple<>, CLayout,
         ck_tile::element_wise::PassThrough, TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
         TileConfig::M_Warp, TileConfig::N_Warp, TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile,
-        TileConfig::K_Warp_Tile, false, MemoryOp>>;
+        TileConfig::K_Warp_Tile, false>>;
 
     using Kernel = ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
 

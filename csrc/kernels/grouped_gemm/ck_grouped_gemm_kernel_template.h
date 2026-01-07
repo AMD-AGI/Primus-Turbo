@@ -110,7 +110,6 @@ public:
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<UniversalGemmProblem>;
     // using UniversalGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3;
 
-    static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<
             ADataType, BDataType, ck_tile::tuple<>, AccDataType,
@@ -119,8 +118,7 @@ public:
             TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
             TileConfig::M_Warp, TileConfig::N_Warp,
             TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile, TileConfig::K_Warp_Tile,
-            UniversalGemmProblem::TransposeC,
-            MemoryOp
+            UniversalGemmProblem::TransposeC
         >
     >;
 
@@ -237,7 +235,6 @@ public:
         ck_tile::ABQuantGemmPipelineAgBgCrCompV3<QuantGemmProblem>
     >;
 
-    static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<
             ADataType,
@@ -251,8 +248,7 @@ public:
             TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
             TileConfig::M_Warp, TileConfig::N_Warp,
             TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile, TileConfig::K_Warp_Tile,
-            QuantGemmProblem::TransposeC,
-            MemoryOp
+            QuantGemmProblem::TransposeC
         >
     >;
 
