@@ -251,6 +251,8 @@ def quantize_mxfp8_impl(
 
     if not scaling_recipe.with_trans:
         assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+    else:
+        assert axis is None, "The axis must be None when with_trans is True."
 
     num_rows, row_length = x.size()
 

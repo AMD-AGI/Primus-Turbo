@@ -209,7 +209,6 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         x_2d,
         dest_dtype,
         granularity=granularity,
-        axis=0,
         block_size=MX_BLOCK_SIZE,
         scaling_recipe=scaling_recipe,
     )
