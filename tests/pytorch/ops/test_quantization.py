@@ -317,6 +317,11 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
