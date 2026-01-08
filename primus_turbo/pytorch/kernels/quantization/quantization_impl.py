@@ -252,7 +252,9 @@ def quantize_mxfp8_impl(
 
     scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
-        scaling_recipe_for_trans = MXScalingRecipe()
+        scaling_recipe_for_trans = (
+            MXScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
     else:
         scaling_recipe_for_trans = scaling_recipe
 
@@ -523,7 +525,9 @@ def quantize_mxfp4_impl(
 
     scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
-        scaling_recipe_for_trans = MXScalingRecipe()
+        scaling_recipe_for_trans = (
+            MXScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
     else:
         scaling_recipe_for_trans = scaling_recipe
 

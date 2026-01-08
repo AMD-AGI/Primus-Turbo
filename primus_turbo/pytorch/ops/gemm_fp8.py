@@ -368,9 +368,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             config.granularity,
             block_size=config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
-                with_trans=True,
-            ),
+            with_trans=True,
         )
         b_fp8, b_scale_inv, b_t_fp8, b_t_scale_inv = quantize_fp8(
             b,
@@ -378,9 +376,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             config.granularity,
             block_size=config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            with_trans=True,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
-                with_trans=True,
             ),
         )
 
@@ -422,9 +420,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
-                with_trans=True,
-            ),
+            with_trans=True,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
