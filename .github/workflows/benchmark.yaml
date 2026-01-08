@@ -174,4 +174,4 @@ jobs:
       - name: "Generate Summary Report"
         run: |
           BENCHMARK_DATE=$(date +%Y-%m-%d)
-          python3 benchmark/ops/summarize_results.py --data-dir "${BENCHMARK_DATE_DIR}" --gpu MI325 H200 --date "${BENCHMARK_DATE}" -o "${BENCHMARK_DATE_DIR}/summary_mi325.csv"
+          python3 benchmark/ops/summarize_results.py --data-dir "${BENCHMARK_DATE_DIR}" --gpu MI325 H200 --date "${BENCHMARK_DATE}" -o "${BENCHMARK_DATE_DIR}/summary.csv"

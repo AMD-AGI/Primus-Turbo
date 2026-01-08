@@ -167,7 +167,9 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
                     {
                         "#": idx,
                         "Op": op_name,
-                        "GPU:Framework:Stage": f"{gpu}:{framework_name}:Fwd",
+                        "GPU": gpu,
+                        "Framework": framework_name,
+                        "Stage": "Fwd",
                         date_str: f"{fwd_tflops:.2f}",
                     }
                 )
@@ -176,7 +178,9 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
                     {
                         "#": idx,
                         "Op": op_name,
-                        "GPU:Framework:Stage": f"{gpu}:{framework_name}:Bwd",
+                        "GPU": gpu,
+                        "Framework": framework_name,
+                        "Stage": "Bwd",
                         date_str: f"{bwd_tflops:.2f}",
                     }
                 )
