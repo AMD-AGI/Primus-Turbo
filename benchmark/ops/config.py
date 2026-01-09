@@ -245,10 +245,10 @@ MoEModelConfigs = {
 # Benchmark Constants
 ###############################################################################
 
-BATCH_SIZE_LIST = [1, 2, 4]
+BATCH_SIZE_LIST = [1]
 
 # Grouped GEMM (MoE) configurations
-GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
+GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192]
 GROUPED_GEMM_EP_SIZE_LIST = [32, 16, 8]
 
 ###############################################################################
