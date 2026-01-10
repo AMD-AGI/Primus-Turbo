@@ -160,18 +160,6 @@ MoEModelConfigs = {
         "head_dim_v": 128,
         "seqlen": 4096,
     },
-    # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
-    "Kimi-K2": {
-        "n_routed_experts": 384,
-        "moe_intermediate_size": 2048,
-        "hidden_size": 7168,
-        # MLA attention config
-        "num_attention_heads": 64,
-        "num_key_value_heads": 64,
-        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
-        "head_dim_v": 128,
-        "seqlen": 4096,
-    },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
         "n_routed_experts": 160,
@@ -250,6 +238,42 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 8192,
+    },
+    # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
+    "Kimi-K2": {
+        "n_routed_experts": 384,
+        "moe_intermediate_size": 2048,
+        "hidden_size": 7168,
+        # MLA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
+        "head_dim_v": 128,
+        "seqlen": 4096,
+    },
+    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_1T.yaml
+    # 1T total params, 44B active params
+    "MoE-1T": {
+        "n_routed_experts": 224,
+        "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
+        "hidden_size": 8192,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,  # num_query_groups
+        "head_dim": 128,
+        "seqlen": 4096,
+    },
+    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
+    # 2T total params, 80B active params
+    "MoE-2T": {
+        "n_routed_experts": 448,
+        "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
+        "hidden_size": 8192,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,  # num_query_groups
+        "head_dim": 128,
+        "seqlen": 4096,
     },
 }
 
