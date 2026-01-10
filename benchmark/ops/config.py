@@ -160,6 +160,18 @@ MoEModelConfigs = {
         "head_dim_v": 128,
         "seqlen": 4096,
     },
+    # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
+    "Kimi-K2": {
+        "n_routed_experts": 384,
+        "moe_intermediate_size": 2048,
+        "hidden_size": 7168,
+        # MLA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
+        "head_dim_v": 128,
+        "seqlen": 4096,
+    },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
         "n_routed_experts": 160,
