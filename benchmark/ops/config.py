@@ -265,16 +265,16 @@ MoEModelConfigs = {
     },
     # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
     # 2T total params, 80B active params
-    "MoE-2T": {
-        "n_routed_experts": 448,
-        "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
-        "hidden_size": 8192,
-        # GQA attention config
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,  # num_query_groups
-        "head_dim": 128,
-        "seqlen": 4096,
-    },
+    # "MoE-2T": {
+    #     "n_routed_experts": 448,
+    #     "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
+    #     "hidden_size": 8192,
+    #     # GQA attention config
+    #     "num_attention_heads": 64,
+    #     "num_key_value_heads": 8,  # num_query_groups
+    #     "head_dim": 128,
+    #     "seqlen": 4096,
+    # },
 }
 
 ###############################################################################
