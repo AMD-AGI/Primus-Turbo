@@ -106,10 +106,10 @@ jobs:
       #   timeout-minutes: 60
       #   continue-on-error: true
       #   run: python3 benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity mx -o "${BENCHMARK_OUTPUT_DIR}/gemm_fp8_mx_benchmark.csv"
-      - name: "[3.1] Run Grouped GEMM Benchmark (PyTorch Baseline)"
-        timeout-minutes: 60
-        continue-on-error: true
-        run: python3 benchmark/ops/bench_grouped_gemm_torch.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_torch_benchmark.csv"
+      # - name: "[3.1] Run Grouped GEMM Benchmark (PyTorch Baseline)"
+      #   timeout-minutes: 60
+      #   continue-on-error: true
+      #   run: python3 benchmark/ops/bench_grouped_gemm_torch.py -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_torch_benchmark.csv"
       - name: "[3.2] Run Grouped GEMM Benchmark (TE Baseline)"
         timeout-minutes: 60
         continue-on-error: true
