@@ -202,7 +202,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
                 ctx.dropout_p,
                 ctx.philox_seed,
                 ctx.philox_offset,
-                False,  # USE_INT64_STRIDES
+                True,  # USE_INT64_STRIDES
                 sink=sink,
                 dsink=dsink,
             )
@@ -234,7 +234,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv_padded[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None, dsink
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):

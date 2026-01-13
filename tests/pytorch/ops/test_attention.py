@@ -283,3 +283,128 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dq_snr > 15, "query_grad_snr too low"
     assert dk_snr > 15, "key_grad_snr too low"
     assert dv_snr > 15, "value_grad_snr too low"
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("config", test_cases)
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_with_sink(batch, dtype, config, causal):
+    """Test flash attention with attention sink feature."""
+    device = "cuda"
+    seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
+        config.seqlen_q,
+        config.seqlen_kv,
+        config.num_head_q,
+        config.num_head_kv,
+        config.head_dim_qk,
+        config.head_dim_v,
+    )
+
+    # Skip if head_dim_qk != head_dim_v (triton kernel limitation for sink)
+    if head_dim_qk != head_dim_v:
+        pytest.skip("Sink attention requires head_dim_qk == head_dim_v")
+
+    print(
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}"
+    )
+
+    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
+    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
+    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
+
+    query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
+    sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn(o_layout, device=device, dtype=dtype)
+
+    query_ref = query.clone().detach().requires_grad_()
+    key_ref = key.clone().detach().requires_grad_()
+    value_ref = value.clone().detach().requires_grad_()
+    sink_ref = sink.clone().detach().requires_grad_()
+
+    sm_scale = query.shape[-1] ** (-0.5)
+
+    # Reference forward with sink
+    o_ref = attention_with_sink_ref(query_ref, key_ref, value_ref, sink_ref, sm_scale, causal)
+    o_ref.backward(grad_out)
+
+    # Flash attention with sink
+    o = flash_attn_func(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        deterministic=False,
+        return_lse=False,
+        return_attn_probs=False,
+        sink=sink,
+    )
+    o.backward(grad_out)
+
+    torch.cuda.synchronize()
+
+    out_snr = compute_snr(o_ref, o)
+    query_grad_snr = compute_snr(query_ref.grad, query.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+    sink_grad_snr = compute_snr(sink_ref.grad, sink.grad)
+    print(
+        f"out={out_snr:.2f}, dq={query_grad_snr:.2f}, dk={key_grad_snr:.2f}, dv={value_grad_snr:.2f}, dsink={sink_grad_snr:.2f}"
+    )
+
+    assert out_snr > 30, f"out_snr too low: {out_snr}"
+    assert query_grad_snr > 30, f"query_grad_snr too low: {query_grad_snr}"
+    assert key_grad_snr > 30, f"key_grad_snr too low: {key_grad_snr}"
+    assert value_grad_snr > 30, f"value_grad_snr too low: {value_grad_snr}"
+    assert sink_grad_snr > 20, f"sink_grad_snr too low: {sink_grad_snr}"
+
+
+def attention_with_sink_ref(q, k, v, sink, sm_scale, causal):
+    """Reference implementation of attention with sink."""
+    import math
+
+    from einops import repeat
+
+    dtype_og = q.dtype
+    q, k, v = q.float(), k.float(), v.float()
+    sink = sink.float()
+
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    # Expand k, v for GQA
+    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+
+    d = q.shape[-1]
+    scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+
+    # Apply causal mask
+    if causal:
+        row_idx = torch.arange(seqlen_q, device=q.device).view(-1, 1)
+        col_idx = torch.arange(seqlen_k, device=q.device)
+        causal_mask = col_idx > row_idx + seqlen_k - seqlen_q
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    # Concatenate sink scores
+    batch_size = scores.shape[0]
+    nheads = scores.shape[1]
+    sink_expanded = sink.view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+    scores = torch.cat([scores, sink_expanded], dim=-1)
+
+    # Softmax
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+
+    # Remove sink attention weights before computing output
+    attention = attention[..., :-1]
+
+    # Compute output
+    output = torch.einsum("bhts,bshd->bthd", attention, v)
+
+    return output.to(dtype=dtype_og)
