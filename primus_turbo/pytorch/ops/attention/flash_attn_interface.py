@@ -19,6 +19,8 @@ from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
     attention_aiter_csrc_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    attention_aiter_triton_backward_impl,
+    attention_aiter_triton_forward_impl,
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
@@ -56,6 +58,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         is_grad_enabled,
         is_v3_atomic_fp32: Optional[bool] = None,
         how_v3_bf16_cvt: Optional[int] = 1,
+        sink: Optional[torch.Tensor] = None,
     ):
         # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
         # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
@@ -78,22 +81,53 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_csrc_forward_impl(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=int(window_size[0]),
-            window_size_right=int(window_size[1]),
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            return_lse=True,
-            return_softmax=return_softmax and dropout_p > 0,
-        )
+        use_triton = sink is not None
+        rng_state = None
+        philox_seed = 0
+        philox_offset = 0
+
+        if not use_triton:
+            out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_csrc_forward_impl(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size_left=int(window_size[0]),
+                window_size_right=int(window_size[1]),
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                return_lse=True,
+                return_softmax=return_softmax and dropout_p > 0,
+            )
+        else:
+            out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+                attention_aiter_triton_forward_impl(
+                    q,
+                    k,
+                    v,
+                    dropout_p,
+                    softmax_scale,
+                    causal=causal,
+                    window_size_left=int(window_size[0]),
+                    window_size_right=int(window_size[1]),
+                    bias=bias,
+                    alibi_slopes=alibi_slopes,
+                    return_lse=True,
+                    return_softmax=return_softmax and dropout_p > 0,
+                    max_seqlen_q=q.shape[1],
+                    max_seqlen_k=k.shape[1],
+                    sink=sink,
+                )
+            )
+
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            if use_triton:
+                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
+            else:
+                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.use_triton = use_triton
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -102,8 +136,12 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
             ctx.head_size_q_og = head_size_q_og
+            ctx.head_size_v_og = head_size_v_og
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
+            ctx.philox_seed = philox_seed
+            ctx.philox_offset = philox_offset
+
         out = out_padded[..., :head_size_v_og]
 
         result = [out]
@@ -116,12 +154,20 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
-
+        use_triton = ctx.use_triton
+        head_size_q_og = ctx.head_size_q_og
+        head_size_v_og = ctx.head_size_v_og
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
-        head_size_q_og = ctx.head_size_q_og
-        head_size_v_og = dout.size(3)
+
+        if use_triton:
+            q, k, v, out_padded, softmax_lse, sink = ctx.saved_tensors
+            dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+        else:
+            q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
+            sink = None
+            dsink = None
+
         dout_padded = dout
         v_padded = v
 
@@ -134,33 +180,61 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
         dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v_padded)
 
-        attention_aiter_csrc_backward_impl(
-            dout_padded,
-            q,
-            k,
-            v_padded,
-            out_padded,
-            softmax_lse,
-            dq,
-            dk,
-            dv_padded,
-            dbias,
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.bias,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state,
-            ctx.is_v3_atomic_fp32,
-            ctx.how_v3_bf16_cvt,
-        )
+        if use_triton:
+            attention_aiter_triton_backward_impl(
+                dout_padded,
+                q,
+                k,
+                v_padded,
+                out_padded,
+                softmax_lse,
+                dq,
+                dk,
+                dv_padded,
+                dbias,
+                ctx.softmax_scale,
+                ctx.alibi_slopes,
+                ctx.causal,
+                None,  # cu_seqlens_q
+                None,  # cu_seqlens_k
+                q.shape[1],  # max_seqlen_q
+                k.shape[1],  # max_seqlen_k
+                ctx.dropout_p,
+                ctx.philox_seed,
+                ctx.philox_offset,
+                False,  # USE_INT64_STRIDES
+                sink=sink,
+                dsink=dsink,
+            )
+        else:
+            attention_aiter_csrc_backward_impl(
+                dout_padded,
+                q,
+                k,
+                v_padded,
+                out_padded,
+                softmax_lse,
+                dq,
+                dk,
+                dv_padded,
+                dbias,
+                ctx.dropout_p,
+                ctx.softmax_scale,
+                ctx.causal,
+                int(ctx.window_size[0]),
+                int(ctx.window_size[1]),
+                ctx.bias,
+                ctx.alibi_slopes,
+                ctx.deterministic,
+                rng_state,
+                ctx.is_v3_atomic_fp32,
+                ctx.how_v3_bf16_cvt,
+            )
+
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv_padded[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None, None
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -279,6 +353,7 @@ def flash_attn_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    sink: Optional[torch.Tensor] = None,
 ):
     return AiterFlashAttnFunc.apply(
         q,
@@ -294,6 +369,9 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        None,  # is_v3_atomic_fp32
+        1,  # how_v3_bf16_cvt
+        sink,
     )
 
 
