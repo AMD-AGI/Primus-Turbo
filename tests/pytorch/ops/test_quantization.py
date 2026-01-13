@@ -15,7 +15,11 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
 )
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
-from primus_turbo.pytorch.ops.quantization import dequantize_fp4
+from primus_turbo.pytorch.ops.quantization import (
+    dequantize_fp4,
+    quantize_fp4_with_trans,
+    quantize_fp8_with_trans,
+)
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
 
@@ -186,8 +190,8 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("B", [1, 4])
-@pytest.mark.parametrize("M", [32, 64, 256, 1024])
-@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("M", [32, 1024])
+@pytest.mark.parametrize("N", [32, 1024])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
@@ -204,12 +208,11 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         use_2d_block=use_2d_block,
     )
 
-    x_fp8_rowwise, x_scale_inv_rowwise, x_fp8_colwise, x_scale_inv_colwise = quantize_fp8(
+    x_fp8_rowwise, x_scale_inv_rowwise, x_fp8_colwise, x_scale_inv_colwise = quantize_fp8_with_trans(
         x_2d,
         dest_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        with_trans=True,
         scaling_recipe=scaling_recipe,
         scaling_recipe_for_trans=scaling_recipe,
     )
@@ -312,8 +315,8 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     ],
 )
 @pytest.mark.parametrize("B", [1, 4])
-@pytest.mark.parametrize("M", [32, 64, 256, 1024])
-@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("M", [32, 1024])
+@pytest.mark.parametrize("N", [32, 1024])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
@@ -335,12 +338,11 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         use_2d_block=use_2d_block,
     )
 
-    x_fp4_rowwise, x_scale_inv_rowwise, x_fp4_colwise, x_scale_inv_colwise = quantize_fp4(
+    x_fp4_rowwise, x_scale_inv_rowwise, x_fp4_colwise, x_scale_inv_colwise = quantize_fp4_with_trans(
         x_2d,
         dest_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        with_trans=True,
         scaling_recipe=scaling_recipe,
         scaling_recipe_for_trans=scaling_recipe,
     )

@@ -128,7 +128,7 @@ def quantize_mxfp4_kernel(
             hadamard_matrix_ptr
             + offset_hadamard_matrix_y[:, None] * MXFP4_BLOCK_SIZE
             + offset_hadamard_matrix_x[None, :]
-        ).to(tl.float32)
+        ).to(tl.bfloat16)
 
         if USE_COLWISE:
             hadamard_matrix_t = tl.trans(hadamard_matrix, (1, 0))
@@ -147,7 +147,7 @@ def quantize_mxfp4_kernel(
             if USE_ROWWISE:
                 # Row-wise
                 if ROWWISE_USE_RHT:
-                    x_chunk = tl.dot(x_chunk, hadamard_matrix)
+                    x_chunk = tl.dot(x_chunk.to(tl.bfloat16), hadamard_matrix).to(tl.float32)
 
                 if ROWWISE_USE_2D_BLOCK:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
@@ -201,7 +201,7 @@ def quantize_mxfp4_kernel(
             if USE_COLWISE:
                 # Col-wise
                 if COLWISE_USE_RHT:
-                    x_chunk = tl.dot(hadamard_matrix_t, x_chunk)
+                    x_chunk = tl.dot(hadamard_matrix_t, x_chunk.to(tl.bfloat16)).to(tl.float32)
 
                 if COLWISE_USE_2D_BLOCK:
                     biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
