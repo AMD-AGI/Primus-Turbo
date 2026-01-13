@@ -61,30 +61,40 @@ class FP4GemmMXFunction(torch.autograd.Function):
             config.format,
         )
 
-        a_fp4, a_scale_inv = quantize_fp4(
+        a_fp4, a_scale_inv, a_t_fp4, a_t_scale_inv = quantize_fp4(
             a,
             a_dtype,
             config.granularity,
             block_size=config.block_size,
-            axis=1,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
+            with_trans=True,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=False,
             ),
+            scaling_recipe_for_trans=MXScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+            ),
         )
 
-        b_fp4, b_scale_inv = quantize_fp4(
+        b_fp4, b_scale_inv, b_t_fp4, b_t_scale_inv = quantize_fp4(
             b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            axis=1,
+            with_trans=True,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
                 use_sr=False,
+                use_rht=False,
+            ),
+            scaling_recipe_for_trans=MXScalingRecipe(
+                use_2d_block=True,
+                use_sr=True,
                 use_rht=False,
             ),
         )
@@ -103,7 +113,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        ctx.save_for_backward(a, b)
+        ctx.save_for_backward(a_t_fp4, a_t_scale_inv, b_t_fp4, b_t_scale_inv)
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -116,66 +126,29 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a, b = ctx.saved_tensors
+        a_t_fp4, a_t_scale_inv, b_t_fp4, b_t_scale_inv = ctx.saved_tensors
         grad_out_dtype = FP4GemmMXFunction.get_fp4_dtype(
             ctx.config.format,
         )
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
 
-        grad_out_fp4, grad_out_scale_inv = quantize_fp4(
+        grad_out_fp4, grad_out_scale_inv, grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
+            with_trans=True,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=True,
                 use_rht=False,
             ),
-        )
-
-        grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
+            scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=True,
                 use_rht=True,
-            ),
-        )
-
-        a_t_fp4, a_t_scale_inv = quantize_fp4(
-            a,
-            ctx.a_fp4_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
-                use_2d_block=False,
-                use_sr=False,
-                use_rht=True,
-            ),
-        )
-
-        b_t_fp4, b_t_scale_inv = quantize_fp4(
-            b,
-            ctx.b_fp4_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
-                use_2d_block=True,
-                use_sr=True,
-                use_rht=False,
             ),
         )
 

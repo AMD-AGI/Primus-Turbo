@@ -362,21 +362,21 @@ class FP8GemmMXFunction(torch.autograd.Function):
         a_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
 
-        a_fp8, a_scale_inv = quantize_fp8(
+        a_fp8, a_scale_inv, a_t_fp8, a_t_scale_inv = quantize_fp8(
             a,
             a_dtype,
             config.granularity,
             block_size=config.block_size,
-            axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            with_trans=True,
         )
-        b_fp8, b_scale_inv = quantize_fp8(
+        b_fp8, b_scale_inv, b_t_fp8, b_t_scale_inv = quantize_fp8(
             b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
+            with_trans=True,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
             ),
@@ -396,7 +396,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        ctx.save_for_backward(a, b)
+        ctx.save_for_backward(a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv)
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -409,47 +409,18 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a, b = ctx.saved_tensors
+        a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv = ctx.saved_tensors
         grad_out_dtype = FP8GemmMXFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
 
-        grad_out_fp8, grad_out_scale_inv = quantize_fp8(
+        grad_out_fp8, grad_out_scale_inv, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=1,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-        )
-        grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-        )
-
-        # TODO(ruibin): cache a_t and b_t for backward pass
-        a_t_fp8, a_t_scale_inv = quantize_fp8(
-            a,
-            ctx.a_fp8_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-        )
-        b_t_fp8, b_t_scale_inv = quantize_fp8(
-            b,
-            ctx.b_fp8_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            scaling_recipe=MXScalingRecipe(
-                use_2d_block=True,
-            ),
+            with_trans=True,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
