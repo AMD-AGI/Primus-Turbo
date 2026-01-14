@@ -81,6 +81,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
+        # Use Triton backend when sink is provided, as C++ backend doesn't support sink feature
         use_triton = sink is not None
         rng_state = None
         philox_seed = 0
@@ -162,6 +163,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
         if use_triton:
             q, k, v, out_padded, softmax_lse, sink = ctx.saved_tensors
+            # dsink must be zeros as kernel accumulates gradients via atomic adds
             dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
         else:
             q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
