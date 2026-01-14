@@ -43,8 +43,12 @@ def attention_aiter_csrc_forward_impl(
         causal,
         window_size_left,
         window_size_right,
+        0,  # sink_size
         bias,
         alibi_slopes,
+        None,  # q_descale
+        None,  # k_descale
+        None,  # v_descale
         return_lse,
         return_softmax,
     )
