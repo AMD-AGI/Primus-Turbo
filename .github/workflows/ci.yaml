@@ -9,6 +9,9 @@ on:
       - 'v*'
   pull_request:
 
+env:
+  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_k8s_ci/uccl-wheel
+
 jobs:
   code-lint:
     runs-on: ubuntu-latest
@@ -51,9 +54,55 @@ jobs:
         with:
           options: "--check --diff --color --verbose --line-length=110"
 
+  install-dependencies:
+    runs-on: turbo-pt-gfx942-2510-279fq
+    env:
+        UCCL_COMMIT: 94f0e20716966a33b1045ded9cdc5f9ad3bb36ab #  [EP] Debug AMD performance and mem consistency issues (#600)
+        UCCL_PY_VER: 3.12
+    steps:
+      - name: Print job info
+        run: |
+          echo "🎉 Begin Primus-Turbo Install Dependencies."
+          echo "🐧 Running on ${{ runner.os }}, branch: ${{ github.ref }}"
+
+      - name: Checkout UCCL
+        uses: actions/checkout@v4
+        with:
+          repository: uccl-project/uccl
+          ref: ${UCCL_COMMIT}
+          fetch-depth: 0
+          path: /tmp/uccl
+
+      - name: Build UCCL
+        run: |
+          start_time=$(date +%s)
+          echo "✅ [build uccl] started at: $(date)"
+
+          sed -i '/pip install.*--pre torch torchvision.*\\$/,+1d' docker/Dockerfile.rocm
+
+          # build wheel
+          bash build.sh rocm ep ${UCCL_PY_VER}
+
+          cd ep/deep_ep_wrapper
+          python3 setup.py bdist_wheel
+          cp dist/*.whl /tmp/uccl/wheelhouse-rocm/
+
+          end_time=$(date +%s)
+          elapsed=$((end_time - start_time))
+          echo "✅ [build uccl] ended at: $(date)"
+          echo "⏱️ [build uccl] Total elapsed time: ${elapsed} seconds"
+
+
+      - name: Copy wheel to shared storage
+        run: |
+          mkdir -p ${{ env.UCCL_WHEEL_DIR }}
+          cp -v /tmp/uccl/wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
+          echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
+          ls -la ${{ env.UCCL_WHEEL_DIR }}/
+
   unittest-pytorch-gfx942:
-    needs: code-lint
-    runs-on: turbo-pt-gfx942-2510-tgjtk
+    needs:[code-lint, install-dependencies]
+    runs-on: turbo-pt-gfx942-2510-279fq
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci/pytorch
     steps:
@@ -99,6 +148,14 @@ jobs:
           pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
+
+          # ===== Install UCCL wheel =====
+          echo "==> Installing UCCL from pre-built wheel..."
+          echo "Wheel directory: ${{ env.UCCL_WHEEL_DIR }}"
+          ls -la "${{ env.UCCL_WHEEL_DIR }}/"
+          pip3 install "${{ env.UCCL_WHEEL_DIR }}"/*.whl
+
+          echo "==> UCCL installation completed successfully!"
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
