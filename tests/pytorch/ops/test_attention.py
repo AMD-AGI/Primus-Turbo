@@ -289,7 +289,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [True, False])
 def test_attention_with_sink(batch, dtype, config, causal):
     """Test flash attention with attention sink feature."""
     device = "cuda"
