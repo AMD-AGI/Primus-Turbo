@@ -14,13 +14,11 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
-from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
-    attention_aiter_csrc_backward_impl,
-    attention_aiter_csrc_forward_impl,
+from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
+    attention_aiter_backward_dispatch,
+    attention_aiter_forward_dispatch,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
-    attention_aiter_triton_backward_impl,
-    attention_aiter_triton_forward_impl,
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
@@ -33,6 +31,16 @@ __all__ = ["flash_attn_func", "flash_attn_fp8_func"]
 
 
 class AiterFlashAttnFunc(torch.autograd.Function):
+    """
+    Flash Attention using unified Aiter kernel dispatch.
+
+    Dispatch policy:
+    1. Prefer the C++ backend (aiter csrc)
+    2. If the C++ backend cannot support the current configs (e.g., sink attention),
+       fallback to the Triton backend
+    3. If the Triton backend also cannot handle it, raise an error
+    """
+
     @staticmethod
     def _resolve_is_v3_atomic_fp32(is_v3_atomic_fp32: Optional[bool]) -> bool:
         if is_v3_atomic_fp32 in [True, False]:
@@ -81,53 +89,37 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        # Use Triton backend when sink is provided, as C++ backend doesn't support sink feature
-        use_triton = sink is not None
-        rng_state = None
-        philox_seed = 0
-        philox_offset = 0
+        # Use unified dispatch: prefers C++ backend, falls back to Triton if needed
+        out_padded, softmax_lse, S_dmask, state_info = attention_aiter_forward_dispatch(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+            return_softmax=return_softmax and dropout_p > 0,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            sink=sink,
+        )
 
-        if not use_triton:
-            out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_csrc_forward_impl(
-                q,
-                k,
-                v,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=bias,
-                alibi_slopes=alibi_slopes,
-                return_lse=True,
-                return_softmax=return_softmax and dropout_p > 0,
-            )
-        else:
-            out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-                attention_aiter_triton_forward_impl(
-                    q,
-                    k,
-                    v,
-                    dropout_p,
-                    softmax_scale,
-                    causal=causal,
-                    window_size_left=int(window_size[0]),
-                    window_size_right=int(window_size[1]),
-                    bias=bias,
-                    alibi_slopes=alibi_slopes,
-                    return_lse=True,
-                    return_softmax=return_softmax and dropout_p > 0,
-                    max_seqlen_q=q.shape[1],
-                    max_seqlen_k=k.shape[1],
-                    sink=sink,
-                )
-            )
+        # Unpack state_info from dispatch
+        # state_info format: (backend_type, state_data, philox_seed, philox_offset)
+        backend_type, state_data, philox_seed, philox_offset = state_info
+        use_triton = backend_type == "triton"
 
         if is_grad:
             if use_triton:
-                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
+                # For triton backend, state_data is sink tensor
+                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, state_data)
             else:
-                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+                # For csrc backend, state_data is rng_state
+                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, state_data)
             ctx.use_triton = use_triton
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
@@ -165,6 +157,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             q, k, v, out_padded, softmax_lse, sink = ctx.saved_tensors
             # dsink must be zeros as kernel accumulates gradients via atomic adds
             dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+            rng_state = None
         else:
             q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
             sink = None
@@ -182,56 +175,34 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
         dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v_padded)
 
-        if use_triton:
-            attention_aiter_triton_backward_impl(
-                dout_padded,
-                q,
-                k,
-                v_padded,
-                out_padded,
-                softmax_lse,
-                dq,
-                dk,
-                dv_padded,
-                dbias,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                None,  # cu_seqlens_q
-                None,  # cu_seqlens_k
-                q.shape[1],  # max_seqlen_q
-                k.shape[1],  # max_seqlen_k
-                ctx.dropout_p,
-                ctx.philox_seed,
-                ctx.philox_offset,
-                True,  # USE_INT64_STRIDES
-                sink=sink,
-                dsink=dsink,
-            )
-        else:
-            attention_aiter_csrc_backward_impl(
-                dout_padded,
-                q,
-                k,
-                v_padded,
-                out_padded,
-                softmax_lse,
-                dq,
-                dk,
-                dv_padded,
-                dbias,
-                ctx.dropout_p,
-                ctx.softmax_scale,
-                ctx.causal,
-                int(ctx.window_size[0]),
-                int(ctx.window_size[1]),
-                ctx.bias,
-                ctx.alibi_slopes,
-                ctx.deterministic,
-                rng_state,
-                ctx.is_v3_atomic_fp32,
-                ctx.how_v3_bf16_cvt,
-            )
+        # Use unified dispatch for backward
+        attention_aiter_backward_dispatch(
+            dout=dout_padded,
+            q=q,
+            k=k,
+            v=v_padded,
+            out=out_padded,
+            softmax_lse=softmax_lse,
+            dq=dq,
+            dk=dk,
+            dv=dv_padded,
+            dbias=dbias,
+            dropout_p=ctx.dropout_p,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            bias=ctx.bias,
+            alibi_slopes=ctx.alibi_slopes,
+            deterministic=ctx.deterministic,
+            rng_state=rng_state,
+            is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
+            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            sink=sink,
+            dsink=dsink,
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+        )
 
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]

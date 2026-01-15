@@ -52,6 +52,7 @@ class GlobalBackendManager:
     _gemm_backend: Optional[BackendType] = None
     _grouped_gemm_backend: Optional[BackendType] = None
     _moe_dispatch_combine_backend: Optional[BackendType] = None
+    _attention_backend: Optional[BackendType] = None
     _auto_tune: Optional[bool] = None
 
     @classmethod
@@ -63,6 +64,11 @@ class GlobalBackendManager:
     def set_grouped_gemm_backend(cls, backend: Optional[BackendType]) -> None:
         """Set the Grouped GEMM backend in code."""
         cls._grouped_gemm_backend = backend
+
+    @classmethod
+    def set_attention_backend(cls, backend: Optional[BackendType]) -> None:
+        """Set the Attention backend in code."""
+        cls._attention_backend = backend
 
     @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:
@@ -106,6 +112,16 @@ class GlobalBackendManager:
         return None
 
     @classmethod
+    def get_attention_backend(cls) -> Optional[BackendType]:
+        """Get the Attention backend configuration. Returns None if not set."""
+        if cls._attention_backend is not None:
+            return cls._attention_backend
+        backend = os.environ.get("PRIMUS_TURBO_ATTENTION_BACKEND")
+        if backend:
+            return BackendType[backend.upper()]
+        return None
+
+    @classmethod
     def auto_tune_enabled(cls) -> bool:
         """Check if auto-tune is enabled."""
         if cls._auto_tune is not None:
@@ -117,6 +133,7 @@ class GlobalBackendManager:
         """Reset all backend settings and clear all dispatcher caches."""
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
+        cls._attention_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
 
