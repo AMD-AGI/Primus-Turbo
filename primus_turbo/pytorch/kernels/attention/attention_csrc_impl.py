@@ -32,8 +32,11 @@ def attention_aiter_csrc_forward_impl(
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
+    sink_size: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
     out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
         q,
         k,
@@ -43,8 +46,12 @@ def attention_aiter_csrc_forward_impl(
         causal,
         window_size_left,
         window_size_right,
+        sink_size,
         bias,
         alibi_slopes,
+        q_descale,
+        k_descale,
+        v_descale,
         return_lse,
         return_softmax,
     )
