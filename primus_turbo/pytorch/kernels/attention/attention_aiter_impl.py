@@ -22,6 +22,11 @@ Benefits:
 from typing import Any, Optional, Tuple
 
 import torch
+from aiter.ops.mha import _flash_attn_backward, _flash_attn_forward
+from aiter.ops.triton.attention.mha import (
+    _flash_attn_forward as _triton_flash_attn_forward,
+)
+from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
@@ -29,14 +34,6 @@ from primus_turbo.pytorch.core.backend import (
     GlobalBackendManager,
     KernelBackend,
     TuneCache,
-)
-from primus_turbo.pytorch.kernels.attention.attention_csrc_impl import (
-    attention_aiter_csrc_backward_impl,
-    attention_aiter_csrc_forward_impl,
-)
-from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
-    attention_aiter_triton_backward_impl,
-    attention_aiter_triton_forward_impl,
 )
 
 
@@ -94,19 +91,24 @@ class AttnFwdAiterCsrcBackend(KernelBackend):
         max_seqlen_k: int,
         sink: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_csrc_forward_impl(
+
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
             dropout_p,
             softmax_scale,
-            causal=causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            return_softmax=return_softmax,
+            causal,
+            window_size_left,
+            window_size_right,
+            0,  # sink_size
+            bias,
+            alibi_slopes,
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
+            return_lse,
+            return_softmax,
         )
         # Return format: (out, lse, S_dmask, state_info)
         # state_info is ("csrc", rng_state, philox_seed=0, philox_offset=0) for csrc backend
@@ -166,21 +168,22 @@ class AttnFwdAiterTritonBackend(KernelBackend):
         max_seqlen_k: int,
         sink: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = attention_aiter_triton_forward_impl(
+
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
             q,
             k,
             v,
             dropout_p,
             softmax_scale,
-            causal=causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            return_softmax=return_softmax,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            causal,
+            window_size_left,
+            window_size_right,
+            bias,
+            alibi_slopes,
+            return_lse,
+            return_softmax,
+            max_seqlen_q,
+            max_seqlen_k,
             sink=sink,
         )
         # Return format: (out, lse, S_dmask, state_info)
@@ -290,7 +293,8 @@ class AttnBwdAiterCsrcBackend(KernelBackend):
         philox_seed: int = 0,
         philox_offset: int = 0,
     ):
-        return attention_aiter_csrc_backward_impl(
+
+        return _flash_attn_backward(
             dout,
             q,
             k,
@@ -388,7 +392,8 @@ class AttnBwdAiterTritonBackend(KernelBackend):
         philox_seed: int = 0,
         philox_offset: int = 0,
     ):
-        return attention_aiter_triton_backward_impl(
+
+        return flash_attn_onekernel_backward(
             dout,
             q,
             k,

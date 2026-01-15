@@ -13,8 +13,6 @@ import triton.language as tl
 _torch_custom_op_wrapper = torch.library.custom_op
 from typing import Optional, Tuple
 
-from aiter.ops.triton.attention.mha import _flash_attn_forward
-from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from torch._library import wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
@@ -755,93 +753,3 @@ def _attention_triton_backward_impl_fake(
         torch.empty_like(v, dtype=bwd_torch_dtype),
     )
     return dq_out, dk_out, dv_out
-
-
-def attention_aiter_triton_forward_impl(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
-    return_softmax: bool,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    sink: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
-
-    o, softmax_lse, s_dmask, philox_seed, philox_offset = _flash_attn_forward(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        bias,
-        alibi_slopes,
-        return_lse,
-        return_softmax,
-        max_seqlen_q,
-        max_seqlen_k,
-        sink=sink,
-    )
-    return o, softmax_lse, s_dmask, philox_seed, philox_offset
-
-
-def attention_aiter_triton_backward_impl(
-    do: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    dbias: torch.Tensor,
-    sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
-    causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
-):
-    return flash_attn_onekernel_backward(
-        do,
-        q,
-        k,
-        v,
-        o,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        dbias,
-        sm_scale,
-        alibi_slopes,
-        causal,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        philox_seed,
-        philox_offset,
-        USE_INT64_STRIDES,
-        sink=sink,
-        dsink=dsink,
-    )
