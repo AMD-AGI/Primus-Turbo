@@ -215,7 +215,7 @@ def quantize_fp4_with_trans(
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert scale is None, "The scale is not supported for MXFP4 quantization"
-        assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
+        assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP4 quantization"
 
         return quantize_mxfp4_impl(
             x,
