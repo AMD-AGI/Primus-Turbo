@@ -64,8 +64,8 @@ class AttnFwdAiterCsrcBackend(KernelBackend):
         alibi_slopes: Optional[torch.Tensor],
         return_lse: bool,
         return_softmax: bool,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
     ) -> bool:
         # C++ backend does not support sink attention
@@ -87,8 +87,8 @@ class AttnFwdAiterCsrcBackend(KernelBackend):
         alibi_slopes: Optional[torch.Tensor],
         return_lse: bool,
         return_softmax: bool,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        max_seqlen_q: Optional[int] = None,  # same as Triton backend
+        max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
 
@@ -132,8 +132,8 @@ class AttnFwdAiterTritonBackend(KernelBackend):
         alibi_slopes: Optional[torch.Tensor],
         return_lse: bool,
         return_softmax: bool,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
     ) -> bool:
         # Triton requires:
@@ -164,10 +164,14 @@ class AttnFwdAiterTritonBackend(KernelBackend):
         alibi_slopes: Optional[torch.Tensor],
         return_lse: bool,
         return_softmax: bool,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
+        if max_seqlen_q is None:
+            max_seqlen_q = q.shape[1]
+        if max_seqlen_k is None:
+            max_seqlen_k = k.shape[1]
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
             q,

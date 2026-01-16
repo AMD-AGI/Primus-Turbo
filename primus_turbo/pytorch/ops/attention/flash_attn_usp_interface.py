@@ -4,16 +4,18 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.distributed as dist
-from aiter.ops.mha import _flash_attn_backward as _aiter_flash_attn_backward
-from aiter.ops.mha import _flash_attn_forward as _aiter_flash_attn_forward
 
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
+)
+from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
+    AttnBwdAiterCsrcBackend,
+    AttnFwdAiterCsrcBackend,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -26,41 +28,6 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
 
 from .usp.attention_a2a_helper import get_attention_cp_a2a_helper
 from .usp.attention_ring import ring_attn_bwd, ring_attn_fwd
-
-
-def _aiter_csrc_attn_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
-    return_softmax: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Adapter for ring attention forward using aiter csrc."""
-    return _aiter_flash_attn_forward(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        0,  # sink_size
-        bias,
-        alibi_slopes,
-        None,  # q_descale
-        None,  # k_descale
-        None,  # v_descale
-        return_lse,
-        return_softmax,
-    )
 
 
 class AttentionCKFunctionCPA2A(torch.autograd.Function):
@@ -116,9 +83,9 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         assert not return_softmax
         assert dropout_p == 0.0
-        out_padded, softmax_lse, S_dmask, rng_state = ring_attn_fwd(
+        out_padded, softmax_lse, S_dmask, state_info = ring_attn_fwd(
             ring_group,
-            _aiter_csrc_attn_fwd,
+            AttnFwdAiterCsrcBackend.execute,
             q_local_heads,
             k_local_heads,
             v_local_heads,
@@ -132,6 +99,8 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
         )
+        # Extract rng_state from state_info: ("csrc", rng_state, philox_seed, philox_offset)
+        rng_state = state_info[1]
 
         if is_grad:
             ctx.save_for_backward(
@@ -201,7 +170,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
-            _aiter_flash_attn_backward,
+            AttnBwdAiterCsrcBackend.execute,
             dout_padded,
             q_local_heads,
             k_local_heads,
