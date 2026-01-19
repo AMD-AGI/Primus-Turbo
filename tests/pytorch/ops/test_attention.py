@@ -302,8 +302,8 @@ def test_attention_with_sink(batch, dtype, config, causal):
         config.head_dim_v,
     )
 
-    # Skip if head_dim_qk != head_dim_v or head_dim <= 32 (triton kernel limitation for sink)
-    if head_dim_qk != head_dim_v or head_dim_qk <= 32:
+    # Skip if head_dim_qk != head_dim_v(triton kernel limitation for sink)
+    if head_dim_qk != head_dim_v:
         pytest.skip("Sink attention requires head_dim_qk == head_dim_v and head_dim > 32")
 
     print(

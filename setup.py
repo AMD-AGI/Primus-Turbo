@@ -386,7 +386,7 @@ if __name__ == "__main__":
     if torch_ext is not None and not is_package_installed("amd-aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(
-            "amd-aiter @ git+https://github.com/ROCm/aiter.git@311deb04d918d10449d57f780295ee487dff5521"
+            "amd-aiter @ git+https://github.com/ROCm/aiter.git@63f588cf5b45b6f99c64cbb8851ea7edf9770a28"
         )
     else:
         print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
