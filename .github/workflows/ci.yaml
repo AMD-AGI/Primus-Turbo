@@ -69,13 +69,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: uccl-project/uccl
-          ref: ${UCCL_COMMIT}
+          ref: ${{ env.UCCL_COMMIT }}
           fetch-depth: 0
           path: uccl
 
       - name: Build UCCL
         run: |
-          mv uccl /tmp/uccl
+          mv ../uccl /tmp/uccl
           cd /tmp/uccl
           git config --global --add safe.directory /tmp/uccl
 
@@ -85,7 +85,7 @@ jobs:
           sed -i '/pip install.*--pre torch torchvision.*\\$/,+1d' docker/Dockerfile.rocm
 
           # build wheel
-          bash build.sh rocm ep ${UCCL_PY_VER}
+          bash build.sh rocm ep ${{ env.UCCL_PY_VER }}
 
           cd ep/deep_ep_wrapper
           python3 setup.py bdist_wheel
