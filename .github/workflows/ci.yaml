@@ -71,10 +71,14 @@ jobs:
           repository: uccl-project/uccl
           ref: ${UCCL_COMMIT}
           fetch-depth: 0
-          path: /tmp/uccl
+          path: uccl
 
       - name: Build UCCL
         run: |
+          mv uccl /tmp/uccl
+          cd /tmp/uccl
+          git config --global --add safe.directory /tmp/uccl
+
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
 
@@ -91,7 +95,6 @@ jobs:
           elapsed=$((end_time - start_time))
           echo "✅ [build uccl] ended at: $(date)"
           echo "⏱️ [build uccl] Total elapsed time: ${elapsed} seconds"
-
 
       - name: Copy wheel to shared storage
         run: |
