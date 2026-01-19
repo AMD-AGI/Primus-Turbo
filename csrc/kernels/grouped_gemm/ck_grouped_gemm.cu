@@ -302,14 +302,14 @@ void ck_grouped_gemm_variable_k(
     }
     runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
 
-    // Postprocess
-    {
-        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
-        const int grids   = (params.group_num + threads - 1) / threads;
-        grouped_gemm_variable_k_postprocess<CDataType><<<grids, threads, 0, params.stream>>>(
-            params.c_ptr, params.group_lens_ptr, params.group_offs_ptr, params.group_num, params.m,
-            params.n);
-    }
+    // // Postprocess
+    // {
+    //     const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
+    //     const int grids   = (params.group_num + threads - 1) / threads;
+    //     grouped_gemm_variable_k_postprocess<CDataType><<<grids, threads, 0, params.stream>>>(
+    //         params.c_ptr, params.group_lens_ptr, params.group_offs_ptr, params.group_num, params.m,
+    //         params.n);
+    // }
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>

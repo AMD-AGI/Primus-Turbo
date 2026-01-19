@@ -237,6 +237,48 @@ public:
     }
 };
 
+#ifdef PRIMUS_TURBO_GFX90A
+template <
+    typename ADataType,
+    typename BDataType,
+    typename CDataType,
+    typename AccDataType,
+    typename ALayout,
+    typename BLayout,
+    typename CLayout
+>
+std::unique_ptr<CKGroupedGemmRunnerInterFace>
+get_ck_grouped_gemm_instance_gfx90a(const ck_tile::index_t group_num, const ck_tile::index_t m,
+                             const ck_tile::index_t n, const ck_tile::index_t k){
+    std::unique_ptr<CKGroupedGemmRunnerInterFace> runner = nullptr;
+    if (get_current_arch() != GPUArch::GFX90A) {
+        PRIMUS_TURBO_ERROR("Currently Arch != gfx90a");
+    }  
+    if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
+                  std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
+        if (n % 256 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX90A, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else if (n % 128 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX90A, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else {
+            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding;
+            using Runner = CKGroupedGemmRunner<GPUArch::GFX90A, ADataType, BDataType, CDataType, ALayout, BLayout,
+                                               CLayout, TileConfig, AccDataType>;
+            runner = std::make_unique<Runner>();
+        }
+    } else {
+        PRIMUS_TURBO_ERROR(" GFX90A Grouped Gemm only support fp16/bf16");
+    }
+    return runner;
+}
+#endif
+
 #ifdef PRIMUS_TURBO_GFX942
 template <
     typename ADataType,
@@ -377,11 +419,38 @@ get_ck_grouped_gemm_instance(const ck_tile::index_t group_num, const ck_tile::in
                 ALayout, BLayout, CLayout>(group_num, m, n, k);
         }
 #endif
+#ifdef PRIMUS_TURBO_GFX90A
+        case GPUArch::GFX90A: {
+            return get_ck_grouped_gemm_instance_gfx90a<
+                ADataType, BDataType, CDataType, AccDataType,
+                ALayout, BLayout, CLayout>(group_num, m, n, k);
+        }
+#endif
         default:
             PRIMUS_TURBO_ERROR("Unsupported arch in get_ck_grouped_gemm_instance()");
     }
 }
-
+// ******* GFX90A Instantiation ***************
+#ifdef PRIMUS_TURBO_GFX90A
+#define DECL_CK_GG_GFX90A_EXTERN_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)           \
+extern template std::unique_ptr<CKGroupedGemmRunnerInterFace>                                       \
+get_ck_grouped_gemm_instance_gfx90a<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
+    const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
+// FP16 * FP16 = FP16
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, ColMajor, RowMajor, RowMajor)
+// BF16 * BF16 = BF16
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, ColMajor, RowMajor)
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, RowMajor, RowMajor, RowMajor)
+DECL_CK_GG_GFX90A_EXTERN_INSTANCE(ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ColMajor, RowMajor, RowMajor)
+#undef DECL_CK_GG_GFX90A_EXTERN_INSTANCE
+#define DECL_CK_GG_GFX90A_INSTANCE(AType, BType, CType, ALayout, BLayout, CLayout)                  \
+template std::unique_ptr<CKGroupedGemmRunnerInterFace>                                              \
+get_ck_grouped_gemm_instance_gfx90a<AType, BType, CType, float, ALayout, BLayout, CLayout>(         \
+    const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t, const ck_tile::index_t);
+#endif
+// ********************************************
 
 // **************** GFX942 Instantiation ****************
 #ifdef PRIMUS_TURBO_GFX942

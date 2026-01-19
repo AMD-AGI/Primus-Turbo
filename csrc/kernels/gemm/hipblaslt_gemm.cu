@@ -13,6 +13,7 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
     case GPUArch::GFX950:
         return 67108864; // 64 MiB
     case GPUArch::GFX942:
+    case GPUArch::GFX90A:
     case GPUArch::UNKNOWN:
         return 33554432; // 32 MiB
     }

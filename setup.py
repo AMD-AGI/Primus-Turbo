@@ -21,7 +21,7 @@ BUILD_TORCH = os.environ.get("PRIMUS_TURBO_BUILD_TORCH", "1") == "1"
 BUILD_JAX = os.environ.get("PRIMUS_TURBO_BUILD_JAX", "0") == "1"
 
 # -------- Supported GPU ARCHS --------
-SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
+SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950", "gfx90a"]
 
 
 class TurboBuildExt(BuildExtension):
