@@ -10,11 +10,33 @@ from typing import Union
 import torch
 import triton
 import triton.language as tl
-from triton.language import core
 from triton.language.standard import _log2
 
 # The following three argsort related kernels are adapted from
 # the issue https://github.com/triton-lang/triton/issues/3698
+
+
+@triton.jit
+def _to_int_bitcast(val, signed: tl.constexpr = True):
+    """Bitcast a value to signed/unsigned integer type matching its primitive bitwidth."""
+    if signed:
+        if val.dtype.primitive_bitwidth == 8:
+            return val.to(tl.int8, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 16:
+            return val.to(tl.int16, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 32:
+            return val.to(tl.int32, bitcast=True)
+        else:
+            return val.to(tl.int64, bitcast=True)
+    else:
+        if val.dtype.primitive_bitwidth == 8:
+            return val.to(tl.uint8, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 16:
+            return val.to(tl.uint16, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 32:
+            return val.to(tl.uint32, bitcast=True)
+        else:
+            return val.to(tl.uint64, bitcast=True)
 
 
 @triton.jit
@@ -32,11 +54,10 @@ def _compare_and_swap(x, indices, flip, i: tl.constexpr, n_dims: tl.constexpr):
     l_indice = tl.reshape(tl.broadcast_to(tl.sum(z * (1 - mask), 1)[:, None, :], shape), x.shape)
     r_indice = tl.reshape(tl.broadcast_to(tl.sum(z * mask, 1)[:, None, :], shape), x.shape)
 
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-
-    il_value = l_value.to(idtype, bitcast=True)
-    ir_value = r_value.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
+    # Bitcast to int based on value's primitive bitwidth
+    il_value = _to_int_bitcast(l_value, signed=True)
+    ir_value = _to_int_bitcast(r_value, signed=True)
+    ix = _to_int_bitcast(x, signed=True)
 
     flag1 = tl.where(((l_value > r_value) ^ flip) != 0, il_value ^ ir_value, tl.zeros_like(ix))
     ret = ix ^ flag1

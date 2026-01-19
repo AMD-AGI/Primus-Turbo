@@ -5,8 +5,32 @@
 ###############################################################################
 
 import triton
+import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, sum, zeros_like
+
+
+@triton.jit
+def _to_int_bitcast(val, signed: core.constexpr = True):
+    """Bitcast a value to signed/unsigned integer type matching its primitive bitwidth."""
+    if signed:
+        if val.dtype.primitive_bitwidth == 8:
+            return val.to(tl.int8, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 16:
+            return val.to(tl.int16, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 32:
+            return val.to(tl.int32, bitcast=True)
+        else:
+            return val.to(tl.int64, bitcast=True)
+    else:
+        if val.dtype.primitive_bitwidth == 8:
+            return val.to(tl.uint8, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 16:
+            return val.to(tl.uint16, bitcast=True)
+        elif val.dtype.primitive_bitwidth == 32:
+            return val.to(tl.uint32, bitcast=True)
+        else:
+            return val.to(tl.uint64, bitcast=True)
 
 
 @triton.jit
@@ -28,11 +52,10 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     left_idx = core.reshape(left_idx, x.shape)
     right_idx = core.reshape(right_idx, x.shape)
 
-    # actual compare-and-swap
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
+    # actual compare-and-swap with bitcast to int
+    ileft = _to_int_bitcast(left, signed=True)
+    iright = _to_int_bitcast(right, signed=True)
+    ix = _to_int_bitcast(x, signed=True)
 
     cond = (left > right) ^ flip
 
