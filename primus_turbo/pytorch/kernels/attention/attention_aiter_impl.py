@@ -138,7 +138,7 @@ class AttnFwdAiterTritonBackend(KernelBackend):
     ) -> bool:
         # Triton requires:
         # 1. head_dim_qk == head_dim_v
-        # 3. head_dim must be a power of 2
+        # 2. head_dim must be a power of 2
         head_dim_qk = q.shape[-1]
         head_dim_v = v.shape[-1]
         if head_dim_qk != head_dim_v:
@@ -353,7 +353,7 @@ class AttnBwdAiterTritonBackend(KernelBackend):
     ) -> bool:
         # Triton requires:
         # 1. head_dim_qk == head_dim_v
-        # 3. head_dim must be a power of 2
+        # 2. head_dim must be a power of 2
         head_dim_qk = q.shape[-1]
         head_dim_v = v.shape[-1]
         if head_dim_qk != head_dim_v:
