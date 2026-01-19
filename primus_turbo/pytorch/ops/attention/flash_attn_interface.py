@@ -280,7 +280,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        (q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_descale) = ctx.saved_tensors
+        q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_descale = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
 
