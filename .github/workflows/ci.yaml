@@ -75,9 +75,6 @@ jobs:
 
       - name: Build UCCL
         run: |
-          mv ../uccl /tmp/uccl
-          cd /tmp/uccl
-          git config --global --add safe.directory /tmp/uccl
 
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
@@ -87,9 +84,10 @@ jobs:
           # build wheel
           bash build.sh rocm ep ${{ env.UCCL_PY_VER }}
 
-          cd ep/deep_ep_wrapper
+          pushd ep/deep_ep_wrapper
           python3 setup.py bdist_wheel
-          cp dist/*.whl /tmp/uccl/wheelhouse-rocm/
+          popd
+          cp ep/deep_ep_wrapper/dist/*.whl wheelhouse-rocm/
 
           end_time=$(date +%s)
           elapsed=$((end_time - start_time))
@@ -99,7 +97,7 @@ jobs:
       - name: Copy wheel to shared storage
         run: |
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
-          cp -v /tmp/uccl/wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
+          cp -v wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
           echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
           ls -la ${{ env.UCCL_WHEEL_DIR }}/
 
