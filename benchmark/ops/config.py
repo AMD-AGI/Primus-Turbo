@@ -159,6 +159,8 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
+        "num_experts": 256,
+        "num_topk": 8,
     },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
@@ -171,6 +173,8 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
+        "num_experts": 160,
+        "num_topk": 8,
     },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite/file/view/master/config.json
     "DeepSeek-V2-Lite": {
@@ -183,6 +187,8 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
+        "num_experts": 64,
+        "num_topk": 8,
     },
     # https://huggingface.co/xai-org/grok-2/blob/main/config.json
     "Grok-2": {
@@ -194,6 +200,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 8192,
+        "num_experts": 8,
+        "num_topk": 2,
     },
     # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
     "Qwen3-30B-A3B": {
@@ -205,6 +213,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 4,
         "head_dim": 64,
         "seqlen": 8192,
+        "num_experts": 128,
+        "num_topk": 8,
     },
     # https://modelscope.cn/models/Qwen/Qwen3-235B-A22B-Instruct-2507
     "Qwen3-235B-A22B": {
@@ -216,6 +226,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 4,
         "head_dim": 64,
         "seqlen": 8192,
+        "num_experts": 128,
+        "num_topk": 8,
     },
     # https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json
     "Mixtral-8x7B": {
@@ -227,6 +239,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 4096,
+        "num_experts": 8,
+        "num_topk": 2,
     },
     # https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/blob/main/config.json
     "Mixtral-8x22B": {
@@ -238,6 +252,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 8192,
+        "num_experts": 8,
+        "num_topk": 2,
     },
     # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
     "Kimi-K2": {
@@ -250,6 +266,8 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
+        "num_experts": 384,
+        "num_topk": 8,
     },
     # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_1T.yaml
     # 1T total params, 44B active params
@@ -262,6 +280,8 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,  # num_query_groups
         "head_dim": 128,
         "seqlen": 4096,
+        "num_experts": 224,
+        "num_topk": 8,
     },
     # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
     # 2T total params, 80B active params
@@ -432,5 +452,14 @@ def gen_attention_test_cases():
                     "seqlen": config["seqlen"],
                 }
             )
+
+    return test_cases
+
+
+def gen_deepep_test_cases():
+    # From MoE models (for MLA and other attention variants)
+    test_cases = []
+    for name, config in MoEModelConfigs.items():
+       test_cases.append((name, config["seqlen"], config["hidden_size"], config["num_experts"], config["num_topk"]))
 
     return test_cases
