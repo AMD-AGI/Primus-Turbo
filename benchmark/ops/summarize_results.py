@@ -123,8 +123,7 @@ def get_avg_metric(data_dir, csv_filename, expected_gpu=None, expected_platform=
     if expected_gpu and "GPU" in df.columns:
         for gpu in df["GPU"].unique():
             if not gpu.startswith(expected_gpu):
-                print(
-                    f"Warning: GPU mismatch in {csv_path}: expected '{expected_gpu}*', found '{gpu}'")
+                print(f"Warning: GPU mismatch in {csv_path}: expected '{expected_gpu}*', found '{gpu}'")
 
     if expected_platform and "Platform" in df.columns:
         for plat in df["Platform"].unique():
@@ -135,18 +134,20 @@ def get_avg_metric(data_dir, csv_filename, expected_gpu=None, expected_platform=
 
     # dispatch and combine bandwidth, maybe need a better way to get metric results from the output
     if "Dispatch Bandwidth (GB/s)" in df.columns or "Combine Bandwidth (GB/s)" in df.columns:
-        dispatch_bw = pd.to_numeric(
-            df["Dispatch Bandwidth (GB/s)"], errors="coerce").mean()
-        combine_bw = pd.to_numeric(
-            df["Combine Bandwidth (GB/s)"], errors="coerce").mean()
-        return ("FP8 Dispatch", dispatch_bw if not pd.isna(dispatch_bw) else 0), ("Combine", combine_bw if not pd.isna(combine_bw) else 0)
+        dispatch_bw = pd.to_numeric(df["Dispatch Bandwidth (GB/s)"], errors="coerce").mean()
+        combine_bw = pd.to_numeric(df["Combine Bandwidth (GB/s)"], errors="coerce").mean()
+        return ("FP8 Dispatch", dispatch_bw if not pd.isna(dispatch_bw) else 0), (
+            "Combine",
+            combine_bw if not pd.isna(combine_bw) else 0,
+        )
 
-    fw_tflops = pd.to_numeric(
-        df["Forward TFLOPS"], errors="coerce").mean()
-    bw_tflops = pd.to_numeric(
-        df["Backward TFLOPS"], errors="coerce").mean()
+    fw_tflops = pd.to_numeric(df["Forward TFLOPS"], errors="coerce").mean()
+    bw_tflops = pd.to_numeric(df["Backward TFLOPS"], errors="coerce").mean()
 
-    return ("Fwd", fw_tflops if not pd.isna(fw_tflops) else 0), ("Bwd", bw_tflops if not pd.isna(bw_tflops) else 0)
+    return ("Fwd", fw_tflops if not pd.isna(fw_tflops) else 0), (
+        "Bwd",
+        bw_tflops if not pd.isna(bw_tflops) else 0,
+    )
 
 
 def generate_summary_table(data_dir, date_str, gpus, output_file=None):
@@ -162,14 +163,12 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
 
         gpu_data_dir = os.path.join(data_dir, gpu)
         if not os.path.exists(gpu_data_dir):
-            print(
-                f"Warning: Data directory '{gpu_data_dir}' not found, skipping {gpu}...")
+            print(f"Warning: Data directory '{gpu_data_dir}' not found, skipping {gpu}...")
             continue
 
         csv_files = [f for f in os.listdir(gpu_data_dir) if f.endswith(".csv")]
         if not csv_files:
-            print(
-                f"Warning: No CSV files in '{gpu_data_dir}', skipping {gpu}...")
+            print(f"Warning: No CSV files in '{gpu_data_dir}', skipping {gpu}...")
             continue
 
         expected_platform = get_expected_platform(gpu)
@@ -203,8 +202,7 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
                 idx += 1
 
     if not summary_data:
-        print(
-            f"\nWarning: No benchmark data found for GPU: {', '.join(gpus_to_process)}")
+        print(f"\nWarning: No benchmark data found for GPU: {', '.join(gpus_to_process)}")
         return pd.DataFrame()
 
     summary_df = pd.DataFrame(summary_data)
@@ -222,8 +220,7 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Summarize daily benchmark results")
+    parser = argparse.ArgumentParser(description="Summarize daily benchmark results")
     parser.add_argument(
         "--data-dir", type=str, required=True, help="Date directory containing GPU subdirectories"
     )
@@ -237,8 +234,7 @@ def parse_args():
     parser.add_argument(
         "--date", type=str, default=None, help="Date string for the summary table (default: today)"
     )
-    parser.add_argument("-o", "--output", type=str,
-                        default=None, help="Output CSV file path")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output CSV file path")
     return parser.parse_args()
 
 

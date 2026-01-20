@@ -460,6 +460,8 @@ def gen_deepep_test_cases():
     # From MoE models (for MLA and other attention variants)
     test_cases = []
     for name, config in MoEModelConfigs.items():
-       test_cases.append((name, config["seqlen"], config["hidden_size"], config["num_experts"], config["num_topk"]))
+        test_cases.append(
+            (name, config["seqlen"], config["hidden_size"], config["num_experts"], config["num_topk"])
+        )
 
     return test_cases
