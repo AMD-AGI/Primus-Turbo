@@ -5,10 +5,10 @@
 ###############################################################################
 
 import argparse
-import datetime
 import io
 import re
 from contextlib import redirect_stdout
+from datetime import datetime
 from types import SimpleNamespace
 
 import pandas as pd
