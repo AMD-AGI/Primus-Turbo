@@ -46,7 +46,7 @@ jobs:
         if: always()
         with:
             configuration: "--profile black --check-only --diff"
-      - uses: psf/black@stable
+      - uses: psf/black@24.8.0
         if: always()
         with:
           options: "--check --diff --color --verbose --line-length=110"
