@@ -165,7 +165,7 @@ jobs:
       - name: "[4.1] Run DeepEP Intranode Benchmark (Turbo Backend)"
         timeout-minutes: 60
         continue-on-error: true
-        run: python3 benchmark/ops/bench_intranode.py --backend turbo -o "${BENCHMARK_OUTPUT_DIR}/deep_ep_intranode_turbo_benchmark.csv"
+        run: python3 benchmark/ops/bench_deepep_intranode.py --backend turbo -o "${BENCHMARK_OUTPUT_DIR}/deep_ep_intranode_turbo_benchmark.csv"
       - name: "Copy H200 benchmark data"
         run: |
           H200_LATEST_DIR="${BENCHMARK_ROOT_DIR}/H200/latest"
