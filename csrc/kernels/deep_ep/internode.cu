@@ -11,9 +11,11 @@
 #if defined(__clang__) || defined(__HIPCC__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-volatile"
+#pragma clang diagnostic ignored "-Wpass-failed"
 #elif defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-volatile"
+#pragma GCC diagnostic ignored "-Wpass-failed"
 #endif
 
 namespace primus_turbo::deep_ep {
