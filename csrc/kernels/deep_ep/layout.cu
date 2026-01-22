@@ -1,6 +1,4 @@
 #include "launch.cuh"
-#include "primus_turbo/deep_ep/configs.cuh"
-#include "primus_turbo/deep_ep/exception.cuh"
 
 namespace primus_turbo::deep_ep {
 
@@ -123,7 +121,7 @@ void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                          int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                          bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
                          int num_experts, cudaStream_t stream) {
-    constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
+    constexpr int kNumThreads = 512, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
     int           num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) +
                   (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
     EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");

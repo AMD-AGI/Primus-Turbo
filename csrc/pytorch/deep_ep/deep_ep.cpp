@@ -13,67 +13,29 @@
 #include "primus_turbo/deep_ep/configs.cuh"
 
 namespace shared_memory {
-void cu_mem_set_access_all(void *ptr, size_t size) {
-    int device_count;
-    CUDA_CHECK(cudaGetDeviceCount(&device_count));
 
-    CUmemAccessDesc access_desc[device_count];
-    for (int idx = 0; idx < device_count; ++idx) {
-        access_desc[idx].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access_desc[idx].location.id   = idx;
-        access_desc[idx].flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    }
 
-    CU_CHECK(cuMemSetAccess((CUdeviceptr) ptr, size, access_desc, device_count));
+SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_fabric) {
+    EP_HOST_ASSERT(not use_fabric and "not supported");
 }
-
-void cu_mem_free(void *ptr) {
-    CUmemGenericAllocationHandle handle;
-    CU_CHECK(cuMemRetainAllocationHandle(&handle, ptr));
-
-    size_t size = 0;
-    CU_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr) ptr));
-
-    CU_CHECK(cuMemUnmap((CUdeviceptr) ptr, size));
-    CU_CHECK(cuMemAddressFree((CUdeviceptr) ptr, size));
-    CU_CHECK(cuMemRelease(handle));
-}
-
-size_t get_size_align_to_granularity(size_t size_raw, size_t granularity) {
-    size_t size = (size_raw + granularity - 1) & ~(granularity - 1);
-    if (size == 0)
-        size = granularity;
-    return size;
-}
-
-SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_fabric) {}
 
 void SharedMemoryAllocator::malloc(void **ptr, size_t size_raw) {
-    EP_HOST_ASSERT(not use_fabric);
     CUDA_CHECK(hipExtMallocWithFlags(ptr, size_raw, hipDeviceMallocUncached));
 }
 
 void SharedMemoryAllocator::free(void *ptr) {
-    EP_HOST_ASSERT(not use_fabric);
     CUDA_CHECK(cudaFree(ptr));
 }
 
 void SharedMemoryAllocator::get_mem_handle(MemHandle *mem_handle, void *ptr) {
-    size_t size = 0;
-    CU_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr) ptr));
-
-    mem_handle->size = size;
-    EP_HOST_ASSERT(not use_fabric);
     CUDA_CHECK(cudaIpcGetMemHandle(&mem_handle->inner, ptr));
 }
 
 void SharedMemoryAllocator::open_mem_handle(void **ptr, MemHandle *mem_handle) {
-    EP_HOST_ASSERT(not use_fabric);
     CUDA_CHECK(cudaIpcOpenMemHandle(ptr, mem_handle->inner, cudaIpcMemLazyEnablePeerAccess));
 }
 
 void SharedMemoryAllocator::close_mem_handle(void *ptr) {
-    EP_HOST_ASSERT(not use_fabric);
     CUDA_CHECK(cudaIpcCloseMemHandle(ptr));
 }
 } // namespace shared_memory
@@ -1613,22 +1575,22 @@ torch::Tensor Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_t
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < num_ranks);
-    internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask,
-                                     at::cuda::getCurrentCUDAStream());
+    // internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask,
+    //                                  at::cuda::getCurrentCUDAStream());
 }
 
 void Buffer::low_latency_query_mask_buffer(const torch::Tensor &mask_status) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == num_ranks && mask_status.scalar_type() == torch::kInt32);
 
-    internode_ll::query_mask_buffer(mask_buffer_ptr, num_ranks,
-                                    reinterpret_cast<int *>(mask_status.data_ptr()),
-                                    at::cuda::getCurrentCUDAStream());
+    // internode_ll::query_mask_buffer(mask_buffer_ptr, num_ranks,
+    //                                 reinterpret_cast<int *>(mask_status.data_ptr()),
+    //                                 at::cuda::getCurrentCUDAStream());
 }
 
 void Buffer::low_latency_clean_mask_buffer() {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
-    internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
+    // internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
 } // namespace primus_turbo::pytorch::deep_ep

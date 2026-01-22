@@ -1,7 +1,5 @@
 #include "buffer.cuh"
 #include "launch.cuh"
-#include "primus_turbo/deep_ep/configs.cuh"
-#include "primus_turbo/deep_ep/exception.cuh"
 #include "utils.cuh"
 
 namespace primus_turbo::deep_ep {
@@ -95,7 +93,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += WARP_SIZE)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
-            if (elect_one_sync())
+            if (lane_id == 0)
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
         __syncthreads();
@@ -243,7 +241,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto     tma_buffer        = smem_buffer + (thread_id / WARP_SIZE) * kNumTMABytesPerWarp;
     auto     tma_mbarrier      = reinterpret_cast<uint64_t *>(tma_buffer + half_hidden_bytes);
     uint32_t tma_phase         = 0;
-    if (elect_one_sync()) {
+    if (lane_id == 0) {
         mbarrier_init(tma_mbarrier, 1);
         fence_barrier_init();
         EP_DEVICE_ASSERT(hidden_int4 % 2 == 0 and
@@ -263,7 +261,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
+        if (send_warp_id_in_rank == 0 and lane_id == 0) {
             int value = responsible_channel > 0
                             ? channel_prefix_matrix[responsible_rank * num_channels +
                                                     responsible_channel - 1]
@@ -285,7 +283,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            if (elect_one_sync()) {
+            if (lane_id == 0) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are
                     // time-consuming
@@ -309,8 +307,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different
                 // from the warp assigned to send the following data
-                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and
-                    elect_one_sync())
+                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and lane_id == 0)
                     send_head[token_idx * kNumRanks + responsible_rank] =
                         is_token_in_rank[token_idx * kNumRanks + responsible_rank]
                             ? cached_channel_tail_idx
@@ -333,7 +330,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                        shifted_x, __ldg, st_na_global);
 
                     // Copy source index
-                    if (elect_one_sync())
+                    if (lane_id == 0)
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
@@ -369,8 +366,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            sync_barrier(responsible_rank, num_threads_per_rank);
-            if (send_warp_id_in_rank == 0 and elect_one_sync())
+            sync_barrier<true>(responsible_rank, num_threads_per_rank);
+            if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
@@ -390,12 +387,15 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                       : 0;
 
         // Receive channel offset
+        // NOTE(zhuang12): different with deepep main branch here
         int total_offset, num_tokens_to_recv;
-        if (elect_one_sync()) {
-            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
-                ;
-            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
-                ;
+        while (lane_id == 0 and
+               (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
+            ;
+        while (lane_id == 0 and
+               (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
+            ;
+        if (lane_id == 0) {
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] =
@@ -433,7 +433,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            sync_barrier(responsible_rank, num_threads_per_rank);
+            sync_barrier<true>(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -450,7 +450,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
                     tma_store_wait<0>();
-                    if (elect_one_sync()) {
+                    if (lane_id == 0) {
                         tma_load_1d(tma_buffer, shifted_buffer_x_int4 + i * half_hidden_int4,
                                     tma_mbarrier, half_hidden_bytes);
                         mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
@@ -506,8 +506,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            sync_barrier(responsible_rank, num_threads_per_rank);
-            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
+            sync_barrier<true>(responsible_rank, num_threads_per_rank);
+            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
             // Exit
@@ -536,7 +536,7 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
               int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
               int num_ranks, cudaStream_t stream, int num_sms, int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    constexpr int kNumThreads         = 768;
+    constexpr int kNumThreads         = 1024;
     constexpr int kNumTMABytesPerWarp = 8192;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / WARP_SIZE);
@@ -724,7 +724,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             auto start_time = clock64();
             int  num_round_tokens =
                 min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            if (elect_one_sync()) {
+            if (lane_id == 0) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are
                     // time-consuming
@@ -757,7 +757,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                    ld_nc_global, st_na_global);
 
                 // Send source index
-                if (elect_one_sync())
+                if (lane_id == 0)
                     channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
 
                 // Send `topk_weights`
@@ -770,7 +770,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             sync_barrier<true>(send_rank_id, num_threads_per_rank);
-            if (send_warp_id_in_rank == 0 and elect_one_sync())
+            if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
@@ -791,7 +791,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             warp_channel_head_idx[recv_warp_id][lane_id] = 0;
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
-        sync_barrier<true>(0, kNumThreads);
+        __syncthreads();
 
         if (thread_id < WARP_SIZE) {
             int *channel_head_idx_ptr =
@@ -959,7 +959,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         // Issue TMA
                         tma_store_fence();
                         __syncwarp();
-                        if (elect_one_sync()) {
+                        if (lane_id == 0) {
                             auto tma_bytes =
                                 min(WARP_SIZE, hidden_int4 - i) * static_cast<int>(sizeof(int4));
                             tma_store_1d(reinterpret_cast<int4 *>(tma_buffer) +
@@ -993,7 +993,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Retired
             __syncwarp();
-            if (elect_one_sync())
+            if (lane_id == 0)
                 warp_retired[recv_warp_id] = true;
         }
     }
