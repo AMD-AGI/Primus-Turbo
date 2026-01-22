@@ -22,7 +22,8 @@ struct SharedData {
     uint32_t barrier[MAX_GROUPS];
 };
 
-__shared__ SharedData shared_data;
+// Use static to avoid duplicate symbol errors when this header is included in multiple .cu files
+static __shared__ SharedData shared_data;
 
 __device__ __forceinline__ void barrier_init(int barrier_id) {
     shared_data.barrier[barrier_id] = 0;

@@ -1,5 +1,6 @@
 #include "buffer.cuh"
 #include "launch.cuh"
+#include "primus_turbo/deep_ep/api.cuh"
 #include "utils.cuh"
 
 namespace primus_turbo::deep_ep {
