@@ -4,251 +4,239 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
-import sys
-from dataclasses import asdict, dataclass
-from pathlib import Path
+import argparse
+import io
+import re
+from contextlib import redirect_stdout
+from datetime import datetime
+from types import SimpleNamespace
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
 from tabulate import tabulate
+from test_intranode import test_main
+from utils import get_deep_ep_backend, init_dist
 
-from primus_turbo.pytorch import deep_ep
-
-# fmt: off
-PROJECT_ROOT = Path(os.path.dirname(__file__)).parent.parent.parent.resolve()
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from benchmark.ops.deep_ep.model_cfg import DeepEPModelCfg, get_model_cfg
-from tests.pytorch.ref.deep_ep_ref import tune_and_verify_intranode
-
-# fmt: on
+from benchmark.ops.config import (
+    BATCH_SIZE_LIST,
+    gen_deepep_test_cases,
+    get_platform_info,
+)
 
 
-@dataclass
-class DeepEPPerf(DeepEPModelCfg):
-    mode: str
-    nvl_chunk_size: int
-    num_sms: int
-    bandwith: float
-    avg_us: float
-
-
-def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
-    # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
-
-    # Warmup
-    for _ in range(num_warmups):
-        fn()
-
-    # Flush L2
-    cache.zero_()
-
-    # Testing
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    for i in range(num_tests):
-        # Record
-        start_events[i].record()
-        fn()
-        end_events[i].record()
-        if post_fn is not None:
-            post_fn()
-    torch.cuda.synchronize()
-
-    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
-    return np.average(times), np.min(times), np.max(times)
-
-
-def bench_intranode(
-    cfg: DeepEPModelCfg,
+def profile_intranode(
+    args: SimpleNamespace,
     num_sms: int,
     local_rank: int,
     num_ranks: int,
     rank: int,
-    buffer: deep_ep.Buffer,
+    buffer,
     group: dist.ProcessGroup,
 ):
-    # Settings
-    num_tokens, hidden = cfg.num_tokens, cfg.hidden_size
-    num_topk, num_experts = cfg.num_topk, cfg.num_experts
+    """
+    Call test_main and extract dispatch/combine performance data from the output.
 
-    (
-        x,
-        x_e4m3,
-        (
-            dispatch_bf16_nvl_recv_bytes,
-            combine_bf16_nvl_send_bytes,
-            nvl_buffer_size,
-            num_tokens_per_rank,
-            is_token_in_rank,
-            num_tokens_per_expert,
-            handle,
-        ),
-    ) = tune_and_verify_intranode(
-        num_sms, num_tokens, hidden, num_topk, num_experts, local_rank, num_ranks, rank, buffer, group
+    Returns:
+        tuple: (dispatch_time_ms, dispatch_bw, combine_time_ms, combine_bw, correct)
+            - dispatch_time_ms: Dispatch time in milliseconds
+            - dispatch_bw: Dispatch bandwidth (GB/s)
+            - combine_time_ms: Combine time in milliseconds
+            - combine_bw: Combine bandwidth (GB/s)
+            - correct: Whether the test passed
+    """
+
+    # Capture stdout
+    captured_output = io.StringIO()
+    correct = True
+
+    try:
+        with redirect_stdout(captured_output):
+            test_main(args, num_sms, local_rank, num_ranks, rank, buffer, group)
+    except Exception as e:
+        correct = False
+        print(f"test_main failed with exception: {e}")
+
+    output = captured_output.getvalue()
+
+    # Parse Best dispatch lines
+    # Format: [tuning] Best dispatch (FP8/BF16): SMs X, NVL chunk Y, Z.ZZ GB/s (NVL), t: W.WW us
+    dispatch_pattern = r"\[tuning\] Best dispatch \((\w+)\): SMs (\d+), NVL chunk (\d+), ([\d.]+) GB/s \(NVL\), t: ([\d.]+) us"
+    dispatch_matches = re.findall(dispatch_pattern, output)
+
+    # Parse Best combine lines
+    # Format: [tuning] Best combine: SMs X, NVL chunk Y: Z.ZZ GB/s (NVL), t: W.WW us
+    combine_pattern = (
+        r"\[tuning\] Best combine: SMs (\d+), NVL chunk (\d+): ([\d.]+) GB/s \(NVL\), t: ([\d.]+) us"
     )
+    combine_matches = re.findall(combine_pattern, output)
 
-    # Random data
+    # Extract dispatch (forward) data - prefer FP8 over BF16
+    dispatch_time_us = 0.0
+    dispatch_bw = 0.0
+    if dispatch_matches:
+        # Prefer FP8 result, otherwise use the last match
+        for match in dispatch_matches:
+            dtype, sms, nvl_chunk, bw, time_us = match
+            dispatch_bw = float(bw)
+            dispatch_time_us = float(time_us)
+            if dtype == "FP8":
+                break
 
-    # Tune dispatch performance
-    best_dispatch_results = None
-    fp8_factor = (1 + 4 / 128) / 2
-    for current_x in filter(lambda elem: elem is not None, (x_e4m3, x)):
-        best_time, best_results = 1e10, None
-        nvl_recv_bytes = (
-            (dispatch_bf16_nvl_recv_bytes * fp8_factor)
-            if isinstance(current_x, tuple)
-            else dispatch_bf16_nvl_recv_bytes
-        )
-        for nvl_chunk_size in tuple(range(4, 33, 2)) + (0,):
-            if nvl_chunk_size > 0:
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
-            else:
-                # Test default config as well
-                deep_ep.Buffer.set_num_sms(num_sms)
-                config = deep_ep.Buffer.get_dispatch_config(num_ranks)
-            tune_args = {"x": current_x, "handle": handle, "config": config}
-            t = bench(lambda: buffer.dispatch(**tune_args))[0]
-            if t < best_time and nvl_chunk_size > 0:
-                best_time, best_results = t, (num_sms, nvl_chunk_size)
+    # Extract combine (backward) data
+    combine_time_us = 0.0
+    combine_bw = 0.0
+    if combine_matches:
+        sms, nvl_chunk, bw, time_us = combine_matches[-1]  # Use the last match
+        combine_bw = float(bw)
+        combine_time_us = float(time_us)
+
+    # Convert time units: us -> ms
+    dispatch_time_ms = dispatch_time_us / 1000.0
+    combine_time_ms = combine_time_us / 1000.0
+
+    # Mark as failed if no data was parsed
+    if dispatch_time_us == 0.0 or combine_time_us == 0.0:
+        correct = False
+
+    return dispatch_time_ms, dispatch_bw, combine_time_ms, combine_bw, correct
+
+
+def benchmark_intranode(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    platform, gpu_name = get_platform_info()
+
+    num_sms = int(args.num_sms)
+    output_csv = args.output
+
+    rows = []
+    test_id = 0
+
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+
+    deep_ep = get_deep_ep_backend(args.backend)
+
+    buffer = deep_ep.Buffer(group, int(2e9), 0, low_latency_mode=False, explicitly_destroy=True)
+
+    test_cases = gen_deepep_test_cases()
+    for MBS in BATCH_SIZE_LIST:
+        for model_name, num_tokens, hidden, num_experts, num_topk in test_cases:
+            test_id += 1
+            num_tokens *= MBS
+
             if local_rank == 0:
+                print(f"\n{'='*60}")
                 print(
-                    f'[{cfg.model_name} tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
-                    f"{nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), avg_t: {t * 1e6:.2f} us",
-                    flush=True,
+                    f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
+                    f"num_tokens: {num_tokens}, hidden: {hidden}, num_topk: {num_topk}, num_experts: {num_experts}"
+                )
+                print(f"{'='*60}")
+
+            try:
+                torch.manual_seed(rank)
+                args = SimpleNamespace(
+                    num_tokens=num_tokens,
+                    hidden=hidden,
+                    num_topk=num_topk,
+                    num_experts=num_experts,
+                    backend=args.backend,
                 )
 
-        if local_rank == 0:
-            print(
-                f'[{cfg.model_name} tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us',
-                flush=True,
-            )
-            print("", flush=True)
-            dispatch_result = DeepEPPerf(
-                **asdict(cfg),
-                mode="dispatch",
-                nvl_chunk_size=best_results[1],
-                num_sms=num_sms,
-                bandwith=nvl_recv_bytes / 1e9 / best_time,
-                avg_us=best_time * 1e6,
-            )
+                dispatch_time_ms, dispatch_bw, combine_time_ms, combine_bw, correct = profile_intranode(
+                    args, num_sms, local_rank, num_ranks, rank, buffer, group
+                )
 
-        # Gather the best config from rank 0 and the first test setting
-        if best_dispatch_results is None:
-            best_dispatch_results = torch.tensor(
-                [best_results[0], best_results[1]], dtype=torch.int32, device="cuda"
-            )
-            all_best_fp8_results_list = [
-                torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())
-            ]
-            dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
-            best_dispatch_results = all_best_fp8_results_list[0].tolist()
-    dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size)
+                row = {
+                    "TestID": test_id,
+                    "Platform": platform,
+                    "GPU": gpu_name,
+                    "Case": model_name,
+                    "MBS": MBS,
+                    "num_tokens": num_tokens,
+                    "hidden": hidden,
+                    "num_topk": num_topk,
+                    "num_experts": num_experts,
+                }
+                row.update(
+                    {
+                        "Check": "PASS" if correct else "FAIL",
+                        "Dispatch Time (ms)": f"{dispatch_time_ms:.2f}",
+                        "Dispatch Bandwidth (GB/s)": f"{dispatch_bw:.2f}",
+                        "Combine Time (ms)": f"{combine_time_ms:.2f}",
+                        "Combine Bandwidth (GB/s)": f"{combine_bw:.2f}",
+                    }
+                )
+                rows.append(row)
 
-    dispatch_args = {
-        "x": x,
-        "num_tokens_per_rank": num_tokens_per_rank,
-        "is_token_in_rank": is_token_in_rank,
-        "num_tokens_per_expert": num_tokens_per_expert,
-        "config": dispatch_config if dispatch_config is not None else config,
-    }
-    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+            except Exception as e:
+                if local_rank == 0:
+                    print(f"Failed: {str(e)}")
+                row = {
+                    "TestID": test_id,
+                    "Platform": platform,
+                    "GPU": gpu_name,
+                    "Case": model_name,
+                    "MBS": MBS,
+                    "num_tokens": num_tokens,
+                    "hidden": hidden,
+                    "num_topk": num_topk,
+                    "num_experts": num_experts,
+                }
+                row.update(
+                    {
+                        "Check": "ERROR",
+                        "Dispatch Time (ms)": "ERROR",
+                        "Dispatch Bandwidth (GB/s)": "0.00",
+                        "Combine Time (ms)": "ERROR",
+                        "Combine Bandwidth (GB/s)": "0.00",
+                    }
+                )
+                rows.append(row)
 
-    # Tune combine performance
-    best_time, best_results = 1e10, None
-    for nvl_chunk_size in tuple(range(1, 17, 1)) + (0,):
-        if nvl_chunk_size > 0:
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
-        else:
-            # Test default config as well
-            deep_ep.Buffer.set_num_sms(num_sms)
-            config = deep_ep.Buffer.get_combine_config(num_ranks)
-        tune_args = {"x": recv_x, "handle": handle, "config": config}
-        t = bench(lambda: buffer.combine(**tune_args))[0]
-        if local_rank == 0:
-            print(
-                f'[{cfg.model_name} tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
-                f"{combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL), avg_t: {t * 1e6:.2f} us",
-                flush=True,
-            )
-            if t < best_time and nvl_chunk_size > 0:
-                best_time, best_results = t, (num_sms, nvl_chunk_size)
-
+    results = pd.DataFrame(rows)
     if local_rank == 0:
-        print(
-            f"[{cfg.model_name} tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}: {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us",
-            flush=True,
-        )
-        print("", flush=True)
-
-        combine_result = DeepEPPerf(
-            **asdict(cfg),
-            mode="combine",
-            nvl_chunk_size=best_results[1],
-            num_sms=num_sms,
-            bandwith=combine_bf16_nvl_send_bytes / 1e9 / best_time,
-            avg_us=best_time * 1e6,
-        )
-
-    return (dispatch_result, combine_result) if local_rank == 0 else (None, None)
-
-
-def init_dist(local_rank: int, num_local_ranks: int, backend: str = "nccl"):
-    if backend == "nccl":
-        ip = os.getenv("MASTER_ADDR", "127.0.0.1")
-        port = int(os.getenv("MASTER_PORT", "8361"))
-        node_rank = int(os.getenv("RANK", 0))
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
-    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
-
-    if backend == "nccl":
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://{ip}:{port}",
-            world_size=num_nodes * num_local_ranks,
-            rank=node_rank * num_local_ranks + local_rank,
-        )
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.cuda.set_device(local_rank)
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
-
-
-def record_perf(local_rank: int, num_local_ranks: int):
-
-    # DataFrame to store results
-    best_result = []
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    buffer = deep_ep.Buffer(group, int(2e9), 0, False, 1, explicitly_destroy=True)
-    torch.manual_seed(rank)
-
-    for cfg in get_model_cfg():
-        for num_sms in (24, 32, 64, 80):
-            dispatch_result, combine_result = bench_intranode(
-                cfg, num_sms, local_rank, num_ranks, rank, buffer, group
-            )
-            if local_rank == 0:
-                best_result.extend([dispatch_result, combine_result])
-    df_result = pd.DataFrame(best_result)
-
-    if local_rank == 0:
-        # Print results
         print("\nFinal Results:")
-        print(tabulate(df_result, headers="keys", tablefmt="grid", showindex=False))
+        print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
-        # Save to CSV
-        df_result.to_csv("deep_ep_intranode_benchmark_results.csv", index=False)
-        print("Results saved to deep_ep_intranode_benchmark_results.csv")
+    avg_dispatch_bw = results["Dispatch Bandwidth (GB/s)"].astype(float).mean()
+    avg_combine_bw = results["Combine Bandwidth (GB/s)"].astype(float).mean()
 
+    if local_rank == 0:
+        print(f"\nAverage Dispatch Bandwidth: {avg_dispatch_bw:.2f}")
+        print(f"Average Combine Bandwidth: {avg_combine_bw:.2f}")
+
+    if output_csv:
+        filename = output_csv
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d")
+        filename = f"deep_ep_intranode_benchmark_results_{timestamp}_{gpu_name}.csv"
+
+    if local_rank == 0:
+
+        results.to_csv(filename, index=False)
+
+        print(f"Results saved to {filename}")
+
+    # Destroy the buffer runtime and communication group
     buffer.destroy()
     dist.barrier()
-    dist.destroy_process_group(group)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(record_perf, args=(8,), nprocs=8)
+    parser = argparse.ArgumentParser(description="Test intranode EP kernels")
+    parser.add_argument(
+        "--num-processes", type=int, default=8, help="Number of processes to spawn (default: 8)"
+    )
+    parser.add_argument("--backend", type=str, default="turbo", help="Backend to use (default: turbo)")
+    parser.add_argument("--num-sms", type=int, default=64, help="Number of SMs to use (default: 32)")
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output CSV filename",
+    )
+    args = parser.parse_args()
+
+    num_processes = args.num_processes
+    torch.multiprocessing.spawn(benchmark_intranode, args=(num_processes, args), nprocs=num_processes)

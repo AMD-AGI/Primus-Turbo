@@ -67,6 +67,9 @@ AMD_BENCHMARK_OPS = {
     "Grouped-GEMM-FP8-Blockwise": {
         "Turbo(CK)": "grouped_gemm_fp8_blockwise_ck_benchmark.csv",
     },
+    "DeepEP-Intranode": {
+        "Turbo": "deep_ep_intranode_turbo_benchmark.csv",
+    },
 }
 
 # NVIDIA Benchmark Ops
@@ -110,10 +113,10 @@ def get_expected_platform(gpu):
         return None
 
 
-def get_avg_tflops(data_dir, csv_filename, expected_gpu=None, expected_platform=None):
+def get_avg_metric(data_dir, csv_filename, expected_gpu=None, expected_platform=None):
     csv_path = os.path.join(data_dir, csv_filename)
     if not os.path.exists(csv_path):
-        return 0, 0
+        return ("Fwd", 0), ("Bwd", 0)
 
     df = pd.read_csv(csv_path)
 
@@ -129,10 +132,22 @@ def get_avg_tflops(data_dir, csv_filename, expected_gpu=None, expected_platform=
                     f"Warning: Platform mismatch in {csv_path}: expected '{expected_platform}', found '{plat}'"
                 )
 
-    fwd_tflops = pd.to_numeric(df["Forward TFLOPS"], errors="coerce").mean()
-    bwd_tflops = pd.to_numeric(df["Backward TFLOPS"], errors="coerce").mean()
+    # dispatch and combine bandwidth, maybe need a better way to get metric results from the output
+    if "Dispatch Bandwidth (GB/s)" in df.columns or "Combine Bandwidth (GB/s)" in df.columns:
+        dispatch_bw = pd.to_numeric(df["Dispatch Bandwidth (GB/s)"], errors="coerce").mean()
+        combine_bw = pd.to_numeric(df["Combine Bandwidth (GB/s)"], errors="coerce").mean()
+        return ("FP8 Dispatch", dispatch_bw if not pd.isna(dispatch_bw) else 0), (
+            "Combine",
+            combine_bw if not pd.isna(combine_bw) else 0,
+        )
 
-    return fwd_tflops if not pd.isna(fwd_tflops) else 0, bwd_tflops if not pd.isna(bwd_tflops) else 0
+    fw_tflops = pd.to_numeric(df["Forward TFLOPS"], errors="coerce").mean()
+    bw_tflops = pd.to_numeric(df["Backward TFLOPS"], errors="coerce").mean()
+
+    return ("Fwd", fw_tflops if not pd.isna(fw_tflops) else 0), (
+        "Bwd",
+        bw_tflops if not pd.isna(bw_tflops) else 0,
+    )
 
 
 def generate_summary_table(data_dir, date_str, gpus, output_file=None):
@@ -160,7 +175,7 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
 
         for op_name, frameworks in benchmark_ops.items():
             for framework_name, csv_filename in frameworks.items():
-                fwd_tflops, bwd_tflops = get_avg_tflops(
+                (metric1_name, metric1_val), (metric2_name, metric2_val) = get_avg_metric(
                     gpu_data_dir, csv_filename, expected_gpu=gpu, expected_platform=expected_platform
                 )
                 summary_data.append(
@@ -169,8 +184,8 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
                         "Op": op_name,
                         "GPU": gpu,
                         "Framework": framework_name,
-                        "Stage": "Fwd",
-                        date_str: f"{fwd_tflops:.2f}",
+                        "Stage": metric1_name,
+                        date_str: f"{metric1_val:.2f}",
                     }
                 )
                 idx += 1
@@ -180,8 +195,8 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
                         "Op": op_name,
                         "GPU": gpu,
                         "Framework": framework_name,
-                        "Stage": "Bwd",
-                        date_str: f"{bwd_tflops:.2f}",
+                        "Stage": metric2_name,
+                        date_str: f"{metric2_val:.2f}",
                     }
                 )
                 idx += 1
