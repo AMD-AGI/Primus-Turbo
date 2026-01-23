@@ -24,8 +24,10 @@ def quant_fp8_blockwise_kernel(
     x_ptr,
     x_fp8_ptr,
     x_scales_ptr,
-    M,
-    N,
+    M_in,  # Input M (for masking)
+    N_in,  # Input N (for masking and input stride)
+    M_out,  # Output M (for output stride)
+    N_out,  # Output N (for output stride)
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
@@ -34,26 +36,26 @@ def quant_fp8_blockwise_kernel(
     pid_n = tl.program_id(axis=1)
     offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
     offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    mask = (offs_m[:, None] < M_in) & (offs_n[None, :] < N_in)
 
-    # Load [BLOCK_SIZE, BLOCK_SIZE]
-    x_ptrs = x_ptr + offs_m[:, None] * N + offs_n[None, :]
+    # Load [BLOCK_SIZE, BLOCK_SIZE] from input (stride = N_in)
+    x_ptrs = x_ptr + offs_m[:, None] * N_in + offs_n[None, :]
     x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     x_tile_abs = tl.abs(x_tile)
 
     x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX)
 
-    # Store
-    x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
+    # Store to output (stride = N_out)
+    x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N_out + offs_n[None, :]
     tl.store(x_fp8_ptrs, x_fp8_tile.to(x_fp8_ptr.dtype.element_ty), mask=mask)
 
-    # Store scale
+    # Store scale (use output dimensions)
     if AXIS == 1:
-        scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
-        scale_mask = offs_m < M
+        scale_offs = offs_m * tl.cdiv(N_out, BLOCK_SIZE) + pid_n
+        scale_mask = offs_m < M_out
     else:
-        scale_offs = pid_m * N + offs_n
-        scale_mask = offs_n < N
+        scale_offs = pid_m * N_out + offs_n
+        scale_mask = offs_n < N_out
     x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
     tl.store(
         x_scales_ptr + scale_offs,
@@ -116,6 +118,82 @@ def quant_fp8_blockwise_segment_m_kernel(
     x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_ptrs, x_fp8_tile.to(x_fp8_ptr.dtype.element_ty), mask=mask)
 
+    scale_offs = pid_m * N + offs_n
+    scale_mask = offs_n < N
+    x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
+    tl.store(
+        x_scales_ptr + scale_offs,
+        x_scales_tile_inv,
+        mask=scale_mask,
+    )
+
+
+# Blockwise quantize with segment padding
+# Reads from original tensor, writes to padded tensor with segment alignment
+@triton.jit
+def quant_fp8_blockwise_segment_padding_kernel(
+    x_ptr,  # Input tensor [M_in, N]
+    x_fp8_ptr,  # Output tensor [M_out, N] (padded)
+    x_scales_ptr,  # Output scales [M_out // BLOCK_SIZE, N]
+    group_offs_ptr,  # Original group offsets [B+1]
+    padded_group_offs_ptr,  # Padded group offsets [B+1]
+    N,
+    num_groups,
+    BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """
+    Each program handles one BLOCK_SIZE x BLOCK_SIZE tile in the output (padded) space.
+    Maps back to input space using group offsets.
+    """
+    pid_m = tl.program_id(axis=0)  # Block index in M dimension (padded)
+    pid_n = tl.program_id(axis=1)  # Block index in N dimension
+
+    # Find which group this block belongs to by searching padded_group_offs
+    # Binary search to find group_id such that padded_group_offs[group_id] <= pid_m * BLOCK_SIZE < padded_group_offs[group_id+1]
+    group_id = 0
+    for g in range(num_groups):
+        padded_start = tl.load(padded_group_offs_ptr + g)
+        padded_end = tl.load(padded_group_offs_ptr + g + 1)
+        block_start = pid_m * BLOCK_SIZE
+        if block_start >= padded_start and block_start < padded_end:
+            group_id = g
+
+    # Get group boundaries
+    orig_group_start = tl.load(group_offs_ptr + group_id)
+    orig_group_end = tl.load(group_offs_ptr + group_id + 1)
+    padded_group_start = tl.load(padded_group_offs_ptr + group_id)
+
+    # Calculate offsets in padded output space
+    offs_m_out = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+
+    # Map output offset to input offset
+    # offs_m_in = orig_group_start + (offs_m_out - padded_group_start)
+    offs_m_in = orig_group_start + (offs_m_out - padded_group_start)
+
+    # Mask: valid if within original group and within N
+    mask = (
+        (offs_m_in[:, None] >= orig_group_start)
+        & (offs_m_in[:, None] < orig_group_end)
+        & (offs_n[None, :] < N)
+    )
+
+    # Load from input (using input offsets)
+    x_ptrs = x_ptr + offs_m_in[:, None] * N + offs_n[None, :]
+    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x_tile_abs = tl.abs(x_tile)
+
+    # Compute scale and quantize
+    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
+
+    # Store to padded output (using output offsets)
+    x_fp8_ptrs = x_fp8_ptr + offs_m_out[:, None] * N + offs_n[None, :]
+    # Output mask: always write to padded space (padding region will be 0)
+    out_mask = offs_n[None, :] < N
+    tl.store(x_fp8_ptrs, x_fp8_tile.to(x_fp8_ptr.dtype.element_ty), mask=out_mask)
+
+    # Store scale
     scale_offs = pid_m * N + offs_n
     scale_mask = offs_n < N
     x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
