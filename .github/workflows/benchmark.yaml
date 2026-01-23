@@ -162,10 +162,10 @@ jobs:
         timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_grouped_gemm_turbo.py --dtype fp8 --granularity blockwise -o "${BENCHMARK_OUTPUT_DIR}/grouped_gemm_fp8_blockwise_ck_benchmark.csv"
-      - name: "[3.12] Run DeepEP Intranode Benchmark (Turbo Backend)"
+      - name: "[4.1] Run DeepEP Intranode Benchmark (Turbo Backend)"
         timeout-minutes: 60
         continue-on-error: true
-        run: python3 benchmark/ops/deep_ep/bench_intranode.py --backend turbo -o "${BENCHMARK_OUTPUT_DIR}/deep_ep_intranode_turbo_benchmark.csv"
+        run: python3 benchmark/ops/bench_deepep_intranode.py --backend turbo -o "${BENCHMARK_OUTPUT_DIR}/deep_ep_intranode_turbo_benchmark.csv"
       - name: "Copy H200 benchmark data"
         run: |
           H200_LATEST_DIR="${BENCHMARK_ROOT_DIR}/H200/latest"

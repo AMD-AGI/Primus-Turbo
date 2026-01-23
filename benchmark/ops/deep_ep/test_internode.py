@@ -17,7 +17,8 @@ import time
 
 import torch
 import torch.distributed as dist
-from utils import (
+
+from .utils import (
     bench,
     bench_kineto,
     calc_diff,
