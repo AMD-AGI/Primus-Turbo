@@ -169,7 +169,7 @@ FP8 quantization is configured through `Float8QuantConfig`:
   - `ScalingGranularity.MX_BLOCKWISE`
 - **scale dtype**
   - `ScaleDtype.FP32` (default)
-  - `ScaleDtype.E8MO` (for mx)
+  - `ScaleDtype.E8M0` (for mx)
 - **block_size**
   - Specifies the size of each block when using BLOCKWISE and MX_BLOCKWISE granularity.
   - This parameter must be explicitly specified in BLOCKWISE and MX_BLOCKWISE mode; otherwise, an error will be raised.
@@ -271,7 +271,7 @@ print(c.shape)  # [128, 256]
 
 ### 3.4 FP4 GEMM
 
-For FP4 GEMM, it will apply some recipe (such as 2D block quantize and random hadamard transform) in quantization. Refercen: https://arxiv.org/pdf/2509.25149
+For FP4 GEMM, it will apply some recipe (such as 2D block quantize and random hadamard transform) in quantization. Reference: https://arxiv.org/pdf/2509.25149
 
 
 Computation flow:

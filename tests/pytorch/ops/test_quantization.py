@@ -278,7 +278,7 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.ones((B, M, N), device="cuda", dtype=orig_dtype) * 4
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
     x.detach().clone()
 
     row_length = x.size(-1)
@@ -292,7 +292,6 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
         block_size=MX_BLOCK_SIZE,
         scaling_recipe=scaling_recipe,
     )
-    print(x_scale_inv.view(torch.uint8))
 
     # check quantize and dequantize precision
     out = dequantize_fp4(
