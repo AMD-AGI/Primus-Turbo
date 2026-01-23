@@ -209,3 +209,75 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
         balance=balance,
         block_size=block_size,
     )
+
+
+# Test case for group_lens containing zeros (MoE scenario where some experts receive no tokens)
+# This matches the actual bug scenario from primus_turbo_ut.py:
+#   E=8, in_features=2048, out_features=8192, group_lens=[8192, 8192, 0, 0, 0, 0, 0, 0]
+def test_grouped_gemm_fp8_blockwise_zero_group_lens():
+    """
+    Test block-wise scaling FP8 group GEMM with group_lens containing zeros.
+    
+    This reproduces the crash that occurs in MoE scenarios where some experts
+    receive no tokens during routing.
+    
+    Bug: backward pass crashes with illegal memory access when group_lens contains 0.
+    """
+    device = "cuda:0"
+    ori_dtype = torch.bfloat16
+    
+    # Match the actual bug scenario
+    E = 8  # Number of experts
+    K = 2048  # in_features
+    N = 8192  # out_features
+    
+    # MoE routing: only first 2 experts receive tokens, rest get 0
+    group_lens_list = [8192, 8192, 0, 0, 0, 0, 0, 0]
+    group_lens = torch.tensor(group_lens_list, dtype=torch.int64, device=device)
+    total_m = group_lens.sum().item()  # 16384
+    
+    print(f"\ngroup_lens={group_lens_list}, total_M={total_m}, N={N}, K={K}")
+    
+    B = E
+    b_shape = (B, N, K)  # trans_b=True
+    
+    a = torch.randn((total_m, K), dtype=ori_dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+    
+    # Ref
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    torch.cuda.synchronize()
+    
+    # Turbo with BLOCKWISE scaling
+    config = Float8QuantConfig(
+        format=Format.E4M3,
+        granularity=ScalingGranularity.BLOCKWISE,
+        block_size=128
+    )
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+    out.backward(grad_out)  # This crashes without the fix
+    
+    # Check Shape
+    assert out.shape == out_ref.shape
+    assert a.grad.shape == a_ref.grad.shape
+    assert b.grad.shape == b_ref.grad.shape
+    
+    # Check Results
+    snr_threshold = 25
+    
+    out_snr = compute_snr(out_ref, out)
+    print(f"Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > snr_threshold, "out_snr too low"
+    
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+    
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
