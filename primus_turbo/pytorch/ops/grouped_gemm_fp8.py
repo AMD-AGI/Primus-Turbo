@@ -23,74 +23,13 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
+    quant_fp8_blockwise_with_segment_padding_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 __all__ = [
     "grouped_gemm_fp8",
 ]
-
-
-def _needs_padding_for_blockwise(group_offs: torch.Tensor, block_size: int = 128) -> bool:
-    """Check if any group boundary is not aligned to block_size."""
-    # group_offs[1:] are the boundaries (excluding the initial 0)
-    # Check if all boundaries are divisible by block_size
-    boundaries = group_offs[1:-1]  # Exclude first (0) and last (total)
-    if boundaries.numel() == 0:
-        return False
-    return not torch.all(boundaries % block_size == 0).item()
-
-
-def _pad_for_blockwise_variable_k(
-    tensor: torch.Tensor,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    block_size: int = 128,
-):
-    """
-    Pad tensor along the K dimension to align group boundaries to block_size.
-
-    Args:
-        tensor: Input tensor of shape [total_K, width]
-        group_lens: Group lengths tensor of shape [B]
-        group_offs: Group offsets tensor of shape [B+1]
-        block_size: Block size for alignment (default 128)
-
-    Returns:
-        padded_tensor: Padded tensor with aligned group boundaries
-        padded_group_lens: New group lengths (each padded to multiple of block_size)
-        padded_group_offs: New group offsets (all aligned to block_size)
-    """
-    device = tensor.device
-    dtype = tensor.dtype
-    total_K, width = tensor.shape
-
-    # Calculate padded group_lens (each group K padded to multiple of block_size)
-    padded_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
-
-    # Calculate new group_offs
-    padded_group_offs = torch.zeros_like(group_offs)
-    padded_group_offs[1:] = torch.cumsum(padded_group_lens, dim=0)
-
-    total_padded_K = padded_group_offs[-1].item()
-
-    # Create padded tensor (zeros for padding regions)
-    padded_tensor = torch.zeros(total_padded_K, width, dtype=dtype, device=device)
-
-    # Compute cumulative padding before each group
-    cumulative_padding = padded_group_offs[:-1] - group_offs[:-1]  # [B]
-
-    # Create row indices and find group assignment using searchsorted
-    row_indices = torch.arange(total_K, device=device, dtype=torch.int64)
-    group_ids = torch.searchsorted(group_offs[1:], row_indices, right=True)
-
-    # Calculate destination indices: src_idx + cumulative_padding[group_id]
-    dst_indices = row_indices + cumulative_padding[group_ids]
-
-    # Scatter source rows to destination (fully vectorized)
-    padded_tensor[dst_indices] = tensor
-
-    return padded_tensor, padded_group_lens, padded_group_offs
 
 
 class GroupedGemmFP8BlockFunc(torch.autograd.Function):
@@ -113,7 +52,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         trans_b: bool,
         config: Float8QuantConfig,
         num_cu: int | None,
-        padding: bool = False,  # Controls padding behavior during HIP graph capture; in normal execution, padding is auto-detected.
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
@@ -145,29 +83,13 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # During graph capture, use padding parameter; otherwise check dynamically
-        if torch.cuda.is_current_stream_capturing():
-            needs_padding = padding
-        else:
-            needs_padding = _needs_padding_for_blockwise(group_offs, config.block_size)
-        if needs_padding:
-            # Pad tensors to align group boundaries to block_size
-            a_padded, padded_group_lens, padded_group_offs = _pad_for_blockwise_variable_k(
-                a, group_lens, group_offs, config.block_size
+        # Quantize for backward pass with segment-aware padding (colwise quantization)
+        # Returns padded tensor and updated group_lens/group_offs for variable-K GEMM
+        a_fp8_col, a_scale_inv_col, var_k_group_lens, var_k_group_offs = (
+            quant_fp8_blockwise_with_segment_padding_impl(
+                a, a_dtype, config.block_size, group_lens, group_offs
             )
-            # Quantize padded tensors
-            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
-                a_padded, a_dtype, axis=0, block_size=config.block_size
-            )
-            var_k_group_lens = padded_group_lens
-            var_k_group_offs = padded_group_offs
-        else:
-            # No padding needed, use original tensors
-            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
-                a, a_dtype, axis=0, block_size=config.block_size
-            )
-            var_k_group_lens = group_lens
-            var_k_group_offs = group_offs
+        )
 
         ctx.save_for_backward(
             a_fp8_col,
@@ -184,7 +106,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.needs_padding = needs_padding
 
         return out
 
@@ -225,20 +146,10 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # For grad_b, we need col-wise quantization with padding for alignment
-        if ctx.needs_padding:
-            # Pad grad_out to align group boundaries to block_size
-            grad_out_padded, _, _ = _pad_for_blockwise_variable_k(
-                grad_out, group_lens, group_offs, block_size
-            )
-            grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_impl(
-                grad_out_padded, grad_out_dtype, axis=0, block_size=block_size
-            )
-        else:
-            # No padding needed, use original tensors
-            grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_impl(
-                grad_out, grad_out_dtype, axis=0, block_size=block_size
-            )
+        # Quantize grad_out with segment-aware padding for wgrad (colwise quantization)
+        grad_out_fp8_col, grad_out_scale_inv_col, _, _ = quant_fp8_blockwise_with_segment_padding_impl(
+            grad_out, grad_out_dtype, block_size, group_lens, group_offs
+        )
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8_col,
@@ -256,7 +167,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None
 
 
 class GroupedGemmFP8RowFunc(torch.autograd.Function):
@@ -475,7 +386,6 @@ def grouped_gemm_fp8(
     trans_b: bool = True,
     config: Union[Float8QuantConfig, None] = None,
     num_cu: int | None = None,
-    padding: bool = False,
 ) -> torch.Tensor:
     """ """
     supported_dtypes = [torch.bfloat16, torch.float16]
@@ -494,6 +404,6 @@ def grouped_gemm_fp8(
     elif config.granularity == ScalingGranularity.ROWWISE:
         return GroupedGemmFP8RowFunc.apply(*args)
     elif config.granularity == ScalingGranularity.BLOCKWISE:
-        return GroupedGemmFP8BlockFunc.apply(*args, padding)
+        return GroupedGemmFP8BlockFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

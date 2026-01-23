@@ -16,6 +16,7 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
+    quant_fp8_blockwise_segment_padding_kernel,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import (
     dequantize_mxfp4_kernel,
@@ -73,6 +74,7 @@ def quant_fp8_blockwise_impl(
     dtype: torch.dtype,
     axis: int,
     block_size: int = 128,
+    padding_align_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantization for fp8 blockwise.
@@ -80,8 +82,17 @@ def quant_fp8_blockwise_impl(
     Quantizes a 2D tensor using blockwise scale along the specified axis.
     Assumes `x` is contiguous and 2D.
 
+    Args:
+        x: Input tensor to quantize.
+        dtype: FP8 dtype for output.
+        axis: Axis along which to compute blockwise scales (0 or 1).
+        block_size: Block size for quantization.
+        padding_align_size: If provided, pad output to align dimension to this size.
+            For axis=0 (colwise), pads M dimension.
+            For axis=1 (rowwise), pads N dimension.
+
     Returns:
-        x_fp8: FP8-quantized tensor.
+        x_fp8: FP8-quantized tensor (possibly padded).
         x_scales: Per-block scale tensor in float32.
     """
 
@@ -90,17 +101,35 @@ def quant_fp8_blockwise_impl(
     axis = axis % 2  # Convert negative axis to positive
 
     M, N = x.shape
-    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
+
+    # Calculate padded dimensions
+    if padding_align_size is not None:
+        if axis == 0:  # colwise: pad M
+            M_padded = (M + padding_align_size - 1) // padding_align_size * padding_align_size
+            N_padded = N
+        else:  # rowwise: pad N
+            M_padded = M
+            N_padded = (N + padding_align_size - 1) // padding_align_size * padding_align_size
+    else:
+        M_padded, N_padded = M, N
+
+    x_fp8 = torch.empty((M_padded, N_padded), dtype=dtype, device=x.device)
+    scales_shape = (
+        (triton.cdiv(M_padded, block_size), N_padded)
+        if axis == 0
+        else (M_padded, triton.cdiv(N_padded, block_size))
+    )
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
 
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N_padded, block_size))
     wrap_triton(quant_fp8_blockwise_kernel)[grid](
         x,
         x_fp8,
         x_scales,
-        M,
-        N,
+        M,  # Input M for masking
+        N,  # Input N for masking and input stride
+        M_padded,  # Output M for output stride
+        N_padded,  # Output N for output stride
         block_size,
         torch.finfo(dtype).max,
         axis,
@@ -114,15 +143,119 @@ def quant_fp8_blockwise_impl_meta(
     dtype: torch.dtype,
     axis: int,
     block_size: int = 128,
+    padding_align_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, "Input must be 2D"
     assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
     axis = axis % 2  # Convert negative axis to positive
     M, N = x.shape
-    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
+
+    # Calculate padded dimensions
+    if padding_align_size is not None:
+        if axis == 0:  # colwise: pad M
+            M_padded = (M + padding_align_size - 1) // padding_align_size * padding_align_size
+            N_padded = N
+        else:  # rowwise: pad N
+            M_padded = M
+            N_padded = (N + padding_align_size - 1) // padding_align_size * padding_align_size
+    else:
+        M_padded, N_padded = M, N
+
+    x_fp8 = torch.empty((M_padded, N_padded), dtype=dtype, device=x.device)
+    scales_shape = (
+        (triton.cdiv(M_padded, block_size), N_padded)
+        if axis == 0
+        else (M_padded, triton.cdiv(N_padded, block_size))
+    )
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8, x_scales
+
+
+@triton_op("primus_turbo::quant_fp8_blockwise_with_segment_padding_impl", mutates_args=())
+def quant_fp8_blockwise_with_segment_padding_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,  # [B,] int64 - segment lengths
+    group_offs: torch.Tensor,  # [B+1,] int64 - segment offsets
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantization for fp8 blockwise with segment-aware padding (colwise only, axis=0).
+
+    Each segment is padded independently to align to block_size.
+    This is used for variable-K grouped GEMM backward pass.
+
+    Args:
+        x: Input tensor [M, N] to quantize.
+        dtype: FP8 dtype for output.
+        block_size: Block size for quantization and padding alignment.
+        group_lens: Segment lengths [B].
+        group_offs: Segment offsets [B+1].
+
+    Returns:
+        x_fp8: FP8-quantized tensor [M_padded, N].
+        x_scales: Per-block scale tensor [M_padded // block_size, N] in float32.
+        padded_group_lens: Padded segment lengths [B].
+        padded_group_offs: Padded segment offsets [B+1].
+    """
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    # Compute padded group lens and offs (all tensor operations, no .item())
+    padded_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    padded_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
+    padded_group_offs[1:] = torch.cumsum(padded_group_lens, dim=0)
+
+    # Calculate max possible M_padded (conservative upper bound to avoid .item())
+    # Each group can add at most (block_size - 1) padding
+    M_padded = M + num_groups * block_size
+
+    # Allocate output tensors
+    x_fp8 = torch.zeros((M_padded, N), dtype=dtype, device=x.device)
+    scales_shape = (triton.cdiv(M_padded, block_size), N)
+    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
+
+    # Launch kernel - one block per BLOCK_SIZE x BLOCK_SIZE tile in output space
+    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_segment_padding_kernel)[grid](
+        x,
+        x_fp8,
+        x_scales,
+        group_offs,
+        padded_group_offs,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+
+    return x_fp8, x_scales, padded_group_lens, padded_group_offs
+
+
+@quant_fp8_blockwise_with_segment_padding_impl.register_fake
+def quant_fp8_blockwise_with_segment_padding_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2, "Input must be 2D"
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    # Conservative upper bound for M_padded
+    M_padded = M + num_groups * block_size
+
+    x_fp8 = torch.empty((M_padded, N), dtype=dtype, device=x.device)
+    scales_shape = (triton.cdiv(M_padded, block_size), N)
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+
+    padded_group_lens = torch.empty(num_groups, dtype=torch.int64, device=x.device)
+    padded_group_offs = torch.empty(num_groups + 1, dtype=torch.int64, device=x.device)
+
+    return x_fp8, x_scales, padded_group_lens, padded_group_offs
 
 
 @triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
