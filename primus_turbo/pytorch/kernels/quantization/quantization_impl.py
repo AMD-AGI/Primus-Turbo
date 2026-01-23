@@ -15,7 +15,6 @@ from primus_turbo.pytorch.kernels.quantization.hadamard_transform import get_rht
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
-    quant_fp8_blockwise_segment_padding_kernel,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import (
     dequantize_mxfp4_kernel,
@@ -67,108 +66,6 @@ def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: i
     raise NotImplementedError(f"Un-impl")
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
-def _quant_fp8_blockwise_impl_inner(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    axis: int,
-    block_size: int,
-    M_padded: int,
-    N_padded: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inner implementation for blockwise quantization with pre-computed padding."""
-    M, N = x.shape
-    x_fp8 = torch.empty((M_padded, N_padded), dtype=dtype, device=x.device)
-    scales_shape = (
-        (triton.cdiv(M_padded, block_size), N_padded)
-        if axis == 0
-        else (M_padded, triton.cdiv(N_padded, block_size))
-    )
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
-
-    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N_padded, block_size))
-    wrap_triton(quant_fp8_blockwise_kernel)[grid](
-        x,
-        x_fp8,
-        x_scales,
-        M,
-        N,
-        M_padded,
-        N_padded,
-        block_size,
-        torch.finfo(dtype).max,
-        axis,
-    )
-    return x_fp8, x_scales
-
-
-@_quant_fp8_blockwise_impl_inner.register_fake
-def _quant_fp8_blockwise_impl_inner_meta(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    axis: int,
-    block_size: int,
-    M_padded: int,
-    N_padded: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    x_fp8 = torch.empty((M_padded, N_padded), dtype=dtype, device=x.device)
-    scales_shape = (
-        (triton.cdiv(M_padded, block_size), N_padded)
-        if axis == 0
-        else (M_padded, triton.cdiv(N_padded, block_size))
-    )
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
-    return x_fp8, x_scales
-
-
-@triton_op("primus_turbo::quant_fp8_blockwise_segment_padding_impl", mutates_args=())
-def _quant_fp8_blockwise_segment_padding_impl_inner(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int,
-    M_padded: int,
-    group_offs: torch.Tensor,
-    padded_group_offs: torch.Tensor,
-    num_groups: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inner implementation for segment padding quantization."""
-    M, N = x.shape
-    x_fp8 = torch.zeros((M_padded, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M_padded, block_size), N)
-    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
-
-    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_segment_padding_kernel)[grid](
-        x,
-        x_fp8,
-        x_scales,
-        group_offs,
-        padded_group_offs,
-        N,
-        num_groups,
-        block_size,
-        torch.finfo(dtype).max,
-    )
-    return x_fp8, x_scales
-
-
-@_quant_fp8_blockwise_segment_padding_impl_inner.register_fake
-def _quant_fp8_blockwise_segment_padding_impl_inner_meta(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int,
-    M_padded: int,
-    group_offs: torch.Tensor,
-    padded_group_offs: torch.Tensor,
-    num_groups: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    M, N = x.shape
-    x_fp8 = torch.empty((M_padded, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M_padded, block_size), N)
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
-    return x_fp8, x_scales
-
-
 def quant_fp8_blockwise_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
@@ -210,27 +107,47 @@ def quant_fp8_blockwise_impl(
 
     M, N = x.shape
 
-    # Segment padding mode (for variable-K GEMM backward)
+    # Segment padding mode (with group_lens/group_offs)
     if group_lens is not None and group_offs is not None:
         assert axis == 0, "Segment padding only supported for axis=0 (colwise)"
         num_groups = group_lens.size(0)
-
-        # Compute padded group lens and offs (all tensor operations, no .item())
         var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
         var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
         var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
-
-        # Conservative upper bound for M_padded (avoids .item())
         M_padded = M + num_groups * block_size
+    else:
+        # Standard mode (single group covering entire tensor)
+        num_groups = 1
+        group_offs = torch.tensor([0, M], dtype=torch.int64, device=x.device)
+        var_k_group_lens = None
+        var_k_group_offs = group_offs
+        M_padded = M
 
-        x_fp8, x_scales = _quant_fp8_blockwise_segment_padding_impl_inner(
-            x, dtype, block_size, M_padded, group_offs, var_k_group_offs, num_groups
-        )
+    # Allocate output tensors
+    x_fp8 = torch.zeros((M_padded, N), dtype=dtype, device=x.device)
+    scales_shape = (
+        (M_padded, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M_padded, block_size), N)
+    )
+    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
+
+    # Launch kernel
+    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N, block_size))
+    quant_fp8_blockwise_kernel[grid](
+        x,
+        x_fp8,
+        x_scales,
+        N,
+        M_padded,
+        group_offs,
+        var_k_group_offs,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+        axis,
+    )
+
+    if var_k_group_lens is not None:
         return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
-
-    # Standard mode (no segment padding)
-    M_padded, N_padded = M, N
-    x_fp8, x_scales = _quant_fp8_blockwise_impl_inner(x, dtype, axis, block_size, M_padded, N_padded)
     return x_fp8, x_scales
 
 
