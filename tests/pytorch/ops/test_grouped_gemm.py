@@ -85,3 +85,68 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     # Reset config and caches
     GlobalBackendManager.reset()
+
+
+def generate_grouped_gemm_group_lens_with_zeros(b, m, num_zero):
+    assert num_zero < b, f"num_zero ({num_zero}) must be less than b ({b})"
+
+    total = b * m
+    num_nonzero = b - num_zero
+    group_lens = torch.zeros(b, dtype=torch.int64)
+
+    nonzero_indices = torch.randperm(b)[:num_nonzero]
+
+    base = total // num_nonzero
+    remainder = total % num_nonzero
+
+    group_lens[nonzero_indices] = base
+    group_lens[nonzero_indices[:remainder]] += 1
+
+    return group_lens
+
+
+@pytest.mark.parametrize("B", [8])
+@pytest.mark.parametrize("M", [2048])
+@pytest.mark.parametrize("N_K", [(4096, 4096)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("trans_b", [True])
+@pytest.mark.parametrize("backend", [BackendType.CK])
+@pytest.mark.parametrize("num_zero", [1, 2])
+def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend, num_zero):
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+
+    device = "cuda"
+    N, K = N_K
+    group_lens = generate_grouped_gemm_group_lens_with_zeros(B, M, num_zero=num_zero).to(device)
+    print(B, M, N, K, dtype, trans_b, backend, num_zero)
+    print(f"group_lens: {group_lens}")
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+    a = torch.randn((B * M, K), dtype=torch.float32, device=device)
+    b = torch.randn(b_shape, dtype=torch.float32, device=device)
+    a = a.to(dtype).requires_grad_(True)
+    b = b.to(dtype).requires_grad_(True)
+
+    zero_mask = group_lens == 0
+    zero_count = int(zero_mask.sum().item())
+    assert (
+        zero_count == num_zero
+    ), f"expected num_zero={num_zero}, but got {zero_count}; group_lens={group_lens}"
+    zero_indices = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
+    print(f"zero_indices: {zero_indices}")
+
+    out = grouped_gemm(a, b, group_lens, trans_b=trans_b)
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+
+    assert b.grad is not None
+    for idx in zero_indices:
+        torch.testing.assert_close(
+            b.grad[idx],
+            torch.zeros_like(b.grad[idx]),
+            rtol=0.0,
+            atol=0.0,
+            msg=f"Expected b.grad[{idx}] to be all zeros when group_len==0 (group_lens={group_lens}).",
+        )
+
+    GlobalBackendManager.reset()
