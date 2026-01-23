@@ -23,7 +23,6 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
-    quant_fp8_blockwise_with_segment_padding_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
@@ -83,12 +82,9 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # Quantize for backward pass with segment-aware padding (colwise quantization)
-        # Returns padded tensor and updated group_lens/group_offs for variable-K GEMM
-        a_fp8_col, a_scale_inv_col, var_k_group_lens, var_k_group_offs = (
-            quant_fp8_blockwise_with_segment_padding_impl(
-                a, a_dtype, config.block_size, group_lens, group_offs
-            )
+        # Quantize for backward pass with segment padding (colwise quantization)
+        a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_impl(
+            a, a_dtype, axis=0, block_size=config.block_size, group_lens=group_lens, group_offs=group_offs
         )
 
         ctx.save_for_backward(
@@ -98,8 +94,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             b_scale_inv,
             group_lens,
             group_offs,
-            var_k_group_lens,
-            var_k_group_offs,
         )
         ctx.trans_a = False
         ctx.trans_b = trans_b
@@ -119,8 +113,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             b_scale_inv,
             group_lens,
             group_offs,
-            var_k_group_lens,
-            var_k_group_offs,
         ) = ctx.saved_tensors
         block_size = ctx.config.block_size
         grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
@@ -146,9 +138,16 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # Quantize grad_out with segment-aware padding for wgrad (colwise quantization)
-        grad_out_fp8_col, grad_out_scale_inv_col, _, _ = quant_fp8_blockwise_with_segment_padding_impl(
-            grad_out, grad_out_dtype, block_size, group_lens, group_offs
+        # Quantize grad_out with segment padding for wgrad (colwise quantization)
+        grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
+            quant_fp8_blockwise_impl(
+                grad_out,
+                grad_out_dtype,
+                axis=0,
+                block_size=block_size,
+                group_lens=group_lens,
+                group_offs=group_offs,
+            )
         )
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
