@@ -62,9 +62,11 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
 
         a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
         b_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
+
         a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
             a, a_dtype, axis=1, block_size=config.block_size
         )
+
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
         out = grouped_gemm_fp8_impl(
@@ -82,7 +84,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # Quantize for backward pass with segment padding (colwise quantization)
         a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_impl(
             a, a_dtype, axis=0, block_size=config.block_size, group_lens=group_lens, group_offs=group_offs
         )
