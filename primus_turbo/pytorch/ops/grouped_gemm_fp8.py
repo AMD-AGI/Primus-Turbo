@@ -113,7 +113,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         trans_b: bool,
         config: Float8QuantConfig,
         num_cu: int | None,
-        padding: bool = False, # only used for graph capture in HIP
+        padding: bool = False,  # Controls padding behavior during HIP graph capture; in normal execution, padding is auto-detected.
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
