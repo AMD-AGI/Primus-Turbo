@@ -261,14 +261,6 @@ print(c)
 print(c.shape)  # [128, 256]
 ```
 
-**Quantization Config (Float8QuantConfig)**
-* format
-    * Format.E4M3 (default)
-    * Format.E5M2
-* granularity
-    * ScalingGranularity.TENSORWISE (default)
-    * ScalingGranularity.ROWWISE
-
 ### 3.4 FP4 GEMM
 
 For FP4 GEMM, it will apply some recipe (such as 2D block quantize and random hadamard transform) in quantization. Reference: https://arxiv.org/pdf/2509.25149
