@@ -113,6 +113,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         trans_b: bool,
         config: Float8QuantConfig,
         num_cu: int | None,
+        padding: bool = False, # only used for graph capture in HIP
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
@@ -144,7 +145,11 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        needs_padding = _needs_padding_for_blockwise(group_offs, config.block_size)
+        # During graph capture, use padding parameter; otherwise check dynamically
+        if torch.cuda.is_current_stream_capturing():
+            needs_padding = padding
+        else:
+            needs_padding = _needs_padding_for_blockwise(group_offs, config.block_size)
         if needs_padding:
             # Pad tensors to align group boundaries to block_size
             a_padded, padded_group_lens, padded_group_offs = _pad_for_blockwise_variable_k(
@@ -251,7 +256,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None
 
 
 class GroupedGemmFP8RowFunc(torch.autograd.Function):
@@ -470,6 +475,7 @@ def grouped_gemm_fp8(
     trans_b: bool = True,
     config: Union[Float8QuantConfig, None] = None,
     num_cu: int | None = None,
+    padding: bool = False,
 ) -> torch.Tensor:
     """ """
     supported_dtypes = [torch.bfloat16, torch.float16]
@@ -488,6 +494,6 @@ def grouped_gemm_fp8(
     elif config.granularity == ScalingGranularity.ROWWISE:
         return GroupedGemmFP8RowFunc.apply(*args)
     elif config.granularity == ScalingGranularity.BLOCKWISE:
-        return GroupedGemmFP8BlockFunc.apply(*args)
+        return GroupedGemmFP8BlockFunc.apply(*args, padding)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
