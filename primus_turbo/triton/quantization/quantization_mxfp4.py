@@ -8,7 +8,7 @@
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.utils.quantization_helper import calculate_e8m0_scale
+from primus_turbo.triton.utils.quantization_helper import calculate_fp4_e8m0_scale
 from primus_turbo.triton.utils.triton_lang_helper import generate_randval_4x
 
 
@@ -150,9 +150,9 @@ def quantize_mxfp4_kernel(
                     x_chunk = tl.dot(x_chunk.to(tl.bfloat16), hadamard_matrix).to(tl.float32)
 
                 if ROWWISE_USE_2D_BLOCK:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+                    biased_exponent = calculate_fp4_e8m0_scale(x_chunk, axis=None)
                 else:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
+                    biased_exponent = calculate_fp4_e8m0_scale(x_chunk, axis=-1)
 
                 scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
                 scale_inv_store_offsets = (
@@ -204,9 +204,9 @@ def quantize_mxfp4_kernel(
                     x_chunk = tl.dot(hadamard_matrix_t, x_chunk.to(tl.bfloat16)).to(tl.float32)
 
                 if COLWISE_USE_2D_BLOCK:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+                    biased_exponent = calculate_fp4_e8m0_scale(x_chunk, axis=None)
                 else:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
+                    biased_exponent = calculate_fp4_e8m0_scale(x_chunk, axis=0)
 
                 scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
                 scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_colwise_col + (

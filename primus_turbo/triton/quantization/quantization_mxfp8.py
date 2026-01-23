@@ -9,8 +9,9 @@ import triton
 import triton.language as tl
 
 from primus_turbo.triton.utils.quantization_helper import (
-    calculate_e8m0_scale,
-    exp2f_rcp,
+    E8M0_EXPONENT_BIAS,
+    calculate_fp8_e8m0_scale,
+    scale_e8m0_to_rcp,
 )
 
 
@@ -82,9 +83,13 @@ def quantize_mxfp8_kernel(
                 tl.device_assert(y_rowwise_ptr is not None)
 
                 if ROWWISE_USE_2D_BLOCK:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+                    biased_exponent = calculate_fp8_e8m0_scale(
+                        x_chunk, axis=None, FP8_DTYPE=y_rowwise_ptr.type.element_ty
+                    )
                 else:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=-1)
+                    biased_exponent = calculate_fp8_e8m0_scale(
+                        x_chunk, axis=-1, FP8_DTYPE=y_rowwise_ptr.type.element_ty
+                    )
 
                 scale_offset_X = (pid_n * num_chunks_in_block_X) + chunk_id_x
                 scale_inv_store_offsets = (
@@ -99,7 +104,7 @@ def quantize_mxfp8_kernel(
                     mask=scale_inv_store_mask,
                 )
 
-                block_inverse_scale = exp2f_rcp(biased_exponent)
+                block_inverse_scale = scale_e8m0_to_rcp(biased_exponent)
                 y_chunk_scaled = x_chunk * block_inverse_scale
 
                 store_mask = (offsets_Y < padded_n_rows)[:, None] & (offsets_X < padded_n_cols)[None, :]
@@ -120,9 +125,13 @@ def quantize_mxfp8_kernel(
                 tl.device_assert(y_colwise_ptr is not None)
 
                 if COLWISE_USE_2D_BLOCK:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=None)
+                    biased_exponent = calculate_fp8_e8m0_scale(
+                        x_chunk, axis=None, FP8_DTYPE=y_colwise_ptr.type.element_ty
+                    )
                 else:
-                    biased_exponent = calculate_e8m0_scale(x_chunk, axis=0)
+                    biased_exponent = calculate_fp8_e8m0_scale(
+                        x_chunk, axis=0, FP8_DTYPE=y_colwise_ptr.type.element_ty
+                    )
 
                 scale_offset_Y = (pid_m * num_chunks_in_block_Y) + chunk_id_y
                 scale_inv_store_offsets = scale_offset_Y * stride_scale_inv_colwise_col + (
@@ -137,7 +146,7 @@ def quantize_mxfp8_kernel(
                     mask=scale_inv_store_mask,
                 )
 
-                block_inverse_scale = exp2f_rcp(biased_exponent)
+                block_inverse_scale = scale_e8m0_to_rcp(biased_exponent)
                 y_chunk_scaled = x_chunk * block_inverse_scale
                 store_mask = (offsets_Y < padded_n_rows)[:, None] & (offsets_X < padded_n_cols)[None, :]
                 y_ptr_current_chunk = (
@@ -206,10 +215,10 @@ def dequantize_mxfp8_kernel(
             scale_inv_load_mask = (offsets_Y < scale_n_rows)[:, None] & (scale_offset_X < scale_n_cols)
 
             biased_exponent = tl.load(
-                scale_inv_ptr + scale_inv_load_offsets, mask=scale_inv_load_mask, other=127
+                scale_inv_ptr + scale_inv_load_offsets, mask=scale_inv_load_mask, other=E8M0_EXPONENT_BIAS
             )
 
-            block_scale = tl.exp2(biased_exponent.to(tl.float32) - 127)
+            block_scale = tl.exp2(biased_exponent.to(tl.float32) - E8M0_EXPONENT_BIAS)
             y_chunk_scaled = x_chunk.to(tl.float32) * block_scale
 
             if USE_ROWWISE:
