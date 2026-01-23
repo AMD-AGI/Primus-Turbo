@@ -182,7 +182,7 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
         __syncthreads();
 
         // Wait previous operations to be finished
-        if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
+        if (thread_id == WARP_SIZE)
             nvshmemi_ibgda_quiet(nvl_rank, 0);
         __syncthreads();
 

@@ -1281,23 +1281,23 @@ Buffer::internode_combine(
 void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden,
                                       int num_experts) {
 #ifndef DISABLE_ROCSHMEM
-    EP_HOST_ASSERT(low_latency_mode);
+    // EP_HOST_ASSERT(low_latency_mode);
 
-    auto layout       = LowLatencyLayout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden,
-                                         num_ranks, num_experts);
-    auto clean_meta_0 = layout.buffers[0].clean_meta();
-    auto clean_meta_1 = layout.buffers[1].clean_meta();
+    // auto layout       = LowLatencyLayout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden,
+    //                                      num_ranks, num_experts);
+    // auto clean_meta_0 = layout.buffers[0].clean_meta();
+    // auto clean_meta_1 = layout.buffers[1].clean_meta();
 
-    auto check_boundary = [=](void *ptr, size_t num_bytes) {
-        auto offset = reinterpret_cast<int64_t>(ptr) - reinterpret_cast<int64_t>(rdma_buffer_ptr);
-        EP_HOST_ASSERT(0 <= offset and offset + num_bytes <= num_rdma_bytes);
-    };
-    check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
-    check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
+    // auto check_boundary = [=](void *ptr, size_t num_bytes) {
+    //     auto offset = reinterpret_cast<int64_t>(ptr) - reinterpret_cast<int64_t>(rdma_buffer_ptr);
+    //     EP_HOST_ASSERT(0 <= offset and offset + num_bytes <= num_rdma_bytes);
+    // };
+    // check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
+    // check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
 
-    internode_ll::clean_low_latency_buffer(
-        clean_meta_0.first, clean_meta_0.second, clean_meta_1.first, clean_meta_1.second, rank,
-        num_ranks, mask_buffer_ptr, sync_buffer_ptr, at::cuda::getCurrentCUDAStream());
+    // internode_ll::clean_low_latency_buffer(
+    //     clean_meta_0.first, clean_meta_0.second, clean_meta_1.first, clean_meta_1.second, rank,
+    //     num_ranks, mask_buffer_ptr, sync_buffer_ptr, at::cuda::getCurrentCUDAStream());
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
@@ -1311,130 +1311,131 @@ Buffer::low_latency_dispatch(const torch::Tensor &x, const torch::Tensor &topk_i
                              int num_max_dispatch_tokens_per_rank, int num_experts, bool use_fp8,
                              bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook) {
 #ifndef DISABLE_ROCSHMEM
-    EP_HOST_ASSERT(low_latency_mode);
+    // EP_HOST_ASSERT(low_latency_mode);
 
-    // Tensor checks
-    // By default using `ptp128c` FP8 cast
-    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
-    EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    // // Tensor checks
+    // // By default using `ptp128c` FP8 cast
+    // EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
+    // EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
+    // EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    // EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
+    // EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    // EP_HOST_ASSERT(num_experts % num_ranks == 0);
 
-    // Diagnosis tensors
-    if (cumulative_local_expert_recv_stats.has_value()) {
-        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
-        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->dim() == 1 and
-                       cumulative_local_expert_recv_stats->is_contiguous());
-        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->size(0) == num_experts / num_ranks);
-    }
-    if (dispatch_wait_recv_cost_stats.has_value()) {
-        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
-        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and
-                       dispatch_wait_recv_cost_stats->is_contiguous());
-        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == num_ranks);
-    }
+    // // Diagnosis tensors
+    // if (cumulative_local_expert_recv_stats.has_value()) {
+    //     EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+    //     EP_HOST_ASSERT(cumulative_local_expert_recv_stats->dim() == 1 and
+    //                    cumulative_local_expert_recv_stats->is_contiguous());
+    //     EP_HOST_ASSERT(cumulative_local_expert_recv_stats->size(0) == num_experts / num_ranks);
+    // }
+    // if (dispatch_wait_recv_cost_stats.has_value()) {
+    //     EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
+    //     EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and
+    //                    dispatch_wait_recv_cost_stats->is_contiguous());
+    //     EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == num_ranks);
+    // }
 
-    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
-    auto num_topk          = static_cast<int>(topk_idx.size(1));
-    auto num_local_experts = num_experts / num_ranks;
+    // auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    // auto num_topk          = static_cast<int>(topk_idx.size(1));
+    // auto num_local_experts = num_experts / num_ranks;
 
-    // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks,
-                            num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-    auto buffer      = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    // // Buffer control
+    // LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks,
+    //                         num_experts);
+    // EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+    // auto buffer      = layout.buffers[low_latency_buffer_idx];
+    // auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
-    // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream  = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // // Wait previous tasks to be finished
+    // // NOTES: the hook mode will always use the default stream
+    // auto compute_stream = at::cuda::getCurrentCUDAStream();
+    // auto launch_stream  = return_recv_hook ? compute_stream : comm_stream;
+    // EP_HOST_ASSERT(not(async and return_recv_hook));
+    // if (not return_recv_hook)
+    //     stream_wait(launch_stream, compute_stream);
 
-    // Allocate packed tensors
-    auto packed_recv_x =
-        torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                     x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-    auto packed_recv_src_info =
-        torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank},
-                     torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks},
-                                                 torch::dtype(torch::kInt64).device(torch::kCUDA));
-    auto packed_recv_count =
-        torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    // // Allocate packed tensors
+    // auto packed_recv_x =
+    //     torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+    //                  x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+    // auto packed_recv_src_info =
+    //     torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank},
+    //                  torch::dtype(torch::kInt32).device(torch::kCUDA));
+    // auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks},
+    //                                              torch::dtype(torch::kInt64).device(torch::kCUDA));
+    // auto packed_recv_count =
+    //     torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
-    // Allocate column-majored scales
-    auto  packed_recv_x_scales     = std::optional<torch::Tensor>();
-    void *packed_recv_x_scales_ptr = nullptr;
-    EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and
-                   "TMA requires the number of tokens to be multiple of 4");
+    // // Allocate column-majored scales
+    // auto  packed_recv_x_scales     = std::optional<torch::Tensor>();
+    // void *packed_recv_x_scales_ptr = nullptr;
+    // EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and
+    //                "TMA requires the number of tokens to be multiple of 4");
 
-    if (use_fp8) {
-        // TODO: support unaligned cases
-        EP_HOST_ASSERT(hidden % 512 == 0);
-        if (not use_ue8m0) {
-            packed_recv_x_scales = torch::empty(
-                {num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
-                torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        } else {
-            EP_HOST_ASSERT(round_scale);
-            packed_recv_x_scales = torch::empty(
-                {num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
-                torch::dtype(torch::kInt).device(torch::kCUDA));
-        }
-        packed_recv_x_scales     = torch::transpose(packed_recv_x_scales.value(), 1, 2);
-        packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
-    }
+    // if (use_fp8) {
+    //     // TODO: support unaligned cases
+    //     EP_HOST_ASSERT(hidden % 512 == 0);
+    //     if (not use_ue8m0) {
+    //         packed_recv_x_scales = torch::empty(
+    //             {num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
+    //             torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    //     } else {
+    //         EP_HOST_ASSERT(round_scale);
+    //         packed_recv_x_scales = torch::empty(
+    //             {num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
+    //             torch::dtype(torch::kInt).device(torch::kCUDA));
+    //     }
+    //     packed_recv_x_scales     = torch::transpose(packed_recv_x_scales.value(), 1, 2);
+    //     packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
+    // }
 
-    // Kernel launch
-    auto next_clean_meta = next_buffer.clean_meta();
-    auto launcher        = [=](int phases) {
-        internode_ll::dispatch(
-            packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-            packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
-            packed_recv_count.data_ptr<int>(), mask_buffer_ptr,
-            cumulative_local_expert_recv_stats.has_value()
-                       ? cumulative_local_expert_recv_stats->data_ptr<int>()
-                       : nullptr,
-            dispatch_wait_recv_cost_stats.has_value()
-                       ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>()
-                       : nullptr,
-            buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
-            buffer.dispatch_rdma_send_buffer, x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
-            next_clean_meta.first, next_clean_meta.second, num_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, use_fp8,
-            round_scale, use_ue8m0, workspace, num_device_sms, launch_stream, phases);
-    };
-    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE
-                              : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    // // Kernel launch
+    // auto next_clean_meta = next_buffer.clean_meta();
+    // auto launcher        = [=](int phases) {
+    //     internode_ll::dispatch(
+    //         packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
+    //         packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
+    //         packed_recv_count.data_ptr<int>(), mask_buffer_ptr,
+    //         cumulative_local_expert_recv_stats.has_value()
+    //                    ? cumulative_local_expert_recv_stats->data_ptr<int>()
+    //                    : nullptr,
+    //         dispatch_wait_recv_cost_stats.has_value()
+    //                    ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>()
+    //                    : nullptr,
+    //         buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
+    //         buffer.dispatch_rdma_send_buffer, x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
+    //         next_clean_meta.first, next_clean_meta.second, num_tokens, hidden,
+    //         num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, use_fp8,
+    //         round_scale, use_ue8m0, workspace, num_device_sms, launch_stream, phases);
+    // };
+    // launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE
+    //                           : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait
-        // happens, so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
+    // // Wait streams
+    // std::optional<EventHandle> event;
+    // if (async) {
+    //     // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait
+    //     // happens, so in Python API, we must wrap all tensors into the event handle.
+    //     event = EventHandle(launch_stream);
+    // } else if (not return_recv_hook) {
+    //     stream_wait(compute_stream, launch_stream);
+    // }
 
-    // Receiver callback
-    std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    // // Receiver callback
+    // std::optional<std::function<void()>> recv_hook = std::nullopt;
+    // if (return_recv_hook)
+    //     recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
-    // Return values
-    return {packed_recv_x,
-            packed_recv_x_scales,
-            packed_recv_count,
-            packed_recv_src_info,
-            packed_recv_layout_range,
-            event,
-            recv_hook};
+    // // Return values
+    // return {packed_recv_x,
+    //         packed_recv_x_scales,
+    //         packed_recv_count,
+    //         packed_recv_src_info,
+    //         packed_recv_layout_range,
+    //         event,
+    //         recv_hook};
+    return {};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -1450,99 +1451,100 @@ Buffer::low_latency_combine(const torch::Tensor &x, const torch::Tensor &topk_id
                             bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor> &out) {
 #ifndef DISABLE_ROCSHMEM
-    EP_HOST_ASSERT(low_latency_mode);
+    // EP_HOST_ASSERT(low_latency_mode);
 
-    // Tensor checks
-    EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
-    EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and
-                   topk_idx.size(1) == topk_weights.size(1));
-    EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
-    EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
-    EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
-    EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
-    EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and x.size(0) == src_info.size(0));
-    EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
-    EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
-                   layout_range.size(1) == num_ranks);
+    // // Tensor checks
+    // EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
+    // EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
+    // EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
+    // EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
+    // EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    // EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and
+    //                topk_idx.size(1) == topk_weights.size(1));
+    // EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    // EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
+    // EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
+    // EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    // EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
+    // EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and x.size(0) == src_info.size(0));
+    // EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
+    // EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
+    // EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
+    //                layout_range.size(1) == num_ranks);
 
-    if (combine_wait_recv_cost_stats.has_value()) {
-        EP_HOST_ASSERT(combine_wait_recv_cost_stats->scalar_type() == torch::kInt64);
-        EP_HOST_ASSERT(combine_wait_recv_cost_stats->dim() == 1 and
-                       combine_wait_recv_cost_stats->is_contiguous());
-        EP_HOST_ASSERT(combine_wait_recv_cost_stats->size(0) == num_ranks);
-    }
+    // if (combine_wait_recv_cost_stats.has_value()) {
+    //     EP_HOST_ASSERT(combine_wait_recv_cost_stats->scalar_type() == torch::kInt64);
+    //     EP_HOST_ASSERT(combine_wait_recv_cost_stats->dim() == 1 and
+    //                    combine_wait_recv_cost_stats->is_contiguous());
+    //     EP_HOST_ASSERT(combine_wait_recv_cost_stats->size(0) == num_ranks);
+    // }
 
-    auto hidden              = static_cast<int>(x.size(2));
-    auto num_topk            = static_cast<int>(topk_weights.size(1));
-    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+    // auto hidden              = static_cast<int>(x.size(2));
+    // auto num_topk            = static_cast<int>(topk_weights.size(1));
+    // auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
 
-    // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks,
-                            num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-    auto buffer      = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    // // Buffer control
+    // LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks,
+    //                         num_experts);
+    // EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+    // auto buffer      = layout.buffers[low_latency_buffer_idx];
+    // auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
-    // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream  = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // // Wait previous tasks to be finished
+    // // NOTES: the hook mode will always use the default stream
+    // auto compute_stream = at::cuda::getCurrentCUDAStream();
+    // auto launch_stream  = return_recv_hook ? compute_stream : comm_stream;
+    // EP_HOST_ASSERT(not(async and return_recv_hook));
+    // if (not return_recv_hook)
+    //     stream_wait(launch_stream, compute_stream);
 
-    // Allocate output tensor
-    torch::Tensor combined_x;
-    if (out.has_value()) {
-        EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
-        EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
-        EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
-        combined_x = out.value();
-    } else {
-        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
-    }
+    // // Allocate output tensor
+    // torch::Tensor combined_x;
+    // if (out.has_value()) {
+    //     EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
+    //     EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
+    //     EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
+    //     combined_x = out.value();
+    // } else {
+    //     combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    // }
 
-    // Kernel launch
-    auto next_clean_meta = next_buffer.clean_meta();
-    auto launcher        = [=](int phases) {
-        internode_ll::combine(
-            combined_x.data_ptr(), buffer.combine_rdma_recv_data_buffer,
-            buffer.combine_rdma_recv_flag_buffer, buffer.combine_rdma_send_buffer, x.data_ptr(),
-            topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
-            src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(), mask_buffer_ptr,
-            combine_wait_recv_cost_stats.has_value()
-                       ? combine_wait_recv_cost_stats->data_ptr<int64_t>()
-                       : nullptr,
-            next_clean_meta.first, next_clean_meta.second, num_combined_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, use_logfmt,
-            workspace, num_device_sms, launch_stream, phases, zero_copy);
-    };
-    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE
-                              : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    // // Kernel launch
+    // auto next_clean_meta = next_buffer.clean_meta();
+    // auto launcher        = [=](int phases) {
+    //     internode_ll::combine(
+    //         combined_x.data_ptr(), buffer.combine_rdma_recv_data_buffer,
+    //         buffer.combine_rdma_recv_flag_buffer, buffer.combine_rdma_send_buffer, x.data_ptr(),
+    //         topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
+    //         src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(), mask_buffer_ptr,
+    //         combine_wait_recv_cost_stats.has_value()
+    //                    ? combine_wait_recv_cost_stats->data_ptr<int64_t>()
+    //                    : nullptr,
+    //         next_clean_meta.first, next_clean_meta.second, num_combined_tokens, hidden,
+    //         num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, use_logfmt,
+    //         workspace, num_device_sms, launch_stream, phases, zero_copy);
+    // };
+    // launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE
+    //                           : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait
-        // happens, so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
+    // // Wait streams
+    // std::optional<EventHandle> event;
+    // if (async) {
+    //     // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait
+    //     // happens, so in Python API, we must wrap all tensors into the event handle.
+    //     event = EventHandle(launch_stream);
+    // } else if (not return_recv_hook) {
+    //     stream_wait(compute_stream, launch_stream);
+    // }
 
-    // Receiver callback
-    std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    // // Receiver callback
+    // std::optional<std::function<void()>> recv_hook = std::nullopt;
+    // if (return_recv_hook)
+    //     recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
-    // Return values
-    return {combined_x, event, recv_hook};
+    // // Return values
+    // return {combined_x, event, recv_hook};
+    return {};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};

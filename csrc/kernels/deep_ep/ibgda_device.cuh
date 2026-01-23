@@ -10,8 +10,8 @@ template <bool kAlwaysDoPostSend = false>
 __device__ static __forceinline__ void
 nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe,
                             int qp_id, int lane_id, int message_idx) {
-    rocshmem_ctx_putmem_nbi_wg(ROCSHMEM_CTX_DEFAULT, reinterpret_cast<void *>(req_rptr),
-                               reinterpret_cast<void *>(req_lptr), bytes, dst_pe);
+    rocshmem_putmem_nbi_wave(reinterpret_cast<void *>(req_rptr), reinterpret_cast<void *>(req_lptr),
+                             bytes, dst_pe);
 }
 
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, const int &value,
@@ -27,7 +27,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, cons
 
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
-    rocshmem_ctx_quiet(ROCSHMEM_CTX_DEFAULT);
+    rocshmem_fence();
 }
 
 } // namespace primus_turbo::deep_ep
