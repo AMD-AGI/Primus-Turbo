@@ -45,7 +45,8 @@ test_cases = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-def test_attention_16bit(batch, dtype, config, causal):
+@pytest.mark.parametrize("enable_sink", [False, True])
+def test_attention_16bit(batch, dtype, config, causal, enable_sink):
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -56,8 +57,17 @@ def test_attention_16bit(batch, dtype, config, causal):
         config.head_dim_v,
     )
 
+    # Sink attention constraints / runtime control (skip early to avoid big allocations)
+    if enable_sink:
+        # Triton kernel limitation for sink: requires same qk/v head dim and head dim > 32
+        if head_dim_qk != head_dim_v or head_dim_qk < 32:
+            pytest.skip("Sink attention requires head_dim_qk == head_dim_v and head_dim >= 32")
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
     print(
-        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}"
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}"
     )
 
     q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
@@ -73,8 +83,16 @@ def test_attention_16bit(batch, dtype, config, causal):
     key_ref = key.clone().detach().requires_grad_()
     value_ref = value.clone().detach().requires_grad_()
 
-    sm_scale = query.shape[-1] ** (-0.5)
-    o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
+    sm_scale = head_dim_qk ** (-0.5)
+
+    sink = None
+    sink_ref = None
+    if enable_sink:
+        sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
+        sink_ref = sink.clone().detach().requires_grad_()
+        o_ref = attention_with_sink_ref_impl(query_ref, key_ref, value_ref, sink_ref, sm_scale, causal)
+    else:
+        o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
     o_ref.backward(grad_out)
     o = flash_attn_func(
         query,
@@ -89,6 +107,7 @@ def test_attention_16bit(batch, dtype, config, causal):
         deterministic=False,
         return_lse=False,
         return_attn_probs=False,
+        sink=sink,
     )
     o.backward(grad_out)
 
@@ -98,12 +117,17 @@ def test_attention_16bit(batch, dtype, config, causal):
     query_grad_snr = compute_snr(query_ref.grad, query.grad)
     key_grad_snr = compute_snr(key_ref.grad, key.grad)
     value_grad_snr = compute_snr(value_ref.grad, value.grad)
-    print(f"{out_snr:.2f}", f"{query_grad_snr:.2f}", f"{key_grad_snr:.2f}", f"{value_grad_snr:.2f}")
+    sink_grad_snr = compute_snr(sink_ref.grad, sink.grad) if enable_sink else None
+    msg = f"out={out_snr:.2f}, dq={query_grad_snr:.2f}, dk={key_grad_snr:.2f}, dv={value_grad_snr:.2f}"
+    if enable_sink:
+        msg += f", dsink={sink_grad_snr:.2f}"
+    print(msg)
 
-    assert out_snr > 40, "out_snr too low"
-    assert query_grad_snr > 40, "query_grad_snr too low"
-    assert key_grad_snr > 40, "key_grad_snr too low"
-    assert value_grad_snr > 40, "value_grad_snr too low"
+    assert out_snr > 40, f"out_snr too low: {out_snr}"
+    assert query_grad_snr > 40, f"query_grad_snr too low: {query_grad_snr}"
+    assert key_grad_snr > 40, f"key_grad_snr too low: {key_grad_snr}"
+    assert value_grad_snr > 40, f"value_grad_snr too low: {value_grad_snr}"
+    assert (sink_grad_snr is None) or (sink_grad_snr > 40), f"sink_grad_snr too low: {sink_grad_snr}"
 
 
 @pytest.mark.parametrize("batch", [4])
@@ -284,85 +308,3 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dq_snr > 15, "query_grad_snr too low"
     assert dk_snr > 15, "key_grad_snr too low"
     assert dv_snr > 15, "value_grad_snr too low"
-
-
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("config", test_cases)
-@pytest.mark.parametrize("causal", [True, False])
-def test_attention_with_sink(batch, dtype, config, causal):
-    """Test flash attention with attention sink feature."""
-    device = "cuda"
-    seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
-        config.seqlen_q,
-        config.seqlen_kv,
-        config.num_head_q,
-        config.num_head_kv,
-        config.head_dim_qk,
-        config.head_dim_v,
-    )
-
-    # Skip if head_dim_qk != head_dim_v(triton kernel limitation for sink)
-    if head_dim_qk != head_dim_v:
-        pytest.skip("Sink attention requires head_dim_qk == head_dim_v and head_dim > 32")
-
-    print(
-        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}"
-    )
-
-    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
-    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
-
-    query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
-    key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
-    value = torch.randn(v_layout, device=device, dtype=dtype, requires_grad=True)
-    sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
-    grad_out = torch.randn(o_layout, device=device, dtype=dtype)
-
-    query_ref = query.clone().detach().requires_grad_()
-    key_ref = key.clone().detach().requires_grad_()
-    value_ref = value.clone().detach().requires_grad_()
-    sink_ref = sink.clone().detach().requires_grad_()
-
-    sm_scale = query.shape[-1] ** (-0.5)
-
-    # Reference forward with sink
-    o_ref = attention_with_sink_ref_impl(query_ref, key_ref, value_ref, sink_ref, sm_scale, causal)
-    o_ref.backward(grad_out)
-
-    # Flash attention with sink
-    o = flash_attn_func(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=(-1, -1),
-        bias=None,
-        alibi_slopes=None,
-        deterministic=False,
-        return_lse=False,
-        return_attn_probs=False,
-        sink=sink,
-    )
-    o.backward(grad_out)
-
-    torch.cuda.synchronize()
-
-    out_snr = compute_snr(o_ref, o)
-    query_grad_snr = compute_snr(query_ref.grad, query.grad)
-    key_grad_snr = compute_snr(key_ref.grad, key.grad)
-    value_grad_snr = compute_snr(value_ref.grad, value.grad)
-    sink_grad_snr = compute_snr(sink_ref.grad, sink.grad)
-    print(
-        f"out={out_snr:.2f}, dq={query_grad_snr:.2f}, dk={key_grad_snr:.2f}, dv={value_grad_snr:.2f}, dsink={sink_grad_snr:.2f}"
-    )
-
-    assert out_snr > 30, f"out_snr too low: {out_snr}"
-    assert query_grad_snr > 30, f"query_grad_snr too low: {query_grad_snr}"
-    assert key_grad_snr > 30, f"key_grad_snr too low: {key_grad_snr}"
-    assert value_grad_snr > 30, f"value_grad_snr too low: {value_grad_snr}"
-    assert sink_grad_snr > 20, f"sink_grad_snr too low: {sink_grad_snr}"

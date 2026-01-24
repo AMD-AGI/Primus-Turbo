@@ -14,8 +14,8 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
-    AttnBwdAiterCsrcBackend,
-    AttnFwdAiterCsrcBackend,
+    attention_aiter_backward_impl,
+    attention_aiter_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -83,9 +83,9 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         assert not return_softmax
         assert dropout_p == 0.0
-        out_padded, softmax_lse, S_dmask, state_info = ring_attn_fwd(
+        out_padded, softmax_lse, S_dmask, rng_state = ring_attn_fwd(
             ring_group,
-            AttnFwdAiterCsrcBackend.execute,
+            attention_aiter_forward_impl,
             q_local_heads,
             k_local_heads,
             v_local_heads,
@@ -99,8 +99,6 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        # Extract rng_state from state_info: ("csrc", rng_state, philox_seed, philox_offset)
-        rng_state = state_info[1]
 
         if is_grad:
             ctx.save_for_backward(
@@ -170,7 +168,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
-            AttnBwdAiterCsrcBackend.execute,
+            attention_aiter_backward_impl,
             dout_padded,
             q_local_heads,
             k_local_heads,

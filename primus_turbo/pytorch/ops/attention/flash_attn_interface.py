@@ -15,8 +15,8 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
-    attention_aiter_backward_dispatch,
-    attention_aiter_forward_dispatch,
+    attention_aiter_backward_impl,
+    attention_aiter_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -31,16 +31,6 @@ __all__ = ["flash_attn_func", "flash_attn_fp8_func"]
 
 
 class AiterFlashAttnFunc(torch.autograd.Function):
-    """
-    Flash Attention using unified Aiter kernel dispatch.
-
-    Dispatch policy:
-    1. Prefer the C++ backend (aiter csrc)
-    2. If the C++ backend cannot support the current configs (e.g., sink attention),
-       fallback to the Triton backend
-    3. If the Triton backend also cannot handle it, raise an error
-    """
-
     @staticmethod
     def _resolve_is_v3_atomic_fp32(is_v3_atomic_fp32: Optional[bool]) -> bool:
         if is_v3_atomic_fp32 in [True, False]:
@@ -89,8 +79,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        # Use unified dispatch: prefers C++ backend, falls back to Triton if needed
-        out_padded, softmax_lse, S_dmask, state_info = attention_aiter_forward_dispatch(
+        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
             q=q,
             k=k,
             v=v,
@@ -108,19 +97,8 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             sink=sink,
         )
 
-        # Unpack state_info from dispatch
-        # state_info format: (backend_type, state_data, philox_seed, philox_offset)
-        backend_type, state_data, philox_seed, philox_offset = state_info
-        use_triton = backend_type == "triton"
-
         if is_grad:
-            if use_triton:
-                # For triton backend, state_data is sink tensor
-                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, state_data)
-            else:
-                # For csrc backend, state_data is rng_state
-                ctx.save_for_backward(q, k, v, out_padded, softmax_lse, state_data)
-            ctx.use_triton = use_triton
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -132,8 +110,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             ctx.head_size_v_og = head_size_v_og
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
+            ctx.sink = sink
 
         out = out_padded[..., :head_size_v_og]
 
@@ -147,21 +124,14 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        use_triton = ctx.use_triton
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = ctx.head_size_v_og
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
 
-        if use_triton:
-            q, k, v, out_padded, softmax_lse, sink = ctx.saved_tensors
-            # dsink must be zeros as kernel accumulates gradients via atomic adds
-            dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
-            rng_state = None
-        else:
-            q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
-            sink = None
-            dsink = None
+        q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
+        sink = getattr(ctx, "sink", None)
+        dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
 
         dout_padded = dout
         v_padded = v
@@ -175,8 +145,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 
         dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v_padded)
 
-        # Use unified dispatch for backward
-        attention_aiter_backward_dispatch(
+        attention_aiter_backward_impl(
             dout=dout_padded,
             q=q,
             k=k,
@@ -200,8 +169,6 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
             sink=sink,
             dsink=dsink,
-            philox_seed=ctx.philox_seed,
-            philox_offset=ctx.philox_offset,
         )
 
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
