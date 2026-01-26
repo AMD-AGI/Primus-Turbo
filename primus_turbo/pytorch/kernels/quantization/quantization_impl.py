@@ -118,7 +118,7 @@ def quant_fp8_blockwise_impl(
     else:
         # Standard mode (single group covering entire tensor)
         num_groups = 1
-        group_offs = torch.tensor([0, M], dtype=torch.int64, device=x.device)
+        group_offs = torch.arange(2, dtype=torch.int64, device=x.device) * M
         var_k_group_lens = None
         var_k_group_offs = group_offs
         M_padded = M
