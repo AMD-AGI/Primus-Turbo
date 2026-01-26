@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.low_precision import (
     MXScalingRecipe,
     ScalingGranularity,
     check_mxfp4_support,
+    check_mxfp8_support,
 )
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
@@ -118,6 +119,11 @@ def test_quantize_fp8_rowwise(
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_size, granularity, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+
     def padding_size(n: int, padding_align_size: int) -> int:
         return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
@@ -195,6 +201,11 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
