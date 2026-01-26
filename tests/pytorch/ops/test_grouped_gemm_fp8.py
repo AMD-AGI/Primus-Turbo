@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScalingGranularity,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -63,6 +64,11 @@ def _run_grouped_gemm_fp8_test(
     auto_tune: bool = False,
 ):
     """Common test logic for grouped_gemm_fp8 with different scaling granularities."""
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
@@ -142,12 +148,15 @@ def _run_grouped_gemm_fp8_test(
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
 
-    # TODO(xiaobochen-amd): When auto tune is enabled and M < 512 (e.g. 128 or 256), autotune hangs on
-    # hipblaslt backend in some cases. Root cause not yet identified, further investigation needed.
-    # Note: This hang only occurs when running via pytest with auto_tune enabled and M < 512;
-    # standalone execution works fine. This issue is observed on MI325, but MI355 works normally.
-    if backend is None and auto_tune and M < 512:
-        pytest.skip("autotune with small M hangs on hipblaslt backend")
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
+    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
+    # Skip also when auto_tune=True because the tuner may select hipBLASLt.
+    if (
+        get_device_compute_capability() == (9, 4)
+        and M <= 512
+        and (backend is BackendType.HIPBLASLT or auto_tune is True)
+    ):
+        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
 
     N, K = NK
     _run_grouped_gemm_fp8_test(

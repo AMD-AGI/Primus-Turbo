@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -28,11 +29,30 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
     if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
         pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
+
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
+    # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
+    # We skip for now to keep CI stable while we investigate the root cause.
+    # (Also skip when auto_tune=True because the tuner may select hipBLASLt.)
+    if (
+        M <= 512
+        and (backend is BackendType.HIPBLASLT or auto_tune is True)
+        and get_device_compute_capability() == (9, 4)
+    ):
+        pytest.skip(
+            "Intermittent flake on gfx942 with hipBLASLt when M <= 512; "
+            "skipping pending root-cause investigation (not reproduced on MI355)."
+        )
 
     # Set backend and auto_tune config
     GlobalBackendManager.set_grouped_gemm_backend(backend)

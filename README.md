@@ -56,7 +56,7 @@ rocm/jax-training:maxtext-v25.9
 
 #### Install from Source
 ```bash
-git clone https://github.com/AMD-AGI/Primus-Turbo.git --recursive
+git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
 pip3 install -r requirements.txt
@@ -71,7 +71,7 @@ GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
 For contributors, use editable mode (`-e`) so that code changes take effect immediately without reinstalling.
 
 ```bash
-git clone https://github.com/AMD-AGI/Primus-Turbo.git --recursive
+git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
 pip3 install -r requirements.txt

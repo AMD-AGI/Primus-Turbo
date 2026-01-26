@@ -29,6 +29,10 @@ jobs:
         run: |
           echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE}"
           echo "current dir: $(pwd)"
+      - name: Print rocminfo
+        run: |
+          echo "=== rocminfo ==="
+          rocminfo || true
       - name: Install Primus-Turbo
         run: |
           unset AITER_ASM_DIR
