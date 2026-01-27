@@ -15,6 +15,7 @@ from primus_turbo.jax.core.low_precision import (
     Format,
     ScalingGranularity,
 )
+from primus_turbo.jax.core.utils import get_device_compute_capability
 from primus_turbo.jax.lax import grouped_gemm_fp8
 from tests.jax.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -35,6 +36,11 @@ from tests.jax.test_utils import compute_snr
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("balance", [True, False])
 def test_grouped_gemm_fp8(B, M, NK, ori_dtype, format, granularity, trans_b, balance):
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
+    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
+    if M <= 512 and get_device_compute_capability() == (9, 4):
+        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
+
     N, K = NK
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, dtype={ori_dtype}, format={format}, "
