@@ -11,5 +11,3 @@ assignees: ""
 
 ## Related material
 <!-- Links, screenshots, benchmarks, logs, prior art, or any relevant context -->
-
-
