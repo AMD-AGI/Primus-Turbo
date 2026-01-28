@@ -20,7 +20,7 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
     GEMMFP4HipBLASLtBackend,
     gemm_fp4_impl,
 )
-from primus_turbo.pytorch.ops.quantization import quantize_fp4
+from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
 
 __all__ = ["gemm_fp4"]
 
@@ -61,13 +61,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
             config.format,
         )
 
-        a_fp4, a_scale_inv, a_t_fp4, a_t_scale_inv = quantize_fp4(
+        a_fp4, a_scale_inv, a_t_fp4, a_t_scale_inv = quantize_fp4_with_trans(
             a,
             a_dtype,
             config.granularity,
             block_size=config.block_size,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
-            with_trans=True,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
@@ -80,12 +79,11 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ),
         )
 
-        b_fp4, b_scale_inv, b_t_fp4, b_t_scale_inv = quantize_fp4(
+        b_fp4, b_scale_inv, b_t_fp4, b_t_scale_inv = quantize_fp4_with_trans(
             b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            with_trans=True,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
@@ -133,12 +131,11 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
 
-        grad_out_fp4, grad_out_scale_inv, grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4(
+        grad_out_fp4, grad_out_scale_inv, grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4_with_trans(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            with_trans=True,
             padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,

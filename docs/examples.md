@@ -149,25 +149,42 @@ print(output)
 print(output.shape)
 ```
 
-## 3. FP8
+## 3. Low-Precision
 
 This section introduces the **FP8 quantization config** and usage of **FP8 GEMM** and **FP8 GroupedGEMM** in Primus-Turbo.
 
 
-### 3.1 Quantization Config (Float8QuantConfig)
+### 3.1 Quantization Config
 
 FP8 quantization is configured through `Float8QuantConfig`:
 
 - **format**
   - `Format.E4M3` (default)
   - `Format.E5M2`
+  - `Format.HYBRID` (backward calculation of dgrad is e5m2 other is e4m3.)
 - **granularity**
   - `ScalingGranularity.TENSORWISE` (default)
   - `ScalingGranularity.ROWWISE`
   - `ScalingGranularity.BLOCKWISE`
+  - `ScalingGranularity.MX_BLOCKWISE`
+- **scale dtype**
+  - `ScaleDtype.FP32` (default)
+  - `ScaleDtype.E8M0` (for mx)
 - **block_size**
-  - Specifies the size of each block when using BLOCKWISE granularity.
-  - This parameter must be explicitly specified in BLOCKWISE mode; otherwise, an error will be raised.
+  - Specifies the size of each block when using BLOCKWISE and MX_BLOCKWISE granularity.
+  - This parameter must be explicitly specified in BLOCKWISE and MX_BLOCKWISE mode; otherwise, an error will be raised.
+
+FP4 quantization is configured through `Float4QuantConfig`:
+
+- **format**
+  - `Format.E2M1_X2` (default)
+- **granularity**
+  - `ScalingGranularity.MX_BLOCKWISE` (default)
+- **scale dtype**
+  - `ScaleDtype.E8M0` (default)
+- **block_size**
+  - Specifies the size of each block when using MX_BLOCKWISE granularity.
+
 
 ### 3.2 FP8 GEMM
 
@@ -244,13 +261,49 @@ print(c)
 print(c.shape)  # [128, 256]
 ```
 
-**Quantization Config (Float8QuantConfig)**
-* format
-    * Format.E4M3 (default)
-    * Format.E5M2
-* granularity
-    * ScalingGranularity.TENSORWISE (default)
-    * ScalingGranularity.ROWWISE
+### 3.4 FP4 GEMM
+
+For FP4 GEMM, it will apply some recipe (such as 2D block quantize and random hadamard transform) in quantization. Reference: https://arxiv.org/pdf/2509.25149
+
+
+Computation flow:
+
+`FP16/BF16 → Quantize → FP4 → GEMM(FP4 × FP4) → FP16/BF16`
+
+Example:
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.low_precision import (
+    Float4QuantConfig,
+    Format,
+    ScalingGranularity,
+    ScaleDtype,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+
+M, N, K = 128, 256, 512
+# a [M, K]
+a = torch.randn((M, K), dtype=dtype, device=device)
+# b [N, K]
+b = torch.randn((N, K), dtype=dtype, device=device)
+# c [M, N]
+
+# Set quant config through Float4QuantConfig class.
+fp4_cfg = Float4QuantConfig(
+    format=Format.E2M1_X2,
+    granularity=ScalingGranularity.MX_BLOCKWISE,
+    block_size=32,
+    scale_dtype=ScaleDtype.E8M0,
+)
+
+c = turbo.ops.gemm_fp4(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=fp4_cfg)
+print(c)
+print(c.shape) # [128, 256]
+```
 
 ## 4. DeepEP
 

@@ -179,7 +179,7 @@ class Float4QuantConfig:
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
-    scale_dtype: ScaleDtype = ScaleDtype.FP32
+    scale_dtype: ScaleDtype = ScaleDtype.E8M0
     block_size: int = 32
 
     def __post_init__(self):

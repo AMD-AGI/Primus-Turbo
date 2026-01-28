@@ -23,7 +23,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
 )
-from primus_turbo.pytorch.ops.quantization import quantize_fp8
+from primus_turbo.pytorch.ops.quantization import quantize_fp8, quantize_fp8_with_trans
 
 __all__ = ["gemm_fp8"]
 
@@ -362,22 +362,23 @@ class FP8GemmMXFunction(torch.autograd.Function):
         a_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmMXFunction.get_fp8_dtype(config.format, True)
 
-        a_fp8, a_scale_inv, a_t_fp8, a_t_scale_inv = quantize_fp8(
+        a_fp8, a_scale_inv, a_t_fp8, a_t_scale_inv = quantize_fp8_with_trans(
             a,
             a_dtype,
             config.granularity,
             block_size=config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            with_trans=True,
         )
-        b_fp8, b_scale_inv, b_t_fp8, b_t_scale_inv = quantize_fp8(
+        b_fp8, b_scale_inv, b_t_fp8, b_t_scale_inv = quantize_fp8_with_trans(
             b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            with_trans=True,
             scaling_recipe=MXScalingRecipe(
+                use_2d_block=True,
+            ),
+            scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=True,
             ),
         )
@@ -414,13 +415,12 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(grad_out.shape[0], -1)
 
-        grad_out_fp8, grad_out_scale_inv, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8(
+        grad_out_fp8, grad_out_scale_inv, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
-            with_trans=True,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.

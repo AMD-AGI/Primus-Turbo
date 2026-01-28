@@ -301,7 +301,7 @@ def quantize_mxfp8_impl(
         if row_length_padding_size > 0 or num_rows_padding_size > 0:
             BLOCK_X = 64
             BLOCK_Y = 64
-            GROUP_Y = block_size
+            GROUP_Y = 8
             grid = lambda META: (
                 triton.cdiv(padded_num_rows, META["BLOCK_Y"])
                 * triton.cdiv(padded_row_length, META["BLOCK_X"]),
@@ -363,7 +363,7 @@ def quantize_mxfp8_impl(
         if num_rows_padding_size > 0 or row_length_padding_size > 0:
             BLOCK_X = 64
             BLOCK_Y = 64
-            GROUP_Y = block_size
+            GROUP_Y = 8
             grid = lambda META: (
                 triton.cdiv(padded_num_rows, META["BLOCK_Y"])
                 * triton.cdiv(padded_row_length, META["BLOCK_X"]),
@@ -405,7 +405,7 @@ def quantize_mxfp8_impl(
     if num_rows_padding_size == 0 and row_length_padding_size == 0:
         BLOCK_X = 64
         BLOCK_Y = 64
-        GROUP_Y = block_size
+        GROUP_Y = 8
         grid = lambda META: (
             triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),
         )
@@ -483,7 +483,7 @@ def dequantize_mxfp8_impl(
 
     BLOCK_X = 64
     BLOCK_Y = 64
-    GROUP_Y = 4
+    GROUP_Y = 8
     grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
     dequantize_mxfp8_kernel[grid](
         x,
@@ -588,7 +588,7 @@ def quantize_mxfp4_impl(
         if num_rows_padding_size > 0 or row_length_padding_size > 0:
             BLOCK_X = 64
             BLOCK_Y = 64
-            GROUP_Y = block_size
+            GROUP_Y = 8
             grid = lambda META: (
                 triton.cdiv(padded_num_rows, META["BLOCK_Y"])
                 * triton.cdiv(padded_row_length, META["BLOCK_X"]),
@@ -670,7 +670,7 @@ def quantize_mxfp4_impl(
         if num_rows_padding_size > 0 or row_length_padding_size > 0:
             BLOCK_X = 64
             BLOCK_Y = 64
-            GROUP_Y = block_size
+            GROUP_Y = 8
             grid = lambda META: (
                 triton.cdiv(padded_num_rows, META["BLOCK_Y"])
                 * triton.cdiv(padded_row_length, META["BLOCK_X"]),
@@ -722,7 +722,7 @@ def quantize_mxfp4_impl(
     if num_rows_padding_size == 0 and row_length_padding_size == 0:
         BLOCK_X = 64
         BLOCK_Y = 64
-        GROUP_Y = block_size
+        GROUP_Y = 8
         grid = lambda META: (
             triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
         )
@@ -826,7 +826,7 @@ def dequantize_mxfp4_impl(
 
     BLOCK_X = 64
     BLOCK_Y = 64
-    GROUP_Y = 4
+    GROUP_Y = 8
     grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
     dequantize_mxfp4_kernel[grid](
         x.view(torch.uint8),
