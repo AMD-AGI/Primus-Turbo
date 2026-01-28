@@ -23,6 +23,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
+    quant_fp8_blockwise_segment_m_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
@@ -84,8 +85,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_impl(
-            a, a_dtype, axis=0, block_size=config.block_size, group_lens=group_lens, group_offs=group_offs
+        a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_impl(
+            a, a_dtype, config.block_size, group_lens, group_offs
         )
 
         ctx.save_for_backward(
@@ -141,13 +142,12 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
 
         # Quantize grad_out with segment padding for wgrad (colwise quantization)
         grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
-            quant_fp8_blockwise_impl(
+            quant_fp8_blockwise_segment_m_impl(
                 grad_out,
                 grad_out_dtype,
-                axis=0,
-                block_size=block_size,
-                group_lens=group_lens,
-                group_offs=group_offs,
+                block_size,
+                group_lens,
+                group_offs,
             )
         )
 

@@ -15,6 +15,7 @@ from primus_turbo.pytorch.kernels.quantization.hadamard_transform import get_rht
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
+    quant_fp8_blockwise_segment_m_kernel,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import (
     dequantize_mxfp4_kernel,
@@ -71,12 +72,7 @@ def quant_fp8_blockwise_impl(
     dtype: torch.dtype,
     axis: int,
     block_size: int = 128,
-    group_lens: Optional[torch.Tensor] = None,
-    group_offs: Optional[torch.Tensor] = None,
-) -> Union[
-    Tuple[torch.Tensor, torch.Tensor],
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantization for fp8 blockwise.
 
@@ -88,18 +84,10 @@ def quant_fp8_blockwise_impl(
         dtype: FP8 dtype for output.
         axis: Axis along which to compute blockwise scales (0 or 1).
         block_size: Block size for quantization.
-        group_lens: Optional segment lengths [B] for segment-aware padding.
-        group_offs: Optional segment offsets [B+1] for segment-aware padding.
 
     Returns:
-        If group_lens/group_offs not provided:
-            x_fp8: FP8-quantized tensor.
-            x_scales: Per-block scale tensor in float32.
-        If group_lens/group_offs provided (segment padding mode, axis=0 only):
-            x_fp8: FP8-quantized tensor [M_padded, N].
-            x_scales: Per-block scale tensor in float32.
-            var_k_group_lens: Padded segment lengths [B].
-            var_k_group_offs: Padded segment offsets [B+1].
+        x_fp8: FP8-quantized tensor.
+        x_scales: Per-block scale tensor in float32.
     """
     assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
     assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
@@ -107,48 +95,80 @@ def quant_fp8_blockwise_impl(
 
     M, N = x.shape
 
-    # Segment padding mode (with group_lens/group_offs)
-    if group_lens is not None and group_offs is not None:
-        assert axis == 0, "Segment padding only supported for axis=0 (colwise)"
-        num_groups = group_lens.size(0)
-        var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
-        var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
-        var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
-        M_padded = M + num_groups * block_size
-    else:
-        # Standard mode (single group covering entire tensor)
-        num_groups = 1
-        group_offs = torch.arange(2, dtype=torch.int64, device=x.device) * M
-        var_k_group_lens = None
-        var_k_group_offs = group_offs
-        M_padded = M
-
-    # Allocate output tensors
-    x_fp8 = torch.zeros((M_padded, N), dtype=dtype, device=x.device)
-    scales_shape = (
-        (M_padded, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M_padded, block_size), N)
-    )
+    x_fp8 = torch.zeros((M, N), dtype=dtype, device=x.device)
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
     x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
 
-    # Launch kernel
-    grid = (triton.cdiv(M_padded, block_size), triton.cdiv(N, block_size))
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     quant_fp8_blockwise_kernel[grid](
         x,
         x_fp8,
         x_scales,
+        M,
         N,
-        M_padded,
-        group_offs,
-        var_k_group_offs,
-        num_groups,
         block_size,
         torch.finfo(dtype).max,
         axis,
     )
-
-    if var_k_group_lens is not None:
-        return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
     return x_fp8, x_scales
+
+
+def quant_fp8_blockwise_segment_m_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantization for fp8 blockwise with segment-aware padding (axis=0 only).
+
+    Reads from original tensor, writes to padded tensor with segment alignment.
+
+    Args:
+        x: Input tensor to quantize [M, N].
+        dtype: FP8 dtype for output.
+        block_size: Block size for quantization.
+        group_lens: Segment lengths [B].
+        group_offs: Segment offsets [B+1].
+
+    Returns:
+        x_fp8: FP8-quantized tensor [M_padded, N].
+        x_scales: Per-block scale tensor in float32.
+        var_k_group_lens: Padded segment lengths [B].
+        var_k_group_offs: Padded segment offsets [B+1].
+    """
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
+    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+
+    # Use upper bound for allocation to avoid .item() sync (required for graph capture)
+    # Each segment can have at most block_size padding, so M_padded <= M + num_groups * block_size
+    M_padded_max = M + num_groups * block_size
+
+    # Allocate output tensors with upper bound size
+    x_fp8 = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+
+    # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
+    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
+    quant_fp8_blockwise_segment_m_kernel[grid](
+        x,
+        x_fp8,
+        x_scales,
+        group_offs,
+        var_k_group_offs,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
 
 
 @triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
