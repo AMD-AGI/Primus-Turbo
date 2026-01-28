@@ -143,7 +143,7 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                 / cfg.router_topk
             )
 
-            (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = dispatcher.token_dispatch(
+            permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
                 hidden_states,
                 probs,
             )

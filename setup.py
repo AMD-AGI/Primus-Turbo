@@ -383,13 +383,13 @@ if __name__ == "__main__":
     ]
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
-    if torch_ext is not None and not is_package_installed("aiter"):
-        print("[Primus-Turbo Setup] aiter not found, will be installed automatically.")
+    if torch_ext is not None and not is_package_installed("amd-aiter"):
+        print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(
-            "aiter @ git+https://github.com/ROCm/aiter.git@a25cb58ee4ee97cb5ad4b426b648a8e66103d706"
+            "amd-aiter @ git+https://github.com/ROCm/aiter.git@63f588cf5b45b6f99c64cbb8851ea7edf9770a28"
         )
     else:
-        print("[Primus-Turbo Setup] Skipping aiter installation.")
+        print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
 
     if BUILD_JAX:
         entry_points["jax_plugins"] = ["primus_turbo = primus_turbo.jax"]

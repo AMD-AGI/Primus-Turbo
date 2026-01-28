@@ -10,66 +10,8 @@ from typing import Union
 import torch
 import triton
 import triton.language as tl
-from triton.language import core
-from triton.language.standard import _log2
 
-# The following three argsort related kernels are adapted from
-# the issue https://github.com/triton-lang/triton/issues/3698
-
-
-@triton.jit
-def _compare_and_swap(x, indices, flip, i: tl.constexpr, n_dims: tl.constexpr):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * (2**i), 2, 2 ** (n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-    z = tl.reshape(indices, shape)
-
-    mask = tl.arange(0, 2)[None, :, None]
-
-    l_value = tl.reshape(tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape), x.shape).to(x.dtype)
-    r_value = tl.reshape(tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape), x.shape).to(x.dtype)
-
-    l_indice = tl.reshape(tl.broadcast_to(tl.sum(z * (1 - mask), 1)[:, None, :], shape), x.shape)
-    r_indice = tl.reshape(tl.broadcast_to(tl.sum(z * mask, 1)[:, None, :], shape), x.shape)
-
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-
-    il_value = l_value.to(idtype, bitcast=True)
-    ir_value = r_value.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    flag1 = tl.where(((l_value > r_value) ^ flip) != 0, il_value ^ ir_value, tl.zeros_like(ix))
-    ret = ix ^ flag1
-    flag2 = tl.where(((l_value > r_value) ^ flip) != 0, l_indice ^ r_indice, tl.zeros_like(ix))
-    ind = indices ^ flag2
-
-    return ret.to(x.dtype, bitcast=True), ind
-
-
-@triton.jit
-def _bitonic_merge(x, indices, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-    """
-    order_type 0 == ascending
-    order_type 1 == descending
-    order_type 2 == alternating
-    """
-    if order == 2:
-        shape: tl.constexpr = [n_outer * (2 ** (n_dims - 1 - stage)), 2, 2**stage]
-        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
-    else:
-        flip = tl.full(x.shape, value=order, dtype=tl.int32)
-    for i in tl.static_range(stage):
-        x, indices = _compare_and_swap(x, indices, flip, i + (n_dims - stage), n_dims)
-    return x, indices
-
-
-@triton.jit
-def _argsort(x, indices, n_dims: tl.constexpr):
-    for i in tl.static_range(1, n_dims + 1):
-        x, indices = _bitonic_merge(x, indices, i, 2 if i < n_dims else 1, n_dims)
-    return x, indices
+from ..utils.argsort import argsort
 
 
 @triton.jit
@@ -167,7 +109,6 @@ def _row_id_map_pass_3_kernel(
     LOAD_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    n_dims: tl.constexpr = _log2(LOAD_SIZE)
     off = tl.arange(0, LOAD_SIZE)
     row_id_map = tl.load(
         row_id_map_ptr + pid * stride_row_id_map_token + stride_row_id_map_expert * off,
@@ -176,7 +117,7 @@ def _row_id_map_pass_3_kernel(
     )
     n_routed = tl.sum(tl.where(row_id_map != -1, 1, 0))
     indices = off
-    sorted_map, indices = _argsort(row_id_map, indices, n_dims=n_dims)
+    sorted_map, indices = argsort(row_id_map, indices, descending=1)
     tl.store(
         row_id_map_ptr + pid * stride_row_id_map_token + off * stride_row_id_map_expert,
         sorted_map,

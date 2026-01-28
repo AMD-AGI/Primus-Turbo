@@ -235,6 +235,11 @@ __global__ void compute_grouped_gemm_variable_k_args(
     if (group_id >= group_num)
         return;
 
+    const int64_t group_k = group_lens_ptr[group_id];
+
+    // If group_k is 0, set effective_m to 0 to avoid undefined behavior
+    const ck_tile::index_t effective_m = (group_k > 0) ? m : 0;
+
     const int64_t strideAK = transA ? m : 1;
     const int64_t strideBK = transB ? 1 : n;
     const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.as_ptr)[0] =
@@ -242,9 +247,9 @@ __global__ void compute_grouped_gemm_variable_k_args(
     const_cast<std::array<const void *, 1> &>(args_ptr[group_id].group_karg.bs_ptr)[0] =
         static_cast<const void *>(b_ptr + group_offs_ptr[group_id] * strideBK);
     args_ptr[group_id].group_karg.e_ptr        = c_ptr + group_id * m * n;
-    args_ptr[group_id].group_karg.M            = m;
+    args_ptr[group_id].group_karg.M            = effective_m;
     args_ptr[group_id].group_karg.N            = n;
-    args_ptr[group_id].group_karg.K            = group_lens_ptr[group_id];
+    args_ptr[group_id].group_karg.K            = group_k;
     args_ptr[group_id].group_karg.stride_As[0] = strideA;
     args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
     args_ptr[group_id].group_karg.stride_E     = strideC;
@@ -265,6 +270,11 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
+
+    const int64_t group_k = group_lens_ptr[group_id];
+
+    // If group_k is 0, set effective_m to 0 to avoid undefined behavior
+    const ck_tile::index_t effective_m = (group_k > 0) ? m : 0;
 
     const int64_t strideAK = transA ? m : 1;
     const int64_t strideBK = transB ? 1 : n;
@@ -288,9 +298,9 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     args_ptr[group_id].group_karg.a_ptr     = a_ptr + group_offs_ptr[group_id] * strideAK;
     args_ptr[group_id].group_karg.b_ptr     = b_ptr + group_offs_ptr[group_id] * strideBK;
     args_ptr[group_id].group_karg.c_ptr     = c_ptr + group_id * m * n;
-    args_ptr[group_id].group_karg.M         = m;
+    args_ptr[group_id].group_karg.M         = effective_m;
     args_ptr[group_id].group_karg.N         = n;
-    args_ptr[group_id].group_karg.K         = group_lens_ptr[group_id];
+    args_ptr[group_id].group_karg.K         = group_k;
     args_ptr[group_id].group_karg.QK_A      = QK_A;
     args_ptr[group_id].group_karg.QK_B      = QK_B;
     args_ptr[group_id].group_karg.stride_A  = strideA;
@@ -309,17 +319,20 @@ __global__ void
 grouped_gemm_variable_k_postprocess(T *c_ptr, const int64_t *group_lens_ptr,
                                     const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
                                     const ck_tile::index_t m, const ck_tile::index_t n) {
-    const int group_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (group_id >= group_num)
-        return;
+    const ck_tile::index_t tid          = blockIdx.x * blockDim.x + threadIdx.x;
+    const ck_tile::index_t num_tids     = blockDim.x * gridDim.x;
+    const ck_tile::index_t group_stride = m * n;
 
-    const int group_len = group_lens_ptr[group_id];
-    const int group_off = group_offs_ptr[group_id];
-    if (group_len > 0)
-        return;
-
-    c_ptr = c_ptr + group_id * m * n;
-    memset(c_ptr, 0, sizeof(T) * m * n);
+    for (ck_tile::index_t group_id = 0; group_id < group_num; ++group_id) {
+        const int group_len = group_lens_ptr[group_id];
+        if (group_len > 0) {
+            continue;
+        }
+        T *group_c_ptr = c_ptr + static_cast<int64_t>(group_id) * group_stride;
+        for (ck_tile::index_t i = tid; i < group_stride; i += num_tids) {
+            group_c_ptr[i] = T(0);
+        }
+    }
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
@@ -359,8 +372,8 @@ void ck_grouped_gemm_variable_k(
 
     // Postprocess
     {
-        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
-        const int grids   = (params.group_num + threads - 1) / threads;
+        const int threads = MAX_THREADS_PER_BLOCK;
+        const int grids   = DIVUP<int64_t>(params.m * params.n, threads);
         grouped_gemm_variable_k_postprocess<CDataType><<<grids, threads, 0, params.stream>>>(
             params.c_ptr, params.group_lens_ptr, params.group_offs_ptr, params.group_num, params.m,
             params.n);
@@ -424,8 +437,8 @@ void ck_grouped_gemm_fp8_variable_k(
 
     // Postprocess
     {
-        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
-        const int grids   = (params.group_num + threads - 1) / threads;
+        const int threads = MAX_THREADS_PER_BLOCK;
+        const int grids   = DIVUP<int64_t>(params.m * params.n, threads);
         grouped_gemm_variable_k_postprocess<CDataType><<<grids, threads, 0, params.stream>>>(
             params.c_ptr, params.group_lens_ptr, params.group_offs_ptr, params.group_num, params.m,
             params.n);

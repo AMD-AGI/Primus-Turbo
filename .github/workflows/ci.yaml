@@ -84,6 +84,10 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
+      - name: Print rocminfo
+        run: |
+          echo "=== rocminfo ==="
+          rocminfo || true
       - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
@@ -149,6 +153,10 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
+      - name: Print rocminfo
+        run: |
+          echo "=== rocminfo ==="
+          rocminfo || true
       - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"

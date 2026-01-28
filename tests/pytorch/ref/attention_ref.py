@@ -5,6 +5,7 @@
 ###############################################################################
 
 import torch
+from einops import repeat
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 ATTN_BACKENDS = [
@@ -45,6 +46,46 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
     if layout == "bshd":
         o_ref = o_ref.transpose(1, 2)
     return o_ref
+
+
+def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal):
+    """Reference implementation of attention with sink."""
+
+    dtype_og = q.dtype
+    q, k, v = q.float(), k.float(), v.float()
+    sink = sink.float()
+
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    # Expand k, v for GQA
+    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+
+    # Use provided sm_scale
+    scores = torch.einsum("bthd,bshd->bhts", q * sm_scale, k)
+
+    # Apply causal mask
+    if causal:
+        row_idx = torch.arange(seqlen_q, device=q.device).view(-1, 1)
+        col_idx = torch.arange(seqlen_k, device=q.device)
+        causal_mask = col_idx > row_idx + seqlen_k - seqlen_q
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    # Concatenate sink scores
+    batch_size = scores.shape[0]
+    nheads = scores.shape[1]
+    sink_expanded = sink.view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+    scores = torch.cat([scores, sink_expanded], dim=-1)
+
+    # Softmax
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+
+    # Remove sink attention weights before computing output
+    attention = attention[..., :-1]
+
+    # Compute output
+    output = torch.einsum("bhts,bshd->bthd", attention, v)
+
+    return output.to(dtype=dtype_og)
 
 
 class TurboAttentionRef(torch.nn.Module):

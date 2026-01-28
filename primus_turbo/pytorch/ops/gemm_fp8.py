@@ -78,7 +78,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        (a_fp8, a_scale_inv, b_fp8, b_scale_inv) = ctx.saved_tensors
+        a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
         grad_out_dtype = FP8GemmTensorFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
@@ -172,7 +172,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        (a_fp8_col, a_scale_inv_col, b_fp8_col, b_scale_inv_col) = ctx.saved_tensors
+        a_fp8_col, a_scale_inv_col, b_fp8_col, b_scale_inv_col = ctx.saved_tensors
         grad_out_dtype = FP8GemmRowFunction.get_fp8_dtype(ctx.config.format, False)
 
         grad_out_fp8_row, grad_out_scale_inv_row = quantize_fp8(
