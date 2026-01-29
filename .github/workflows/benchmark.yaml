@@ -60,6 +60,10 @@ jobs:
         timeout-minutes: 60
         continue-on-error: true
         run: python3 benchmark/ops/bench_attention_turbo.py --fp8 -o "${BENCHMARK_OUTPUT_DIR}/attention_fp8_benchmark.csv"
+      - name: "[1.4] Run Attention-Deterministic Benchmark (Aiter/CK)"
+        timeout-minutes: 60
+        continue-on-error: true
+        run: python3 benchmark/ops/bench_attention_turbo.py --deterministic -o "${BENCHMARK_OUTPUT_DIR}/attention_deterministic_benchmark.csv"
       - name: "[2.1] Run GEMM Benchmark (PyTorch Baseline)"
         timeout-minutes: 60
         continue-on-error: true

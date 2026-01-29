@@ -4,8 +4,24 @@
 # See LICENSE for license information.
 ###############################################################################
 
+"""
+Benchmark external flash-attn (Dao-AILab/flash-attention) performance.
+
+This script intentionally aligns with benchmark/ops/bench_attention_turbo.py:
+- Same test case generator (config.gen_attention_test_cases)
+- Same FLOPs model and TFLOPS reporting
+- Same correctness check vs PyTorch SDPA reference (SNR)
+
+Installation notes:
+- flash-attn v2 install:
+    pip install flash-attn
+- flash-attn v3 install:
+    git clone https://github.com/Dao-AILab/flash-attention.git
+    cd ./flash-attention/hopper
+    python setup.py install
+"""
+
 import argparse
-import os
 from datetime import datetime
 
 import pandas as pd
@@ -20,19 +36,6 @@ from config import (
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-
-# Disable FP32 atomic for better performance on gfx950
-def _is_gfx950():
-    """Check if current GPU is gfx950 using torch."""
-    props = torch.cuda.get_device_properties(0)
-    return props.major == 9 and props.minor == 5
-
-
-if _is_gfx950():
-    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
-
-import primus_turbo.pytorch as turbo
-
 # PyTorch SDPA backends for reference implementation
 ATTN_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
@@ -42,7 +45,7 @@ ATTN_BACKENDS = [
 
 
 def attention_ref(q, k, v, sm_scale, causal):
-    """Reference attention using PyTorch's scaled_dot_product_attention."""
+    """Reference attention using PyTorch's scaled_dot_product_attention (BSHD in/out)."""
     num_heads = q.shape[2]
     n_kv_heads = k.shape[2]
     n_rep = num_heads // n_kv_heads
@@ -61,21 +64,17 @@ def attention_ref(q, k, v, sm_scale, causal):
     return o_ref.transpose(1, 2)
 
 
-def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out, use_fp8):
+def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out):
     """Check correctness of attention forward and backward against PyTorch reference."""
-    # Backward pass
     o_ref.backward(grad_out, retain_graph=True)
     o.backward(grad_out, retain_graph=True)
 
-    # Compute SNRs
     out_snr = compute_snr(o_ref, o)
     dq_snr = compute_snr(q_ref.grad, q.grad)
     dk_snr = compute_snr(k_ref.grad, k.grad)
     dv_snr = compute_snr(v_ref.grad, v.grad)
 
-    # SNR thresholds: bf16 requires higher SNR (40), fp8 allows lower (20)
-    threshold = 20 if use_fp8 else 40
-
+    threshold = 40  # bf16 threshold
     correct = all(snr > threshold for snr in [out_snr, dq_snr, dk_snr, dv_snr])
     status = "PASS" if correct else "FAIL"
     print(
@@ -83,17 +82,14 @@ def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out
         f"{status} (out={out_snr:.1f}, dq={dq_snr:.1f}, dk={dk_snr:.1f}, dv={dv_snr:.1f})"
     )
 
-    # Reset gradients
     q.grad = None
     k.grad = None
     v.grad = None
-
     return correct
 
 
 def check_attention_determinism(fwd_func, q, k, v, grad_out):
-    """Check deterministic for forward outputs and backward gradients (bitwise exact)."""
-    # Forward: same input -> same output
+    """Check determinism for forward outputs and backward gradients (bitwise exact)."""
     out1 = fwd_func()
     out2 = fwd_func()
     torch.cuda.synchronize()
@@ -101,7 +97,6 @@ def check_attention_determinism(fwd_func, q, k, v, grad_out):
     out_ok = torch.equal(out1, out2)
     out_max_abs_diff = (out1 - out2).abs().max().item()
 
-    # Backward: same input + same grad_out -> same grads
     q.grad = None
     k.grad = None
     v.grad = None
@@ -131,7 +126,6 @@ def check_attention_determinism(fwd_func, q, k, v, grad_out):
     dk_max_abs_diff = (dk1 - dk2).abs().max().item()
     dv_max_abs_diff = (dv1 - dv2).abs().max().item()
 
-    # Reset gradients
     q.grad = None
     k.grad = None
     v.grad = None
@@ -149,6 +143,7 @@ def check_attention_determinism(fwd_func, q, k, v, grad_out):
 
 
 def profile_attention(
+    flash_attn_func,
     batch,
     seqlen,
     num_head_q,
@@ -156,14 +151,18 @@ def profile_attention(
     head_dim_qk,
     head_dim_v,
     causal,
-    use_fp8,
     deterministic,
 ):
-    """Profile attention forward and backward performance."""
+    """Profile external flash-attn forward and backward performance."""
     device = "cuda"
     dtype = torch.bfloat16
 
-    # Create tensors
+    if head_dim_v != head_dim_qk:
+        raise ValueError(
+            "flash-attn expects q/k/v to share the same head dim; "
+            f"got head_dim_qk={head_dim_qk}, head_dim_v={head_dim_v}"
+        )
+
     q = torch.randn((batch, seqlen, num_head_q, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
     k = torch.randn((batch, seqlen, num_head_kv, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
     v = torch.randn((batch, seqlen, num_head_kv, head_dim_v), device=device, dtype=dtype, requires_grad=True)
@@ -172,43 +171,18 @@ def profile_attention(
     v_ref = v.clone().detach().requires_grad_()
 
     sm_scale = head_dim_qk ** (-0.5)
-
-    # Reference forward
     o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal)
 
-    # Define forward function
-    if use_fp8:
-        fwd_func = lambda: turbo.ops.flash_attn_fp8_func(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            bias=None,
-            alibi_slopes=None,
-            deterministic=deterministic,
-            return_lse=False,
-            return_attn_probs=False,
-        )
-    else:
-        fwd_func = lambda: turbo.ops.flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            bias=None,
-            alibi_slopes=None,
-            deterministic=deterministic,
-            return_lse=False,
-            return_attn_probs=False,
-        )
+    fwd_func = lambda: flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=sm_scale,
+        causal=causal,
+        deterministic=deterministic,
+        return_attn_probs=False,
+    )
 
-    # Fixed grad_out for deterministic / correctness checks
     out_for_grad = fwd_func()
     grad_out = torch.randn_like(out_for_grad)
 
@@ -232,11 +206,9 @@ def profile_attention(
             det_dv_max_abs_diff,
         ) = check_attention_determinism(fwd_func, q, k, v, grad_out)
 
-    # Forward pass and correctness check
     out = fwd_func()
-    correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
+    correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out)
 
-    # Print deterministic status only when deterministic is enabled
     if deterministic:
         determinism_ok = bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
         status = "PASS" if determinism_ok else "FAIL"
@@ -246,24 +218,20 @@ def profile_attention(
             f"dk={det_dk_max_abs_diff}, dv={det_dv_max_abs_diff})"
         )
 
-    # Prepare benchmark functions
     out = fwd_func()
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     bwd_func()
 
-    # Calculate FLOPs
     fwd_flops = 2 * batch * seqlen * seqlen * num_head_q * (head_dim_qk + head_dim_v)
     if causal:
         fwd_flops //= 2
     bwd_flops = fwd_flops * 2.5
 
-    # Warmup
     for _ in range(20):
         fwd_func()
         bwd_func()
     torch.cuda.synchronize()
 
-    # Benchmark
     fwd_time = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func}).timeit(100).mean * 1e3
     bwd_time = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func}).timeit(100).mean * 1e3
     fwd_tflops = fwd_flops / (fwd_time * 1e-3) / 1e12
@@ -289,17 +257,15 @@ def profile_attention(
     )
 
 
-def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
-    """Run attention benchmark."""
+def benchmark_attention_flashattn(flash_attn_func, fa_version: int, output_csv=None, deterministic=False):
+    """Run external flash-attn benchmark."""
     platform, gpu_name = get_platform_info()
-
-    # Generate test cases from config
     test_cases = gen_attention_test_cases()
 
     rows = []
     test_id = 0
     total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
-    print(f"Total tests: {total_tests}, FP8: {use_fp8}, deterministic: {deterministic}")
+    print(f"Total tests: {total_tests}, deterministic: {deterministic}")
 
     for causal in [False, True]:
         for case in test_cases:
@@ -315,7 +281,7 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
                 print(
                     f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
                     f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
-                    f"causal={causal}, fp8={use_fp8}, deterministic={deterministic}"
+                    f"causal={causal}, deterministic={deterministic}"
                 )
                 print(f"{'='*60}")
 
@@ -333,6 +299,22 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
                     "Deterministic": deterministic,
                 }
 
+                if head_dim_qk != head_dim_v:
+                    # Many MLA-style configs have head_dim_qk != head_dim_v; external flash-attn doesn't support that.
+                    row.update(
+                        {
+                            "Check": "SKIP",
+                            "Forward Time (ms)": "SKIP",
+                            "Forward TFLOPS": "0.00",
+                            "Backward Time (ms)": "SKIP",
+                            "Backward TFLOPS": "0.00",
+                        }
+                    )
+                    if deterministic:
+                        row["Deterministic Check"] = "SKIP"
+                    rows.append(row)
+                    continue
+
                 try:
                     (
                         fwd_time,
@@ -349,6 +331,7 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
                         det_dv_ok,
                         det_dv_max_abs_diff,
                     ) = profile_attention(
+                        flash_attn_func,
                         batch,
                         seqlen,
                         num_head_q,
@@ -356,7 +339,6 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
                         head_dim_qk,
                         head_dim_v,
                         causal,
-                        use_fp8,
                         deterministic,
                     )
                     row.update(
@@ -388,59 +370,68 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
 
                 rows.append(row)
 
-    # Create DataFrame
     results = pd.DataFrame(rows)
     if deterministic and "Check" in results.columns and "Deterministic Check" in results.columns:
         cols = list(results.columns)
         cols.insert(cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check")))
         results = results[cols]
 
-    # Print results
     print("\nFinal Results:")
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
-    # Print average TFLOPS
-    avg_fwd = results["Forward TFLOPS"].astype(float).mean()
-    avg_bwd = results["Backward TFLOPS"].astype(float).mean()
+    avg_fwd = results.loc[results["Forward TFLOPS"] != "0.00", "Forward TFLOPS"].astype(float).mean()
+    avg_bwd = results.loc[results["Backward TFLOPS"] != "0.00", "Backward TFLOPS"].astype(float).mean()
     print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
     print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
 
-    # Save to CSV
     if output_csv:
         filename = output_csv
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
-        if deterministic:
-            prefix = (
-                "attention_deterministic_fp8_benchmark_result"
-                if use_fp8
-                else "attention_deterministic_benchmark_result"
-            )
-        else:
-            prefix = "attention_fp8_benchmark_result" if use_fp8 else "attention_benchmark_result"
+        ver_tag = f"v{fa_version}"
+        prefix = (
+            f"attention_fa_{ver_tag}_deterministic_benchmark_result"
+            if deterministic
+            else f"attention_fa_{ver_tag}_benchmark_result"
+        )
         filename = f"{prefix}_{timestamp}_{gpu_name}.csv"
+
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark Attention operations")
+    parser = argparse.ArgumentParser(description="Benchmark external flash-attn")
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Output CSV filename. Default: attention[_fp8]_benchmark_result_{date}_{gpu}.csv",
+        help="Output CSV filename. Default: attention_fa[_deterministic]_benchmark_result_{date}_{gpu}.csv",
     )
     parser.add_argument(
-        "--fp8",
-        action="store_true",
-        help="Enable FP8 attention benchmark (default: disabled)",
+        "--fa-version",
+        type=int,
+        choices=[2, 3],
+        default=3,
+        help="Select flash-attn API version: fa-v2 or fa-v3.",
     )
     parser.add_argument(
         "--deterministic",
         action="store_true",
-        help="Enable deterministic kernel mode (default: disabled).",
+        help="Enable deterministic kernel mode if supported by flash-attn (default: disabled).",
     )
+
     args = parser.parse_args()
-    benchmark_attention(output_csv=args.output, use_fp8=args.fp8, deterministic=args.deterministic)
+
+    if args.fa_version == 2:
+        from flash_attn import flash_attn_func  # type: ignore
+    else:
+        from flash_attn_interface import flash_attn_func  # type: ignore
+
+    benchmark_attention_flashattn(
+        flash_attn_func,
+        fa_version=args.fa_version,
+        output_csv=args.output,
+        deterministic=args.deterministic,
+    )
