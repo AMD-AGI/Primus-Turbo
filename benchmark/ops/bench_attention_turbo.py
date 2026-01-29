@@ -79,7 +79,8 @@ def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out
     correct = all(snr > threshold for snr in [out_snr, dq_snr, dk_snr, dv_snr])
     status = "PASS" if correct else "FAIL"
     print(
-        f"Correctness Check: {status} (out={out_snr:.1f}, dq={dq_snr:.1f}, dk={dk_snr:.1f}, dv={dv_snr:.1f})"
+        f"Correctness Check (SNR>thr={threshold} vs torch-ref): "
+        f"{status} (out={out_snr:.1f}, dq={dq_snr:.1f}, dk={dk_snr:.1f}, dv={dv_snr:.1f})"
     )
 
     # Reset gradients
@@ -90,7 +91,74 @@ def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out
     return correct
 
 
-def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8):
+def check_attention_determinism(fwd_func, q, k, v, grad_out):
+    """Check deterministic for forward outputs and backward gradients (bitwise exact)."""
+    # Forward: same input -> same output
+    out1 = fwd_func()
+    out2 = fwd_func()
+    torch.cuda.synchronize()
+
+    out_ok = torch.equal(out1, out2)
+    out_max_abs_diff = (out1 - out2).abs().max().item()
+
+    # Backward: same input + same grad_out -> same grads
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    out1_bwd = fwd_func()
+    out1_bwd.backward(grad_out, retain_graph=False)
+    dq1 = q.grad.detach().clone()
+    dk1 = k.grad.detach().clone()
+    dv1 = v.grad.detach().clone()
+
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    out2_bwd = fwd_func()
+    out2_bwd.backward(grad_out, retain_graph=False)
+    dq2 = q.grad.detach().clone()
+    dk2 = k.grad.detach().clone()
+    dv2 = v.grad.detach().clone()
+    torch.cuda.synchronize()
+
+    dq_ok = torch.equal(dq1, dq2)
+    dk_ok = torch.equal(dk1, dk2)
+    dv_ok = torch.equal(dv1, dv2)
+
+    dq_max_abs_diff = (dq1 - dq2).abs().max().item()
+    dk_max_abs_diff = (dk1 - dk2).abs().max().item()
+    dv_max_abs_diff = (dv1 - dv2).abs().max().item()
+
+    # Reset gradients
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    return (
+        out_ok,
+        out_max_abs_diff,
+        dq_ok,
+        dq_max_abs_diff,
+        dk_ok,
+        dk_max_abs_diff,
+        dv_ok,
+        dv_max_abs_diff,
+    )
+
+
+def profile_attention(
+    batch,
+    seqlen,
+    num_head_q,
+    num_head_kv,
+    head_dim_qk,
+    head_dim_v,
+    causal,
+    use_fp8,
+    deterministic,
+):
     """Profile attention forward and backward performance."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -120,7 +188,7 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
             window_size=(-1, -1),
             bias=None,
             alibi_slopes=None,
-            deterministic=False,
+            deterministic=deterministic,
             return_lse=False,
             return_attn_probs=False,
         )
@@ -135,15 +203,48 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
             window_size=(-1, -1),
             bias=None,
             alibi_slopes=None,
-            deterministic=False,
+            deterministic=deterministic,
             return_lse=False,
             return_attn_probs=False,
         )
 
+    # Fixed grad_out for deterministic / correctness checks
+    out_for_grad = fwd_func()
+    grad_out = torch.randn_like(out_for_grad)
+
+    det_out_ok = None
+    det_out_max_abs_diff = None
+    det_dq_ok = None
+    det_dq_max_abs_diff = None
+    det_dk_ok = None
+    det_dk_max_abs_diff = None
+    det_dv_ok = None
+    det_dv_max_abs_diff = None
+    if deterministic:
+        (
+            det_out_ok,
+            det_out_max_abs_diff,
+            det_dq_ok,
+            det_dq_max_abs_diff,
+            det_dk_ok,
+            det_dk_max_abs_diff,
+            det_dv_ok,
+            det_dv_max_abs_diff,
+        ) = check_attention_determinism(fwd_func, q, k, v, grad_out)
+
     # Forward pass and correctness check
     out = fwd_func()
-    grad_out = torch.randn_like(out)
     correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
+
+    # Print deterministic status only when deterministic is enabled
+    if deterministic:
+        determinism_ok = bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
+        status = "PASS" if determinism_ok else "FAIL"
+        print(
+            "Deterministic Check (bitwise; max_abs_diff): "
+            f"{status} (out={det_out_max_abs_diff}, dq={det_dq_max_abs_diff}, "
+            f"dk={det_dk_max_abs_diff}, dv={det_dv_max_abs_diff})"
+        )
 
     # Prepare benchmark functions
     out = fwd_func()
@@ -171,10 +272,24 @@ def profile_attention(batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_
     print(f"Forward  Mean time: {fwd_time:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
     print(f"Backward Mean time: {bwd_time:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
 
-    return fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct
+    return (
+        fwd_time,
+        fwd_tflops,
+        bwd_time,
+        bwd_tflops,
+        correct,
+        det_out_ok,
+        det_out_max_abs_diff,
+        det_dq_ok,
+        det_dq_max_abs_diff,
+        det_dk_ok,
+        det_dk_max_abs_diff,
+        det_dv_ok,
+        det_dv_max_abs_diff,
+    )
 
 
-def benchmark_attention(output_csv=None, use_fp8=False):
+def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
     """Run attention benchmark."""
     platform, gpu_name = get_platform_info()
 
@@ -184,7 +299,7 @@ def benchmark_attention(output_csv=None, use_fp8=False):
     rows = []
     test_id = 0
     total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
-    print(f"Total tests: {total_tests}, FP8: {use_fp8}")
+    print(f"Total tests: {total_tests}, FP8: {use_fp8}, deterministic: {deterministic}")
 
     for causal in [False, True]:
         for case in test_cases:
@@ -200,7 +315,7 @@ def benchmark_attention(output_csv=None, use_fp8=False):
                 print(
                     f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
                     f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
-                    f"causal={causal}, fp8={use_fp8}"
+                    f"causal={causal}, fp8={use_fp8}, deterministic={deterministic}"
                 )
                 print(f"{'='*60}")
 
@@ -215,11 +330,34 @@ def benchmark_attention(output_csv=None, use_fp8=False):
                     "head_dim_qk": head_dim_qk,
                     "head_dim_v": head_dim_v,
                     "Causal": causal,
+                    "Deterministic": deterministic,
                 }
 
                 try:
-                    fwd_time, fwd_tflops, bwd_time, bwd_tflops, correct = profile_attention(
-                        batch, seqlen, num_head_q, num_head_kv, head_dim_qk, head_dim_v, causal, use_fp8
+                    (
+                        fwd_time,
+                        fwd_tflops,
+                        bwd_time,
+                        bwd_tflops,
+                        correct,
+                        det_out_ok,
+                        det_out_max_abs_diff,
+                        det_dq_ok,
+                        det_dq_max_abs_diff,
+                        det_dk_ok,
+                        det_dk_max_abs_diff,
+                        det_dv_ok,
+                        det_dv_max_abs_diff,
+                    ) = profile_attention(
+                        batch,
+                        seqlen,
+                        num_head_q,
+                        num_head_kv,
+                        head_dim_qk,
+                        head_dim_v,
+                        causal,
+                        use_fp8,
+                        deterministic,
                     )
                     row.update(
                         {
@@ -230,6 +368,10 @@ def benchmark_attention(output_csv=None, use_fp8=False):
                             "Backward TFLOPS": f"{bwd_tflops:.2f}",
                         }
                     )
+                    if deterministic:
+                        row["Deterministic Check"] = (
+                            "PASS" if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok) else "FAIL"
+                        )
                 except Exception as e:
                     print(f"Failed: {str(e)}")
                     row.update(
@@ -241,11 +383,17 @@ def benchmark_attention(output_csv=None, use_fp8=False):
                             "Backward TFLOPS": "0.00",
                         }
                     )
+                    if deterministic:
+                        row["Deterministic Check"] = "ERROR"
 
                 rows.append(row)
 
     # Create DataFrame
     results = pd.DataFrame(rows)
+    if deterministic and "Check" in results.columns and "Deterministic Check" in results.columns:
+        cols = list(results.columns)
+        cols.insert(cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check")))
+        results = results[cols]
 
     # Print results
     print("\nFinal Results:")
@@ -262,7 +410,14 @@ def benchmark_attention(output_csv=None, use_fp8=False):
         filename = output_csv
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
-        prefix = "attention_fp8_benchmark_result" if use_fp8 else "attention_benchmark_result"
+        if deterministic:
+            prefix = (
+                "attention_deterministic_fp8_benchmark_result"
+                if use_fp8
+                else "attention_deterministic_benchmark_result"
+            )
+        else:
+            prefix = "attention_fp8_benchmark_result" if use_fp8 else "attention_benchmark_result"
         filename = f"{prefix}_{timestamp}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
@@ -282,5 +437,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable FP8 attention benchmark (default: disabled)",
     )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic kernel mode (default: disabled).",
+    )
     args = parser.parse_args()
-    benchmark_attention(output_csv=args.output, use_fp8=args.fp8)
+    benchmark_attention(output_csv=args.output, use_fp8=args.fp8, deterministic=args.deterministic)

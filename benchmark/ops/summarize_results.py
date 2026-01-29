@@ -24,6 +24,9 @@ AMD_BENCHMARK_OPS = {
         "PyTorch": "attention_torch_benchmark.csv",
         "Turbo(Aiter/CK)": "attention_benchmark.csv",
     },
+    "Attention-Deterministic": {
+        "Turbo(Aiter/CK)": "attention_deterministic_benchmark.csv",
+    },
     "Attention-FP8": {
         "Turbo(Triton)": "attention_fp8_benchmark.csv",
     },
