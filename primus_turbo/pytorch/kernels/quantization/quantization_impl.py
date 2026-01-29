@@ -100,7 +100,7 @@ def quant_fp8_blockwise_impl(
     x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_kernel)[grid](
+    quant_fp8_blockwise_kernel[grid](
         x,
         x_fp8,
         x_scales,
@@ -157,7 +157,7 @@ def quant_fp8_blockwise_segment_m_impl(
 
     # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
+    quant_fp8_blockwise_segment_m_kernel[grid](
         x,
         x_fp8,
         x_scales,
