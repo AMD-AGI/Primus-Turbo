@@ -161,6 +161,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
     runtime_module.def("destroy_stream", &destroy_stream);
+
+    // ********* Pipelined EP *********
+    auto pipelined_ep_module = m.def_submodule(
+        "pipelined_ep",
+        "Pipelined EP: aim to overlap the ep communication and grouped-gemm computation");
+    pipelined_ep_module.def("dispatch", &pipelined_ep::dispatch);
+    pipelined_ep_module.def("combine", &pipelined_ep::combine);
 }
 
 /********************************************/

@@ -18,6 +18,7 @@
 
 #include "primus_turbo/common.h"
 
+#include "cco/pipelined_ep/pipelined_ep.h"
 #include "deep_ep/deep_ep.hpp"
 
 namespace primus_turbo::pytorch {
