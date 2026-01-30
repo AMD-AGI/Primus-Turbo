@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+
 import pytest
 import torch
 
@@ -62,6 +63,7 @@ def _run_grouped_gemm_fp8_test(
     block_size: int | None = None,
     backend: BackendType | None = None,
     auto_tune: bool = False,
+    cuda_graph: bool = False,
 ):
     """Common test logic for grouped_gemm_fp8 with different scaling granularities."""
     seed = 42
@@ -91,7 +93,7 @@ def _run_grouped_gemm_fp8_test(
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
         f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
-        f"balance={balance}, backend={backend}, auto_tune={auto_tune}"
+        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
@@ -110,8 +112,32 @@ def _run_grouped_gemm_fp8_test(
 
     # Turbo
     config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
-    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
-    out.backward(grad_out)
+
+    if cuda_graph:
+        # CUDA graph mode: warmup -> capture -> replay
+        # Warmup is REQUIRED to JIT compile Triton kernels before graph capture
+        # (CUDA graphs cannot capture kernel compilation)
+        out_warmup = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+        out_warmup.backward(grad_out)
+        del out_warmup
+
+        a.grad.zero_()
+        b.grad.zero_()
+        torch.cuda.synchronize()
+
+        # Capture the CUDA graph
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+            out.backward(grad_out)
+
+        # Replay the graph
+        g.replay()
+        torch.cuda.synchronize()
+    else:
+        # Normal mode: direct execution
+        out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+        out.backward(grad_out)
 
     # Check Shape
     assert out.shape == out_ref.shape
@@ -217,6 +243,41 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
         trans_b=trans_b,
         balance=balance,
         block_size=block_size,
+    )
+
+
+@pytest.mark.parametrize("B", [2, 16])
+@pytest.mark.parametrize("M", [128, 1024])
+@pytest.mark.parametrize(
+    "NK",
+    [
+        (2048, 1536),
+        (2048, 1408),
+        (1408, 2048),
+        (3072, 5120),
+        (5120, 1536),
+        (4096, 7168),
+    ],
+)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
+    N, K = NK
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        block_size=block_size,
+        cuda_graph=True,
     )
 
 
