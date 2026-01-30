@@ -110,7 +110,7 @@ jobs:
           ls -al ${{ env.UCCL_WHEEL_DIR }}
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
 
-          cp -v wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
+          cp -v dist/*.whl ${{ env.UCCL_WHEEL_DIR }}/
           echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
           ls -la ${{ env.UCCL_WHEEL_DIR }}/
 
