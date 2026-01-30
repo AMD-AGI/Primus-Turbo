@@ -211,7 +211,6 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
-        maybe_pre_sync: bool = False,
     ):
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
             a,
@@ -224,7 +223,6 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
             trans_b,
             out_dtype,
             granularity.name,
-            maybe_pre_sync,
         )
 
 
@@ -272,7 +270,6 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
-        maybe_pre_sync: bool = False,
     ):
         if trans_c:
             lhs, rhs = b, a
@@ -293,7 +290,6 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             trans_rhs,
             out_dtype,
             granularity.name,
-            maybe_pre_sync,
         )
 
 
@@ -378,7 +374,6 @@ def grouped_gemm_fp8_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
@@ -396,7 +391,6 @@ def grouped_gemm_fp8_impl(
         out_dtype=out_dtype,
         granularity=granularity_enum,
         num_cu=num_cu,
-        maybe_pre_sync=maybe_pre_sync,
     )
 
     return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -419,7 +413,6 @@ def grouped_gemm_fp8_variable_k_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
@@ -438,7 +431,6 @@ def grouped_gemm_fp8_variable_k_impl(
         out_dtype=out_dtype,
         granularity=granularity_enum,
         num_cu=num_cu,
-        maybe_pre_sync=maybe_pre_sync,
     )
 
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -463,7 +455,6 @@ def grouped_gemm_fp8_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -495,7 +486,6 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"

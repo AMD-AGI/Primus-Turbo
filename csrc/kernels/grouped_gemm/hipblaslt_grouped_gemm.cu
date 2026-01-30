@@ -71,11 +71,7 @@ public:
         }
     }
 
-    void run(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-        if (pre_sync) {
-            PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
-        }
-
+    void run(const HipblasltGroupedGemmParams &params) {
         // Check
         check(params);
         // Compute arguments
@@ -138,8 +134,6 @@ private:
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
-        // TODO(xiaobochen): group_lens_ptr is device pointer, but host can access
-        // it directly on MI300/MI350. Need to investigate why this works.
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
             valid_group_num += params.group_lens_ptr[i] > 0 ? 1 : 0;
@@ -244,11 +238,11 @@ private:
     std::vector<int64_t> cols_c_;
 };
 
-void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params) {
     // TODO: This uses a single static instance, which may be risky under multi-threaded usage.
     // If/when needed, add proper thread-safety (e.g., per-thread instances or locking).
     static HipblasltGroupedGemm instance;
-    instance.run(params, pre_sync);
+    instance.run(params);
 }
 
 } // namespace primus_turbo

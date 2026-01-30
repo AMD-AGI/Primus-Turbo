@@ -64,6 +64,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         assert a.ndim == 2, "Input tensor must be 2-dimensional."
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         assert group_lens.size(0) == b.size(0), "group_lens size must match b size(0)."
+        assert group_lens.is_cuda() and group_offs.is_cuda(), "group_lens and group_offs must be on GPU."
         out_dtype = a.dtype
         assert out_dtype in [torch.float16, torch.bfloat16]
 
@@ -335,7 +336,6 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
-            maybe_pre_sync=True,
         )
 
         ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs)

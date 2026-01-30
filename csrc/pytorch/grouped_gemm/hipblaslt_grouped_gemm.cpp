@@ -16,6 +16,16 @@
 
 namespace primus_turbo::pytorch {
 
+static void maybe_group_lens_and_group_offs_d2h(at::Tensor &group_lens, at::Tensor &group_offs) {
+    // If group_lens or group_offs is not on CPU, copy it to CPU.
+    if (!group_lens.is_cpu()) {
+        group_lens = group_lens.to(at::kCPU);
+    }
+    if (!group_offs.is_cpu()) {
+        group_offs = group_offs.to(at::kCPU);
+    }
+}
+
 inline HipblasltGroupedGemmParams
 make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
                                    const at::Tensor &group_lens, const at::Tensor &group_offs,
@@ -82,8 +92,7 @@ inline HipblasltGroupedGemmParams make_hipblaslt_grouped_gemm_fp8_params(
 }
 
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                  at::Tensor &group_offs, const bool transA, const bool transB,
-                                  const bool pre_sync) {
+                                  at::Tensor &group_offs, const bool transA, const bool transB) {
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()),
                        "hipblaslt_grouped_gemm only supports float16 and bfloat16");
@@ -92,6 +101,8 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
+
+    maybe_group_lens_and_group_offs_d2h(group_lens, group_offs);
 
     // Create output tensor
     at::Tensor c;
@@ -112,15 +123,14 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
 
     auto params = make_hipblaslt_grouped_gemm_params(a, b, c, group_lens, group_offs, transA,
                                                      transB, workspace);
-    primus_turbo::hipblaslt_grouped_gemm(params, pre_sync);
+    primus_turbo::hipblaslt_grouped_gemm(params);
     return c;
 }
 
 at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                       at::Tensor &b_scales, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      at::ScalarType out_dtype, const std::string &granularity,
-                                      const bool pre_sync) {
+                                      at::ScalarType out_dtype, const std::string &granularity) {
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));
@@ -129,6 +139,8 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE", "granularity must be 'TENSORWISE'");
+
+    maybe_group_lens_and_group_offs_d2h(group_lens, group_offs);
 
     // Scale mode
     hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_END;
@@ -157,7 +169,7 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
 
     auto params = make_hipblaslt_grouped_gemm_fp8_params(
         a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB, scale_mode, workspace);
-    primus_turbo::hipblaslt_grouped_gemm(params, pre_sync);
+    primus_turbo::hipblaslt_grouped_gemm(params);
 
     return c;
 }

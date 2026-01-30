@@ -89,7 +89,9 @@ def _run_grouped_gemm_fp8_test(
 
     device = "cuda:0"
 
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance)
+    if backend != BackendType.HIPBLASLT:
+        group_lens = group_lens.to(device)
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
         f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
