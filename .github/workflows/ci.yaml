@@ -77,15 +77,19 @@ jobs:
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
 
-          sed -i '/pip install.*--pre torch torchvision.*\\$/,+1d' docker/Dockerfile.rocm
+          apt update && apt install -y rdma-core libibverbs-dev libnuma-dev libgoogle-glog-dev
 
-          # build wheel
-          bash build.sh rocm ep ${{ env.UCCL_PY_VER }}
+          # build ep
+          pushd ep
+          python3 setup.py build
+          popd
+          cp ep/build/**/*.so uccl/
+          python3 setup.py bdist_wheel
 
           pushd ep/deep_ep_wrapper
           python3 setup.py bdist_wheel
           popd
-          cp ep/deep_ep_wrapper/dist/*.whl wheelhouse-rocm/
+          cp ep/deep_ep_wrapper/dist/*.whl dist/
 
           end_time=$(date +%s)
           elapsed=$((end_time - start_time))
