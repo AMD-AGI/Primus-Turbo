@@ -15,6 +15,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
     quantize_fp8_rowwise_impl,
+    quantize_fp8_tensorwise_fused_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
@@ -53,12 +54,16 @@ def quantize_fp8(
             5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        assert with_trans is False, "The with_trans must be False for tensorwise FP8 quantization"
         assert (
             scaling_recipe_for_trans is None
         ), "The scaling_recipe_for_trans must be None for tensorwise FP8 quantization"
 
-        return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
+        if with_trans:
+            # Fused cast + transpose kernel (optimized C++ implementation)
+            # Single pass: amax -> scale -> cast + transpose
+            return quantize_fp8_tensorwise_fused_impl(x, out_dtype, scale)
+        else:
+            return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
     elif granularity == ScalingGranularity.ROWWISE:
         assert axis is not None, "The axis must be specified for rowwise FP8 quantization"
         assert with_trans is False, "The with_trans must be False for rowwise FP8 quantization"

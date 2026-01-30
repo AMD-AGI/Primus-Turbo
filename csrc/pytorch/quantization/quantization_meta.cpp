@@ -14,6 +14,19 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
     return {input_fp8, scale_inv};
 }
 
+std::vector<at::Tensor> quantize_fp8_tensorwise_fused_meta(const at::Tensor          input,
+                                                           const at::ScalarType      dest_dtype,
+                                                           c10::optional<at::Tensor> scale_opt) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D for fused cast+transpose");
+    const int64_t M         = input.size(0);
+    const int64_t N         = input.size(1);
+    auto          output    = at::empty({M, N}, at::dtype(dest_dtype).device(at::kMeta));
+    auto          output_t  = at::empty({N, M}, at::dtype(dest_dtype).device(at::kMeta));
+    auto          scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
+    // Return (x_fp8, x_t_fp8, scale_inv) - same scale_inv for both
+    return {output, output_t, scale_inv};
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   const int64_t             axis,
@@ -33,6 +46,13 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
                                           const at::ScalarType dest_dtype) {
     at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
     return output;
+}
+
+std::vector<at::Tensor> compute_fp8_scale_tensorwise_meta(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype) {
+    auto scale     = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
+    auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
+    return {scale, scale_inv};
 }
 
 } // namespace primus_turbo::pytorch

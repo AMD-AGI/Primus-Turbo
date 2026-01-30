@@ -34,6 +34,14 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt);
 
+std::vector<at::Tensor> quantize_fp8_tensorwise_fused(const at::Tensor          input,
+                                                      const at::ScalarType      dest_dtype,
+                                                      c10::optional<at::Tensor> scale_opt);
+
+std::vector<at::Tensor> quantize_fp8_tensorwise_fused_meta(const at::Tensor          input,
+                                                           const at::ScalarType      dest_dtype,
+                                                           c10::optional<at::Tensor> scale_opt);
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                              const at::ScalarType dest_dtype, const int64_t axis,
                                              c10::optional<at::Tensor> scale_opt);
@@ -48,6 +56,12 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
+
+std::vector<at::Tensor> compute_fp8_scale_tensorwise(const at::Tensor     input,
+                                                     const at::ScalarType dest_dtype);
+
+std::vector<at::Tensor> compute_fp8_scale_tensorwise_meta(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype);
 
 //==================================================================
 //  GEMM

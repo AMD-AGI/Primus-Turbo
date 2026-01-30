@@ -40,6 +40,21 @@ def quantize_fp8_tensorwise_impl(
     return x_fp8, scale_inv
 
 
+def quantize_fp8_tensorwise_fused_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantize FP8 Tensor-Wise with fused transpose (Triton kernel).
+    Returns: (x_fp8, x_t_fp8, scale_inv) - same scale_inv for both layouts
+    """
+    from primus_turbo.triton.quantization.quantization_tensorwise import (
+        quantize_fp8_tensorwise_with_transpose,
+    )
+
+    x_fp8, scale_inv, x_t_fp8 = quantize_fp8_tensorwise_with_transpose(x, out_dtype)
+    return x_fp8, x_t_fp8, scale_inv
+
+
 def quantize_fp8_rowwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:

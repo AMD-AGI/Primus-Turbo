@@ -34,4 +34,16 @@ template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,
                                 hipStream_t stream);
 
+// *************** Fused Cast + Transpose Tensorwise ***************
+// Uses quantize_tensorwise_impl + transpose kernel
+template <typename FType, typename QType, typename ComputeType = float>
+void cast_transpose_tensorwise_impl(const FType *input, QType *output, QType *output_t,
+                                    float *scale, float *scale_inv, float *amax, const int64_t M,
+                                    const int64_t N, const float q_max, hipStream_t stream);
+
+// Transpose kernel for FP8 tensors
+template <int TILE_DIM, int BLOCK_ROWS, typename QType>
+void transpose_fp8_kernel(const QType *input, QType *output, int64_t M, int64_t N,
+                          hipStream_t stream);
+
 } // namespace primus_turbo

@@ -26,8 +26,12 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ********* Quantization *********
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
           "Tensor[]");
+    m.def("quantize_fp8_tensorwise_fused(Tensor input, ScalarType dest_dtype, Tensor? "
+          "scale_opt=None) -> "
+          "Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
           "scale_opt=None) -> Tensor[]");
+    m.def("compute_fp8_scale_tensorwise(Tensor input, ScalarType dest_dtype) -> Tensor[]");
 
     m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
           "Tensor");
@@ -63,7 +67,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("ck_gemm_fp8", ck_gemm_fp8);
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
+    m.impl("quantize_fp8_tensorwise_fused", quantize_fp8_tensorwise_fused);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
+    m.impl("compute_fp8_scale_tensorwise", compute_fp8_scale_tensorwise);
 
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
 
@@ -89,8 +95,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
+    m.impl("quantize_fp8_tensorwise_fused", quantize_fp8_tensorwise_fused_meta);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
+    m.impl("compute_fp8_scale_tensorwise", compute_fp8_scale_tensorwise_meta);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);

@@ -24,11 +24,60 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
+from primus_turbo.triton.quantization.quantization_tensorwise import (
+    quantize_fp8_delayed_scaling,
+)
 
 __all__ = ["gemm_fp8"]
 
 
+class PersistentAmaxBuffers:
+    """
+    Persistent GPU buffers for amax - eliminates Python dict lookups and tensor allocation.
+    Double-buffering: prev_amax (read) and next_amax (write) swap each iteration.
+    """
+
+    def __init__(self):
+        self._buffers = {}  # key -> [buf0, buf1]
+        self._idx = {}  # key -> current write index (0 or 1)
+
+    def get_buffers(self, key: str, device: torch.device) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """
+        Get (prev_amax, next_amax) for a key.
+        First call: prev_amax=None (triggers sync computation), next_amax=buf0
+        Subsequent: prev_amax=buf[read_idx], next_amax=buf[write_idx]
+        """
+        if key not in self._buffers:
+            # First call: allocate persistent buffers
+            buf0 = torch.zeros(1, dtype=torch.float32, device=device)
+            buf1 = torch.zeros(1, dtype=torch.float32, device=device)
+            self._buffers[key] = [buf0, buf1]
+            self._idx[key] = 0  # First write goes to buf0
+            return None, buf0  # prev=None signals first call
+
+        write_idx = self._idx[key]
+        read_idx = 1 - write_idx  # Read from the OTHER buffer (previous write)
+
+        prev_amax = self._buffers[key][read_idx]
+        next_amax = self._buffers[key][write_idx]
+
+        # Reset next_amax to 0 for atomic_max
+        next_amax.zero_()
+
+        return prev_amax, next_amax
+
+    def flip(self, key: str):
+        """Flip write index for next iteration."""
+        if key in self._idx:
+            self._idx[key] = 1 - self._idx[key]
+
+
+# Global persistent buffers
+_amax_buffers = PersistentAmaxBuffers()
+
+
 class FP8GemmTensorFunction(torch.autograd.Function):
+    """FP8 GEMM with TE-style delayed scaling for maximum performance."""
 
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -53,8 +102,18 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         a_dtype = FP8GemmTensorFunction.get_fp8_dtype(config.format, True)
         b_dtype = FP8GemmTensorFunction.get_fp8_dtype(config.format, True)
 
-        a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
-        b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
+        # TE-style delayed scaling with persistent GPU buffers
+        # No Python dict lookups or tensor allocation after first call!
+        a_prev, a_next = _amax_buffers.get_buffers("fwd_a", a.device)
+        b_prev, b_next = _amax_buffers.get_buffers("fwd_b", b.device)
+
+        # Quantize with persistent buffers - kernel writes directly to next buffer
+        a_fp8, a_scale_inv, a_t_fp8 = quantize_fp8_delayed_scaling(a, a_dtype, a_prev, a_next)
+        b_fp8, b_scale_inv, b_t_fp8 = quantize_fp8_delayed_scaling(b, b_dtype, b_prev, b_next)
+
+        # Flip buffers for next iteration (just index swap, no data copy)
+        _amax_buffers.flip("fwd_a")
+        _amax_buffers.flip("fwd_b")
 
         out = gemm_fp8_impl(
             a_fp8,
@@ -68,7 +127,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             granularity=config.granularity.value,
             default_backend=BackendType.HIPBLASLT.value,
         )
-        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
+        # Save transposed FP8 tensors for backward to use NT layout
+        ctx.save_for_backward(a_t_fp8, a_scale_inv, b_t_fp8, b_scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -78,33 +138,45 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
+        a_t_fp8, a_scale_inv, b_t_fp8, b_scale_inv = ctx.saved_tensors
         grad_out_dtype = FP8GemmTensorFunction.get_fp8_dtype(ctx.config.format, False)
 
-        grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
+        # TE-style delayed scaling with persistent buffers
+        grad_prev, grad_next = _amax_buffers.get_buffers("bwd_grad", grad_out.device)
 
+        grad_out_fp8, grad_out_scale_inv, grad_out_t_fp8 = quantize_fp8_delayed_scaling(
+            grad_out, grad_out_dtype, grad_prev, grad_next
+        )
+
+        # Flip buffer for next backward pass
+        _amax_buffers.flip("bwd_grad")
+
+        # dA = grad_out @ B (when trans_b=True, B is (N,K), we need grad_out @ B)
+        # Use NT layout: grad_out_fp8 @ b_t_fp8^T
         a_grad = gemm_fp8_impl(
             grad_out_fp8,
             grad_out_scale_inv,
             False,
-            b_fp8,
+            b_t_fp8,
             b_scale_inv,
-            not ctx.trans_b,
+            True,  # NT layout for fast kernel
             ctx.out_dtype,
-            ctx.trans_a,
+            False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.HIPBLASLT.value,
         )
 
+        # dB = grad_out^T @ A (result shape matches B)
+        # Use NT layout: grad_out_t_fp8 @ a_t_fp8^T
         b_grad = gemm_fp8_impl(
-            a_fp8,
-            a_scale_inv,
-            not ctx.trans_a,
-            grad_out_fp8,
-            grad_out_scale_inv,
+            grad_out_t_fp8,
+            grad_out_scale_inv,  # same scale_inv for original and transposed
             False,
+            a_t_fp8,
+            a_scale_inv,
+            True,  # NT layout for fast kernel
             ctx.out_dtype,
-            ctx.trans_b,
+            False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.HIPBLASLT.value,
         )
