@@ -58,6 +58,10 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         how_v3_bf16_cvt: Optional[int] = 1,
         sink: Optional[torch.Tensor] = None,
     ):
+        assert not (deterministic and sink is not None), (
+            "deterministic and sink cannot be enabled together currently; "
+            "please set deterministic=False or sink=None"
+        )
         # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
         # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
         is_v3_atomic_fp32 = AiterFlashAttnFunc._resolve_is_v3_atomic_fp32(is_v3_atomic_fp32)
