@@ -13,12 +13,14 @@ from config import (
 )
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformer_engine.pytorch.attention.dot_product_attention import DotProductAttention
+from transformer_engine.pytorch.attention.dot_product_attention import (
+    DotProductAttention,
+)
 
 
 ATTENTION_ENV_VARS = [
     "NVTE_FUSED_ATTN",
-    "NVTE_FLASH_ATTN", 
+    "NVTE_FLASH_ATTN",
     "NVTE_FUSED_ATTN_AOTRITON",
     "NVTE_FUSED_ATTN_CK",
     "NVTE_UNFUSED_ATTN",
@@ -27,19 +29,22 @@ ATTENTION_ENV_VARS = [
     "NVTE_CK_IS_V3_ATOMIC_FP32",
 ]
 
+
 def cleanup_env():
     for var in ATTENTION_ENV_VARS:
         os.environ[var] = "0"
 
+
 def setup_backend_env(use_ck_bwd_v3=True, use_ck_fwd_v3=True, use_ck_v3_a16=False):
     cleanup_env()
-    
+
     os.environ["NVTE_FUSED_ATTN"] = "1"
     os.environ["NVTE_FUSED_ATTN_CK"] = "1"
     os.environ["NVTE_CK_USES_BWD_V3"] = "1" if use_ck_bwd_v3 else "0"
     if use_ck_bwd_v3:
         os.environ["NVTE_CK_IS_V3_ATOMIC_FP32"] = "0" if use_ck_v3_a16 else "1"
     os.environ["NVTE_CK_USES_FWD_V3"] = "1" if use_ck_fwd_v3 else "0"
+
 
 def _is_gfx950():
     props = torch.cuda.get_device_properties(0)
@@ -165,9 +170,24 @@ def profile_attention(
     device = "cuda"
     dtype = torch.bfloat16
 
-    q = torch.randn((batch, seqlen, num_head_q, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn((batch, seqlen, num_head_kv, head_dim_qk), device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn((batch, seqlen, num_head_kv, head_dim_v), device=device, dtype=dtype, requires_grad=True)
+    q = torch.randn(
+        (batch, seqlen, num_head_q, head_dim_qk),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (batch, seqlen, num_head_kv, head_dim_qk),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (batch, seqlen, num_head_kv, head_dim_v),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
     q_ref = q.clone().detach().requires_grad_()
     k_ref = k.clone().detach().requires_grad_()
     v_ref = v.clone().detach().requires_grad_()
@@ -227,10 +247,14 @@ def profile_attention(
         ) = check_attention_determinism(fwd_call, q, k, v, grad_out)
 
     out = fwd_call()
-    correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out)
+    correct = check_attention_correctness(
+        q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out
+    )
 
     if deterministic:
-        determinism_ok = bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
+        determinism_ok = (
+            bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
+        )
         status = "PASS" if determinism_ok else "FAIL"
         print(
             "Deterministic Check (bitwise; max_abs_diff): "
@@ -251,36 +275,46 @@ def profile_attention(
         out.backward(grad_out, retain_graph=True)
     torch.cuda.synchronize()
 
-    fwd_time = benchmark.Timer(
-        stmt=(
-            "fwd_func(q, k, v, qkv_format='bshd', max_seqlen_q=seqlen, "
-            "max_seqlen_kv=seqlen, attn_mask_type=attn_mask_type, window_size=None)"
-        ),
-        globals={
-            "fwd_func": fwd_func,
-            "q": q,
-            "k": k,
-            "v": v,
-            "seqlen": seqlen,
-            "attn_mask_type": attn_mask_type,
-        },
-    ).timeit(100).mean * 1e3
-    bwd_time = benchmark.Timer(
-        stmt=(
-            "out = fwd_func(q, k, v, qkv_format='bshd', max_seqlen_q=seqlen, "
-            "max_seqlen_kv=seqlen, attn_mask_type=attn_mask_type, window_size=None); "
-            "out.backward(grad_out, retain_graph=True)"
-        ),
-        globals={
-            "fwd_func": fwd_func,
-            "q": q,
-            "k": k,
-            "v": v,
-            "seqlen": seqlen,
-            "attn_mask_type": attn_mask_type,
-            "grad_out": grad_out,
-        },
-    ).timeit(100).mean * 1e3
+    fwd_time = (
+        benchmark.Timer(
+            stmt=(
+                "fwd_func(q, k, v, qkv_format='bshd', max_seqlen_q=seqlen, "
+                "max_seqlen_kv=seqlen, attn_mask_type=attn_mask_type, window_size=None)"
+            ),
+            globals={
+                "fwd_func": fwd_func,
+                "q": q,
+                "k": k,
+                "v": v,
+                "seqlen": seqlen,
+                "attn_mask_type": attn_mask_type,
+            },
+        )
+        .timeit(100)
+        .mean
+        * 1e3
+    )
+    bwd_time = (
+        benchmark.Timer(
+            stmt=(
+                "out = fwd_func(q, k, v, qkv_format='bshd', max_seqlen_q=seqlen, "
+                "max_seqlen_kv=seqlen, attn_mask_type=attn_mask_type, window_size=None); "
+                "out.backward(grad_out, retain_graph=True)"
+            ),
+            globals={
+                "fwd_func": fwd_func,
+                "q": q,
+                "k": k,
+                "v": v,
+                "seqlen": seqlen,
+                "attn_mask_type": attn_mask_type,
+                "grad_out": grad_out,
+            },
+        )
+        .timeit(100)
+        .mean
+        * 1e3
+    )
     fwd_tflops = fwd_flops / (fwd_time * 1e-3) / 1e12
     bwd_tflops = bwd_flops / (bwd_time * 1e-3) / 1e12
 
@@ -312,7 +346,9 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
     rows = []
     test_id = 0
     total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
-    print(f"Total tests: {total_tests}, ck: {ck_version}, deterministic: {deterministic}")
+    print(
+        f"Total tests: {total_tests}, ck: {ck_version}, deterministic: {deterministic}"
+    )
 
     for causal in [False, True]:
         for case in test_cases:
@@ -382,7 +418,9 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                     )
                     if deterministic:
                         row["Deterministic Check"] = (
-                            "PASS" if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok) else "FAIL"
+                            "PASS"
+                            if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok)
+                            else "FAIL"
                         )
                 except Exception as e:
                     print(f"Failed: {str(e)}")
@@ -401,9 +439,15 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                 rows.append(row)
 
     results = pd.DataFrame(rows)
-    if deterministic and "Check" in results.columns and "Deterministic Check" in results.columns:
+    if (
+        deterministic
+        and "Check" in results.columns
+        and "Deterministic Check" in results.columns
+    ):
         cols = list(results.columns)
-        cols.insert(cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check")))
+        cols.insert(
+            cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check"))
+        )
         results = results[cols]
 
     print("\nFinal Results:")
@@ -450,5 +494,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     use_ck_v3 = args.ck == "v3"
-    setup_backend_env(use_ck_bwd_v3=use_ck_v3, use_ck_fwd_v3=use_ck_v3, use_ck_v3_a16=False)
-    benchmark_attention(output_csv=args.output, ck_version=args.ck, deterministic=args.deterministic)
+    setup_backend_env(
+        use_ck_bwd_v3=use_ck_v3, use_ck_fwd_v3=use_ck_v3, use_ck_v3_a16=False
+    )
+    benchmark_attention(
+        output_csv=args.output, ck_version=args.ck, deterministic=args.deterministic
+    )
