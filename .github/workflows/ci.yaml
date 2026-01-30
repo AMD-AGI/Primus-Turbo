@@ -74,9 +74,13 @@ jobs:
 
       - name: Build UCCL
         run: |
+          # Build and install uccl-ep wheel based on Primus-Turbo CI container.
+          # Note(zhuang12): For official builds, use uccl/build.sh with docker/Dockerfile.rocm instead.
+
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
 
+          # Install UCCL build dependencies
           apt update && apt install -y rdma-core libibverbs-dev libnuma-dev libgoogle-glog-dev
 
           # build ep
