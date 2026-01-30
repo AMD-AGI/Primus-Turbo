@@ -10,7 +10,7 @@ env:
 
 jobs:
   benchmark-pytorch-gfx942:
-    runs-on: turbo-pt-bench-gfx942-2510-vsskr
+    runs-on: turbo-pt-bench-gfx942-2510-kfpfd
     env:
       GPU_NAME: MI325  # Change this to your GPU model
     steps:
