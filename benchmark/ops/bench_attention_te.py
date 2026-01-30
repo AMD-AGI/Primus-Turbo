@@ -17,7 +17,6 @@ from transformer_engine.pytorch.attention.dot_product_attention import (
     DotProductAttention,
 )
 
-
 ATTENTION_ENV_VARS = [
     "NVTE_FUSED_ATTN",
     "NVTE_FLASH_ATTN",
@@ -247,14 +246,10 @@ def profile_attention(
         ) = check_attention_determinism(fwd_call, q, k, v, grad_out)
 
     out = fwd_call()
-    correct = check_attention_correctness(
-        q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out
-    )
+    correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out)
 
     if deterministic:
-        determinism_ok = (
-            bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
-        )
+        determinism_ok = bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
         status = "PASS" if determinism_ok else "FAIL"
         print(
             "Deterministic Check (bitwise; max_abs_diff): "
@@ -346,9 +341,7 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
     rows = []
     test_id = 0
     total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
-    print(
-        f"Total tests: {total_tests}, ck: {ck_version}, deterministic: {deterministic}"
-    )
+    print(f"Total tests: {total_tests}, ck: {ck_version}, deterministic: {deterministic}")
 
     for causal in [False, True]:
         for case in test_cases:
@@ -418,9 +411,7 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                     )
                     if deterministic:
                         row["Deterministic Check"] = (
-                            "PASS"
-                            if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok)
-                            else "FAIL"
+                            "PASS" if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok) else "FAIL"
                         )
                 except Exception as e:
                     print(f"Failed: {str(e)}")
@@ -439,15 +430,9 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                 rows.append(row)
 
     results = pd.DataFrame(rows)
-    if (
-        deterministic
-        and "Check" in results.columns
-        and "Deterministic Check" in results.columns
-    ):
+    if deterministic and "Check" in results.columns and "Deterministic Check" in results.columns:
         cols = list(results.columns)
-        cols.insert(
-            cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check"))
-        )
+        cols.insert(cols.index("Check") + 1, cols.pop(cols.index("Deterministic Check")))
         results = results[cols]
 
     print("\nFinal Results:")
@@ -494,9 +479,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     use_ck_v3 = args.ck == "v3"
-    setup_backend_env(
-        use_ck_bwd_v3=use_ck_v3, use_ck_fwd_v3=use_ck_v3, use_ck_v3_a16=False
-    )
-    benchmark_attention(
-        output_csv=args.output, ck_version=args.ck, deterministic=args.deterministic
-    )
+    setup_backend_env(use_ck_bwd_v3=use_ck_v3, use_ck_fwd_v3=use_ck_v3, use_ck_v3_a16=False)
+    benchmark_attention(output_csv=args.output, ck_version=args.ck, deterministic=args.deterministic)
