@@ -121,10 +121,9 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
-        maybe_pre_sync: bool = False,
     ) -> torch.Tensor:
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            a, b, group_lens, group_offs, trans_a, trans_b, maybe_pre_sync
+            a, b, group_lens, group_offs, trans_a, trans_b
         )
 
 
@@ -157,7 +156,6 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
-        maybe_pre_sync: bool = False,
     ) -> torch.Tensor:
         if trans_c:
             lhs, rhs = b, a
@@ -167,7 +165,7 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
             trans_lhs, trans_rhs = trans_a, trans_b
 
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync
+            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs
         )
 
 
@@ -206,16 +204,14 @@ class GroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(
-        cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, maybe_pre_sync, **kwargs
-    ):
+    def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, **kwargs):
         bs = group_lens.shape[0]
         m = a.shape[1] if trans_a else a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c, maybe_pre_sync)
+        return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c)
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -231,7 +227,6 @@ def grouped_gemm_impl(
     trans_b: bool,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
@@ -244,7 +239,6 @@ def grouped_gemm_impl(
         trans_a=trans_a,
         trans_b=trans_b,
         num_cu=num_cu,
-        maybe_pre_sync=maybe_pre_sync,
     )
 
     return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -261,7 +255,6 @@ def grouped_gemm_variable_k_impl(
     trans_c: bool,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
@@ -275,7 +268,6 @@ def grouped_gemm_variable_k_impl(
         trans_b=trans_b,
         trans_c=trans_c,
         num_cu=num_cu,
-        maybe_pre_sync=maybe_pre_sync,
     )
     return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
@@ -290,7 +282,6 @@ def grouped_gemm_impl_meta(
     trans_b: bool,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -314,7 +305,6 @@ def grouped_gemm_variable_k_impl_meta(
     trans_c: bool,
     num_cu: int | None,
     default_backend: int,
-    maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"

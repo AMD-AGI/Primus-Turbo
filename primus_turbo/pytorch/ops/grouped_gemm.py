@@ -44,7 +44,6 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_b=trans_b,
                 num_cu=num_cu,
                 default_backend=BackendType.CK.value,
-                maybe_pre_sync=True,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False

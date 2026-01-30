@@ -68,13 +68,22 @@ at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens) {
     // Create output tensor with one more element than input
     at::Tensor group_offs = at::empty({group_lens.numel() + 1}, group_lens.options());
 
-    // Get current CUDA stream
-    auto stream = at::cuda::getCurrentCUDAStream();
+    if (group_lens.is_cuda()) {
+        // Get current CUDA stream
+        auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Call the CUDA implementation to compute group offsets
-    compute_group_offs<int64_t>(reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
-                                reinterpret_cast<int64_t *>(group_offs.data_ptr()),
-                                group_lens.numel(), stream);
+        // Call the CUDA implementation to compute group offsets
+        compute_group_offs<int64_t>(reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
+                                    reinterpret_cast<int64_t *>(group_offs.data_ptr()),
+                                    group_lens.numel(), stream);
+    } else {
+        int64_t *group_offs_ptr = group_offs.data_ptr<int64_t>();
+        int64_t *group_lens_ptr = group_lens.data_ptr<int64_t>();
+        group_offs_ptr[0]       = 0;
+        for (int i = 0; i < group_lens.numel(); i++) {
+            group_offs_ptr[i + 1] = group_offs_ptr[i] + group_lens_ptr[i];
+        }
+    }
 
     return group_offs;
 }
@@ -134,6 +143,22 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
     return c;
 }
 
+static __inline__ void maybe_group_lens_and_group_offs_h2d(at::Tensor &group_lens,
+                                                           at::Tensor &group_offs) {
+    // If group_lens or group_offs is not on CUDA, copy it to CUDA.
+    auto                      stream = at::cuda::getCurrentCUDAStream();
+    at::cuda::CUDAStreamGuard guard(stream);
+
+    if (!group_lens.is_cuda()) {
+        // blocking H2D memcpy
+        group_lens = group_lens.to(at::kCUDA, false);
+    }
+    if (!group_offs.is_cuda()) {
+        // blocking H2D memcpy
+        group_offs = group_offs.to(at::kCUDA, false);
+    }
+}
+
 at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,
                                const bool transA, const bool transB, at::ScalarType out_dtype,
@@ -150,6 +175,8 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "ROWWISE" ||
                            granularity == "BLOCKWISE",
                        "granularity must be 'TENSORWISE', 'ROWWISE', or 'BLOCKWISE'");
+
+    maybe_group_lens_and_group_offs_h2d(group_lens, group_offs);
 
     // Determine output tensor size based on transA and transB
     const int64_t bs = b.size(0);
@@ -273,6 +300,8 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
 
+    maybe_group_lens_and_group_offs_h2d(group_lens, group_offs);
+
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
     at::Tensor    args_tensor =
@@ -326,6 +355,8 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "ROWWISE" ||
                            granularity == "BLOCKWISE",
                        "granularity must be 'TENSORWISE', 'ROWWISE', or 'BLOCKWISE'");
+
+    maybe_group_lens_and_group_offs_h2d(group_lens, group_offs);
 
     // Determine output tensor size based on transA and transB
     const int64_t bs = group_lens.numel();

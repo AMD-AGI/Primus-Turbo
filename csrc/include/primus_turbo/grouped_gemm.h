@@ -105,7 +105,7 @@ void ck_grouped_gemm_fp8_variable_k(
 //  hipBLASLt Grouped GEMM
 //==================================================================
 
-void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync);
+void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params);
 
 template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
