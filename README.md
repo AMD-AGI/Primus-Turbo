@@ -97,12 +97,18 @@ pytest tests/jax/        # run all JAX tests
 **Option 2: Multi-process mode (faster)**
 ```bash
 # PyTorch tests
-pytest tests/pytorch/ -n 8        # single-GPU tests (parallel)
-pytest tests/pytorch/ --dist-only # multi-GPU tests
+## single-GPU tests (parallel)
+pytest tests/pytorch/ -n 8
+## deterministic tests (parallel)
+pytest tests/pytorch/ -n 8 --deterministic-only
+## multi-GPU tests
+pytest tests/pytorch/ --dist-only
 
 # JAX tests
-pytest tests/jax/ -n 8            # single-GPU tests (parallel)
-pytest tests/jax/ --dist-only     # multi-GPU tests
+## single-GPU tests (parallel)
+pytest tests/jax/ -n 8
+## multi-GPU tests
+pytest tests/jax/ --dist-only
 ```
 
 ### 4. Packaging

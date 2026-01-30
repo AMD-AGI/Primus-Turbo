@@ -34,18 +34,40 @@ def pytest_addoption(parser):
         default=False,
         help="Only run multi-GPU distributed tests (MultiProcessTestCase)",
     )
+    parser.addoption(
+        "--deterministic-only",
+        action="store_true",
+        default=False,
+        help="Only run deterministic tests (marked with @pytest.mark.deterministic)",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
+    config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip distributed tests in parallel mode, skip single-GPU tests in --dist-only mode."""
     dist_only = config.getoption("--dist-only", False)
+    deterministic_only = config.getoption("--deterministic-only", False)
+
+    if dist_only and deterministic_only:
+        raise pytest.UsageError("--dist-only and --deterministic-only cannot be enabled together")
 
     for item in items:
         is_dist = _is_distributed_test(item)
+        is_deterministic = item.get_closest_marker("deterministic") is not None
         if _worker_id and is_dist:
             item.add_marker(pytest.mark.skip(reason="Distributed test, run with --dist-only"))
         elif dist_only and not is_dist:
             item.add_marker(pytest.mark.skip(reason="Single-GPU test, run with -n 8"))
+        elif deterministic_only and not is_deterministic:
+            item.add_marker(
+                pytest.mark.skip(reason="Non-deterministic test, run without --deterministic-only")
+            )
+        elif is_deterministic and not deterministic_only:
+            item.add_marker(pytest.mark.skip(reason="Deterministic test, run with --deterministic-only"))
 
 
 def _is_distributed_test(item):
