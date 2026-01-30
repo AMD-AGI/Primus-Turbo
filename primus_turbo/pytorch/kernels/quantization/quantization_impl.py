@@ -67,6 +67,7 @@ def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: i
     raise NotImplementedError(f"Un-impl")
 
 
+@triton_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
 def quant_fp8_blockwise_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
@@ -100,7 +101,7 @@ def quant_fp8_blockwise_impl(
     x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    quant_fp8_blockwise_kernel[grid](
+    wrap_triton(quant_fp8_blockwise_kernel)[grid](
         x,
         x_fp8,
         x_scales,
@@ -113,6 +114,25 @@ def quant_fp8_blockwise_impl(
     return x_fp8, x_scales
 
 
+@quant_fp8_blockwise_impl.register_fake
+def quant_fp8_blockwise_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2, "Input must be 2D"
+    assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
+    axis = axis % 2
+
+    M, N = x.shape
+    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+    return x_fp8, x_scales
+
+
+@triton_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
 def quant_fp8_blockwise_segment_m_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
@@ -157,7 +177,7 @@ def quant_fp8_blockwise_segment_m_impl(
 
     # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
-    quant_fp8_blockwise_segment_m_kernel[grid](
+    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
         x,
         x_fp8,
         x_scales,
@@ -168,6 +188,29 @@ def quant_fp8_blockwise_segment_m_impl(
         block_size,
         torch.finfo(dtype).max,
     )
+    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
+
+
+@quant_fp8_blockwise_segment_m_impl.register_fake
+def quant_fp8_blockwise_segment_m_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2, "Input must be 2D"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    # Use upper bound for allocation
+    M_padded_max = M + num_groups * block_size
+
+    x_fp8 = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+    var_k_group_lens = torch.empty(num_groups, dtype=torch.int64, device=x.device)
+    var_k_group_offs = torch.empty(num_groups + 1, dtype=torch.int64, device=x.device)
     return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
 
 
