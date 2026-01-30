@@ -102,11 +102,6 @@ jobs:
 
       - name: Copy wheel to shared storage
         run: |
-          # if exists, remove the existing wheels
-          # if [ -d "${{ env.UCCL_WHEEL_DIR }}" ]; then
-          #   echo "UCCL_WHEEL_DIR dir exists. Deleting..."
-          #   rm -rf "${{ env.UCCL_WHEEL_DIR }}"
-          # fi
           ls -al ${{ env.UCCL_WHEEL_DIR }}
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
 
