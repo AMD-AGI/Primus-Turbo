@@ -57,7 +57,7 @@ jobs:
   install-dependencies:
     runs-on: turbo-pt-gfx942-2510-279fq
     env:
-        UCCL_COMMIT: 94f0e20716966a33b1045ded9cdc5f9ad3bb36ab #  [EP] Debug AMD performance and mem consistency issues (#600)
+        UCCL_COMMIT: 69a21407d261a8ff0f01f83bb0f5b35da059876d #  [rdma] Make CQ Ex flags configurable for NIC compatibility. (#689)
         UCCL_PY_VER: 3.12
     steps:
       - name: Print job info
@@ -71,11 +71,11 @@ jobs:
           repository: uccl-project/uccl
           ref: ${{ env.UCCL_COMMIT }}
           fetch-depth: 0
-          path: uccl
 
       - name: Build UCCL
         run: |
 
+          # clear wheelhouse-rocm
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
 
@@ -96,7 +96,14 @@ jobs:
 
       - name: Copy wheel to shared storage
         run: |
+          # if exists, remove the existing wheels
+          # if [ -d "${{ env.UCCL_WHEEL_DIR }}" ]; then
+          #   echo "UCCL_WHEEL_DIR dir exists. Deleting..."
+          #   rm -rf "${{ env.UCCL_WHEEL_DIR }}"
+          # fi
+          ls -al ${{ env.UCCL_WHEEL_DIR }}
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
+
           cp -v wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
           echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
           ls -la ${{ env.UCCL_WHEEL_DIR }}/
@@ -138,6 +145,15 @@ jobs:
         run: |
           echo "=== rocminfo ==="
           rocminfo || true
+      - name: Install dependencies
+        run: |
+          # ===== Install UCCL wheel =====
+          echo "==> Installing UCCL from pre-built wheel..."
+          echo "Wheel directory: ${{ env.UCCL_WHEEL_DIR }}"
+          ls -la "${{ env.UCCL_WHEEL_DIR }}/"
+          pip3 install "${{ env.UCCL_WHEEL_DIR }}"/*.whl
+
+          echo "==> UCCL installation completed successfully!"
       - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
@@ -149,14 +165,6 @@ jobs:
           pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
-
-          # ===== Install UCCL wheel =====
-          echo "==> Installing UCCL from pre-built wheel..."
-          echo "Wheel directory: ${{ env.UCCL_WHEEL_DIR }}"
-          ls -la "${{ env.UCCL_WHEEL_DIR }}/"
-          pip3 install "${{ env.UCCL_WHEEL_DIR }}"/*.whl
-
-          echo "==> UCCL installation completed successfully!"
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
