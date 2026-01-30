@@ -74,8 +74,6 @@ jobs:
 
       - name: Build UCCL
         run: |
-
-          # clear wheelhouse-rocm
           start_time=$(date +%s)
           echo "✅ [build uccl] started at: $(date)"
 

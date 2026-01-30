@@ -5,8 +5,8 @@ build
 .vscode
 .gitmodules
 test-reports/
-# *_hip.h
-# *.hip
-# *_hip.cpp
-# *_hip.hpp
-# *_hip.cuh
+*_hip.h
+*.hip
+*_hip.cpp
+*_hip.hpp
+*_hip.cuh
