@@ -127,7 +127,6 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
-    PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE", "granularity must be 'TENSORWISE'");
