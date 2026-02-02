@@ -103,16 +103,16 @@ jobs:
       - name: Copy wheel to shared storage
         run: |
           # if exists, remove the existing wheels
-          # if [ -d "${{ env.UCCL_WHEEL_DIR }}" ]; then
-          #   echo "UCCL_WHEEL_DIR dir exists. Deleting..."
-          #   rm -rf "${{ env.UCCL_WHEEL_DIR }}"
-          # fi
+          if [ -d "${{ env.UCCL_WHEEL_DIR }}" ]; then
+            echo "UCCL_WHEEL_DIR dir exists. Deleting..."
+            rm -rf "${{ env.UCCL_WHEEL_DIR }}"
+          fi
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
           ls -al ${{ env.UCCL_WHEEL_DIR }}
 
-          cp -v wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
+          cp -v dist/*.whl ${{ env.UCCL_WHEEL_DIR }}/
           echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
-          ls -la ${{ env.UCCL_WHEEL_DIR }}/
+          ls -la ${{ env.UCCL_WHEEL_DIR }}
 
   unittest-pytorch-gfx942:
     needs: [code-lint, install-dependencies]
