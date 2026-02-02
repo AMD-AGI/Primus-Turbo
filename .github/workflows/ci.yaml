@@ -107,8 +107,8 @@ jobs:
           #   echo "UCCL_WHEEL_DIR dir exists. Deleting..."
           #   rm -rf "${{ env.UCCL_WHEEL_DIR }}"
           # fi
-          ls -al ${{ env.UCCL_WHEEL_DIR }}
           mkdir -p ${{ env.UCCL_WHEEL_DIR }}
+          ls -al ${{ env.UCCL_WHEEL_DIR }}
 
           cp -v wheelhouse-rocm/*.whl ${{ env.UCCL_WHEEL_DIR }}/
           echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
