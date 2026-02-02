@@ -9,6 +9,9 @@ on:
       - 'v*'
   pull_request:
 
+env:
+  UCCL_WHEEL_DIR: /wekafs/primus_turbo/uccl-wheel
+
 jobs:
   code-lint:
     runs-on: ubuntu-latest
@@ -51,11 +54,71 @@ jobs:
         with:
           options: "--check --diff --color --verbose --line-length=110"
 
-  unittest-pytorch-gfx942:
-    needs: code-lint
+  install-dependencies:
     runs-on: turbo-pt-gfx942-2510-tgjtk
     env:
-      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci/pytorch
+        UCCL_COMMIT: 69a21407d261a8ff0f01f83bb0f5b35da059876d #  [rdma] Make CQ Ex flags configurable for NIC compatibility. (#689)
+        UCCL_PY_VER: 3.12
+    steps:
+      - name: Print job info
+        run: |
+          echo "🎉 Begin Primus-Turbo Install Dependencies."
+          echo "🐧 Running on ${{ runner.os }}, branch: ${{ github.ref }}"
+
+      - name: Checkout UCCL
+        uses: actions/checkout@v4
+        with:
+          repository: uccl-project/uccl
+          ref: ${{ env.UCCL_COMMIT }}
+          fetch-depth: 0
+
+      - name: Build UCCL
+        run: |
+          # Build and install uccl-ep wheel based on Primus-Turbo CI container.
+          # Note(zhuang12): For official builds, use uccl/build.sh with docker/Dockerfile.rocm instead.
+
+          start_time=$(date +%s)
+          echo "✅ [build uccl] started at: $(date)"
+
+          # Install UCCL build dependencies
+          apt update && apt install -y rdma-core libibverbs-dev libnuma-dev libgoogle-glog-dev
+
+          # build ep
+          pushd ep
+          python3 setup.py build
+          popd
+          cp ep/build/**/*.so uccl/
+          python3 setup.py bdist_wheel
+
+          pushd ep/deep_ep_wrapper
+          python3 setup.py bdist_wheel
+          popd
+          cp ep/deep_ep_wrapper/dist/*.whl dist/
+
+          end_time=$(date +%s)
+          elapsed=$((end_time - start_time))
+          echo "✅ [build uccl] ended at: $(date)"
+          echo "⏱️ [build uccl] Total elapsed time: ${elapsed} seconds"
+
+      - name: Copy wheel to shared storage
+        run: |
+          # if exists, remove the existing wheels
+          if [ -d "${{ env.UCCL_WHEEL_DIR }}" ]; then
+            echo "UCCL_WHEEL_DIR dir exists. Deleting..."
+            rm -rf "${{ env.UCCL_WHEEL_DIR }}"
+          fi
+          mkdir -p ${{ env.UCCL_WHEEL_DIR }}
+          ls -al ${{ env.UCCL_WHEEL_DIR }}
+
+          cp -v dist/*.whl ${{ env.UCCL_WHEEL_DIR }}/
+          echo "📦 Wheel files copied to: ${{ env.UCCL_WHEEL_DIR }}"
+          ls -la ${{ env.UCCL_WHEEL_DIR }}
+
+  unittest-pytorch-gfx942:
+    needs: [code-lint, install-dependencies]
+    runs-on: turbo-pt-gfx942-2510-tgjtk
+    env:
+      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo/k8s_ci_pytorch
     steps:
       - run: echo "🎉 Begin Primus-Turbo PyTorch Framework Unit Test."
       - name: Change owner
@@ -88,6 +151,15 @@ jobs:
         run: |
           echo "=== rocminfo ==="
           rocminfo || true
+      - name: Install dependencies
+        run: |
+          # ===== Install UCCL wheel =====
+          echo "==> Installing UCCL from pre-built wheel..."
+          echo "Wheel directory: ${{ env.UCCL_WHEEL_DIR }}"
+          ls -la "${{ env.UCCL_WHEEL_DIR }}/"
+          pip3 install "${{ env.UCCL_WHEEL_DIR }}"/*.whl
+
+          echo "==> UCCL installation completed successfully!"
       - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
@@ -124,7 +196,7 @@ jobs:
     needs: code-lint
     runs-on: turbo-jax-gfx942-259-f8qds
     env:
-      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_k8s_ci/jax
+      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo/k8s_ci_jax
     steps:
       - run: echo "🎉 Begin Primus-Turbo JAX Framework Unit-Test."
       - name: Change owner
