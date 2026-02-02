@@ -10,7 +10,7 @@ on:
   pull_request:
 
 env:
-  UCCL_WHEEL_DIR: /wekafs/primus_turbo_k8s_ci/uccl-wheel
+  UCCL_WHEEL_DIR: /wekafs/primus_turbo/uccl-wheel
 
 jobs:
   code-lint:
@@ -118,7 +118,7 @@ jobs:
     needs: [code-lint, install-dependencies]
     runs-on: turbo-pt-gfx942-2510-tgjtk
     env:
-      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo_k8s_ci/pytorch
+      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo/k8s_ci_pytorch
     steps:
       - run: echo "🎉 Begin Primus-Turbo PyTorch Framework Unit Test."
       - name: Change owner
@@ -196,7 +196,7 @@ jobs:
     needs: code-lint
     runs-on: turbo-jax-gfx942-259-f8qds
     env:
-      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo_k8s_ci/jax
+      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo/k8s_ci_jax
     steps:
       - run: echo "🎉 Begin Primus-Turbo JAX Framework Unit-Test."
       - name: Change owner
