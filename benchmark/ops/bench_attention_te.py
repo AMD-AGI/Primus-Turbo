@@ -1,3 +1,22 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""
+Benchmark Transformer Engine attention performance.
+
+This script intentionally aligns with benchmark/ops/bench_attention_turbo.py:
+- Same test case generator (config.gen_attention_test_cases)
+- Same FLOPs model and TFLOPS reporting
+- Same correctness check vs PyTorch SDPA reference (SNR)
+
+Installation notes:
+- NVIDIA TE: https://github.com/NVIDIA/TransformerEngine
+- AMD TE: https://github.com/ROCm/TransformerEngine
+"""
+
 import argparse
 import os
 from datetime import datetime
@@ -13,12 +32,16 @@ from config import (
 )
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformer_engine.pytorch.attention.dot_product_attention import (
-    DotProductAttention,
-)
+_platform, _ = get_platform_info()
+if _platform == "CUDA":
+    from transformer_engine.pytorch import DotProductAttention
+else:
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        DotProductAttention,
+    )
 
 ATTENTION_ENV_VARS = [
-    "NVTE_FUSED_ATTN",
+    "NVTE_FUSED_ATTN",  # supports both NV and AMD
     "NVTE_FLASH_ATTN",
     "NVTE_FUSED_ATTN_AOTRITON",
     "NVTE_FUSED_ATTN_CK",
@@ -34,15 +57,14 @@ def cleanup_env():
         os.environ[var] = "0"
 
 
-def setup_backend_env(use_ck_bwd_v3=True, use_ck_fwd_v3=True, use_ck_v3_a16=False):
+def setup_backend_env():
     cleanup_env()
 
     os.environ["NVTE_FUSED_ATTN"] = "1"
     os.environ["NVTE_FUSED_ATTN_CK"] = "1"
-    os.environ["NVTE_CK_USES_BWD_V3"] = "1" if use_ck_bwd_v3 else "0"
-    if use_ck_bwd_v3:
-        os.environ["NVTE_CK_IS_V3_ATOMIC_FP32"] = "0" if use_ck_v3_a16 else "1"
-    os.environ["NVTE_CK_USES_FWD_V3"] = "1" if use_ck_fwd_v3 else "0"
+    os.environ["NVTE_CK_USES_BWD_V3"] = "1"
+    os.environ["NVTE_CK_IS_V3_ATOMIC_FP32"] = "0"
+    os.environ["NVTE_CK_USES_FWD_V3"] = "1"
 
 
 def _is_gfx950():
@@ -163,7 +185,6 @@ def profile_attention(
     head_dim_qk,
     head_dim_v,
     causal,
-    ck_version,
     deterministic,
 ):
     device = "cuda"
@@ -333,7 +354,7 @@ def profile_attention(
     )
 
 
-def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
+def benchmark_attention(output_csv=None, deterministic=False):
     platform, gpu_name = get_platform_info()
 
     test_cases = gen_attention_test_cases()
@@ -341,7 +362,7 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
     rows = []
     test_id = 0
     total_tests = 2 * len(BATCH_SIZE_LIST) * len(test_cases)
-    print(f"Total tests: {total_tests}, ck: {ck_version}, deterministic: {deterministic}")
+    print(f"Total tests: {total_tests}, ck: v3, deterministic: {deterministic}")
 
     for causal in [False, True]:
         for case in test_cases:
@@ -357,7 +378,7 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                 print(
                     f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
                     f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
-                    f"causal={causal}, ck={ck_version}, deterministic={deterministic}"
+                    f"causal={causal}, ck=v3, deterministic={deterministic}"
                 )
                 print(f"{'='*60}")
 
@@ -397,7 +418,6 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
                         head_dim_qk,
                         head_dim_v,
                         causal,
-                        ck_version,
                         deterministic,
                     )
                     row.update(
@@ -448,9 +468,9 @@ def benchmark_attention(output_csv=None, ck_version="v3", deterministic=False):
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
         if deterministic:
-            prefix = f"attention_deterministic_benchmark_result_ck_{ck_version}"
+            prefix = "attention_deterministic_benchmark_result_ck_v3"
         else:
-            prefix = f"attention_benchmark_result_ck_{ck_version}"
+            prefix = "attention_benchmark_result_ck_v3"
         filename = f"{prefix}_{timestamp}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
@@ -463,13 +483,7 @@ if __name__ == "__main__":
         "-o",
         type=str,
         default=None,
-        help="Output CSV filename. Default: attention_benchmark_result_ck{v2|v3}_{date}_{gpu}.csv",
-    )
-    parser.add_argument(
-        "--ck",
-        choices=["v2", "v3"],
-        default="v3",
-        help="Use CK attention version (v2 or v3). Default: v3",
+        help="Output CSV filename. Default: attention_benchmark_result_ck_v3_{date}_{gpu}.csv",
     )
     parser.add_argument(
         "--deterministic",
@@ -477,7 +491,5 @@ if __name__ == "__main__":
         help="Enable deterministic kernel mode (default: disabled).",
     )
     args = parser.parse_args()
-
-    use_ck_v3 = args.ck == "v3"
-    setup_backend_env(use_ck_bwd_v3=use_ck_v3, use_ck_fwd_v3=use_ck_v3, use_ck_v3_a16=False)
-    benchmark_attention(output_csv=args.output, ck_version=args.ck, deterministic=args.deterministic)
+    setup_backend_env()
+    benchmark_attention(output_csv=args.output, deterministic=args.deterministic)
