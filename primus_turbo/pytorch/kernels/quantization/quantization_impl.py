@@ -80,19 +80,25 @@ def quant_fp8_blockwise_impl(
     Quantizes a 2D tensor using blockwise scale along the specified axis.
     Assumes `x` is contiguous and 2D.
 
+    Args:
+        x: Input tensor to quantize.
+        dtype: FP8 dtype for output.
+        axis: Axis along which to compute blockwise scales (0 or 1).
+        block_size: Block size for quantization.
+
     Returns:
         x_fp8: FP8-quantized tensor.
         x_scales: Per-block scale tensor in float32.
     """
-
     assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
     assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
-    axis = axis % 2  # Convert negative axis to positive
+    axis = axis % 2
 
     M, N = x.shape
-    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+
+    x_fp8 = torch.zeros((M, N), dtype=dtype, device=x.device)
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     wrap_triton(quant_fp8_blockwise_kernel)[grid](
@@ -117,12 +123,95 @@ def quant_fp8_blockwise_impl_meta(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, "Input must be 2D"
     assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
-    axis = axis % 2  # Convert negative axis to positive
+    axis = axis % 2
+
     M, N = x.shape
     x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (triton.cdiv(M, block_size), N) if axis == 0 else (M, triton.cdiv(N, block_size))
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8, x_scales
+
+
+@triton_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
+def quant_fp8_blockwise_segment_m_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantization for fp8 blockwise with segment-aware padding (axis=0 only).
+
+    Reads from original tensor, writes to padded tensor with segment alignment.
+
+    Args:
+        x: Input tensor to quantize [M, N].
+        dtype: FP8 dtype for output.
+        block_size: Block size for quantization.
+        group_lens: Segment lengths [B].
+        group_offs: Segment offsets [B+1].
+
+    Returns:
+        x_fp8: FP8-quantized tensor [M_padded, N].
+        x_scales: Per-block scale tensor in float32.
+        var_k_group_lens: Padded segment lengths [B].
+        var_k_group_offs: Padded segment offsets [B+1].
+    """
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
+    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+
+    # Use upper bound for allocation to avoid .item() sync (required for graph capture)
+    # Each segment can have at most block_size padding, so M_padded <= M + num_groups * block_size
+    M_padded_max = M + num_groups * block_size
+
+    # Allocate output tensors with upper bound size
+    x_fp8 = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+
+    # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
+    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
+        x,
+        x_fp8,
+        x_scales,
+        group_offs,
+        var_k_group_offs,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
+
+
+@quant_fp8_blockwise_segment_m_impl.register_fake
+def quant_fp8_blockwise_segment_m_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2, "Input must be 2D"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    # Use upper bound for allocation
+    M_padded_max = M + num_groups * block_size
+
+    x_fp8 = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+    var_k_group_lens = torch.empty(num_groups, dtype=torch.int64, device=x.device)
+    var_k_group_offs = torch.empty(num_groups + 1, dtype=torch.int64, device=x.device)
+    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
 
 
 @triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
@@ -198,39 +287,6 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
-
-
-def quant_fp8_blockwise_segment_m_impl(
-    x: torch.Tensor,
-    batch_size: int,
-    seg_lens: torch.Tensor,
-    seg_indptr: torch.Tensor,
-    scales_seg_indptr: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int = 128,
-):
-    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
-    M, N = x.shape
-    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    scales_shape = (
-        triton.cdiv(M, block_size) + batch_size,
-        N,
-    )  # M dim add batchsize.
-    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
-    grid = (triton.cdiv(M, block_size) + seg_lens.shape[0], triton.cdiv(N, block_size))
-    quant_fp8_blockwise_segment_m_kernel[grid](
-        x,
-        x_fp8,
-        x_scales,
-        N,
-        batch_size,
-        seg_indptr,
-        scales_seg_indptr,
-        block_size,
-        torch.finfo(dtype).max,
-    )
-    return x_fp8, x_scales
 
 
 def padding_size(n: int, padding_align_size: int) -> int:
