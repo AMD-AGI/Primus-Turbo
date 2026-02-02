@@ -32,6 +32,7 @@ from config import (
 )
 from tabulate import tabulate
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
 _platform, _ = get_platform_info()
 if _platform == "CUDA":
     from transformer_engine.pytorch import DotProductAttention
