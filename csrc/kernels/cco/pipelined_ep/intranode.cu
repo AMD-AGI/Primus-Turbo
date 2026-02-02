@@ -6,7 +6,18 @@
 
 namespace primus_turbo::cco::pipelined_ep::intranode {
 
-template <int kNumRanks>
+/*
+input:
+    num_tokens_per_rank: (num_ranks x num_stages)
+
+output:
+    moe_recv_counter_mapped: (num_stages,)
+    moe_recv_expert_counter_mapped: (num_stages, num_experts)
+    channel_prefix_matrix: (num_ranks x num_channels x num_stages)
+    rank_prefix_matrix: (num_ranks x num_ranks x num_stages)
+*/
+
+template <int kNumRanks, int kNumStages>
 __global__ void
 notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
                 int const *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
@@ -19,29 +30,35 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
          num_warps = num_threads / WARP_SIZE;
 
     if (sm_id == 0) {
+        int responsible_stage = thread_id < kNumRanks * kNumStages ? thread_id / kNumRanks : -1;
+        int responsible_rank  = thread_id < kNumRanks * kNumStages ? thread_id % kNumRanks : -1;
+
         // Barrier first
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
-        int *per_rank_buffer, *per_expert_buffer;
-        if (thread_id < kNumRanks) {
-            per_rank_buffer   = static_cast<int *>(buffer_ptrs[thread_id]);
-            per_expert_buffer = per_rank_buffer + kNumRanks * kNumRanks;
+        int *per_rank_stage_buffer, *per_expert_stage_buffer;
+        if (thread_id < kNumRanks * kNumStages) {
+            per_rank_stage_buffer = static_cast<int *>(buffer_ptrs[thread_id]);
+            per_expert_stage_buffer     = per_rank_stage_buffer + kNumRanks * kNumRanks * kNumStages;
         }
 
         // After this loop:
-        //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i
-        //  to rank j
+        // per_rank_stage_buffer: (kNumRanks x kNumRanks x kNumStages)
+        //  - `per_rank_buffer[rank][i, j, k]` means the number of tokens from rank i
+        //  to rank j in stage k
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i
         //  to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
-        if (thread_id < kNumRanks) {
+        if (thread_id < kNumRanks * kNumStages) {
 #pragma unroll
             for (int i = 0; i < kNumRanks; ++i)
-                per_rank_buffer[rank * kNumRanks + i] = num_tokens_per_rank[i];
-#pragma unroll
-            for (int i = 0; i < num_experts_per_rank; ++i)
-                per_expert_buffer[rank * num_experts_per_rank + i] =
-                    num_tokens_per_expert[thread_id * num_experts_per_rank + i];
+                per_rank_stage_buffer[rank * kNumRanks * kNumStages + i * kNumStages +
+                                      responsible_stage] =
+                    num_tokens_per_rank[i * kNumStages + responsible_stage];
+            #pragma unroll
+                        for (int i = 0; i < num_experts_per_rank; ++i)
+                            per_expert_stage_buffer[rank * num_experts_per_rank + i] =
+                                num_tokens_per_expert[thread_id * num_experts_per_rank + i];
         }
 
         // Wait for all ranks to be finished
@@ -49,19 +66,22 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
 
         // Sum per-rank counts and return to CPU
         // Also pre-compute the prefix sum for data sending
-        auto local_per_rank_buffer = static_cast<int *>(buffer_ptrs[rank]);
-        if (thread_id < kNumRanks) {
+        auto local_per_rank_stage_buffer = static_cast<int *>(buffer_ptrs[rank]);
+        if (thread_id < kNumRanks * kNumStages) {
 #pragma unroll
             for (int i = 1; i < kNumRanks; ++i)
-                local_per_rank_buffer[i * kNumRanks + thread_id] +=
-                    local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
-            if (thread_id == rank)
-                *moe_recv_counter_mapped =
-                    local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
+                local_per_rank_stage_buffer[i * kNumRanks * kNumStages + thread_id] +=
+                    local_per_rank_stage_buffer[(i - 1) * kNumRanks * kNumStages + thread_id];
+            if (responsible_rank == rank) {
+                moe_recv_counter_mapped[responsible_stage] =
+                    local_per_rank_stage_buffer[(kNumRanks - 1) * kNumRanks * kNumStages +
+                                                rank * kNumStages + responsible_stage];
+            }
         }
 
         // Sum per-experts counts and return to CPU
-        auto local_per_expert_buffer = local_per_rank_buffer + kNumRanks * kNumRanks;
+        auto local_per_expert_stage_buffer =
+            local_per_rank_stage_buffer + kNumRanks * kNumRanks * kNumStages;
         if (thread_id < num_experts_per_rank) {
             int sum = 0;
 #pragma unroll
@@ -74,13 +94,13 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
 
 // Copy rank size prefix matrix to another tensor
 #pragma unroll
-        for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
-            rank_prefix_matrix_copy[i] = local_per_rank_buffer[i];
+        for (int i = thread_id; i < kNumRanks * kNumRanks * kNumStages; i += num_threads)
+            rank_prefix_matrix_copy[i] = local_per_rank_stage_buffer[i];
 
 // Extra memset for later communication queue
 #pragma unroll
         for (int i = thread_id; i < num_memset_int; i += num_threads)
-            local_per_expert_buffer[i] = 0;
+            local_per_expert_stage_buffer[i] = 0;
 
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -264,14 +284,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (lane_id == 0 and send_warp_id_in_rank == 0) {
+        if (lane_id < num_stages and send_warp_id_in_rank == 0) {
             int value = responsible_channel > 0
                             ? channel_prefix_matrix[responsible_rank * num_channels +
                                                     responsible_channel - 1]
                             : 0;
-            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
+            st_relaxed_sys_global(channel_stage_start_offset.buffer() + lane_id, -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
-            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+            st_relaxed_sys_global(channel_stage_end_offset.buffer() + lane_id, -value - 1);
         }
         __syncwarp();
 
