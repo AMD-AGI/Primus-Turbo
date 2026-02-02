@@ -164,10 +164,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // ********* Pipelined EP *********
     auto pipelined_ep_module = m.def_submodule(
-        "pipelined_ep",
-        "Pipelined EP: aim to overlap the ep communication and grouped-gemm computation");
-    pipelined_ep_module.def("dispatch", &pipelined_ep::dispatch);
-    pipelined_ep_module.def("combine", &pipelined_ep::combine);
+        "pipelined_ep", " aim to overlap the ep communication and grouped-gemm computation");
+    pybind11::class_<cco::pipelined_ep::Config>(pipelined_ep_module, "Config")
+        .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = 32,
+             py::arg("num_max_nvl_chunked_send_tokens")  = 6,
+             py::arg("num_max_nvl_chunked_recv_tokens")  = 256,
+             py::arg("num_max_rdma_chunked_send_tokens") = 6,
+             py::arg("num_max_rdma_chunked_recv_tokens") = 256)
+        .def("get_nvl_buffer_size_hint", &cco::pipelined_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint", &cco::pipelined_ep::Config::get_rdma_buffer_size_hint);
+
+    pybind11::class_<cco::pipelined_ep::EventHandle>(pipelined_ep_module, "EventHandle")
+        .def(pybind11::init<>())
+        .def("current_stream_wait", &cco::pipelined_ep::EventHandle::current_stream_wait);
+
+    pybind11::class_<cco::pipelined_ep::PipelinedBuffer>(pipelined_ep_module, "PipelinedBuffer")
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
+        .def("is_available", &cco::pipelined_ep::PipelinedBuffer::is_available)
+        .def("get_num_rdma_ranks", &cco::pipelined_ep::PipelinedBuffer::get_num_rdma_ranks)
+        .def("get_rdma_rank", &cco::pipelined_ep::PipelinedBuffer::get_rdma_rank)
+        .def("get_root_rdma_rank", &cco::pipelined_ep::PipelinedBuffer::get_root_rdma_rank)
+        .def("get_local_device_id", &cco::pipelined_ep::PipelinedBuffer::get_local_device_id)
+        .def("get_local_ipc_handle", &cco::pipelined_ep::PipelinedBuffer::get_local_ipc_handle)
+        .def("get_local_nvshmem_unique_id",
+             &cco::pipelined_ep::PipelinedBuffer::get_local_nvshmem_unique_id)
+        .def("get_local_buffer_tensor",
+             &cco::pipelined_ep::PipelinedBuffer::get_local_buffer_tensor)
+        .def("get_comm_stream", &cco::pipelined_ep::PipelinedBuffer::get_comm_stream)
+        .def("sync", &cco::pipelined_ep::PipelinedBuffer::sync)
+        .def("destroy", &cco::pipelined_ep::PipelinedBuffer::destroy)
+        .def("get_dispatch_layout", &cco::pipelined_ep::PipelinedBuffer::get_dispatch_layout)
+        .def("intranode_dispatch", &cco::pipelined_ep::PipelinedBuffer::intranode_dispatch);
 }
 
 /********************************************/

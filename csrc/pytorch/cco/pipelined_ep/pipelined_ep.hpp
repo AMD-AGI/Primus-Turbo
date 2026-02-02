@@ -1,0 +1,166 @@
+#pragma once
+
+// Forcibly disable NDEBUG
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
+#include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
+#include <torch/types.h>
+
+#include <tuple>
+#include <vector>
+
+#include "event.hpp"
+#include "config.hpp"
+#include "../kernels/cco/pipelined_ep/configs.cuh"
+#include "../kernels/cco/pipelined_ep/exception.cuh"
+
+
+namespace shared_memory {
+
+struct MemHandle {
+    cudaIpcMemHandle_t inner;
+    size_t             size;
+};
+
+constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
+
+class SharedMemoryAllocator {
+public:
+    SharedMemoryAllocator(bool use_fabric);
+    void malloc(void **ptr, size_t size);
+    void free(void *ptr);
+    void get_mem_handle(MemHandle *mem_handle, void *ptr);
+    void open_mem_handle(void **ptr, MemHandle *mem_handle);
+    void close_mem_handle(void *ptr);
+
+private:
+    bool use_fabric;
+};
+} // namespace shared_memory
+
+namespace primus_turbo::pytorch::cco::pipelined_ep {
+
+using namespace primus_turbo::cco::pipelined_ep;
+
+struct PipelinedBuffer {
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
+
+private:
+    // Low-latency mode buffer
+    int  low_latency_buffer_idx = 0;
+    bool low_latency_mode       = false;
+
+    // NVLink Buffer
+    int64_t num_nvl_bytes;
+    void   *buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    void  **buffer_ptrs_gpu                = nullptr;
+
+    // NVSHMEM Buffer
+    int64_t num_rdma_bytes;
+    void   *rdma_buffer_ptr = nullptr;
+
+    // Shrink mode buffer
+    bool enable_shrink   = false;
+    int *mask_buffer_ptr = nullptr;
+    int *sync_buffer_ptr = nullptr;
+
+    // Device info and communication
+    int                      device_id;
+    int                      num_device_sms;
+    int                      rank, rdma_rank, nvl_rank;
+    int                      num_ranks, num_rdma_ranks, num_nvl_ranks;
+    shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+
+    // Stream for communication
+    at::cuda::CUDAStream comm_stream;
+
+    // After IPC/NVSHMEM synchronization, this flag will be true
+    bool available = false;
+
+    // Whether explicit `destroy()` is required.
+    bool explicitly_destroy;
+    // After `destroy()` be called, this flag will be true
+    bool destroyed = false;
+
+    // Barrier signals
+    int  *barrier_signal_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    int **barrier_signal_ptrs_gpu                = nullptr;
+
+    // Workspace
+    void *workspace = nullptr;
+
+    // Host-side MoE info
+    volatile int *moe_recv_counter        = nullptr;
+    int          *moe_recv_counter_mapped = nullptr;
+
+    // Host-side expert-level MoE info
+    volatile int *moe_recv_expert_counter        = nullptr;
+    int          *moe_recv_expert_counter_mapped = nullptr;
+
+    // Host-side RDMA-level MoE info
+    volatile int *moe_recv_rdma_counter        = nullptr;
+    int          *moe_recv_rdma_counter_mapped = nullptr;
+
+    shared_memory::SharedMemoryAllocator shared_memory_allocator;
+
+public:
+    PipelinedBuffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
+                    bool low_latency_mode, bool explicitly_destroy, bool enable_shrink,
+                    bool use_fabric);
+
+    ~PipelinedBuffer() noexcept(false);
+
+    bool is_available() const;
+
+    bool is_internode_available() const;
+
+    int get_num_rdma_ranks() const;
+
+    int get_rdma_rank() const;
+
+    int get_root_rdma_rank(bool global) const;
+
+    int get_local_device_id() const;
+
+    pybind11::bytearray get_local_ipc_handle() const;
+
+    pybind11::bytearray get_local_nvshmem_unique_id() const;
+
+    torch::Tensor get_local_buffer_tensor(const pybind11::object &dtype, int64_t offset,
+                                          bool use_rdma_buffer) const;
+
+    torch::Stream get_comm_stream() const;
+
+    void sync(const std::vector<int>                                &device_ids,
+              const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
+              const std::optional<pybind11::bytearray>              &root_unique_id_opt);
+
+    void destroy();
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
+               std::optional<EventHandle>>
+    get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
+                        std::optional<EventHandle> &previous_event, bool async,
+                        bool allocate_on_comm_stream);
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+    intranode_dispatch(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+                       const std::optional<torch::Tensor> &topk_idx,
+                       const std::optional<torch::Tensor> &topk_weights,
+                       const std::optional<torch::Tensor> &num_tokens_per_rank,
+                       const torch::Tensor                &is_token_in_rank,
+                       const std::optional<torch::Tensor> &num_tokens_per_expert,
+                       int                                 cached_num_recv_tokens,
+                       const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
+                       const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
+                       int expert_alignment, int num_worst_tokens, const Config &config,
+                       std::optional<EventHandle> &previous_event, bool async,
+                       bool allocate_on_comm_stream);
+};
+
+} // namespace primus_turbo::pytorch::cco::pipelined_ep
