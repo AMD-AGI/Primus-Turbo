@@ -247,7 +247,7 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
     )
 
 
-@pytest.mark.parametrize("B", [2])  # B=16 will case segmentation fault
+@pytest.mark.parametrize("B", [2])  # B=16 will cause segmentation fault
 @pytest.mark.parametrize("M", [128, 1024])
 @pytest.mark.parametrize(
     "NK",
