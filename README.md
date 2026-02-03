@@ -29,7 +29,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 ### Requirements
 
 #### Software
-- ROCm >= 6.4
+- ROCm >= 7.0
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
@@ -109,8 +109,12 @@ pytest tests/jax/ --dist-only     # multi-GPU tests
 
 ```bash
 pip3 install -r requirements.txt
-python3 -m build --wheel --no-isolation
-pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl
+
+# (Optional) Specify target GPU architectures and build for a specific framework.
+GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" python3 -m build --wheel --no-isolation
+
+# Install the generated wheel
+pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-*.whl
 ```
 
 ### 5. Minimal Example
@@ -132,12 +136,11 @@ print(c.shape)
 ## 💡 Example
 See [Examples](./docs/examples.md) for usage examples.
 
-
 ## 📊 Performance
 See [Benchmarks](./benchmark/README.md) for detailed performance results and comparisons.
 
 ## 📍 Roadmap
-[Roadmap: Primus-Turbo Roadmap H2 2025](https://github.com/AMD-AGI/Primus-Turbo/issues/101)
+[Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
 
 ## 📜 License
 
