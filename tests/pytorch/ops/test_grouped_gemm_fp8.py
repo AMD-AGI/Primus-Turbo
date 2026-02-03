@@ -247,7 +247,7 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
     )
 
 
-@pytest.mark.parametrize("B", [2])  # B=16 will cause segmentation fault
+@pytest.mark.parametrize("B", [2, 16])  # segmentation fault will happen
 @pytest.mark.parametrize("M", [128, 1024])
 @pytest.mark.parametrize(
     "NK",
@@ -295,13 +295,12 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    seed += 1  # change the seed to avoid the same random numbers as the ref
+    # Generate group_lens2 with different seed (same total M, different distribution)
+    seed += 1
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    group_lens2 = generate_grouped_gemm_group_lens(B, M, balance=balance).to(
-        device
-    )  # generate new group_lens
+    group_lens2 = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
 
     # Ref for group_lens2
     a_ref2 = a.detach().clone().requires_grad_(True)
@@ -313,6 +312,7 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
     # Turbo
     config = Float8QuantConfig(format=format, granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
 
+    # Warmup both group_lens to compile all kernels
     out_warmup = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     out_warmup.backward(grad_out)
     out_warmup2 = grouped_gemm_fp8(a, b, group_lens2, trans_b=trans_b, config=config)
@@ -323,51 +323,56 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
     b.grad.zero_()
     torch.cuda.synchronize()
 
-    # Capture the CUDA graph
+    # Capture the CUDA graph with ONE grouped_gemm_fp8 operation
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
         out.backward(grad_out)
-        out2 = grouped_gemm_fp8(a, b, group_lens2, trans_b=trans_b, config=config)
-        out2.backward(grad_out)
 
-    # Replay the graph with original group_lens
+    # first run
     g.replay()
     torch.cuda.synchronize()
 
-    # Check Shape for out (group_lens)
-    assert out.shape == out_ref.shape
-    assert a.grad.shape == a_ref.grad.shape
-    assert b.grad.shape == b_ref.grad.shape
-
-    # Check Shape for out2 (group_lens2)
-    assert out2.shape == out_ref2.shape
-
-    # Check Results
     snr_threshold = 25 if format == Format.E4M3 else 20
 
-    # Verify out (group_lens)
+    # Verify out with group_lens
     out_snr = compute_snr(out_ref, out)
-    print(f"Out-SNR: {out_snr:.2f} dB")
+    print(f"[group_lens] Out-SNR: {out_snr:.2f} dB")
     assert out_snr > snr_threshold, "out_snr too low"
 
-    # Verify out2 (group_lens2)
-    out2_snr = compute_snr(out_ref2, out2)
-    print(f"Out2-SNR: {out2_snr:.2f} dB")
-    assert out2_snr > snr_threshold, "out2_snr too low"
-
-    # Verify accumulated gradients (a.grad and b.grad contain sum of both backwards)
-    # Reference accumulated gradients: a_ref.grad + a_ref2.grad
-    a_grad_ref_combined = a_ref.grad + a_ref2.grad
-    b_grad_ref_combined = b_ref.grad + b_ref2.grad
-
-    a_grad_snr = compute_snr(a_grad_ref_combined, a.grad)
-    print(f"AGrad-SNR (accumulated): {a_grad_snr:.2f} dB")
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    print(f"[group_lens] AGrad-SNR: {a_grad_snr:.2f} dB")
     assert a_grad_snr > snr_threshold, "a_grad_snr too low"
 
-    b_grad_snr = compute_snr(b_grad_ref_combined, b.grad)
-    print(f"BGrad-SNR (accumulated): {b_grad_snr:.2f} dB")
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+    print(f"[group_lens] BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    print(f"\n[Graph Reuse] Changing group_lens in-place...")
+    print(f"  Before: {group_lens.tolist()}")
+    group_lens.copy_(group_lens2)  # In-place update
+    print(f"  After:  {group_lens.tolist()}")
+
+    # Reset gradients for second replay
+    a.grad.zero_()
+    b.grad.zero_()
+
+    # second run, replay the same graph with updated group_lens
+    g.replay()
+    torch.cuda.synchronize()
+
+    # Verify out with group_lens2
+    out2_snr = compute_snr(out_ref2, out)
+    print(f"[group_lens2] Out-SNR: {out2_snr:.2f} dB")
+    assert out2_snr > snr_threshold, f"out2_snr too low after graph reuse: {out2_snr}"
+
+    a_grad_snr2 = compute_snr(a_ref2.grad, a.grad)
+    print(f"[group_lens2] AGrad-SNR: {a_grad_snr2:.2f} dB")
+    assert a_grad_snr2 > snr_threshold, f"a_grad_snr2 too low after graph reuse: {a_grad_snr2}"
+
+    b_grad_snr2 = compute_snr(b_ref2.grad, b.grad)
+    print(f"[group_lens2] BGrad-SNR: {b_grad_snr2:.2f} dB")
+    assert b_grad_snr2 > snr_threshold, f"b_grad_snr2 too low after graph reuse: {b_grad_snr2}"
 
     del g
     torch.cuda.synchronize()
