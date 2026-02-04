@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import GlobalBackendManager
 from primus_turbo.pytorch.modules import GroupedLinear
 from tests.pytorch.ref.gemm_ref import (
     GroupedLinearRef,
@@ -20,8 +21,10 @@ from tests.pytorch.test_utils import get_tolerances
 @pytest.mark.parametrize("N_K", [(1024, 2048), (512, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("auto_tune", [False, True])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
-def test_grouped_linear(B, M, N_K, dtype, balance, enable_torch_compile):
+def test_grouped_linear(B, M, N_K, dtype, balance, auto_tune, enable_torch_compile):
+    GlobalBackendManager.set_auto_tune(auto_tune)
     torch._dynamo.reset()
     device = "cuda"
     N, K = N_K
@@ -47,4 +50,10 @@ def test_grouped_linear(B, M, N_K, dtype, balance, enable_torch_compile):
     out1.backward(grad_output)
     out2.backward(grad_output)
     torch.testing.assert_close(x1.grad, x2.grad, **get_tolerances(dtype))
-    torch.testing.assert_close(primus_linear.weight.grad, torch_linear.weight.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(
+        primus_linear.weight.grad,
+        torch_linear.weight.grad,
+        **get_tolerances(dtype),
+    )
+
+    GlobalBackendManager.set_auto_tune(None)

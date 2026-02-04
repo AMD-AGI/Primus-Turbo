@@ -7,7 +7,6 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
-    AutoKernelDispatcher,
     BackendType,
     GlobalBackendManager,
     KernelBackend,
@@ -17,6 +16,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     float8_e4m3,
     float8_e5m2,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
 )
 
 _COMMON_SUPPORTED_DTYPES = (
@@ -294,7 +297,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         )
 
 
-class GroupedGEMMFP8KernelDispatcher(AutoKernelDispatcher):
+class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8CKBackend,
         BackendType.HIPBLASLT: GroupedGEMMFP8HipblasltBackend,
@@ -317,19 +320,15 @@ class GroupedGEMMFP8KernelDispatcher(AutoKernelDispatcher):
         num_cu,
         **kwargs,
     ):
-        def get_grouped_gemm_logical_shape(a, b, trans_a, trans_b):
-            bs = b.shape[0]
-            m = a.shape[1] if trans_a else a.shape[0]
-            n = b.shape[-2] if trans_b else b.shape[-1]
-            k = a.shape[0] if trans_a else a.shape[1]
-            return bs, m, n, k
-
-        bs, m, n, k = get_grouped_gemm_logical_shape(a, b, trans_a, trans_b)
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c
-        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False)
+        bs = b.shape[0]
+        m = a.shape[1] if trans_a else a.shape[0]
+        n = b.shape[-2] if trans_b else b.shape[-1]
+        k = a.shape[0] if trans_a else a.shape[1]
+        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity
+        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
 
 
-class GroupedGEMMFP8VariableKKernelDispatcher(AutoKernelDispatcher):
+class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8VariableKCKBackend,
         BackendType.HIPBLASLT: GroupedGEMMFP8VariableKHipblasltBackend,
@@ -359,7 +358,6 @@ class GroupedGEMMFP8VariableKKernelDispatcher(AutoKernelDispatcher):
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
 
 

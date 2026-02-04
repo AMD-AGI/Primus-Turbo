@@ -7,11 +7,14 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
-    AutoKernelDispatcher,
     BackendType,
     GlobalBackendManager,
     KernelBackend,
     TuneCache,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
 )
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -182,26 +185,21 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
 }
 
 
-class GroupedGEMMKernelDispatcher(AutoKernelDispatcher):
+class GroupedGEMMKernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = _GROUPED_GEMM_BACKENDS
     _cache = TuneCache(1024)
 
     @classmethod
     def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, num_cu, **kwargs):
-
-        def get_grouped_gemm_logical_shape(a, b, trans_a, trans_b):
-            bs = b.shape[0]
-            m = a.shape[1] if trans_a else a.shape[0]
-            n = b.shape[-2] if trans_b else b.shape[-1]
-            k = a.shape[0] if trans_a else a.shape[1]
-            return bs, m, n, k
-
-        bs, m, n, k = get_grouped_gemm_logical_shape(a, b, trans_a, trans_b)
+        bs = b.shape[0]
+        m = a.shape[1] if trans_a else a.shape[0]
+        n = b.shape[-2] if trans_b else b.shape[-1]
+        k = a.shape[0] if trans_a else a.shape[1]
         # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c
         return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, False)
 
 
-class GroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
+class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = _GROUPED_GEMM_VARIABLE_K_BACKENDS
     _cache = TuneCache(1024)
 

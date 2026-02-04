@@ -15,24 +15,21 @@ namespace primus_turbo {
 
 static constexpr size_t kMaxNumStreams = 4;
 
-std::int64_t get_hipblaslt_grouped_gemm_workspace_size(const int64_t group_num) {
+std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
     return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
 }
 
 class HipblasltGroupedGemm {
 public:
     HipblasltGroupedGemm() {
-        PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&sync_event_));
+        PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event_, hipEventDisableTiming));
 
-        handles_[0]         = nullptr;
-        compute_streams_[0] = nullptr;
         for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            if (i > 0) {
-                PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
-                PRIMUS_TURBO_CHECK_HIP(
-                    hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
-            }
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&hipblaslt_events_[i]));
+            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipEventCreateWithFlags(&hipblaslt_events_[i], hipEventDisableTiming));
         }
         workspaces_.resize(kMaxNumStreams);
     }
@@ -43,11 +40,15 @@ public:
         }
 
         for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            if (i > 0) {
+            if (compute_streams_[i] != nullptr) {
                 (void) hipStreamDestroy(compute_streams_[i]);
+            }
+            if (handles_[i] != nullptr) {
                 (void) hipblasLtDestroy(handles_[i]);
             }
-            (void) hipEventDestroy(hipblaslt_events_[i]);
+            if (hipblaslt_events_[i] != nullptr) {
+                (void) hipEventDestroy(hipblaslt_events_[i]);
+            }
         }
     }
 
@@ -88,15 +89,14 @@ public:
             PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
 
             for (size_t s = 0; s < num_stream_used; ++s) {
-                auto stream = (s == 0) ? params.stream : compute_streams_[s];
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(stream, sync_event_, 0));
+                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
             }
 
             for (size_t idx = 0; idx < num_gemms; ++idx) {
-                const auto stream_idx = kMaxNumStreams ? idx % kMaxNumStreams : 0;
-                auto       stream = stream_idx == 0 ? params.stream : compute_streams_[stream_idx];
-                auto       handle = stream_idx == 0 ? params.handle : handles_[stream_idx];
-                auto       workspace = workspaces_[stream_idx];
+                const auto stream_idx = idx % kMaxNumStreams;
+                auto       stream     = compute_streams_[stream_idx];
+                auto       handle     = handles_[stream_idx];
+                auto       workspace  = workspaces_[stream_idx];
                 // clang-format off
                 hipblaslt_gemm_impl(
                     gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
@@ -117,8 +117,7 @@ public:
 
             // record events on compute streams
             for (size_t s = 0; s < num_stream_used; ++s) {
-                auto stream = (s == 0) ? params.stream : compute_streams_[s];
-                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], stream));
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
             }
 
             // wait for all compute streams to finish
@@ -219,10 +218,10 @@ private:
     }
 
     // Handles, events, streams, heuristic, epilogue
-    hipblasLtHandle_t   handles_[kMaxNumStreams];
+    hipblasLtHandle_t   handles_[kMaxNumStreams]{};
     hipEvent_t          sync_event_{nullptr};
-    hipStream_t         compute_streams_[kMaxNumStreams];
-    hipEvent_t          hipblaslt_events_[kMaxNumStreams];
+    hipStream_t         compute_streams_[kMaxNumStreams]{};
+    hipEvent_t          hipblaslt_events_[kMaxNumStreams]{};
     hipblasLtEpilogue_t epilogue_{HIPBLASLT_EPILOGUE_DEFAULT};
 
     // Gemm Pointers
@@ -246,6 +245,8 @@ private:
 };
 
 void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+    // TODO: This uses a single static instance, which may be risky under multi-threaded usage.
+    // If/when needed, add proper thread-safety (e.g., per-thread instances or locking).
     static HipblasltGroupedGemm instance;
     instance.run(params, pre_sync);
 }

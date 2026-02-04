@@ -180,6 +180,17 @@ class AutoKernelDispatcher(ABC):
     _profile_iters: int = 20
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
+    @staticmethod
+    def _is_graph_capturing() -> bool:
+        fn = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if fn is None:
+            graphs = getattr(torch.cuda, "graphs", None)
+            fn = getattr(graphs, "is_current_stream_capturing", None) if graphs is not None else None
+        try:
+            return bool(fn()) if fn is not None else False
+        except Exception:
+            return False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "_backends" not in cls.__dict__:
@@ -202,13 +213,15 @@ class AutoKernelDispatcher(ABC):
     @classmethod
     @torch.no_grad()
     def profile(cls, backend: Type[KernelBackend], **kwargs) -> float:
-        for _ in range(cls._warmup_iters):
-            backend.execute(**kwargs)
-        torch.cuda.synchronize()
-
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
+        # warm-up
+        for _ in range(cls._warmup_iters):
+            backend.execute(**kwargs)
+            torch.cuda.synchronize()
+
+        torch.cuda.synchronize()
         start.record()
         for _ in range(cls._profile_iters):
             backend.execute(**kwargs)
@@ -265,7 +278,8 @@ class AutoKernelDispatcher(ABC):
             return backend_cls.execute(**kwargs)
 
         # 2. Auto tune
-        if GlobalBackendManager.auto_tune_enabled():
+        # NOTE: Skip autotune during cuda graph capture.
+        if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)

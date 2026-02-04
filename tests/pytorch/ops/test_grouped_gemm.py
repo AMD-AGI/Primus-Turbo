@@ -37,6 +37,12 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
+    if auto_tune and reduce_num_cu > 0:
+        pytest.skip(
+            "skip auto_tune when reduce_num_cu > 0 because hipBLASLt does not support reduce_num_cu > 0 "
+            "and the tuner may select hipBLASLt"
+        )
+
     if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
         pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
 
