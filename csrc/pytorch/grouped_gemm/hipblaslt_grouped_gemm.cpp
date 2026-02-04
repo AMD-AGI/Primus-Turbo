@@ -106,9 +106,8 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
         c               = at::empty({m, n}, a.options());
     }
 
-    const int64_t workspace_size =
-        primus_turbo::get_hipblaslt_grouped_gemm_workspace_size(group_lens.numel());
-    at::Tensor workspace =
+    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 
     auto params = make_hipblaslt_grouped_gemm_params(a, b, c, group_lens, group_offs, transA,
@@ -152,9 +151,8 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
         c               = at::empty({m, n}, a.options().dtype(out_dtype));
     }
 
-    const int64_t workspace_size =
-        primus_turbo::get_hipblaslt_grouped_gemm_workspace_size(group_lens.numel());
-    at::Tensor workspace =
+    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 
     auto params = make_hipblaslt_grouped_gemm_fp8_params(

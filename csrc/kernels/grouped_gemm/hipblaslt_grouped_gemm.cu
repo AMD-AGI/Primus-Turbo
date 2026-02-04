@@ -15,20 +15,21 @@ namespace primus_turbo {
 
 static constexpr size_t kMaxNumStreams = 4;
 
-std::int64_t get_hipblaslt_grouped_gemm_workspace_size(const int64_t group_num) {
+std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
     return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
 }
 
 class HipblasltGroupedGemm {
 public:
     HipblasltGroupedGemm() {
-        PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&sync_event_));
+        PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event_, hipEventDisableTiming));
 
         for (size_t i = 0; i < kMaxNumStreams; ++i) {
             PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
             PRIMUS_TURBO_CHECK_HIP(
                 hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
-            PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&hipblaslt_events_[i]));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipEventCreateWithFlags(&hipblaslt_events_[i], hipEventDisableTiming));
         }
         workspaces_.resize(kMaxNumStreams);
     }
@@ -45,7 +46,9 @@ public:
             if (handles_[i] != nullptr) {
                 (void) hipblasLtDestroy(handles_[i]);
             }
-            (void) hipEventDestroy(hipblaslt_events_[i]);
+            if (hipblaslt_events_[i] != nullptr) {
+                (void) hipEventDestroy(hipblaslt_events_[i]);
+            }
         }
     }
 
@@ -215,10 +218,10 @@ private:
     }
 
     // Handles, events, streams, heuristic, epilogue
-    hipblasLtHandle_t   handles_[kMaxNumStreams];
+    hipblasLtHandle_t   handles_[kMaxNumStreams]{};
     hipEvent_t          sync_event_{nullptr};
-    hipStream_t         compute_streams_[kMaxNumStreams];
-    hipEvent_t          hipblaslt_events_[kMaxNumStreams];
+    hipStream_t         compute_streams_[kMaxNumStreams]{};
+    hipEvent_t          hipblaslt_events_[kMaxNumStreams]{};
     hipblasLtEpilogue_t epilogue_{HIPBLASLT_EPILOGUE_DEFAULT};
 
     // Gemm Pointers
@@ -242,6 +245,8 @@ private:
 };
 
 void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+    // TODO: This uses a single static instance, which may be risky under multi-threaded usage.
+    // If/when needed, add proper thread-safety (e.g., per-thread instances or locking).
     static HipblasltGroupedGemm instance;
     instance.run(params, pre_sync);
 }
