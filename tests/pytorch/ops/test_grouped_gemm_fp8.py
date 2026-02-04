@@ -247,26 +247,25 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
     )
 
 
-@pytest.mark.parametrize("B", [2, 16])  # segmentation fault will happen
-@pytest.mark.parametrize("M", [128, 1024])
-@pytest.mark.parametrize(
-    "NK",
-    [
-        (2048, 1536),
-        (2048, 1408),
-        (1408, 2048),
-        (3072, 5120),
-        (5120, 1536),
-        (4096, 7168),
-    ],
-)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("balance", [False])
-def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
-    N, K = NK
+def _test_grouped_gemm_fp8_hipgraph_test(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    ori_dtype: torch.dtype,
+    format: Format,
+    granularity: ScalingGranularity,
+    trans_b: bool,
+    balance: bool,
+    block_size: int | None = None,
+):
+    """Common test logic for grouped_gemm_fp8 hipgraph with different scaling granularities."""
+    # Skip invalid granularity/block_size combinations
+    if granularity == ScalingGranularity.BLOCKWISE and block_size is None:
+        pytest.skip("BLOCKWISE granularity requires block_size to be set.")
+    if granularity != ScalingGranularity.BLOCKWISE and block_size is not None:
+        pytest.skip("Only BLOCKWISE granularity supports block_size.")
+
     seed = 33
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -277,7 +276,7 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
-        f"granularity={ScalingGranularity.BLOCKWISE}, block_size={block_size}, trans_b={trans_b}, "
+        f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
         f"balance={balance}"
     )
 
@@ -310,7 +309,7 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
     torch.cuda.synchronize()
 
     # Turbo
-    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
+    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
 
     # Warmup both group_lens to compile all kernels
     out_warmup = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
@@ -376,6 +375,74 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
 
     # Reset config and caches
     GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_tensorwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _test_grouped_gemm_fp8_hipgraph_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_rowwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _test_grouped_gemm_fp8_hipgraph_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.ROWWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
+    N, K = NK
+    _test_grouped_gemm_fp8_hipgraph_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        block_size=block_size,
+    )
 
 
 # Test case for group_lens containing zeros (MoE scenario where some experts receive no tokens)
