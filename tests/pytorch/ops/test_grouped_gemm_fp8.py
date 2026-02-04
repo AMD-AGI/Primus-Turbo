@@ -134,6 +134,7 @@ def _run_grouped_gemm_fp8_test(
         # Replay the graph
         g.replay()
         torch.cuda.synchronize()
+        del g
     else:
         # Normal mode: direct execution
         out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
@@ -246,19 +247,188 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
     )
 
 
-@pytest.mark.parametrize("B", [2, 16])
-@pytest.mark.parametrize("M", [128, 1024])
-@pytest.mark.parametrize(
-    "NK",
-    [
-        (2048, 1536),
-        (2048, 1408),
-        (1408, 2048),
-        (3072, 5120),
-        (5120, 1536),
-        (4096, 7168),
-    ],
-)
+def _test_grouped_gemm_fp8_hipgraph_test(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    ori_dtype: torch.dtype,
+    format: Format,
+    granularity: ScalingGranularity,
+    trans_b: bool,
+    balance: bool,
+    block_size: int | None = None,
+):
+    """Common test logic for grouped_gemm_fp8 hipgraph with different scaling granularities."""
+    # Skip invalid granularity/block_size combinations
+    if granularity == ScalingGranularity.BLOCKWISE and block_size is None:
+        pytest.skip("BLOCKWISE granularity requires block_size to be set.")
+    if granularity != ScalingGranularity.BLOCKWISE and block_size is not None:
+        pytest.skip("Only BLOCKWISE granularity supports block_size.")
+
+    seed = 33
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = "cuda:0"
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    print(
+        f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
+        f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
+        f"balance={balance}"
+    )
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+
+    a = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Ref for group_lens
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Generate group_lens2 with different seed (same total M, different distribution)
+    seed += 1
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    group_lens2 = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+
+    # Ref for group_lens2
+    a_ref2 = a.detach().clone().requires_grad_(True)
+    b_ref2 = b.detach().clone().requires_grad_(True)
+    out_ref2 = grouped_gemm_ref(a_ref2, b_ref2, group_lens2, trans_b)
+    out_ref2.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Turbo
+    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
+
+    # Warmup both group_lens to compile all kernels
+    out_warmup = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    out_warmup.backward(grad_out)
+    out_warmup2 = grouped_gemm_fp8(a, b, group_lens2, trans_b=trans_b, config=config)
+    out_warmup2.backward(grad_out)
+    del out_warmup, out_warmup2
+
+    a.grad.zero_()
+    b.grad.zero_()
+    torch.cuda.synchronize()
+
+    # Capture the CUDA graph with ONE grouped_gemm_fp8 operation
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+        out.backward(grad_out)
+
+    # first run
+    g.replay()
+    torch.cuda.synchronize()
+
+    snr_threshold = 25 if format == Format.E4M3 else 20
+
+    # Verify out with group_lens
+    out_snr = compute_snr(out_ref, out)
+    print(f"[group_lens] Out-SNR: {out_snr:.2f} dB")
+    assert out_snr > snr_threshold, "out_snr too low"
+
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    print(f"[group_lens] AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+
+    b_grad_snr = compute_snr(b_ref.grad, b.grad)
+    print(f"[group_lens] BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    group_lens.copy_(group_lens2)  # In-place update
+
+    # Reset gradients for second replay
+    a.grad.zero_()
+    b.grad.zero_()
+
+    # second run, replay the same graph with updated group_lens
+    g.replay()
+    torch.cuda.synchronize()
+
+    # Verify out with group_lens2
+    out2_snr = compute_snr(out_ref2, out)
+    print(f"[group_lens2] Out-SNR: {out2_snr:.2f} dB")
+    assert out2_snr > snr_threshold, f"out2_snr too low"
+
+    a_grad_snr2 = compute_snr(a_ref2.grad, a.grad)
+    print(f"[group_lens2] AGrad-SNR: {a_grad_snr2:.2f} dB")
+    assert a_grad_snr2 > snr_threshold, f"a_grad_snr2 too low"
+
+    b_grad_snr2 = compute_snr(b_ref2.grad, b.grad)
+    print(f"[group_lens2] BGrad-SNR: {b_grad_snr2:.2f} dB")
+    assert b_grad_snr2 > snr_threshold, f"b_grad_snr2 too low"
+
+    del g
+    torch.cuda.synchronize()
+
+    # Reset config and caches
+    GlobalBackendManager.reset()
+
+
+# NOTE: HIPGraph tests are temporarily skipped due to hipgraph issue.
+# These tests require a PyTorch version upgrade to work properly with HIPGraph.
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_tensorwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _test_grouped_gemm_fp8_hipgraph_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", [False])
+def test_grouped_gemm_fp8_rowwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):
+    N, K = NK
+    _test_grouped_gemm_fp8_hipgraph_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.ROWWISE,
+        trans_b=trans_b,
+        balance=balance,
+    )
+
+
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("block_size", [128])
@@ -266,7 +436,7 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
 @pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
     N, K = NK
-    _run_grouped_gemm_fp8_test(
+    _test_grouped_gemm_fp8_hipgraph_test(
         B=B,
         M=M,
         N=N,
@@ -277,7 +447,6 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, NK, ori_dtype, format, block_
         trans_b=trans_b,
         balance=balance,
         block_size=block_size,
-        cuda_graph=True,
     )
 
 
