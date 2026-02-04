@@ -377,6 +377,9 @@ def _test_grouped_gemm_fp8_hipgraph_test(
     GlobalBackendManager.reset()
 
 
+# NOTE: HIPGraph tests are temporarily skipped due to hipgraph issue.
+# These tests require a PyTorch version upgrade to work properly with HIPGraph.
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
@@ -399,6 +402,7 @@ def test_grouped_gemm_fp8_tensorwise_hipgraph(B, M, NK, ori_dtype, format, trans
     )
 
 
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
@@ -421,6 +425,7 @@ def test_grouped_gemm_fp8_rowwise_hipgraph(B, M, NK, ori_dtype, format, trans_b,
     )
 
 
+@pytest.mark.skip(reason="Requires PyTorch version upgrade for HIPGraph support")
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
