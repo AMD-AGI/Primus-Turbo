@@ -26,6 +26,13 @@ _COMMON_SUPPORTED_DTYPES = (
     (float8_e5m2, float8_e5m2, torch.bfloat16),
 )
 
+_HYBRID_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e5m2, torch.float16),
+    (float8_e4m3, float8_e5m2, torch.bfloat16),
+    (float8_e5m2, float8_e4m3, torch.float16),
+    (float8_e5m2, float8_e4m3, torch.bfloat16),
+)
+
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
     SUPPORTED_GRANULARITIES = {
@@ -53,7 +60,7 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
-        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
         return supported
@@ -115,7 +122,7 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
-        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
         return supported
@@ -164,7 +171,7 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
@@ -183,7 +190,7 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
-        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8HipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8HipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
         return supported
@@ -223,7 +230,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
@@ -243,7 +250,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
-        supported &= (a.dtype, b.dtype, out_dtype) in _COMMON_SUPPORTED_DTYPES
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
         return supported
