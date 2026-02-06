@@ -48,7 +48,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm/primus/tags):
 ```bash
 # PyTorch Ecosystem
-rocm/primus:v25.10
+rocm/primus:v26.1
 
 # JAX Ecosystem
 rocm/jax-training:maxtext-v25.9
@@ -137,7 +137,7 @@ See [Examples](./docs/examples.md) for usage examples.
 See [Benchmarks](./benchmark/README.md) for detailed performance results and comparisons.
 
 ## 📍 Roadmap
-[Roadmap: Primus-Turbo Roadmap H2 2025](https://github.com/AMD-AGI/Primus-Turbo/issues/101)
+[Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
 
 ## 📜 License
 
