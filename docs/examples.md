@@ -2,6 +2,25 @@
 
 This page shows usage of **Primus-Turbo**.
 
+## Table of Contents
+
+- [1. Operators](#1-operators)
+  - [1.1 Gemm](#11-gemm)
+  - [1.2 Attention](#12-attention)
+  - [1.3 Grouped Gemm](#13-grouped-gemm)
+- [2. Modules](#2-modules)
+  - [2.1 Linear](#21-linear)
+- [3. Low-Precision](#3-low-precision)
+  - [3.1 Quantization Config](#31-quantization-config)
+  - [3.2 FP8 GEMM](#32-fp8-gemm)
+  - [3.3 FP8 GroupedGEMM](#33-fp8-groupedgemm)
+  - [3.4 FP4 GEMM](#34-fp4-gemm)
+- [4. DeepEP](#4-deepep)
+- [5. Backend and AutoTune](#5-backend-and-autotune)
+  - [5.1 Backend Selection](#51-backend-selection)
+  - [5.2 AutoTune](#52-autotune)
+  - [5.3 Environment Variables](#53-environment-variables)
+
 
 ## 1. Operators
 
@@ -151,7 +170,7 @@ print(output.shape)
 
 ## 3. Low-Precision
 
-This section introduces the **FP8 quantization config** and usage of **FP8 GEMM** and **FP8 GroupedGEMM** in Primus-Turbo.
+This section introduces the **FP8/FP4 quantization config** and usage of **FP8/FP4 GEMM** and **FP8 GroupedGEMM** in Primus-Turbo.
 
 
 ### 3.1 Quantization Config
@@ -419,4 +438,91 @@ def combine_backward(grad_combined_x: Union[torch.Tensor, Tuple[torch.Tensor, to
 
     # For event management, please refer to the docs of the `EventOverlap` class
     return grad_x, event
+```
+
+## 5. Backend and AutoTune
+
+Some Primus-Turbo operators provide multiple backends. You can force a backend (for reproducibility/debugging) or enable AutoTune to pick the fastest backend for your shapes on the current GPU.
+
+Priority (high to low):
+
+1. Code settings (`GlobalBackendManager.set_*_backend(...)`)
+2. Environment variables (`PRIMUS_TURBO_*_BACKEND`)
+3. AutoTune (`PRIMUS_TURBO_AUTO_TUNE=1`)
+4. Operator defaults
+5. Fallback: try all registered backends
+
+### 5.1 Backend Selection
+
+You can set backends in code via `GlobalBackendManager`.
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+
+# Set GEMM backend to CK
+GlobalBackendManager.set_gemm_backend(BackendType.CK)
+
+M, N, K = 128, 256, 512
+a = torch.randn((M, K), dtype=dtype, device=device)
+b = torch.randn((N, K), dtype=dtype, device=device)  # [N, K] when trans_b=True
+
+fp8_cfg = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.TENSORWISE,
+)
+
+out = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=fp8_cfg)
+print(out.shape)
+
+# Unset GEMM backend
+GlobalBackendManager.set_gemm_backend(None)
+```
+
+### 5.2 AutoTune
+
+AutoTune profiles compatible backends on the first call (per input "key", usually shape/dtype/layout) and caches the fastest choice. This is useful for stable shapes, but may add overhead if shapes change frequently.
+
+NOTE: AutoTune is skipped during CUDA graph capture.
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import GlobalBackendManager
+
+GlobalBackendManager.set_auto_tune(True)  # or set PRIMUS_TURBO_AUTO_TUNE=1
+
+# First call may be slower due to profiling; later calls hit the cache.
+# Use fixed shapes for best results.
+device = "cuda:0"
+dtype = torch.bfloat16
+G, M, N, K = 4, 128, 256, 512
+group_lens = torch.tensor([32, 16, 48, 32], dtype=torch.long, device=device)
+a = torch.randn(M, K, device=device, dtype=dtype)
+b = torch.randn(G, K, N, device=device, dtype=dtype)
+out = turbo.ops.grouped_gemm(a, b, group_lens, trans_b=False)
+print(out.shape)
+
+# Clear backend settings + all AutoTune caches.
+GlobalBackendManager.reset()
+```
+
+### 5.3 Environment Variables
+
+You can also control backend selection and AutoTune via environment variables:
+
+```bash
+export PRIMUS_TURBO_AUTO_TUNE=1
+export PRIMUS_TURBO_GEMM_BACKEND=HIPBLASLT
+export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=CK
+export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=DEEP_EP
 ```
