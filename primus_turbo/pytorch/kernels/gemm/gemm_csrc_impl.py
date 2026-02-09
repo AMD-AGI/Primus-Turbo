@@ -7,7 +7,7 @@
 import torch
 
 
-def gemm_impl(
+def gemm_csrc_impl(
     a: torch.Tensor,
     trans_a: bool,
     b: torch.Tensor,

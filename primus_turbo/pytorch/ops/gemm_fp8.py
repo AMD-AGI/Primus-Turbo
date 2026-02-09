@@ -78,6 +78,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if not grad_out.is_contiguous():
+            grad_out = grad_out.contiguous()
         a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
         grad_out_dtype = FP8GemmTensorFunction.get_fp8_dtype(ctx.config.format, False)
 
@@ -172,6 +174,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if not grad_out.is_contiguous():
+            grad_out = grad_out.contiguous()
         a_fp8_col, a_scale_inv_col, b_fp8_col, b_scale_inv_col = ctx.saved_tensors
         grad_out_dtype = FP8GemmRowFunction.get_fp8_dtype(ctx.config.format, False)
 
