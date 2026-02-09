@@ -174,9 +174,60 @@ class GEMMFP8CKBackend(KernelBackend):
         )
 
 
+class GEMMFP8TritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for FP8 GEMM (per-tensor scaling only)."""
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        supported &= granularity in GEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TritonBackend.SUPPORTED_DTYPES
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        from primus_turbo.triton.gemm.gemm_kernel import fp8_gemm_pertensor
+
+        return fp8_gemm_pertensor(
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            trans_c=trans_c,
+        )
+
+
 _GEMM_FP8_BACKENDS = {
     BackendType.HIPBLASLT: GEMMFP8HipBLASLtBackend,
     BackendType.CK: GEMMFP8CKBackend,
+    BackendType.TRITON: GEMMFP8TritonBackend,
 }
 
 
