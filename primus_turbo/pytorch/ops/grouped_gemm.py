@@ -8,12 +8,12 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_csrc_impl
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_csrc_impl import (
-    grouped_gemm_impl,
-    grouped_gemm_variable_k_impl,
-)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+    grouped_gemm_impl,
+    grouped_gemm_variable_k_impl,
 )
 
 __all__ = ["grouped_gemm"]
