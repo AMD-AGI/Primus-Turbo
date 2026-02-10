@@ -94,6 +94,11 @@ def compute_sk_grid(
 NUM_XCDS = 8
 _NUM_CUS: Optional[int] = None
 
+# Skip autotune when output size (M*N) exceeds this threshold (in elements).
+# Prevents OOM during autotune warmup/benchmarking for large problems.
+# Default: 128M elements (~256 MB for BF16 output).
+_AUTOTUNE_MN_THRESHOLD = 128 * 1024 * 1024
+
 
 def _get_num_cus() -> int:
     """Lazy initialization of CU count (avoids import-time CUDA calls)."""
@@ -171,12 +176,6 @@ def _select_group_size_m_bf16(M, N, stride_ak, stride_bk):
         return 4
 
 
-@triton.autotune(
-    configs=_get_bf16_autotune_configs(),
-    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
-    warmup=20,
-    rep=80,
-)
 @triton.jit()
 def _bf16_persistent_gemm_kernel(
     A,
@@ -234,8 +233,9 @@ def _bf16_persistent_gemm_kernel(
         rk = tl.arange(0, BLOCK_SIZE_K)
         rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
+        A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+        B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
 
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
@@ -261,8 +261,8 @@ def _bf16_persistent_gemm_kernel(
         if not EVEN_K:
             k = loop_k
             rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
-            B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+            A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+            B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
             if stride_ak == 1:
                 A_BASE = tl.multiple_of(A_BASE, (1, 16))
             else:
@@ -281,8 +281,16 @@ def _bf16_persistent_gemm_kernel(
         rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-        C_ = C + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
         tl.store(C_, c, c_mask)
+
+
+_bf16_persistent_gemm_kernel_autotuned = triton.autotune(
+    configs=_get_bf16_autotune_configs(),
+    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
+    warmup=20,
+    rep=80,
+)(_bf16_persistent_gemm_kernel)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -348,13 +356,6 @@ def _prune_fp8_configs(configs, named_args, **kwargs):
     return configs
 
 
-@triton.autotune(
-    configs=_get_fp8_autotune_configs(),
-    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
-    prune_configs_by={"early_config_prune": _prune_fp8_configs},
-    warmup=20,
-    rep=80,
-)
 @triton.jit()
 def _fp8_persistent_gemm_kernel(
     A,
@@ -418,8 +419,9 @@ def _fp8_persistent_gemm_kernel(
         rk = tl.arange(0, BLOCK_SIZE_K)
         rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
+        A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+        B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
 
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
@@ -445,8 +447,8 @@ def _fp8_persistent_gemm_kernel(
         if not EVEN_K:
             k = loop_k
             rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
-            B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+            A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+            B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
             if stride_ak == 1:
                 A_BASE = tl.multiple_of(A_BASE, (1, 16))
             else:
@@ -468,8 +470,17 @@ def _fp8_persistent_gemm_kernel(
         rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-        C_ = C + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
         tl.store(C_, c, c_mask)
+
+
+_fp8_persistent_gemm_kernel_autotuned = triton.autotune(
+    configs=_get_fp8_autotune_configs(),
+    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
+    prune_configs_by={"early_config_prune": _prune_fp8_configs},
+    warmup=20,
+    rep=80,
+)(_fp8_persistent_gemm_kernel)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -526,6 +537,9 @@ def gemm_triton_kernel(
     if B_view.stride(0) == 0 or B_view.stride(1) == 0:
         B_view = B_view.contiguous()
 
+    num_cus = _get_num_cus()
+    BLOCK_K = 64
+
     # Handle trans_c by writing to a (N, M) buffer with swapped strides
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
@@ -543,26 +557,15 @@ def gemm_triton_kernel(
     # Heuristic GROUP_SIZE_M (not autotuned)
     group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
 
-    num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, 256, 256, 64, num_cus)
-    even_k = K % 64 == 0
+    num_sms = compute_sk_grid(M, N, K, 256, 256, BLOCK_K, num_cus)
+    even_k = K % BLOCK_K == 0
 
-    _bf16_persistent_gemm_kernel[(num_sms,)](
-        A_view,
-        B_view,
-        out,
-        M,
-        N,
-        K,
-        A_view.stride(0),
-        B_view.stride(1),
-        stride_cm,
-        stride_cn,
+    common_kwargs = dict(
         stride_ak=s_ak,
         stride_bk=s_bk,
         BLOCK_SIZE_M=256,
         BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
+        BLOCK_SIZE_K=BLOCK_K,
         GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
@@ -570,6 +573,25 @@ def gemm_triton_kernel(
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
     )
+    args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
+
+    if M * N > _AUTOTUNE_MN_THRESHOLD:
+        # Large problem: skip autotune to avoid OOM, use default config
+        _bf16_persistent_gemm_kernel[(num_sms,)](
+            *args,
+            **common_kwargs,
+            CHUNK_SIZE=32,
+            num_warps=8,
+            num_stages=2,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=16,
+            kpack=1,
+        )
+    else:
+        _bf16_persistent_gemm_kernel_autotuned[(num_sms,)](
+            *args,
+            **common_kwargs,
+        )
     return out
 
 
@@ -647,9 +669,8 @@ def gemm_fp8_tensorwise_triton_kernel(
 
     num_cus = _get_num_cus()
     num_sms = compute_sk_grid(M, N, K, 256, 256, 64, num_cus)
-    even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
 
-    _fp8_persistent_gemm_kernel[(num_sms,)](
+    args = (
         A_view,
         B_view,
         out,
@@ -662,15 +683,45 @@ def gemm_fp8_tensorwise_triton_kernel(
         B_view.stride(1),
         stride_cm,
         stride_cn,
-        stride_ak=s_ak,
-        stride_bk=s_bk,
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        GROUP_SIZE_M=group_m,
-        NUM_SMS=num_sms,
-        NUM_XCDS=NUM_XCDS,
-        EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
     )
+
+    if M * N > _AUTOTUNE_MN_THRESHOLD:
+        # Large problem: skip autotune to avoid OOM, use default config
+        blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
+        even_k = K % blk_k == 0
+        _fp8_persistent_gemm_kernel[(num_sms,)](
+            *args,
+            stride_ak=s_ak,
+            stride_bk=s_bk,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_K=blk_k,
+            GROUP_SIZE_M=group_m,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
+            CHUNK_SIZE=32,
+            EVEN_K=even_k,
+            CACHE_MODIFIER_A=".ca",
+            CACHE_MODIFIER_B=".ca",
+            num_warps=8,
+            num_stages=2,
+            waves_per_eu=0,
+            matrix_instr_nonkdim=16,
+            kpack=1,
+        )
+    else:
+        even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
+        _fp8_persistent_gemm_kernel_autotuned[(num_sms,)](
+            *args,
+            stride_ak=s_ak,
+            stride_bk=s_bk,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=256,
+            GROUP_SIZE_M=group_m,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
+            EVEN_K=even_k,
+            CACHE_MODIFIER_A=".ca",
+            CACHE_MODIFIER_B=".ca",
+        )
     return out

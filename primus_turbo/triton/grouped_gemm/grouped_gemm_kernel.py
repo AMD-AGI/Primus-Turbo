@@ -176,8 +176,12 @@ def _grouped_bf16_persistent_gemm_kernel(
         rk = tl.arange(0, BLOCK_SIZE_K)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
+        # Cast group_idx to int64 to prevent overflow in B group offset
+        # (group_idx * stride_bg can exceed int32 when B has many groups)
+        group_offset_b = group_idx.to(tl.int64) * stride_bg
+
         A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + group_idx * stride_bg + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
 
         # ── K-loop (identical to single GEMM) ──
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
@@ -204,7 +208,7 @@ def _grouped_bf16_persistent_gemm_kernel(
         if not EVEN_K:
             rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
             A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
-            B_LAST = B + group_idx * stride_bg + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+            B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
             if stride_ak == 1:
                 A_LAST = tl.multiple_of(A_LAST, (1, 16))
             else:
@@ -420,8 +424,11 @@ def _grouped_fp8_persistent_gemm_kernel(
         rk = tl.arange(0, BLOCK_SIZE_K)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
+        # Cast group_idx to int64 to prevent overflow in B group offset
+        group_offset_b = group_idx.to(tl.int64) * stride_bg
+
         A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + group_idx * stride_bg + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
 
         # ── K-loop ──
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
@@ -448,7 +455,7 @@ def _grouped_fp8_persistent_gemm_kernel(
         if not EVEN_K:
             rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
             A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
-            B_LAST = B + group_idx * stride_bg + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+            B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
             if stride_ak == 1:
                 A_LAST = tl.multiple_of(A_LAST, (1, 16))
             else:
@@ -733,7 +740,8 @@ def _grouped_variable_k_gemm_kernel(
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
-        C_ = C + group_idx * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        # Cast group_idx to int64 to prevent overflow in C group offset
+        C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         tl.store(C_, c, c_mask)
 
 
