@@ -5,18 +5,16 @@
 ###############################################################################
 
 """
-Optimized GEMM kernels for MI300X GPUs (Triton persistent kernels).
+GEMM Triton persistent kernels.
 
 Contains:
-  - BF16/FP16 persistent GEMM kernel
-    * 256×256×64 tiles, 2-config autotune for (CHUNK_SIZE, waves_per_eu)
-    * Heuristic GROUP_SIZE_M (not autotuned): TN large→5, small→8, default→4
-  - FP8 per-tensor scaling persistent GEMM kernel
-    * 256×256 tiles, 4-config autotune for (BLOCK_SIZE_K, CHUNK_SIZE), pruned by layout
-    * Heuristic GROUP_SIZE_M: small→8, default→4
+  - BF16/FP16 GEMM: _bf16_persistent_gemm_kernel
+  - FP8 GEMM (per-tensor scaling): _fp8_persistent_gemm_kernel
   - StreamK grid computation utility
 
-Supported layouts: NN, NT, TN
+Public API:
+  - gemm_triton_kernel  — BF16/FP16 GEMM
+  - gemm_fp8_tensorwise_triton_kernel  — FP8 GEMM (per-tensor scaling)
 
 Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 """
@@ -132,14 +130,7 @@ def _chiplet_transform_chunked(
 
 
 def _get_bf16_autotune_configs():
-    """BF16 autotune configs — only 2 (fast compilation).
-
-    Key insight from 94-entry exhaustive tuning on MI300X:
-      - CHUNK_SIZE and waves_per_eu are strongly correlated:
-        * CHUNK=32 → waves_per_eu=2  (93.6%)
-        * CHUNK=64 → waves_per_eu=0  (100%)
-      - GROUP_SIZE_M: determined by heuristic (not autotuned)
-    """
+    """BF16 autotune configs — only 2 (fast compilation)."""
     configs = []
     for chunk_size, waves in [(32, 2), (64, 0)]:
         configs.append(
@@ -158,7 +149,7 @@ def _get_bf16_autotune_configs():
 
 
 def _select_group_size_m_bf16(M, N, stride_ak, stride_bk):
-    """Deterministic GROUP_SIZE_M from 94-entry BF16 MI300 tuning data.
+    """Deterministic GROUP_SIZE_M from 94-entry BF16 tuning data.
 
     Patterns:
     - min_tile < 16 (non-standard dims like 3584): GROUP=8
@@ -302,7 +293,7 @@ def _bf16_persistent_gemm_kernel(
 def _get_fp8_autotune_configs():
     """FP8 autotune configs — 4 total, pruned to 2 by layout.
 
-    Hardcoded from 98-entry exhaustive tuning on MI300X:
+    Hardcoded from 98-entry exhaustive tuning:
       - waves_per_eu=0 (85% of cases)
       - GROUP_SIZE_M: computed by heuristic, passed directly
 
@@ -332,7 +323,7 @@ def _get_fp8_autotune_configs():
 
 
 def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
-    """Deterministic GROUP_SIZE_M from FP8 MI300 tuning data.
+    """Deterministic GROUP_SIZE_M from FP8 tuning data.
 
     FP8 patterns:
     - min_tile < 16 (non-standard dims like 3584): GROUP=8
@@ -494,7 +485,7 @@ def gemm_triton_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
 ) -> torch.Tensor:
-    """General-purpose BF16/FP16 GEMM on MI300 using optimized persistent kernel.
+    """General-purpose BF16/FP16 GEMM using optimized persistent kernel.
 
     Computes: C = op(A) @ op(B), where op(X) = X^T if trans else X.
     If trans_c=True, returns C^T (contiguous, shape N×M).
@@ -587,7 +578,7 @@ def gemm_triton_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def fp8_gemm_pertensor(
+def gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
     b: torch.Tensor,
@@ -597,7 +588,7 @@ def fp8_gemm_pertensor(
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
 ) -> torch.Tensor:
-    """General-purpose FP8 GEMM on MI300 with per-tensor scaling.
+    """General-purpose FP8 GEMM with per-tensor scaling.
 
     Computes: C = op(A) @ op(B) * a_scale_inv * b_scale_inv
     If trans_c=True, returns C^T (contiguous, shape N×M).
@@ -683,8 +674,3 @@ def fp8_gemm_pertensor(
         CACHE_MODIFIER_B=".ca",
     )
     return out
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Legacy API (backward compatibility with gemm_triton_impl.py)
-# ═══════════════════════════════════════════════════════════════════════════════

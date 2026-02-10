@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.triton.gemm.gemm_kernel import gemm_fp8_tensorwise_triton_kernel
 
 
 def get_gemm_logical_shape(
@@ -210,9 +211,7 @@ class GEMMFP8TritonBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        from primus_turbo.triton.gemm.gemm_kernel import fp8_gemm_pertensor
-
-        return fp8_gemm_pertensor(
+        return gemm_fp8_tensorwise_triton_kernel(
             a,
             a_scale_inv,
             b,
