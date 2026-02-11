@@ -6,9 +6,20 @@
 
 import torch
 
-from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_impl
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_csrc_impl
 
 __all__ = ["gemm"]
+
+
+def _gemm_dispatch(a, trans_a, b, trans_b, out_dtype, trans_c):
+    """Dispatch GEMM to the appropriate backend (csrc or triton)."""
+    backend = GlobalBackendManager.get_gemm_backend()
+    if backend == BackendType.TRITON:
+        from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
+
+        return gemm_triton_kernel(a, b, trans_a, trans_b, out_dtype, trans_c)
+    return gemm_csrc_impl(a, trans_a, b, trans_b, out_dtype, trans_c)
 
 
 class GemmFunction(torch.autograd.Function):
@@ -25,7 +36,7 @@ class GemmFunction(torch.autograd.Function):
         # FWD
         # out    = a * b
         # [M, N] = [M, K] * [K, N]
-        out = gemm_impl(a, trans_a, b, trans_b, out_dtype, False)
+        out = _gemm_dispatch(a, trans_a, b, trans_b, out_dtype, False)
         # Save for bwd
         if a.requires_grad or b.requires_grad:
             ctx.save_for_backward(a, b)
@@ -39,11 +50,11 @@ class GemmFunction(torch.autograd.Function):
 
         # AGrad
         # grad_a = grad_out * b^T
-        grad_a = gemm_impl(grad_out, False, b, not ctx.trans_b, a.dtype, ctx.trans_a)
+        grad_a = _gemm_dispatch(grad_out, False, b, not ctx.trans_b, a.dtype, ctx.trans_a)
 
         # BGrad
         # grad_b = a^T * grad_out
-        grad_b = gemm_impl(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
+        grad_b = _gemm_dispatch(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
 
         return grad_a, grad_b, None, None, None
 
