@@ -24,6 +24,8 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
 from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_blockwise_triton_kernel,
     grouped_gemm_fp8_blockwise_variable_k_triton_kernel,
+    grouped_gemm_fp8_rowwise_triton_kernel,
+    grouped_gemm_fp8_rowwise_variable_k_triton_kernel,
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
@@ -308,11 +310,13 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
 
     Supports:
       - TENSORWISE: per-tensor scaling
+      - ROWWISE: per-row/per-col vector scaling
       - BLOCKWISE: block-wise scaling (2D B_scales per group)
     """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
 
@@ -357,6 +361,16 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_triton_kernel(
+                a,
+                b,
+                a_scales,
+                b_scales,
+                group_offs,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return grouped_gemm_fp8_rowwise_triton_kernel(
                 a,
                 b,
                 a_scales,
@@ -413,11 +427,13 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
     Supports:
       - TENSORWISE: per-tensor scaling
+      - ROWWISE: per-row/per-col vector scaling
       - BLOCKWISE: 1D+1D block-wise scaling (TN/CRR layout)
     """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
 
@@ -471,6 +487,15 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
+                lhs,
+                rhs,
+                lhs_scales,
+                rhs_scales,
+                group_offs,
+                out_dtype=out_dtype,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
                 lhs,
                 rhs,
                 lhs_scales,

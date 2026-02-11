@@ -12,6 +12,10 @@ Contains:
     - _fp8_persistent_gemm_kernel: Core persistent kernel
     - gemm_fp8_tensorwise_triton_kernel: Public API
 
+  Rowwise (per-row/per-col vector) scaling:
+    - _fp8_rowwise_persistent_gemm_kernel: Core persistent kernel
+    - gemm_fp8_rowwise_triton_kernel: Public API
+
   Blockwise scaling:
     - _blockwise_fp8_autotune_kernel: Core autotuned persistent kernel
     - gemm_fp8_blockwise_triton_kernel: Unified public API (NT/NN/TN)
@@ -361,6 +365,292 @@ def gemm_fp8_tensorwise_triton_kernel(
     else:
         even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
         _fp8_persistent_gemm_kernel_autotuned[(num_sms,)](
+            *args,
+            stride_ak=s_ak,
+            stride_bk=s_bk,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=256,
+            GROUP_SIZE_M=group_m,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
+            EVEN_K=even_k,
+            CACHE_MODIFIER_A=".ca",
+            CACHE_MODIFIER_B=".ca",
+        )
+    return out
+
+
+# ###########################################################################
+#
+#  PART 1.5 — ROWWISE (per-row / per-col vector) FP8 GEMM
+#
+# ###########################################################################
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rowwise FP8 persistent kernel
+#
+# Identical to the tensorwise kernel except:
+#   - A_scale_ptr is (M,) fp32 and B_scale_ptr is (N,) fp32
+#   - Scale is applied as  acc *= a_scale[rm][:, None] * b_scale[rn][None, :]
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@triton.jit()
+def _fp8_rowwise_persistent_gemm_kernel(
+    A,
+    B,
+    C,
+    A_scale_ptr,  # (M,) fp32 — per output-row scale
+    B_scale_ptr,  # (N,) fp32 — per output-col scale
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+):
+    """Persistent FP8 GEMM kernel with per-row/per-col vector scaling.
+
+    Computes: C[m,n] = (sum_k A[m,k] * B[k,n]) * a_scale[m] * b_scale[n]
+
+    Kernel structure mirrors ``_fp8_persistent_gemm_kernel`` (tensorwise)
+    and the standalone ``fp8_gemm_8192_mi300.py`` benchmark kernel.
+    """
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    total_tiles = num_pid_m * num_pid_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    acc_dtype = tl.float32
+
+    for tile_id in range(pid, total_tiles, NUM_SMS):
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
+        A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+        B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
+
+        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+        if not EVEN_K:
+            loop_k -= 1
+        tl.assume(loop_k > 1)
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        for k in range(0, loop_k):
+            if stride_ak == 1:
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+            else:
+                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+
+            if stride_bk == 1:
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+            else:
+                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+
+            acc += tl.dot(a, b, input_precision="ieee")
+            A_BASE += BLOCK_SIZE_K * stride_ak
+            B_BASE += BLOCK_SIZE_K * stride_bk
+
+        if not EVEN_K:
+            k = loop_k
+            rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+            B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
+            if stride_ak == 1:
+                A_BASE = tl.multiple_of(A_BASE, (1, 16))
+            else:
+                A_BASE = tl.multiple_of(A_BASE, (16, 1))
+            if stride_bk == 1:
+                B_BASE = tl.multiple_of(B_BASE, (16, 1))
+            else:
+                B_BASE = tl.multiple_of(B_BASE, (1, 16))
+            a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+            acc += tl.dot(a, b, input_precision="ieee")
+
+        # Apply per-row/per-col vector scales
+        a_scale = tl.load(A_scale_ptr + rm)
+        b_scale = tl.load(B_scale_ptr + rn)
+        acc *= a_scale[:, None] * b_scale[None, :]
+        c = acc.to(C.type.element_ty)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
+        tl.store(C_, c, c_mask)
+
+
+_fp8_rowwise_persistent_gemm_kernel_autotuned = triton.autotune(
+    configs=_get_fp8_autotune_configs(),
+    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
+    prune_configs_by={"early_config_prune": _prune_fp8_configs},
+    warmup=20,
+    rep=80,
+)(_fp8_rowwise_persistent_gemm_kernel)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rowwise FP8 GEMM Public API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def gemm_fp8_rowwise_triton_kernel(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+    trans_c: bool = False,
+) -> torch.Tensor:
+    """General-purpose FP8 GEMM with per-row / per-col (rowwise) scaling.
+
+    Computes: C = op(A) @ op(B)  element-wise scaled by a_scale and b_scale.
+    Scale semantics (after transposing into [M,K]@[K,N] form):
+      a_scale_inv: (M,) fp32 — per output-row
+      b_scale_inv: (N,) fp32 — per output-col
+
+    Typical caller scale shapes from ``FP8GemmRowFunction``:
+      NT (forward):  a=[M,K] axis=-1 → (M,);  b=[N,K] axis=-1 → (N,)
+      NN (grad_X):   grad_out=[M,N] axis=-1 → (M,);  b_col=[N,K] axis=-2 → (K,)
+      TN (grad_W):   a_col=[M,K] axis=-2 → (K,);  grad_out_col=[M,N] axis=-2 → (N,)
+
+    Args:
+        a: FP8 input matrix.
+        a_scale_inv: Per-row dequantization scale for A (after transpose), shape (M,), fp32.
+        b: FP8 input matrix.
+        b_scale_inv: Per-col dequantization scale for B (after transpose), shape (N,), fp32.
+        trans_a: Whether A is transposed.
+        trans_b: Whether B is transposed.
+        out_dtype: Output dtype (default bfloat16).
+        trans_c: If True, return transposed output C^T (shape N×M).
+
+    Returns:
+        C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
+    """
+    if trans_a:
+        K, M = a.shape
+        A_view = a.T
+    else:
+        M, K = a.shape
+        A_view = a
+
+    if trans_b:
+        N, K2 = b.shape
+        B_view = b.T
+    else:
+        K2, N = b.shape
+        B_view = b
+
+    assert K == K2, f"K mismatch: A gives K={K}, B gives K={K2}"
+
+    # Ensure views have proper strides (no broadcast/expand zeros from autograd)
+    if A_view.stride(0) == 0 or A_view.stride(1) == 0:
+        A_view = A_view.contiguous()
+    if B_view.stride(0) == 0 or B_view.stride(1) == 0:
+        B_view = B_view.contiguous()
+
+    # Handle trans_c by writing to (N, M) buffer with swapped strides
+    if trans_c:
+        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
+        stride_cm = out.stride(1)  # = 1
+        stride_cn = out.stride(0)  # = M
+    else:
+        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
+        stride_cm = out.stride(0)  # = N
+        stride_cn = out.stride(1)  # = 1
+
+    # Stride constexprs for compiler optimisation
+    s_ak = A_view.stride(1)
+    s_bk = B_view.stride(0)
+
+    # Heuristic GROUP_SIZE_M (reuse FP8 heuristic)
+    group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
+
+    num_cus = _get_num_cus()
+    num_sms = compute_sk_grid(M, N, K, 256, 256, 64, num_cus)
+
+    args = (
+        A_view,
+        B_view,
+        out,
+        a_scale_inv,
+        b_scale_inv,
+        M,
+        N,
+        K,
+        A_view.stride(0),
+        B_view.stride(1),
+        stride_cm,
+        stride_cn,
+    )
+
+    if M * N > _AUTOTUNE_MN_THRESHOLD:
+        # Large problem: skip autotune to avoid OOM, use default config
+        blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
+        even_k = K % blk_k == 0
+        _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
+            *args,
+            stride_ak=s_ak,
+            stride_bk=s_bk,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_K=blk_k,
+            GROUP_SIZE_M=group_m,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
+            CHUNK_SIZE=32,
+            EVEN_K=even_k,
+            CACHE_MODIFIER_A=".ca",
+            CACHE_MODIFIER_B=".ca",
+            num_warps=8,
+            num_stages=2,
+            waves_per_eu=0,
+            matrix_instr_nonkdim=16,
+            kpack=1,
+        )
+    else:
+        even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
+        _fp8_rowwise_persistent_gemm_kernel_autotuned[(num_sms,)](
             *args,
             stride_ak=s_ak,
             stride_bk=s_bk,

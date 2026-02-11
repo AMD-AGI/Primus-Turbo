@@ -24,6 +24,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
+    gemm_fp8_rowwise_triton_kernel,
     gemm_fp8_tensorwise_triton_kernel,
 )
 
@@ -183,11 +184,16 @@ class GEMMFP8TritonBackend(KernelBackend):
 
     Supports:
       - TENSORWISE: per-tensor scaling (all layouts)
+      - ROWWISE: per-row/per-col vector scaling (all layouts)
       - BLOCKWISE: block-wise scaling with three layouts:
           NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.BLOCKWISE}
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
@@ -222,6 +228,17 @@ class GEMMFP8TritonBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.TENSORWISE:
             return gemm_fp8_tensorwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return gemm_fp8_rowwise_triton_kernel(
                 a,
                 a_scale_inv,
                 b,
