@@ -54,6 +54,9 @@ class GroupedGemmFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        if not grad_out.is_contiguous():
+            grad_out = grad_out.contiguous()
+
         a, b, group_lens, group_offs = ctx.saved_tensors
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
@@ -71,7 +74,6 @@ class GroupedGemmFunc(torch.autograd.Function):
                 num_cu=ctx.num_cu,
                 default_backend=BackendType.CK.value,
             )
-
             grad_b = grouped_gemm_variable_k_impl(
                 a,
                 grad_out,

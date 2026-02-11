@@ -32,6 +32,12 @@ __all__ = [
 ]
 
 
+def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
+    # Some upstream reductions can produce expanded zero-stride grad_out views.
+    # Custom grouped GEMM kernels expect dense layouts.
+    return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+
+
 class GroupedGemmFP8BlockFunc(torch.autograd.Function):
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -107,6 +113,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
 
         (
             a_fp8_col,
@@ -234,6 +241,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens, group_offs = ctx.saved_tensors
 
         # For grad_a
@@ -340,6 +348,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
 
         # For grad_a
