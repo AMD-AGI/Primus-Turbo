@@ -747,12 +747,16 @@ def _blockwise_fp8_autotune_kernel(
 ):
     pid = tl.program_id(0)
 
-    # XCD-aware PID transform (inlined to avoid constexpr propagation issues)
+    # XCD-aware PID transform (inlined from _chiplet_transform_chunked
+    # because NUM_SMS is not constexpr in this kernel)
     if NUM_XCDS != 1:
-        chunk_id = pid // CHUNK
-        chunk_off = pid % CHUNK
-        cta_per_xcd = NUM_SMS // NUM_XCDS
-        pid = (chunk_id % NUM_XCDS) * cta_per_xcd + (chunk_id // NUM_XCDS) * CHUNK + chunk_off
+        full_chunk_pids = (NUM_SMS // (NUM_XCDS * CHUNK)) * (NUM_XCDS * CHUNK)
+        if pid <= full_chunk_pids:
+            local_pid = pid // NUM_XCDS
+            chunk_idx = local_pid // CHUNK
+            pos_in_chunk = local_pid % CHUNK
+            xcd = pid % NUM_XCDS
+            pid = chunk_idx * NUM_XCDS * CHUNK + xcd * CHUNK + pos_in_chunk
 
     num_m = tl.cdiv(M, BLOCK_M)
     num_n = tl.cdiv(N, BLOCK_N)
@@ -797,15 +801,20 @@ def _blockwise_fp8_autotune_kernel(
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for ki in range(NUM_K_BLOCKS):
+            # Mask for partial K blocks (last iteration when K % BLOCK_K != 0)
+            k_remaining = K - ki * BLOCK_K
+            mask_k_col = rk[None, :] < k_remaining  # [1, BLOCK_K] for A
+            mask_k_row = rk[:, None] < k_remaining  # [BLOCK_K, 1] for B
+
             if A_K_CONTIGUOUS:
-                a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), cache_modifier=".ca")
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
             else:
-                a = tl.load(tl.multiple_of(a_ptrs, (16, 1)), cache_modifier=".ca")
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
 
             if B_K_CONTIGUOUS:
-                b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), cache_modifier=".ca")
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
             else:
-                b = tl.load(tl.multiple_of(b_ptrs, (1, 16)), cache_modifier=".ca")
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
 
             partial = tl.dot(a, b, input_precision="ieee")
 
@@ -910,7 +919,7 @@ def _blockwise_nt(
 
     M, K = a.shape
     N = b.shape[0]
-    num_k = K // 128
+    num_k = (K + 127) // 128
 
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
@@ -967,7 +976,7 @@ def _blockwise_nn(
 
     M, K = a.shape
     _, N = b.shape
-    num_k = K // 128
+    num_k = (K + 127) // 128
 
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
@@ -1031,7 +1040,7 @@ def _blockwise_tn(
 
     K, M = a.shape
     _, N = b.shape
-    num_k = K // 128
+    num_k = (K + 127) // 128
 
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
