@@ -189,14 +189,12 @@ def check_hip_compiler_flag(flag):
 
 def get_common_flags():
     arch = platform.machine().lower()
-    extra_link_args = [
-        "-Wl,-rpath,/opt/rocm/lib",
-        f"-L/usr/lib/{arch}-linux-gnu",
-    ]
+    extra_link_args = ["-Wl,-rpath,/opt/rocm/lib", f"-L/usr/lib/{arch}-linux-gnu", "-fgpu-rdc", "--hip-link"]
 
     cxx_flags = [
         "-O3",
         "-fvisibility=hidden",
+        "-fgpu-rdc",
         "-std=c++20",
     ]
 
@@ -218,6 +216,7 @@ def get_common_flags():
         "-amdgpu-early-inline-all=true",
         "-mllvm",
         "-amdgpu-function-calls=false",
+        "-fgpu-rdc",
         "-std=c++20",
     ]
 
