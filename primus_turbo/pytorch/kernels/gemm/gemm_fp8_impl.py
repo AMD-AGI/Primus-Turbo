@@ -22,7 +22,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.triton.gemm.gemm_kernel import gemm_fp8_tensorwise_triton_kernel
+from primus_turbo.triton.gemm.gemm_fp8_kernel import (
+    gemm_fp8_blockwise_triton_kernel,
+    gemm_fp8_tensorwise_triton_kernel,
+)
 
 
 def get_gemm_logical_shape(
@@ -176,9 +179,15 @@ class GEMMFP8CKBackend(KernelBackend):
 
 
 class GEMMFP8TritonBackend(KernelBackend):
-    """Triton persistent-kernel backend for FP8 GEMM (per-tensor scaling only)."""
+    """Triton persistent-kernel backend for FP8 GEMM.
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    Supports:
+      - TENSORWISE: per-tensor scaling (all layouts)
+      - BLOCKWISE: block-wise scaling with three layouts:
+          NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.BLOCKWISE}
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
@@ -211,16 +220,30 @@ class GEMMFP8TritonBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        return gemm_fp8_tensorwise_triton_kernel(
-            a,
-            a_scale_inv,
-            b,
-            b_scale_inv,
-            trans_a=trans_a,
-            trans_b=trans_b,
-            out_dtype=out_dtype,
-            trans_c=trans_c,
-        )
+        if granularity == ScalingGranularity.TENSORWISE:
+            return gemm_fp8_tensorwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        elif granularity == ScalingGranularity.BLOCKWISE:
+            return gemm_fp8_blockwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        else:
+            raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")
 
 
 _GEMM_FP8_BACKENDS = {

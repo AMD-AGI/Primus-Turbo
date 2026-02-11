@@ -21,7 +21,9 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+    grouped_gemm_fp8_blockwise_triton_kernel,
+    grouped_gemm_fp8_blockwise_variable_k_triton_kernel,
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
@@ -302,10 +304,16 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
 
 
 class GroupedGEMMFP8TritonBackend(KernelBackend):
-    """Triton persistent-kernel backend for FP8 grouped GEMM (CPU-sync-free, per-tensor scaling)."""
+    """Triton persistent-kernel backend for FP8 grouped GEMM (CPU-sync-free).
+
+    Supports:
+      - TENSORWISE: per-tensor scaling
+      - BLOCKWISE: block-wise scaling (2D B_scales per group)
+    """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
+        ScalingGranularity.BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
@@ -347,6 +355,16 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
+        if granularity == ScalingGranularity.BLOCKWISE:
+            return grouped_gemm_fp8_blockwise_triton_kernel(
+                a,
+                b,
+                a_scales,
+                b_scales,
+                group_offs,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+            )
         return grouped_gemm_fp8_tensorwise_triton_kernel(
             a,
             b,
@@ -391,10 +409,16 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
 
 
 class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
-    """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward, per-tensor scaling)."""
+    """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward).
+
+    Supports:
+      - TENSORWISE: per-tensor scaling
+      - BLOCKWISE: 1D+1D block-wise scaling (TN/CRR layout)
+    """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
+        ScalingGranularity.BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
@@ -445,6 +469,15 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
 
+        if granularity == ScalingGranularity.BLOCKWISE:
+            return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
+                lhs,
+                rhs,
+                lhs_scales,
+                rhs_scales,
+                group_offs,
+                out_dtype=out_dtype,
+            )
         return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             lhs,
             rhs,
