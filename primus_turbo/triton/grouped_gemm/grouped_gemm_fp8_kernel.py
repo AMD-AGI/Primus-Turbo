@@ -924,6 +924,7 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     NUM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
 ):
     """Persistent grouped block-wise FP8 GEMM kernel (CPU-sync-free)."""
@@ -932,7 +933,6 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    NUM_K_BLOCKS = K // BLOCK_SIZE_K
 
     # ── Compute total tiles across all groups ──
     total_tiles: tl.int32 = 0
@@ -994,10 +994,15 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
         # B_scales pointer: B_scales[g, pn, ki] (2D block scaling)
         bs_ptr_base = B_scales_ptr + group_idx.to(tl.int64) * stride_bs_g + pid_n * stride_bs_n
 
-        # ── K-loop with block-wise scaling ──
+        # ── K-loop with block-wise scaling (EVEN_K pattern) ──
+        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+        if not EVEN_K:
+            loop_k -= 1
+        tl.assume(loop_k > 1)
+
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for ki in range(NUM_K_BLOCKS):
+        for ki in range(0, loop_k):
             if stride_ak == 1:
                 a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
             else:
@@ -1017,6 +1022,26 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
 
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
+
+        if not EVEN_K:
+            # ── Last partial K-block (masked) ──
+            rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
+            B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+            if stride_ak == 1:
+                A_LAST = tl.multiple_of(A_LAST, (1, 16))
+            else:
+                A_LAST = tl.multiple_of(A_LAST, (16, 1))
+            if stride_bk == 1:
+                B_LAST = tl.multiple_of(B_LAST, (16, 1))
+            else:
+                B_LAST = tl.multiple_of(B_LAST, (1, 16))
+            a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER)
+            b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER)
+            partial = tl.dot(a, b, input_precision="ieee")
+            a_s = tl.load(as_ptrs_base + loop_k * stride_as_k)
+            b_s = tl.load(bs_ptr_base + loop_k * stride_bs_k)
+            acc += partial * (a_s * b_s)[:, None]
 
         # ── Store output ──
         c = acc.to(C.type.element_ty)
@@ -1043,7 +1068,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
     C,  # [G, OUT_M, OUT_N]
     LHS_scales_ptr,  # [ceil(M_padded/128), OUT_M] float32
     RHS_scales_ptr,  # [ceil(M_padded/128), OUT_N] float32
-    group_offs_ptr,  # [G+1] int64 (padded segment offsets)
+    group_offs_ptr,  # [G+1] int64 (padded segment offsets, each aligned to 128)
     G,  # number of groups
     OUT_M,
     OUT_N,
@@ -1076,6 +1101,10 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
 
     All groups share the same output dims (OUT_M × OUT_N), only the inner product
     dimension M_g varies per group. 1D+1D scale pattern for TN/CRR layout.
+
+    NOTE: Data is segment-padded to BLOCK_SIZE_K (128) boundaries by
+    quant_fp8_blockwise_segment_m_impl, so M_g is always a multiple of
+    BLOCK_SIZE_K. No masking is needed in the K-loop.
     """
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -1127,40 +1156,30 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         scale_row_start = m_start // BLOCK_SIZE_K
 
         # ── K-loop over M_g with block-wise 1D+1D scaling ──
-        loop_k = tl.cdiv(M_g, BLOCK_SIZE_K)
+        # M_g is always a multiple of BLOCK_SIZE_K (data padded), so no masking needed.
+        loop_k = M_g // BLOCK_SIZE_K
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(loop_k):
-            k_start = k * BLOCK_SIZE_K
-            mask_k = (k_start + tl.arange(0, BLOCK_SIZE_K)) < M_g
-
             if stride_lhs_n == 1:
                 a = tl.load(
                     tl.multiple_of(LHS_BASE, (16, 1)),
-                    mask=mask_k[None, :],
-                    other=0.0,
                     cache_modifier=CACHE_MODIFIER,
                 )
             else:
                 a = tl.load(
                     tl.multiple_of(LHS_BASE, (1, 16)),
-                    mask=mask_k[None, :],
-                    other=0.0,
                     cache_modifier=CACHE_MODIFIER,
                 )
 
             if stride_rhs_n == 1:
                 b = tl.load(
                     tl.multiple_of(RHS_BASE, (1, 16)),
-                    mask=mask_k[:, None],
-                    other=0.0,
                     cache_modifier=CACHE_MODIFIER,
                 )
             else:
                 b = tl.load(
                     tl.multiple_of(RHS_BASE, (16, 1)),
-                    mask=mask_k[:, None],
-                    other=0.0,
                     cache_modifier=CACHE_MODIFIER,
                 )
 
@@ -1243,6 +1262,16 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     A_scales_t = a_scales.T.contiguous()
     num_sms = _get_num_cus()
 
+    blk_m = 256
+    blk_n = 128  # Keep 128 to match B_scale block alignment
+    blk_k = 128
+    even_k = K % blk_k == 0
+
+    # GROUP_SIZE_M heuristic (match tensorwise)
+    tiles_m_per_group = (M_total + G * blk_m - 1) // (G * blk_m)
+    tiles_n = (N + blk_n - 1) // blk_n
+    group_m = 8 if min(tiles_m_per_group, tiles_n) < 16 else 4
+
     _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -1265,17 +1294,18 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
         stride_bs_k,
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=128,
-        GROUP_SIZE_M=8,
+        BLOCK_SIZE_M=blk_m,
+        BLOCK_SIZE_N=blk_n,
+        BLOCK_SIZE_K=blk_k,
+        GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=32,
+        EVEN_K=even_k,
         CACHE_MODIFIER=".ca",
-        num_warps=4,
-        num_stages=1,
-        waves_per_eu=2,
+        num_warps=8,
+        num_stages=1,  # 256×128×128 needs 48KB/stage; 2 stages=96KB > 64KB LDS
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -1322,6 +1352,11 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
+    # Use 128x128 tiles to reduce register pressure from double-accumulator
+    # (partial + acc both need full tile VGPRs for blockwise scale application).
+    # With 256x256 tiles + 8 warps, 2 accumulator sets need ~290 VGPRs/wave
+    # which exceeds the 256 limit at 2 waves/SIMD, causing spilling.
+    # 128x128 with 4 warps keeps VGPRs at ~170/wave, fitting 2 waves/SIMD.
     _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
@@ -1343,17 +1378,17 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         rhs_scales.stride(1),
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=128,
         BLOCK_SIZE_K=128,
         GROUP_SIZE_M=4,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=32,
         CACHE_MODIFIER=".ca",
-        num_warps=8,
+        num_warps=4,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
