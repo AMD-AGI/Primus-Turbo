@@ -89,7 +89,7 @@ public:
             }
 
             for (size_t idx = 0; idx < num_gemms; ++idx) {
-                const auto stream_idx = idx % kMaxNumStreams;
+                const auto stream_idx = idx % num_stream_used;
                 auto       stream     = compute_streams_[stream_idx];
                 auto       handle     = handles_[stream_idx];
                 auto       workspace  = workspaces_[stream_idx];
