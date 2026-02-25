@@ -1,0 +1,7 @@
+[build-system]
+requires = [
+    "setuptools==69.5.1",
+    "wheel",
+    "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git",
+]
+build-backend = "setuptools.build_meta"

@@ -8,10 +8,12 @@ from pathlib import Path
 
 from setuptools import find_packages, setup
 
+PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from tools.build_ext import TurboBuildExt, _join_rocm_home
 from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
-
-PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 
 # -------- Framework Switches ---------
 # PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX"
@@ -81,6 +83,21 @@ def check_submodules():
 def is_package_installed(package_name):
     """Check if a package is installed in the current Python environment."""
     return importlib.util.find_spec(package_name) is not None
+
+
+def get_extras_require():
+    extras = {
+        "pytorch": [
+            "torch",
+        ],
+        "jax": [
+            "jax",
+            "jaxlib",
+            "pybind11>=3.0.1",
+        ],
+    }
+    extras["all"] = sorted(set(extras["pytorch"] + extras["jax"]))
+    return extras
 
 
 def all_files_in_dir(path, name_extensions=None):
@@ -384,6 +401,7 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "hip-python",
+        "triton==3.5.1",
     ]
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
@@ -405,4 +423,5 @@ if __name__ == "__main__":
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,
         install_requires=install_requires,
+        extras_require=get_extras_require(),
     )

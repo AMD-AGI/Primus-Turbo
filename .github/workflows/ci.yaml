@@ -170,7 +170,7 @@ jobs:
           unset AITER_ASM_DIR
           pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
-          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e ".[pytorch]" -v
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
@@ -250,7 +250,7 @@ jobs:
           fi
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
-          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
