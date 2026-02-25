@@ -245,9 +245,7 @@ private:
 };
 
 void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-    // TODO: This uses a single static instance, which may be risky under multi-threaded usage.
-    // If/when needed, add proper thread-safety (e.g., per-thread instances or locking).
-    static HipblasltGroupedGemm instance;
+    static thread_local HipblasltGroupedGemm instance;
     instance.run(params, pre_sync);
 }
 
