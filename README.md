@@ -1,4 +1,7 @@
 # Primus-Turbo
+[What is Primus-Turbo?](#-what-is-primus-turbo) | [What's New](#-whats-new) | [Primus Product Matrix](#-primus-product-matrix) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [License](#-license)
+
+## 🔍 What is Primus-Turbo?
 **Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
@@ -29,7 +32,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 ### Requirements
 
 #### Software
-- ROCm >= 6.4
+- ROCm >= 7.0
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
@@ -55,16 +58,31 @@ rocm/jax-training:maxtext-v25.9
 ```
 
 #### Install from Source
+
 ```bash
 git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
+# Install build/runtime dependencies first
 pip3 install -r requirements.txt
-pip3 install --no-build-isolation .
+
+# PyTorch backend (default compile target)
+pip3 install --no-build-isolation ".[pytorch]"
+
+# JAX backend
+PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation ".[jax]"
+
+# Build both backends from source
+PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX" pip3 install --no-build-isolation ".[pytorch,jax]"
 
 # (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
-GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
+GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation ".[pytorch]"
 ```
+
+> Note:
+> - `".[pytorch]"` / `".[jax]"` means "install from current local repo with extras".
+> - `"primus_turbo[pytorch]"` is for package-index install (for example, after publishing to PyPI).
+> - Extras select Python dependencies. Source compilation target is controlled by `PRIMUS_TURBO_FRAMEWORK`.
 
 ### 2. Development
 
@@ -75,15 +93,15 @@ git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
 pip3 install -r requirements.txt
-pip3 install --no-build-isolation -e . -v
+pip3 install --no-build-isolation -e ".[pytorch]" -v
 
 # (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
-GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
+GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e ".[pytorch]" -v
 
 # (Optional) Set PRIMUS_TURBO_FRAMEWORK to compile for a specific framework.
 # Supported values: PYTORCH (default), JAX.
 # For example, to compile for JAX:
-PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
+PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
 ```
 
 ### 3. Testing
@@ -107,11 +125,35 @@ pytest tests/jax/ --dist-only     # multi-GPU tests
 
 ### 4. Packaging
 
+`pip` installation behavior:
+1. Use a compatible wheel (`.whl`) if available.
+2. Fall back to source distribution (`sdist`, `.tar.gz`) when no wheel matches.
+
+Artifact roles:
+- **wheel**: prebuilt binary package, fast install, no local C++/HIP build.
+- **sdist**: source package, slower install, requires local toolchain, fallback path.
+
+#### Build artifacts
 ```bash
-pip3 install -r requirements.txt
+# Build wheel (binary distribution)
 python3 -m build --wheel --no-isolation
+
+# Build sdist (source distribution)
+python3 -m build --sdist --no-isolation
+```
+
+#### Verify wheel install
+```bash
 pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl
 ```
+
+#### Verify source fallback install
+```bash
+pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.tar.gz
+```
+
+> Tip:
+> Run import checks outside the source tree (for example under `/tmp`) to avoid importing local source files by accident.
 
 ### 5. Minimal Example
 ```python
