@@ -2,6 +2,11 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
+#
+# Acknowledgement:
+#   The persistent GEMM kernels in this file are adapted from tritonBLAS
+#   (https://github.com/ROCm/tritonBLAS). We thank the tritonBLAS authors
+#   for their high-quality Triton kernel implementations on AMD GPUs.
 ###############################################################################
 
 """
@@ -33,29 +38,29 @@ import triton.language as tl
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def compute_sk_grid(
-    M: int,
-    N: int,
-    K: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_cus: int,
-    max_workspace_bytes: int = 128 * 1024 * 1024,
-) -> int:
+def compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus, max_workspace_bytes=128 * 1024 * 1024):
     """Compute optimal StreamK grid size based on problem dimensions and hardware.
 
-    Implements the dynamic grid logic from tritonBLAS:
+    Implements the dynamic grid logic from tritonBLAS/Origami:
     - If tiles > CUs: Try fractional splits to balance work
     - If tiles < CUs: Split along K-dimension
     - Consider workspace constraints for partial tiles
+
+    Args:
+        M, N, K: Matrix dimensions
+        block_m, block_n, block_k: Tile sizes
+        num_cus: Number of compute units (e.g., 256 for MI300, 304 for MI325X)
+        max_workspace_bytes: Maximum workspace size for partial tiles (default 128MB)
+
+    Returns:
+        int: Optimal grid size for StreamK kernel
     """
     tiles = math.ceil(M / block_m) * math.ceil(N / block_n)
     iters_per_tile = max(1, math.ceil(K / block_k))
 
     sk_grid = tiles
 
-    tile_fractions = [0.0, 1.0 / 2, 1.0 / 8, 1.0 / 5, 1.0 / 4, 1.0 / 3]
+    tile_fractions = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
     split_factors = [8, 6, 4, 3, 2, 1]
 
     if tiles > num_cus:
@@ -135,7 +140,7 @@ def _chiplet_transform_chunked(
 
 
 def _get_bf16_autotune_configs():
-    """BF16 autotune configs — only 2 (fast compilation)."""
+    """BF16 autotune configs — 2 configs (fast compilation)."""
     configs = []
     for chunk_size, waves in [(32, 2), (64, 0)]:
         configs.append(

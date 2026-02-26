@@ -2,6 +2,11 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
+#
+# Acknowledgement:
+#   The persistent FP8 GEMM kernels in this file are adapted from tritonBLAS
+#   (https://github.com/ROCm/tritonBLAS). We thank the tritonBLAS authors
+#   for their high-quality Triton kernel implementations on AMD GPUs.
 ###############################################################################
 
 """
@@ -103,22 +108,46 @@ def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
 
     FP8 patterns:
     - min_tile < 16 (non-standard dims like 3584): GROUP=8
+    - TT layout (stride_ak!=1, stride_bk==1) + tiles > 256: GROUP=5
     - Default (including TN): GROUP=4
       (29/32 FP8 TN entries use GROUP=4)
     """
     tiles_m = (M + 255) // 256
     tiles_n = (N + 255) // 256
+    total_tiles = tiles_m * tiles_n
     min_tile = min(tiles_m, tiles_n)
+
+    is_tt = (stride_ak != 1) and (stride_bk == 1)
 
     if min_tile < 16:
         return 8
+    elif is_tt and total_tiles > 256:
+        return 5
     else:
         return 4
 
 
 def _prune_fp8_configs(configs, named_args, **kwargs):
-    """Prune FP8 configs — placeholder for future layout-specific pruning."""
-    return configs
+    """Prune BLOCK_SIZE_K by layout — deterministic from tuning data.
+
+    Rules:
+    1. TT (stride_ak==1, stride_bk!=1): always BLK_K=64 → remove 128
+       (100% of TT cases in tuning used BLK_K=64)
+    2. TN / NT: keep both BLK_K=64 and 128, let autotune decide
+       (TN: 91% use 128, but 3 cases need 64 → autotune is safest)
+    """
+    stride_ak = kwargs.get("stride_ak", named_args.get("stride_ak", None))
+    stride_bk = kwargs.get("stride_bk", named_args.get("stride_bk", None))
+
+    is_TT = stride_ak == 1 and stride_bk is not None and stride_bk != 1
+
+    pruned = []
+    for cfg in configs:
+        bk = cfg.kwargs["BLOCK_SIZE_K"]
+        if is_TT and bk == 128:
+            continue
+        pruned.append(cfg)
+    return pruned if pruned else configs
 
 
 @triton.jit()
