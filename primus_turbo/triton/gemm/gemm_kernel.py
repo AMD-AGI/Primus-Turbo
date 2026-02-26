@@ -29,7 +29,7 @@ import triton
 import triton.language as tl
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Grid Utilities (StreamK)
+# Grid Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -45,7 +45,7 @@ def compute_sk_grid(
 ) -> int:
     """Compute optimal StreamK grid size based on problem dimensions and hardware.
 
-    Implements the dynamic grid logic from tritonBLAS/Origami:
+    Implements the dynamic grid logic from tritonBLAS:
     - If tiles > CUs: Try fractional splits to balance work
     - If tiles < CUs: Split along K-dimension
     - Consider workspace constraints for partial tiles
@@ -88,7 +88,7 @@ def compute_sk_grid(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Hardware constants (lazy init)
+# Hardware constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NUM_XCDS = 8
@@ -109,7 +109,7 @@ def _get_num_cus() -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Chiplet Transform (shared helper)
+# Chiplet Transform
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
