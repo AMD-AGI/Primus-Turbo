@@ -28,6 +28,10 @@ SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
 # try to found rocshmem in default path or enviorment
 ROCSHMEM_LIBRARY = find_rocshmem_library()
 
+# ---------- AITER COMMIT ------------
+
+AITER_COMMIT = "512cd4c65ff7841edac9ec594d859d415c76e819"
+
 # -------------------------------------
 
 
@@ -385,9 +389,7 @@ if __name__ == "__main__":
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
-        install_requires.append(
-            "amd-aiter @ git+https://github.com/ROCm/aiter.git@66fc02bfe54925d0b0488c2356656858064e8ace"
-        )
+        install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
     else:
         print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
 
