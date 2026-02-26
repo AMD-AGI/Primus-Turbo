@@ -30,7 +30,7 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-AITER_COMMIT = "80e34831d15599d6c4b326a2d6b088af95328617"
+AITER_COMMIT = "512cd4c65ff7841edac9ec594d859d415c76e819"
 
 # -------------------------------------
 
