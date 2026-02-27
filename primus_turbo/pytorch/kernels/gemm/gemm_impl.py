@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.backend import (
 from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+_HIPBLASLT_SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 class GEMMHipBLASLtBackend(KernelBackend):
@@ -34,7 +35,7 @@ class GEMMHipBLASLtBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.ndim == 2 and b.ndim == 2
-        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= a.dtype in _HIPBLASLT_SUPPORTED_DTYPES and b.dtype in _HIPBLASLT_SUPPORTED_DTYPES
         return supported
 
     @staticmethod

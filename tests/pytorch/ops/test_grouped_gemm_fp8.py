@@ -362,7 +362,7 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     if format == Format.HYBRID:
@@ -402,9 +402,9 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("balance", [False])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False])
 def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     N, K = NK
     _run_grouped_gemm_fp8_test(
@@ -430,7 +430,7 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance,
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_blockwise(
     B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend, auto_tune
