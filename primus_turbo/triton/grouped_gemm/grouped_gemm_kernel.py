@@ -22,11 +22,21 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 
 from __future__ import annotations
 
+import functools
+import itertools
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+try:
+    import origami
+
+    _HAS_ORIGAMI = not os.environ.get("PRIMUS_TURBO_DISABLE_ORIGAMI", "")
+except ModuleNotFoundError:
+    _HAS_ORIGAMI = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants (lazy init)
@@ -42,6 +52,80 @@ def _get_num_cus() -> int:
     if _NUM_CUS is None:
         _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     return _NUM_CUS
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Origami analytical config selection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ORIGAMI_CONFIGS: Optional[list] = None
+
+
+def _build_origami_configs():
+    """Build candidate configs for origami (gfx942 BF16)."""
+    block_mn = [16, 32, 64, 128, 256]
+    block_k = [16, 32, 64, 128, 256, 512]
+    configs = []
+    for bm, bn, bk in itertools.product(block_mn, block_mn, block_k):
+        for wpe in [0, 1, 2]:
+            for nw in [4, 8]:
+                for ns in [1, 2]:
+                    configs.append(
+                        triton.Config(
+                            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "waves_per_eu": wpe},
+                            num_warps=nw,
+                            num_stages=ns,
+                        )
+                    )
+    return configs
+
+
+def _get_origami_configs():
+    global _ORIGAMI_CONFIGS
+    if _ORIGAMI_CONFIGS is None:
+        _ORIGAMI_CONFIGS = _build_origami_configs()
+    return _ORIGAMI_CONFIGS
+
+
+@functools.lru_cache(maxsize=4096)
+def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
+    """Use origami to select macrotile, GROUP_SIZE_M, CHUNK_SIZE, waves_per_eu.
+
+    Results are cached by (M, N, K, strides, dtype).
+
+    Returns (block_m, block_n, block_k, wgm, chunk, wpe) or None.
+    """
+    if not _HAS_ORIGAMI:
+        return None
+    try:
+        selector = origami.OrigamiMatmulSelector(
+            config_gen=_get_origami_configs(),
+            m=M,
+            n=N,
+            k=K,
+            a_dtype=torch.bfloat16,
+            b_dtype=torch.bfloat16,
+            out_dtype=out_dtype,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            a_stride=a_stride,
+            b_stride=b_stride,
+            batch=1,
+        )
+        block_m = selector.macrotile_m
+        block_n = selector.macrotile_n
+        block_k = selector.macrotile_k
+        wgm = selector.wgm
+        chunk = selector.wgmxccchunk if selector.wgmxccchunk > 0 else 32
+        wpe = selector.occupancy if selector.occupancy > 0 else 2
+        print(
+            f"[grouped_gemm/origami] M={M} N={N} K={K} "
+            f"a_stride={a_stride} b_stride={b_stride} → "
+            f"tile={block_m}x{block_n}x{block_k} wgm={wgm} chunk={chunk} wpe={wpe}"
+        )
+        return block_m, block_n, block_k, wgm, chunk, wpe
+    except Exception as e:
+        print(f"[grouped_gemm/origami] ERROR M={M} N={N} K={K}: {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -280,8 +364,22 @@ def grouped_gemm_triton_kernel(
 
     # Kernel config
     num_sms = _get_num_cus()
-    even_k = K % 64 == 0
-    group_m = 4  # Default GROUP_SIZE_M for grouped GEMM
+
+    # Origami selection using average M per group as representative dimension
+    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    chunk_size = 32
+    waves_per_eu = 2
+    group_m = 4
+    avg_m = max(M_total // max(G, 1), 256)
+    # A[M,K] always row-major → (K, 1) → origami sees transpose_t.N
+    # RCR (trans_b): B_logical[K,N] col-major → (1, K) → origami sees transpose_t.T
+    # RRR (!trans_b): B_logical[K,N] row-major → (N, 1) → origami sees transpose_t.N
+    b_stride = (1, K) if trans_b else (N, 1)
+    origami_params = _select_params_origami(avg_m, N, K, (K, 1), b_stride, a.dtype)
+    if origami_params is not None:
+        BLOCK_M, BLOCK_N, BLOCK_K, group_m, chunk_size, waves_per_eu = origami_params
+
+    even_k = K % BLOCK_K == 0
 
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
@@ -298,19 +396,19 @@ def grouped_gemm_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
         GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
         num_warps=8,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -513,6 +611,19 @@ def grouped_gemm_variable_k_triton_kernel(
     num_sms = _get_num_cus()
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
+    # Origami selection: K dimension (inner product) is M_total/G on average
+    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    chunk_size = 32
+    waves_per_eu = 2
+    group_m = 4
+    M_total = lhs.shape[0]
+    avg_k = max(M_total // max(G, 1), 64)
+    # CRR: A_logical[OUT_M,K] col-major (transposed) → (1, OUT_M) → transpose_t.T
+    #      B_logical[K,OUT_N] row-major               → (OUT_N, 1) → transpose_t.N
+    origami_params = _select_params_origami(OUT_M, OUT_N, avg_k, (1, OUT_M), (OUT_N, 1), lhs.dtype)
+    if origami_params is not None:
+        BLOCK_M, BLOCK_N, BLOCK_K, group_m, chunk_size, waves_per_eu = origami_params
+
     _grouped_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
@@ -530,19 +641,19 @@ def grouped_gemm_variable_k_triton_kernel(
         out.stride(2),
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=4,
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
+        GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         IS_FP8=False,
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
         num_warps=8,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
