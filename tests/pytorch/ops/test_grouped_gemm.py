@@ -119,7 +119,7 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend):
     seed = 42

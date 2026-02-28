@@ -278,7 +278,7 @@ _DET_NK_VALUES = [(2048, 1536), (4096, 7168)]
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     N, K = NK
@@ -305,7 +305,7 @@ def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, 
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_rowwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     N, K = NK
@@ -333,7 +333,7 @@ def test_grouped_gemm_fp8_rowwise_deterministic(B, M, NK, ori_dtype, format, tra
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_blockwise_deterministic(
     B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend
