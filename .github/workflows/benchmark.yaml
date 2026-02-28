@@ -38,7 +38,7 @@ jobs:
           unset AITER_ASM_DIR
           pip3 uninstall -y aiter || true
           pip3 install -r requirements.txt
-          GPU_ARCHS="gfx942" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
+          GPU_ARCHS="gfx942" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e ".[pytorch]" -v
       - name: Create benchmark output directory
         run: |
           BENCHMARK_DATE=$(date +%Y%m%d)

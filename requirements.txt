@@ -4,9 +4,8 @@ hip-python
 clang-format==18.1.6
 hipify_torch @ git+https://github.com/ROCm/hipify_torch.git
 build
-triton==3.5.1
 expecttest
 pytest
 pytest-xdist
 setuptools==69.5.1
-scipy
+twine

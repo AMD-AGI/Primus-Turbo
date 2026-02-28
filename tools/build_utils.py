@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import List, Optional
 
 import setuptools
-from hipify_torch.hipify_python import hipify
+
+try:
+    from hipify_torch.hipify_python import hipify
+except ImportError as exc:
+    raise RuntimeError(
+        "hipify_torch is required to build primus_turbo.\n"
+        "Please install it first:\n"
+        '  pip3 install "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git"'
+    ) from exc
 
 try:
     import torch  # noqa: F401
