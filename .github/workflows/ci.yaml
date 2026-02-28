@@ -183,6 +183,18 @@ jobs:
             "exec pytest -v tests/pytorch -n 8 --log-cli-level=INFO"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Run deterministic tests (parallel)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          max_attempts: 2
+          # use timeout to terminate pytest and its workers on timeout
+          command: >
+            timeout -k 60s 55m
+            bash -lc
+            "exec pytest -v tests/pytorch -n 8 --deterministic-only --log-cli-level=INFO"
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
         uses: nick-fields/retry@v3
         with:
