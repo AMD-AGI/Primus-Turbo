@@ -10,3 +10,4 @@ test-reports/
 *_hip.cpp
 *_hip.hpp
 *_hip.cuh
+primus_turbo/_build_info.py

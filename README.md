@@ -57,6 +57,16 @@ rocm/primus:v26.1
 rocm/jax-training:maxtext-v25.9
 ```
 
+#### Install from PyPI (Recommended)
+
+```bash
+# Prerequisite for --no-build-isolation builds
+pip3 install "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git"
+
+# PyTorch backend
+pip3 install --no-build-isolation "primus-turbo[pytorch]"
+```
+
 #### Install from Source
 
 ```bash
@@ -66,22 +76,28 @@ cd Primus-Turbo
 # Install build/runtime dependencies first
 pip3 install -r requirements.txt
 
-# PyTorch backend (default compile target)
+# Default backend: PyTorch
 pip3 install --no-build-isolation ".[pytorch]"
 
 # JAX backend
 PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation ".[jax]"
 
-# Build both backends from source
-PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX" pip3 install --no-build-isolation ".[pytorch,jax]"
+# Optional: build both backends
+PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX" pip3 install --no-build-isolation ".[all]"
+```
 
-# (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
-GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation ".[pytorch]"
+#### Install from GitHub URL (without cloning)
+
+```bash
+# Install from default branch
+pip3 install --no-build-isolation "git+https://github.com/AMD-AGI/Primus-Turbo.git"
+
+# Install from a specific branch
+pip3 install --no-build-isolation "git+https://github.com/AMD-AGI/Primus-Turbo.git@main"
 ```
 
 > Note:
-> - `".[pytorch]"` / `".[jax]"` means "install from current local repo with extras".
-> - `"primus_turbo[pytorch]"` is for package-index install (for example, after publishing to PyPI).
+> - `".[pytorch]"` / `".[jax]"` means install from current local repo with extras.
 > - Extras select Python dependencies. Source compilation target is controlled by `PRIMUS_TURBO_FRAMEWORK`.
 
 ### 2. Development
