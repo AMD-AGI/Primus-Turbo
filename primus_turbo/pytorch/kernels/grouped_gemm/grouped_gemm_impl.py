@@ -16,6 +16,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_triton_kernel,
+    grouped_gemm_variable_k_triton_kernel,
+)
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -174,14 +178,91 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         )
 
 
+class GroupedGEMMTritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for grouped GEMM (CPU-sync-free)."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= not trans_a
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b)
+
+
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: GroupedGEMMCKBackend,
     BackendType.HIPBLASLT: GroupedGEMMHipblasltBackend,
+    BackendType.TRITON: GroupedGEMMTritonBackend,
 }
+
+
+class GroupedGEMMVariableKTritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for variable-K grouped GEMM (backward pass)."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= trans_a and not trans_b
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if trans_c:
+            lhs, rhs = b, a
+        else:
+            lhs, rhs = a, b
+        return grouped_gemm_variable_k_triton_kernel(lhs, rhs, group_offs)
+
 
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: GroupedGEMMVariableKCKBackend,
     BackendType.HIPBLASLT: GroupedGEMMVariableKHipblasltBackend,
+    BackendType.TRITON: GroupedGEMMVariableKTritonBackend,
 }
 
 
@@ -263,7 +344,6 @@ def grouped_gemm_variable_k_impl(
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
-
     kwargs = dict(
         a=a,
         b=b,

@@ -6,7 +6,8 @@
 
 import torch
 
-from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_impl
+from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
 
 __all__ = ["gemm"]
 
@@ -25,7 +26,7 @@ class GemmFunction(torch.autograd.Function):
         # FWD
         # out    = a * b
         # [M, N] = [M, K] * [K, N]
-        out = gemm_impl(a, trans_a, b, trans_b, out_dtype, False)
+        out = gemm_impl(a, trans_a, b, trans_b, out_dtype, False, default_backend=BackendType.HIPBLASLT.value)
         # Save for bwd
         if a.requires_grad or b.requires_grad:
             ctx.save_for_backward(a, b)
@@ -39,11 +40,27 @@ class GemmFunction(torch.autograd.Function):
 
         # AGrad
         # grad_a = grad_out * b^T
-        grad_a = gemm_impl(grad_out, False, b, not ctx.trans_b, a.dtype, ctx.trans_a)
+        grad_a = gemm_impl(
+            grad_out,
+            False,
+            b,
+            not ctx.trans_b,
+            a.dtype,
+            ctx.trans_a,
+            default_backend=BackendType.HIPBLASLT.value,
+        )
 
         # BGrad
         # grad_b = a^T * grad_out
-        grad_b = gemm_impl(a, not ctx.trans_a, grad_out, False, b.dtype, ctx.trans_b)
+        grad_b = gemm_impl(
+            a,
+            not ctx.trans_a,
+            grad_out,
+            False,
+            b.dtype,
+            ctx.trans_b,
+            default_backend=BackendType.HIPBLASLT.value,
+        )
 
         return grad_a, grad_b, None, None, None
 

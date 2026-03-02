@@ -22,6 +22,11 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.triton.gemm.gemm_fp8_kernel import (
+    gemm_fp8_blockwise_triton_kernel,
+    gemm_fp8_rowwise_triton_kernel,
+    gemm_fp8_tensorwise_triton_kernel,
+)
 
 
 def get_gemm_logical_shape(
@@ -174,9 +179,94 @@ class GEMMFP8CKBackend(KernelBackend):
         )
 
 
+class GEMMFP8TritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for FP8 GEMM.
+
+    Supports:
+      - TENSORWISE: per-tensor scaling (all layouts)
+      - ROWWISE: per-row/per-col vector scaling (all layouts)
+      - BLOCKWISE: block-wise scaling with three layouts:
+          NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        supported &= granularity in GEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TritonBackend.SUPPORTED_DTYPES
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        if granularity == ScalingGranularity.TENSORWISE:
+            return gemm_fp8_tensorwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return gemm_fp8_rowwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        elif granularity == ScalingGranularity.BLOCKWISE:
+            return gemm_fp8_blockwise_triton_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
+        else:
+            raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")
+
+
 _GEMM_FP8_BACKENDS = {
     BackendType.HIPBLASLT: GEMMFP8HipBLASLtBackend,
     BackendType.CK: GEMMFP8CKBackend,
+    BackendType.TRITON: GEMMFP8TritonBackend,
 }
 
 

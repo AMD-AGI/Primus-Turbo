@@ -21,6 +21,14 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
+from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+    grouped_gemm_fp8_blockwise_triton_kernel,
+    grouped_gemm_fp8_blockwise_variable_k_triton_kernel,
+    grouped_gemm_fp8_rowwise_triton_kernel,
+    grouped_gemm_fp8_rowwise_variable_k_triton_kernel,
+    grouped_gemm_fp8_tensorwise_triton_kernel,
+    grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+)
 
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
@@ -297,10 +305,96 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFP8TritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for FP8 grouped GEMM (CPU-sync-free).
+
+    Supports:
+      - TENSORWISE: per-tensor scaling
+      - ROWWISE: per-row/per-col vector scaling
+      - BLOCKWISE: block-wise scaling (2D B_scales per group)
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        if granularity == ScalingGranularity.BLOCKWISE:
+            return grouped_gemm_fp8_blockwise_triton_kernel(
+                a,
+                b,
+                a_scales,
+                b_scales,
+                group_offs,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return grouped_gemm_fp8_rowwise_triton_kernel(
+                a,
+                b,
+                a_scales,
+                b_scales,
+                group_offs,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+            )
+        return grouped_gemm_fp8_tensorwise_triton_kernel(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_offs,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+        )
+
+
 class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8CKBackend,
         BackendType.HIPBLASLT: GroupedGEMMFP8HipblasltBackend,
+        BackendType.TRITON: GroupedGEMMFP8TritonBackend,
     }
     _cache = TuneCache(1024)
 
@@ -328,10 +422,102 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
 
 
+class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
+    """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward).
+
+    Supports:
+      - TENSORWISE: per-tensor scaling
+      - ROWWISE: per-row/per-col vector scaling
+      - BLOCKWISE: 1D+1D block-wise scaling (TN/CRR layout)
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.ROWWISE,
+        ScalingGranularity.BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_GRANULARITIES
+        supported &= trans_a and not trans_b
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+
+        if granularity == ScalingGranularity.BLOCKWISE:
+            return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
+                lhs,
+                rhs,
+                lhs_scales,
+                rhs_scales,
+                group_offs,
+                out_dtype=out_dtype,
+            )
+        elif granularity == ScalingGranularity.ROWWISE:
+            return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
+                lhs,
+                rhs,
+                lhs_scales,
+                rhs_scales,
+                group_offs,
+                out_dtype=out_dtype,
+            )
+        return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_offs,
+            out_dtype=out_dtype,
+        )
+
+
 class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
         BackendType.CK: GroupedGEMMFP8VariableKCKBackend,
         BackendType.HIPBLASLT: GroupedGEMMFP8VariableKHipblasltBackend,
+        BackendType.TRITON: GroupedGEMMFP8VariableKTritonBackend,
     }
     _cache = TuneCache(1024)
 
