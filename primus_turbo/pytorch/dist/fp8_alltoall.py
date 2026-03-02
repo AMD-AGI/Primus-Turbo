@@ -22,15 +22,6 @@ from primus_turbo.pytorch.ops.quantization import dequantize_fp8, quantize_fp8
 __all__ = ["FP8AllToAll"]
 
 
-@torch.compile
-def calc_scale_and_scale_inv(x: torch.Tensor, fp8_max: float):
-    amax = x.abs().amax()
-    scale = torch.full([1], fill_value=fp8_max, dtype=torch.float32, device=x.device) / amax
-    scale_inv = 1.0 / scale
-
-    return scale, scale_inv
-
-
 class FP8AllToAll(torch.autograd.Function):
     """
     Split input tensor and then scatter the split list to all processes in a group.
@@ -73,8 +64,6 @@ class FP8AllToAll(torch.autograd.Function):
         assert config.strategy == ScalingStrategy.DYNAMIC
         assert config.granularity == ScalingGranularity.TENSORWISE
 
-        allreduce_amax = True
-
         if config.format == Format.E4M3:
             fwd_fp8_dtype = float8_e4m3
         elif config.format == Format.HYBRID:
@@ -92,11 +81,8 @@ class FP8AllToAll(torch.autograd.Function):
         input_ = input_.contiguous()
         # quant
         if fwd_quant:
-            # pertensor scale. scale = FP8_MAX / amax
-            scale, scale_inv = calc_scale_and_scale_inv(input_, torch.finfo(fwd_fp8_dtype).max)
-            dist.all_reduce(scale, op=dist.ReduceOp.MIN, group=group)
-
-            input_, scale_inv = quantize_fp8(input_, fwd_fp8_dtype, config.granularity, scale=scale)
+            input_, scale_inv = quantize_fp8(input_, fwd_fp8_dtype, config.granularity)
+            dist.all_reduce(scale_inv, op=dist.ReduceOp.MIN, group=group)
             input_ = input_.view(torch.uint8)
 
         if output_split_sizes is None:
@@ -128,10 +114,6 @@ class FP8AllToAll(torch.autograd.Function):
             if fwd_quant:
                 output = output.view(fwd_fp8_dtype)
 
-                if allreduce_amax:
-                    # recompute scale_inv
-                    scale_inv = 1 / scale
-
                 output = dequantize_fp8(output, orig_dtype, config.granularity, scale_inv=scale_inv)
 
         ctx.config = config
@@ -147,8 +129,6 @@ class FP8AllToAll(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         config = ctx.config
         bwd_quant = ctx.bwd_quant
-
-        allreduce_amax = True
 
         if config.format == Format.E4M3:
             bwd_fp8_dtype = float8_e4m3
@@ -167,10 +147,9 @@ class FP8AllToAll(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         # quant
         if bwd_quant:
-            scale, scale_inv = calc_scale_and_scale_inv(grad_output, torch.finfo(bwd_fp8_dtype).max)
-            dist.all_reduce(scale, op=dist.ReduceOp.MIN, group=ctx.group)
+            grad_output, scale_inv = quantize_fp8(grad_output, bwd_fp8_dtype, config.granularity)
+            dist.all_reduce(scale_inv, op=dist.ReduceOp.MIN, group=ctx.group)
 
-            grad_output, scale_inv = quantize_fp8(grad_output, bwd_fp8_dtype, config.granularity, scale=scale)
             grad_output = grad_output.view(torch.uint8)
 
         if ctx.input_split_sizes is None:
@@ -201,10 +180,6 @@ class FP8AllToAll(torch.autograd.Function):
             # dequant
             if bwd_quant:
                 dgrad = dgrad.view(bwd_fp8_dtype)
-
-                if allreduce_amax:
-                    # recompute sclae_inv
-                    scale_inv = 1 / scale
 
                 dgrad = dequantize_fp8(dgrad, orig_dtype, config.granularity, scale_inv=scale_inv)
 
