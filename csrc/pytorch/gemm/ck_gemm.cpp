@@ -36,7 +36,6 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));
-    PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "ROWWISE" ||
@@ -73,87 +72,27 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
     at::Tensor c         = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
     auto       stream    = at::cuda::getCurrentCUDAStream();
 
-    if (a.dtype() == at::kFloat8_e4m3fnuz || a.dtype() == at::kFloat8_e4m3fn) {
-        using AType = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;
-        using BType = AType;
-
-        if (out_dtype == at::kBFloat16) {
-            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
-            auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
-                static_cast<CType *>(c.data_ptr()),
-                static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
-            if (granularity == "TENSORWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else if (granularity == "ROWWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
-            else // BLOCKWISE
+    TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F16(
+        out_dtype, CType,
+        TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F8(
+            a.scalar_type(), AType,
+            TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F8(
+                b.scalar_type(), BType,
+                auto params = CKGemmFP8Params<AType, BType, CType, float>(
+                    static_cast<const AType *>(a.data_ptr()),
+                    static_cast<const BType *>(b.data_ptr()), static_cast<CType *>(c.data_ptr()),
+                    static_cast<const float *>(aq_tensor.data_ptr()),
+                    static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k,
+                    stream);
+                if (granularity == "TENSORWISE")
+                    ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
+                        params);
+                else if (granularity == "ROWWISE")
+                    ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
+                        params);
+                else // BLOCKWISE
                 ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
-                    params);
-        } else if (out_dtype == at::kHalf) {
-            using CType = typename TorchToCKTileType<at::kHalf>::type;
-            auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
-                static_cast<CType *>(c.data_ptr()),
-                static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
-            if (granularity == "TENSORWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else if (granularity == "ROWWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
-            else // BLOCKWISE
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
-                    params);
-        } else {
-            PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e4m3");
-        }
-    } else if (a.dtype() == at::kFloat8_e5m2fnuz || a.dtype() == at::kFloat8_e5m2) {
-        using AType = typename TorchToCKTileType<at::kFloat8_e5m2fnuz>::type;
-        using BType = AType;
-
-        if (out_dtype == at::kBFloat16) {
-            using CType = typename TorchToCKTileType<at::kBFloat16>::type;
-            auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
-                static_cast<CType *>(c.data_ptr()),
-                static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
-            if (granularity == "TENSORWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else if (granularity == "ROWWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
-            else // BLOCKWISE
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
-                    params);
-        } else if (out_dtype == at::kHalf) {
-            using CType = typename TorchToCKTileType<at::kHalf>::type;
-            auto params = CKGemmFP8Params<AType, BType, CType, float>(
-                static_cast<const AType *>(a.data_ptr()), static_cast<const BType *>(b.data_ptr()),
-                static_cast<CType *>(c.data_ptr()),
-                static_cast<const float *>(aq_tensor.data_ptr()),
-                static_cast<const float *>(bq_tensor.data_ptr()), transA, transB, m, n, k, stream);
-            if (granularity == "TENSORWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(
-                    params);
-            else if (granularity == "ROWWISE")
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::RowColQuant>(
-                    params);
-            else // BLOCKWISE
-                ck_gemm_fp8_impl<AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(
-                    params);
-        } else {
-            PRIMUS_TURBO_CHECK(false, "Unsupported out_dtype for fp8 e5m2");
-        }
-    } else {
-        PRIMUS_TURBO_CHECK(false, "GroupedGemmFp8 only support fp8/bf8");
-    }
+                    params);)))
 
     return c;
 }

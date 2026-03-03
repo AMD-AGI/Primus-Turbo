@@ -110,7 +110,6 @@ public:
     using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<UniversalGemmProblem>;
     // using UniversalGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3;
 
-    static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<
             ADataType, BDataType, ck_tile::tuple<>, AccDataType,
@@ -119,8 +118,7 @@ public:
             TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
             TileConfig::M_Warp, TileConfig::N_Warp,
             TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile, TileConfig::K_Warp_Tile,
-            UniversalGemmProblem::TransposeC,
-            MemoryOp
+            UniversalGemmProblem::TransposeC
         >
     >;
 
@@ -179,8 +177,9 @@ public:
         TileConfig::kPadM,
         TileConfig::kPadN,
         TileConfig::kPadK,
-        false,
-        false,
+        false, /* A PreshuffleQuant */
+        false, /* B PreshuffleQuant */
+        false, /* PreshuffleB */
         ALayout,
         BLayout,
         CLayout,
@@ -237,7 +236,6 @@ public:
         ck_tile::ABQuantGemmPipelineAgBgCrCompV3<QuantGemmProblem>
     >;
 
-    static constexpr ck_tile::memory_operation_enum MemoryOp = ck_tile::memory_operation_enum::set;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<
             ADataType,
@@ -251,8 +249,7 @@ public:
             TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
             TileConfig::M_Warp, TileConfig::N_Warp,
             TileConfig::M_Warp_Tile, TileConfig::N_Warp_Tile, TileConfig::K_Warp_Tile,
-            QuantGemmProblem::TransposeC,
-            MemoryOp
+            QuantGemmProblem::TransposeC
         >
     >;
 
@@ -378,6 +375,7 @@ APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::G
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding)
 APPLY_CK_GG_ALL_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX942, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1)
 
+
 #endif
 
 // ***********************************************************************************
@@ -407,6 +405,30 @@ APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTER
 APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
 APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
 APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+
+// FP8_E4M3 * FP8_E5M2 = FP16
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+
+// FP8_E4M3 * FP8_E5M2 = BF16
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+
+// FP8_E5M2 * FP8_E4M3 = FP16
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+
+// FP8_E5M2 * FP8_E4M3 = BF16
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
+APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
+APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH_EXTERN, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
 
 #endif
 
