@@ -420,6 +420,7 @@ if __name__ == "__main__":
     install_requires = [
         "hip-python",
         "triton==3.5.1",
+        "scipy",
     ]
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
