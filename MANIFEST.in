@@ -1,0 +1,11 @@
+include README.md
+include LICENSE
+include setup.py
+include pyproject.toml
+include requirements.txt
+include .gitmodules
+
+recursive-include tools *.py
+recursive-include csrc *
+recursive-include primus_turbo *.py
+recursive-include 3rdparty/composable_kernel/include *
