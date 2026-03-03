@@ -147,6 +147,22 @@ def _chiplet_transform_chunked(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+_GPU_ARCH: Optional[str] = None
+
+
+def _get_gpu_arch() -> str:
+    """Return GPU architecture string (e.g. 'gfx950', 'gfx942')."""
+    global _GPU_ARCH
+    if _GPU_ARCH is None:
+        target = triton.runtime.driver.active.get_current_target()
+        _GPU_ARCH = target.arch
+    return _GPU_ARCH
+
+
+def _is_mi355x() -> bool:
+    return _get_gpu_arch().startswith("gfx950")
+
+
 def _select_group_size_m_bf16(M, N, stride_ak, stride_bk):
     """Fallback heuristic GROUP_SIZE_M (used when origami is unavailable).
 
@@ -201,25 +217,52 @@ def _build_origami_configs():
 
 
 @functools.lru_cache(maxsize=4096)
-def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
-    """Use origami to select macrotile, GROUP_SIZE_M, CHUNK_SIZE, waves_per_eu.
+def _select_params_origami(M, N, K, a_stride, b_stride, a_dtype, b_dtype, out_dtype):
+    """Use origami to select macrotile and GROUP_SIZE_M.
 
-    Results are cached by (M, N, K, strides, dtype).
+    Aligned with TensorAtlas persistent kernel: only tile sizes + wgm are
+    selected analytically; grid, chunk_size, and waves_per_eu are determined
+    by the dispatch code.
+
+    Configs are pre-filtered by LDS capacity before passing to origami
+    (aligned with TensorAtlas _get_valid_tiles).
+
+    Results are cached by (M, N, K, strides, dtypes).
 
     Returns:
-        (block_m, block_n, block_k, wgm, chunk, wpe) or None.
+        (block_m, block_n, block_k, wgm) or None.
     """
     if not _HAS_ORIGAMI:
         return None
 
     try:
+        hw = origami.get_hardware_for_device(torch.cuda.current_device())
+        lds_cap = hw.lds_capacity
+        elem_bytes_a = torch.finfo(a_dtype).bits // 8
+        elem_bytes_b = torch.finfo(b_dtype).bits // 8
+        num_stages = 2
+
+        valid_configs = [
+            cfg
+            for cfg in _get_origami_configs()
+            if (
+                cfg.kwargs["BLOCK_M"] * cfg.kwargs["BLOCK_K"] * elem_bytes_a
+                + cfg.kwargs["BLOCK_K"] * cfg.kwargs["BLOCK_N"] * elem_bytes_b
+            )
+            * num_stages
+            <= lds_cap
+        ]
+        if not valid_configs:
+            print(f"[gemm/origami] M={M} N={N} K={K}: no configs fit LDS {lds_cap}")
+            return None
+
         selector = origami.OrigamiMatmulSelector(
-            config_gen=_get_origami_configs(),
+            config_gen=valid_configs,
             m=M,
             n=N,
             k=K,
-            a_dtype=torch.bfloat16,
-            b_dtype=torch.bfloat16,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
             out_dtype=out_dtype,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             a_stride=a_stride,
@@ -230,14 +273,12 @@ def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
         block_n = selector.macrotile_n
         block_k = selector.macrotile_k
         wgm = selector.wgm
-        chunk = selector.wgmxccchunk if selector.wgmxccchunk > 0 else 32
-        wpe = selector.occupancy if selector.occupancy > 0 else 2
         print(
             f"[gemm/origami] M={M} N={N} K={K} "
             f"a_stride={a_stride} b_stride={b_stride} → "
-            f"tile={block_m}x{block_n}x{block_k} wgm={wgm} chunk={chunk} wpe={wpe}"
+            f"tile={block_m}x{block_n}x{block_k} wgm={wgm}"
         )
-        return block_m, block_n, block_k, wgm, chunk, wpe
+        return block_m, block_n, block_k, wgm
     except Exception as e:
         print(f"[gemm/origami] ERROR M={M} N={N} K={K}: {e}")
         return None
@@ -300,7 +341,6 @@ def _bf16_persistent_gemm_kernel(
         rk = tl.arange(0, BLOCK_SIZE_K)
         rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
         A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
         B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
 
@@ -409,7 +449,7 @@ def gemm_triton_kernel(
     if B_view.stride(0) == 0 or B_view.stride(1) == 0:
         B_view = B_view.contiguous()
 
-    num_cus = _get_num_cus()
+    _get_num_cus()
 
     # Handle trans_c by writing to a (N, M) buffer with swapped strides
     if trans_c:
@@ -427,20 +467,40 @@ def gemm_triton_kernel(
 
     # Config selection: origami analytical model > heuristic fallback
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
-    chunk_size = 32
-    waves_per_eu = 2
     group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
-    origami_params = _select_params_origami(M, N, K, A_view.stride(), B_view.stride(), out_dtype)
+    origami_params = _select_params_origami(
+        M, N, K, A_view.stride(), B_view.stride(), a.dtype, b.dtype, out_dtype
+    )
     if origami_params is not None:
-        BLOCK_M, BLOCK_N, BLOCK_K, group_m, chunk_size, waves_per_eu = origami_params
-        chunk_size = max(chunk_size, 1)
+        BLOCK_M, BLOCK_N, BLOCK_K, group_m = origami_params
 
-    num_sms = compute_sk_grid(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_cus)
     even_k = K % BLOCK_K == 0
+
+    # Data-parallel grid (aligned with TensorAtlas persistent_matmul_lt)
+    total_tiles = math.ceil(M / BLOCK_M) * math.ceil(N / BLOCK_N)
+
+    # Chunk size for XCD distribution (aligned with TensorAtlas)
+    chunk_size = group_m * group_m
+    chunk_size = min(chunk_size, total_tiles // NUM_XCDS) if total_tiles >= NUM_XCDS else max(chunk_size, 1)
+
+    # Architecture-specific kernel launch parameters.
+    # MI355X (gfx950): cache hints from triton_bench; wpe=2 best for all layouts.
+    # MI300X (gfx942): TensorAtlas default parameters.
+    if _is_mi355x():
+        wpe = 2
+        cache_a = ".ca"
+        cache_b = ".ca"
+        n_stages = 2
+    else:
+        # MI300X defaults (from TensorAtlas persistent_matmul_lt)
+        wpe = 0
+        cache_a = None
+        cache_b = None
+        n_stages = 2
 
     args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
 
-    _bf16_persistent_gemm_kernel[(num_sms,)](
+    _bf16_persistent_gemm_kernel[(total_tiles,)](
         *args,
         stride_ak=s_ak,
         stride_bk=s_bk,
@@ -448,15 +508,15 @@ def gemm_triton_kernel(
         BLOCK_SIZE_N=BLOCK_N,
         BLOCK_SIZE_K=BLOCK_K,
         GROUP_SIZE_M=group_m,
-        NUM_SMS=num_sms,
+        NUM_SMS=total_tiles,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
-        waves_per_eu=waves_per_eu,
+        num_stages=n_stages,
+        waves_per_eu=wpe,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
