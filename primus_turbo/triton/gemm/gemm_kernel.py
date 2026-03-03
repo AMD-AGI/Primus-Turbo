@@ -27,11 +27,23 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+
+def _skip_autotune() -> bool:
+    """Check if Triton autotuning should be skipped (use default config instead).
+
+    Controlled by PRIMUS_TURBO_TRITON_AUTOTUNE_LEVEL:
+      0 (default) — skip autotune, use fixed default config
+      1           — enable autotune
+    """
+    return os.environ.get("PRIMUS_TURBO_TRITON_AUTOTUNE_LEVEL", "0") != "1"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Grid Utilities
@@ -390,8 +402,7 @@ def gemm_triton_kernel(
     )
     args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
 
-    if M * N > _AUTOTUNE_MN_THRESHOLD:
-        # Large problem: skip autotune to avoid OOM, use default config
+    if M * N > _AUTOTUNE_MN_THRESHOLD or _skip_autotune():
         _bf16_persistent_gemm_kernel[(num_sms,)](
             *args,
             **common_kwargs,

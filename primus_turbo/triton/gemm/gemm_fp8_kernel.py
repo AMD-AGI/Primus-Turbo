@@ -41,6 +41,7 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
     _get_num_cus,
+    _skip_autotune,
     compute_sk_grid,
 )
 
@@ -367,8 +368,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cn,
     )
 
-    if M * N > _AUTOTUNE_MN_THRESHOLD:
-        # Large problem: skip autotune to avoid OOM, use default config
+    if M * N > _AUTOTUNE_MN_THRESHOLD or _skip_autotune():
         blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
         even_k = K % blk_k == 0
         _fp8_persistent_gemm_kernel[(num_sms,)](
@@ -653,8 +653,7 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cn,
     )
 
-    if M * N > _AUTOTUNE_MN_THRESHOLD:
-        # Large problem: skip autotune to avoid OOM, use default config
+    if M * N > _AUTOTUNE_MN_THRESHOLD or _skip_autotune():
         blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
         even_k = K % blk_k == 0
         _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
@@ -736,14 +735,10 @@ def _get_blockwise_autotune_configs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Autotuned block-wise FP8 GEMM kernel
+# Block-wise FP8 GEMM kernel (raw JIT + autotuned wrapper)
 # ═══════════════════════════════════════════════════════════════════════════════
-@triton.autotune(
-    configs=_get_blockwise_autotune_configs(),
-    key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
-)
 @triton.jit
-def _blockwise_fp8_autotune_kernel(
+def _blockwise_fp8_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -873,6 +868,24 @@ def _blockwise_fp8_autotune_kernel(
         tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
 
 
+_blockwise_fp8_autotune_kernel = triton.autotune(
+    configs=_get_blockwise_autotune_configs(),
+    key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
+)(_blockwise_fp8_kernel)
+
+# Default blockwise config (BLOCK_M=256 variant, good general-purpose choice)
+_BLOCKWISE_DEFAULT = dict(
+    BLOCK_M=256,
+    BLOCK_N=128,
+    BLOCK_K=128,
+    GROUP_M=4,
+    NUM_XCDS=8,
+    CHUNK=32,
+)
+_BLOCKWISE_DEFAULT_WARPS = 8
+_BLOCKWISE_DEFAULT_STAGES = 2
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unified Public API — Block-wise FP8 GEMM
 # Interface consistent with CK blockwise backend.
@@ -964,7 +977,7 @@ def _blockwise_nt(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    bw_args = (
         a,
         B_t,
         out,
@@ -985,10 +998,19 @@ def _blockwise_nt(
         b_scale_inv.stride(1),
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=True,
-        SCALE_2D_B=True,
     )
+    bw_constexprs = dict(A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=True)
+
+    if _skip_autotune():
+        _blockwise_fp8_kernel[(NUM_SMS,)](
+            *bw_args,
+            **bw_constexprs,
+            **_BLOCKWISE_DEFAULT,
+            num_warps=_BLOCKWISE_DEFAULT_WARPS,
+            num_stages=_BLOCKWISE_DEFAULT_STAGES,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](*bw_args, **bw_constexprs)
     return out
 
 
@@ -1023,7 +1045,7 @@ def _blockwise_nn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    bw_args = (
         a,
         b,
         out,
@@ -1044,10 +1066,19 @@ def _blockwise_nn(
         b_scale_inv_t.stride(1),
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=True,
     )
+    bw_constexprs = dict(A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=False, SCALE_2D_B=True)
+
+    if _skip_autotune():
+        _blockwise_fp8_kernel[(NUM_SMS,)](
+            *bw_args,
+            **bw_constexprs,
+            **_BLOCKWISE_DEFAULT,
+            num_warps=_BLOCKWISE_DEFAULT_WARPS,
+            num_stages=_BLOCKWISE_DEFAULT_STAGES,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](*bw_args, **bw_constexprs)
     return out
 
 
@@ -1084,7 +1115,7 @@ def _blockwise_tn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    bw_args = (
         A_view,
         b,
         out,
@@ -1105,8 +1136,17 @@ def _blockwise_tn(
         b_scale_inv.stride(0),  # [K//128, N]: stride_bs_0=1(rn), stride_bs_1=N(ki)
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=False,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=False,
     )
+    bw_constexprs = dict(A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False, SCALE_2D_B=False)
+
+    if _skip_autotune():
+        _blockwise_fp8_kernel[(NUM_SMS,)](
+            *bw_args,
+            **bw_constexprs,
+            **_BLOCKWISE_DEFAULT,
+            num_warps=_BLOCKWISE_DEFAULT_WARPS,
+            num_stages=_BLOCKWISE_DEFAULT_STAGES,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](*bw_args, **bw_constexprs)
     return out
