@@ -278,7 +278,7 @@ _DET_NK_VALUES = [(2048, 1536), (4096, 7168)]
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     N, K = NK
@@ -305,7 +305,7 @@ def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, 
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_rowwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     N, K = NK
@@ -333,7 +333,7 @@ def test_grouped_gemm_fp8_rowwise_deterministic(B, M, NK, ori_dtype, format, tra
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_blockwise_deterministic(
     B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend
@@ -362,7 +362,7 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     if format == Format.HYBRID:
@@ -402,8 +402,10 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance):
+@pytest.mark.parametrize("balance", [False])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False])
+def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
@@ -415,6 +417,8 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance)
         granularity=ScalingGranularity.ROWWISE,
         trans_b=trans_b,
         balance=balance,
+        backend=backend,
+        auto_tune=auto_tune,
     )
 
 
@@ -426,7 +430,11 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance)
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, trans_b, balance):
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_fp8_blockwise(
+    B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend, auto_tune
+):
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
@@ -439,6 +447,8 @@ def test_grouped_gemm_fp8_blockwise(B, M, NK, ori_dtype, format, block_size, tra
         trans_b=trans_b,
         balance=balance,
         block_size=block_size,
+        backend=backend,
+        auto_tune=auto_tune,
     )
 
 

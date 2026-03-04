@@ -7,13 +7,13 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.gemm.gemm_csrc_impl import gemm_impl
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_csrc_impl import (
-    grouped_gemm_impl,
-    grouped_gemm_variable_k_impl,
-)
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+    grouped_gemm_impl,
+    grouped_gemm_variable_k_impl,
 )
 
 __all__ = ["grouped_gemm"]
@@ -33,7 +33,9 @@ class GroupedGemmFunc(torch.autograd.Function):
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)
-            out = gemm_impl(a, False, b_2d, trans_b, a.dtype, False)
+            out = gemm_impl(
+                a, False, b_2d, trans_b, a.dtype, False, default_backend=BackendType.HIPBLASLT.value
+            )
         else:
             out = grouped_gemm_impl(
                 a,
@@ -61,8 +63,24 @@ class GroupedGemmFunc(torch.autograd.Function):
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)
-            grad_a = gemm_impl(grad_out, False, b_2d, not ctx.trans_b, a.dtype, ctx.trans_a)
-            grad_b = gemm_impl(a, True, grad_out, False, b.dtype, ctx.trans_b).view(b.size())
+            grad_a = gemm_impl(
+                grad_out,
+                False,
+                b_2d,
+                not ctx.trans_b,
+                a.dtype,
+                ctx.trans_a,
+                default_backend=BackendType.HIPBLASLT.value,
+            )
+            grad_b = gemm_impl(
+                a,
+                True,
+                grad_out,
+                False,
+                b.dtype,
+                ctx.trans_b,
+                default_backend=BackendType.HIPBLASLT.value,
+            ).view(b.size())
         else:
             grad_a = grouped_gemm_impl(
                 grad_out,

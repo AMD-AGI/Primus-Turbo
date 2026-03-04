@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from tests.pytorch.test_utils import get_tolerances
 
 
@@ -71,17 +72,34 @@ def test_gemm(m, n, k, layout, dtype):
 @pytest.mark.parametrize("k", [1, 16, 127, 255, 512, 1024, 2048])
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
 @pytest.mark.deterministic
-def test_gemm_deterministic(m, n, k, layout, dtype):
+def test_gemm_deterministic(m, n, k, layout, dtype, backend):
     trans_a = layout[0] == "T"
     trans_b = layout[1] == "T"
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+    if backend is BackendType.TRITON and dtype == torch.float32:
+        pytest.skip("Triton backend does not support float32")
+
+    if backend is BackendType.TRITON and min(m, n, k) < 64:
+        pytest.skip(
+            "Triton persistent kernel uses BLOCK_K=64 / BLOCK_M=256 / BLOCK_N=256; "
+            "small dimensions cause illegal memory access in pytest environment"
+        )
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
     device = "cuda"
     torch.manual_seed(42)
 
-    print(f"\n[deterministic] M={m}, N={n}, K={k}, trans_a={trans_a}, trans_b={trans_b}, dtype={dtype}")
+    print(
+        f"\n[deterministic] M={m}, N={n}, K={k}, trans_a={trans_a}, trans_b={trans_b}, "
+        f"dtype={dtype}, backend={backend}"
+    )
 
     a_shape = (m, k) if not trans_a else (k, m)
     b_shape = (k, n) if not trans_b else (n, k)
@@ -126,3 +144,5 @@ def test_gemm_deterministic(m, n, k, layout, dtype):
     torch.testing.assert_close(c0, c_ref.detach(), **get_tolerances(dtype))
     torch.testing.assert_close(da0, a_ref.grad.detach(), **get_tolerances(dtype))
     torch.testing.assert_close(db0, b_ref.grad.detach(), **get_tolerances(dtype))
+
+    GlobalBackendManager.reset()

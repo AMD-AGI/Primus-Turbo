@@ -2,122 +2,409 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
+#
+# Acknowledgement:
+#   The persistent GEMM kernels in this file are adapted from tritonBLAS
+#   (https://github.com/ROCm/tritonBLAS). We thank the tritonBLAS authors
+#   for their high-quality Triton kernel implementations on AMD GPUs.
 ###############################################################################
 
+"""
+GEMM Triton persistent kernels — BF16/FP16.
+
+Contains:
+  - _bf16_persistent_gemm_kernel: BF16/FP16 persistent kernel
+  - StreamK grid computation utility
+
+Public API:
+  - gemm_triton_kernel  — BF16/FP16 GEMM
+
+FP8 kernels (tensorwise + blockwise) are in gemm_fp8_kernel.py.
+
+Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+import torch
 import triton
 import triton.language as tl
 
-
-def get_hip_autotune_config():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 16,
-                # "GROUP_SIZE_M": 1,
-                # "waves_per_eu": 2,
-            },
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 256,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 16,
-                # "GROUP_SIZE_M": 4,
-                # "waves_per_eu": 2,
-            },
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                # "GROUP_SIZE_M": 1,
-                # "waves_per_eu": 2,
-            },
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                # "GROUP_SIZE_M": 8,
-                # "waves_per_eu": 3,
-            },
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                # "GROUP_SIZE_M": 1,
-                # "waves_per_eu": 8,
-            },
-            num_warps=4,
-            num_stages=2,
-        ),
-    ]
+# ═══════════════════════════════════════════════════════════════════════════════
+# Grid Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
-# TODO: Optimize the perf
-@triton.autotune(
-    configs=get_hip_autotune_config(),
-    key=["M", "N", "K"],
-)
+def compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus, max_workspace_bytes=128 * 1024 * 1024):
+    """Compute optimal StreamK grid size based on problem dimensions and hardware.
+
+    Implements the dynamic grid logic from tritonBLAS/Origami:
+    - If tiles > CUs: Try fractional splits to balance work
+    - If tiles < CUs: Split along K-dimension
+    - Consider workspace constraints for partial tiles
+
+    Args:
+        M, N, K: Matrix dimensions
+        block_m, block_n, block_k: Tile sizes
+        num_cus: Number of compute units (e.g., 256 for MI300, 304 for MI325X)
+        max_workspace_bytes: Maximum workspace size for partial tiles (default 128MB)
+
+    Returns:
+        int: Optimal grid size for StreamK kernel
+    """
+    tiles = math.ceil(M / block_m) * math.ceil(N / block_n)
+    iters_per_tile = max(1, math.ceil(K / block_k))
+
+    sk_grid = tiles
+
+    tile_fractions = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
+    split_factors = [8, 6, 4, 3, 2, 1]
+
+    if tiles > num_cus:
+        min_even_tiles = tiles / num_cus
+        for frac in tile_fractions:
+            frac_grid = int((tiles / (min_even_tiles + frac)) + 0.5)
+            partial_tile_bytes = block_m * block_n * 2 * frac_grid
+            if tiles % frac_grid != 0 and partial_tile_bytes > max_workspace_bytes:
+                continue
+            if frac_grid <= num_cus:
+                sk_grid = frac_grid
+                break
+    elif tiles < num_cus:
+        for factor in split_factors:
+            split_grid = tiles * factor
+            iters_per_cu = iters_per_tile // factor
+            if split_grid <= num_cus and iters_per_cu >= 8:
+                sk_grid = split_grid
+                break
+
+    if tiles % sk_grid != 0:
+        sk_grid = tiles
+
+    if tiles >= num_cus:
+        last_wave_remainder = tiles % num_cus
+        if last_wave_remainder < 128 and last_wave_remainder > 0 and num_cus == 304:
+            sk_grid = 256
+
+    return sk_grid
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hardware constants
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NUM_XCDS = 8
+_NUM_CUS: Optional[int] = None
+
+# Skip autotune when output size (M*N) exceeds this threshold (in elements).
+# Prevents OOM during autotune warmup/benchmarking for large problems.
+# Default: 128M elements (~256 MB for BF16 output).
+_AUTOTUNE_MN_THRESHOLD = 128 * 1024 * 1024
+
+
+def _get_num_cus() -> int:
+    """Lazy initialization of CU count (avoids import-time CUDA calls)."""
+    global _NUM_CUS
+    if _NUM_CUS is None:
+        _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return _NUM_CUS
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chiplet Transform
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 @triton.jit
-def gemm_triton_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
+def _chiplet_transform_chunked(
+    pid,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+):
+    if pid > (NUM_SMS // (NUM_XCDS * CHUNK_SIZE)) * (NUM_XCDS * CHUNK_SIZE):
+        return pid
+    local_pid = pid // NUM_XCDS
+    chunk_idx = local_pid // CHUNK_SIZE
+    pos_in_chunk = local_pid % CHUNK_SIZE
+    xcd = pid % NUM_XCDS
+    return chunk_idx * NUM_XCDS * CHUNK_SIZE + xcd * CHUNK_SIZE + pos_in_chunk
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BF16 Persistent GEMM Kernel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _get_bf16_autotune_configs():
+    """BF16 autotune configs — 2 configs (fast compilation)."""
+    configs = []
+    for chunk_size, waves in [(32, 2), (64, 0)]:
+        configs.append(
+            triton.Config(
+                {
+                    "CHUNK_SIZE": chunk_size,
+                    "waves_per_eu": waves,
+                    "matrix_instr_nonkdim": 16,
+                    "kpack": 1,
+                },
+                num_warps=8,
+                num_stages=2,
+            )
+        )
+    return configs
+
+
+def _select_group_size_m_bf16(M, N, stride_ak, stride_bk):
+    """Deterministic GROUP_SIZE_M from 94-entry BF16 tuning data.
+
+    Patterns:
+    - min_tile < 16 (non-standard dims like 3584): GROUP=8
+    - TN layout (stride_ak!=1, stride_bk!=1) + both tiles >= 32: GROUP=5
+      (BF16 tuning: 8 of 8 large TN cases prefer GROUP=5)
+    - Default: 4
+    """
+    tiles_m = (M + 255) // 256
+    tiles_n = (N + 255) // 256
+    min_tile = min(tiles_m, tiles_n)
+
+    is_tn = (stride_ak != 1) and (stride_bk != 1)
+
+    if min_tile < 16:
+        return 8
+    elif is_tn and tiles_m >= 32 and tiles_n >= 32:
+        return 5
+    else:
+        return 4
+
+
+@triton.jit()
+def _bf16_persistent_gemm_kernel(
+    A,
+    B,
+    C,
     M,
     N,
     K,
     stride_am,
-    stride_ak,
-    stride_bk,
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+    ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    total_tiles = num_pid_m * num_pid_n
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < N),
-            other=0,
-        )
-        accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+    acc_dtype = tl.float32
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        accumulator.to(c_ptr.dtype.element_ty),
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    for tile_id in range(pid, total_tiles, NUM_SMS):
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
+        A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+        B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
+
+        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+        if not EVEN_K:
+            loop_k -= 1
+        tl.assume(loop_k > 1)
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        for k in range(0, loop_k):
+            if stride_ak == 1:
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+            else:
+                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+
+            if stride_bk == 1:
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+            else:
+                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+
+            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+            A_BASE += BLOCK_SIZE_K * stride_ak
+            B_BASE += BLOCK_SIZE_K * stride_bk
+
+        if not EVEN_K:
+            k = loop_k
+            rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
+            B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
+            if stride_ak == 1:
+                A_BASE = tl.multiple_of(A_BASE, (1, 16))
+            else:
+                A_BASE = tl.multiple_of(A_BASE, (16, 1))
+            if stride_bk == 1:
+                B_BASE = tl.multiple_of(B_BASE, (16, 1))
+            else:
+                B_BASE = tl.multiple_of(B_BASE, (1, 16))
+            a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+
+        c = acc.to(C.type.element_ty)
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
+        tl.store(C_, c, c_mask)
+
+
+_bf16_persistent_gemm_kernel_autotuned = triton.autotune(
+    configs=_get_bf16_autotune_configs(),
+    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
+    warmup=20,
+    rep=80,
+)(_bf16_persistent_gemm_kernel)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API — BF16 GEMM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def gemm_triton_kernel(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+    trans_c: bool = False,
+) -> torch.Tensor:
+    """General-purpose BF16/FP16 GEMM using optimized persistent kernel.
+
+    Computes: C = op(A) @ op(B), where op(X) = X^T if trans else X.
+    If trans_c=True, returns C^T (contiguous, shape N×M).
+
+    Args:
+        a: Input matrix (BF16 or FP16).
+        b: Input matrix (BF16 or FP16).
+        trans_a: Whether A is transposed.
+        trans_b: Whether B is transposed.
+        out_dtype: Output dtype (default bfloat16).
+        trans_c: If True, return transposed output C^T (shape N×M).
+
+    Returns:
+        C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
+    """
+    assert a.dtype in (torch.bfloat16, torch.float16), f"Unsupported dtype: {a.dtype}"
+    assert b.dtype in (torch.bfloat16, torch.float16), f"Unsupported dtype: {b.dtype}"
+    # Determine logical (M, K) and (K, N) views
+    if trans_a:
+        K, M = a.shape
+        A_view = a.T
+    else:
+        M, K = a.shape
+        A_view = a
+
+    if trans_b:
+        N, K2 = b.shape
+        B_view = b.T
+    else:
+        K2, N = b.shape
+        B_view = b
+
+    assert K == K2, f"K mismatch: A gives K={K}, B gives K={K2}"
+
+    # Ensure views have proper strides (no broadcast/expand zeros from autograd)
+    if A_view.stride(0) == 0 or A_view.stride(1) == 0:
+        A_view = A_view.contiguous()
+    if B_view.stride(0) == 0 or B_view.stride(1) == 0:
+        B_view = B_view.contiguous()
+
+    num_cus = _get_num_cus()
+    BLOCK_K = 64
+
+    # Handle trans_c by writing to a (N, M) buffer with swapped strides
+    if trans_c:
+        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
+        stride_cm = out.stride(1)  # = 1
+        stride_cn = out.stride(0)  # = M
+    else:
+        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
+        stride_cm = out.stride(0)  # = N
+        stride_cn = out.stride(1)  # = 1
+
+    # Stride constexprs for compiler optimisation
+    s_ak = A_view.stride(1)
+    s_bk = B_view.stride(0)
+
+    # Heuristic GROUP_SIZE_M (not autotuned)
+    group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
+
+    num_sms = compute_sk_grid(M, N, K, 256, 256, BLOCK_K, num_cus)
+    even_k = K % BLOCK_K == 0
+
+    common_kwargs = dict(
+        stride_ak=s_ak,
+        stride_bk=s_bk,
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=BLOCK_K,
+        GROUP_SIZE_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
     )
+    args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
+
+    if M * N > _AUTOTUNE_MN_THRESHOLD:
+        # Large problem: skip autotune to avoid OOM, use default config
+        _bf16_persistent_gemm_kernel[(num_sms,)](
+            *args,
+            **common_kwargs,
+            CHUNK_SIZE=32,
+            num_warps=8,
+            num_stages=2,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=16,
+            kpack=1,
+        )
+    else:
+        _bf16_persistent_gemm_kernel_autotuned[(num_sms,)](
+            *args,
+            **common_kwargs,
+        )
+    return out
