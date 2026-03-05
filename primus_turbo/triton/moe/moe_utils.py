@@ -10,7 +10,6 @@ import triton.language as tl
 
 from primus_turbo.triton.utils.argsort import argsort
 
-
 ###############################################################################
 # Fused Router Kernel
 ###############################################################################
