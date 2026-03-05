@@ -43,6 +43,8 @@ try:
 except ModuleNotFoundError:
     _HAS_ORIGAMI = False
 
+_ORIGAMI_UNAVAILABLE_LOGGED = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Grid Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
