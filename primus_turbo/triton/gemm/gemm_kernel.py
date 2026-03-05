@@ -43,6 +43,8 @@ try:
 except ModuleNotFoundError:
     _HAS_ORIGAMI = False
 
+_ORIGAMI_UNAVAILABLE_LOGGED = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Grid Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,16 +203,25 @@ def _build_origami_configs():
 
 
 @functools.lru_cache(maxsize=4096)
-def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
+def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype, a_dtype=None, b_dtype=None):
     """Use origami to select macrotile, GROUP_SIZE_M, CHUNK_SIZE, waves_per_eu.
 
-    Results are cached by (M, N, K, strides, dtype).
+    Results are cached by (M, N, K, strides, dtypes).
 
+    Args:
+        a_dtype, b_dtype: input matrix dtypes; when None, use out_dtype.
     Returns:
         (block_m, block_n, block_k, wgm, chunk, wpe) or None.
     """
+    global _ORIGAMI_UNAVAILABLE_LOGGED
     if not _HAS_ORIGAMI:
+        if not _ORIGAMI_UNAVAILABLE_LOGGED:
+            _ORIGAMI_UNAVAILABLE_LOGGED = True
+            print("[gemm/origami] origami not installed or disabled, using heuristic params")
         return None
+
+    a_dtype = a_dtype if a_dtype is not None else out_dtype
+    b_dtype = b_dtype if b_dtype is not None else out_dtype
 
     try:
         selector = origami.OrigamiMatmulSelector(
@@ -218,8 +229,8 @@ def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
             m=M,
             n=N,
             k=K,
-            a_dtype=torch.bfloat16,
-            b_dtype=torch.bfloat16,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
             out_dtype=out_dtype,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             a_stride=a_stride,
@@ -232,11 +243,6 @@ def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype):
         wgm = selector.wgm
         chunk = selector.wgmxccchunk if selector.wgmxccchunk > 0 else 32
         wpe = selector.occupancy if selector.occupancy > 0 else 2
-        print(
-            f"[gemm/origami] M={M} N={N} K={K} "
-            f"a_stride={a_stride} b_stride={b_stride} → "
-            f"tile={block_m}x{block_n}x{block_k} wgm={wgm} chunk={chunk} wpe={wpe}"
-        )
         return block_m, block_n, block_k, wgm, chunk, wpe
     except Exception as e:
         print(f"[gemm/origami] ERROR M={M} N={N} K={K}: {e}")
@@ -425,15 +431,18 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: origami analytical model > heuristic fallback
+    # Config selection: origami only when it returns (256, 256, 64), else heuristic
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
     chunk_size = 32
     waves_per_eu = 2
     group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
-    origami_params = _select_params_origami(M, N, K, A_view.stride(), B_view.stride(), out_dtype)
+    origami_params = _select_params_origami(
+        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
+    )
     if origami_params is not None:
-        BLOCK_M, BLOCK_N, BLOCK_K, group_m, chunk_size, waves_per_eu = origami_params
-        chunk_size = max(chunk_size, 1)
+        om, on, ok, ogm, ochunk, owpe = origami_params
+        if (om, on, ok) == (256, 256, 64):
+            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
 
     num_sms = compute_sk_grid(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_cus)
     even_k = K % BLOCK_K == 0
