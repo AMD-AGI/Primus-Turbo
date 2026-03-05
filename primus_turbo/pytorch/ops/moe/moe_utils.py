@@ -19,7 +19,7 @@ from primus_turbo.pytorch.kernels.moe.tokens_per_expert_to_mask_impl import (
     tokens_per_expert_to_mask_impl,
 )
 from primus_turbo.triton.moe import permutation
-from primus_turbo.triton.moe.multihot_to_indices import (
+from primus_turbo.triton.moe.moe_utils import (
     _indices_to_multihot_kernel,
     _multihot_to_indices_kernel,
 )
@@ -295,7 +295,7 @@ def indices_to_multihot(
 ###############################################################################
 
 
-class TokenPermuteMaskMap(torch.autograd.Function):
+class PermuteMaskMap(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -422,7 +422,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         return act_grad, None, None, probs_grad, None
 
 
-class TokenUnpermuteMaskMap(torch.autograd.Function):
+class UnpermuteMaskMap(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -589,7 +589,7 @@ def moe_permute(
         if topk_indices != None:
             raise NotImplementedError("not support topk_indices")
         if routing_map != None:
-            output, row_id_map, permuted_probs, tokens_per_experts = TokenPermuteMaskMap.apply(
+            output, row_id_map, permuted_probs, tokens_per_experts = PermuteMaskMap.apply(
                 inp, routing_map, num_out_tokens, probs, return_tokens_per_expert
             )
             return output, permuted_probs, row_id_map, tokens_per_experts
@@ -667,7 +667,7 @@ def moe_unpermute(
                                     and pads the number of tokens to the expert capacity.
     """
     if fused:
-        return TokenUnpermuteMaskMap.apply(inp, sorted_indices, merging_probs, restore_shape)
+        return UnpermuteMaskMap.apply(inp, sorted_indices, merging_probs, restore_shape)
 
     _, hidden = restore_shape
     input_dtype = inp.dtype
