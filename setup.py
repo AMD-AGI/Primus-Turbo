@@ -2,8 +2,10 @@ import importlib.util
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -38,6 +40,63 @@ AITER_COMMIT = "e83f9903c07001a0ec29e85d223f6e6cdbe00859"
 ORIGAMI_COMMIT = "01abf3db57f692c7ff70200b0697ed10335fb1e3"
 
 # -------------------------------------
+
+
+@contextmanager
+def _chdir(path):
+    prev_cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev_cwd)
+
+
+def install_origami():
+    """Install origami from rocm-libraries: ensure build deps, clone, checkout, pip install."""
+    if is_package_installed("origami"):
+        print("[Primus-Turbo Setup] origami already installed, skipping.")
+        return
+    origami_dir = PROJECT_ROOT / "_origami"
+    if origami_dir.exists():
+        print("[Primus-Turbo Setup] Removing existing _origami directory...")
+        shutil.rmtree(origami_dir)
+    print("[Primus-Turbo Setup] Cloning rocm-libraries (sparse) for origami...")
+    subprocess.check_call(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            "--branch",
+            "develop",
+            "https://github.com/ROCm/rocm-libraries.git",
+            str(origami_dir),
+        ],
+        cwd=PROJECT_ROOT,
+    )
+    print(f"[Primus-Turbo Setup] Checking out origami commit {ORIGAMI_COMMIT}...")
+    subprocess.check_call(
+        ["git", "fetch", "--depth", "1", "origin", ORIGAMI_COMMIT],
+        cwd=origami_dir,
+    )
+    subprocess.check_call(
+        ["git", "checkout", ORIGAMI_COMMIT],
+        cwd=origami_dir,
+    )
+    with _chdir(origami_dir):
+        subprocess.check_call(["git", "sparse-checkout", "set", "shared/origami"])
+    origami_setup_path = origami_dir / "shared" / "origami" / "python"
+    print(f"[Primus-Turbo Setup] Installing origami from {origami_setup_path}...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--no-build-isolation", "."],
+        cwd=origami_setup_path,
+    )
+    print("[Primus-Turbo Setup] origami installed. Removing clone _origami...")
+    shutil.rmtree(origami_dir)
+    print("[Primus-Turbo Setup] _origami removed.")
 
 
 def get_submodule_folders():
@@ -375,6 +434,14 @@ def build_jax_extension():
     )
 
 
+class PrimusTurboBuildExt(TurboBuildExt.with_options(use_ninja=True)):
+    """Build extension that installs origami before building Primus-Turbo extensions."""
+
+    def run(self):
+        install_origami()
+        super().run()
+
+
 if __name__ == "__main__":
     # Initialize submodules
     check_submodules()
@@ -393,7 +460,11 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "hip-python",
+        "scikit-build-core",  # required when building origami in install_origami() with --no-build-isolation
     ]
+
+    # origami is installed in build_ext (install_origami), not via install_requires,
+    # to avoid pip resolution/build ordering issues with scikit-build-core.
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
@@ -420,7 +491,7 @@ if __name__ == "__main__":
         packages=find_packages(exclude=["tests", "tests.*"]),
         package_data={"primus_turbo": ["lib/*.so"]},
         ext_modules=ext_modules,
-        cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
+        cmdclass={"build_ext": PrimusTurboBuildExt},
         entry_points=entry_points,
         install_requires=install_requires,
     )
