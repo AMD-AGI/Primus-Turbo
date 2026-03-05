@@ -241,7 +241,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
         hidden_states, permuted_probs, self.reversed_mapping_for_combine, tokens_per_expert = (
-            turbo.ops.token_permute(
+            turbo.ops.moe_permute(
                 hidden_states,
                 num_out_tokens=num_out_tokens,
                 routing_map=self.dispatched_routing_map,
@@ -261,7 +261,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         return hidden_states, tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):
-        hidden_states = turbo.ops.token_unpermute(
+        hidden_states = turbo.ops.moe_unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,
             restore_shape=self.hidden_shape_before_permute,
