@@ -32,6 +32,13 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
           "Tensor");
 
+    // ********* MXFP4 Quantization *********
+    m.def("quantize_mxfp4_dual_shuffle(Tensor input, ScalarType dest_dtype, "
+          "bool shuffle_rowwise_scale, bool shuffle_rowwise_output, bool rowwise_use_2d_block, "
+          "bool rowwise_use_sr, bool rowwise_use_rht, "
+          "bool shuffle_colwise_scale, bool shuffle_colwise_output, bool colwise_use_2d_block, "
+          "bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
+
     // ********* RMSNorm *********
     m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
     m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
@@ -63,9 +70,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("ck_gemm_fp8", ck_gemm_fp8);
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
+    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
 
-    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
+    // ********* MXFP4 Quantization *********
+    m.impl("quantize_mxfp4_dual_shuffle", quantize_mxfp4_dual_shuffle);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd);
@@ -91,6 +100,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
+
+    // ********* MXFP4 Quantization *********
+    m.impl("quantize_mxfp4_dual_shuffle", quantize_mxfp4_dual_shuffle_meta);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
