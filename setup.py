@@ -57,6 +57,14 @@ def install_origami():
     if is_package_installed("origami"):
         print("[Primus-Turbo Setup] origami already installed, skipping.")
         return
+    # CI / editable install may run build_ext before pip has installed our install_requires;
+    # ensure scikit-build-core is available so "pip install --no-build-isolation ." for origami succeeds.
+    if not is_package_installed("scikit_build_core"):
+        print("[Primus-Turbo Setup] Installing scikit-build-core for origami build...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "scikit-build-core"],
+            cwd=PROJECT_ROOT,
+        )
     origami_dir = PROJECT_ROOT / "_origami"
     if origami_dir.exists():
         print("[Primus-Turbo Setup] Removing existing _origami directory...")
@@ -460,11 +468,7 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "hip-python",
-        "scikit-build-core",  # required when building origami in install_origami() with --no-build-isolation
     ]
-
-    # origami is installed in build_ext (install_origami), not via install_requires,
-    # to avoid pip resolution/build ordering issues with scikit-build-core.
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
