@@ -18,10 +18,16 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx942(const ck_tile
         PRIMUS_TURBO_ERROR("Currently Arch != gfx942");
     }
 
-    if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
-                  std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
-        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+    if constexpr ((std::is_same_v<ADataType, ck_tile::bf8_t> ||
+                  std::is_same_v<ADataType, ck_tile::fp8_t>) && (std::is_same_v<BDataType, ck_tile::fp8_t> || std::is_same_v<BDataType, ck_tile::bf8_t>)) {
+        if constexpr (!std::is_same_v<ADataType, BDataType>) {
+            // TODO(ruibin): tuning the tile config for mixed precision
+            using TileConfig = GFX942_CKGemmTileCfg_256x256x128_32x32x16_2x2x1_padding;
+            using Runner = CKQuantGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
+                                      BLayout, CLayout, TileConfig, QuantMode, AccDataType>;
+            runner = std::make_unique<Runner>();
+        } else if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+            // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
             using TileConfig = GFX942_CKGemmTileCfg_128x128x128_32x32x32_2x2x1;
             using Runner =
                 CKQuantGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType, CDataType, ALayout,
@@ -73,9 +79,9 @@ std::unique_ptr<CKGemmRunnerInterFace> get_ck_gemm_instance_gfx950(const ck_tile
         PRIMUS_TURBO_ERROR("Currently Arch != gfx950");
     }
 
-    if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
-                  std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+    if constexpr ((std::is_same_v<ADataType, ck_tile::bf8_t> ||
+                  std::is_same_v<ADataType, ck_tile::fp8_t>) && (std::is_same_v<BDataType, ck_tile::fp8_t> || std::is_same_v<BDataType, ck_tile::bf8_t>)) {
+        if constexpr(QuantMode == ck_tile::QuantType::ABQuantGrouped) {
             using TileConfig = GFX950_CKGemmTileCfg_128x128x128_16x16x128_1x4x1;
             using Runner =
                 CKQuantGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType, CDataType, ALayout,
@@ -126,7 +132,7 @@ get_ck_gemm_instance(const ck_tile::index_t m, const ck_tile::index_t n, const c
 #ifdef PRIMUS_TURBO_GFX942
     case GPUArch::GFX942: {
         return get_ck_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType, ALayout,
-                                           BLayout, CLayout, QuantMode>(m, n, k);
+                                            BLayout, CLayout, QuantMode>(m, n, k);
     }
 #endif
 #ifdef PRIMUS_TURBO_GFX950
@@ -154,6 +160,14 @@ APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::fp8_t,
 APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t)
 // FP8_E5M2 * FP8_E5M2 = BF16
 APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t)
+// FP8_E4M3 * FP8_E5M2 = FP16
+APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t)
+// FP8_E4M3 * FP8_E5M2 = BF16
+APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t)
+// FP8_E5M2 * FP8_E4M3 = FP16
+APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t)
+// FP8_E5M2 * FP8_E4M3 = BF16
+APPLY_GET_CK_GEMM_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GEMM_INSTANCE, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t)
 
 // clang-format on
 } // namespace primus_turbo

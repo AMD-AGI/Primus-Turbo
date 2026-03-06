@@ -124,7 +124,7 @@ class GEMMFP8CKBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(

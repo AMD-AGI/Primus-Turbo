@@ -184,6 +184,8 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             return float8_e4m3
         elif format == Format.E5M2:
             return float8_e5m2
+        elif format == Format.HYBRID:
+            return float8_e4m3 if is_fwd_stage else float8_e5m2
         else:
             raise ValueError(f"Unsupported FP8 format: {format}")
 
