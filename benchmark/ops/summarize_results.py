@@ -34,19 +34,23 @@ AMD_BENCHMARK_OPS = {
         "PyTorch": "gemm_torch_benchmark.csv",
         "TE": "gemm_te_benchmark.csv",
         "Turbo(Hipblaslt)": "gemm_hipblaslt_benchmark.csv",
+        "Turbo(Triton)": "gemm_triton_benchmark.csv",
     },
     "GEMM-FP8-Tensorwise": {
         "PyTorch": "gemm_fp8_tensorwise_torch_benchmark.csv",
         "TE": "gemm_fp8_tensorwise_te_benchmark.csv",
         "Turbo(Hipblaslt)": "gemm_fp8_tensorwise_hipblaslt_benchmark.csv",
+        "Turbo(Triton)": "gemm_fp8_tensorwise_triton_benchmark.csv",
         "Turbo(CK)": "gemm_fp8_tensorwise_ck_benchmark.csv",
         "Turbo(AutoTune)": "gemm_fp8_tensorwise_autotune_benchmark.csv",
     },
     "GEMM-FP8-Rowwise": {
         "Turbo(CK)": "gemm_fp8_rowwise_ck_benchmark.csv",
+        "Turbo(Triton)": "gemm_fp8_rowwise_triton_benchmark.csv",
     },
     "GEMM-FP8-Blockwise": {
         "Turbo(CK)": "gemm_fp8_blockwise_ck_benchmark.csv",
+        "Turbo(Triton)": "gemm_fp8_blockwise_triton_benchmark.csv",
     },
     "GEMM-MXFP8": {
         "Turbo(Hipblaslt)": "gemm_mxfp8_hipblaslt_benchmark.csv",
@@ -55,20 +59,24 @@ AMD_BENCHMARK_OPS = {
         "PyTorch": "grouped_gemm_torch_benchmark.csv",
         "TE": "grouped_gemm_te_benchmark.csv",
         "Turbo(Hipblaslt)": "grouped_gemm_hipblaslt_benchmark.csv",
+        "Turbo(Triton)": "grouped_gemm_triton_benchmark.csv",
         "Turbo(CK)": "grouped_gemm_ck_benchmark.csv",
         "Turbo(AutoTune)": "grouped_gemm_autotune_benchmark.csv",
     },
     "Grouped-GEMM-FP8-Tensorwise": {
         "TE": "grouped_gemm_fp8_tensorwise_te_benchmark.csv",
         "Turbo(Hipblaslt)": "grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv",
+        "Turbo(Triton)": "grouped_gemm_fp8_tensorwise_triton_benchmark.csv",
         "Turbo(CK)": "grouped_gemm_fp8_tensorwise_ck_benchmark.csv",
         "Turbo(AutoTune)": "grouped_gemm_fp8_tensorwise_autotune_benchmark.csv",
     },
     "Grouped-GEMM-FP8-Rowwise": {
         "Turbo(CK)": "grouped_gemm_fp8_rowwise_ck_benchmark.csv",
+        "Turbo(Triton)": "grouped_gemm_fp8_rowwise_triton_benchmark.csv",
     },
     "Grouped-GEMM-FP8-Blockwise": {
         "Turbo(CK)": "grouped_gemm_fp8_blockwise_ck_benchmark.csv",
+        "Turbo(Triton)": "grouped_gemm_fp8_blockwise_triton_benchmark.csv",
     },
     "DeepEP-Intranode": {
         "Turbo": "deep_ep_intranode_turbo_benchmark.csv",

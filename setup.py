@@ -4,6 +4,7 @@ import platform
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -32,7 +33,22 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 AITER_COMMIT = "512cd4c65ff7841edac9ec594d859d415c76e819"
 
+# ---------- ORIGAMI (rocm-libraries) ------------
+# Pin to commit. Installed during build via clone + pip install (avoids pip resolution
+# ordering issue with scikit-build-core when using --no-build-isolation).
+ORIGAMI_COMMIT = "01abf3db57f692c7ff70200b0697ed10335fb1e3"
+
 # -------------------------------------
+
+
+@contextmanager
+def _chdir(path):
+    prev_cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev_cwd)
 
 
 def get_submodule_folders():
@@ -370,6 +386,11 @@ def build_jax_extension():
     )
 
 
+class PrimusTurboBuildExt(TurboBuildExt.with_options(use_ninja=True)):
+    def run(self):
+        super().run()
+
+
 if __name__ == "__main__":
     # Initialize submodules
     check_submodules()
@@ -397,6 +418,15 @@ if __name__ == "__main__":
     else:
         print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
 
+    # Conditionally add origami if torch_ext is being built and origami is not already installed
+    if torch_ext is not None and not is_package_installed("origami"):
+        print("[Primus-Turbo Setup] origami not found, will be installed automatically.")
+        install_requires.append(
+            f"origami @ git+https://github.com/ROCm/rocm-libraries.git@{ORIGAMI_COMMIT}#subdirectory=shared/origami/python"
+        )
+    else:
+        print("[Primus-Turbo Setup] Skipping origami installation.")
+
     if BUILD_JAX:
         entry_points["jax_plugins"] = ["primus_turbo = primus_turbo.jax"]
 
@@ -406,7 +436,7 @@ if __name__ == "__main__":
         packages=find_packages(exclude=["tests", "tests.*"]),
         package_data={"primus_turbo": ["lib/*.so"]},
         ext_modules=ext_modules,
-        cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
+        cmdclass={"build_ext": PrimusTurboBuildExt},
         entry_points=entry_points,
         install_requires=install_requires,
     )
