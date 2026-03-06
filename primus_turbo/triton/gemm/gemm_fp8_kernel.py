@@ -39,9 +39,7 @@ import triton.language as tl
 from primus_turbo.triton.gemm.gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
-    _get_num_cus,
     _select_params_origami,
-    compute_sk_grid,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,16 +281,27 @@ def gemm_fp8_tensorwise_triton_kernel(
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
     chunk_size = 32
     waves_per_eu = 0
+    cache_a, cache_b = ".ca", ".ca"
     origami_params = _select_params_origami(
-        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
+        M,
+        N,
+        K,
+        out_dtype,
+        A_view.dtype,
+        B_view.dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe = origami_params
+        om, on, ok, ogm, ochunk, owpe, cache_a, cache_b = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
+            group_m, waves_per_eu = ogm, owpe
 
-    num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
+    # Data-parallel (align with TensorAtlas ops/matmul.py)
+    total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
+    total_programs = total_tiles
+    chunk_size = group_m * group_m
+    chunk_size = min(chunk_size, max(1, total_programs // NUM_XCDS))
     args = (
         A_view,
         B_view,
@@ -308,7 +317,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
-    _fp8_persistent_gemm_kernel[(num_sms,)](
+    _fp8_persistent_gemm_kernel[(total_tiles,)](
         *args,
         stride_ak=s_ak,
         stride_bk=s_bk,
@@ -316,12 +325,12 @@ def gemm_fp8_tensorwise_triton_kernel(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=group_m,
-        NUM_SMS=num_sms,
+        NUM_SMS=total_programs,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -551,16 +560,27 @@ def gemm_fp8_rowwise_triton_kernel(
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
     chunk_size = 32
     waves_per_eu = 0
+    cache_a, cache_b = ".ca", ".ca"
     origami_params = _select_params_origami(
-        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
+        M,
+        N,
+        K,
+        out_dtype,
+        A_view.dtype,
+        B_view.dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe = origami_params
+        om, on, ok, ogm, ochunk, owpe, cache_a, cache_b = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
+            group_m, waves_per_eu = ogm, owpe
 
-    num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
+    # Data-parallel (align with TensorAtlas ops/matmul.py)
+    total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
+    total_programs = total_tiles
+    chunk_size = group_m * group_m
+    chunk_size = min(chunk_size, max(1, total_programs // NUM_XCDS))
 
     args = (
         A_view,
@@ -577,7 +597,7 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
-    _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
+    _fp8_rowwise_persistent_gemm_kernel[(total_tiles,)](
         *args,
         stride_ak=s_ak,
         stride_bk=s_bk,
@@ -585,12 +605,12 @@ def gemm_fp8_rowwise_triton_kernel(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=group_m,
-        NUM_SMS=num_sms,
+        NUM_SMS=total_programs,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
         waves_per_eu=waves_per_eu,
