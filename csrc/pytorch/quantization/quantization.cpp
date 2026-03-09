@@ -315,8 +315,8 @@ std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
             stream);
     });
 
-    return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale,
-            colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale};
+    return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale.view(at::kFloat8_e8m0fnu),
+            colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale.view(at::kFloat8_e8m0fnu)};
 }
 
 } // namespace primus_turbo::pytorch
