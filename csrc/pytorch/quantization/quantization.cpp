@@ -221,4 +221,102 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
     return output;
 }
 
+// Quantize MXFP4 Dual with scale and output shuffle
+std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
+    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht) {
+    using namespace primus_turbo::detail;
+
+    std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
+        return (a + b - 1) / b;
+    };
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2.");
+
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+
+    PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
+
+    if (shuffle_rowwise_output) {
+        PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0, "M must be divisible by ", MXFP4_SHUFFLE_BN,
+                           " for shuffled rowwise FP4. But got M=", M);
+        PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0, "N/2 must be divisible by ",
+                           MXFP4_SHUFFLE_BK, " for shuffled rowwise FP4. But got N/2=", N / 2);
+    }
+    if (shuffle_colwise_output) {
+        PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BN == 0, "N must be divisible by ", MXFP4_SHUFFLE_BN,
+                           " for shuffled colwise FP4. But got N=", N);
+        PRIMUS_TURBO_CHECK((M / 2) % MXFP4_SHUFFLE_BK == 0, "M/2 must be divisible by ",
+                           MXFP4_SHUFFLE_BK, " for shuffled colwise FP4. But got M/2=", M / 2);
+    }
+
+    auto device = input.device();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
+    int64_t rowwise_scale_N     = cdiv(N, MXFP4_BLOCK_SIZE);
+    int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
+
+    int64_t    rowwise_scale_stride = 1;
+    at::Tensor rowwise_scale;
+    if (shuffle_rowwise_scale) {
+        rowwise_scale        = at::empty({rowwise_scale_M_pad, rowwise_scale_N_pad},
+                                         at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale_stride = rowwise_scale.stride(0);
+    } else {
+        rowwise_scale =
+            at::empty({M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+    }
+
+    // packed 2 fp4 values in N dimension
+    at::Tensor rowwise_output =
+        at::empty({M, N / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
+    int64_t colwise_scale_N     = cdiv(M, MXFP4_BLOCK_SIZE);
+    int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
+
+    at::Tensor colwise_scale;
+    int        colwise_scale_stride = 1;
+    if (shuffle_colwise_scale) {
+        colwise_scale        = at::empty({colwise_scale_M_pad, colwise_scale_N_pad},
+                                         at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale_stride = colwise_scale.stride(0);
+    } else {
+        colwise_scale =
+            at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+    }
+
+    // packed 2 fp4 values in N dimension
+    at::Tensor colwise_output =
+        at::empty({N, M / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), DType, {
+        quantize_mxfp4_dual_shuffle_impl<DType>(
+            reinterpret_cast<DType *>(input.data_ptr()),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(rowwise_output.data_ptr()),
+            rowwise_scale.data_ptr<uint8_t>(),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
+            colwise_scale.data_ptr<uint8_t>(), M, N, rowwise_scale_stride, colwise_scale_stride,
+            rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N, colwise_scale_N,
+            colwise_scale_M_pad, colwise_scale_N_pad,
+            MXScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
+                            shuffle_rowwise_scale, shuffle_rowwise_output),
+            MXScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht,
+                            shuffle_colwise_scale, shuffle_colwise_output),
+            stream);
+    });
+
+    return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale.view(at::kFloat8_e8m0fnu),
+            colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale.view(at::kFloat8_e8m0fnu)};
+}
+
 } // namespace primus_turbo::pytorch

@@ -16,9 +16,8 @@
 
 #include <ATen/hip/HIPGraphsUtils.cuh>
 
-#include "primus_turbo/common.h"
-
 #include "deep_ep/deep_ep.hpp"
+#include "primus_turbo/common.h"
 
 namespace primus_turbo::pytorch {
 
@@ -48,6 +47,18 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
+
+std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
+    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
+
+std::vector<at::Tensor> quantize_mxfp4_dual_shuffle_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
+    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
 
 //==================================================================
 //  GEMM

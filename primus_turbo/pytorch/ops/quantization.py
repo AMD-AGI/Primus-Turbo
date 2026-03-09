@@ -17,6 +17,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
+    quantize_mxfp4_shuffle_impl,
     quantize_mxfp8_impl,
 )
 
@@ -217,16 +218,30 @@ def quantize_fp4_with_trans(
         assert scale is None, "The scale is not supported for MXFP4 quantization"
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP4 quantization"
 
-        return quantize_mxfp4_impl(
-            x,
-            out_dtype,
-            axis,
-            block_size,
-            padding_align_size,
-            True,
-            scaling_recipe,
-            scaling_recipe_for_trans,
-        )
+        if (scaling_recipe.shuffle_scale or scaling_recipe.shuffle_output) or (
+            scaling_recipe_for_trans.shuffle_scale or scaling_recipe_for_trans.shuffle_output
+        ):
+            return quantize_mxfp4_shuffle_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                padding_align_size,
+                True,
+                scaling_recipe,
+                scaling_recipe_for_trans,
+            )
+        else:
+            return quantize_mxfp4_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                padding_align_size,
+                True,
+                scaling_recipe,
+                scaling_recipe_for_trans,
+            )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 

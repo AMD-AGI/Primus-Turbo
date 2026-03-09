@@ -24,6 +24,8 @@ from primus_turbo.pytorch.ops.quantization import (
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
 
+MXFP4_BLOCK_SIZE = 32
+
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
@@ -383,3 +385,134 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
 
     if use_2d_block:
         torch.testing.assert_close(out_rowwise, out_colwise, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dest_dtype",
+    [
+        turbo.float4_e2m1fn_x2,
+    ],
+)
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+@pytest.mark.parametrize("use_2d_block", [True, False])
+@pytest.mark.parametrize("use_sr", [True, False])
+def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block, use_sr):
+    if use_sr:
+        # FIXME(ruibin): Stochastic rounding has numerical issues in quantize_mxfp4_dual_shuffle kernel.
+        pytest.skip("SR is not supported for shuffled FP4.")
+
+    def unshuffle_scale_ref(
+        shuffled_scale: torch.Tensor,
+        scale_rows: int,
+        scale_cols: int,
+    ) -> torch.Tensor:
+        """Convert a shuffled MX scale tensor back to naive (row, col) layout.
+
+        Args:
+            shuffled_scale: Shuffled scale buffer (2D, padded shape).
+            scale_rows: Logical number of rows in the scale matrix.
+            scale_cols: Logical number of columns in the scale matrix.
+
+        Returns:
+            Scale tensor of shape ``(scale_rows, scale_cols)`` in naive layout.
+        """
+
+        def _ceil_div(a, b):
+            return (a + b - 1) // b
+
+        scale_n_pad = _ceil_div(scale_cols, 8) * 8
+
+        shuffled_flat = shuffled_scale.flatten()
+
+        rows = torch.arange(scale_rows, dtype=torch.long).unsqueeze(1).expand(scale_rows, scale_cols)
+        cols = torch.arange(scale_cols, dtype=torch.long).unsqueeze(0).expand(scale_rows, scale_cols)
+
+        i0 = rows // 32
+        i1 = (rows % 32) // 16
+        i2 = rows % 16
+        i3 = cols // 8
+        i4 = (cols % 8) // 4
+        i5 = cols % 4
+
+        indices = i0 * (scale_n_pad // 8) * 256 + i3 * 256 + i5 * 64 + i2 * 4 + i4 * 2 + i1
+
+        naive_scale = shuffled_flat[indices.flatten().to(shuffled_scale.device)].reshape(
+            scale_rows, scale_cols
+        )
+        return naive_scale
+
+    # Skip unit test on gfx942.
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    MX_BLOCK_SIZE = 32
+    torch.manual_seed(42)
+
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+
+    x.detach().clone()
+
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+
+    scaling_recipe = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+        use_sr=use_sr,
+        shuffle_scale=True,
+        shuffle_output=False,
+    )
+
+    x_fp4_rowwise, x_scale_inv_rowwise, x_fp4_colwise, x_scale_inv_colwise = quantize_fp4_with_trans(
+        x_2d,
+        dest_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        scaling_recipe=scaling_recipe,
+        scaling_recipe_for_trans=scaling_recipe,
+    )
+
+    # --- Unshuffle rowwise scale ---
+    rowwise_scale_rows = x_2d.size(0)
+    rowwise_scale_cols = N // MX_BLOCK_SIZE
+    naive_rowwise_scale = unshuffle_scale_ref(
+        x_scale_inv_rowwise.view(torch.uint8),
+        rowwise_scale_rows,
+        rowwise_scale_cols,
+    )
+
+    # --- Unshuffle colwise scale ---
+    colwise_scale_rows = N
+    colwise_scale_cols = x_2d.size(0) // MX_BLOCK_SIZE
+    naive_colwise_scale = unshuffle_scale_ref(
+        x_scale_inv_colwise.view(torch.uint8),
+        colwise_scale_rows,
+        colwise_scale_cols,
+    )
+
+    # check quantize and dequantize precision
+    out_rowwise = dequantize_fp4(
+        x_fp4_rowwise,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=1,
+        scale_inv=naive_rowwise_scale,
+        scaling_recipe=scaling_recipe,
+    )
+    out_colwise = dequantize_fp4(
+        x_fp4_colwise,
+        orig_dtype,
+        granularity=granularity,
+        block_size=MX_BLOCK_SIZE,
+        axis=0,
+        scale_inv=naive_colwise_scale,
+        scaling_recipe=scaling_recipe,
+    )
+
+    torch.testing.assert_close(x_2d, out_rowwise, **get_tolerances(dest_dtype))
+    torch.testing.assert_close(x_2d, out_colwise, **get_tolerances(dest_dtype))
