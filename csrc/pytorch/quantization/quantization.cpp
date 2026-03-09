@@ -238,7 +238,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
                        "Input must be BFloat16 or Half");
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
-    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2.");
 
     const int64_t M = input.size(0);
     const int64_t N = input.size(1);
@@ -246,16 +246,16 @@ std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
     PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
 
     if (shuffle_rowwise_output) {
-        PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0,
-                           "M must be divisible by 16 for shuffled rowwise FP4");
-        PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0,
-                           "N/2 must be divisible by 32 for shuffled rowwise FP4");
+        PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0, "M must be divisible by ", MXFP4_SHUFFLE_BN,
+                           " for shuffled rowwise FP4. But got M=", M);
+        PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0, "N/2 must be divisible by ",
+                           MXFP4_SHUFFLE_BK, " for shuffled rowwise FP4. But got N/2=", N / 2);
     }
     if (shuffle_colwise_output) {
-        PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BN == 0,
-                           "N must be divisible by 16 for shuffled colwise FP4");
-        PRIMUS_TURBO_CHECK((M / 2) % MXFP4_SHUFFLE_BK == 0,
-                           "M/2 must be divisible by 32 for shuffled colwise FP4");
+        PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BN == 0, "N must be divisible by ", MXFP4_SHUFFLE_BN,
+                           " for shuffled colwise FP4. But got N=", N);
+        PRIMUS_TURBO_CHECK((M / 2) % MXFP4_SHUFFLE_BK == 0, "M/2 must be divisible by ",
+                           MXFP4_SHUFFLE_BK, " for shuffled colwise FP4. But got M/2=", M / 2);
     }
 
     auto device = input.device();
