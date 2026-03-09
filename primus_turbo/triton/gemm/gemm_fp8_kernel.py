@@ -275,13 +275,11 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
+    # Config selection: origami or heuristic (align with TensorAtlas)
     blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
     block_m, block_n, block_k = 256, 256, blk_k
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    chunk_size = 32
-    waves_per_eu = 0
-    cache_a, cache_b = ".ca", ".ca"
+    cache_a, cache_b = None, None
     origami_params = _select_params_origami(
         M,
         N,
@@ -293,11 +291,11 @@ def gemm_fp8_tensorwise_triton_kernel(
         trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe, cache_a, cache_b = origami_params
+        om, on, ok, ogm, cache_a, cache_b = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, waves_per_eu = ogm, owpe
+            group_m = ogm
 
-    # Data-parallel (align with TensorAtlas ops/matmul.py)
+    # Data-parallel launch (align with TensorAtlas ops/matmul.py)
     total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
     total_programs = total_tiles
     chunk_size = group_m * group_m
@@ -333,7 +331,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=waves_per_eu,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -554,13 +552,11 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
+    # Config selection: origami or heuristic (align with TensorAtlas)
     blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
     block_m, block_n, block_k = 256, 256, blk_k
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    chunk_size = 32
-    waves_per_eu = 0
-    cache_a, cache_b = ".ca", ".ca"
+    cache_a, cache_b = None, None
     origami_params = _select_params_origami(
         M,
         N,
@@ -572,11 +568,11 @@ def gemm_fp8_rowwise_triton_kernel(
         trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe, cache_a, cache_b = origami_params
+        om, on, ok, ogm, cache_a, cache_b = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, waves_per_eu = ogm, owpe
+            group_m = ogm
 
-    # Data-parallel (align with TensorAtlas ops/matmul.py)
+    # Data-parallel launch (align with TensorAtlas ops/matmul.py)
     total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
     total_programs = total_tiles
     chunk_size = group_m * group_m
@@ -613,7 +609,7 @@ def gemm_fp8_rowwise_triton_kernel(
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=waves_per_eu,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import Optional
 
 import torch
 import triton
@@ -48,13 +47,20 @@ _ORIGAMI_DTYPE_TO_STR = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
 }
-for _k in ("float8_e4m3fn", "float8_e5m2"):
+for _k in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
     if hasattr(torch, _k):
         _ORIGAMI_DTYPE_TO_STR[getattr(torch, _k)] = "f8"
 
 # FP8 dtypes: torch.finfo can be unsupported/buggy, so we treat them explicitly.
 _ORIGAMI_FP8_DTYPES = tuple(
-    d for d in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)) if d is not None
+    d
+    for d in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if d is not None
 )
 
 
@@ -71,32 +77,10 @@ def _dtype_bits(dtype):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Grid Utilities
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Hardware constants
+# Hardware constants & chiplet transform
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NUM_XCDS = 8
-_NUM_CUS: Optional[int] = None
-
-# Kept for FP8 kernel compatibility (gemm_fp8_kernel.py imports this).
-_AUTOTUNE_MN_THRESHOLD = 128 * 1024 * 1024
-
-
-def _get_num_cus() -> int:
-    """Lazy initialization of CU count (avoids import-time CUDA calls)."""
-    global _NUM_CUS
-    if _NUM_CUS is None:
-        _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return _NUM_CUS
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Chiplet Transform
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @triton.jit
@@ -173,19 +157,6 @@ def _infer_mi_dim(hardware, element_size_a, element_size_b):
             return [16, 16, 16]
         if max_bits == 8:
             return [16, 16, 32]
-    # MI300A (228), MI200 (104)
-    if n_cu == 228:
-        if max_bits == 32:
-            return [16, 16, 4]
-        if max_bits == 16:
-            return [16, 16, 16]
-        if max_bits == 8:
-            return [16, 16, 32]
-    if n_cu == 104:
-        if max_bits == 32:
-            return [16, 16, 4]
-        if max_bits == 16:
-            return [16, 16, 16]
     return [16, 16, 16]
 
 
@@ -239,12 +210,11 @@ def _tiles_to_configs(valid_tiles, streamk=True):
 
 @functools.lru_cache(maxsize=4096)
 def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans_a=False, trans_b=True):
-    """Use origami rank_configs + select_workgroup_mapping (TensorAtlas/tritonBLAS API).
+    """Use origami rank_configs + select_workgroup_mapping (align with TensorAtlas selector.py).
 
     trans_a, trans_b: logical layout (op(A) @ op(B)). Forward NT = (False, True);
     backward grad_a (NN) = (False, False); backward grad_b (TN) = (True, False).
-    Returns (block_m, block_n, block_k, group_size_m, chunk_size, waves_per_eu, cache_a, cache_b) or None.
-    cache_a/cache_b are from origami config_t.cache_hints_a/b (e.g. ".ca", ".cg", ".cv").
+    Returns (block_m, block_n, block_k, group_size_m, cache_a, cache_b) or None.
     """
     global _ORIGAMI_UNAVAILABLE_LOGGED
     if not _HAS_ORIGAMI:
@@ -268,12 +238,17 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
         elem_bits_b = _dtype_bits(b_dtype)
         elem_bytes_a = elem_bits_a // 8
         elem_bytes_b = elem_bits_b // 8
-        mi_dtype_str = "bf16" if max(elem_bits_a, elem_bits_b) == 16 else "f8"
+
+        # mi_dtype: use the smaller input dtype (align with TensorAtlas selector.py)
+        input_dtype_for_mi = a_dtype if elem_bits_a <= elem_bits_b else b_dtype
+        mi_dtype_str = _ORIGAMI_DTYPE_TO_STR.get(
+            input_dtype_for_mi, _ORIGAMI_DTYPE_TO_STR.get(out_dtype, "bf16")
+        )
 
         mi_dim = _infer_mi_dim(hardware, elem_bits_a, elem_bits_b)
-        block_mn_range = [16, 32, 64, 128, 256]
-        block_k_range = [16, 32, 64, 128, 256, 512]
-        if hardware.N_CU in (304, 80, 64, 228) and max(elem_bits_a, elem_bits_b) == 8:
+        block_mn_range = [128, 256]
+        block_k_range = [64, 128, 256, 512]
+        if hardware.N_CU in (304, 80, 64) and max(elem_bits_a, elem_bits_b) == 8:
             block_mn_range = block_mn_range + [512]
             block_k_range = block_k_range + [128, 256]
 
@@ -286,30 +261,25 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
         problem = _make_problem(M, N, K, a_dtype, b_dtype, out_dtype, mi_dtype_str, trans_a, trans_b)
         configs = _tiles_to_configs(valid_tiles, streamk=True)
 
-        ranked = origami.rank_configs(problem, hardware, configs)
-        if not ranked:
-            return None
-        best = ranked[0]
+        best_result = origami.select_config(problem, hardware, configs)
         # origami may return items with .config (TensorAtlas) or the config itself
-        best_cfg = best.config if hasattr(best, "config") else best
+        best_cfg = best_result.config if hasattr(best_result, "config") else best_result
         BLK_M = best_cfg.mt.m
         BLK_N = best_cfg.mt.n
         BLK_K = best_cfg.mt.k
 
-        # Data-parallel grid (align with TensorAtlas ops/matmul.py)
         total_tiles = ((M + BLK_M - 1) // BLK_M) * ((N + BLK_N - 1) // BLK_N)
         wgm_result = origami.select_workgroup_mapping(problem, hardware, best_cfg, total_tiles)
         gsize_m = abs(wgm_result.wgm)
-        chunk = getattr(wgm_result, "wgmxccchunk", 32) or 32
-        occupancy = getattr(best_cfg, "occupancy", 2) or 2
-        # origami config_t.cache_hints_a/b (int) → Triton CACHE_MODIFIER ".ca"/".cg"/".cv"
+
         cache_hint_to_modifier = {0: ".ca", 1: ".cg", 2: ".cv"}
-        cache_a = cache_hint_to_modifier.get(getattr(best_cfg, "cache_hints_a", 0), ".ca")
-        cache_b = cache_hint_to_modifier.get(getattr(best_cfg, "cache_hints_b", 0), ".ca")
+        cache_a = cache_hint_to_modifier.get(getattr(best_cfg, "cache_hints_a", 0), None)
+        cache_b = cache_hint_to_modifier.get(getattr(best_cfg, "cache_hints_b", 0), None)
+
         print(
-            f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, chunk: {chunk}, occupancy: {occupancy}, cache_a: {cache_a}, cache_b: {cache_b}"
+            f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, cache_a: {cache_a}, cache_b: {cache_b}"
         )
-        return BLK_M, BLK_N, BLK_K, gsize_m, chunk, occupancy, cache_a, cache_b
+        return BLK_M, BLK_N, BLK_K, gsize_m, cache_a, cache_b
     except Exception as e:
         print(f"[gemm/origami] ERROR M={M} N={N} K={K}: {e}")
         return None
@@ -495,11 +465,10 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: origami (rank_configs + select_workgroup_mapping) or heuristic
+    # Config selection: origami or heuristic (align with TensorAtlas)
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
-    waves_per_eu = 0  # TensorAtlas ops/matmul.py data-parallel
-    cache_a, cache_b = ".ca", ".ca"
     group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
+    cache_a, cache_b = None, None
     origami_params = _select_params_origami(
         M,
         N,
@@ -511,23 +480,15 @@ def gemm_triton_kernel(
         trans_b=trans_b,
     )
     if origami_params is not None:
-        BLOCK_M, BLOCK_N, BLOCK_K, group_m, chunk_size, waves_per_eu, cache_a, cache_b = origami_params
-        # When tile != 256×256×64, keep heuristic tile and params (not used if we always take origami branch here)
-        if (BLOCK_M, BLOCK_N, BLOCK_K) != (256, 256, 64):
-            BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
-            group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
-            chunk_size = 32
-            waves_per_eu = 0
-            cache_a, cache_b = ".ca", ".ca"
-        else:
-            pass  # use origami chunk_size, waves_per_eu, cache_*
+        om, on, ok, ogm, cache_a, cache_b = origami_params
+        if (om, on, ok) == (BLOCK_M, BLOCK_N, BLOCK_K):
+            group_m = ogm
 
-    # Data-parallel mode (align with TensorAtlas ops/matmul.py): grid = total_tiles, NUM_SMS = total_programs
+    # Data-parallel launch (align with TensorAtlas ops/matmul.py)
     total_blocks_M = (M + BLOCK_M - 1) // BLOCK_M
     total_blocks_N = (N + BLOCK_N - 1) // BLOCK_N
     total_tiles = total_blocks_M * total_blocks_N
     total_programs = total_tiles
-    # Set chunk to same area as L2 tiles (TensorAtlas)
     chunk_size = group_m * group_m
     chunk_size = min(chunk_size, max(1, total_programs // NUM_XCDS))
     even_k = K % BLOCK_K == 0
@@ -551,7 +512,7 @@ def gemm_triton_kernel(
         # origami config_t does not expose num_warps/num_stages; use fixed values like TensorAtlas (ops/matmul.py)
         num_warps=8,
         num_stages=2,
-        waves_per_eu=waves_per_eu,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
