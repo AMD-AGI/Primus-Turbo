@@ -6,7 +6,7 @@
 #
 # Fields:
 #   label  : Display name for logs (required)
-#   group  : Group tag for filtering with --group (required)
+#   group  : Group tag for filtering with --group (optional)
 #   script : Benchmark script, relative to benchmark/ops/ (required)
 #   output : Output CSV filename (required)
 #   args   : CLI arguments (optional, default [])
