@@ -817,17 +817,20 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_shuf
             }
         }
     }
+}
 
-    template <typename DType>
-    void quantize_mxfp4_dual_shuffle_impl(
-        const DType *input, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-        dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
-        int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
-        int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-        int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
-        MXScalingRecipe colwise_recipe, hipStream_t stream) {
-        dim3 grid((M + BLOCK_M - 1) / BLOCK_M, (N + BLOCK_N - 1) / BLOCK_N);
-        dim3 block(THREADS_PER_BLOCK);
+template <typename DType>
+void quantize_mxfp4_dual_shuffle_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
+                                      uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
+                                      uint8_t *colwise_scale, int M, int N,
+                                      int rowwise_scale_stride, int colwise_scale_stride,
+                                      int rowwise_scale_N, int rowwise_scale_M_pad,
+                                      int rowwise_scale_N_pad, int colwise_scale_M,
+                                      int colwise_scale_N, int colwise_scale_M_pad,
+                                      int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+                                      MXScalingRecipe colwise_recipe, hipStream_t stream) {
+    dim3 grid((M + BLOCK_M - 1) / BLOCK_M, (N + BLOCK_N - 1) / BLOCK_N);
+    dim3 block(THREADS_PER_BLOCK);
 
 #define KERNEL_ARGS                                                                                \
     input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
@@ -893,29 +896,29 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_shuf
         }                                                                                          \
     }
 
-        // launch kernel
-        DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR()
+    // launch kernel
+    DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR()
 
 #undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D
 #undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT
 #undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR
 #undef LAUNCH_KERNEL
 #undef KERNEL_ARGS
-    }
+}
 
-    template void quantize_mxfp4_dual_shuffle_impl<dtype::float16>(
-        const dtype::float16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-        dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
-        int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
-        int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-        int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
-        MXScalingRecipe colwise_recipe, hipStream_t stream);
-    template void quantize_mxfp4_dual_shuffle_impl<dtype::bfloat16>(
-        const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-        dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
-        int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
-        int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-        int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
-        MXScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp4_dual_shuffle_impl<dtype::float16>(
+    const dtype::float16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    MXScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp4_dual_shuffle_impl<dtype::bfloat16>(
+    const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    MXScalingRecipe colwise_recipe, hipStream_t stream);
 
 } // namespace primus_turbo
