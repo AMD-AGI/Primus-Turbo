@@ -1,0 +1,250 @@
+###############################################################################
+# Benchmark Suite Configuration
+#
+# All benchmark tasks are defined here as a flat list. The runner
+# (run_suite.py) schedules them across GPUs automatically.
+#
+# Fields:
+#   label  : Display name for logs (required)
+#   group  : Group tag for filtering with --group (optional)
+#   script : Benchmark script, relative to benchmark/ops/ (required)
+#   output : Output CSV filename (required)
+#   args   : CLI arguments (optional, default [])
+#   env    : Extra environment variables (optional, default {})
+#   gpus   : Number of GPUs needed (optional, default 1)
+#
+# Usage:
+#   python3 benchmark/ops/run_suite.py -d output/               # run all
+#   python3 benchmark/ops/run_suite.py -d output/ -g attention  # run one group
+###############################################################################
+
+num_gpus: 8
+
+tasks:
+  # ── Attention ─────────────────────────────────────────────
+  - label: attention_torch
+    group: attention
+    script: bench_attention_torch.py
+    output: attention_torch_benchmark.csv
+
+  - label: attention_turbo
+    group: attention
+    script: bench_attention_turbo.py
+    output: attention_benchmark.csv
+
+  - label: attention_fp8
+    group: attention
+    script: bench_attention_turbo.py
+    args: [--fp8]
+    output: attention_fp8_benchmark.csv
+
+  - label: attention_deterministic
+    group: attention
+    script: bench_attention_turbo.py
+    args: [--deterministic]
+    output: attention_deterministic_benchmark.csv
+
+  # ── GEMM BF16 ────────────────────────────────────────────
+  - label: gemm_bf16_torch
+    group: gemm_bf16
+    script: bench_gemm_torch.py
+    args: [--dtype, bf16]
+    output: gemm_torch_benchmark.csv
+
+  - label: gemm_bf16_te
+    group: gemm_bf16
+    script: bench_gemm_te.py
+    args: [--dtype, bf16]
+    output: gemm_te_benchmark.csv
+
+  - label: gemm_bf16_hipblaslt
+    group: gemm_bf16
+    script: bench_gemm_turbo.py
+    args: [--dtype, bf16]
+    output: gemm_hipblaslt_benchmark.csv
+
+  - label: gemm_bf16_triton
+    group: gemm_bf16
+    script: bench_gemm_turbo.py
+    args: [--dtype, bf16]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
+    output: gemm_triton_benchmark.csv
+
+  # ── GEMM FP8 Tensorwise ──────────────────────────────────
+  - label: gemm_fp8_tensorwise_torch
+    group: gemm_fp8
+    script: bench_gemm_torch.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    output: gemm_fp8_tensorwise_torch_benchmark.csv
+
+  - label: gemm_fp8_tensorwise_te
+    group: gemm_fp8
+    script: bench_gemm_te.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    output: gemm_fp8_tensorwise_te_benchmark.csv
+
+  - label: gemm_fp8_tensorwise_hipblaslt
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: HIPBLASLT}
+    output: gemm_fp8_tensorwise_hipblaslt_benchmark.csv
+
+  - label: gemm_fp8_tensorwise_ck
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
+    output: gemm_fp8_tensorwise_ck_benchmark.csv
+
+  - label: gemm_fp8_tensorwise_triton
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
+    output: gemm_fp8_tensorwise_triton_benchmark.csv
+
+  - label: gemm_fp8_tensorwise_autotune
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
+    output: gemm_fp8_tensorwise_autotune_benchmark.csv
+
+  # ── GEMM FP8 Rowwise ─────────────────────────────────────
+  - label: gemm_fp8_rowwise_ck
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, rowwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
+    output: gemm_fp8_rowwise_ck_benchmark.csv
+
+  - label: gemm_fp8_rowwise_triton
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, rowwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
+    output: gemm_fp8_rowwise_triton_benchmark.csv
+
+  # ── GEMM FP8 Blockwise ───────────────────────────────────
+  - label: gemm_fp8_blockwise_ck
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, blockwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
+    output: gemm_fp8_blockwise_ck_benchmark.csv
+
+  - label: gemm_fp8_blockwise_triton
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, blockwise]
+    env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
+    output: gemm_fp8_blockwise_triton_benchmark.csv
+
+  # ── Grouped GEMM BF16 ────────────────────────────────────
+  - label: grouped_gemm_bf16_te
+    group: grouped_gemm_bf16
+    script: bench_grouped_gemm_te.py
+    args: [--dtype, bf16]
+    output: grouped_gemm_te_benchmark.csv
+
+  - label: grouped_gemm_bf16_hipblaslt
+    group: grouped_gemm_bf16
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, bf16]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: HIPBLASLT}
+    output: grouped_gemm_hipblaslt_benchmark.csv
+
+  - label: grouped_gemm_bf16_ck
+    group: grouped_gemm_bf16
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, bf16]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
+    output: grouped_gemm_ck_benchmark.csv
+
+  - label: grouped_gemm_bf16_triton
+    group: grouped_gemm_bf16
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, bf16]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
+    output: grouped_gemm_triton_benchmark.csv
+
+  - label: grouped_gemm_bf16_autotune
+    group: grouped_gemm_bf16
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, bf16]
+    env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
+    output: grouped_gemm_autotune_benchmark.csv
+
+  # ── Grouped GEMM FP8 Tensorwise ──────────────────────────
+  - label: grouped_gemm_fp8_tensorwise_te
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_te.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    output: grouped_gemm_fp8_tensorwise_te_benchmark.csv
+
+  - label: grouped_gemm_fp8_tensorwise_hipblaslt
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: HIPBLASLT}
+    output: grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv
+
+  - label: grouped_gemm_fp8_tensorwise_ck
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
+    output: grouped_gemm_fp8_tensorwise_ck_benchmark.csv
+
+  - label: grouped_gemm_fp8_tensorwise_triton
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
+    output: grouped_gemm_fp8_tensorwise_triton_benchmark.csv
+
+  - label: grouped_gemm_fp8_tensorwise_autotune
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise]
+    env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
+    output: grouped_gemm_fp8_tensorwise_autotune_benchmark.csv
+
+  # ── Grouped GEMM FP8 Rowwise ─────────────────────────────
+  - label: grouped_gemm_fp8_rowwise_ck
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, rowwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
+    output: grouped_gemm_fp8_rowwise_ck_benchmark.csv
+
+  - label: grouped_gemm_fp8_rowwise_triton
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, rowwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
+    output: grouped_gemm_fp8_rowwise_triton_benchmark.csv
+
+  # ── Grouped GEMM FP8 Blockwise ───────────────────────────
+  - label: grouped_gemm_fp8_blockwise_ck
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, blockwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
+    output: grouped_gemm_fp8_blockwise_ck_benchmark.csv
+
+  - label: grouped_gemm_fp8_blockwise_triton
+    group: grouped_gemm_fp8
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, blockwise]
+    env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
+    output: grouped_gemm_fp8_blockwise_triton_benchmark.csv
+
+  # ── DeepEP (multi-GPU, placed last) ──────────────────────
+  - label: deep_ep_intranode
+    group: deepep
+    script: bench_deepep_intranode.py
+    args: [--backend, turbo]
+    output: deep_ep_intranode_turbo_benchmark.csv
+    gpus: 8
