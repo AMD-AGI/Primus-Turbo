@@ -10,6 +10,7 @@ from setuptools import find_packages, setup
 
 from tools.build_ext import TurboBuildExt, _join_rocm_home
 from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
+from tools.precompiled import use_precompiled_wheel
 
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 
@@ -386,25 +387,29 @@ def build_jax_extension():
 
 
 if __name__ == "__main__":
-    # Initialize submodules
-    check_submodules()
+    skip_build = use_precompiled_wheel()
 
-    # set cxx
-    setup_cxx_env()
+    if not skip_build:
+        check_submodules()
+        setup_cxx_env()
 
-    # Extensions
-    kernels_ext = build_kernels_extension()
+    if skip_build:
+        kernels_ext = None
+        torch_ext = None
+        jax_ext = None
+    else:
+        kernels_ext = build_kernels_extension()
+        torch_ext = build_torch_extension()
+        jax_ext = build_jax_extension()
 
-    torch_ext = build_torch_extension()
-    jax_ext = build_jax_extension()
-    ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]
+    ext_modules = [e for e in (kernels_ext, torch_ext, jax_ext) if e is not None]
 
-    # Entry points and Install Requires
     entry_points = {}
     install_requires = []
 
-    # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
-    if torch_ext is not None and not is_package_installed("amd-aiter"):
+    # amd-aiter is a runtime dep when torch_ext is built OR when using a precompiled wheel with PYTORCH enabled
+    needs_aiter = (torch_ext is not None) or (skip_build and BUILD_TORCH)
+    if needs_aiter and not is_package_installed("amd-aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
     else:
