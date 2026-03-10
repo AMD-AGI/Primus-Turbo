@@ -133,7 +133,6 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, padding_align_siz
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -212,7 +211,6 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -292,7 +290,6 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -342,7 +339,6 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -401,6 +397,11 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
 @pytest.mark.parametrize("use_2d_block", [True, False])
 @pytest.mark.parametrize("use_sr", [True, False])
 def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block, use_sr):
+    # Skip unit test on gfx942.
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
     if use_sr:
         # FIXME(ruibin): Stochastic rounding has numerical issues in quantize_mxfp4_dual_shuffle kernel.
         pytest.skip("SR is not supported for shuffled FP4.")
@@ -454,8 +455,6 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)

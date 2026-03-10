@@ -8,7 +8,11 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import (
+    MX_BLOCK_SIZE,
+    MXScalingRecipe,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -17,13 +21,10 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
-    quantize_mxfp4_shuffle_impl,
     quantize_mxfp8_impl,
 )
 
 __all__ = ["quantize_fp8", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
-
-MX_BLOCK_SIZE = 32
 
 
 def quantize_fp8(
@@ -218,30 +219,16 @@ def quantize_fp4_with_trans(
         assert scale is None, "The scale is not supported for MXFP4 quantization"
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP4 quantization"
 
-        if (scaling_recipe.shuffle_scale or scaling_recipe.shuffle_output) or (
-            scaling_recipe_for_trans.shuffle_scale or scaling_recipe_for_trans.shuffle_output
-        ):
-            return quantize_mxfp4_shuffle_impl(
-                x,
-                out_dtype,
-                axis,
-                block_size,
-                padding_align_size,
-                True,
-                scaling_recipe,
-                scaling_recipe_for_trans,
-            )
-        else:
-            return quantize_mxfp4_impl(
-                x,
-                out_dtype,
-                axis,
-                block_size,
-                padding_align_size,
-                True,
-                scaling_recipe,
-                scaling_recipe_for_trans,
-            )
+        return quantize_mxfp4_impl(
+            x,
+            out_dtype,
+            axis,
+            block_size,
+            padding_align_size,
+            True,
+            scaling_recipe,
+            scaling_recipe_for_trans,
+        )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
