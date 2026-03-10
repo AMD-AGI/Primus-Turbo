@@ -246,12 +246,8 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
         )
 
         mi_dim = _infer_mi_dim(hardware, elem_bits_a, elem_bits_b)
-        block_mn_range = [128, 256]
-        block_k_range = [64, 128, 256, 512]
-        if hardware.N_CU in (304, 80, 64) and max(elem_bits_a, elem_bits_b) == 8:
-            block_mn_range = block_mn_range + [512]
-            block_k_range = block_k_range + [128, 256]
-
+        block_mn_range = [64, 128, 256]
+        block_k_range = [64, 128, 256]
         valid_tiles = _get_valid_tiles(
             hardware, block_mn_range, block_k_range, mi_dim, elem_bytes_a, elem_bytes_b
         )
