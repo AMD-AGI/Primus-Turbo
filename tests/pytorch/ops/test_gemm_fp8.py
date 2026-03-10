@@ -349,9 +349,31 @@ def test_gemm_fp8_rowwise_deterministic(m, n, k, layout, format, dtype, backend)
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [BackendType.CK])
 @pytest.mark.deterministic
 def test_gemm_fp8_blockwise_deterministic(m, n, k, layout, format, dtype, backend):
+    _run_gemm_fp8_deterministic_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        block_size=128,
+    )
+
+
+@pytest.mark.parametrize("m", [257])
+@pytest.mark.parametrize("n", [4096])
+@pytest.mark.parametrize("k", [1024, 4096])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [BackendType.TRITON])
+@pytest.mark.deterministic
+def test_gemm_fp8_blockwise_triton_deterministic(m, n, k, layout, format, dtype, backend):
     _run_gemm_fp8_deterministic_test(
         m=m,
         n=n,

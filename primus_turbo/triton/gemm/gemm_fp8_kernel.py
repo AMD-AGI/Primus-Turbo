@@ -37,10 +37,10 @@ import triton
 import triton.language as tl
 
 from primus_turbo.triton.gemm.gemm_kernel import (
-    _AUTOTUNE_MN_THRESHOLD,
     NUM_XCDS,
     _chiplet_transform_chunked,
     _get_num_cus,
+    _select_params_origami,
     compute_sk_grid,
 )
 
@@ -66,43 +66,6 @@ def _set_amd_knobs(enable: bool = True):
 # ###########################################################################
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tensorwise FP8 autotune configs
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _get_fp8_autotune_configs():
-    """FP8 autotune configs — 4 total, pruned to 2 by layout.
-
-    Hardcoded from 98-entry exhaustive tuning:
-      - waves_per_eu=0 (85% of cases)
-      - GROUP_SIZE_M: computed by heuristic, passed directly
-
-    Autotuned:
-      - BLOCK_SIZE_K ∈ {64, 128}
-      - CHUNK_SIZE ∈ {32, 64}
-
-    Total: 4 configs.
-    """
-    configs = []
-    for blk_k in [64, 128]:
-        for chunk in [32, 64]:
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_SIZE_K": blk_k,
-                        "CHUNK_SIZE": chunk,
-                        "waves_per_eu": 0,
-                        "matrix_instr_nonkdim": 16,
-                        "kpack": 1,
-                    },
-                    num_warps=8,
-                    num_stages=2,
-                )
-            )
-    return configs
-
-
 def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
     """Deterministic GROUP_SIZE_M from FP8 tuning data.
 
@@ -125,29 +88,6 @@ def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
         return 5
     else:
         return 4
-
-
-def _prune_fp8_configs(configs, named_args, **kwargs):
-    """Prune BLOCK_SIZE_K by layout — deterministic from tuning data.
-
-    Rules:
-    1. TT (stride_ak==1, stride_bk!=1): always BLK_K=64 → remove 128
-       (100% of TT cases in tuning used BLK_K=64)
-    2. TN / NT: keep both BLK_K=64 and 128, let autotune decide
-       (TN: 91% use 128, but 3 cases need 64 → autotune is safest)
-    """
-    stride_ak = kwargs.get("stride_ak", named_args.get("stride_ak", None))
-    stride_bk = kwargs.get("stride_bk", named_args.get("stride_bk", None))
-
-    is_TT = stride_ak == 1 and stride_bk is not None and stride_bk != 1
-
-    pruned = []
-    for cfg in configs:
-        bk = cfg.kwargs["BLOCK_SIZE_K"]
-        if is_TT and bk == 128:
-            continue
-        pruned.append(cfg)
-    return pruned if pruned else configs
 
 
 @triton.jit()
@@ -268,15 +208,6 @@ def _fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-_fp8_persistent_gemm_kernel_autotuned = triton.autotune(
-    configs=_get_fp8_autotune_configs(),
-    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
-    prune_configs_by={"early_config_prune": _prune_fp8_configs},
-    warmup=20,
-    rep=80,
-)(_fp8_persistent_gemm_kernel)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tensorwise FP8 GEMM Public API
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -346,12 +277,22 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Heuristic GROUP_SIZE_M (FP8-specific, not autotuned)
+    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
+    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
+    block_m, block_n, block_k = 256, 256, blk_k
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
+    chunk_size = 32
+    waves_per_eu = 0
+    origami_params = _select_params_origami(
+        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
+    )
+    if origami_params is not None:
+        om, on, ok, ogm, ochunk, owpe = origami_params
+        if (om, on, ok) == (block_m, block_n, block_k):
+            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
 
     num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, 256, 256, 64, num_cus)
-
+    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
     args = (
         A_view,
         B_view,
@@ -366,46 +307,27 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cm,
         stride_cn,
     )
-
-    if M * N > _AUTOTUNE_MN_THRESHOLD:
-        # Large problem: skip autotune to avoid OOM, use default config
-        blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-        even_k = K % blk_k == 0
-        _fp8_persistent_gemm_kernel[(num_sms,)](
-            *args,
-            stride_ak=s_ak,
-            stride_bk=s_bk,
-            BLOCK_SIZE_M=256,
-            BLOCK_SIZE_N=256,
-            BLOCK_SIZE_K=blk_k,
-            GROUP_SIZE_M=group_m,
-            NUM_SMS=num_sms,
-            NUM_XCDS=NUM_XCDS,
-            CHUNK_SIZE=32,
-            EVEN_K=even_k,
-            CACHE_MODIFIER_A=".ca",
-            CACHE_MODIFIER_B=".ca",
-            num_warps=8,
-            num_stages=2,
-            waves_per_eu=0,
-            matrix_instr_nonkdim=16,
-            kpack=1,
-        )
-    else:
-        even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
-        _fp8_persistent_gemm_kernel_autotuned[(num_sms,)](
-            *args,
-            stride_ak=s_ak,
-            stride_bk=s_bk,
-            BLOCK_SIZE_M=256,
-            BLOCK_SIZE_N=256,
-            GROUP_SIZE_M=group_m,
-            NUM_SMS=num_sms,
-            NUM_XCDS=NUM_XCDS,
-            EVEN_K=even_k,
-            CACHE_MODIFIER_A=".ca",
-            CACHE_MODIFIER_B=".ca",
-        )
+    even_k = K % block_k == 0
+    _fp8_persistent_gemm_kernel[(num_sms,)](
+        *args,
+        stride_ak=s_ak,
+        stride_bk=s_bk,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        GROUP_SIZE_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK_SIZE=chunk_size,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=8,
+        num_stages=2,
+        waves_per_eu=waves_per_eu,
+        matrix_instr_nonkdim=16,
+        kpack=1,
+    )
     return out
 
 
@@ -547,15 +469,6 @@ def _fp8_rowwise_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-_fp8_rowwise_persistent_gemm_kernel_autotuned = triton.autotune(
-    configs=_get_fp8_autotune_configs(),
-    key=["M", "N", "K", "GROUP_SIZE_M", "NUM_SMS", "EVEN_K", "stride_ak", "stride_bk"],
-    prune_configs_by={"early_config_prune": _prune_fp8_configs},
-    warmup=20,
-    rep=80,
-)(_fp8_rowwise_persistent_gemm_kernel)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rowwise FP8 GEMM Public API
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -632,11 +545,22 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Heuristic GROUP_SIZE_M (reuse FP8 heuristic)
+    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
+    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
+    block_m, block_n, block_k = 256, 256, blk_k
     group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
+    chunk_size = 32
+    waves_per_eu = 0
+    origami_params = _select_params_origami(
+        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
+    )
+    if origami_params is not None:
+        om, on, ok, ogm, ochunk, owpe = origami_params
+        if (om, on, ok) == (block_m, block_n, block_k):
+            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
 
     num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, 256, 256, 64, num_cus)
+    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
 
     args = (
         A_view,
@@ -652,46 +576,27 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cm,
         stride_cn,
     )
-
-    if M * N > _AUTOTUNE_MN_THRESHOLD:
-        # Large problem: skip autotune to avoid OOM, use default config
-        blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-        even_k = K % blk_k == 0
-        _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
-            *args,
-            stride_ak=s_ak,
-            stride_bk=s_bk,
-            BLOCK_SIZE_M=256,
-            BLOCK_SIZE_N=256,
-            BLOCK_SIZE_K=blk_k,
-            GROUP_SIZE_M=group_m,
-            NUM_SMS=num_sms,
-            NUM_XCDS=NUM_XCDS,
-            CHUNK_SIZE=32,
-            EVEN_K=even_k,
-            CACHE_MODIFIER_A=".ca",
-            CACHE_MODIFIER_B=".ca",
-            num_warps=8,
-            num_stages=2,
-            waves_per_eu=0,
-            matrix_instr_nonkdim=16,
-            kpack=1,
-        )
-    else:
-        even_k = K % 128 == 0  # Safe for both BLK_K=64 and 128
-        _fp8_rowwise_persistent_gemm_kernel_autotuned[(num_sms,)](
-            *args,
-            stride_ak=s_ak,
-            stride_bk=s_bk,
-            BLOCK_SIZE_M=256,
-            BLOCK_SIZE_N=256,
-            GROUP_SIZE_M=group_m,
-            NUM_SMS=num_sms,
-            NUM_XCDS=NUM_XCDS,
-            EVEN_K=even_k,
-            CACHE_MODIFIER_A=".ca",
-            CACHE_MODIFIER_B=".ca",
-        )
+    even_k = K % block_k == 0
+    _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
+        *args,
+        stride_ak=s_ak,
+        stride_bk=s_bk,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        GROUP_SIZE_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK_SIZE=chunk_size,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=8,
+        num_stages=2,
+        waves_per_eu=waves_per_eu,
+        matrix_instr_nonkdim=16,
+        kpack=1,
+    )
     return out
 
 

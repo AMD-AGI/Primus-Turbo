@@ -32,6 +32,11 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 AITER_COMMIT = "512cd4c65ff7841edac9ec594d859d415c76e819"
 
+# ---------- ORIGAMI (rocm-libraries) ------------
+# Pin to commit. Installed during build via clone + pip install (avoids pip resolution
+# ordering issue with scikit-build-core when using --no-build-isolation).
+ORIGAMI_COMMIT = "01abf3db57f692c7ff70200b0697ed10335fb1e3"
+
 # -------------------------------------
 
 
@@ -396,6 +401,15 @@ if __name__ == "__main__":
         install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
     else:
         print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
+
+    # Conditionally add origami if torch_ext is being built and origami is not already installed
+    if torch_ext is not None and not is_package_installed("origami"):
+        print("[Primus-Turbo Setup] origami not found, will be installed automatically.")
+        install_requires.append(
+            f"origami @ git+https://github.com/ROCm/rocm-libraries.git@{ORIGAMI_COMMIT}#subdirectory=shared/origami/python"
+        )
+    else:
+        print("[Primus-Turbo Setup] Skipping origami installation.")
 
     if BUILD_JAX:
         entry_points["jax_plugins"] = ["primus_turbo = primus_turbo.jax"]
