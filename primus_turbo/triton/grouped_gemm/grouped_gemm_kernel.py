@@ -22,18 +22,18 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
+
+from primus_turbo.triton.gemm.gemm_kernel import _select_params_origami
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants (lazy init)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NUM_XCDS = 8
-_NUM_CUS: Optional[int] = None
+_NUM_CUS: int | None = None
 
 
 def _get_num_cus() -> int:
@@ -278,10 +278,31 @@ def grouped_gemm_triton_kernel(
     # Output
     out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
 
-    # Kernel config
+    # Kernel config — origami analytical selection
     num_sms = _get_num_cus()
-    even_k = K % 64 == 0
-    group_m = 4  # Default GROUP_SIZE_M for grouped GEMM
+    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    group_m = 4
+    cache_a, cache_b = ".ca", ".ca"
+
+    avg_m = max(M_total // max(G, 1), 256)
+    origami_params = _select_params_origami(
+        avg_m,
+        N,
+        K,
+        a.dtype,
+        a.dtype,
+        b.dtype,
+        trans_a=False,
+        trans_b=trans_b,
+    )
+    if origami_params is not None:
+        om, on, ok, ogm, oc_a, oc_b = origami_params
+        if ogm >= 2 and om * on >= 256 * 256:
+            BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = om, on, ok, ogm, oc_a, oc_b
+
+    even_k = K % BLOCK_K == 0
+    chunk_size = group_m * group_m
+    chunk_size = min(chunk_size, max(1, num_sms // NUM_XCDS))
 
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
@@ -298,19 +319,19 @@ def grouped_gemm_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
         GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -513,6 +534,31 @@ def grouped_gemm_variable_k_triton_kernel(
     num_sms = _get_num_cus()
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
+    # Origami selection: CRR (trans_a=True, trans_b=False), K = avg M_g
+    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    group_m = 4
+    cache_a, cache_b = ".ca", ".ca"
+
+    M_total = lhs.shape[0]
+    avg_k = max(M_total // max(G, 1), 64)
+    origami_params = _select_params_origami(
+        OUT_M,
+        OUT_N,
+        avg_k,
+        lhs.dtype,
+        lhs.dtype,
+        rhs.dtype,
+        trans_a=True,
+        trans_b=False,
+    )
+    if origami_params is not None:
+        om, on, ok, ogm, oc_a, oc_b = origami_params
+        if ogm >= 2 and om * on >= 256 * 256:
+            BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = om, on, ok, ogm, oc_a, oc_b
+
+    chunk_size = group_m * group_m
+    chunk_size = min(chunk_size, max(1, num_sms // NUM_XCDS))
+
     _grouped_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
@@ -530,19 +576,19 @@ def grouped_gemm_variable_k_triton_kernel(
         out.stride(2),
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=4,
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
+        GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         IS_FP8=False,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
