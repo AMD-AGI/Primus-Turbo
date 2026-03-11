@@ -39,6 +39,8 @@ import triton.language as tl
 from primus_turbo.triton.gemm.gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
+    _compute_sk_grid,
+    _get_hardware,
     _select_params_origami,
 )
 
@@ -64,28 +66,62 @@ def _set_amd_knobs(enable: bool = True):
 # ###########################################################################
 
 
-def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
-    """Deterministic GROUP_SIZE_M from FP8 tuning data.
+def offline_select_fp8(M, N, K, s_ak, s_bk):
+    """FP8 config selection from MI300X bench data (out_fp8_gemm_persistent_full.yaml, 184 entries).
 
-    FP8 patterns:
-    - min_tile < 16 (non-standard dims like 3584): GROUP=8
-    - TT layout (stride_ak!=1, stride_bk==1) + tiles > 256: GROUP=5
-    - Default (including TN): GROUP=4
-      (29/32 FP8 TN entries use GROUP=4)
+    Stride → layout:
+      TN (trans_a=False, trans_b=True):  s_ak=1, s_bk=1   → C = A @ B^T
+      TT (trans_a=False, trans_b=False): s_ak=1, s_bk≠1   → C = A @ B
+      NT (trans_a=True,  trans_b=False): s_ak≠1, s_bk≠1   → C = A^T @ B
+
+    Returns (BM, BN, BK, GM, NUM_SMS, CHUNK, CA, CB).
     """
+    is_tn = s_ak == 1 and s_bk == 1
+
     tiles_m = (M + 255) // 256
     tiles_n = (N + 255) // 256
+
+    # ── Block sizes (97% = 256×256, BK depends on layout) ──
+    BM, BN = 256, 256
+    BK = 128 if is_tn else 64  # TN→128 (84%), TT→64 (100%), NT→64 (91%)
+
+    # TN with N≈3584 (tiles_n≤14) + M≥8192 (tiles_m≥32): 128×128×128
+    # quadruples tile count for CU utilisation (448→1792)
+    if is_tn and tiles_n <= 14 and tiles_m >= 32:
+        BM, BN, BK = 128, 128, 128
+
+    # Recalculate tiles with actual block sizes
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
     total_tiles = tiles_m * tiles_n
-    min_tile = min(tiles_m, tiles_n)
 
-    is_tt = (stride_ak != 1) and (stride_bk == 1)
+    cu_count = _get_hardware().N_CU
 
-    if min_tile < 16:
-        return 8
-    elif is_tt and total_tiles > 256:
-        return 5
+    # ── NUM_SMS ──
+    # tiles <= ~5 waves (cu*5): sk_grid for wave efficiency
+    # tiles > ~5 waves: data-parallel (avoids regression at tiles>=1792)
+    if total_tiles <= cu_count * 5:
+        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
     else:
-        return 4
+        num_sms = total_tiles
+
+    # ── GROUP_SIZE_M ──
+    # small tiles: GM=8 (87%); TN large: GM=4 (62%); TT/NT large: GM=5 (68-75%)
+    if min(tiles_m, tiles_n) < 16:
+        group_m = 8
+    elif is_tn:
+        group_m = 4
+    else:
+        group_m = 5
+
+    # ── CHUNK_SIZE ──
+    # persistent mode benefits from smaller chunks; data-parallel prefers 64
+    if num_sms < total_tiles:
+        chunk = min(32, max(1, num_sms // NUM_XCDS))
+    else:
+        chunk = 64
+
+    return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
 
 
 @triton.jit()
@@ -275,11 +311,9 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: origami or heuristic (align with TensorAtlas)
-    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-    block_m, block_n, block_k = 256, 256, blk_k
-    group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    cache_a, cache_b = None, None
+    block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+        M, N, K, s_ak, s_bk
+    )
     origami_params = _select_params_origami(
         M,
         N,
@@ -291,15 +325,12 @@ def gemm_fp8_tensorwise_triton_kernel(
         trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, cache_a, cache_b = origami_params
+        om, on, ok, ogm, oca, ocb = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
             group_m = ogm
+            cache_a = oca
+            cache_b = ocb
 
-    # Data-parallel launch (align with TensorAtlas ops/matmul.py)
-    total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
-    total_programs = total_tiles
-    chunk_size = group_m * group_m
-    chunk_size = min(chunk_size, max(1, total_programs // NUM_XCDS))
     args = (
         A_view,
         B_view,
@@ -315,7 +346,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
-    _fp8_persistent_gemm_kernel[(total_tiles,)](
+    _fp8_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
         stride_bk=s_bk,
@@ -323,7 +354,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=group_m,
-        NUM_SMS=total_programs,
+        NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
@@ -552,11 +583,9 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: origami or heuristic (align with TensorAtlas)
-    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-    block_m, block_n, block_k = 256, 256, blk_k
-    group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    cache_a, cache_b = None, None
+    block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+        M, N, K, s_ak, s_bk
+    )
     origami_params = _select_params_origami(
         M,
         N,
@@ -568,15 +597,11 @@ def gemm_fp8_rowwise_triton_kernel(
         trans_b=trans_b,
     )
     if origami_params is not None:
-        om, on, ok, ogm, cache_a, cache_b = origami_params
+        om, on, ok, ogm, oca, ocb = origami_params
         if (om, on, ok) == (block_m, block_n, block_k):
             group_m = ogm
-
-    # Data-parallel launch (align with TensorAtlas ops/matmul.py)
-    total_tiles = ((M + block_m - 1) // block_m) * ((N + block_n - 1) // block_n)
-    total_programs = total_tiles
-    chunk_size = group_m * group_m
-    chunk_size = min(chunk_size, max(1, total_programs // NUM_XCDS))
+            cache_a = oca
+            cache_b = ocb
 
     args = (
         A_view,
@@ -593,7 +618,7 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
-    _fp8_rowwise_persistent_gemm_kernel[(total_tiles,)](
+    _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
         stride_bk=s_bk,
@@ -601,7 +626,7 @@ def gemm_fp8_rowwise_triton_kernel(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=group_m,
-        NUM_SMS=total_programs,
+        NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
