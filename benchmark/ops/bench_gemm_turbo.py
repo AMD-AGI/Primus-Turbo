@@ -351,6 +351,8 @@ def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", outpu
         timestamp = datetime.now().strftime("%Y%m%d")
         if is_fp8:
             filename = f"gemm_turbo_fp8_{granularity_name}_{timestamp}_{gpu_name}.csv"
+        elif is_fp4:
+            filename = f"gemm_turbo_fp4_{granularity_name}_{timestamp}_{gpu_name}.csv"
         else:
             filename = f"gemm_turbo_bf16_{timestamp}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
