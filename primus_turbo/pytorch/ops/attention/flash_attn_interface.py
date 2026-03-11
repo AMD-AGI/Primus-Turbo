@@ -138,22 +138,16 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
 
         dout_padded = dout
-        v_padded = v
-
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
-        if head_size_q_og != head_size_v_og:
-            v_padded = torch.nn.functional.pad(v_padded, [0, head_size_q_og - head_size_v_og])
-            out_padded = torch.nn.functional.pad(out_padded, [0, head_size_q_og - head_size_v_og])
-            dout_padded = torch.nn.functional.pad(dout, [0, head_size_q_og - head_size_v_og])
 
-        dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v_padded)
+        dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
 
         attention_aiter_backward_impl(
             dout=dout_padded,
             q=q,
             k=k,
-            v=v_padded,
+            v=v,
             out=out_padded,
             softmax_lse=softmax_lse,
             dq=dq,
