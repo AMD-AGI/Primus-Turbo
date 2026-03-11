@@ -8,7 +8,11 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import (
+    MX_BLOCK_SIZE,
+    MXScalingRecipe,
+    ScalingGranularity,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -21,8 +25,6 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 
 __all__ = ["quantize_fp8", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
-
-MX_BLOCK_SIZE = 32
 
 
 def quantize_fp8(

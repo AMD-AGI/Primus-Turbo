@@ -575,7 +575,7 @@ def quantize_mxfp4_impl(
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    # NOTE: quantize fp4 kernel use the ISA which only avaiable on cdna4.
+    # NOTE: quantize fp4 kernel use the ISA which only available on cdna4.
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
 
@@ -595,6 +595,39 @@ def quantize_mxfp4_impl(
     assert (
         out_dtype == torch.float4_e2m1fn_x2
     ), f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
+
+    if (scaling_recipe.shuffle_scale or scaling_recipe.shuffle_output) or (
+        scaling_recipe_for_trans.shuffle_scale or scaling_recipe_for_trans.shuffle_output
+    ):
+        # NOTE: Disptach to quantize mxfp4 with shuffle
+
+        assert with_trans == True, "The with_trans must be True."
+        assert padding_align_size is None, "The padding_align_size must be None."
+        assert axis is None, "The axis must be None when with_trans is True."
+
+        scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
+        scaling_recipe_for_trans = (
+            MXScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+
+        y_rowwise, y_rowwise_scale, y_colwise, y_colwise_scale = (
+            torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual_shuffle(
+                x,
+                out_dtype,
+                scaling_recipe.shuffle_scale,
+                scaling_recipe.shuffle_output,
+                scaling_recipe.use_2d_block,
+                scaling_recipe.use_sr,
+                scaling_recipe.use_rht,
+                scaling_recipe_for_trans.shuffle_scale,
+                scaling_recipe_for_trans.shuffle_output,
+                scaling_recipe_for_trans.use_2d_block,
+                scaling_recipe_for_trans.use_sr,
+                scaling_recipe_for_trans.use_rht,
+            )
+        )
+
+        return (y_rowwise, y_rowwise_scale, y_colwise, y_colwise_scale)
 
     num_rows, row_length = x.size()
 

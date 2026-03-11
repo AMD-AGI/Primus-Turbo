@@ -138,16 +138,26 @@ class MXScalingRecipe:
 
     - use_2d_block: Whether to use 2D block in quantization. Available in MXFP8 and MXFP4.
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
+    - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
+    - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.
+    - shuffle_output: Whether to shuffle the output tensor. Available in MXFP4.
     - philox_seed: The philox generator's seed for the stochastic rounding. Available in MXFP4.
     - philox_offset: The philox generator's offset for the stochastic rounding. Available in MXFP4.
-    - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     """
 
     use_2d_block: bool = False
     use_sr: bool = False
+    use_rht: bool = False
+
     philox_seed: Optional[int] = None
     philox_offset: Optional[int] = None
-    use_rht: bool = False
+
+    # Memory Layout Shuffle
+    shuffle_scale: bool = False
+    shuffle_output: bool = False
+
+
+MX_BLOCK_SIZE = 32
 
 
 @dataclass
@@ -163,7 +173,7 @@ class Float8QuantConfig:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
-            mx_support_block_size = [32]
+            mx_support_block_size = [MX_BLOCK_SIZE]
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
@@ -187,7 +197,7 @@ class Float4QuantConfig:
             self.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
 
-        mx_support_block_size = [32]
+        mx_support_block_size = [MX_BLOCK_SIZE]
         assert (
             self.block_size in mx_support_block_size
         ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
