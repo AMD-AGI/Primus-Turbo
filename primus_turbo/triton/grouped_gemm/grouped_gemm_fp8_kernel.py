@@ -34,6 +34,7 @@ import torch
 import triton
 import triton.language as tl
 
+from primus_turbo.triton.gemm.gemm_kernel import _select_params_origami
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
@@ -51,6 +52,36 @@ def _set_amd_knobs(enable: bool = True):
     if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
         triton.knobs.amd.use_async_copy = enable
         triton.knobs.amd.scalarize_packed_fops = enable
+
+
+def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
+    """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
+
+    Returns (BM, BN, BK, GM, NUM_SMS, CHUNK, CA, CB).
+    """
+    is_tn = s_ak == 1 and s_bk == 1
+    avg_m = max(M_total // max(G, 1), 1)
+
+    BM, BN = 256, 256
+    BK = 128 if is_tn else 64
+
+    tiles_m_g = max(1, (avg_m + BM - 1) // BM)
+    tiles_n = (N + BN - 1) // BN
+    tiles_m_total = (M_total + BM - 1) // BM
+    total_tiles = tiles_m_total * tiles_n
+
+    if min(tiles_m_g, tiles_n) < 16:
+        group_m = 8
+    elif is_tn:
+        group_m = 4
+    else:
+        group_m = 5
+
+    cu_count = _get_num_cus()
+    num_sms = min(total_tiles, cu_count)
+    chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
+
+    return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
 
 
 # ###########################################################################
@@ -270,15 +301,29 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # Output
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
-    # Kernel config (fixed, no autotune)
-    num_sms = _get_num_cus()
-    blk_k = 128 if (stride_ak == 1 and stride_bk == 1) else 64
-    even_k = K % blk_k == 0
+    # Kernel config — grouped GEMM FP8 offline selection
+    blk_m, blk_n, blk_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_gg_fp8(
+        M_total, G, N, K, stride_ak, stride_bk
+    )
+    avg_m = max(M_total // max(G, 1), 256)
+    origami_params = _select_params_origami(
+        avg_m,
+        N,
+        K,
+        out_dtype,
+        a.dtype,
+        b.dtype,
+        trans_a=False,
+        trans_b=trans_b,
+    )
+    if origami_params is not None:
+        om, on, ok, ogm, oca, ocb = origami_params
+        if (om, on, ok) == (blk_m, blk_n, blk_k):
+            group_m = ogm
+            cache_a = oca
+            cache_b = ocb
 
-    # GROUP_SIZE_M heuristic
-    tiles_m_per_group = (M_total + G * 256 - 1) // (G * 256)
-    tiles_n = (N + 255) // 256
-    group_m = 8 if min(tiles_m_per_group, tiles_n) < 16 else 4
+    even_k = K % blk_k == 0
 
     _grouped_fp8_persistent_gemm_kernel[(num_sms,)](
         a,
@@ -297,16 +342,16 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_M=blk_m,
+        BLOCK_SIZE_N=blk_n,
         BLOCK_SIZE_K=blk_k,
         GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
         waves_per_eu=0,
