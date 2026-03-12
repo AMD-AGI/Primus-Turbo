@@ -301,8 +301,7 @@ def grouped_gemm_triton_kernel(
             BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = om, on, ok, ogm, oc_a, oc_b
 
     even_k = K % BLOCK_K == 0
-    chunk_size = group_m * group_m
-    chunk_size = min(chunk_size, max(1, num_sms // NUM_XCDS))
+    chunk_size = 64 if num_sms >= NUM_XCDS * 64 else 32
 
     _grouped_bf16_persistent_gemm_kernel[(num_sms,)](
         a,
@@ -539,25 +538,7 @@ def grouped_gemm_variable_k_triton_kernel(
     group_m = 4
     cache_a, cache_b = ".ca", ".ca"
 
-    M_total = lhs.shape[0]
-    avg_k = max(M_total // max(G, 1), 64)
-    origami_params = _select_params_origami(
-        OUT_M,
-        OUT_N,
-        avg_k,
-        lhs.dtype,
-        lhs.dtype,
-        rhs.dtype,
-        trans_a=True,
-        trans_b=False,
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, oc_a, oc_b = origami_params
-        if ogm >= 2 and om * on >= 256 * 256:
-            BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = om, on, ok, ogm, oc_a, oc_b
-
-    chunk_size = group_m * group_m
-    chunk_size = min(chunk_size, max(1, num_sms // NUM_XCDS))
+    chunk_size = 64 if num_sms >= NUM_XCDS * 64 else 32
 
     _grouped_variable_k_gemm_kernel[(num_sms,)](
         lhs,
