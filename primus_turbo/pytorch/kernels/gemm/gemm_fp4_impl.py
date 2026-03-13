@@ -158,8 +158,12 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        # TODO(ruibin): Add shuffle
-        return aiter.gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
+        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale_impl(a_scale_inv)
+        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale_impl(b_scale_inv)
+        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight_impl(b)
+        return aiter.gemm_a4w4(
+            a, b_shuffled, a_scale_inv_shuffled, b_scale_inv_shuffled, dtype=out_dtype, bpreshuffle=True
+        )
 
 
 _GEMM_FP4_BACKENDS = {

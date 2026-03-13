@@ -289,6 +289,9 @@ def quant_fp8_blockwise_for_weight_impl_meta(
     return w_fp8, w_scales
 
 
+_MXFP8_PADDING_ALIGN_SIZE = 128
+
+
 def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
@@ -298,7 +301,6 @@ def quantize_mxfp8_impl(
     out_dtype: torch.dtype,
     axis: int,
     block_size: int,
-    padding_align_size: Optional[int] = None,
     with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
@@ -329,10 +331,8 @@ def quantize_mxfp8_impl(
     y_rowwise, y_colwise = None, None
     scale_inv_rowwise, scale_inv_colwise = None, None
 
-    num_rows_padding_size, row_length_padding_size = 0, 0
-    if padding_align_size is not None:
-        num_rows_padding_size = padding_size(num_rows, padding_align_size)
-        row_length_padding_size = padding_size(row_length, padding_align_size)
+    num_rows_padding_size = padding_size(num_rows, _MXFP8_PADDING_ALIGN_SIZE)
+    row_length_padding_size = padding_size(row_length, _MXFP8_PADDING_ALIGN_SIZE)
 
     if use_rowwise:
         padded_num_rows, padded_row_length = num_rows, row_length
@@ -565,12 +565,14 @@ def dequantize_mxfp8_impl(
     return y
 
 
+_MXFP4_PADDING_ALIGN_SIZE = 128
+
+
 def quantize_mxfp4_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
     axis: int,
     block_size: int,
-    padding_align_size: Optional[int] = None,
     with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
@@ -606,10 +608,8 @@ def quantize_mxfp4_impl(
     y_rowwise, y_colwise = None, None
     scale_inv_rowwise, scale_inv_colwise = None, None
 
-    num_rows_padding_size, row_length_padding_size = 0, 0
-    if padding_align_size is not None:
-        num_rows_padding_size = padding_size(num_rows, padding_align_size)
-        row_length_padding_size = padding_size(row_length, padding_align_size)
+    num_rows_padding_size = padding_size(num_rows, _MXFP4_PADDING_ALIGN_SIZE)
+    row_length_padding_size = padding_size(row_length, _MXFP4_PADDING_ALIGN_SIZE)
 
     if scaling_recipe.use_rht or scaling_recipe_for_trans.use_rht:
         hadamard_matrix = get_rht_matrix(x.dtype, x.device)
