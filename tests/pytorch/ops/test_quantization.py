@@ -366,3 +366,91 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     )
 
     torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dest_dtype",
+    [
+        turbo.float4_e2m1fn_x2,
+    ],
+)
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+@pytest.mark.parametrize("use_2d_block", [True, False])
+def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    scaling_recipe = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+    )
+    scaling_recipe_for_trans = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+    )
+
+    torch.manual_seed(42)
+
+    # x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+    x = torch.ones((B, M, N), device="cuda", dtype=orig_dtype) * 6
+    x.detach().clone()
+
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+
+    rowwise_out, rowwise_scale, colwise_out, colwise_scale = (
+        torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
+            x_2d,
+            dest_dtype,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe_for_trans.use_sr,
+            scaling_recipe_for_trans.use_rht,
+            False,
+            False,
+            False,
+            False,
+        )
+    )
+
+    rowwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(rowwise_out)
+    rowwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(rowwise_scale)
+    colwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(colwise_out)
+    colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale)
+
+    rowwise_out_shuffle_ref, rowwise_scale_shuffle_ref, colwise_out_shuffle_ref, colwise_scale_shuffle_ref = (
+        torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
+            x_2d,
+            dest_dtype,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe_for_trans.use_sr,
+            scaling_recipe_for_trans.use_rht,
+            True,
+            True,
+            True,
+            True,
+        )
+    )
+
+    torch.testing.assert_close(
+        rowwise_out_shuffle.view(torch.uint8), rowwise_out_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        rowwise_scale_shuffle.view(torch.uint8), rowwise_scale_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        colwise_out_shuffle.view(torch.uint8), colwise_out_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        colwise_scale_shuffle.view(torch.uint8), colwise_scale_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )

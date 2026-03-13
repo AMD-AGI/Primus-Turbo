@@ -88,7 +88,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_fp4_weight_kernel(
     constexpr int THREADS_PER_TILE = 16;
     constexpr int TILES_PER_BLOCK  = THREADS_PER_BLOCK / THREADS_PER_TILE;
 
-    const int K_packed    = static_cast<int>(N >> 1); // N / 2
+    const int K_packed    = static_cast<int>(N);
     const int k_blocks    = K_packed >> 5;
     const int total_tiles = static_cast<int>(M >> 4) * k_blocks;
 
@@ -129,7 +129,7 @@ void shuffle_weight(DType *weight, DType *shuffled_weight, int64_t weight_M, int
                     hipStream_t stream) {
     if constexpr (std::is_same_v<DType, float4x2_e2m1>) {
         constexpr int TILES_PER_BLOCK = THREADS_PER_BLOCK / 16;
-        int64_t       total_tiles     = (weight_M >> 4) * (weight_N >> 4) / 4;
+        int64_t       total_tiles     = (weight_M >> 4) * (weight_N >> 5);
         dim3          grid((total_tiles + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK);
         dim3          block(THREADS_PER_BLOCK);
         shuffle_fp4_weight_kernel<<<grid, block, 0, stream>>>(

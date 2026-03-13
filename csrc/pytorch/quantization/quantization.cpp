@@ -268,8 +268,8 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     int64_t    rowwise_scale_stride = 1;
     at::Tensor rowwise_scale;
     if (shuffle_rowwise_scale) {
-        rowwise_scale        = at::empty({rowwise_scale_M_pad, rowwise_scale_N_pad},
-                                         at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale = at::full({rowwise_scale_M_pad, rowwise_scale_N_pad}, E8M0_EXPONENT_BIAS,
+                                 at::TensorOptions().dtype(at::kByte).device(device));
         rowwise_scale_stride = rowwise_scale.stride(0);
     } else {
         rowwise_scale =
@@ -288,8 +288,8 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     at::Tensor colwise_scale;
     int        colwise_scale_stride = 1;
     if (shuffle_colwise_scale) {
-        colwise_scale        = at::empty({colwise_scale_M_pad, colwise_scale_N_pad},
-                                         at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale = at::full({colwise_scale_M_pad, colwise_scale_N_pad}, E8M0_EXPONENT_BIAS,
+                                 at::TensorOptions().dtype(at::kByte).device(device));
         colwise_scale_stride = colwise_scale.stride(0);
     } else {
         colwise_scale =

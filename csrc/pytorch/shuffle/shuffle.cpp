@@ -48,20 +48,20 @@ at::Tensor shuffle_weight_impl(const at::Tensor weight) {
     PRIMUS_TURBO_CHECK(weight.dim() == 2, "Weight must be 2D");
     PRIMUS_TURBO_CHECK(weight.is_contiguous(), "Weight must be contiguous");
 
-    const int64_t M = weight.size(0);
-    const int64_t N = weight.size(1);
+    int64_t M = weight.size(0);
+    int64_t N = weight.size(1);
 
     PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0, "M must be divisible by ", MXFP4_SHUFFLE_BN,
                        " for shuffled FP4. But got M=", M);
-    PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0, "N/2 must be divisible by ",
-                       MXFP4_SHUFFLE_BK, " for shuffled FP4. But got N/2=", N / 2);
+    PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BK == 0, "N must be divisible by ", MXFP4_SHUFFLE_BK,
+                       " for shuffled FP4. But got N=", N);
 
     auto device = weight.device();
     auto stream = at::cuda::getCurrentCUDAStream();
 
     // packed 2 fp4 values in N dimension
     at::Tensor shuffled_weight =
-        at::empty({M, N / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({M, N}, at::TensorOptions().dtype(at::kByte).device(device));
 
     TORCH_TYPE_SWITCH_FP4(weight.scalar_type(), DType, {
         shuffle_weight<DType>(reinterpret_cast<DType *>(weight.data_ptr()),
