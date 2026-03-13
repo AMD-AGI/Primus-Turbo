@@ -8,7 +8,6 @@
 #include "primus_turbo/elementwise/unary_kernel_template.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
-#include "primus_turbo/quantization/shuffle.cuh"
 
 namespace primus_turbo {
 

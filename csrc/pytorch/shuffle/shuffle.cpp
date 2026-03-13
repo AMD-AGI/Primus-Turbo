@@ -33,8 +33,8 @@ at::Tensor shuffle_scale_impl(const at::Tensor scale) {
         at::empty({scale_M_pad, scale_N_pad}, at::TensorOptions().dtype(at::kByte).device(device));
 
     shuffle_e8m0_scale(reinterpret_cast<uint8_t *>(scale.data_ptr()),
-                       reinterpret_cast<uint8_t *>(shuffled_scale.data_ptr()), M, N, scale_M_pad,
-                       scale_N_pad, stream);
+                       reinterpret_cast<uint8_t *>(shuffled_scale.data_ptr()), M, scale_N,
+                       scale_M_pad, scale_N_pad, stream);
 
     return shuffled_scale.view(at::kFloat8_e8m0fnu);
 }

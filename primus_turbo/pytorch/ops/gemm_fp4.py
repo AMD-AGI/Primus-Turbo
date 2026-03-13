@@ -83,7 +83,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ),
             scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=True,
-                use_sr=True,
+                use_sr=False,
                 use_rht=False,
             ),
         )
@@ -129,12 +129,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
-                use_sr=True,
+                use_sr=False,
                 use_rht=False,
             ),
             scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=False,
-                use_sr=True,
+                use_sr=False,
                 use_rht=True,
             ),
         )

@@ -11,16 +11,12 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, check_mxfp4_support
-from primus_turbo.pytorch.kernels.quantization.hadamard_transform import get_rht_matrix
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
 )
-from primus_turbo.triton.quantization.quantization_mxfp4 import (
-    dequantize_mxfp4_kernel,
-    quantize_mxfp4_kernel,
-)
+from primus_turbo.triton.quantization.quantization_mxfp4 import dequantize_mxfp4_kernel
 from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
@@ -299,7 +295,7 @@ def padding_size(n: int, padding_align_size: int) -> int:
 def quantize_mxfp8_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
-    axis: int,
+    axis: Union[int, None],
     block_size: int,
     with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
@@ -571,7 +567,7 @@ _MXFP4_PADDING_ALIGN_SIZE = 128
 def quantize_mxfp4_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
-    axis: int,
+    axis: Union[int, None],
     block_size: int,
     with_trans: bool = False,
     scaling_recipe: Optional[MXScalingRecipe] = None,
@@ -594,251 +590,30 @@ def quantize_mxfp4_impl(
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
-    assert (
-        out_dtype == torch.float4_e2m1fn_x2
-    ), f"The out dtype expect torch.float4_e2m1fn_x2 but got {out_dtype}"
-
-    num_rows, row_length = x.size()
-
-    use_rowwise = axis == 1
-    use_colwise = axis == 0
-    if with_trans:
-        use_rowwise, use_colwise = True, True
-
-    y_rowwise, y_colwise = None, None
-    scale_inv_rowwise, scale_inv_colwise = None, None
-
-    num_rows_padding_size = padding_size(num_rows, _MXFP4_PADDING_ALIGN_SIZE)
-    row_length_padding_size = padding_size(row_length, _MXFP4_PADDING_ALIGN_SIZE)
-
-    if scaling_recipe.use_rht or scaling_recipe_for_trans.use_rht:
-        hadamard_matrix = get_rht_matrix(x.dtype, x.device)
-
-    rowwise_philox_seed, rowwise_philox_offset = scaling_recipe.philox_seed, scaling_recipe.philox_offset
-    if use_rowwise:
-        padded_num_rows, padded_row_length = num_rows, row_length
-        padded_row_length += row_length_padding_size
-
-        assert (
-            padded_row_length % block_size == 0
-        ), f"The last dimension of the x tensor must be divisible by the block size but got {padded_row_length} % {block_size} != 0."
-
-        if scaling_recipe.use_2d_block:
-            assert (
-                num_rows % block_size == 0
-            ), f"The first dimension of the x tensor must be divisible by the block size when use 2D block but got {num_rows} % {block_size} != 0."
-
-        if scaling_recipe.use_sr:
-            if rowwise_philox_seed is None:
-                rowwise_philox_seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
-            if rowwise_philox_offset is None:
-                rowwise_philox_offset = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
-
-        scale_inv_rowwise_n_rows, scale_inv_rowwise_n_cols = padded_num_rows, padded_row_length // block_size
-
-        y_rowwise = torch.empty((padded_num_rows, padded_row_length // 2), dtype=torch.uint8, device=x.device)
-        scale_inv_rowwise = torch.empty(
-            scale_inv_rowwise_n_rows, scale_inv_rowwise_n_cols, dtype=torch.uint8, device=x.device
-        )
-
-        if num_rows_padding_size > 0 or row_length_padding_size > 0:
-            BLOCK_X = 64
-            BLOCK_Y = 64
-            GROUP_Y = 8
-            grid = lambda META: (
-                triton.cdiv(padded_num_rows, META["BLOCK_Y"])
-                * triton.cdiv(padded_row_length, META["BLOCK_X"]),
-            )
-            quantize_mxfp4_kernel[grid](
-                x,
-                y_rowwise,
-                None,
-                x.stride(0),
-                x.stride(1),
-                y_rowwise.stride(0),
-                y_rowwise.stride(1),
-                None,
-                None,
-                num_rows,
-                row_length,
-                padded_num_rows,
-                padded_row_length,
-                scale_inv_rowwise,
-                None,
-                scale_inv_rowwise.stride(0),
-                scale_inv_rowwise.stride(1),
-                None,
-                None,
-                scale_inv_rowwise_n_rows,
-                scale_inv_rowwise_n_cols,
-                None,
-                None,
-                hadamard_matrix if scaling_recipe.use_rht else None,
-                hadamard_matrix.size(0) if scaling_recipe.use_rht else 0,
-                rowwise_philox_seed,
-                rowwise_philox_offset,
-                None,
-                None,
-                BLOCK_X=BLOCK_X,
-                BLOCK_Y=BLOCK_Y,
-                GROUP_Y=GROUP_Y,
-                USE_ROWWISE=use_rowwise,
-                USE_COLWISE=False,
-                ROWWISE_USE_2D_BLOCK=scaling_recipe.use_2d_block,
-                COLWISE_USE_2D_BLOCK=False,
-                ROWWISE_USE_SR=scaling_recipe.use_sr,
-                COLWISE_USE_SR=False,
-                ROWWISE_USE_RHT=scaling_recipe.use_rht,
-                COLWISE_USE_RHT=False,
-                MXFP4_BLOCK_SIZE=block_size,
-            )
-
-    colwise_philox_seed, colwise_philox_offset = (
-        scaling_recipe_for_trans.philox_seed,
-        scaling_recipe_for_trans.philox_offset,
-    )
-    if use_colwise:
-        padded_num_rows, padded_row_length = num_rows, row_length
-        padded_num_rows += num_rows_padding_size
-
-        assert (
-            padded_num_rows % block_size == 0
-        ), f"The first dimension of the x tensor must be divisible by the block size but got {padded_num_rows} % {block_size} != 0."
-
-        if scaling_recipe_for_trans.use_2d_block:
-            assert (
-                padded_row_length % block_size == 0
-            ), f"The last dimension of the x tensor must be divisible by the block size when use 2D block but got {padded_row_length} % {block_size} != 0."
-
-        if scaling_recipe_for_trans.use_sr:
-            if colwise_philox_seed is None:
-                colwise_philox_seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
-            if colwise_philox_offset is None:
-                colwise_philox_offset = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
-
-        scale_inv_colwise_n_rows, scale_inv_colwise_n_cols = padded_num_rows // block_size, padded_row_length
-
-        y_colwise = torch.empty((padded_row_length, padded_num_rows // 2), dtype=torch.uint8, device=x.device)
-        scale_inv_colwise = torch.empty(
-            scale_inv_colwise_n_cols, scale_inv_colwise_n_rows, dtype=torch.uint8, device=x.device
-        )
-
-        if num_rows_padding_size > 0 or row_length_padding_size > 0:
-            BLOCK_X = 64
-            BLOCK_Y = 64
-            GROUP_Y = 8
-            grid = lambda META: (
-                triton.cdiv(padded_num_rows, META["BLOCK_Y"])
-                * triton.cdiv(padded_row_length, META["BLOCK_X"]),
-            )
-            quantize_mxfp4_kernel[grid](
-                x,
-                None,
-                y_colwise,
-                x.stride(0),
-                x.stride(1),
-                None,
-                None,
-                y_colwise.stride(0),
-                y_colwise.stride(1),
-                num_rows,
-                row_length,
-                padded_num_rows,
-                padded_row_length,
-                scale_inv_rowwise,
-                scale_inv_colwise,
-                None,
-                None,
-                scale_inv_colwise.stride(0),
-                scale_inv_colwise.stride(1),
-                None,
-                None,
-                scale_inv_colwise_n_rows,
-                scale_inv_colwise_n_cols,
-                hadamard_matrix if scaling_recipe_for_trans.use_rht else None,
-                hadamard_matrix.size(0) if scaling_recipe_for_trans.use_rht else 0,
-                None,
-                None,
-                colwise_philox_seed,
-                colwise_philox_offset,
-                BLOCK_X=BLOCK_X,
-                BLOCK_Y=BLOCK_Y,
-                GROUP_Y=GROUP_Y,
-                USE_ROWWISE=False,
-                USE_COLWISE=use_colwise,
-                ROWWISE_USE_2D_BLOCK=False,
-                COLWISE_USE_2D_BLOCK=scaling_recipe_for_trans.use_2d_block,
-                ROWWISE_USE_SR=False,
-                COLWISE_USE_SR=scaling_recipe_for_trans.use_sr,
-                ROWWISE_USE_RHT=False,
-                COLWISE_USE_RHT=scaling_recipe_for_trans.use_rht,
-                MXFP4_BLOCK_SIZE=block_size,
-            )
-
-    if num_rows_padding_size == 0 and row_length_padding_size == 0:
-        BLOCK_X = 64
-        BLOCK_Y = 64
-        GROUP_Y = 8
-        grid = lambda META: (
-            triton.cdiv(padded_num_rows, META["BLOCK_Y"]) * triton.cdiv(padded_row_length, META["BLOCK_X"]),
-        )
-        quantize_mxfp4_kernel[grid](
+    # TODO(ruibin): Add single dimension quantization support to optimize performance.
+    rowwise_out, rowwise_scale, colwise_out, colwise_scale = (
+        torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
-            y_rowwise,
-            y_colwise,
-            x.stride(0),
-            x.stride(1),
-            y_rowwise.stride(0) if y_rowwise is not None else None,
-            y_rowwise.stride(1) if y_rowwise is not None else None,
-            y_colwise.stride(0) if y_colwise is not None else None,
-            y_colwise.stride(1) if y_colwise is not None else None,
-            num_rows,
-            row_length,
-            padded_num_rows,
-            padded_row_length,
-            scale_inv_rowwise,
-            scale_inv_colwise,
-            scale_inv_rowwise.stride(0) if scale_inv_rowwise is not None else None,
-            scale_inv_rowwise.stride(1) if scale_inv_rowwise is not None else None,
-            scale_inv_colwise.stride(0) if scale_inv_colwise is not None else None,
-            scale_inv_colwise.stride(1) if scale_inv_colwise is not None else None,
-            scale_inv_rowwise_n_rows if scale_inv_rowwise is not None else None,
-            scale_inv_rowwise_n_cols if scale_inv_rowwise is not None else None,
-            scale_inv_colwise_n_rows if scale_inv_colwise is not None else None,
-            scale_inv_colwise_n_cols if scale_inv_colwise is not None else None,
-            hadamard_matrix if scaling_recipe.use_rht or scaling_recipe_for_trans.use_rht else None,
-            hadamard_matrix.size(0) if scaling_recipe.use_rht or scaling_recipe_for_trans.use_rht else 0,
-            rowwise_philox_seed,
-            rowwise_philox_offset,
-            colwise_philox_seed,
-            colwise_philox_offset,
-            BLOCK_X=BLOCK_X,
-            BLOCK_Y=BLOCK_Y,
-            GROUP_Y=GROUP_Y,
-            USE_ROWWISE=use_rowwise,
-            USE_COLWISE=use_colwise,
-            ROWWISE_USE_2D_BLOCK=scaling_recipe.use_2d_block,
-            COLWISE_USE_2D_BLOCK=scaling_recipe_for_trans.use_2d_block,
-            ROWWISE_USE_SR=scaling_recipe.use_sr,
-            COLWISE_USE_SR=scaling_recipe_for_trans.use_sr,
-            ROWWISE_USE_RHT=scaling_recipe.use_rht,
-            COLWISE_USE_RHT=scaling_recipe_for_trans.use_rht,
-            MXFP4_BLOCK_SIZE=block_size,
+            out_dtype,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe_for_trans.use_sr,
+            scaling_recipe_for_trans.use_rht,
+            False,  # shuffle_rowwise_scale
+            False,  # shuffle_rowwise
+            False,  # shuffle_colwise_scale
+            False,  # shuffle_colwise
         )
+    )
 
-    return_list = []
-    if use_rowwise:
-        return_list += [
-            y_rowwise.view(torch.float4_e2m1fn_x2),
-            scale_inv_rowwise.view(dtype=torch.float8_e8m0fnu),
-        ]
-    if use_colwise:
-        return_list += [
-            y_colwise.view(torch.float4_e2m1fn_x2),
-            scale_inv_colwise.view(dtype=torch.float8_e8m0fnu),
-        ]
-
-    return tuple(return_list)
+    if axis == 0:
+        return colwise_out, colwise_scale
+    elif axis == 1:
+        return rowwise_out, rowwise_scale
+    else:
+        return rowwise_out, rowwise_scale, colwise_out, colwise_scale
 
 
 def dequantize_mxfp4_impl(

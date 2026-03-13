@@ -158,9 +158,9 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale_impl(a_scale_inv)
-        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale_impl(b_scale_inv)
-        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight_impl(b)
+        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv)
+        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv)
+        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b)
         return aiter.gemm_a4w4(
             a, b_shuffled, a_scale_inv_shuffled, b_scale_inv_shuffled, dtype=out_dtype, bpreshuffle=True
         )
@@ -168,7 +168,7 @@ class GEMMFP4AITERBackend(KernelBackend):
 
 _GEMM_FP4_BACKENDS = {
     BackendType.HIPBLASLT: GEMMFP4HipBLASLtBackend,
-    BackendType.TRITON: GEMMFP4AITERBackend,
+    BackendType.AITER: GEMMFP4AITERBackend,
 }
 
 

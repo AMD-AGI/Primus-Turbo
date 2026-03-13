@@ -244,26 +244,25 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     const int64_t M = input.size(0);
     const int64_t N = input.size(1);
 
+    const int64_t M_pad = cdiv(M, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+    const int64_t N_pad = cdiv(N, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+
     PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
 
     if (shuffle_rowwise) {
         PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0, "M must be divisible by ", MXFP4_SHUFFLE_BN,
                            " for shuffled rowwise FP4. But got M=", M);
-        PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0, "N/2 must be divisible by ",
-                           MXFP4_SHUFFLE_BK, " for shuffled rowwise FP4. But got N/2=", N / 2);
     }
     if (shuffle_colwise) {
         PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BN == 0, "N must be divisible by ", MXFP4_SHUFFLE_BN,
                            " for shuffled colwise FP4. But got N=", N);
-        PRIMUS_TURBO_CHECK((M / 2) % MXFP4_SHUFFLE_BK == 0, "M/2 must be divisible by ",
-                           MXFP4_SHUFFLE_BK, " for shuffled colwise FP4. But got M/2=", M / 2);
     }
 
     auto device = input.device();
     auto stream = at::cuda::getCurrentCUDAStream();
 
     int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
-    int64_t rowwise_scale_N     = cdiv(N, MXFP4_BLOCK_SIZE);
+    int64_t rowwise_scale_N     = cdiv(N_pad, MXFP4_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
     int64_t    rowwise_scale_stride = 1;
@@ -275,14 +274,15 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     } else {
         rowwise_scale =
             at::empty({M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale_stride = rowwise_scale_N;
     }
 
     // packed 2 fp4 values in N dimension
     at::Tensor rowwise_output =
-        at::empty({M, N / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
 
     int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
-    int64_t colwise_scale_N     = cdiv(M, MXFP4_BLOCK_SIZE);
+    int64_t colwise_scale_N     = cdiv(M_pad, MXFP4_BLOCK_SIZE);
     int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
 
     at::Tensor colwise_scale;
@@ -294,11 +294,12 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     } else {
         colwise_scale =
             at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale_stride = colwise_scale_N;
     }
 
     // packed 2 fp4 values in N dimension
     at::Tensor colwise_output =
-        at::empty({N, M / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
 
     TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), DType, {
         quantize_mxfp4_dual_impl<DType>(
@@ -306,10 +307,10 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
             reinterpret_cast<dtype::float4x2_e2m1 *>(rowwise_output.data_ptr()),
             rowwise_scale.data_ptr<uint8_t>(),
             reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
-            colwise_scale.data_ptr<uint8_t>(), M, N, rowwise_scale_stride, colwise_scale_stride,
-            rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N, colwise_scale_N,
-            colwise_scale_M_pad, colwise_scale_N_pad, shuffle_rowwise, shuffle_colwise,
-            shuffle_rowwise_scale, shuffle_colwise_scale,
+            colwise_scale.data_ptr<uint8_t>(), M, N, M_pad, N_pad, rowwise_scale_stride,
+            colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
+            colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, shuffle_rowwise,
+            shuffle_colwise, shuffle_rowwise_scale, shuffle_colwise_scale,
             MXScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht),
             MXScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht), stream);
     });

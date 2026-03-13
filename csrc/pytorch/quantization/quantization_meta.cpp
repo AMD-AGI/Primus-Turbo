@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/quantization.h"
+#include "primus_turbo/shuffle.h"
 #include "pytorch/extensions.h"
 
 namespace primus_turbo::pytorch {
@@ -57,6 +58,9 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const int64_t M = input.size(0);
     const int64_t N = input.size(1);
 
+    const int64_t M_pad = cdiv(M, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+    const int64_t N_pad = cdiv(N, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+
     PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
 
     if (shuffle_rowwise) {
@@ -73,7 +77,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     }
 
     int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
-    int64_t rowwise_scale_N     = cdiv(N, MXFP4_BLOCK_SIZE);
+    int64_t rowwise_scale_N     = cdiv(N_pad, MXFP4_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
     at::Tensor rowwise_scale;
@@ -87,10 +91,10 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
 
     // packed 2 fp4 values in N dimension
     at::Tensor rowwise_output =
-        at::empty({M, N / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
     int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
-    int64_t colwise_scale_N     = cdiv(M, MXFP4_BLOCK_SIZE);
+    int64_t colwise_scale_N     = cdiv(M_pad, MXFP4_BLOCK_SIZE);
     int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
 
     at::Tensor colwise_scale;
@@ -104,7 +108,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
 
     // packed 2 fp4 values in N dimension
     at::Tensor colwise_output =
-        at::empty({N, M / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
     return {rowwise_output, rowwise_scale, colwise_output, colwise_scale};
 }

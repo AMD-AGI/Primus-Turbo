@@ -407,11 +407,11 @@ template <typename DType, bool ROWWISE_USE_RHT = false, bool COLWISE_USE_RHT = f
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kernel(
     const DType *__restrict__ input, uint8_t *__restrict__ rowwise_fp4,
     uint8_t *__restrict__ rowwise_scale, uint8_t *__restrict__ colwise_fp4,
-    uint8_t *__restrict__ colwise_scale, const int M, const int N, const int rowwise_scale_stride,
-    const int colwise_scale_stride, const int rowwise_scale_N, const int rowwise_scale_M_pad,
-    const int rowwise_scale_N_pad, const int colwise_scale_M, const int colwise_scale_N,
-    const int colwise_scale_M_pad, const int colwise_scale_N_pad, const bool shuffle_rowwise,
-    const bool shuffle_colwise, const bool shuffle_rowwise_scale,
+    uint8_t *__restrict__ colwise_scale, const int M, const int N, const int M_pad, const int N_pad,
+    const int rowwise_scale_stride, const int colwise_scale_stride, const int rowwise_scale_N,
+    const int rowwise_scale_M_pad, const int rowwise_scale_N_pad, const int colwise_scale_M,
+    const int colwise_scale_N, const int colwise_scale_M_pad, const int colwise_scale_N_pad,
+    const bool shuffle_rowwise, const bool shuffle_colwise, const bool shuffle_rowwise_scale,
     const bool shuffle_colwise_scale) {
     // ========================================================================
     // Thread and Block Identification
@@ -434,9 +434,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     const int base_m = block_m * BLOCK_M;
     const int base_n = block_n * BLOCK_N;
 
-    // Packed dimensions (2 FP4 values per byte)
-    const int K_packed = N / 2;
-    const int M_packed = M / 2;
+    // Packed dimensions (2 FP4 values per byte), using padded sizes for output stride
+    const int K_packed = N_pad / 2;
+    const int M_packed = M_pad / 2;
 
     constexpr int ROWS_PER_PASS   = WARP_SIZE / THREADS_PER_ROW;
     constexpr int PASSES_PER_TILE = MXFP4_BLOCK_SIZE / ROWS_PER_PASS;
@@ -595,7 +595,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                                                    r_rowwise_scale_native[pass]);
                     }
 
-                    if (global_col < N) {
+                    if (global_col < N_pad) {
                         if (shuffle_rowwise) {
                             int packed_col = global_col / 2;
                             int shuffled_idx =
@@ -617,8 +617,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                                 rowwise_scale[idx] = r_rowwise_scale_e8m0[pass];
                             }
                         } else {
-                            rowwise_scale[global_row * rowwise_scale_stride + scale_col] =
-                                r_rowwise_scale_e8m0[pass];
+                            if (scale_col < rowwise_scale_N) {
+                                rowwise_scale[global_row * rowwise_scale_stride + scale_col] =
+                                    r_rowwise_scale_e8m0[pass];
+                            }
                         }
                     }
                 }
@@ -728,7 +730,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                                                    r_colwise_scale_native[pass]);
                     }
 
-                    if (global_row_base < M) {
+                    if (global_row_base < M_pad) {
                         if (shuffle_colwise) {
                             int packed_col = global_row_base / 2;
                             int shuffled_idx =
@@ -750,8 +752,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                                 colwise_scale[idx] = r_colwise_scale_e8m0[pass];
                             }
                         } else {
-                            colwise_scale[global_col * colwise_scale_stride + scale_col] =
-                                r_colwise_scale_e8m0[pass];
+                            if (scale_col < colwise_scale_N) {
+                                colwise_scale[global_col * colwise_scale_stride + scale_col] =
+                                    r_colwise_scale_e8m0[pass];
+                            }
                         }
                     }
                 }
@@ -763,23 +767,24 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
                               uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
-                              uint8_t *colwise_scale, int M, int N, int rowwise_scale_stride,
-                              int colwise_scale_stride, int rowwise_scale_N,
-                              int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
-                              int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
-                              bool shuffle_rowwise, bool shuffle_colwise,
+                              uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+                              int rowwise_scale_stride, int colwise_scale_stride,
+                              int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
+                              int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
+                              int colwise_scale_N_pad, bool shuffle_rowwise, bool shuffle_colwise,
                               bool shuffle_rowwise_scale, bool shuffle_colwise_scale,
                               MXScalingRecipe rowwise_recipe, MXScalingRecipe colwise_recipe,
                               hipStream_t stream) {
-    dim3 grid((M + BLOCK_M - 1) / BLOCK_M, (N + BLOCK_N - 1) / BLOCK_N);
+    dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
 #define KERNEL_ARGS                                                                                \
     input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
-        reinterpret_cast<uint8_t *>(colwise_output), colwise_scale, M, N, rowwise_scale_stride,    \
-        colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad,           \
-        colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,                \
-        shuffle_rowwise, shuffle_colwise, shuffle_rowwise_scale, shuffle_colwise_scale
+        reinterpret_cast<uint8_t *>(colwise_output), colwise_scale, M, N, M_pad, N_pad,            \
+        rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
+        rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
+        colwise_scale_N_pad, shuffle_rowwise, shuffle_colwise, shuffle_rowwise_scale,              \
+        shuffle_colwise_scale
 
 #define LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,                      \
                       COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR)                        \
@@ -849,16 +854,16 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
 
 template void quantize_mxfp4_dual_impl<dtype::float16>(
     const dtype::float16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
-    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad,
+    int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, bool shuffle_rowwise, bool shuffle_colwise,
     bool shuffle_rowwise_scale, bool shuffle_colwise_scale, MXScalingRecipe rowwise_recipe,
     MXScalingRecipe colwise_recipe, hipStream_t stream);
 template void quantize_mxfp4_dual_impl<dtype::bfloat16>(
     const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
-    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad,
+    int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, bool shuffle_rowwise, bool shuffle_colwise,
     bool shuffle_rowwise_scale, bool shuffle_colwise_scale, MXScalingRecipe rowwise_recipe,
