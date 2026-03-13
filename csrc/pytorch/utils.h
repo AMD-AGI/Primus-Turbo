@@ -87,24 +87,16 @@
         TORCH_CHECK(false, "Invalid dtype (only fp8).");                          \
     }
 
-#define TORCH_TYPE_SWITCH_FP8ONLY(scalar_type, type, ...)                         \
-    [&] {                                                                         \
-        using namespace primus_turbo;                                             \
-        switch (scalar_type) {                                                    \
-        case at::kFloat8_e4m3fnuz:                                                \
-        case at::kFloat8_e4m3fn: {                                                \
-            using type = dtype::float8_e4m3;                                      \
-            { __VA_ARGS__ }                                                       \
-        } break;                                                                  \
-        case at::kFloat8_e5m2fnuz:                                                \
-        case at::kFloat8_e5m2: {                                                  \
-            using type = dtype::float8_e5m2;                                      \
-            { __VA_ARGS__ }                                                       \
-        } break;                                                                  \
-        default:                                                                  \
-            PRIMUS_TURBO_ERROR("Only float8 types are supported.");               \
-        }                                                                         \
-    }()
+#define TORCH_TYPE_SWITCH_FP4(scalar_type, TYPE, ...)                             \
+    switch (scalar_type) {                                                        \
+    case at::kFloat4_e2m1fn_x2: {                                                  \
+        using TYPE = dtype::float4x2_e2m1;                                         \
+        { __VA_ARGS__ }                                                           \
+    } break;                                                                      \
+    default:                                                                      \
+        TORCH_CHECK(false, "Invalid dtype (only fp4).");                          \
+    }
+
 
 #define TORCH_TYPE_SWITCH_INPUT(scalar_type, type, ...)                      \
     [&] {                                                                    \

@@ -12,6 +12,8 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
+from primus_turbo.common.logger import log_warning_once
+
 try:
     HAVE_DEEP_EP = True
     import deep_ep  # fmt: skip
@@ -26,6 +28,11 @@ __all__ = [
     "TuneCache",
     "AutoKernelDispatcher",
 ]
+
+_ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
+_ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
+_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
+_ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
 
 
 class BackendType(Enum):
@@ -74,7 +81,7 @@ class GlobalBackendManager:
         """Get the GEMM backend configuration. Returns None if not set."""
         if cls._gemm_backend is not None:
             return cls._gemm_backend
-        backend = os.environ.get("PRIMUS_TURBO_GEMM_BACKEND")
+        backend = os.environ.get(_ENV_GEMM_BACKEND_KEY)
         if backend:
             return BackendType[backend.upper()]
         return None
@@ -84,7 +91,7 @@ class GlobalBackendManager:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend
-        backend = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_BACKEND")
+        backend = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY)
         if backend:
             return BackendType[backend.upper()]
         return None
@@ -94,7 +101,7 @@ class GlobalBackendManager:
         """Get the MoE dispatch combine backend configuration. Returns None if not set."""
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend
-        backend = os.getenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+        backend = os.getenv(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
 
         if backend:
             backend_type = BackendType[backend.upper()]
@@ -110,7 +117,7 @@ class GlobalBackendManager:
         """Check if auto-tune is enabled."""
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get("PRIMUS_TURBO_AUTO_TUNE", "0") == "1"
+        return os.environ.get(_ENV_AUTO_TUNE_KEY, "0") == "1"
 
     @classmethod
     def reset(cls) -> None:
@@ -290,8 +297,11 @@ class AutoKernelDispatcher(ABC):
             return default_backend_cls.execute(**kwargs)
 
         # 4. Fallback: try all backends
-        for fallback_backend_cls in cls._backends.values():
+        for fallback_backend_enum, fallback_backend_cls in cls._backends.items():
             if fallback_backend_cls.can_handle(**kwargs):
+                log_warning_once(
+                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!"
+                )
                 return fallback_backend_cls.execute(**kwargs)
 
         raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")

@@ -48,17 +48,32 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
 
-std::vector<at::Tensor> quantize_mxfp4_dual_shuffle(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
-    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
-    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
+std::vector<at::Tensor>
+quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
+                    const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+                    const bool rowwise_use_rht, const bool colwise_use_2d_block,
+                    const bool colwise_use_sr, const bool colwise_use_rht,
+                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
-std::vector<at::Tensor> quantize_mxfp4_dual_shuffle_meta(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
-    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
-    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
+std::vector<at::Tensor> quantize_mxfp4_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,
+    const bool colwise_use_sr, const bool colwise_use_rht, const bool shuffle_rowwise_scale = false,
+    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+    const bool shuffle_colwise = false);
+
+//==================================================================
+//  Shuffle
+//==================================================================
+
+at::Tensor shuffle_scale_impl(const at::Tensor scale);
+
+at::Tensor shuffle_scale_impl_meta(const at::Tensor scale);
+
+at::Tensor shuffle_weight_impl(const at::Tensor weight);
+
+at::Tensor shuffle_weight_impl_meta(const at::Tensor weight);
 
 //==================================================================
 //  GEMM

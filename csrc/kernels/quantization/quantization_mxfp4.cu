@@ -21,6 +21,7 @@
  */
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/device/shuffle.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
 
@@ -53,9 +54,6 @@ constexpr int THREADS_PER_ROW =
 
 // Shared memory optimization
 constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
-
-// Memory layout shuffle parameters (for GEMM optimization)
-constexpr int SHUFFLE_SUB_BLOCKS = MXFP4_SHUFFLE_BK / MXFP4_SHUFFLE_K_ELEM;
 
 // Stochastic rounding parameters
 // NOTE: Hardcode the seed of stochastic rounding to 0 to make it deterministic
@@ -391,59 +389,6 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(float v0, float v1, fl
 }
 
 // ============================================================================
-// MEMORY LAYOUT - Index Computation for Shuffled Layouts
-// ============================================================================
-
-/*
- * Scale Shuffle Index Computation
- * --------------------------------
- * Computes the shuffled memory index for scale factors to optimize
- * memory access patterns during GEMM operations.
- *
- * Permutation formula:
- *   i0 = row // 32
- *   i1 = (row % 32) // 16
- *   i2 = row % 16
- *   i3 = col // 8
- *   i4 = (col % 8) // 4
- *   i5 = col % 4
- *   index = i0*(scale_n_pad//8)*256 + i3*256 + i5*64 + i2*4 + i4*2 + i1
- */
-__device__ __forceinline__ int compute_shuffle_scale_index(int row, int col, int scale_n_pad) {
-    int i0 = row >> 5;       // row // 32
-    int i1 = (row >> 4) & 1; // (row % 32) // 16
-    int i2 = row & 15;       // row % 16
-    int i3 = col >> 3;       // col // 8
-    int i4 = (col >> 2) & 1; // (col % 8) // 4
-    int i5 = col & 3;        // col % 4
-
-    return (i0 * (scale_n_pad >> 3) << 8) + (i3 << 8) + (i5 << 6) + (i2 << 2) + (i4 << 1) + i1;
-}
-
-/*
- * FP4 Data Shuffle Index Computation
- * -----------------------------------
- * Computes the shuffled memory index for FP4 quantized data.
- * This layout is optimized for GEMM performance by improving cache locality.
- *
- * Structure:
- *   - 16xK blocks where K must be multiple of 32
- *   - Each K=32 block is split into two K=16 sub-blocks
- *   - Data is stored in (BN=16, BK=32) tiles
- */
-__device__ __forceinline__ int compute_shuffled_fp4_index_2bytes(int row, int col, int K_packed) {
-    int N_block      = row >> 4;          // row // 16
-    int row_in_block = row & 15;          // row % 16
-    int K_block      = col >> 5;          // col // 32
-    int col_in_block = col & 31;          // col % 32
-    int sub_block    = col_in_block >> 4; // Which half: [0:15] or [16:31]
-    int k_elem       = col_in_block & 15; // Position within sub-block
-
-    return N_block * (K_packed << 4) + K_block * 512 + sub_block * 256 +
-           row_in_block * MXFP4_SHUFFLE_K_ELEM + k_elem;
-}
-
-// ============================================================================
 // MAIN KERNEL - MXFP4 Quantization with Shuffle
 // ============================================================================
 
@@ -459,7 +404,7 @@ __device__ __forceinline__ int compute_shuffled_fp4_index_2bytes(int row, int co
 template <typename DType, bool ROWWISE_USE_RHT = false, bool COLWISE_USE_RHT = false,
           bool ROWWISE_USE_2D_BLOCK = false, bool COLWISE_USE_2D_BLOCK = false,
           bool ROWWISE_USE_SR = false, bool COLWISE_USE_SR = false>
-__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_shuffle(
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kernel(
     const DType *__restrict__ input, uint8_t *__restrict__ rowwise_fp4,
     uint8_t *__restrict__ rowwise_scale, uint8_t *__restrict__ colwise_fp4,
     uint8_t *__restrict__ colwise_scale, const int M, const int N, const int rowwise_scale_stride,
@@ -816,15 +761,16 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_shuf
 }
 
 template <typename DType>
-void quantize_mxfp4_dual_shuffle_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
-                                      uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
-                                      uint8_t *colwise_scale, int M, int N,
-                                      int rowwise_scale_stride, int colwise_scale_stride,
-                                      int rowwise_scale_N, int rowwise_scale_M_pad,
-                                      int rowwise_scale_N_pad, int colwise_scale_M,
-                                      int colwise_scale_N, int colwise_scale_M_pad,
-                                      int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
-                                      MXScalingRecipe colwise_recipe, hipStream_t stream) {
+void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
+                              uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
+                              uint8_t *colwise_scale, int M, int N, int rowwise_scale_stride,
+                              int colwise_scale_stride, int rowwise_scale_N,
+                              int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
+                              int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+                              bool shuffle_rowwise, bool shuffle_colwise,
+                              bool shuffle_rowwise_scale, bool shuffle_colwise_scale,
+                              MXScalingRecipe rowwise_recipe, MXScalingRecipe colwise_recipe,
+                              hipStream_t stream) {
     dim3 grid((M + BLOCK_M - 1) / BLOCK_M, (N + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
@@ -833,13 +779,12 @@ void quantize_mxfp4_dual_shuffle_impl(const DType *input, dtype::float4x2_e2m1 *
         reinterpret_cast<uint8_t *>(colwise_output), colwise_scale, M, N, rowwise_scale_stride,    \
         colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad,           \
         colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,                \
-        rowwise_recipe.shuffle_output, colwise_recipe.shuffle_output,                              \
-        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale
+        shuffle_rowwise, shuffle_colwise, shuffle_rowwise_scale, shuffle_colwise_scale
 
 #define LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,                      \
                       COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR)                        \
-    quantize_mxfp4_dual_shuffle<DType, ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,     \
-                                COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR>              \
+    quantize_mxfp4_dual_kernel<DType, ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,      \
+                               COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR>               \
         <<<grid, block, 0, stream>>>(KERNEL_ARGS)
 
 #define DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_SR,     \
@@ -902,19 +847,21 @@ void quantize_mxfp4_dual_shuffle_impl(const DType *input, dtype::float4x2_e2m1 *
 #undef KERNEL_ARGS
 }
 
-template void quantize_mxfp4_dual_shuffle_impl<dtype::float16>(
+template void quantize_mxfp4_dual_impl<dtype::float16>(
     const dtype::float16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
     dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, bool shuffle_rowwise, bool shuffle_colwise,
+    bool shuffle_rowwise_scale, bool shuffle_colwise_scale, MXScalingRecipe rowwise_recipe,
     MXScalingRecipe colwise_recipe, hipStream_t stream);
-template void quantize_mxfp4_dual_shuffle_impl<dtype::bfloat16>(
+template void quantize_mxfp4_dual_impl<dtype::bfloat16>(
     const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
     dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, bool shuffle_rowwise, bool shuffle_colwise,
+    bool shuffle_rowwise_scale, bool shuffle_colwise_scale, MXScalingRecipe rowwise_recipe,
     MXScalingRecipe colwise_recipe, hipStream_t stream);
 
 } // namespace primus_turbo

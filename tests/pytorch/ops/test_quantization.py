@@ -402,7 +402,7 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
 @pytest.mark.parametrize("use_sr", [True, False])
 def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block, use_sr):
     if use_sr:
-        # FIXME(ruibin): Stochastic rounding has numerical issues in quantize_mxfp4_dual_shuffle kernel.
+        # FIXME(ruibin): Stochastic rounding has numerical issues in quantize_mxfp4_dual kernel.
         pytest.skip("SR is not supported for shuffled FP4.")
 
     def unshuffle_scale_ref(

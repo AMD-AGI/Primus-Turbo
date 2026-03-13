@@ -36,11 +36,11 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
     return output;
 }
 
-std::vector<at::Tensor> quantize_mxfp4_dual_shuffle_meta(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool shuffle_rowwise_scale,
-    const bool shuffle_rowwise_output, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-    const bool rowwise_use_rht, const bool shuffle_colwise_scale, const bool shuffle_colwise_output,
-    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht) {
+std::vector<at::Tensor> quantize_mxfp4_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,
+    const bool colwise_use_sr, const bool colwise_use_rht, const bool shuffle_rowwise_scale,
+    const bool shuffle_rowwise, const bool shuffle_colwise_scale, const bool shuffle_colwise) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
@@ -59,13 +59,13 @@ std::vector<at::Tensor> quantize_mxfp4_dual_shuffle_meta(
 
     PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
 
-    if (shuffle_rowwise_output) {
+    if (shuffle_rowwise) {
         PRIMUS_TURBO_CHECK(M % MXFP4_SHUFFLE_BN == 0,
                            "M must be divisible by 16 for shuffled rowwise FP4");
         PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0,
                            "N/2 must be divisible by 32 for shuffled rowwise FP4");
     }
-    if (shuffle_colwise_output) {
+    if (shuffle_colwise) {
         PRIMUS_TURBO_CHECK(N % MXFP4_SHUFFLE_BN == 0,
                            "N must be divisible by 16 for shuffled colwise FP4");
         PRIMUS_TURBO_CHECK((M / 2) % MXFP4_SHUFFLE_BK == 0,

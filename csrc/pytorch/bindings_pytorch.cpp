@@ -33,11 +33,15 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor");
 
     // ********* MXFP4 Quantization *********
-    m.def("quantize_mxfp4_dual_shuffle(Tensor input, ScalarType dest_dtype, "
-          "bool shuffle_rowwise_scale, bool shuffle_rowwise_output, bool rowwise_use_2d_block, "
-          "bool rowwise_use_sr, bool rowwise_use_rht, "
-          "bool shuffle_colwise_scale, bool shuffle_colwise_output, bool colwise_use_2d_block, "
-          "bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
+    m.def("quantize_mxfp4_dual(Tensor input, ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
+          "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht, "
+          "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
+          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
+
+    // ********* Shuffle *********
+    m.def("shuffle_scale(Tensor scale) -> Tensor");
+    m.def("shuffle_weight(Tensor weight) -> Tensor");
 
     // ********* RMSNorm *********
     m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
@@ -74,7 +78,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
 
     // ********* MXFP4 Quantization *********
-    m.impl("quantize_mxfp4_dual_shuffle", quantize_mxfp4_dual_shuffle);
+    m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
+
+    // ********* Shuffle *********
+    m.impl("shuffle_scale", shuffle_scale_impl);
+    m.impl("shuffle_weight", shuffle_weight_impl);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd);
@@ -102,7 +110,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
 
     // ********* MXFP4 Quantization *********
-    m.impl("quantize_mxfp4_dual_shuffle", quantize_mxfp4_dual_shuffle_meta);
+    m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
+
+    // ********* Shuffle *********
+    m.impl("shuffle_scale", shuffle_scale_impl_meta);
+    m.impl("shuffle_weight", shuffle_weight_impl_meta);
 
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
