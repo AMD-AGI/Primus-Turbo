@@ -41,7 +41,9 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _chiplet_transform_chunked,
     _compute_sk_grid,
     _get_hardware,
+    _is_gfx950,
     _select_params_origami,
+    _set_knobs_gfx950,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -311,25 +313,47 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
-        M, N, K, s_ak, s_bk
-    )
-    origami_params = _select_params_origami(
-        M,
-        N,
-        K,
-        out_dtype,
-        A_view.dtype,
-        B_view.dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, oca, ocb = origami_params
-        if (om, on, ok) == (block_m, block_n, block_k):
-            group_m = ogm
-            cache_a = oca
-            cache_b = ocb
+    if _is_gfx950():
+        _set_knobs_gfx950()
+
+        # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
+        block_m, block_n, block_k = 256, 256, 128
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + block_m - 1) // block_m
+        tiles_n = (N + block_n - 1) // block_n
+        min_tile = min(tiles_m, tiles_n)
+        is_tn = s_ak == 1 and s_bk == 1
+        group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == block_k:
+                block_m, block_n, group_m = om, on, ogm
+
+        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    else:
+        # gfx942 path
+        block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+            M, N, K, s_ak, s_bk
+        )
+        waves_per_eu = 0
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (block_m, block_n, block_k):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
 
     args = (
         A_view,
@@ -362,7 +386,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=0,
+        waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -583,25 +607,47 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
-        M, N, K, s_ak, s_bk
-    )
-    origami_params = _select_params_origami(
-        M,
-        N,
-        K,
-        out_dtype,
-        A_view.dtype,
-        B_view.dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, oca, ocb = origami_params
-        if (om, on, ok) == (block_m, block_n, block_k):
-            group_m = ogm
-            cache_a = oca
-            cache_b = ocb
+    if _is_gfx950():
+        _set_knobs_gfx950()
+
+        # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
+        block_m, block_n, block_k = 256, 256, 128
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + block_m - 1) // block_m
+        tiles_n = (N + block_n - 1) // block_n
+        min_tile = min(tiles_m, tiles_n)
+        is_tn = s_ak == 1 and s_bk == 1
+        group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == block_k:
+                block_m, block_n, group_m = om, on, ogm
+
+        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    else:
+        # gfx942 path
+        block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+            M, N, K, s_ak, s_bk
+        )
+        waves_per_eu = 0
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (block_m, block_n, block_k):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
 
     args = (
         A_view,
@@ -634,7 +680,7 @@ def gemm_fp8_rowwise_triton_kernel(
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
-        waves_per_eu=0,
+        waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
@@ -890,7 +936,10 @@ def _blockwise_nt(
     trans_c: bool,
 ) -> torch.Tensor:
     """NT/RCR forward: C = A[M,K] @ B[N,K].T, 2D B_scales."""
-    _set_amd_knobs(enable=True)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
 
     M, K = a.shape
     N = b.shape[0]
@@ -947,7 +996,10 @@ def _blockwise_nn(
     trans_c: bool,
 ) -> torch.Tensor:
     """NN/RRR grad_X: C = A[M,K] @ B[K,N], 2D B_scales (transposed internally)."""
-    _set_amd_knobs(enable=True)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
 
     M, K = a.shape
     _, N = b.shape
@@ -1011,7 +1063,10 @@ def _blockwise_tn(
       a_scale_inv: [K//128, M]
       b_scale_inv: [K//128, N]
     """
-    _set_amd_knobs(enable=False)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=False)
 
     K, M = a.shape
     _, N = b.shape
