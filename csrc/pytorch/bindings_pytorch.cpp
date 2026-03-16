@@ -12,97 +12,99 @@ namespace primus_turbo::pytorch {
 
 TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ********* Gemm *********
-    m.def("hipblaslt_gemm(Tensor A, Tensor B, "
-          "ScalarType out_dtype, bool transA, bool transB, bool transC) -> Tensor");
-    m.def(
-        "hipblaslt_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
-        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
-    m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
-          "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
+    // m.def("hipblaslt_gemm(Tensor A, Tensor B, "
+    //       "ScalarType out_dtype, bool transA, bool transB, bool transC) -> Tensor");
+    // m.def(
+    //     "hipblaslt_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+    //     "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) ->
+    //     Tensor");
+    // m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
+    //       "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
-    // ********* Quantization *********
-    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
-          "Tensor[]");
-    m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
-          "scale_opt=None) -> Tensor[]");
+    // // ********* Quantization *********
+    // m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None)
+    // -> "
+    //       "Tensor[]");
+    // m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
+    //       "scale_opt=None) -> Tensor[]");
 
-    m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
-          "Tensor");
+    // m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
+    //       "Tensor");
 
-    // ********* RMSNorm *********
-    m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
-    m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
+    // // ********* RMSNorm *********
+    // m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
+    // m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
 
-    // ********* Grouped Gemm *********
-    m.def("grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
-          "bool transB, int? num_cu=None) -> Tensor");
-    m.def("grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
-          "bool transA, bool transB, int? num_cu=None) -> Tensor");
-    m.def("grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
-          "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
-          "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
-    m.def("grouped_gemm_fp8_variable_k(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
-          "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
-          "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
-    m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
-    m.def("hipblaslt_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
-          "bool transA, bool transB, bool pre_sync) -> Tensor");
+    // // ********* Grouped Gemm *********
+    // m.def("grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
+    //       "bool transB, int? num_cu=None) -> Tensor");
+    // m.def("grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
+    //       "bool transA, bool transB, int? num_cu=None) -> Tensor");
+    // m.def("grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+    //       "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
+    //       "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
+    // m.def("grouped_gemm_fp8_variable_k(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+    //       "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
+    //       "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
+    // m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
+    // m.def("hipblaslt_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
+    //       "bool transA, bool transB, bool pre_sync) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* Gemm *********
-    m.impl("hipblaslt_gemm", hipblaslt_gemm);
-    m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);
-    m.impl("ck_gemm_fp8", ck_gemm_fp8);
-    // ********* Quantization *********
-    m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
-    m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
+    // m.impl("hipblaslt_gemm", hipblaslt_gemm);
+    // m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);
+    // m.impl("ck_gemm_fp8", ck_gemm_fp8);
+    // // ********* Quantization *********
+    // m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
+    // m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
 
-    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
+    // m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
 
-    // ********* RMSNorm *********
-    m.impl("rmsnorm_fwd", rmsnorm_fwd);
-    m.impl("rmsnorm_bwd", rmsnorm_bwd);
+    // // ********* RMSNorm *********
+    // m.impl("rmsnorm_fwd", rmsnorm_fwd);
+    // m.impl("rmsnorm_bwd", rmsnorm_bwd);
 
-    // ********* Grouped Gemm *********
-    m.impl("grouped_gemm", grouped_gemm);
-    m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k);
-    m.impl("grouped_gemm_fp8", grouped_gemm_fp8);
-    m.impl("grouped_gemm_fp8_variable_k", grouped_gemm_fp8_variable_k);
-    m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
-    m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
+    // // ********* Grouped Gemm *********
+    // m.impl("grouped_gemm", grouped_gemm);
+    // m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k);
+    // m.impl("grouped_gemm_fp8", grouped_gemm_fp8);
+    // m.impl("grouped_gemm_fp8_variable_k", grouped_gemm_fp8_variable_k);
+    // m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
+    // m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Gemm *********
-    m.impl("hipblaslt_gemm", hipblaslt_gemm_meta);
-    m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8_meta);
-    m.impl("ck_gemm_fp8", ck_gemm_fp8_meta);
+    // m.impl("hipblaslt_gemm", hipblaslt_gemm_meta);
+    // m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8_meta);
+    // m.impl("ck_gemm_fp8", ck_gemm_fp8_meta);
 
-    // ********* Quantization *********
-    m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
-    m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
-    m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
+    // // ********* Quantization *********
+    // m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
+    // m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
+    // m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
 
-    // ********* RMSNorm *********
-    m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
-    m.impl("rmsnorm_bwd", rmsnorm_bwd_meta);
+    // // ********* RMSNorm *********
+    // m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
+    // m.impl("rmsnorm_bwd", rmsnorm_bwd_meta);
 
-    // ********* Grouped Gemm *********
-    m.impl("grouped_gemm", grouped_gemm_meta);
-    m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k_meta);
-    m.impl("grouped_gemm_fp8", grouped_gemm_fp8_meta);
-    m.impl("grouped_gemm_fp8_variable_k", grouped_gemm_fp8_variable_k_meta);
-    m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
-    m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm_meta);
+    // // ********* Grouped Gemm *********
+    // m.impl("grouped_gemm", grouped_gemm_meta);
+    // m.impl("grouped_gemm_variable_k", grouped_gemm_variable_k_meta);
+    // m.impl("grouped_gemm_fp8", grouped_gemm_fp8_meta);
+    // m.impl("grouped_gemm_fp8_variable_k", grouped_gemm_fp8_variable_k_meta);
+    // m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
+    // m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "rendezvous_shmem",
-        [](const std::string &group_name, const std::vector<int64_t> &shape,
-           c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
-        py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
+    // m.def(
+    //     "rendezvous_shmem",
+    //     [](const std::string &group_name, const std::vector<int64_t> &shape,
+    //        c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
+    //     py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
 
     // ********* DeepEP *********
     auto deep_ep_module =
@@ -152,9 +154,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_ep_module.attr("topk_idx_t") = py::reinterpret_borrow<py::object>(
         (PyObject *) torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
     // ********* Runtime *********
-    auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
-    runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
-    runtime_module.def("destroy_stream", &destroy_stream);
+    // auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
+    // runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
+    // runtime_module.def("destroy_stream", &destroy_stream);
 }
 
 /********************************************/

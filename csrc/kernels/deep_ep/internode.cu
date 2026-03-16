@@ -391,8 +391,8 @@ void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mappe
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <=
                    num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int64_t>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
 
     // Launch kernel
     SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
@@ -1316,7 +1316,7 @@ void dispatch(void *recv_x, float *recv_x_scales, topk_idx_t *recv_topk_idx,
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride <
-                   std::numeric_limits<int>::max());
+                   std::numeric_limits<int64_t>::max());
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                       \
     {                                                                                              \
@@ -1544,9 +1544,9 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                    int num_max_nvl_chunked_recv_tokens, int **barrier_signal_ptrs, int rank,
                    cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
                    bool is_cached_dispatch, bool low_latency_mode) {
-    const int  num_threads         = std::max(128, WARP_SIZE * num_channels);
-    const int  num_warps           = num_threads / WARP_SIZE;
-    const auto num_rdma_ranks      = num_ranks / NUM_MAX_NVL_PEERS;
+    const int  num_threads    = std::max(128, std::min(WARP_SIZE * num_channels, MAX_NTHREADS));
+    const int  num_warps      = num_threads / WARP_SIZE;
+    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     const int  kNumTMABytesPerWarp = 8192;
     const int  smem_size           = kNumTMABytesPerWarp * num_warps;
 
@@ -1560,9 +1560,11 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <=
                    num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int64_t>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(num_channels * 2 > 3);
+
+    EP_HOST_ASSERT(num_warps * WARP_SIZE <= MAX_NTHREADS);
 
     // Launch kernel
     auto cached_notify_func = low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp>
