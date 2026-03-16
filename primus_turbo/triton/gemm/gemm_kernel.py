@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 
 import origami
 import torch
@@ -120,6 +121,27 @@ def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
             sk_grid = 256 if cu_count == 304 else 64
 
     return sk_grid
+
+
+def _is_gfx950() -> bool:
+    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return target is not None and target.backend == "hip" and target.arch == "gfx950"
+    except (AttributeError, TypeError):
+        return False
+
+
+def _set_knobs_gfx950():
+    """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize)."""
+    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+        triton.knobs.amd.use_async_copy = True
+        triton.knobs.amd.scalarize_packed_fops = True
+        triton.knobs.amd.use_block_pingpong = True
+    else:
+        os.environ.setdefault("TRITON_HIP_USE_ASYNC_COPY", "1")
+        os.environ.setdefault("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
+        os.environ.setdefault("TRITON_HIP_USE_BLOCK_PINGPONG", "1")
 
 
 @triton.jit
@@ -503,25 +525,62 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: offline heuristic + origami override
-    BLOCK_M, BLOCK_N, BLOCK_K, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_bf16(
-        M, N, K, s_ak, s_bk
-    )
-    origami_params = _select_params_origami(
-        M,
-        N,
-        K,
-        out_dtype,
-        A_view.dtype,
-        B_view.dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, oca, ocb = origami_params
-        if (om, on, ok) == (BLOCK_M, BLOCK_N, BLOCK_K):
-            group_m = ogm
-            cache_a, cache_b = oca, ocb
+    if _is_gfx950():
+        _set_knobs_gfx950()
+
+        # gfx950 BF16 config from 164-entry tuning data.
+        # TN layout with large K → BLK_K=64, stages=2; all other cases → 32/3.
+        # Small TN (K≤3584, dims≤16384, min dim≤4608) stays on 32/3.
+        is_tn = (s_ak == 1) and (s_bk == 1)
+        use_bk64 = is_tn and (K > 3584 or min(M, N) > 4608 or max(M, N) > 16384)
+
+        BLOCK_M, BLOCK_N = 256, 256
+        BLOCK_K, num_stages = (64, 2) if use_bk64 else (32, 3)
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + BLOCK_M - 1) // BLOCK_M
+        tiles_n = (N + BLOCK_N - 1) // BLOCK_N
+        min_tile = min(tiles_m, tiles_n)
+        group_m = 7 if min_tile < 16 else 4
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == BLOCK_K:
+                BLOCK_M, BLOCK_N, group_m = om, on, ogm
+
+        # Occupancy: when TN BLK_K=64 tiles land in 1–2 wave zone, halve
+        # BLOCK_N for better CU utilisation (keeps BLOCK_M=256 for A locality).
+        if use_bk64:
+            tm = (M + BLOCK_M - 1) // BLOCK_M
+            tn = (N + BLOCK_N - 1) // BLOCK_N
+            if cu_count < tm * tn < 2 * cu_count and tn >= tm:
+                new_tn = (N + 127) // 128
+                if tm * new_tn >= 2 * cu_count:
+                    BLOCK_N, group_m = 128, 8
+
+        num_sms = _compute_sk_grid(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, cu_count)
+    else:
+        # ── gfx942 path (unchanged) ──────────────────────────────────────────
+        BLOCK_M, BLOCK_N, BLOCK_K, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_bf16(
+            M, N, K, s_ak, s_bk
+        )
+        num_stages, waves_per_eu = 2, 0
+        origami_params = _select_params_origami(
+            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (BLOCK_M, BLOCK_N, BLOCK_K):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
 
     even_k = K % BLOCK_K == 0
     args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
@@ -541,8 +600,8 @@ def gemm_triton_kernel(
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
-        waves_per_eu=0,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
