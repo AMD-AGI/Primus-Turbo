@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 
@@ -35,7 +35,7 @@ def quantize_fp8(
     scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
 
@@ -84,7 +84,7 @@ def quantize_fp8_with_trans(
     padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize with trans
 
@@ -159,9 +159,8 @@ def quantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
-    padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize
 
@@ -182,9 +181,8 @@ def quantize_fp4(
             out_dtype,
             axis,
             block_size,
-            padding_align_size,
-            False,
-            scaling_recipe,
+            with_trans=False,
+            scaling_recipe=scaling_recipe,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -198,10 +196,9 @@ def quantize_fp4_with_trans(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
-    padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize with trans
 
@@ -210,7 +207,6 @@ def quantize_fp4_with_trans(
             1. The x must be 2D tensor.
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
             3. The block size must be 32.
-            4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
             5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
@@ -222,10 +218,9 @@ def quantize_fp4_with_trans(
             out_dtype,
             axis,
             block_size,
-            padding_align_size,
-            True,
-            scaling_recipe,
-            scaling_recipe_for_trans,
+            with_trans=True,
+            scaling_recipe=scaling_recipe,
+            scaling_recipe_for_trans=scaling_recipe_for_trans,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

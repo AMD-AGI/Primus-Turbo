@@ -17,7 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
-    GEMMFP4HipBLASLtBackend,
+    enable_preshuffle,
     gemm_fp4_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
@@ -50,10 +50,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
-        assert (
-            config.granularity == ScalingGranularity.MX_BLOCKWISE
-        ), "MXFP4 only supports MX_BLOCKWISE granularity"
-
         a_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
         )
@@ -66,16 +62,18 @@ class FP4GemmMXFunction(torch.autograd.Function):
             a_dtype,
             config.granularity,
             block_size=config.block_size,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=False,
+                shuffle_scale=enable_preshuffle(),
             ),
             scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=True,
+                shuffle_scale=enable_preshuffle(),
+                shuffle_out=enable_preshuffle(),
             ),
         )
 
@@ -84,16 +82,19 @@ class FP4GemmMXFunction(torch.autograd.Function):
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
                 use_sr=False,
                 use_rht=False,
+                shuffle_scale=enable_preshuffle(),
+                shuffle_out=enable_preshuffle(),
             ),
             scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=True,
-                use_sr=True,
+                use_sr=False,
                 use_rht=False,
+                shuffle_scale=enable_preshuffle(),
+                shuffle_out=enable_preshuffle(),
             ),
         )
 
@@ -136,16 +137,17 @@ class FP4GemmMXFunction(torch.autograd.Function):
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            padding_align_size=GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=False,
-                use_sr=True,
+                use_sr=False,
                 use_rht=False,
+                shuffle_scale=enable_preshuffle(),
             ),
             scaling_recipe_for_trans=MXScalingRecipe(
                 use_2d_block=False,
-                use_sr=True,
+                use_sr=False,
                 use_rht=True,
+                shuffle_scale=enable_preshuffle(),
             ),
         )
 

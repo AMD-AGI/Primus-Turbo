@@ -15,6 +15,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     KernelBackend,
+    PrecisionType,
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import (
@@ -294,7 +295,7 @@ def gemm_fp8_impl(
     default_backend: int,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(

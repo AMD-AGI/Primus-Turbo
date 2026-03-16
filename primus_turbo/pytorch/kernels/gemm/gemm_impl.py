@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     KernelBackend,
+    PrecisionType,
     TuneCache,
 )
 from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
@@ -110,7 +111,7 @@ def gemm_impl(
     default_backend: int,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_OR_FP16)
 
     kwargs = dict(
         a=a,

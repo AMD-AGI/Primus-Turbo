@@ -6,6 +6,7 @@
 
 from typing import Tuple
 
+import aiter
 import torch
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -15,6 +16,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     KernelBackend,
+    PrecisionType,
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
@@ -46,7 +48,6 @@ _COMMON_SUPPORTED_DTYPES = (
 
 class GEMMFP4HipBLASLtBackend(KernelBackend):
     SUPPORTED_GRANULARITIES = {
-        ScalingGranularity.TENSORWISE,
         ScalingGranularity.MX_BLOCKWISE,
     }
 
@@ -85,10 +86,73 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
             and b.size(0) % GEMMFP4HipBLASLtBackend.HIPBLASLT_N_MULTIPLE == 0
         )
 
-        # NOTE: The k dim is packed for FP4. So it need to multiply 2.
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        # TODO(ruibin): Add padding
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
+            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        )
+
+
+def enable_preshuffle() -> bool:
+    # NOTE: When auto-tune backend is disabled and gemm backend is AITER, we enable preshuffle for better performance.
+    is_aiter_backend = (
+        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.AITER
+        and GlobalBackendManager.auto_tune_enabled() is False
+    )
+
+    return is_aiter_backend
+
+
+class GEMMFP4AITERBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    # (a_dtype, b_dtype, c_dtype)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    # (trans_a, trans_b, trans_c)
+    SUPPORTED_LAYOUTS = ((False, True, False),)
+
+    AITER_FP4GEMM_M_MULTIPLE = 16
+    AITER_FP4GEMM_N_MULTIPLE = 16
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        # check ScalingGranularity
+        supported &= granularity in GEMMFP4AITERBackend.SUPPORTED_GRANULARITIES
+        # check dtype
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP4AITERBackend.SUPPORTED_DTYPES
+        supported &= (trans_a, trans_b, trans_c) in GEMMFP4AITERBackend.SUPPORTED_LAYOUTS
+
+        # check dimension
         supported &= (
-            a.size(1) * 2 % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0
-            and b.size(1) * 2 % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0
+            a.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_M_MULTIPLE == 0
+            and b.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_N_MULTIPLE == 0
         )
 
         return supported
@@ -105,13 +169,21 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        if enable_preshuffle():
+            # NOTE: When enable preshuffle, the input tensor is already shuffled.
+            return aiter.gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
+
+        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv)
+        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv)
+        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b)
+        return aiter.gemm_a4w4(
+            a, b_shuffled, a_scale_inv_shuffled, b_scale_inv_shuffled, dtype=out_dtype, bpreshuffle=True
         )
 
 
 _GEMM_FP4_BACKENDS = {
     BackendType.HIPBLASLT: GEMMFP4HipBLASLtBackend,
+    BackendType.AITER: GEMMFP4AITERBackend,
 }
 
 
@@ -139,7 +211,7 @@ def gemm_fp4_impl(
     default_backend: int,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(

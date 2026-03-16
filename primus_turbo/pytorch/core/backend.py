@@ -8,9 +8,12 @@ import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from enum import Enum, auto
+from functools import lru_cache
 from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
+
+from primus_turbo.common.logger import log_warning_once
 
 try:
     HAVE_DEEP_EP = True
@@ -26,6 +29,25 @@ __all__ = [
     "TuneCache",
     "AutoKernelDispatcher",
 ]
+
+_ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
+_ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
+_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
+_ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
+
+
+class PrecisionType(Enum):
+    FP4 = auto()
+    FP8 = auto()
+    BF16_OR_FP16 = auto()
+
+
+_PRECISION_TYPE_MAPPING = {
+    "FP4": PrecisionType.FP4,
+    "FP8": PrecisionType.FP8,
+    "BF16": PrecisionType.BF16_OR_FP16,
+    "FP16": PrecisionType.BF16_OR_FP16,
+}
 
 
 class BackendType(Enum):
@@ -49,20 +71,50 @@ class GlobalBackendManager:
     5. Fallback: try all backends
     """
 
-    _gemm_backend: Optional[BackendType] = None
-    _grouped_gemm_backend: Optional[BackendType] = None
-    _moe_dispatch_combine_backend: Optional[BackendType] = None
+    _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
+    _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
+    _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _auto_tune: Optional[bool] = None
 
     @classmethod
-    def set_gemm_backend(cls, backend: Optional[BackendType]) -> None:
-        """Set the GEMM backend in code."""
-        cls._gemm_backend = backend
+    @lru_cache(maxsize=4)
+    def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendType]:
+        """
+        Extract the backend from the environment variable.
+        Support formats. Example:
+        1. ENV_KEY=backend -> All precison use the same backend
+        2. ENV_KEY=<precision1>:<backend1>,<precision2>:<backend2>,... -> Each precision uses a different backend
+
+        Precision types are defined in the _PRECISION_TYPE_MAPPING.
+        """
+        precision_backend_dict = {}
+        # Parse format 2: <precision1>:<backend1>,<precision2>:<backend2>,...
+        if "fp4" in env_value or "fp8" in env_value or "bf16" in env_value or "fp16" in env_value:
+            precision_backend_pairs = env_value.split(",")
+            for pair in precision_backend_pairs:
+                if pair.strip() == "":
+                    # Skip empty pair.
+                    continue
+                precision, backend = pair.split(":")
+                precision, backend = precision.upper(), backend.upper()
+                assert precision in _PRECISION_TYPE_MAPPING, f"Precision {precision} not supported."
+                precision_backend_dict[_PRECISION_TYPE_MAPPING[precision]] = BackendType[backend]
+        else:
+            # Parse format 1: ENV_KEY=backend -> All precison use the same backend
+            for value in _PRECISION_TYPE_MAPPING.values():
+                precision_backend_dict[value] = BackendType[env_value.upper()]
+
+        return precision_backend_dict
 
     @classmethod
-    def set_grouped_gemm_backend(cls, backend: Optional[BackendType]) -> None:
+    def set_gemm_backend(cls, precision: PrecisionType, backend: Optional[BackendType]) -> None:
+        """Set the GEMM backend in code."""
+        cls._gemm_backend[precision] = backend
+
+    @classmethod
+    def set_grouped_gemm_backend(cls, precision: PrecisionType, backend: Optional[BackendType]) -> None:
         """Set the Grouped GEMM backend in code."""
-        cls._grouped_gemm_backend = backend
+        cls._grouped_gemm_backend[precision] = backend
 
     @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:
@@ -70,39 +122,40 @@ class GlobalBackendManager:
         cls._auto_tune = enabled
 
     @classmethod
-    def get_gemm_backend(cls) -> Optional[BackendType]:
+    def get_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
         """Get the GEMM backend configuration. Returns None if not set."""
         if cls._gemm_backend is not None:
-            return cls._gemm_backend
-        backend = os.environ.get("PRIMUS_TURBO_GEMM_BACKEND")
-        if backend:
-            return BackendType[backend.upper()]
+            return cls._gemm_backend[precision]
+        env_value = os.environ.get(_ENV_GEMM_BACKEND_KEY, None)
+        if env_value is not None:
+            return cls._extract_backend_from_env(env_value)[precision]
         return None
 
     @classmethod
-    def get_grouped_gemm_backend(cls) -> Optional[BackendType]:
+    def get_grouped_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend
-        backend = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_BACKEND")
-        if backend:
-            return BackendType[backend.upper()]
+        env_value = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY, None)
+        if env_value is not None:
+            return cls._extract_backend_from_env(env_value)[precision]
         return None
 
     @classmethod
-    def get_moe_dispatch_combine_backend(cls) -> Optional[BackendType]:
+    def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
         """Get the MoE dispatch combine backend configuration. Returns None if not set."""
         if cls._moe_dispatch_combine_backend is not None:
-            return cls._moe_dispatch_combine_backend
-        backend = os.getenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+            return cls._moe_dispatch_combine_backend[precision]
+        env_value = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
+        if env_value is not None:
+            backend = cls._extract_backend_from_env(env_value)[precision]
 
-        if backend:
-            backend_type = BackendType[backend.upper()]
-            if backend_type == BackendType.DEEP_EP:
+            if backend == BackendType.DEEP_EP:
                 assert (
                     HAVE_DEEP_EP
                 ), "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
-            return BackendType[backend.upper()]
+            return backend
+
         return None
 
     @classmethod
@@ -110,7 +163,7 @@ class GlobalBackendManager:
         """Check if auto-tune is enabled."""
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get("PRIMUS_TURBO_AUTO_TUNE", "0") == "1"
+        return os.environ.get(_ENV_AUTO_TUNE_KEY, "0") == "1"
 
     @classmethod
     def reset(cls) -> None:
@@ -290,8 +343,11 @@ class AutoKernelDispatcher(ABC):
             return default_backend_cls.execute(**kwargs)
 
         # 4. Fallback: try all backends
-        for fallback_backend_cls in cls._backends.values():
+        for fallback_backend_enum, fallback_backend_cls in cls._backends.items():
             if fallback_backend_cls.can_handle(**kwargs):
+                log_warning_once(
+                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!"
+                )
                 return fallback_backend_cls.execute(**kwargs)
 
         raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
