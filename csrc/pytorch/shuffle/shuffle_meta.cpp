@@ -42,7 +42,7 @@ at::Tensor shuffle_weight_impl_meta(const at::Tensor weight) {
     PRIMUS_TURBO_CHECK((N / 2) % MXFP4_SHUFFLE_BK == 0, "N/2 must be divisible by ",
                        MXFP4_SHUFFLE_BK, " for shuffled FP4. But got N/2=", N / 2);
 
-    return at::empty({M, N / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    return at::empty({M, N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 }
 
 } // namespace primus_turbo::pytorch

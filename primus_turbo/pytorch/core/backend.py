@@ -135,7 +135,7 @@ class GlobalBackendManager:
     def get_grouped_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
-            return cls._grouped_gemm_backend
+            return cls._grouped_gemm_backend[precision]
         env_value = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY, None)
         if env_value is not None:
             return cls._extract_backend_from_env(env_value)[precision]

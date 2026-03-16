@@ -48,7 +48,6 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
         return (a + b - 1) / b;
     };
 
-    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
                        "Input must be BFloat16 or Half");
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
