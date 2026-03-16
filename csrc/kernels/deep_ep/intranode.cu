@@ -175,7 +175,7 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads>
+template <int kNumRanks, int kNumThreads, bool kUseCheapFence>
 __global__ void __launch_bounds__(kNumThreads, 1)
     dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
@@ -365,7 +365,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 syncwarp();
             }
             if (send_warp_id_in_rank == 0 and lane_id == 0)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
+                                                      cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -411,7 +412,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by
             // different warps are the same
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
+                cached_channel_tail_idx =
+                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -530,11 +532,15 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
                        std::numeric_limits<int>::max());
 
+    const bool use_cheap_fence = is_enable_cheap_fence();
+
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
+        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true>                  \
+                                             : dispatch<ranks, kNumThreads, false>;                \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
-            &cfg, dispatch<ranks, kNumThreads>, reinterpret_cast<int4 *>(recv_x), recv_x_scales,   \
-            recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,        \
+            &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
+            recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
             reinterpret_cast<const int4 *>(x), x_scales, topk_idx, topk_weights, is_token_in_rank, \
             channel_prefix_matrix, num_tokens, num_worst_tokens, hidden_int4, num_topk,            \
             num_experts, num_scales, scale_token_stride, scale_hidden_stride, buffer_ptrs, rank,   \
@@ -618,7 +624,7 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template <typename dtype_t, int kNumRanks, int kNumThreads>
+template <typename dtype_t, int kNumRanks, int kNumThreads, bool kUseCheapFence>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x, const float *topk_weights,
             const dtype_t *bias_0, const dtype_t *bias_1, const int *src_idx,
@@ -747,7 +753,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 syncwarp();
             }
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
+                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
+                                                      current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -787,7 +794,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     break;
 
                 // Update queue tail
-                channel_tail_idx[lane_id] = ld_relaxed_sys_global(channel_tail_idx_ptr);
+                channel_tail_idx[lane_id] =
+                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx_ptr);
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -940,15 +948,19 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 1024;
 
+    const bool use_cheap_fence = is_enable_cheap_fence();
+
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
-        LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
-            &cfg, combine<dtype, ranks, kNumThreads>, reinterpret_cast<dtype *>(recv_x),           \
-            recv_topk_weights, reinterpret_cast<const dtype *>(x), topk_weights,                   \
-            reinterpret_cast<const dtype *>(bias_0), reinterpret_cast<const dtype *>(bias_1),      \
-            src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, num_tokens,             \
-            num_recv_tokens, hidden, num_topk, buffer_ptrs, rank, num_max_send_tokens,             \
-            num_recv_buffer_tokens);                                                               \
+        auto combine_func = use_cheap_fence ? combine<dtype, ranks, kNumThreads, true>             \
+                                            : combine<dtype, ranks, kNumThreads, false>;           \
+        LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, reinterpret_cast<dtype *>(recv_x),       \
+                                      recv_topk_weights, reinterpret_cast<const dtype *>(x),       \
+                                      topk_weights, reinterpret_cast<const dtype *>(bias_0),       \
+                                      reinterpret_cast<const dtype *>(bias_1), src_idx,            \
+                                      rank_prefix_matrix, channel_prefix_matrix, send_head,        \
+                                      num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs,  \
+                                      rank, num_max_send_tokens, num_recv_buffer_tokens);          \
     }                                                                                              \
     break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype)                                                           \
