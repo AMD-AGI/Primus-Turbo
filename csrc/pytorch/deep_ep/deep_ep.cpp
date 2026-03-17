@@ -543,7 +543,7 @@ Buffer::intranode_dispatch(
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > NUM_CPU_TIMEOUT_SECS)
+                        .count() > get_num_cpu_timeout_secs())
                     throw std::runtime_error("DeepEP error: CPU recv timeout");
             }
             num_recv_tokens_per_expert_list = std::vector<int>(
@@ -1004,7 +1004,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > NUM_CPU_TIMEOUT_SECS) {
+                        .count() > get_num_cpu_timeout_secs()) {
                     printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank,
                            num_recv_tokens, num_rdma_recv_tokens);
                     for (int i = 0; i < num_local_experts; ++i)
