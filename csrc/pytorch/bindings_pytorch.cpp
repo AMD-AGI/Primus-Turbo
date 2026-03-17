@@ -53,6 +53,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, bool pre_sync) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
+
+    // ********* CCO *********
+
+    // ********* CCO *********
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
