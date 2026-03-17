@@ -4,7 +4,6 @@ import platform
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -39,16 +38,6 @@ AITER_COMMIT = "e83f9903c07001a0ec29e85d223f6e6cdbe00859"
 ORIGAMI_COMMIT = "01abf3db57f692c7ff70200b0697ed10335fb1e3"
 
 # -------------------------------------
-
-
-@contextmanager
-def _chdir(path):
-    prev_cwd = os.getcwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(prev_cwd)
 
 
 def get_submodule_folders():
@@ -386,11 +375,6 @@ def build_jax_extension():
     )
 
 
-class PrimusTurboBuildExt(TurboBuildExt.with_options(use_ninja=True)):
-    def run(self):
-        super().run()
-
-
 if __name__ == "__main__":
     # Initialize submodules
     check_submodules()
@@ -436,7 +420,7 @@ if __name__ == "__main__":
         packages=find_packages(exclude=["tests", "tests.*"]),
         package_data={"primus_turbo": ["lib/*.so"]},
         ext_modules=ext_modules,
-        cmdclass={"build_ext": PrimusTurboBuildExt},
+        cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,
         install_requires=install_requires,
     )
