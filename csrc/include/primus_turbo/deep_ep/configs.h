@@ -22,8 +22,8 @@
 
 #define FINISHED_SUM_TAG 1024
 
-#define NUM_CPU_TIMEOUT_SECS 100
-#define NUM_TIMEOUT_CYCLES 200000000000ll // 200G cycles ~= 100s
+#define NUM_CPU_TIMEOUT_SECS 300
+#define NUM_TIMEOUT_CYCLES 300000000000ll // 300G cycles ~= 150s
 
 #define NUM_WAIT_NANOSECONDS 500
 
@@ -66,3 +66,11 @@ static constexpr uint64_t kSecondHalfMask   = 0xffffffff00000000;
 #ifdef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_OPERATORS__
 #endif
+
+static inline auto get_num_cpu_timeout_secs() {
+    const char *env = getenv("PRIMUS_TURBO_DEEPEP_TIMEOUT");
+    if (!env || env[0] == '\0')
+        return NUM_CPU_TIMEOUT_SECS;
+
+    return std::stoi(env);
+}
