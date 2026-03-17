@@ -532,7 +532,7 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
                        std::numeric_limits<int>::max());
 
-    const bool use_cheap_fence = is_enable_cheap_fence();
+    static const bool use_cheap_fence = is_enable_cheap_fence();
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
@@ -948,7 +948,7 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 1024;
 
-    const bool use_cheap_fence = is_enable_cheap_fence();
+    static const bool use_cheap_fence = is_enable_cheap_fence();
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
