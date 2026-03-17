@@ -190,6 +190,111 @@ MoEModelConfigs = {
         "num_experts": 64,
         "num_topk": 8,
     },
+    # https://huggingface.co/xai-org/grok-2/blob/main/config.json
+    "Grok-2": {
+        "n_routed_experts": 8,
+        "moe_intermediate_size": 16384,
+        "hidden_size": 8192,
+        # Standard MHA
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "seqlen": 8192,
+        "num_experts": 8,
+        "num_topk": 2,
+    },
+    # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
+    "Qwen3-30B-A3B": {
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 2048,
+        "hidden_size": 2048,
+        # GQA attention config
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "seqlen": 8192,
+        "num_experts": 128,
+        "num_topk": 8,
+    },
+    # https://modelscope.cn/models/Qwen/Qwen3-235B-A22B-Instruct-2507
+    "Qwen3-235B-A22B": {
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 4096,
+        "hidden_size": 4096,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "seqlen": 8192,
+        "num_experts": 128,
+        "num_topk": 8,
+    },
+    # https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json
+    "Mixtral-8x7B": {
+        "n_routed_experts": 8,  # num_local_experts
+        "moe_intermediate_size": 14336,
+        "hidden_size": 4096,
+        # GQA attention config
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "seqlen": 4096,
+        "num_experts": 8,
+        "num_topk": 2,
+    },
+    # https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/blob/main/config.json
+    "Mixtral-8x22B": {
+        "n_routed_experts": 8,  # num_local_experts
+        "moe_intermediate_size": 16384,
+        "hidden_size": 6144,
+        # GQA attention config
+        "num_attention_heads": 48,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "seqlen": 8192,
+        "num_experts": 8,
+        "num_topk": 2,
+    },
+    # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
+    "Kimi-K2": {
+        "n_routed_experts": 384,
+        "moe_intermediate_size": 2048,
+        "hidden_size": 7168,
+        # MLA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
+        "head_dim_v": 128,
+        "seqlen": 4096,
+        "num_experts": 384,
+        "num_topk": 8,
+    },
+    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_1T.yaml
+    # 1T total params, 44B active params
+    "MoE-1T": {
+        "n_routed_experts": 224,
+        "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
+        "hidden_size": 8192,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,  # num_query_groups
+        "head_dim": 128,
+        "seqlen": 4096,
+        "num_experts": 224,
+        "num_topk": 8,
+    },
+    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
+    # 2T total params, 80B active params
+    # "MoE-2T": {
+    #     "n_routed_experts": 448,
+    #     "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
+    #     "hidden_size": 8192,
+    #     # GQA attention config
+    #     "num_attention_heads": 64,
+    #     "num_key_value_heads": 8,  # num_query_groups
+    #     "head_dim": 128,
+    #     "seqlen": 4096,
+    # },
 }
 
 ###############################################################################
