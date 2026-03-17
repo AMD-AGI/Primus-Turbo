@@ -30,11 +30,19 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import _select_params_origami
+from primus_turbo.triton.gemm.gemm_kernel import (
+    _select_params_origami,
+    _is_gfx950,
+    _set_knobs_gfx950,
+    _calculate_lds_usage,
+    _get_hardware,
+)
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
@@ -82,6 +90,188 @@ def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
 
     return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cached config selection (avoids per-call origami / LDS overhead)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gg_fp8_tw_fwd_config(
+    avg_m, N, K, out_dtype, a_dtype, b_dtype, trans_b, G, num_sms,
+    M_total, stride_ak, stride_bk,
+):
+    """Cached kernel config for FP8 tensorwise grouped GEMM forward."""
+    if _is_gfx950():
+        blk_m, blk_n = 256, 256
+        blk_k = 128
+        num_stages_val = 2
+        group_m = 4
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+        grid_sms = num_sms
+
+        origami_params = _select_params_origami(
+            avg_m, N, K, out_dtype, a_dtype, b_dtype,
+            trans_a=False, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oc_a, oc_b = origami_params
+            tiles_default = G * ((avg_m + 255) // 256) * ((N + 255) // 256)
+            if min(om, on) >= 128 and ok == blk_k:
+                blk_m, blk_n, group_m = om, on, ogm
+                cache_a, cache_b = oc_a, oc_b
+            elif tiles_default < num_sms and min(om, on) >= 64:
+                proposed_stages = 2 if ok >= 128 else 3
+                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= _get_hardware().lds_capacity:
+                    blk_m, blk_n, blk_k = om, on, ok
+                    group_m = ogm
+                    cache_a, cache_b = oc_a, oc_b
+                    num_stages_val = proposed_stages
+    else:
+        blk_m, blk_n, blk_k, group_m, grid_sms, chunk_size, cache_a, cache_b = (
+            offline_select_gg_fp8(M_total, G, N, K, stride_ak, stride_bk)
+        )
+        num_stages_val = 2
+
+        origami_params = _select_params_origami(
+            avg_m, N, K, out_dtype, a_dtype, b_dtype,
+            trans_a=False, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (blk_m, blk_n, blk_k):
+                group_m = ogm
+                cache_a = oca
+                cache_b = ocb
+
+    return blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, grid_sms
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
+    """Cached kernel config for FP8 tensorwise grouped GEMM variable-K backward."""
+    if _is_gfx950():
+        blk_m, blk_n = 256, 256
+        blk_k, num_stages_val = 64, 3
+        group_m = 4
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+        origami_params = _select_params_origami(
+            OUT_M, OUT_N, avg_k, a_dtype, a_dtype, b_dtype,
+            trans_a=True, trans_b=False,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oc_a, oc_b = origami_params
+            tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
+            if min(om, on) >= 128 and ok in (64, 128):
+                blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
+                num_stages_val = 3 if ok <= 64 else 2
+                cache_a, cache_b = oc_a, oc_b
+            elif tiles_default < num_sms and min(om, on) >= 64:
+                proposed_stages = 2 if ok >= 128 else 3
+                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= _get_hardware().lds_capacity:
+                    blk_m, blk_n, blk_k = om, on, ok
+                    group_m = ogm
+                    cache_a, cache_b = oc_a, oc_b
+                    num_stages_val = proposed_stages
+    else:
+        blk_m, blk_n, blk_k = 256, 256, 64
+        group_m = 4
+        num_stages_val = 2
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+    return blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gg_fp8_rw_fwd_config(
+    avg_m, N, K, out_dtype, a_dtype, b_dtype, trans_b, G, num_sms,
+    M_total, stride_ak, stride_bk,
+):
+    """Cached kernel config for FP8 rowwise grouped GEMM forward."""
+    if _is_gfx950():
+        blk_m, blk_n = 256, 256
+        blk_k = 128
+        num_stages_val = 2
+        group_m = 4
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+        origami_params = _select_params_origami(
+            avg_m, N, K, out_dtype, a_dtype, b_dtype,
+            trans_a=False, trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oc_a, oc_b = origami_params
+            tiles_default = G * ((avg_m + 255) // 256) * ((N + 255) // 256)
+            if min(om, on) >= 128 and ok == blk_k:
+                blk_m, blk_n, group_m = om, on, ogm
+                cache_a, cache_b = oc_a, oc_b
+            elif tiles_default < num_sms and min(om, on) >= 64:
+                proposed_stages = 2 if ok >= 128 else 3
+                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= _get_hardware().lds_capacity:
+                    blk_m, blk_n, blk_k = om, on, ok
+                    group_m = ogm
+                    cache_a, cache_b = oc_a, oc_b
+                    num_stages_val = proposed_stages
+    else:
+        blk_m, blk_n = 256, 256
+        blk_k = 128 if (stride_ak == 1 and stride_bk == 1) else 64
+        num_stages_val = 2
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+        tiles_m_per_group = (M_total + G * blk_m - 1) // (G * blk_m)
+        tiles_n = (N + blk_n - 1) // blk_n
+        group_m = 8 if min(tiles_m_per_group, tiles_n) < 16 else 4
+
+    return blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
+    """Cached kernel config for FP8 rowwise grouped GEMM variable-K backward."""
+    if _is_gfx950():
+        blk_m, blk_n = 256, 256
+        blk_k, num_stages_val = 64, 3
+        group_m = 4
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+        origami_params = _select_params_origami(
+            OUT_M, OUT_N, avg_k, a_dtype, a_dtype, b_dtype,
+            trans_a=True, trans_b=False,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oc_a, oc_b = origami_params
+            tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
+            if min(om, on) >= 128 and ok in (64, 128):
+                blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
+                num_stages_val = 3 if ok <= 64 else 2
+                cache_a, cache_b = oc_a, oc_b
+            elif tiles_default < num_sms and min(om, on) >= 64:
+                proposed_stages = 2 if ok >= 128 else 3
+                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= _get_hardware().lds_capacity:
+                    blk_m, blk_n, blk_k = om, on, ok
+                    group_m = ogm
+                    cache_a, cache_b = oc_a, oc_b
+                    num_stages_val = proposed_stages
+    else:
+        blk_m, blk_n, blk_k = 256, 256, 64
+        group_m = 4
+        num_stages_val = 2
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+
+    return blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size
 
 
 # ###########################################################################
@@ -301,28 +491,17 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # Output
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
-    # Kernel config — grouped GEMM FP8 offline selection
-    blk_m, blk_n, blk_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_gg_fp8(
-        M_total, G, N, K, stride_ak, stride_bk
-    )
+    # Kernel config (cached — origami + LDS check run only on first call per shape)
+    num_sms = _get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    origami_params = _select_params_origami(
-        avg_m,
-        N,
-        K,
-        out_dtype,
-        a.dtype,
-        b.dtype,
-        trans_a=False,
-        trans_b=trans_b,
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
+        _get_gg_fp8_tw_fwd_config(
+            avg_m, N, K, out_dtype, a.dtype, b.dtype, trans_b, G, num_sms,
+            M_total, stride_ak, stride_bk,
+        )
     )
-    if origami_params is not None:
-        om, on, ok, ogm, oca, ocb = origami_params
-        if (om, on, ok) == (blk_m, blk_n, blk_k):
-            group_m = ogm
-            cache_a = oca
-            cache_b = ocb
-
     even_k = K % blk_k == 0
 
     _grouped_fp8_persistent_gemm_kernel[(num_sms,)](
@@ -353,7 +532,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
@@ -397,6 +576,13 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
+    blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
+        _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms)
+    )
+
     _grouped_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
@@ -414,18 +600,18 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         out.stride(2),
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=4,
+        BLOCK_SIZE_M=blk_m,
+        BLOCK_SIZE_N=blk_n,
+        BLOCK_SIZE_K=blk_k,
+        GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         IS_FP8=True,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
@@ -649,15 +835,18 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
     # Output
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
-    # Kernel config (fixed, no autotune — same as tensorwise)
+    # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
-    blk_k = 128 if (stride_ak == 1 and stride_bk == 1) else 64
+    avg_m = max(M_total // max(G, 1), 256)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
+        _get_gg_fp8_rw_fwd_config(
+            avg_m, N, K, out_dtype, a.dtype, b.dtype, trans_b, G, num_sms,
+            M_total, stride_ak, stride_bk,
+        )
+    )
     even_k = K % blk_k == 0
-
-    # GROUP_SIZE_M heuristic
-    tiles_m_per_group = (M_total + G * 256 - 1) // (G * 256)
-    tiles_n = (N + 255) // 256
-    group_m = 8 if min(tiles_m_per_group, tiles_n) < 16 else 4
 
     _grouped_fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
         a,
@@ -677,18 +866,18 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
         b_scale.stride(0),  # stride_bscale_g
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_M=blk_m,
+        BLOCK_SIZE_N=blk_n,
         BLOCK_SIZE_K=blk_k,
         GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
@@ -882,6 +1071,13 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
+    blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
+        _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms)
+    )
+
     _grouped_fp8_rowwise_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
@@ -899,17 +1095,17 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
         out.stride(2),
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=256,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=4,
+        BLOCK_SIZE_M=blk_m,
+        BLOCK_SIZE_N=blk_n,
+        BLOCK_SIZE_K=blk_k,
+        GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CHUNK_SIZE=chunk_size,
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
@@ -1278,7 +1474,10 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    _set_amd_knobs(enable=True)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
 
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
@@ -1386,7 +1585,10 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    _set_amd_knobs(enable=False)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=False)
 
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]

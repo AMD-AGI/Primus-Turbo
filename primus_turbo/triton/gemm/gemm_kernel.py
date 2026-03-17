@@ -123,6 +123,7 @@ def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
     return sk_grid
 
 
+@functools.lru_cache(maxsize=1)
 def _is_gfx950() -> bool:
     """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
     try:
@@ -132,8 +133,15 @@ def _is_gfx950() -> bool:
         return False
 
 
+_KNOBS_SET = False
+
+
 def _set_knobs_gfx950():
     """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize)."""
+    global _KNOBS_SET
+    if _KNOBS_SET:
+        return
+    _KNOBS_SET = True
     if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
         triton.knobs.amd.use_async_copy = True
         triton.knobs.amd.scalarize_packed_fops = True
@@ -214,11 +222,58 @@ def offline_select_bf16(M, N, K, s_ak, s_bk):
 
 
 def _estimate_lds_bytes(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages=2):
-    """LDS usage for Triton matmul tile; num_stages=2. Matches TensorAtlas without async_copy."""
+    """LDS usage for Triton matmul tile without async_copy."""
     lds_a = block_m * block_k * elem_bytes_a
     lds_b = block_k * block_n * elem_bytes_b
     base_buffers = max(1, num_stages - 1)
     return (lds_a + lds_b) * base_buffers
+
+
+def _padded_size_32_4(unpadded_size):
+    """Triton [[32, 4]] PaddedSharedEncoding — bank-conflict avoidance padding."""
+    block_padding = (unpadded_size >> 5) << 2
+    if (unpadded_size & 31) == 0 and block_padding >= 4:
+        block_padding -= 4
+    return unpadded_size + block_padding
+
+
+def _padded_size_pow2(unpadded_size, interval, padding):
+    """Triton PaddedSharedEncodingAttr.getPaddedSize for a single (interval, padding) pair."""
+    log2_interval = (interval - 1).bit_length()
+    log2_padding = (padding - 1).bit_length() if padding else 0
+    bp = (unpadded_size >> log2_interval) << log2_padding
+    if unpadded_size % interval == 0 and bp >= padding:
+        bp -= padding
+    return unpadded_size + bp
+
+
+def _estimate_lds_bytes_async_copy(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
+    """LDS usage with async_copy (PaddedSharedEncoding + num_stages buffers).
+
+    Matches tritonBLAS origami.estimate_triton_lds_bytes / triton_bench calculate_lds_usage.
+    """
+    elem_a = block_m * block_k
+    elem_b = block_k * block_n
+    padded_a = _padded_size_32_4(elem_a)
+    padded_b = _padded_size_32_4(elem_b)
+    if block_k & (block_k - 1) == 0:
+        pa = _padded_size_pow2(elem_a, block_k, 8)
+        if pa > padded_a:
+            padded_a = pa
+    if block_n & (block_n - 1) == 0:
+        pb = _padded_size_pow2(elem_b, block_n, 8)
+        if pb > padded_b:
+            padded_b = pb
+    return num_stages * (padded_a * elem_bytes_a + padded_b * elem_bytes_b)
+
+
+def _calculate_lds_usage(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
+    """LDS usage with auto-detection of async_copy mode."""
+    if _is_gfx950():
+        return _estimate_lds_bytes_async_copy(
+            block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
+    return _estimate_lds_bytes(
+        block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
 
 
 def _infer_mi_dim(hardware, element_size_a, element_size_b):
@@ -245,13 +300,22 @@ def _infer_mi_dim(hardware, element_size_a, element_size_b):
 
 
 def _get_valid_tiles(hardware, block_mn_range, block_k_range, mi_dim, elem_bytes_a, elem_bytes_b):
-    """Valid (blk_m, blk_n, blk_k, mi_m, mi_n, mi_k, occ) passing LDS check."""
+    """Valid (blk_m, blk_n, blk_k, mi_m, mi_n, mi_k, occ) passing LDS check.
+
+    Uses async_copy-aware LDS estimate on gfx950 with num_stages=2.
+    Tiles passing here may still exceed LDS at higher num_stages; callers
+    should verify with _calculate_lds_usage for their actual num_stages.
+    """
     lds_cap = hardware.lds_capacity
+    use_async = _is_gfx950()
     valid = []
     for bm, bn, bk in (
         (bm, bn, bk) for bm in block_mn_range for bn in block_mn_range for bk in block_k_range
     ):
-        lds = _estimate_lds_bytes(bm, bn, bk, elem_bytes_a, elem_bytes_b, num_stages=2)
+        if use_async:
+            lds = _estimate_lds_bytes_async_copy(bm, bn, bk, elem_bytes_a, elem_bytes_b, num_stages=2)
+        else:
+            lds = _estimate_lds_bytes(bm, bn, bk, elem_bytes_a, elem_bytes_b, num_stages=2)
         if lds <= lds_cap:
             valid.append((bm, bn, bk, mi_dim[0], mi_dim[1], mi_dim[2], 1))
     return valid
