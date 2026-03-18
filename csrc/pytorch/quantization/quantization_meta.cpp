@@ -109,7 +109,8 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     at::Tensor colwise_output =
         at::empty({N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
-    return {rowwise_output, rowwise_scale, colwise_output, colwise_scale};
+    return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale.view(at::kFloat8_e8m0fnu),
+            colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale.view(at::kFloat8_e8m0fnu)};
 }
 
 std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
@@ -151,7 +152,7 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     at::Tensor output      = at::empty({output_rows, output_cols},
                                        at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
-    return {output, scale_tensor};
+    return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
 }
 
 } // namespace primus_turbo::pytorch

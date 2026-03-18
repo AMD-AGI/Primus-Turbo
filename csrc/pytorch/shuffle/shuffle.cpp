@@ -20,6 +20,7 @@ at::Tensor shuffle_scale_impl(const at::Tensor scale) {
 
     PRIMUS_TURBO_CHECK(scale.is_cuda(), "Scale must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(scale.scalar_type() == at::kFloat8_e8m0fnu, "Scale must be Float8_e8m0fnu.");
+    PRIMUS_TURBO_CHECK(scale.dim() == 2, "Scale must be 2D");
 
     int64_t M           = scale.size(0);
     int64_t scale_M_pad = cdiv(M, 256) * 256;
