@@ -111,7 +111,7 @@ def gemm_impl(
     default_backend: int,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_OR_FP16)
+    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,

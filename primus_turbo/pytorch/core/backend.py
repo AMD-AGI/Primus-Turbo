@@ -39,15 +39,18 @@ _ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
 class PrecisionType(Enum):
     FP4 = auto()
     FP8 = auto()
-    BF16_OR_FP16 = auto()
+    BF16_FP16_FP32 = auto()
 
 
 _PRECISION_TYPE_MAPPING = {
     "FP4": PrecisionType.FP4,
     "FP8": PrecisionType.FP8,
-    "BF16": PrecisionType.BF16_OR_FP16,
-    "FP16": PrecisionType.BF16_OR_FP16,
+    "BF16": PrecisionType.BF16_FP16_FP32,
+    "FP16": PrecisionType.BF16_FP16_FP32,
+    "FP32": PrecisionType.BF16_FP16_FP32,
 }
+_PRECISION_TYPE_SET = set(_PRECISION_TYPE_MAPPING.values())
+_OTHER_PRECISION_HOLDER = "OTHER"
 
 
 class BackendType(Enum):
@@ -77,28 +80,45 @@ class GlobalBackendManager:
     _auto_tune: Optional[bool] = None
 
     @classmethod
-    @lru_cache(maxsize=4)
+    @lru_cache(maxsize=32)
     def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendType]:
         """
         Extract the backend from the environment variable.
         Support formats. Example:
         1. ENV_KEY=backend -> All precison use the same backend
         2. ENV_KEY=<precision1>:<backend1>,<precision2>:<backend2>,... -> Each precision uses a different backend
+        3. ENV_KEY=<precision1>:<backend1>,other:<backend2>,... -> precision1 use backend1, other precisions use backend2
 
         Precision types are defined in the _PRECISION_TYPE_MAPPING.
         """
         precision_backend_dict = {}
-        # Parse format 2: <precision1>:<backend1>,<precision2>:<backend2>,...
-        if "fp4" in env_value or "fp8" in env_value or "bf16" in env_value or "fp16" in env_value:
+
+        # Parse format 2 & 3
+        env_lower = env_value.lower()
+        if (
+            "fp4" in env_lower
+            or "fp8" in env_lower
+            or "bf16" in env_lower
+            or "fp16" in env_lower
+            or "other" in env_lower
+        ):
             precision_backend_pairs = env_value.split(",")
+            other_precision_backend = None
             for pair in precision_backend_pairs:
                 if pair.strip() == "":
-                    # Skip empty pair.
                     continue
                 precision, backend = pair.split(":")
-                precision, backend = precision.upper(), backend.upper()
+                precision, backend = precision.strip().upper(), backend.strip().upper()
+                if precision == _OTHER_PRECISION_HOLDER:
+                    other_precision_backend = BackendType[backend]
+                    continue
                 assert precision in _PRECISION_TYPE_MAPPING, f"Precision {precision} not supported."
                 precision_backend_dict[_PRECISION_TYPE_MAPPING[precision]] = BackendType[backend]
+
+            # Set rest precisions to the other precision backend
+            for precision in _PRECISION_TYPE_MAPPING.values():
+                if precision not in precision_backend_dict:
+                    precision_backend_dict[precision] = other_precision_backend
         else:
             # Parse format 1: ENV_KEY=backend -> All precison use the same backend
             for value in _PRECISION_TYPE_MAPPING.values():
@@ -107,14 +127,42 @@ class GlobalBackendManager:
         return precision_backend_dict
 
     @classmethod
-    def set_gemm_backend(cls, precision: PrecisionType, backend: Optional[BackendType]) -> None:
+    def set_gemm_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
         """Set the GEMM backend in code."""
-        cls._gemm_backend[precision] = backend
+        if backend is None:
+            cls._gemm_backend = None
+            return
+
+        if cls._gemm_backend is None:
+            cls._gemm_backend = {}
+
+        # backend is not None
+        if precision is None:
+            # preicision is None -> set all precisions to the same backend
+            cls._gemm_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._gemm_backend[precision] = backend
 
     @classmethod
-    def set_grouped_gemm_backend(cls, precision: PrecisionType, backend: Optional[BackendType]) -> None:
+    def set_grouped_gemm_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
         """Set the Grouped GEMM backend in code."""
-        cls._grouped_gemm_backend[precision] = backend
+        if backend is None:
+            cls._grouped_gemm_backend = None
+            return
+
+        if cls._gemm_backend is None:
+            cls._gemm_backend = {}
+
+        # backend is not None
+        if precision is None:
+            # preicision is None -> set all precisions to the same backend
+            cls._grouped_gemm_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._grouped_gemm_backend[precision] = backend
 
     @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:

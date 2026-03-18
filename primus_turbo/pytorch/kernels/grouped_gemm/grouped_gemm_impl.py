@@ -314,7 +314,7 @@ def grouped_gemm_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_OR_FP16)
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,
@@ -344,7 +344,7 @@ def grouped_gemm_variable_k_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_OR_FP16)
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         a=a,
         b=b,

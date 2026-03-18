@@ -383,7 +383,7 @@ def moe_dispatch_impl(
     default_backend: Optional[BackendType] = BackendType.DEEP_EP,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
 
-    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_OR_FP16)
+    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         group=group,
         x=x,
@@ -407,7 +407,7 @@ def moe_combine_impl(
     allocate_on_comm_stream: bool = False,
     default_backend: Optional[BackendType] = BackendType.DEEP_EP,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_OR_FP16)
+    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         group=group,
         x=x,

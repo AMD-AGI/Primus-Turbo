@@ -17,6 +17,7 @@ from primus_turbo.pytorch.core.backend import (
 def clean_backend_state(monkeypatch):
     """Reset backend state and clear env vars before/after each test."""
     GlobalBackendManager.reset()
+    GlobalBackendManager._extract_backend_from_env.cache_clear()
     for key in (
         "PRIMUS_TURBO_GEMM_BACKEND",
         "PRIMUS_TURBO_GROUPED_GEMM_BACKEND",
@@ -26,6 +27,7 @@ def clean_backend_state(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     yield
     GlobalBackendManager.reset()
+    GlobalBackendManager._extract_backend_from_env.cache_clear()
 
 
 class TestGlobalBackendManagerEnvVar:
@@ -35,7 +37,7 @@ class TestGlobalBackendManagerEnvVar:
         monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "ck")
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.CK
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.CK
-        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_OR_FP16) == BackendType.CK
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32) == BackendType.CK
 
     def test_gemm_backend_per_precision_format(self, monkeypatch):
         """Format 2: fp4:hipblaslt,fp8:ck -> per-precision mapping."""
@@ -59,6 +61,19 @@ class TestGlobalBackendManagerEnvVar:
         monkeypatch.setenv("PRIMUS_TURBO_AUTO_TUNE", "0")
         assert GlobalBackendManager.auto_tune_enabled() is False
 
+    def test_gemm_backend_other_precision_format(self, monkeypatch):
+        """Format 3: fp8:ck,other:hipblaslt -> FP8 uses CK, rest use HIPBLASLT."""
+        monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "fp8:ck,other:hipblaslt")
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.CK
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.HIPBLASLT
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32) == BackendType.HIPBLASLT
+
+    def test_gemm_backend_invalid_precision_raises(self, monkeypatch):
+        """Invalid precision name should raise AssertionError."""
+        monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "fp8:ck,invalid:hipblaslt")
+        with pytest.raises(AssertionError, match="Precision INVALID not supported"):
+            GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+
     def test_returns_none_when_env_not_set(self):
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) is None
         assert GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
@@ -78,22 +93,22 @@ class TestGlobalBackendManagerFunction:
 
     def test_set_get_gemm_backend(self):
         self._init_gemm_backend()
-        GlobalBackendManager.set_gemm_backend(PrecisionType.FP8, BackendType.CK)
+        GlobalBackendManager.set_gemm_backend(BackendType.CK, PrecisionType.FP8)
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.CK
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) is None
 
     def test_set_get_gemm_backend_multiple_precisions(self):
         self._init_gemm_backend()
-        GlobalBackendManager.set_gemm_backend(PrecisionType.FP4, BackendType.HIPBLASLT)
-        GlobalBackendManager.set_gemm_backend(PrecisionType.FP8, BackendType.CK)
-        GlobalBackendManager.set_gemm_backend(PrecisionType.BF16_OR_FP16, BackendType.HIPBLASLT)
+        GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT, PrecisionType.FP4)
+        GlobalBackendManager.set_gemm_backend(BackendType.CK, PrecisionType.FP8)
+        GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT, PrecisionType.BF16_FP16_FP32)
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.HIPBLASLT
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.CK
-        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_OR_FP16) == BackendType.HIPBLASLT
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32) == BackendType.HIPBLASLT
 
     def test_set_get_grouped_gemm_backend(self):
         self._init_grouped_gemm_backend()
-        GlobalBackendManager.set_grouped_gemm_backend(PrecisionType.FP8, BackendType.CK)
+        GlobalBackendManager.set_grouped_gemm_backend(BackendType.CK, PrecisionType.FP8)
         result = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
         assert result is not None
 
@@ -105,7 +120,7 @@ class TestGlobalBackendManagerFunction:
 
     def test_reset_clears_code_settings(self):
         self._init_gemm_backend()
-        GlobalBackendManager.set_gemm_backend(PrecisionType.FP8, BackendType.CK)
+        GlobalBackendManager.set_gemm_backend(BackendType.CK, PrecisionType.FP8)
         GlobalBackendManager.set_auto_tune(True)
 
         GlobalBackendManager.reset()
