@@ -154,8 +154,8 @@ class GlobalBackendManager:
             cls._grouped_gemm_backend = None
             return
 
-        if cls._gemm_backend is None:
-            cls._gemm_backend = {}
+        if cls._grouped_gemm_backend is None:
+            cls._grouped_gemm_backend = {}
 
         # backend is not None
         if precision is None:
