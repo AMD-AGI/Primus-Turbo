@@ -11,7 +11,6 @@
 #include "primus_turbo/macros.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
-#include <c10/cuda/CUDAStream.h>
 
 // NOTE: pytorch hipify v2 support
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
