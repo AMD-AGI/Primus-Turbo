@@ -271,9 +271,9 @@ def _calculate_lds_usage(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, 
     """LDS usage with auto-detection of async_copy mode."""
     if _is_gfx950():
         return _estimate_lds_bytes_async_copy(
-            block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
-    return _estimate_lds_bytes(
-        block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
+            block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages
+        )
+    return _estimate_lds_bytes(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
 
 
 def _infer_mi_dim(hardware, element_size_a, element_size_b):
@@ -611,8 +611,14 @@ def gemm_triton_kernel(
         cu_count = _get_hardware().N_CU
 
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params
@@ -637,8 +643,14 @@ def gemm_triton_kernel(
         )
         num_stages, waves_per_eu = 2, 0
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params

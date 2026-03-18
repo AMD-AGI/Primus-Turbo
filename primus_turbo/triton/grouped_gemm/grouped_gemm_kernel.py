@@ -29,8 +29,8 @@ import triton
 import triton.language as tl
 
 from primus_turbo.triton.gemm.gemm_kernel import (
-    _select_params_origami,
     _is_gfx950,
+    _select_params_origami,
     _set_knobs_gfx950,
 )
 
@@ -70,8 +70,14 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
         chunk_size = 32
 
         origami_params = _select_params_origami(
-            avg_m, N, K, dtype_a, dtype_a, dtype_b,
-            trans_a=False, trans_b=trans_b,
+            avg_m,
+            N,
+            K,
+            dtype_a,
+            dtype_a,
+            dtype_b,
+            trans_a=False,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
@@ -86,15 +92,19 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
         chunk_size = 64 if num_sms >= NUM_XCDS * 64 else 32
 
         origami_params = _select_params_origami(
-            avg_m, N, K, dtype_a, dtype_a, dtype_b,
-            trans_a=False, trans_b=trans_b,
+            avg_m,
+            N,
+            K,
+            dtype_a,
+            dtype_a,
+            dtype_b,
+            trans_a=False,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
             if ogm >= 2 and om * on >= 256 * 256:
-                BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = (
-                    om, on, ok, ogm, oc_a, oc_b
-                )
+                BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = (om, on, ok, ogm, oc_a, oc_b)
 
     return BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size
 
@@ -110,8 +120,14 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
         chunk_size = 32
 
         origami_params = _select_params_origami(
-            OUT_M, OUT_N, avg_k, dtype_lhs, dtype_lhs, dtype_rhs,
-            trans_a=True, trans_b=False,
+            OUT_M,
+            OUT_N,
+            avg_k,
+            dtype_lhs,
+            dtype_lhs,
+            dtype_rhs,
+            trans_a=True,
+            trans_b=False,
         )
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
@@ -605,8 +621,8 @@ def grouped_gemm_variable_k_triton_kernel(
     if _is_gfx950():
         _set_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
-    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
-        _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms)
+    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_bf16_vk_config(
+        OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
     )
 
     _grouped_variable_k_gemm_kernel[(num_sms,)](

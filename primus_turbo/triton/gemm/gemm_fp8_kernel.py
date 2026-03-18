@@ -330,8 +330,14 @@ def gemm_fp8_tensorwise_triton_kernel(
         cu_count = _get_hardware().N_CU
 
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params
@@ -346,8 +352,14 @@ def gemm_fp8_tensorwise_triton_kernel(
         )
         waves_per_eu = 0
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params
@@ -624,8 +636,14 @@ def gemm_fp8_rowwise_triton_kernel(
         cu_count = _get_hardware().N_CU
 
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params
@@ -640,8 +658,14 @@ def gemm_fp8_rowwise_triton_kernel(
         )
         waves_per_eu = 0
         origami_params = _select_params_origami(
-            M, N, K, out_dtype, A_view.dtype, B_view.dtype,
-            trans_a=trans_a, trans_b=trans_b,
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
         )
         if origami_params is not None:
             om, on, ok, ogm, oca, ocb = origami_params
