@@ -13,8 +13,7 @@
 GEMM Triton persistent kernels — BF16/FP16.
 
 Contains:
-  - _bf16_persistent_gemm_kernel: BF16/FP16 persistent kernel
-  - StreamK grid computation utility
+  - _bf16_persistent_gemm_kernel: BF16/FP16 persistent kernel (data-parallel grid)
 
 Public API:
   - gemm_triton_kernel  — BF16/FP16 GEMM
@@ -27,105 +26,162 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 from __future__ import annotations
 
 import functools
-import itertools
 import math
 import os
-from typing import Optional
 
+import origami
 import torch
 import triton
 import triton.language as tl
 
-try:
-    import origami
+# Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
+_ORIGAMI_DTYPE_TO_STR = {
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+}
+for _k in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+    if hasattr(torch, _k):
+        _ORIGAMI_DTYPE_TO_STR[getattr(torch, _k)] = "f8"
 
-    _HAS_ORIGAMI = not os.environ.get("PRIMUS_TURBO_DISABLE_ORIGAMI", "")
-except ModuleNotFoundError:
-    _HAS_ORIGAMI = False
+# FP8 dtypes: torch.finfo can be unsupported/buggy, so we treat them explicitly.
+_ORIGAMI_FP8_DTYPES = tuple(
+    d
+    for d in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if d is not None
+)
 
-_ORIGAMI_UNAVAILABLE_LOGGED = False
+
+def _dtype_bits(dtype):
+    """Element bits for LDS/MI dim; safe for FP8 (finfo not fully supported)."""
+    if _ORIGAMI_FP8_DTYPES and dtype in _ORIGAMI_FP8_DTYPES:
+        return 8
+    try:
+        if dtype.is_floating_point:
+            return torch.finfo(dtype).bits
+        return torch.iinfo(dtype).bits
+    except (TypeError, AttributeError):
+        return 16
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Grid Utilities
+# Hardware constants & chiplet transform
 # ═══════════════════════════════════════════════════════════════════════════════
 
+NUM_XCDS = 8
 
-def compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus, max_workspace_bytes=128 * 1024 * 1024):
-    """Compute optimal StreamK grid size based on problem dimensions and hardware.
+# Per-architecture defaults for LDS capacity (bytes) and max compute clock (KHz).
+# Used by _get_hardware to avoid calling origami.get_hardware_for_device() which
+# internally invokes HIP C APIs that can segfault in certain Docker / distributed
+# training environments due to HIP runtime double-initialization conflicts.
+_ARCH_HW_DEFAULTS: dict[str, tuple[int, int]] = {
+    "gfx950": (163840, 2400000),  # MI350X / MI355X  — 160 KB LDS, 2.4 GHz
+    "gfx942": (65536, 2100000),  # MI300X / MI300A  —  64 KB LDS, 2.1 GHz
+}
 
-    Implements the dynamic grid logic from tritonBLAS/Origami:
-    - If tiles > CUs: Try fractional splits to balance work
-    - If tiles < CUs: Split along K-dimension
-    - Consider workspace constraints for partial tiles
 
-    Args:
-        M, N, K: Matrix dimensions
-        block_m, block_n, block_k: Tile sizes
-        num_cus: Number of compute units (e.g., 256 for MI300, 304 for MI325X)
-        max_workspace_bytes: Maximum workspace size for partial tiles (default 128MB)
+@functools.lru_cache(maxsize=8)
+def _get_hardware(device_id=None):
+    """Cached origami hardware descriptor (align with TensorAtlas selector.py).
 
-    Returns:
-        int: Optimal grid size for StreamK kernel
+    Uses origami.get_hardware_for_arch() with parameters sourced from
+    torch.cuda.get_device_properties() to avoid direct HIP C API calls inside
+    the origami C++ extension, which can segfault due to HIP runtime
+    double-initialization in certain container environments.
+    Falls back to origami.get_hardware_for_device() for unknown architectures.
     """
-    tiles = math.ceil(M / block_m) * math.ceil(N / block_n)
-    iters_per_tile = max(1, math.ceil(K / block_k))
+    if device_id is None:
+        device_id = torch.cuda.current_device()
 
+    props = torch.cuda.get_device_properties(device_id)
+    arch_full = getattr(props, "gcnArchName", "")  # e.g. "gfx950:sramecc+:xnack-"
+    arch_base = arch_full.split(":")[0]  # e.g. "gfx950"
+    arch_enum = getattr(origami.architecture_t, arch_base, None)
+
+    if arch_enum is not None and arch_base in _ARCH_HW_DEFAULTS:
+        lds_capacity, clock_khz = _ARCH_HW_DEFAULTS[arch_base]
+        return origami.get_hardware_for_arch(
+            arch_enum,
+            props.multi_processor_count,
+            lds_capacity,
+            props.L2_cache_size,
+            clock_khz,
+        )
+
+    return origami.get_hardware_for_device(device_id)
+
+
+_SK_TILE_FRACTIONS = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
+_SK_SPLIT_FACTORS = [8, 6, 4, 3, 2, 1]
+_SK_MAX_WORKSPACE = 128 * 1024 * 1024
+
+
+def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
+    tiles = math.ceil(M / BLK_M) * math.ceil(N / BLK_N)
     sk_grid = tiles
+    iters_per_tile = max(1, math.ceil(K / BLK_K))
 
-    tile_fractions = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
-    split_factors = [8, 6, 4, 3, 2, 1]
-
-    if tiles > num_cus:
-        min_even_tiles = tiles / num_cus
-        for frac in tile_fractions:
+    if tiles > cu_count:
+        min_even_tiles = tiles / cu_count
+        for frac in _SK_TILE_FRACTIONS:
             frac_grid = int((tiles / (min_even_tiles + frac)) + 0.5)
-            partial_tile_bytes = block_m * block_n * 2 * frac_grid
-            if tiles % frac_grid != 0 and partial_tile_bytes > max_workspace_bytes:
+            partial_size = BLK_M * BLK_N * elem_bytes_out * frac_grid
+            if tiles % frac_grid != 0 and partial_size > _SK_MAX_WORKSPACE:
                 continue
-            if frac_grid <= num_cus:
+            if frac_grid <= cu_count:
                 sk_grid = frac_grid
                 break
-    elif tiles < num_cus:
-        for factor in split_factors:
+    elif tiles < cu_count:
+        for factor in _SK_SPLIT_FACTORS:
             split_grid = tiles * factor
             iters_per_cu = iters_per_tile // factor
-            if split_grid <= num_cus and iters_per_cu >= 8:
+            if split_grid <= cu_count and iters_per_cu >= 8:
                 sk_grid = split_grid
                 break
 
     if tiles % sk_grid != 0:
         sk_grid = tiles
 
-    if tiles >= num_cus:
-        last_wave_remainder = tiles % num_cus
-        if last_wave_remainder < 128 and last_wave_remainder > 0 and num_cus == 304:
-            sk_grid = 256
+    if tiles >= cu_count and cu_count in (304, 80, 64):
+        last_wave_remainder = tiles % cu_count
+        if 0 < last_wave_remainder < 128:
+            sk_grid = 256 if cu_count == 304 else 64
 
     return sk_grid
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Hardware constants
-# ═══════════════════════════════════════════════════════════════════════════════
-
-NUM_XCDS = 8
-_NUM_CUS: Optional[int] = None
-
-# Kept for FP8 kernel compatibility (gemm_fp8_kernel.py imports this).
-_AUTOTUNE_MN_THRESHOLD = 128 * 1024 * 1024
-
-
-def _get_num_cus() -> int:
-    """Lazy initialization of CU count (avoids import-time CUDA calls)."""
-    global _NUM_CUS
-    if _NUM_CUS is None:
-        _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return _NUM_CUS
+@functools.lru_cache(maxsize=1)
+def _is_gfx950() -> bool:
+    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return target is not None and target.backend == "hip" and target.arch == "gfx950"
+    except (AttributeError, TypeError):
+        return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Chiplet Transform
-# ═══════════════════════════════════════════════════════════════════════════════
+_KNOBS_SET = False
+
+
+def _set_knobs_gfx950():
+    """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize)."""
+    global _KNOBS_SET
+    if _KNOBS_SET:
+        return
+    _KNOBS_SET = True
+    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+        triton.knobs.amd.use_async_copy = True
+        triton.knobs.amd.scalarize_packed_fops = True
+        triton.knobs.amd.use_block_pingpong = True
+    else:
+        os.environ.setdefault("TRITON_HIP_USE_ASYNC_COPY", "1")
+        os.environ.setdefault("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
+        os.environ.setdefault("TRITON_HIP_USE_BLOCK_PINGPONG", "1")
 
 
 @triton.jit
@@ -149,104 +205,251 @@ def _chiplet_transform_chunked(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _select_group_size_m_bf16(M, N, stride_ak, stride_bk):
-    """Fallback heuristic GROUP_SIZE_M (used when origami is unavailable).
+def offline_select_bf16(M, N, K, s_ak, s_bk):
+    """BF16 config selection from MI300X bench data (out_bf16_gemm.yaml, 186 entries).
 
-    Patterns from 94-entry BF16 tuning data:
-    - min_tile < 16 (non-standard dims like 3584): GROUP=8
-    - TN layout (stride_ak!=1, stride_bk!=1) + both tiles >= 32: GROUP=5
-    - Default: 4
+    Stride → layout:
+      NT (trans_a=False, trans_b=True):  s_ak=1, s_bk=1   → C = A @ B^T
+      NN (trans_a=False, trans_b=False): s_ak=1, s_bk≠1   → C = A @ B
+      TN (trans_a=True,  trans_b=False): s_ak≠1, s_bk≠1   → C = A^T @ B
+      TT (trans_a=True,  trans_b=True):  s_ak≠1, s_bk=1   → C = A^T @ B^T
+
+    Returns (BM, BN, BK, GM, NUM_SMS, CHUNK, CA, CB).
     """
-    tiles_m = (M + 255) // 256
-    tiles_n = (N + 255) // 256
-    min_tile = min(tiles_m, tiles_n)
+    # ── Block sizes (256×256×64 covers ~93% of bench entries) ──
+    BM, BN, BK = 256, 256, 64
 
-    is_tn = (stride_ak != 1) and (stride_bk != 1)
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
+    total_tiles = tiles_m * tiles_n
 
-    if min_tile < 16:
-        return 8
-    elif is_tn and tiles_m >= 32 and tiles_n >= 32:
-        return 5
+    cu_count = _get_hardware().N_CU
+
+    # ── NUM_SMS ──
+    # Small grids: sk_grid for wave efficiency (persistent, NUM_SMS=256/304)
+    # Large grids: data-parallel (NUM_SMS=total_tiles) to keep all CUs busy
+    if total_tiles <= cu_count * 4:
+        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
     else:
-        return 4
+        num_sms = total_tiles
+
+    # ── GROUP_SIZE_M ──
+    if min(tiles_m, tiles_n) < 16:
+        group_m = 8
+    else:
+        group_m = 4
+
+    # ── CHUNK_SIZE ──
+    # persistent mode: small chunks for XCD load-balance
+    # data-parallel: 64 for large tile counts, 32 for small
+    if num_sms < total_tiles:
+        chunk = min(32, max(1, num_sms // NUM_XCDS))
+    else:
+        chunk = 64 if total_tiles > 1024 else 32
+
+    return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
 
 
-# ─── Origami analytical config selection ──────────────────────────────────────
-
-_ORIGAMI_CONFIGS: Optional[list] = None
+# ─── Origami analytical config selection (aligned with TensorAtlas / tritonBLAS) ───
 
 
-def _get_origami_configs():
-    global _ORIGAMI_CONFIGS
-    if _ORIGAMI_CONFIGS is None:
-        _ORIGAMI_CONFIGS = _build_origami_configs()
-    return _ORIGAMI_CONFIGS
+def _estimate_lds_bytes(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages=2):
+    """LDS usage for Triton matmul tile without async_copy."""
+    lds_a = block_m * block_k * elem_bytes_a
+    lds_b = block_k * block_n * elem_bytes_b
+    base_buffers = max(1, num_stages - 1)
+    return (lds_a + lds_b) * base_buffers
 
 
-def _build_origami_configs():
-    """Build candidate configs for origami (gfx942 BF16)."""
-    block_mn = [16, 32, 64, 128, 256]
-    block_k = [16, 32, 64, 128, 256, 512]
+def _padded_size_32_4(unpadded_size):
+    """Triton [[32, 4]] PaddedSharedEncoding — bank-conflict avoidance padding."""
+    block_padding = (unpadded_size >> 5) << 2
+    if (unpadded_size & 31) == 0 and block_padding >= 4:
+        block_padding -= 4
+    return unpadded_size + block_padding
+
+
+def _padded_size_pow2(unpadded_size, interval, padding):
+    """Triton PaddedSharedEncodingAttr.getPaddedSize for a single (interval, padding) pair."""
+    log2_interval = (interval - 1).bit_length()
+    log2_padding = (padding - 1).bit_length() if padding else 0
+    bp = (unpadded_size >> log2_interval) << log2_padding
+    if unpadded_size % interval == 0 and bp >= padding:
+        bp -= padding
+    return unpadded_size + bp
+
+
+def _estimate_lds_bytes_async_copy(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
+    """LDS usage with async_copy (PaddedSharedEncoding + num_stages buffers).
+
+    Matches tritonBLAS origami.estimate_triton_lds_bytes / triton_bench calculate_lds_usage.
+    """
+    elem_a = block_m * block_k
+    elem_b = block_k * block_n
+    padded_a = _padded_size_32_4(elem_a)
+    padded_b = _padded_size_32_4(elem_b)
+    if block_k & (block_k - 1) == 0:
+        pa = _padded_size_pow2(elem_a, block_k, 8)
+        if pa > padded_a:
+            padded_a = pa
+    if block_n & (block_n - 1) == 0:
+        pb = _padded_size_pow2(elem_b, block_n, 8)
+        if pb > padded_b:
+            padded_b = pb
+    return num_stages * (padded_a * elem_bytes_a + padded_b * elem_bytes_b)
+
+
+def _calculate_lds_usage(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
+    """LDS usage with auto-detection of async_copy mode."""
+    if _is_gfx950():
+        return _estimate_lds_bytes_async_copy(
+            block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages
+        )
+    return _estimate_lds_bytes(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages)
+
+
+def _infer_mi_dim(hardware, element_size_a, element_size_b):
+    """Infer matrix instruction dimensions from hardware and dtypes. Align with TensorAtlas."""
+    n_cu = hardware.N_CU
+    max_bits = max(element_size_a, element_size_b)
+    # gfx950
+    if n_cu == 256:
+        if max_bits == 32:
+            return [16, 16, 4]
+        if max_bits == 16:
+            return [16, 16, 32]
+        if max_bits <= 8:
+            return [16, 16, 128]
+    # gfx942 (304, 80, 64 CUs)
+    if n_cu in (304, 80, 64):
+        if max_bits == 32:
+            return [16, 16, 4]
+        if max_bits == 16:
+            return [16, 16, 16]
+        if max_bits == 8:
+            return [16, 16, 32]
+    return [16, 16, 16]
+
+
+def _get_valid_tiles(hardware, block_mn_range, block_k_range, mi_dim, elem_bytes_a, elem_bytes_b):
+    """Valid (blk_m, blk_n, blk_k, mi_m, mi_n, mi_k, occ) passing LDS check.
+
+    Uses async_copy-aware LDS estimate on gfx950 with num_stages=2.
+    Tiles passing here may still exceed LDS at higher num_stages; callers
+    should verify with _calculate_lds_usage for their actual num_stages.
+    """
+    lds_cap = hardware.lds_capacity
+    use_async = _is_gfx950()
+    valid = []
+    for bm, bn, bk in (
+        (bm, bn, bk) for bm in block_mn_range for bn in block_mn_range for bk in block_k_range
+    ):
+        if use_async:
+            lds = _estimate_lds_bytes_async_copy(bm, bn, bk, elem_bytes_a, elem_bytes_b, num_stages=2)
+        else:
+            lds = _estimate_lds_bytes(bm, bn, bk, elem_bytes_a, elem_bytes_b, num_stages=2)
+        if lds <= lds_cap:
+            valid.append((bm, bn, bk, mi_dim[0], mi_dim[1], mi_dim[2], 1))
+    return valid
+
+
+def _make_problem(M, N, K, a_dtype, b_dtype, c_dtype, mi_dtype_str, trans_a, trans_b, mx_block_size=0):
+    """Build origami problem_t for rank_configs / select_workgroup_mapping.
+
+    trans_a, trans_b: logical op(A) @ op(B). NT = (False, True), TN/CRR = (True, False), NN/RRR = (False, False).
+    """
+    problem = origami.problem_t()
+    problem.size = origami.dim3_t(M, N, K)
+    problem.batch = 1
+    # Per your convention: trans_a=True -> origami N, trans_a=False -> origami T
+    problem.a_transpose = origami.transpose_t.N if trans_a else origami.transpose_t.T
+    problem.b_transpose = origami.transpose_t.N if trans_b else origami.transpose_t.T
+    problem.a_dtype = origami.string_to_datatype(_ORIGAMI_DTYPE_TO_STR.get(a_dtype, "bf16"))
+    problem.b_dtype = origami.string_to_datatype(_ORIGAMI_DTYPE_TO_STR.get(b_dtype, "bf16"))
+    problem.c_dtype = origami.string_to_datatype(_ORIGAMI_DTYPE_TO_STR.get(c_dtype, "bf16"))
+    problem.d_dtype = problem.c_dtype
+    problem.mi_dtype = origami.string_to_datatype(mi_dtype_str)
+    problem.a_mx_block_size = mx_block_size
+    problem.b_mx_block_size = mx_block_size
+    return problem
+
+
+def _tiles_to_configs(valid_tiles, streamk=True):
+    """Convert valid_tiles to origami config_t list."""
+    grid_sel = origami.grid_selection_t.k_split_aware if streamk else origami.grid_selection_t.data_parallel
     configs = []
-    for bm, bn, bk in itertools.product(block_mn, block_mn, block_k):
-        for wpe in [0, 1, 2]:
-            for nw in [4, 8]:
-                for ns in [1, 2]:
-                    configs.append(
-                        triton.Config(
-                            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "waves_per_eu": wpe},
-                            num_warps=nw,
-                            num_stages=ns,
-                        )
-                    )
+    for blk_m, blk_n, blk_k, mi_m, mi_n, mi_k, occ in valid_tiles:
+        cfg = origami.config_t()
+        cfg.mt = origami.dim3_t(blk_m, blk_n, blk_k)
+        cfg.mi = origami.dim3_t(mi_m, mi_n, mi_k)
+        cfg.occupancy = occ
+        cfg.grid_selection = grid_sel
+        configs.append(cfg)
     return configs
 
 
+def _safe_rank_configs(problem, hardware, configs):
+    """rank_configs that returns [] instead of raising on unsupported problems."""
+    try:
+        return origami.rank_configs(problem, hardware, configs)
+    except RuntimeError:
+        return []
+
+
 @functools.lru_cache(maxsize=4096)
-def _select_params_origami(M, N, K, a_stride, b_stride, out_dtype, a_dtype=None, b_dtype=None):
-    """Use origami to select macrotile, GROUP_SIZE_M, CHUNK_SIZE, waves_per_eu.
+def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans_a=False, trans_b=True):
+    """Use origami rank_configs + select_workgroup_mapping (align with TensorAtlas selector.py).
 
-    Results are cached by (M, N, K, strides, dtypes).
-
-    Args:
-        a_dtype, b_dtype: input matrix dtypes; when None, use out_dtype.
-    Returns:
-        (block_m, block_n, block_k, wgm, chunk, wpe) or None.
+    trans_a, trans_b: logical layout (op(A) @ op(B)). Forward NT = (False, True);
+    backward grad_a (NN) = (False, False); backward grad_b (TN) = (True, False).
+    Returns (block_m, block_n, block_k, group_size_m, cache_a, cache_b) or None.
     """
-    global _ORIGAMI_UNAVAILABLE_LOGGED
-    if not _HAS_ORIGAMI:
-        if not _ORIGAMI_UNAVAILABLE_LOGGED:
-            _ORIGAMI_UNAVAILABLE_LOGGED = True
-            print("[gemm/origami] origami not installed or disabled, using heuristic params")
-        return None
-
     a_dtype = a_dtype if a_dtype is not None else out_dtype
     b_dtype = b_dtype if b_dtype is not None else out_dtype
 
-    try:
-        selector = origami.OrigamiMatmulSelector(
-            config_gen=_get_origami_configs(),
-            m=M,
-            n=N,
-            k=K,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            out_dtype=out_dtype,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-            a_stride=a_stride,
-            b_stride=b_stride,
-            batch=1,
-        )
-        block_m = selector.macrotile_m
-        block_n = selector.macrotile_n
-        block_k = selector.macrotile_k
-        wgm = selector.wgm
-        chunk = selector.wgmxccchunk if selector.wgmxccchunk > 0 else 32
-        wpe = selector.occupancy if selector.occupancy > 0 else 2
-        return block_m, block_n, block_k, wgm, chunk, wpe
-    except Exception as e:
-        print(f"[gemm/origami] ERROR M={M} N={N} K={K}: {e}")
+    hardware = _get_hardware()
+
+    elem_bits_a = _dtype_bits(a_dtype)
+    elem_bits_b = _dtype_bits(b_dtype)
+    elem_bytes_a = elem_bits_a // 8
+    elem_bytes_b = elem_bits_b // 8
+
+    input_dtype_for_mi = a_dtype if elem_bits_a <= elem_bits_b else b_dtype
+    mi_dtype_str = _ORIGAMI_DTYPE_TO_STR.get(input_dtype_for_mi, _ORIGAMI_DTYPE_TO_STR.get(out_dtype, "bf16"))
+
+    mi_dim = _infer_mi_dim(hardware, elem_bits_a, elem_bits_b)
+    block_mn_range = [64, 128, 256]
+    block_k_range = [64, 128, 256]
+    valid_tiles = _get_valid_tiles(
+        hardware, block_mn_range, block_k_range, mi_dim, elem_bytes_a, elem_bytes_b
+    )
+    if not valid_tiles:
         return None
+
+    problem = _make_problem(M, N, K, a_dtype, b_dtype, out_dtype, mi_dtype_str, trans_a, trans_b)
+    configs = _tiles_to_configs(valid_tiles, streamk=True)
+
+    ranked = _safe_rank_configs(problem, hardware, configs)
+    if not ranked:
+        return None
+    best_result = ranked[0]
+    best_cfg = best_result.config if hasattr(best_result, "config") else best_result
+    BLK_M = best_cfg.mt.m
+    BLK_N = best_cfg.mt.n
+    BLK_K = best_cfg.mt.k
+
+    elem_bytes_out = _dtype_bits(out_dtype) // 8
+    sk_grid = _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, hardware.N_CU, elem_bytes_out)
+    wgm_result = origami.select_workgroup_mapping(problem, hardware, best_cfg, sk_grid)
+    gsize_m = abs(wgm_result.wgm)
+
+    _CACHE_HINT_TO_MODIFIER = {0: ".ca", 1: ".cg", 2: ".cv"}
+    cache_a = _CACHE_HINT_TO_MODIFIER.get(getattr(best_cfg, "cache_hints_a", 0), None)
+    cache_b = _CACHE_HINT_TO_MODIFIER.get(getattr(best_cfg, "cache_hints_b", 0), None)
+    # print(
+    #     f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, cache_a: {cache_a}, cache_b: {cache_b}"
+    # )
+    return BLK_M, BLK_N, BLK_K, gsize_m, cache_a, cache_b
 
 
 @triton.jit()
@@ -373,8 +576,8 @@ def gemm_triton_kernel(
 ) -> torch.Tensor:
     """General-purpose BF16/FP16 GEMM using optimized persistent kernel.
 
-    Uses origami analytical model for config selection (GROUP_SIZE_M, CHUNK_SIZE)
-    when available, otherwise falls back to heuristic.
+    Uses offline heuristic for block sizes / NUM_SMS, then origami analytical
+    model to override GROUP_SIZE_M and cache modifiers.
 
     Computes: C = op(A) @ op(B), where op(X) = X^T if trans else X.
     If trans_c=True, returns C^T (contiguous, shape N×M).
@@ -415,8 +618,6 @@ def gemm_triton_kernel(
     if B_view.stride(0) == 0 or B_view.stride(1) == 0:
         B_view = B_view.contiguous()
 
-    num_cus = _get_num_cus()
-
     # Handle trans_c by writing to a (N, M) buffer with swapped strides
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
@@ -431,22 +632,76 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: origami only when it returns (256, 256, 64), else heuristic
-    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
-    chunk_size = 32
-    waves_per_eu = 2
-    group_m = _select_group_size_m_bf16(M, N, s_ak, s_bk)
-    origami_params = _select_params_origami(
-        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe = origami_params
-        if (om, on, ok) == (256, 256, 64):
-            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
+    if _is_gfx950():
+        _set_knobs_gfx950()
 
-    num_sms = compute_sk_grid(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_cus)
+        # gfx950 BF16 config from 164-entry tuning data.
+        # TN layout with large K → BLK_K=64, stages=2; all other cases → 32/3.
+        # Small TN (K≤3584, dims≤16384, min dim≤4608) stays on 32/3.
+        is_tn = (s_ak == 1) and (s_bk == 1)
+        use_bk64 = is_tn and (K > 3584 or min(M, N) > 4608 or max(M, N) > 16384)
+
+        BLOCK_M, BLOCK_N = 256, 256
+        BLOCK_K, num_stages = (64, 2) if use_bk64 else (32, 3)
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + BLOCK_M - 1) // BLOCK_M
+        tiles_n = (N + BLOCK_N - 1) // BLOCK_N
+        min_tile = min(tiles_m, tiles_n)
+        group_m = 7 if min_tile < 16 else 4
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == BLOCK_K:
+                BLOCK_M, BLOCK_N, group_m = om, on, ogm
+
+        # Occupancy: when TN BLK_K=64 tiles land in 1–2 wave zone, halve
+        # BLOCK_N for better CU utilisation (keeps BLOCK_M=256 for A locality).
+        if use_bk64:
+            tm = (M + BLOCK_M - 1) // BLOCK_M
+            tn = (N + BLOCK_N - 1) // BLOCK_N
+            if cu_count < tm * tn < 2 * cu_count and tn >= tm:
+                new_tn = (N + 127) // 128
+                if tm * new_tn >= 2 * cu_count:
+                    BLOCK_N, group_m = 128, 8
+
+        num_sms = _compute_sk_grid(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, cu_count)
+    else:
+        # ── gfx942 path (unchanged) ──────────────────────────────────────────
+        BLOCK_M, BLOCK_N, BLOCK_K, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_bf16(
+            M, N, K, s_ak, s_bk
+        )
+        num_stages, waves_per_eu = 2, 0
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (BLOCK_M, BLOCK_N, BLOCK_K):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
+
     even_k = K % BLOCK_K == 0
-
     args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
 
     _bf16_persistent_gemm_kernel[(num_sms,)](
@@ -461,10 +716,10 @@ def gemm_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages,
         waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
         kpack=1,
