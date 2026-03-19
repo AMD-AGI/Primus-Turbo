@@ -388,6 +388,14 @@ def _tiles_to_configs(valid_tiles, streamk=True):
     return configs
 
 
+def _safe_rank_configs(problem, hardware, configs):
+    """rank_configs that returns [] instead of raising on unsupported problems."""
+    try:
+        return origami.rank_configs(problem, hardware, configs)
+    except RuntimeError:
+        return []
+
+
 @functools.lru_cache(maxsize=4096)
 def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans_a=False, trans_b=True):
     """Use origami rank_configs + select_workgroup_mapping (align with TensorAtlas selector.py).
@@ -421,7 +429,10 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     problem = _make_problem(M, N, K, a_dtype, b_dtype, out_dtype, mi_dtype_str, trans_a, trans_b)
     configs = _tiles_to_configs(valid_tiles, streamk=True)
 
-    best_result = origami.select_config(problem, hardware, configs)
+    ranked = _safe_rank_configs(problem, hardware, configs)
+    if not ranked:
+        return None
+    best_result = ranked[0]
     best_cfg = best_result.config if hasattr(best_result, "config") else best_result
     BLK_M = best_cfg.mt.m
     BLK_N = best_cfg.mt.n
