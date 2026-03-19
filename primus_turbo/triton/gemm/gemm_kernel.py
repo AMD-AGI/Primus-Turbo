@@ -75,12 +75,44 @@ def _dtype_bits(dtype):
 
 NUM_XCDS = 8
 
+# Per-architecture defaults for LDS capacity (bytes) and max compute clock (KHz).
+# Used by _get_hardware to avoid calling origami.get_hardware_for_device() which
+# internally invokes HIP C APIs that can segfault in certain Docker / distributed
+# training environments due to HIP runtime double-initialization conflicts.
+_ARCH_HW_DEFAULTS: dict[str, tuple[int, int]] = {
+    "gfx950": (163840, 2400000),  # MI350X / MI355X  — 160 KB LDS, 2.4 GHz
+    "gfx942": (65536, 2100000),  # MI300X / MI300A  —  64 KB LDS, 2.1 GHz
+}
+
 
 @functools.lru_cache(maxsize=8)
 def _get_hardware(device_id=None):
-    """Cached origami hardware descriptor (align with TensorAtlas selector.py)."""
+    """Cached origami hardware descriptor (align with TensorAtlas selector.py).
+
+    Uses origami.get_hardware_for_arch() with parameters sourced from
+    torch.cuda.get_device_properties() to avoid direct HIP C API calls inside
+    the origami C++ extension, which can segfault due to HIP runtime
+    double-initialization in certain container environments.
+    Falls back to origami.get_hardware_for_device() for unknown architectures.
+    """
     if device_id is None:
         device_id = torch.cuda.current_device()
+
+    props = torch.cuda.get_device_properties(device_id)
+    arch_full = getattr(props, "gcnArchName", "")  # e.g. "gfx950:sramecc+:xnack-"
+    arch_base = arch_full.split(":")[0]  # e.g. "gfx950"
+    arch_enum = getattr(origami.architecture_t, arch_base, None)
+
+    if arch_enum is not None and arch_base in _ARCH_HW_DEFAULTS:
+        lds_capacity, clock_khz = _ARCH_HW_DEFAULTS[arch_base]
+        return origami.get_hardware_for_arch(
+            arch_enum,
+            props.multi_processor_count,
+            lds_capacity,
+            props.L2_cache_size,
+            clock_khz,
+        )
+
     return origami.get_hardware_for_device(device_id)
 
 
@@ -403,9 +435,9 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     _CACHE_HINT_TO_MODIFIER = {0: ".ca", 1: ".cg", 2: ".cv"}
     cache_a = _CACHE_HINT_TO_MODIFIER.get(getattr(best_cfg, "cache_hints_a", 0), None)
     cache_b = _CACHE_HINT_TO_MODIFIER.get(getattr(best_cfg, "cache_hints_b", 0), None)
-    print(
-        f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, cache_a: {cache_a}, cache_b: {cache_b}"
-    )
+    # print(
+    #     f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, cache_a: {cache_a}, cache_b: {cache_b}"
+    # )
     return BLK_M, BLK_N, BLK_K, gsize_m, cache_a, cache_b
 
 
