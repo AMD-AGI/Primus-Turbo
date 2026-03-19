@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendEntry,
     BackendType,
     GlobalBackendManager,
     KernelBackend,
@@ -392,9 +393,9 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
 
 class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
-        BackendType.CK: GroupedGEMMFP8CKBackend,
-        BackendType.HIPBLASLT: GroupedGEMMFP8HipblasltBackend,
-        BackendType.TRITON: GroupedGEMMFP8TritonBackend,
+        BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
+        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
+        BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
     }
     _cache = TuneCache(1024)
 
@@ -515,9 +516,9 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
 class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
-        BackendType.CK: GroupedGEMMFP8VariableKCKBackend,
-        BackendType.HIPBLASLT: GroupedGEMMFP8VariableKHipblasltBackend,
-        BackendType.TRITON: GroupedGEMMFP8VariableKTritonBackend,
+        BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
+        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
+        BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
     }
     _cache = TuneCache(1024)
 

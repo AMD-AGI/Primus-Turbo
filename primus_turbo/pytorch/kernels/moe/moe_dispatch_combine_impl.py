@@ -14,6 +14,7 @@ import primus_turbo.pytorch.deep_ep as turbo_ep
 from primus_turbo.pytorch.core.backend import (
     HAVE_DEEP_EP,
     AutoKernelDispatcher,
+    BackendEntry,
     BackendType,
     GlobalBackendManager,
     KernelBackend,
@@ -329,8 +330,8 @@ class MoECombineTurboBackend(KernelBackend):
 
 class MoEDispatchKernelDispatcher(AutoKernelDispatcher):
     _backends = {
-        BackendType.TURBO: MoEDispatchTurboBackend,
-        BackendType.DEEP_EP: MoEDispatchDeepEPBackend,
+        BackendType.TURBO: BackendEntry(MoEDispatchTurboBackend),
+        BackendType.DEEP_EP: BackendEntry(MoEDispatchDeepEPBackend),
     }
 
     _cache = TuneCache(1024)
@@ -355,8 +356,8 @@ class MoEDispatchKernelDispatcher(AutoKernelDispatcher):
 
 class MoECombineKernelDispatcher(AutoKernelDispatcher):
     _backends = {
-        BackendType.TURBO: MoECombineTurboBackend,
-        BackendType.DEEP_EP: MoECombineDeepEPBackend,
+        BackendType.TURBO: BackendEntry(MoECombineTurboBackend),
+        BackendType.DEEP_EP: BackendEntry(MoECombineDeepEPBackend),
     }
 
     _cache = TuneCache(1024)

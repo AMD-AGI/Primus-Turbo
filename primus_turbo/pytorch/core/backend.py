@@ -7,6 +7,7 @@ import os
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Dict, Hashable, List, Optional, Type
 
@@ -20,6 +21,7 @@ except ImportError:
 
 
 __all__ = [
+    "BackendEntry",
     "BackendType",
     "GlobalBackendManager",
     "KernelBackend",
@@ -133,6 +135,21 @@ class KernelBackend(ABC):
         raise NotImplementedError("execute is not implemented")
 
 
+@dataclass(frozen=True)
+class BackendEntry:
+    """Metadata wrapper for a registered kernel backend.
+
+    Attributes:
+        impl: The kernel backend class.
+        autotune: Whether this backend participates in auto-tuning.
+                  Backends with autotune=False can still be selected via
+                  explicit user configuration or as a fallback.
+    """
+
+    impl: Type[KernelBackend]
+    autotune: bool = True
+
+
 class TuneCache:
     """LRU cache for storing tuned backend results."""
 
@@ -174,7 +191,7 @@ class AutoKernelDispatcher(ABC):
     Base class for auto kernel dispatcher.
     """
 
-    _backends: Dict[BackendType, Type[KernelBackend]] = {}
+    _backends: Dict[BackendType, BackendEntry] = {}
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 10
     _profile_iters: int = 20
@@ -241,18 +258,20 @@ class AutoKernelDispatcher(ABC):
 
         best_backend = None
         best_time = float("inf")
-        for backend in cls._backends.values():
-            if backend.can_handle(**kwargs):
+        for entry in cls._backends.values():
+            if not entry.autotune:
+                continue
+            if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(backend, **kwargs)
+                    cur_time = cls.profile(entry.impl, **kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
                     torch.cuda.synchronize()
                 if cur_time < best_time:
                     best_time = cur_time
-                    best_backend = backend
+                    best_backend = entry.impl
 
         if best_backend is not None:
             cls._cache.put(key, best_backend)
@@ -269,13 +288,13 @@ class AutoKernelDispatcher(ABC):
                     f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
                     f"Available backends: {[b.name for b in cls._backends.keys()]}"
                 )
-            backend_cls = cls._backends[user_backend_enum]
-            if not backend_cls.can_handle(**kwargs):
+            entry = cls._backends[user_backend_enum]
+            if not entry.impl.can_handle(**kwargs):
                 raise ValueError(
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs. "
                     f"Please check input constraints or choose a different backend."
                 )
-            return backend_cls.execute(**kwargs)
+            return entry.impl.execute(**kwargs)
 
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
@@ -285,13 +304,13 @@ class AutoKernelDispatcher(ABC):
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend
-        default_backend_cls = cls._backends.get(default_backend_enum)
-        if default_backend_cls is not None and default_backend_cls.can_handle(**kwargs):
-            return default_backend_cls.execute(**kwargs)
+        default_entry = cls._backends.get(default_backend_enum)
+        if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+            return default_entry.impl.execute(**kwargs)
 
         # 4. Fallback: try all backends
-        for fallback_backend_cls in cls._backends.values():
-            if fallback_backend_cls.can_handle(**kwargs):
-                return fallback_backend_cls.execute(**kwargs)
+        for entry in cls._backends.values():
+            if entry.impl.can_handle(**kwargs):
+                return entry.impl.execute(**kwargs)
 
         raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
