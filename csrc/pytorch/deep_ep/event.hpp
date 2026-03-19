@@ -39,8 +39,7 @@ inline torch::Event create_event(const c10::cuda::CUDAStream &s) {
     return event;
 }
 
-inline void stream_wait(const c10::cuda::CUDAStream &s_0,
-                        const c10::cuda::CUDAStream &s_1) {
+inline void stream_wait(const c10::cuda::CUDAStream &s_0, const c10::cuda::CUDAStream &s_1) {
     PRIMUS_TURBO_CHECK(s_0.id() != s_1.id());
     s_0.unwrap().wait(create_event(s_1));
 }
