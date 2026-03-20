@@ -67,12 +67,19 @@ static constexpr uint64_t kSecondHalfMask   = 0xffffffff00000000;
 #undef __HIP_NO_HALF_OPERATORS__
 #endif
 
-static inline auto get_num_cpu_timeout_secs() {
-    const char *env = getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT");
-    if (!env || env[0] == '\0')
-        return NUM_CPU_TIMEOUT_SECS;
-
-    return std::stoi(env);
+static inline int get_num_cpu_timeout_secs() {
+    static int timeout = []() {
+        const char *env = std::getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT");
+        if (!env || env[0] == '\0') {
+            return NUM_CPU_TIMEOUT_SECS;
+        }
+        try {
+            return std::stoi(env);
+        } catch (...) {
+            return NUM_CPU_TIMEOUT_SECS;
+        }
+    }();
+    return timeout;
 }
 
 inline static bool is_enable_cheap_fence() {
