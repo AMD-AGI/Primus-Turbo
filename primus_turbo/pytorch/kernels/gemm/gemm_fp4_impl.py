@@ -174,9 +174,9 @@ class GEMMFP4AITERBackend(KernelBackend):
             # NOTE: When enable preshuffle, the input tensor is already shuffled.
             return aiter.gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
 
-        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv)
-        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv)
-        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b)
+        a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv, [16, 16])
+        b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv, [16, 16])
+        b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b, [16, 16])
         return aiter.gemm_a4w4(
             a, b_shuffled, a_scale_inv_shuffled, b_scale_inv_shuffled, dtype=out_dtype, bpreshuffle=True
         )

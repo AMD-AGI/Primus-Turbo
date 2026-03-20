@@ -506,10 +506,10 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
         scaling_recipe_for_trans=scaling_recipe,
     )
 
-    rowwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(rowwise_out)
-    rowwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(rowwise_scale)
-    colwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(colwise_out)
-    colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale)
+    rowwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(rowwise_out, [16, 16])
+    rowwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(rowwise_scale, [16, 16])
+    colwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(colwise_out, [16, 16])
+    colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale, [16, 16])
 
     scaling_recipe_with_shuffle = MXScalingRecipe(
         use_2d_block=use_2d_block,

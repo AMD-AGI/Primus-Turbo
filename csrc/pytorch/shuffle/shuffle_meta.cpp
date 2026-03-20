@@ -10,7 +10,7 @@ namespace primus_turbo::pytorch {
 
 using namespace primus_turbo::detail;
 
-at::Tensor shuffle_scale_impl_meta(const at::Tensor scale) {
+at::Tensor shuffle_scale_impl_meta(const at::Tensor scale, at::IntArrayRef layout) {
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
         return (a + b - 1) / b;
     };
@@ -29,7 +29,7 @@ at::Tensor shuffle_scale_impl_meta(const at::Tensor scale) {
         .view(at::kFloat8_e8m0fnu);
 }
 
-at::Tensor shuffle_weight_impl_meta(const at::Tensor weight) {
+at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef layout) {
     PRIMUS_TURBO_CHECK(weight.scalar_type() == at::kFloat4_e2m1fn_x2,
                        "Weight must be Float4_e2m1fn_x2.");
     PRIMUS_TURBO_CHECK(weight.dim() == 2, "Weight must be 2D");

@@ -79,13 +79,13 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
 //  Shuffle
 //==================================================================
 
-at::Tensor shuffle_scale_impl(const at::Tensor scale);
+at::Tensor shuffle_scale_impl(const at::Tensor scale, at::IntArrayRef layout);
 
-at::Tensor shuffle_scale_impl_meta(const at::Tensor scale);
+at::Tensor shuffle_scale_impl_meta(const at::Tensor scale, at::IntArrayRef layout);
 
-at::Tensor shuffle_weight_impl(const at::Tensor weight);
+at::Tensor shuffle_weight_impl(const at::Tensor weight, at::IntArrayRef layout);
 
-at::Tensor shuffle_weight_impl_meta(const at::Tensor weight);
+at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef layout);
 
 //==================================================================
 //  GEMM

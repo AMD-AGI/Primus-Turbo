@@ -43,8 +43,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
 
     // ********* Shuffle *********
-    m.def("shuffle_scale(Tensor scale) -> Tensor");
-    m.def("shuffle_weight(Tensor weight) -> Tensor");
+    m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
+    m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
 
     // ********* RMSNorm *********
     m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");

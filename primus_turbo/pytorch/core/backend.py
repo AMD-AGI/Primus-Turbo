@@ -14,7 +14,7 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
-from primus_turbo.common.logger import log_warning_once
+from primus_turbo.common.logger import logger
 
 try:
     HAVE_DEEP_EP = True
@@ -97,13 +97,7 @@ class GlobalBackendManager:
 
         # Parse format 2 & 3
         env_lower = env_value.lower()
-        if (
-            "fp4" in env_lower
-            or "fp8" in env_lower
-            or "bf16" in env_lower
-            or "fp16" in env_lower
-            or "other" in env_lower
-        ):
+        if any(key_word in env_lower for key_word in ("fp4", "fp8", "bf16", "fp16", "other")):
             precision_backend_pairs = env_value.split(",")
             other_precision_backend = None
             for pair in precision_backend_pairs:
@@ -412,8 +406,9 @@ class AutoKernelDispatcher(ABC):
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                log_warning_once(
-                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!"
+                logger.warning(
+                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!",
+                    once=True,
                 )
                 return fallback_backend_entry.impl.execute(**kwargs)
 

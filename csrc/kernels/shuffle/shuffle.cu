@@ -23,7 +23,7 @@ using namespace primus_turbo::detail;
  * Thread mapping: 64 threads per (32×8) tile, one per (i5, i2) pair.
  * Writes are fully coalesced: 64 threads × 4 B = 256 B contiguous per tile.
  */
-__global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_e8m0_scale_kernel(
+__global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_e8m0_scale_16x16_kernel(
     uint8_t *__restrict__ x, uint8_t *__restrict__ y, int64_t M, int64_t N, int64_t M_pad,
     int64_t N_pad) {
     constexpr int THREADS_PER_TILE = 64;
@@ -83,7 +83,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_e8m0_scale_kernel(
  *   - Store second 16 B into sub-block 1
  *
  */
-__global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_fp4_weight_kernel(
+__global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_fp4_weight_16x16_kernel(
     uint8_t *__restrict__ x, uint8_t *__restrict__ y, int64_t M, int64_t N) {
     constexpr int THREADS_PER_TILE = 16;
     constexpr int TILES_PER_BLOCK  = THREADS_PER_BLOCK / THREADS_PER_TILE;
@@ -113,28 +113,38 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_fp4_weight_kernel(
     *reinterpret_cast<uint4 *>(&y[dst + 256]) = hi;
 }
 
-void shuffle_e8m0_scale(uint8_t *scale, uint8_t *shuffled_scale, int64_t scale_M, int64_t scale_N,
-                        int64_t scale_M_pad, int64_t scale_N_pad, hipStream_t stream) {
+void shuffle_e8m0_scale(uint8_t *scale, uint8_t *shuffled_scale, int tile_m, int tile_n,
+                        int64_t scale_M, int64_t scale_N, int64_t scale_M_pad, int64_t scale_N_pad,
+                        hipStream_t stream) {
     constexpr int TILES_PER_BLOCK = THREADS_PER_BLOCK / 64;
     int64_t       total_tiles     = (scale_M_pad >> 5) * (scale_N_pad >> 3);
     dim3          grid((total_tiles + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK);
     dim3          block(THREADS_PER_BLOCK);
 
-    shuffle_e8m0_scale_kernel<<<grid, block, 0, stream>>>(scale, shuffled_scale, scale_M, scale_N,
-                                                          scale_M_pad, scale_N_pad);
+    if (tile_m == 16 && tile_n == 16) {
+        shuffle_e8m0_scale_16x16_kernel<<<grid, block, 0, stream>>>(
+            scale, shuffled_scale, scale_M, scale_N, scale_M_pad, scale_N_pad);
+    } else {
+        PRIMUS_TURBO_ERROR("Unsupported shuffle layout.");
+    }
 }
 
 template <typename DType>
-void shuffle_weight(DType *weight, DType *shuffled_weight, int64_t weight_M, int64_t weight_N,
-                    hipStream_t stream) {
+void shuffle_weight(DType *weight, DType *shuffled_weight, int tile_m, int tile_n, int64_t weight_M,
+                    int64_t weight_N, hipStream_t stream) {
     if constexpr (std::is_same_v<DType, float4x2_e2m1>) {
         constexpr int TILES_PER_BLOCK = THREADS_PER_BLOCK / 16;
         int64_t       total_tiles     = (weight_M >> 4) * (weight_N >> 5);
         dim3          grid((total_tiles + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK);
         dim3          block(THREADS_PER_BLOCK);
-        shuffle_fp4_weight_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<uint8_t *>(weight), reinterpret_cast<uint8_t *>(shuffled_weight),
-            weight_M, weight_N);
+
+        if (tile_m == 16 && tile_n == 16) {
+            shuffle_fp4_weight_16x16_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<uint8_t *>(weight), reinterpret_cast<uint8_t *>(shuffled_weight),
+                weight_M, weight_N);
+        } else {
+            PRIMUS_TURBO_ERROR("Unsupported shuffle layout.");
+        }
     } else {
         PRIMUS_TURBO_ERROR("Unsupported weight type");
     }
@@ -142,7 +152,7 @@ void shuffle_weight(DType *weight, DType *shuffled_weight, int64_t weight_M, int
 
 template void shuffle_weight<dtype::float4x2_e2m1>(dtype::float4x2_e2m1 *weight,
                                                    dtype::float4x2_e2m1 *shuffled_weight,
-                                                   int64_t weight_M, int64_t weight_N,
-                                                   hipStream_t stream);
+                                                   int tile_m, int tile_n, int64_t weight_M,
+                                                   int64_t weight_N, hipStream_t stream);
 
 } // namespace primus_turbo
