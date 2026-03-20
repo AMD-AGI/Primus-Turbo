@@ -32,6 +32,17 @@ __all__ = [
 ]
 
 
+def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
+    if format == Format.E4M3:
+        return float8_e4m3
+    elif format == Format.E5M2:
+        return float8_e5m2
+    elif format == Format.HYBRID:
+        return float8_e4m3 if is_fwd_stage else float8_e5m2
+    else:
+        raise ValueError(f"Unsupported FP8 format: {format}")
+
+
 def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     # Some upstream reductions can produce expanded zero-stride grad_out views.
     # Custom grouped GEMM kernels expect dense layouts.
@@ -39,14 +50,6 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
 
 
 class GroupedGemmFP8BlockFunc(torch.autograd.Function):
-    @staticmethod
-    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
-        if format == Format.E4M3:
-            return float8_e4m3
-        elif format == Format.E5M2:
-            return float8_e5m2
-        else:
-            raise ValueError(f"Unsupported FP8 format: {format}")
 
     @staticmethod
     def forward(
@@ -67,8 +70,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         out_dtype = a.dtype
         assert out_dtype in [torch.float16, torch.bfloat16]
 
-        a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
-        b_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
+        a_dtype = _get_fp8_dtype(config.format, True)
+        b_dtype = _get_fp8_dtype(config.format, True)
 
         a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
             a, a_dtype, axis=1, block_size=config.block_size
@@ -124,7 +127,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             group_offs,
         ) = ctx.saved_tensors
         block_size = ctx.config.block_size
-        grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         # Quantize grad_out in row-wise for dgrad
         grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
@@ -178,14 +181,6 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
 
 
 class GroupedGemmFP8RowFunc(torch.autograd.Function):
-    @staticmethod
-    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
-        if format == Format.E4M3:
-            return float8_e4m3
-        elif format == Format.E5M2:
-            return float8_e5m2
-        else:
-            raise ValueError(f"Unsupported FP8 format: {format}")
 
     @staticmethod
     def forward(
@@ -204,8 +199,8 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
         out_dtype = a.dtype
         assert out_dtype in [torch.float16, torch.bfloat16]
 
-        a_dtype = GroupedGemmFP8RowFunc.get_fp8_dtype(config.format, True)
-        b_dtype = GroupedGemmFP8RowFunc.get_fp8_dtype(config.format, True)
+        a_dtype = _get_fp8_dtype(config.format, True)
+        b_dtype = _get_fp8_dtype(config.format, True)
         a_fp8_row, a_scale_inv_row = quantize_fp8(a, a_dtype, config.granularity, axis=-1)
         b_fp8_row, b_scale_inv_row = quantize_fp8(
             b, b_dtype, config.granularity, axis=(-1 if trans_b else -2)
@@ -245,7 +240,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
         a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens, group_offs = ctx.saved_tensors
 
         # For grad_a
-        grad_out_dtype = GroupedGemmFP8RowFunc.get_fp8_dtype(ctx.config.format, False)
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         grad_out_fp8_row, grad_out_scale_inv_row = quantize_fp8(
             grad_out, grad_out_dtype, ctx.config.granularity, axis=-1
         )
@@ -292,17 +287,6 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
 class GroupedGemmFP8TensorFunc(torch.autograd.Function):
 
     @staticmethod
-    def get_fp8_dtype(format: Format, is_fwd_stage: bool):
-        if format == Format.E4M3:
-            return float8_e4m3
-        elif format == Format.E5M2:
-            return float8_e5m2
-        elif format == Format.HYBRID:
-            return float8_e4m3 if is_fwd_stage else float8_e5m2
-        else:
-            raise ValueError(f"Unsupported FP8 format: {format}")
-
-    @staticmethod
     def forward(
         ctx,
         a: torch.Tensor,
@@ -317,8 +301,8 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         assert config.granularity == ScalingGranularity.TENSORWISE
         assert a.ndim == 2, "Input tensor must be 3-dimensions."
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
-        a_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
-        b_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
+        a_dtype = _get_fp8_dtype(config.format, True)
+        b_dtype = _get_fp8_dtype(config.format, True)
         a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
         b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
 
@@ -352,7 +336,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
 
         # For grad_a
-        grad_out_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(ctx.config.format, False)
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
         grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8,
