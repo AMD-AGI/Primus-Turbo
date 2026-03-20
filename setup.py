@@ -30,7 +30,7 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-AITER_COMMIT = "512cd4c65ff7841edac9ec594d859d415c76e819"
+AITER_COMMIT = "e83f9903c07001a0ec29e85d223f6e6cdbe00859"
 
 # ---------- ORIGAMI (rocm-libraries) ------------
 # Pin to commit. Installed during build via clone + pip install (avoids pip resolution
@@ -241,6 +241,7 @@ def get_common_flags():
     # Device Archs
     offload_arch_list, macro_arch_list = get_offload_archs()
     cxx_flags += macro_arch_list
+    cxx_flags += offload_arch_list  # hipcc needs --offload-arch for CK headers in .cpp files
     nvcc_flags += macro_arch_list
     nvcc_flags += offload_arch_list
 
@@ -396,7 +397,7 @@ if __name__ == "__main__":
     ]
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
-    if torch_ext is not None and not is_package_installed("amd-aiter"):
+    if torch_ext is not None and not is_package_installed("aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
     else:

@@ -12,6 +12,7 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendEntry,
     BackendType,
     GlobalBackendManager,
     KernelBackend,
@@ -265,9 +266,9 @@ class GEMMFP8TritonBackend(KernelBackend):
 
 
 _GEMM_FP8_BACKENDS = {
-    BackendType.HIPBLASLT: GEMMFP8HipBLASLtBackend,
-    BackendType.CK: GEMMFP8CKBackend,
-    BackendType.TRITON: GEMMFP8TritonBackend,
+    BackendType.HIPBLASLT: BackendEntry(GEMMFP8HipBLASLtBackend),
+    BackendType.CK: BackendEntry(GEMMFP8CKBackend),
+    BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),
 }
 
 

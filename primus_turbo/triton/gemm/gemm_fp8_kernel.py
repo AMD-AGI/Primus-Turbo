@@ -39,9 +39,11 @@ import triton.language as tl
 from primus_turbo.triton.gemm.gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
-    _get_num_cus,
+    _compute_sk_grid,
+    _get_hardware,
+    _is_gfx950,
     _select_params_origami,
-    compute_sk_grid,
+    _set_knobs_gfx950,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,28 +68,62 @@ def _set_amd_knobs(enable: bool = True):
 # ###########################################################################
 
 
-def _select_group_size_m_fp8(M, N, stride_ak, stride_bk):
-    """Deterministic GROUP_SIZE_M from FP8 tuning data.
+def offline_select_fp8(M, N, K, s_ak, s_bk):
+    """FP8 config selection from MI300X bench data (out_fp8_gemm_persistent_full.yaml, 184 entries).
 
-    FP8 patterns:
-    - min_tile < 16 (non-standard dims like 3584): GROUP=8
-    - TT layout (stride_ak!=1, stride_bk==1) + tiles > 256: GROUP=5
-    - Default (including TN): GROUP=4
-      (29/32 FP8 TN entries use GROUP=4)
+    Stride → layout:
+      TN (trans_a=False, trans_b=True):  s_ak=1, s_bk=1   → C = A @ B^T
+      TT (trans_a=False, trans_b=False): s_ak=1, s_bk≠1   → C = A @ B
+      NT (trans_a=True,  trans_b=False): s_ak≠1, s_bk≠1   → C = A^T @ B
+
+    Returns (BM, BN, BK, GM, NUM_SMS, CHUNK, CA, CB).
     """
+    is_tn = s_ak == 1 and s_bk == 1
+
     tiles_m = (M + 255) // 256
     tiles_n = (N + 255) // 256
+
+    # ── Block sizes (97% = 256×256, BK depends on layout) ──
+    BM, BN = 256, 256
+    BK = 128 if is_tn else 64  # TN→128 (84%), TT→64 (100%), NT→64 (91%)
+
+    # TN with N≈3584 (tiles_n≤14) + M≥8192 (tiles_m≥32): 128×128×128
+    # quadruples tile count for CU utilisation (448→1792)
+    if is_tn and tiles_n <= 14 and tiles_m >= 32:
+        BM, BN, BK = 128, 128, 128
+
+    # Recalculate tiles with actual block sizes
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
     total_tiles = tiles_m * tiles_n
-    min_tile = min(tiles_m, tiles_n)
 
-    is_tt = (stride_ak != 1) and (stride_bk == 1)
+    cu_count = _get_hardware().N_CU
 
-    if min_tile < 16:
-        return 8
-    elif is_tt and total_tiles > 256:
-        return 5
+    # ── NUM_SMS ──
+    # tiles <= ~5 waves (cu*5): sk_grid for wave efficiency
+    # tiles > ~5 waves: data-parallel (avoids regression at tiles>=1792)
+    if total_tiles <= cu_count * 5:
+        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
     else:
-        return 4
+        num_sms = total_tiles
+
+    # ── GROUP_SIZE_M ──
+    # small tiles: GM=8 (87%); TN large: GM=4 (62%); TT/NT large: GM=5 (68-75%)
+    if min(tiles_m, tiles_n) < 16:
+        group_m = 8
+    elif is_tn:
+        group_m = 4
+    else:
+        group_m = 5
+
+    # ── CHUNK_SIZE ──
+    # persistent mode benefits from smaller chunks; data-parallel prefers 64
+    if num_sms < total_tiles:
+        chunk = min(32, max(1, num_sms // NUM_XCDS))
+    else:
+        chunk = 64
+
+    return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
 
 
 @triton.jit()
@@ -277,22 +313,60 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
-    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-    block_m, block_n, block_k = 256, 256, blk_k
-    group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    chunk_size = 32
-    waves_per_eu = 0
-    origami_params = _select_params_origami(
-        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe = origami_params
-        if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
+    if _is_gfx950():
+        _set_knobs_gfx950()
 
-    num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
+        # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
+        block_m, block_n, block_k = 256, 256, 128
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + block_m - 1) // block_m
+        tiles_n = (N + block_n - 1) // block_n
+        min_tile = min(tiles_m, tiles_n)
+        is_tn = s_ak == 1 and s_bk == 1
+        group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == block_k:
+                block_m, block_n, group_m = om, on, ogm
+
+        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    else:
+        # gfx942 path
+        block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+            M, N, K, s_ak, s_bk
+        )
+        waves_per_eu = 0
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (block_m, block_n, block_k):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
+
     args = (
         A_view,
         B_view,
@@ -320,8 +394,8 @@ def gemm_fp8_tensorwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -545,22 +619,59 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    # Config selection: use origami params when available, else heuristic (like gemm_kernel.py)
-    blk_k = 128 if (s_ak == 1 and s_bk == 1) else 64
-    block_m, block_n, block_k = 256, 256, blk_k
-    group_m = _select_group_size_m_fp8(M, N, s_ak, s_bk)
-    chunk_size = 32
-    waves_per_eu = 0
-    origami_params = _select_params_origami(
-        M, N, K, A_view.stride(), B_view.stride(), out_dtype, A_view.dtype, B_view.dtype
-    )
-    if origami_params is not None:
-        om, on, ok, ogm, ochunk, owpe = origami_params
-        if (om, on, ok) == (block_m, block_n, block_k):
-            group_m, chunk_size, waves_per_eu = ogm, max(ochunk, 1), owpe
+    if _is_gfx950():
+        _set_knobs_gfx950()
 
-    num_cus = _get_num_cus()
-    num_sms = compute_sk_grid(M, N, K, block_m, block_n, block_k, num_cus)
+        # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
+        block_m, block_n, block_k = 256, 256, 128
+        chunk_size, waves_per_eu = 32, 0
+        cache_a, cache_b = ".ca", ".ca"
+
+        tiles_m = (M + block_m - 1) // block_m
+        tiles_n = (N + block_n - 1) // block_n
+        min_tile = min(tiles_m, tiles_n)
+        is_tn = s_ak == 1 and s_bk == 1
+        group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
+
+        cu_count = _get_hardware().N_CU
+
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if min(om, on) >= 128 and ok == block_k:
+                block_m, block_n, group_m = om, on, ogm
+
+        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    else:
+        # gfx942 path
+        block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
+            M, N, K, s_ak, s_bk
+        )
+        waves_per_eu = 0
+        origami_params = _select_params_origami(
+            M,
+            N,
+            K,
+            out_dtype,
+            A_view.dtype,
+            B_view.dtype,
+            trans_a=trans_a,
+            trans_b=trans_b,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oca, ocb = origami_params
+            if (om, on, ok) == (block_m, block_n, block_k):
+                group_m = ogm
+                cache_a, cache_b = oca, ocb
 
     args = (
         A_view,
@@ -589,8 +700,8 @@ def gemm_fp8_rowwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
-        CACHE_MODIFIER_A=".ca",
-        CACHE_MODIFIER_B=".ca",
+        CACHE_MODIFIER_A=cache_a,
+        CACHE_MODIFIER_B=cache_b,
         num_warps=8,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -849,7 +960,10 @@ def _blockwise_nt(
     trans_c: bool,
 ) -> torch.Tensor:
     """NT/RCR forward: C = A[M,K] @ B[N,K].T, 2D B_scales."""
-    _set_amd_knobs(enable=True)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
 
     M, K = a.shape
     N = b.shape[0]
@@ -906,7 +1020,10 @@ def _blockwise_nn(
     trans_c: bool,
 ) -> torch.Tensor:
     """NN/RRR grad_X: C = A[M,K] @ B[K,N], 2D B_scales (transposed internally)."""
-    _set_amd_knobs(enable=True)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
 
     M, K = a.shape
     _, N = b.shape
@@ -970,7 +1087,10 @@ def _blockwise_tn(
       a_scale_inv: [K//128, M]
       b_scale_inv: [K//128, N]
     """
-    _set_amd_knobs(enable=False)
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=False)
 
     K, M = a.shape
     _, N = b.shape

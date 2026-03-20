@@ -21,7 +21,7 @@ struct EventHandle {
         event->record(at::hip::getCurrentHIPStreamMasqueradingAsCUDA());
     }
 
-    explicit EventHandle(const at::hip::HIPStreamMasqueradingAsCUDA &stream) {
+    explicit EventHandle(const c10::cuda::CUDAStream &stream) {
         event = std::make_shared<torch::Event>(torch::kCUDA);
         event->record(stream);
     }
@@ -33,19 +33,18 @@ struct EventHandle {
     }
 };
 
-inline torch::Event create_event(const at::hip::HIPStreamMasqueradingAsCUDA &s) {
+inline torch::Event create_event(const c10::cuda::CUDAStream &s) {
     auto event = torch::Event(torch::kCUDA);
     event.record(s);
     return event;
 }
 
-inline void stream_wait(const at::hip::HIPStreamMasqueradingAsCUDA &s_0,
-                        const at::hip::HIPStreamMasqueradingAsCUDA &s_1) {
+inline void stream_wait(const c10::cuda::CUDAStream &s_0, const c10::cuda::CUDAStream &s_1) {
     PRIMUS_TURBO_CHECK(s_0.id() != s_1.id());
     s_0.unwrap().wait(create_event(s_1));
 }
 
-inline void stream_wait(const at::hip::HIPStreamMasqueradingAsCUDA &s, const EventHandle &event) {
+inline void stream_wait(const c10::cuda::CUDAStream &s, const EventHandle &event) {
     s.unwrap().wait(*event.event);
 }
 

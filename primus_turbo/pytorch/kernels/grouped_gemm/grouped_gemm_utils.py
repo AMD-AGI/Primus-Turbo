@@ -65,18 +65,20 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
 
         best_backend = None
         best_time = float("inf")
-        for backend in cls._backends.values():
-            if backend.can_handle(**kwargs):
+        for entry in cls._backends.values():
+            if not entry.autotune:
+                continue
+            if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(backend, **prof_kwargs)
+                    cur_time = cls.profile(entry.impl, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
                     torch.cuda.synchronize()
                 if cur_time < best_time:
                     best_time = cur_time
-                    best_backend = backend
+                    best_backend = entry.impl
 
         if best_backend is not None and cls._cache is not None:
             cls._cache.put(key, best_backend)
@@ -127,18 +129,20 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
 
         best_backend = None
         best_time = float("inf")
-        for backend in cls._backends.values():
-            if backend.can_handle(**kwargs):
+        for entry in cls._backends.values():
+            if not entry.autotune:
+                continue
+            if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(backend, **prof_kwargs)
+                    cur_time = cls.profile(entry.impl, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
                     torch.cuda.synchronize()
                 if cur_time < best_time:
                     best_time = cur_time
-                    best_backend = backend
+                    best_backend = entry.impl
 
         if best_backend is not None and cls._cache is not None:
             cls._cache.put(key, best_backend)
