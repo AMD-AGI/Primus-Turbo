@@ -183,7 +183,7 @@ class GEMMFP4AITERBackend(KernelBackend):
 
 
 _GEMM_FP4_BACKENDS = {
-    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend),
+    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
 }
 
