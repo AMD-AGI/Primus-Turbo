@@ -41,10 +41,10 @@ private:
     int               num_device_sms;
     int               rank, rdma_rank, nvl_rank;
     int               num_ranks, num_rdma_ranks, num_nvl_ranks;
-    hipIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    at::hip::HIPStreamMasqueradingAsCUDA comm_stream;
+    at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;

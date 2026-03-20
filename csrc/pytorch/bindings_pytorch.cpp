@@ -55,6 +55,11 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 
     // ********* CCO *********
+    m.def("fused_dispatch_groupedgemm(Tensor x, Tensor? x_scales, Tensor? topk_idx, Tensor? "
+          "topk_weights, "
+          "int num_experts, Tensor workspace, str group_name, int num_sms) -> (Tensor, "
+          "Tensor?, Tensor?, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, "
+          "Tensor?)");
 
     // ********* CCO *********
 }
@@ -83,6 +88,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
+    m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -108,6 +114,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm_meta);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
+    m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

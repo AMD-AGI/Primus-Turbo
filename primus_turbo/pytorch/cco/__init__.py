@@ -1,40 +1,48 @@
 import torch
 
-import primus_turbo.pytorch as turbo
+import primus_turbo.pytorch._C
 
-from typing import Tuple
+
+from typing import Tuple, Optional
+
+import torch.distributed._symmetric_memory as _symm_mem
 
 lib = torch.library.Library("cco", "DEF")  # noqa: TOR901
 lib.define(
     "fused_dispatch_groupedgemm("
-    "Tensor A, Tensor B, Tensor token_indices, Tensor token_probs, int num_experts, str group_name, *, bool return_A = True) -> (Tensor?, Tensor?)",
+    "Tensor x, str group_name, Tensor? x_scales, Tensor? topk_idx, Tensor? topk_weights, int num_experts=-1, *, int num_sms, bool return_x)"
+    "-> (Tensor, Tensor?, Tensor?, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)",
     tags=[torch._C.Tag.needs_fixed_stride_order],
 )
 
+
 @torch.library.impl(lib, "fused_dispatch_groupedgemm", "CUDA")
-def _fused_dispatch_groupedgemm(A: torch.Tensor,
-                           B: torch.Tensor,
-                           input_routing_map: torch.Tensor,
-                           token_probs: torch.Tensor,
-                           num_experts: int,
-                           group_name: str,                      
-                           *,
-                           return_A: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-     
-    group = torch.distributed.group.WORLD
-    global_routing_map = torch.empty(
-        input_routing_map.size(0) * group.size(),
-        input_routing_map.size(1),
-        device=input_routing_map.device,
-        dtype=input_routing_map.dtype,
-    )
-    torch.distributed.all_gather_into_tensor(global_routing_map, input_routing_map, group)
-    (sparse_to_dense_map, rdma_to_attn_map,
-                         attn_to_rdma_map, num_of_tokens_for_experts,
-                         local_expert_routing_map) = turbo._C.get_dispatch_layout(
-        global_routing_map=global_routing_map,
-        node_rank=0,       # TODO: get from distributed config
-        local_rank=group.rank(),# TODO: get from distributed config
-        num_of_tokens_per_rank=A.size(0),
-    )
-    return sparse_to_dense_map, num_of_tokens_for_experts
+def _fused_dispatch_groupedgemm(
+    x: torch.Tensor,
+    group_name: str,
+    x_scales: Optional[torch.Tensor] = None,
+    topk_idx: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    num_experts: Optional[int] = -1,
+    *,
+    num_sms: int,
+    return_x: bool,
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    workspace_size = int(1e9)
+    symm = _symm_mem.get_symm_mem_workspace(group_name, workspace_size)
+    rank = symm.rank
+    workspace = symm.get_buffer(rank, [workspace_size], torch.uint8)
+    return torch.ops.primus_turbo_cpp_extension.fused_dispatch_groupedgemm(x, x_scales, topk_idx, topk_weights, num_experts, workspace, group_name, num_sms)
