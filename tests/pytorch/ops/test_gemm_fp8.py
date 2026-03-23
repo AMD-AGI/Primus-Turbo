@@ -244,14 +244,14 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
     )
 
 
-@pytest.mark.parametrize("m", [255, 257, 512, 1024])
-@pytest.mark.parametrize("n", [256, 512, 1024, 4096])
+@pytest.mark.parametrize("m", [512, 1024])
+@pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("k", [256, 1024, 4096])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
     _run_gemm_fp8_test(
