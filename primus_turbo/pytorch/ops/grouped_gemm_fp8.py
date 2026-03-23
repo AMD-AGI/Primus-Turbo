@@ -23,8 +23,11 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    _BlockwiseBufferCache,
     quant_fp8_blockwise_for_weight_impl,
+    quant_fp8_blockwise_cached,
     quant_fp8_blockwise_impl,
+    quant_fp8_blockwise_segment_m_cached,
     quant_fp8_blockwise_segment_m_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
@@ -40,6 +43,10 @@ __all__ = [
 _tw_cache_a = _BufferCache()
 _tw_cache_b = _BufferCache()
 _tw_cache_grad = _BufferCache()
+_bw_cache_a_row = _BlockwiseBufferCache()
+_bw_cache_grad_row = _BlockwiseBufferCache()
+_bw_cache_a_seg = _BlockwiseBufferCache()
+_bw_cache_grad_seg = _BlockwiseBufferCache()
 _tw_weight_cache: dict[tuple[int, int, int, tuple[int, ...], tuple[int, ...], torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 _bw_weight_cache: dict[
     int,
@@ -47,6 +54,14 @@ _bw_weight_cache: dict[
         weakref.ReferenceType[torch.Tensor],
         tuple[int, int, tuple[int, ...], tuple[int, ...], int],
         torch.Tensor,
+        torch.Tensor,
+    ],
+] = {}
+_group_offs_cache: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[torch.Tensor],
+        tuple[int, int, tuple[int, ...]],
         torch.Tensor,
     ],
 ] = {}
@@ -92,6 +107,31 @@ def _tensorwise_weight_reuse_enabled() -> bool:
     return os.environ.get("PRIMUS_TURBO_FP8_TW_REUSE_B", "0") == "1"
 
 
+def _get_group_lens_cache_key(group_lens: torch.Tensor) -> tuple[int, int, tuple[int, ...]]:
+    return (
+        int(group_lens.data_ptr()),
+        int(getattr(group_lens, "_version", 0)),
+        tuple(group_lens.shape),
+    )
+
+
+def _get_cached_group_offs(group_lens: torch.Tensor) -> torch.Tensor:
+    cache_key = _get_group_lens_cache_key(group_lens)
+    cached_entry = _group_offs_cache.get(id(group_lens))
+    if (
+        cached_entry is not None
+        and cached_entry[0]() is group_lens
+        and cached_entry[1] == cache_key
+    ):
+        return cached_entry[2]
+
+    group_offs = grouped_gemm_compute_offs(group_lens)
+    if len(_group_offs_cache) >= 64:
+        _group_offs_cache.clear()
+    _group_offs_cache[id(group_lens)] = (weakref.ref(group_lens), cache_key, group_offs)
+    return group_offs
+
+
 class GroupedGemmFP8BlockFunc(torch.autograd.Function):
     @staticmethod
     def get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -124,13 +164,16 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
         b_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(config.format, True)
         use_triton_layout = _use_triton_grouped_gemm_backend()
+        needs_grad_a = ctx.needs_input_grad[0]
+        needs_grad_b = ctx.needs_input_grad[1]
 
-        a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
+        a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_cached(
             a,
             a_dtype,
             axis=1,
             block_size=config.block_size,
             scales_transposed=use_triton_layout,
+            buf_cache=_bw_cache_a_row,
         )
 
         weight_key = _get_blockwise_weight_cache_key(b, config.block_size)
@@ -164,13 +207,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_impl(
-            a, a_dtype, config.block_size, group_lens, group_offs
-        )
-
         ctx.save_for_backward(
-            a_fp8_col,
-            a_scale_inv_col,
+            a,
             b_fp8,
             b_scale_inv,
             group_lens,
@@ -181,6 +219,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.needs_grad_a = needs_grad_a
+        ctx.needs_grad_b = needs_grad_b
 
         return out
 
@@ -189,8 +229,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
 
         (
-            a_fp8_col,
-            a_scale_inv_col,
+            a,
             b_fp8,
             b_scale_inv,
             group_lens,
@@ -199,58 +238,69 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         block_size = ctx.config.block_size
         grad_out_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, False)
         use_triton_layout = _use_triton_grouped_gemm_backend()
+        grad_a = None
+        grad_b = None
 
-        # Quantize grad_out in row-wise for dgrad
-        grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
-            grad_out,
-            grad_out_dtype,
-            axis=1,
-            block_size=block_size,
-            scales_transposed=use_triton_layout,
-        )
-
-        # grad_a: grad_out @ b^T
-        grad_a = grouped_gemm_fp8_impl(
-            grad_out_fp8_row,
-            b_fp8,
-            grad_out_scale_inv_row,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
-        )
-
-        # Quantize grad_out with segment padding for wgrad (colwise quantization)
-        grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
-            quant_fp8_blockwise_segment_m_impl(
+        if ctx.needs_grad_a:
+            # Quantize grad_out in row-wise for dgrad
+            grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_cached(
                 grad_out,
                 grad_out_dtype,
-                block_size,
+                axis=1,
+                block_size=block_size,
+                scales_transposed=use_triton_layout,
+                buf_cache=_bw_cache_grad_row,
+            )
+
+            # grad_a: grad_out @ b^T
+            grad_a = grouped_gemm_fp8_impl(
+                grad_out_fp8_row,
+                b_fp8,
+                grad_out_scale_inv_row,
+                b_scale_inv,
                 group_lens,
                 group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.CK.value,
             )
-        )
 
-        grad_b = grouped_gemm_fp8_variable_k_impl(
-            a_fp8_col,
-            grad_out_fp8_col,
-            a_scale_inv_col,
-            grad_out_scale_inv_col,
-            var_k_group_lens,
-            var_k_group_offs,
-            trans_a=not ctx.trans_a,
-            trans_b=False,
-            trans_c=ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
-        )
+        if ctx.needs_grad_b:
+            a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, True)
+            a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_cached(
+                a, a_dtype, block_size, group_lens, group_offs, buf_cache=_bw_cache_a_seg
+            )
+
+            # Quantize grad_out with segment padding for wgrad (colwise quantization)
+            grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
+                quant_fp8_blockwise_segment_m_cached(
+                    grad_out,
+                    grad_out_dtype,
+                    block_size,
+                    group_lens,
+                    group_offs,
+                    buf_cache=_bw_cache_grad_seg,
+                )
+            )
+
+            grad_b = grouped_gemm_fp8_variable_k_impl(
+                a_fp8_col,
+                grad_out_fp8_col,
+                a_scale_inv_col,
+                grad_out_scale_inv_col,
+                var_k_group_lens,
+                var_k_group_offs,
+                trans_a=not ctx.trans_a,
+                trans_b=False,
+                trans_c=ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.CK.value,
+            )
 
         return grad_a, grad_b, None, None, None, None, None
 
@@ -494,7 +544,7 @@ def grouped_gemm_fp8(
     assert b.dtype in supported_dtypes, f"Unsupported dtype {b.dtype}, expected one of {supported_dtypes}"
 
     if group_offs is None:
-        group_offs = grouped_gemm_compute_offs(group_lens)
+        group_offs = _get_cached_group_offs(group_lens)
     if config is None:
         config = Float8QuantConfig()
 

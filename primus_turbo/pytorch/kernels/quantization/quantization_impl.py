@@ -37,6 +37,34 @@ _SEGMENT_PADDING_META_CACHE: dict[
 ] = {}
 
 
+class _BlockwiseBufferCache:
+    __slots__ = ("fp8_buf", "scale_buf", "fp8_shape", "scale_shape", "fp8_dtype", "device")
+
+    def __init__(self):
+        self.fp8_buf = None
+        self.scale_buf = None
+        self.fp8_shape = None
+        self.scale_shape = None
+        self.fp8_dtype = None
+        self.device = None
+
+    def get(self, fp8_shape, fp8_dtype, scale_shape, device):
+        if (
+            self.fp8_buf is None
+            or self.fp8_shape != tuple(fp8_shape)
+            or self.scale_shape != tuple(scale_shape)
+            or self.fp8_dtype != fp8_dtype
+            or self.device != device
+        ):
+            self.fp8_buf = torch.empty(fp8_shape, dtype=fp8_dtype, device=device)
+            self.scale_buf = torch.empty(scale_shape, dtype=torch.float32, device=device)
+            self.fp8_shape = tuple(fp8_shape)
+            self.scale_shape = tuple(scale_shape)
+            self.fp8_dtype = fp8_dtype
+            self.device = device
+        return self.fp8_buf, self.scale_buf
+
+
 def _get_segment_padding_meta(
     group_lens: torch.Tensor,
     group_offs: torch.Tensor,
@@ -159,6 +187,43 @@ def quant_fp8_blockwise_impl(
     return x_fp8, x_scales
 
 
+def quant_fp8_blockwise_cached(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+    scales_transposed: bool = False,
+    buf_cache: _BlockwiseBufferCache | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if buf_cache is None:
+        return quant_fp8_blockwise_impl(x, dtype, axis, block_size, scales_transposed)
+
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+    assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
+    axis = axis % 2
+
+    M, N = x.shape
+    if axis == 1 and scales_transposed:
+        scales_shape = (triton.cdiv(N, block_size), M)
+    else:
+        scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_fp8, x_scales = buf_cache.get((M, N), dtype, scales_shape, x.device)
+
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_kernel)[grid](
+        x,
+        x_fp8,
+        x_scales,
+        M,
+        N,
+        block_size,
+        torch.finfo(dtype).max,
+        axis,
+        scales_transposed,
+    )
+    return x_fp8, x_scales
+
+
 @quant_fp8_blockwise_impl.register_fake
 def quant_fp8_blockwise_impl_meta(
     x: torch.Tensor,
@@ -224,6 +289,49 @@ def quant_fp8_blockwise_segment_m_impl(
     x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
 
     # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
+    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
+        x,
+        x_fp8,
+        x_scales,
+        group_offs,
+        var_k_group_offs,
+        block_group_ids,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
+
+
+def quant_fp8_blockwise_segment_m_cached(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    buf_cache: _BlockwiseBufferCache | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if buf_cache is None:
+        return quant_fp8_blockwise_segment_m_impl(x, dtype, block_size, group_lens, group_offs)
+
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+    var_k_group_lens, var_k_group_offs, block_group_ids = _get_segment_padding_meta(
+        group_lens, group_offs, block_size
+    )
+
+    M_padded_max = M + num_groups * block_size
+    x_fp8, x_scales = buf_cache.get(
+        (M_padded_max, N),
+        dtype,
+        (triton.cdiv(M_padded_max, block_size), N),
+        x.device,
+    )
+
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
     wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
         x,
