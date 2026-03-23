@@ -97,7 +97,7 @@ class GlobalBackendManager:
 
         # Parse format 2 & 3
         env_lower = env_value.lower()
-        if any(key_word in env_lower for key_word in ("fp4", "fp8", "bf16", "fp16", "other")):
+        if any(key_word in env_lower for key_word in ("fp4", "fp8", "bf16", "fp16", "fp32", "other")):
             precision_backend_pairs = env_value.split(",")
             other_precision_backend = None
             for pair in precision_backend_pairs:
@@ -172,7 +172,15 @@ class GlobalBackendManager:
             return cls._gemm_backend[precision]
         env_value = os.environ.get(_ENV_GEMM_BACKEND_KEY, None)
         if env_value is not None:
-            return cls._extract_backend_from_env(env_value)[precision]
+            backend = cls._extract_backend_from_env(env_value).get(precision, None)
+            if backend is None:
+                logger.warning(
+                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
+                    f"Using default backend.",
+                    once=True,
+                )
+            return backend
+
         return None
 
     @classmethod
@@ -182,7 +190,15 @@ class GlobalBackendManager:
             return cls._grouped_gemm_backend[precision]
         env_value = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY, None)
         if env_value is not None:
-            return cls._extract_backend_from_env(env_value)[precision]
+            backend = cls._extract_backend_from_env(env_value).get(precision, None)
+            if backend is None:
+                logger.warning(
+                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
+                    f"Using default backend.",
+                    once=True,
+                )
+            return backend
+
         return None
 
     @classmethod
@@ -192,7 +208,14 @@ class GlobalBackendManager:
             return cls._moe_dispatch_combine_backend[precision]
         env_value = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
         if env_value is not None:
-            backend = cls._extract_backend_from_env(env_value)[precision]
+            backend = cls._extract_backend_from_env(env_value).get(precision, None)
+
+            if backend is None:
+                logger.warning(
+                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
+                    f"Using default backend.",
+                    once=True,
+                )
 
             if backend == BackendType.DEEP_EP:
                 assert (

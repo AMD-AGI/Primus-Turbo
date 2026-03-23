@@ -81,11 +81,16 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP4HipBLASLtBackend.SUPPORTED_DTYPES
         supported &= (trans_a, trans_b, trans_c) in GEMMFP4HipBLASLtBackend.SUPPORTED_LAYOUTS
 
-        # check dimension
+        # check dimension. Assume layout is NT.
         supported &= (
             a.size(0) % GEMMFP4HipBLASLtBackend.HIPBLASLT_M_MULTIPLE == 0
             and b.size(0) % GEMMFP4HipBLASLtBackend.HIPBLASLT_N_MULTIPLE == 0
         )
+
+        # NOTE: The k dim is packed for FP4. So it need to multiply 2.
+        supported &= (a.size(1) * 2) % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0 and (
+            b.size(1) * 2
+        ) % GEMMFP4HipBLASLtBackend.HIPBLASLT_K_MULTIPLE == 0
 
         return supported
 

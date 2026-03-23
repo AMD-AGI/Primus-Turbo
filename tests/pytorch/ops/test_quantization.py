@@ -138,7 +138,6 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -320,7 +319,6 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
 
     # x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
     x = torch.ones((B, M, N), device="cuda", dtype=orig_dtype) * 6
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
@@ -489,7 +487,6 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-    x.detach().clone()
 
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
