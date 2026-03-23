@@ -57,9 +57,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ********* CCO *********
     m.def("fused_dispatch_groupedgemm(Tensor x, Tensor? x_scales, Tensor? topk_idx, Tensor? "
           "topk_weights, "
-          "int num_experts, Tensor workspace, str group_name, int num_sms) -> (Tensor, "
-          "Tensor?, Tensor?, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, "
-          "Tensor?)");
+          "int num_experts, Tensor workspace, str group_name, int num_sms) -> (Tensor, Tensor, "
+          "Tensor, Tensor, Tensor, Tensor)");
 
     // ********* CCO *********
 }

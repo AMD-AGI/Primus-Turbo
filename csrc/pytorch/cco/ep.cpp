@@ -15,9 +15,7 @@ namespace primus_turbo::pytorch {
 
 size_t get_workspace_size() {}
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
-           std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                            const std::optional<at::Tensor> &topk_idx,
                            const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
@@ -184,38 +182,26 @@ fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> 
 
     // Dispatch
 
-    void    **recv_x              = symm_mem->get_buffer_ptrs_dev();
-    float   **recv_x_scales       = nullptr;
-    int     **recv_src_idx        = nullptr;
-    int64_t **recv_topk_idx       = nullptr;
-    float   **recv_topk_weights   = nullptr;
-    int     **recv_channel_offset = nullptr;
+    void    **recv_x_ptrs              = symm_mem->get_buffer_ptrs_dev();
+    float   **recv_x_scales_ptrs       = nullptr;
+    int     **recv_src_idx_ptrs        = nullptr;
+    int64_t **recv_topk_idx_ptrs       = nullptr;
+    float   **recv_topk_weights_ptrs   = nullptr;
+    int     **recv_channel_offset_ptrs = nullptr;
     primus_turbo::cco::ep::intranode::dispatch(
-        recv_x, recv_x_scales, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset,
-        send_head.data_ptr<int>(), x.data_ptr(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
-        is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
-        rank_prefix_matrix.data_ptr<int>(), num_tokens,
-        static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)), num_topk, num_experts,
+        recv_x_ptrs, recv_x_scales_ptrs, recv_src_idx_ptrs, recv_topk_idx_ptrs,
+        recv_topk_weights_ptrs, recv_channel_offset_ptrs, send_head.data_ptr<int>(), x.data_ptr(),
+        x_scales_ptr, topk_idx_ptr, topk_weights_ptr, is_token_in_rank.data_ptr<bool>(),
+        channel_prefix_matrix.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(), num_tokens,
+        static_cast<int>(hidden * num_recv_tokens / sizeof(int4)), num_topk, num_experts,
         num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms);
 
     // Return values
-    return {recv_x,
-            recv_x_scales,
-            recv_topk_idx,
-            recv_topk_weights,
-            rank_prefix_matrix,
-            channel_prefix_matrix,
-            recv_channel_prefix_matrix,
-            recv_src_idx,
-            send_head,
-            num_tokens_per_rank,
-            num_tokens_per_expert,
-            is_token_in_rank};
+    return std::make_tuple(rank_prefix_matrix, channel_prefix_matrix, send_head,
+                           num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank);
 }
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
-           std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_dispatch_groupedgemm_meta(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                                 const std::optional<at::Tensor> &topk_idx,
                                 const std::optional<at::Tensor> &topk_weights, int64_t num_experts,

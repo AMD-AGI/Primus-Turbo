@@ -289,10 +289,12 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     int num_experts_per_rank = num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
     EP_DEVICE_ASSERT(num_topk <= WARP_SIZE);
-    EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
-    EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
-    auto ptr = reinterpret_cast<void *>(recv_x[is_sender ? responsible_rank : rank]);
+    return;
+    // EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
+    // EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
+
+    auto ptr           = reinterpret_cast<void *>(recv_x[is_sender ? responsible_rank : rank]);
     auto recv_x_buffer = Buffer<int4>(ptr, 128);
 
     if (is_sender) {

@@ -1,17 +1,15 @@
+from typing import Optional, Tuple
+
 import torch
+import torch.distributed._symmetric_memory as _symm_mem
 
 import primus_turbo.pytorch._C
-
-
-from typing import Tuple, Optional
-
-import torch.distributed._symmetric_memory as _symm_mem
 
 lib = torch.library.Library("cco", "DEF")  # noqa: TOR901
 lib.define(
     "fused_dispatch_groupedgemm("
     "Tensor x, str group_name, Tensor? x_scales, Tensor? topk_idx, Tensor? topk_weights, int num_experts=-1, *, int num_sms, bool return_x)"
-    "-> (Tensor, Tensor?, Tensor?, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)",
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
     tags=[torch._C.Tag.needs_fixed_stride_order],
 )
 
@@ -45,4 +43,6 @@ def _fused_dispatch_groupedgemm(
     symm = _symm_mem.get_symm_mem_workspace(group_name, workspace_size)
     rank = symm.rank
     workspace = symm.get_buffer(rank, [workspace_size], torch.uint8)
-    return torch.ops.primus_turbo_cpp_extension.fused_dispatch_groupedgemm(x, x_scales, topk_idx, topk_weights, num_experts, workspace, group_name, num_sms)
+    return torch.ops.primus_turbo_cpp_extension.fused_dispatch_groupedgemm(
+        x, x_scales, topk_idx, topk_weights, num_experts, workspace, group_name, num_sms
+    )

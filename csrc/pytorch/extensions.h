@@ -184,18 +184,14 @@ void destroy_stream(const int device_id, const int64_t stream_ptr);
 //  CCO
 //==================================================================
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
-           std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                            const std::optional<at::Tensor> &topk_idx,
                            const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
                            const at::Tensor &workspace, const std::string &group_name,
                            const int64_t num_sms);
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
-           std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_dispatch_groupedgemm_meta(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                                 const std::optional<at::Tensor> &topk_idx,
                                 const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
