@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
+import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, check_mxfp4_support
@@ -16,6 +17,9 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
+)
+from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
+    quantize_fp8_tensorwise as _triton_quantize_fp8_tensorwise,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import (
     dequantize_mxfp4_kernel,
@@ -27,6 +31,42 @@ from primus_turbo.triton.quantization.quantization_mxfp8 import (
 )
 
 
+_SEGMENT_PADDING_META_CACHE: dict[
+    tuple[int, int, int, int, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+
+
+def _get_segment_padding_meta(
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = (
+        id(group_lens),
+        id(group_offs),
+        int(group_lens.data_ptr()),
+        int(group_offs.data_ptr()),
+        int(block_size),
+    )
+    cached = _SEGMENT_PADDING_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    var_k_group_offs = torch.zeros(group_lens.size(0) + 1, dtype=torch.int64, device=group_lens.device)
+    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+    blocks_per_group = (var_k_group_lens // block_size).to(torch.int32)
+    block_group_ids = torch.repeat_interleave(
+        torch.arange(group_lens.size(0), dtype=torch.int32, device=group_lens.device), blocks_per_group
+    )
+
+    if len(_SEGMENT_PADDING_META_CACHE) >= 64:
+        _SEGMENT_PADDING_META_CACHE.clear()
+    _SEGMENT_PADDING_META_CACHE[key] = (var_k_group_lens, var_k_group_offs, block_group_ids)
+    return var_k_group_lens, var_k_group_offs, block_group_ids
+
+
 def ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -35,10 +75,10 @@ def quantize_fp8_tensorwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize FP8 Tensor-Wise
+    Quantize FP8 Tensor-Wise — Triton implementation.
+    Handles 2D (M, K) and 3D (G, N, K) tensors from grouped GEMM.
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
-    return x_fp8, scale_inv
+    return _triton_quantize_fp8_tensorwise(x, out_dtype, scale)
 
 
 def quantize_fp8_rowwise_impl(
@@ -73,6 +113,7 @@ def quant_fp8_blockwise_impl(
     dtype: torch.dtype,
     axis: int,
     block_size: int = 128,
+    scales_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantization for fp8 blockwise.
@@ -96,9 +137,12 @@ def quant_fp8_blockwise_impl(
 
     M, N = x.shape
 
-    x_fp8 = torch.zeros((M, N), dtype=dtype, device=x.device)
-    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
-    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
+    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
+    if axis == 1 and scales_transposed:
+        scales_shape = (triton.cdiv(N, block_size), M)
+    else:
+        scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     wrap_triton(quant_fp8_blockwise_kernel)[grid](
@@ -110,6 +154,7 @@ def quant_fp8_blockwise_impl(
         block_size,
         torch.finfo(dtype).max,
         axis,
+        scales_transposed,
     )
     return x_fp8, x_scales
 
@@ -120,6 +165,7 @@ def quant_fp8_blockwise_impl_meta(
     dtype: torch.dtype,
     axis: int,
     block_size: int = 128,
+    scales_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, "Input must be 2D"
     assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
@@ -127,7 +173,10 @@ def quant_fp8_blockwise_impl_meta(
 
     M, N = x.shape
     x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
-    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    if axis == 1 and scales_transposed:
+        scales_shape = (triton.cdiv(N, block_size), M)
+    else:
+        scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8, x_scales
 
@@ -163,17 +212,16 @@ def quant_fp8_blockwise_segment_m_impl(
     M, N = x.shape
     num_groups = group_lens.size(0)
 
-    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
-    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
-    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+    var_k_group_lens, var_k_group_offs, block_group_ids = _get_segment_padding_meta(
+        group_lens, group_offs, block_size
+    )
 
     # Use upper bound for allocation to avoid .item() sync (required for graph capture)
     # Each segment can have at most block_size padding, so M_padded <= M + num_groups * block_size
     M_padded_max = M + num_groups * block_size
 
-    # Allocate output tensors with upper bound size
-    x_fp8 = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
-    x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+    x_fp8 = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
 
     # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
@@ -183,6 +231,7 @@ def quant_fp8_blockwise_segment_m_impl(
         x_scales,
         group_offs,
         var_k_group_offs,
+        block_group_ids,
         N,
         num_groups,
         block_size,

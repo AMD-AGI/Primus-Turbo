@@ -29,6 +29,7 @@ def quant_fp8_blockwise_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
+    SCALES_TRANSPOSED: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -49,7 +50,10 @@ def quant_fp8_blockwise_kernel(
 
     # Store scale
     if AXIS == 1:
-        scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+        if SCALES_TRANSPOSED:
+            scale_offs = pid_n * M + offs_m
+        else:
+            scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
         scale_mask = offs_m < M
     else:
         scale_offs = pid_m * N + offs_n
@@ -71,6 +75,7 @@ def quant_fp8_blockwise_segment_m_kernel(
     x_scales_ptr,  # Output scales [M_out // BLOCK_SIZE, N]
     group_offs_ptr,  # Original group offsets [B+1]
     padded_group_offs_ptr,  # Padded group offsets [B+1]
+    block_group_ids_ptr,  # [ceil(M_padded/BLOCK_SIZE)] int32
     N,
     num_groups,
     BLOCK_SIZE: tl.constexpr,
@@ -91,13 +96,8 @@ def quant_fp8_blockwise_segment_m_kernel(
     if block_start >= M_padded:
         return
 
-    # Find which group this block belongs to by searching padded_group_offs
-    group_id = 0
-    for g in range(num_groups):
-        padded_start = tl.load(padded_group_offs_ptr + g)
-        padded_end = tl.load(padded_group_offs_ptr + g + 1)
-        if block_start >= padded_start and block_start < padded_end:
-            group_id = g
+    # Block→group mapping is precomputed on the host to avoid O(G) tile scans in-kernel.
+    group_id = tl.load(block_group_ids_ptr + pid_m)
 
     # Get group boundaries
     orig_group_start = tl.load(group_offs_ptr + group_id)
