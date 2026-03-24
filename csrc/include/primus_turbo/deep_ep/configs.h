@@ -22,8 +22,8 @@
 
 #define FINISHED_SUM_TAG 1024
 
-#define NUM_CPU_TIMEOUT_SECS 100
-#define NUM_TIMEOUT_CYCLES 200000000000ll // 200G cycles ~= 100s
+#define NUM_CPU_TIMEOUT_SECS 300
+#define NUM_TIMEOUT_CYCLES 600000000000ll // 600G cycles ~= 300s
 
 #define NUM_WAIT_NANOSECONDS 500
 
@@ -66,3 +66,25 @@ static constexpr uint64_t kSecondHalfMask   = 0xffffffff00000000;
 #ifdef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_OPERATORS__
 #endif
+
+static inline int get_num_cpu_timeout_secs() {
+    static int timeout = []() {
+        const char *env = std::getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT");
+        if (!env || env[0] == '\0') {
+            return NUM_CPU_TIMEOUT_SECS;
+        }
+        try {
+            return std::stoi(env);
+        } catch (...) {
+            return NUM_CPU_TIMEOUT_SECS;
+        }
+    }();
+    return timeout;
+}
+
+inline static bool is_enable_cheap_fence() {
+    char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
+    if (!v || v[0] == '\0')
+        return true;
+    return std::stoi(v) == 0;
+}

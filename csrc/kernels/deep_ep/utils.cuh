@@ -377,11 +377,4 @@ __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t *ptr) {
     }
     return ret;
 }
-
-inline static bool is_enable_cheap_fence() {
-    char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
-    if (!v || v[0] == '\0')
-        return true;
-    return std::stoi(v) == 0;
-}
 } // namespace primus_turbo::deep_ep
