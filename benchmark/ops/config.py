@@ -7,6 +7,7 @@
 """Shared configurations for benchmark scripts."""
 
 import re
+from copy import deepcopy
 
 import torch
 
@@ -307,6 +308,49 @@ BATCH_SIZE_LIST = [1, 2, 4]
 GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 GROUPED_GEMM_EP_SIZE_LIST = [32, 16, 8]
 
+GROUPED_GEMM_CASE_PRESETS = {
+    "smoke": [
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-Down", "B": 8, "M": 4096, "N": 7168, "K": 2048, "balance": True},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 512, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "MoE-1T-GateUP", "B": 28, "M": 4096, "N": 3840, "K": 8192, "balance": True},
+        {"Case": "Grok-2-GateUP", "B": 1, "M": 8192, "N": 32768, "K": 8192, "balance": True},
+    ],
+    "tuning": [
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 512, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 16384, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-Down", "B": 8, "M": 4096, "N": 7168, "K": 2048, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 32, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 32, "M": 4096, "N": 4096, "K": 7168, "balance": False},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 512, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 16384, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "MoE-1T-GateUP", "B": 28, "M": 4096, "N": 3840, "K": 8192, "balance": True},
+        {"Case": "Grok-2-GateUP", "B": 1, "M": 8192, "N": 32768, "K": 8192, "balance": True},
+        {"Case": "Qwen3-30B-A3B-GateUP", "B": 16, "M": 4096, "N": 4096, "K": 2048, "balance": True},
+        {"Case": "DeepSeek-V2-Lite-GateUP", "B": 8, "M": 2048, "N": 2816, "K": 2048, "balance": True},
+    ],
+    "acceptance": [
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 512, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 8, "M": 16384, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-Down", "B": 8, "M": 4096, "N": 7168, "K": 2048, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 32, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "DeepSeek-V3-GateUP", "B": 32, "M": 4096, "N": 4096, "K": 7168, "balance": False},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 512, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 4096, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "Kimi-K2-GateUP", "B": 48, "M": 16384, "N": 4096, "K": 7168, "balance": True},
+        {"Case": "Kimi-K2-Down", "B": 48, "M": 4096, "N": 7168, "K": 2048, "balance": True},
+        {"Case": "MoE-1T-GateUP", "B": 28, "M": 4096, "N": 3840, "K": 8192, "balance": True},
+        {"Case": "MoE-1T-GateUP", "B": 28, "M": 4096, "N": 3840, "K": 8192, "balance": False},
+        {"Case": "MoE-1T-Down", "B": 28, "M": 4096, "N": 8192, "K": 1920, "balance": True},
+        {"Case": "Grok-2-GateUP", "B": 1, "M": 8192, "N": 32768, "K": 8192, "balance": True},
+        {"Case": "Mixtral-8x7B-GateUP", "B": 1, "M": 4096, "N": 28672, "K": 4096, "balance": True},
+        {"Case": "Qwen3-30B-A3B-GateUP", "B": 16, "M": 4096, "N": 4096, "K": 2048, "balance": True},
+        {"Case": "DeepSeek-V2-Lite-GateUP", "B": 8, "M": 2048, "N": 2816, "K": 2048, "balance": True},
+    ],
+}
+
 ###############################################################################
 # Test Case Generators
 ###############################################################################
@@ -400,6 +444,81 @@ def gen_grouped_gemm_test_cases():
         )
         all_test_cases.extend(test_cases)
     return all_test_cases
+
+
+def get_grouped_gemm_preset_cases(preset: str):
+    """Return a copy of the grouped GEMM preset cases with dtype filled in."""
+    if preset not in GROUPED_GEMM_CASE_PRESETS:
+        raise ValueError(
+            f"Unknown grouped GEMM preset {preset!r}, expected one of {list(GROUPED_GEMM_CASE_PRESETS)}"
+        )
+    cases = []
+    for case in GROUPED_GEMM_CASE_PRESETS[preset]:
+        item = deepcopy(case)
+        item["dtype"] = torch.bfloat16
+        cases.append(item)
+    return cases
+
+
+def expand_grouped_gemm_cases_by_balance(test_cases, balance_mode: str):
+    """Attach or expand grouped GEMM cases with balance metadata."""
+    if balance_mode not in {"balanced", "imbalanced", "both"}:
+        raise ValueError(f"Unknown balance mode {balance_mode!r}")
+
+    expanded = []
+    for case in test_cases:
+        if "balance" in case:
+            is_balanced = bool(case["balance"])
+            if balance_mode == "balanced" and not is_balanced:
+                continue
+            if balance_mode == "imbalanced" and is_balanced:
+                continue
+            item = deepcopy(case)
+            item["balance"] = is_balanced
+            expanded.append(item)
+            continue
+
+        if balance_mode in {"balanced", "both"}:
+            item = deepcopy(case)
+            item["balance"] = True
+            expanded.append(item)
+        if balance_mode in {"imbalanced", "both"}:
+            item = deepcopy(case)
+            item["balance"] = False
+            expanded.append(item)
+    return expanded
+
+
+def filter_grouped_gemm_test_cases(
+    test_cases,
+    *,
+    case_names=None,
+    b_values=None,
+    m_values=None,
+    n_values=None,
+    k_values=None,
+):
+    """Filter grouped GEMM cases by shape dimensions and case names."""
+    case_name_set = set(case_names) if case_names else None
+    b_set = set(b_values) if b_values else None
+    m_set = set(m_values) if m_values else None
+    n_set = set(n_values) if n_values else None
+    k_set = set(k_values) if k_values else None
+
+    filtered = []
+    for case in test_cases:
+        if case_name_set is not None and case["Case"] not in case_name_set:
+            continue
+        if b_set is not None and case["B"] not in b_set:
+            continue
+        if m_set is not None and case["M"] not in m_set:
+            continue
+        if n_set is not None and case["N"] not in n_set:
+            continue
+        if k_set is not None and case["K"] not in k_set:
+            continue
+        filtered.append(case)
+    return filtered
 
 
 def gen_attention_test_cases():

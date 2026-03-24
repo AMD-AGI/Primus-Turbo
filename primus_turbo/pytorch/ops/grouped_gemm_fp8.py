@@ -47,6 +47,7 @@ _bw_cache_a_row = _BlockwiseBufferCache()
 _bw_cache_grad_row = _BlockwiseBufferCache()
 _bw_cache_a_seg = _BlockwiseBufferCache()
 _bw_cache_grad_seg = _BlockwiseBufferCache()
+_bw_aux_streams: dict[int, torch.cuda.Stream] = {}
 _tw_weight_cache: dict[tuple[int, int, int, tuple[int, ...], tuple[int, ...], torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 _bw_weight_cache: dict[
     int,
@@ -130,6 +131,33 @@ def _get_cached_group_offs(group_lens: torch.Tensor) -> torch.Tensor:
         _group_offs_cache.clear()
     _group_offs_cache[id(group_lens)] = (weakref.ref(group_lens), cache_key, group_offs)
     return group_offs
+
+
+def _get_blockwise_aux_stream(device: torch.device) -> torch.cuda.Stream:
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _bw_aux_streams.get(device_index)
+    if stream is None:
+        with torch.cuda.device(device_index):
+            stream = torch.cuda.Stream()
+        _bw_aux_streams[device_index] = stream
+    return stream
+
+
+def _should_overlap_blockwise_bwd(
+    a: torch.Tensor,
+    needs_grad_a: bool,
+    needs_grad_b: bool,
+) -> bool:
+    if os.environ.get("PRIMUS_TURBO_BW_BWD_OVERLAP", "1") == "0":
+        return False
+    # Overlap only helps when both backward branches run and K is large enough to
+    # hide the segment-padding quantization behind dgrad GEMM.
+    return (
+        needs_grad_a
+        and needs_grad_b
+        and a.is_cuda
+        and a.shape[1] > 2048
+    )
 
 
 class GroupedGemmFP8BlockFunc(torch.autograd.Function):
@@ -240,6 +268,35 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         use_triton_layout = _use_triton_grouped_gemm_backend()
         grad_a = None
         grad_b = None
+        overlap_seg_quant = _should_overlap_blockwise_bwd(a, ctx.needs_grad_a, ctx.needs_grad_b)
+        aux_stream = None
+        a_fp8_col = None
+        a_scale_inv_col = None
+        grad_out_fp8_col = None
+        grad_out_scale_inv_col = None
+        var_k_group_lens = None
+        var_k_group_offs = None
+
+        if overlap_seg_quant:
+            main_stream = torch.cuda.current_stream(device=a.device)
+            aux_stream = _get_blockwise_aux_stream(a.device)
+            aux_stream.wait_stream(main_stream)
+            with torch.cuda.stream(aux_stream):
+                a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, True)
+                a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_cached(
+                    a, a_dtype, block_size, group_lens, group_offs, buf_cache=_bw_cache_a_seg
+                )
+
+                grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
+                    quant_fp8_blockwise_segment_m_cached(
+                        grad_out,
+                        grad_out_dtype,
+                        block_size,
+                        group_lens,
+                        group_offs,
+                        buf_cache=_bw_cache_grad_seg,
+                    )
+                )
 
         if ctx.needs_grad_a:
             # Quantize grad_out in row-wise for dgrad
@@ -269,22 +326,25 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             )
 
         if ctx.needs_grad_b:
-            a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, True)
-            a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_cached(
-                a, a_dtype, block_size, group_lens, group_offs, buf_cache=_bw_cache_a_seg
-            )
-
-            # Quantize grad_out with segment padding for wgrad (colwise quantization)
-            grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
-                quant_fp8_blockwise_segment_m_cached(
-                    grad_out,
-                    grad_out_dtype,
-                    block_size,
-                    group_lens,
-                    group_offs,
-                    buf_cache=_bw_cache_grad_seg,
+            if overlap_seg_quant:
+                torch.cuda.current_stream(device=a.device).wait_stream(aux_stream)
+            else:
+                a_dtype = GroupedGemmFP8BlockFunc.get_fp8_dtype(ctx.config.format, True)
+                a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_cached(
+                    a, a_dtype, block_size, group_lens, group_offs, buf_cache=_bw_cache_a_seg
                 )
-            )
+
+                # Quantize grad_out with segment padding for wgrad (colwise quantization)
+                grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
+                    quant_fp8_blockwise_segment_m_cached(
+                        grad_out,
+                        grad_out_dtype,
+                        block_size,
+                        group_lens,
+                        group_offs,
+                        buf_cache=_bw_cache_grad_seg,
+                    )
+                )
 
             grad_b = grouped_gemm_fp8_variable_k_impl(
                 a_fp8_col,
