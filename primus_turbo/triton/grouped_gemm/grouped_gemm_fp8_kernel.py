@@ -39,15 +39,17 @@ import triton.language as tl
 from primus_turbo.triton.gemm.gemm_kernel import (
     _calculate_lds_usage,
     _get_hardware,
-    _is_gfx950,
     _select_params_origami,
-    _set_knobs_gfx950,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
     _get_num_cus,
     _grouped_variable_k_gemm_kernel,
+)
+from primus_turbo.triton.utils.hardware_helper import (
+    _is_gfx950,
+    _set_knobs_gfx950,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════

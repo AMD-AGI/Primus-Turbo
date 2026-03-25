@@ -28,9 +28,9 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import (
+from primus_turbo.triton.gemm.gemm_kernel import _select_params_origami
+from primus_turbo.triton.utils.hardware_helper import (
     _is_gfx950,
-    _select_params_origami,
     _set_knobs_gfx950,
 )
 

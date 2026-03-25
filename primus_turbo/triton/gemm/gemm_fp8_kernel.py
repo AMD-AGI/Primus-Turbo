@@ -41,8 +41,10 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _chiplet_transform_chunked,
     _compute_sk_grid,
     _get_hardware,
-    _is_gfx950,
     _select_params_origami,
+)
+from primus_turbo.triton.utils.hardware_helper import (
+    _is_gfx950,
     _set_knobs_gfx950,
 )
 

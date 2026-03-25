@@ -16,11 +16,18 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
 )
-from primus_turbo.triton.quantization.quantization_mxfp4 import dequantize_mxfp4_kernel
+from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
+    quantize_fp8_tensorwise as _triton_quantize_fp8_tensorwise,
+)
+from primus_turbo.triton.quantization.quantization_mxfp4 import (
+    dequantize_mxfp4_kernel,
+    quantize_mxfp4_kernel,
+)
 from primus_turbo.triton.quantization.quantization_mxfp8 import (
     dequantize_mxfp8_kernel,
     quantize_mxfp8_kernel,
 )
+from primus_turbo.triton.utils.hardware_helper import _is_mi355_quant_device
 
 
 def ceil_div(a, b):
@@ -31,8 +38,15 @@ def quantize_fp8_tensorwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize FP8 Tensor-Wise
+    Quantize FP8 Tensor-Wise.
+
+    On MI355X we route tensorwise quant through the Triton implementation
+    tuned from the MI355X sweep data. Other targets keep the original C++
+    implementation.
     """
+    if _is_mi355_quant_device(x.device):
+        return _triton_quantize_fp8_tensorwise(x, out_dtype, scale)
+
     x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
     return x_fp8, scale_inv
 

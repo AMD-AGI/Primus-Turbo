@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 
 import origami
 import torch
 import triton
 import triton.language as tl
+from primus_turbo.triton.utils.hardware_helper import (
+    _is_gfx950,
+    _set_knobs_gfx950,
+)
 
 # Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
 _ORIGAMI_DTYPE_TO_STR = {
@@ -153,35 +156,6 @@ def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
             sk_grid = 256 if cu_count == 304 else 64
 
     return sk_grid
-
-
-@functools.lru_cache(maxsize=1)
-def _is_gfx950() -> bool:
-    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
-    try:
-        target = triton.runtime.driver.active.get_current_target()
-        return target is not None and target.backend == "hip" and target.arch == "gfx950"
-    except (AttributeError, TypeError):
-        return False
-
-
-_KNOBS_SET = False
-
-
-def _set_knobs_gfx950():
-    """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize)."""
-    global _KNOBS_SET
-    if _KNOBS_SET:
-        return
-    _KNOBS_SET = True
-    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
-        triton.knobs.amd.use_async_copy = True
-        triton.knobs.amd.scalarize_packed_fops = True
-        triton.knobs.amd.use_block_pingpong = True
-    else:
-        os.environ.setdefault("TRITON_HIP_USE_ASYNC_COPY", "1")
-        os.environ.setdefault("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
-        os.environ.setdefault("TRITON_HIP_USE_BLOCK_PINGPONG", "1")
 
 
 @triton.jit
