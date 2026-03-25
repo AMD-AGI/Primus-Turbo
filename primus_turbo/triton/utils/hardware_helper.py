@@ -7,6 +7,22 @@ import torch
 import triton
 
 
+def _is_torch_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None:
+        is_compiling = getattr(compiler, "is_compiling", None)
+        if is_compiling is not None and is_compiling():
+            return True
+
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None:
+        is_compiling = getattr(dynamo, "is_compiling", None)
+        if is_compiling is not None and is_compiling():
+            return True
+
+    return False
+
+
 @functools.lru_cache(maxsize=1)
 def _get_current_target():
     try:
@@ -30,18 +46,28 @@ def _get_device_name_upper(device_index: int) -> str | None:
         return None
 
 
-def _is_mi355_quant_device(device: torch.device | None = None) -> bool:
-    """Return whether the runtime target is specifically MI355 on gfx950."""
+@functools.lru_cache(maxsize=8)
+def _is_mi355_quant_device_index(device_index: int) -> bool:
     if not torch.cuda.is_available() or not _is_gfx950():
         return False
 
+    device_name = _get_device_name_upper(device_index)
+    return device_name is not None and "MI355" in device_name
+
+
+def _is_mi355_quant_device(device: torch.device | None = None) -> bool:
+    """Return whether the runtime target is specifically MI355 on gfx950."""
+    if _is_torch_compiling():
+        return False
+
     if device is None:
+        if not torch.cuda.is_available():
+            return False
         device_index = torch.cuda.current_device()
     else:
         device_index = device.index if device.index is not None else torch.cuda.current_device()
 
-    device_name = _get_device_name_upper(device_index)
-    return device_name is not None and "MI355" in device_name
+    return _is_mi355_quant_device_index(device_index)
 
 
 _KNOBS_SET = False

@@ -17,6 +17,7 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_segment_m_kernel,
 )
 from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
+    _should_use_triton_fp8_tensorwise,
     quantize_fp8_tensorwise as _triton_quantize_fp8_tensorwise,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import (
@@ -44,9 +45,16 @@ def quantize_fp8_tensorwise_impl(
     tuned from the MI355X sweep data. Other targets keep the original C++
     implementation.
     """
-    if _is_mi355_quant_device(x.device):
+    if _should_use_triton_fp8_tensorwise(x) and _is_mi355_quant_device(x.device):
         return _triton_quantize_fp8_tensorwise(x, out_dtype, scale)
 
+    return quantize_fp8_tensorwise_cpp_impl(x, out_dtype, scale)
+
+
+def quantize_fp8_tensorwise_cpp_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Force the original C++ tensorwise FP8 quantization path."""
     x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
     return x_fp8, scale_inv
 

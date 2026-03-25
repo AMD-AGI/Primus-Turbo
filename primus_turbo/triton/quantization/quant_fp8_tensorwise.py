@@ -26,6 +26,8 @@ FP8_MAX_MAP = {
 }
 
 FUSE_THRESHOLD = 70_000_000
+TRITON_USE_MIN_NUMEL = 8_000_000
+TRITON_USE_MAX_NUMEL = 600_000_000
 
 @triton.jit
 def _amax_partial_kernel(
@@ -157,6 +159,12 @@ class _BufferCache:
 _cache = _BufferCache()
 
 
+def _should_use_triton_fp8_tensorwise(x: torch.Tensor) -> bool:
+    """Conservative MI355 gate from direct C++ vs Triton quant sweeps."""
+    n = x.numel()
+    return TRITON_USE_MIN_NUMEL <= n <= TRITON_USE_MAX_NUMEL
+
+
 def _select_strategy(n: int):
     """Select path + launch config from MI355X sweep data."""
     if n <= 3_000_000:
@@ -205,12 +213,13 @@ def quantize_fp8_tensorwise(
     if scale is not None:
         num_tiles = (n + bs - 1) // bs
         if not isinstance(scale, torch.Tensor):
-            scale = torch.tensor([float(scale)], dtype=torch.float32, device=x.device)
-        scale = scale.to(device=x.device, dtype=torch.float32).reshape(1)
+            scale = torch.tensor(float(scale), dtype=torch.float32, device=x.device)
+        scale = scale.to(device=x.device, dtype=torch.float32).reshape(())
+        scale_view = scale.view(1)
         _quant_with_known_scale_kernel[(num_tiles,)](
             x_flat,
             out_flat,
-            scale,
+            scale_view,
             n,
             FP8_MAX=fp8_max,
             BLOCK_SIZE=bs,
@@ -218,14 +227,15 @@ def quantize_fp8_tensorwise(
             num_stages=ns,
             waves_per_eu=waves,
         )
-        scale_inv = (1.0 / scale).clone()
-        return out_flat.reshape(orig_shape), scale_inv
+        return out_flat.reshape(orig_shape), scale.reciprocal()
 
     if buf_cache is None:
         buf_cache = _cache
 
     num_tiles = (n + bs - 1) // bs
     partials, scale_buf = buf_cache.get(x.device, num_tiles)
+    scale_inv_out = torch.empty((), dtype=torch.float32, device=x.device)
+    scale_inv_ptr = scale_inv_out.view(1)
 
     _amax_partial_kernel[(num_tiles,)](
         x_flat,
@@ -238,7 +248,6 @@ def quantize_fp8_tensorwise(
     )
 
     if path == "2k":
-        scale_inv_ptr = scale_buf[1:2]
         red_bs = min(4096, triton.next_power_of_2(num_tiles))
         _reduce_and_quant_kernel[(num_tiles,)](
             x_flat,
@@ -254,10 +263,9 @@ def quantize_fp8_tensorwise(
             num_stages=ns,
             waves_per_eu=waves,
         )
-        return out_flat.reshape(orig_shape), scale_inv_ptr.clone()
+        return out_flat.reshape(orig_shape), scale_inv_out
 
     scale_ptr = scale_buf[0:1]
-    scale_inv_ptr = scale_buf[1:2]
     red_bs = min(4096, triton.next_power_of_2(num_tiles))
     red_nw = min(16, max(1, red_bs // 64))
 
@@ -284,4 +292,4 @@ def quantize_fp8_tensorwise(
         waves_per_eu=waves,
     )
 
-    return out_flat.reshape(orig_shape), scale_inv_ptr.clone()
+    return out_flat.reshape(orig_shape), scale_inv_out
