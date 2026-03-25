@@ -37,6 +37,7 @@ class BackendType(Enum):
     TRITON = auto()
     DEEP_EP = auto()
     TURBO = auto()
+    HIPKITTENS = auto()
 
 
 class GlobalBackendManager:

@@ -66,7 +66,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.HIPKITTENS.value,
         )
         ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
         ctx.trans_a = trans_a
@@ -95,7 +95,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_a,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.HIPKITTENS.value,
         )
 
         b_grad = gemm_fp8_impl(
@@ -108,7 +108,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.HIPKITTENS.value,
         )
 
         return (a_grad, b_grad, None, None, None, None)
