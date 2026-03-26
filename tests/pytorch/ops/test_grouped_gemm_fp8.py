@@ -395,11 +395,6 @@ def test_grouped_gemm_fp8_blockwise_triton_deterministic(
 @pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
-    if format == Format.HYBRID:
-        # TODO(ruibin): Remove skip after CK backend supports hybrid format.
-        if backend != BackendType.HIPBLASLT or auto_tune:
-            pytest.skip("HYBRID format requires HIPBLASLt backend")
-
     # FIXME(ruibin): CK backend has numerical issues.
     if backend == BackendType.CK or backend == None:
         pytest.skip("CK backend has numerical issues currently")
@@ -623,7 +618,7 @@ def _test_grouped_gemm_fp8_hipgraph_test(
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8_tensorwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):
@@ -646,7 +641,7 @@ def test_grouped_gemm_fp8_tensorwise_hipgraph(B, M, NK, ori_dtype, format, trans
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", [False])
 def test_grouped_gemm_fp8_rowwise_hipgraph(B, M, NK, ori_dtype, format, trans_b, balance):

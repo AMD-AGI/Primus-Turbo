@@ -84,6 +84,9 @@ using GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1 = CKGroupedGemmTile
 using GFX942_CKGroupedGemmTileCfg_256x128x128_32x32x32_2x2x1_padding = CKGroupedGemmTileConfigWithArch<
     GPUArch::GFX942, 256, 128, 128, 32, 32, 32, 2, 2, 1, false, true
 >;
+using GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x16_2x2x1_padding = CKGroupedGemmTileConfigWithArch<
+    GPUArch::GFX942, 256, 256, 128, 32, 32, 16, 2, 2, 1, false, true
+>;
 // ABQuantGrouped (blockwise) config
 using GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1 = CKGroupedGemmTileConfigWithArch<
     GPUArch::GFX942, 128, 128, 128, 32, 32, 32, 2, 2, 1, false, false
