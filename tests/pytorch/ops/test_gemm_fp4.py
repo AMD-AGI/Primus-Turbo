@@ -38,9 +38,18 @@ torch.manual_seed(42)
     ],
 )
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.AITER])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
+    if backend == BackendType.AITER:
+        if dtype != torch.bfloat16:
+            pytest.skip("AITER backend only supports bfloat16 dtype")
+        import aiter
+
+        aiter_gemm_config = aiter.get_GEMM_config(m, n, k)
+        if aiter_gemm_config is None:
+            pytest.skip("AITER does not support this gemm configuration. Have potential numerical issue.")
+
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")

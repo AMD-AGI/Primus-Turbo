@@ -305,10 +305,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
 class FP8GemmMXFunction(torch.autograd.Function):
 
-    HIPBLASLT_M_MULTIPLE = 16
-    HIPBLASLT_N_MULTIPLE = 16
-    HIPBLASLT_K_MULTIPLE = 128
-
     @staticmethod
     def forward(
         ctx,
@@ -322,19 +318,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
 
-        assert config.granularity == ScalingGranularity.MX_BLOCKWISE
-        assert (
-            trans_a == False and trans_b == True
-        ), "MXFP8 GEMM only supports trans_a=False and trans_b=True."
-        assert (
-            a.size(0) % __class__.HIPBLASLT_M_MULTIPLE == 0
-            and b.size(0) % __class__.HIPBLASLT_N_MULTIPLE == 0
-        ), f"MXFP8 requires M are multiples of {__class__.HIPBLASLT_M_MULTIPLE} and N are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
-        assert (
-            a.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
-            and b.size(1) % __class__.HIPBLASLT_N_MULTIPLE == 0
-        ), f"MXFP8 requires K are multiples of {__class__.HIPBLASLT_N_MULTIPLE}."
-
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
@@ -343,14 +326,12 @@ class FP8GemmMXFunction(torch.autograd.Function):
             a_dtype,
             config.granularity,
             block_size=config.block_size,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
         b_fp8, b_scale_inv, b_t_fp8, b_t_scale_inv = quantize_fp8_with_trans(
             b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
             scaling_recipe=MXScalingRecipe(
                 use_2d_block=True,
             ),
@@ -396,7 +377,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            padding_align_size=__class__.HIPBLASLT_K_MULTIPLE,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.

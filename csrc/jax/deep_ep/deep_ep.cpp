@@ -341,7 +341,7 @@ void Buffer::IntranodeDispatch(
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > NUM_CPU_TIMEOUT_SECS)
+                        .count() > get_num_cpu_timeout_secs())
                     throw std::runtime_error("DeepEP error: CPU recv timeout");
             }
         }

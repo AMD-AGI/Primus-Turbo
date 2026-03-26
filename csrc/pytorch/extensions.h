@@ -16,9 +16,8 @@
 
 #include <ATen/hip/HIPGraphsUtils.cuh>
 
-#include "primus_turbo/common.h"
-
 #include "deep_ep/deep_ep.hpp"
+#include "primus_turbo/common.h"
 
 namespace primus_turbo::pytorch {
 
@@ -48,6 +47,45 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
+
+std::vector<at::Tensor>
+quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
+                    const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+                    const bool rowwise_use_rht, const bool colwise_use_2d_block,
+                    const bool colwise_use_sr, const bool colwise_use_rht,
+                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp4_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,
+    const bool colwise_use_sr, const bool colwise_use_rht, const bool shuffle_rowwise_scale = false,
+    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+    const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarType dest_dtype,
+                                       const int64_t axis, const bool use_2d_block,
+                                       const bool use_sr, const bool use_rht,
+                                       const bool shuffle_scale = false,
+                                       const bool shuffle_out   = false);
+
+std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
+                                            const int64_t axis, const bool use_2d_block,
+                                            const bool use_sr, const bool use_rht,
+                                            const bool shuffle_scale = false,
+                                            const bool shuffle_out   = false);
+
+//==================================================================
+//  Shuffle
+//==================================================================
+
+at::Tensor shuffle_scale_impl(const at::Tensor scale, at::IntArrayRef layout);
+
+at::Tensor shuffle_scale_impl_meta(const at::Tensor scale, at::IntArrayRef layout);
+
+at::Tensor shuffle_weight_impl(const at::Tensor weight, at::IntArrayRef layout);
+
+at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef layout);
 
 //==================================================================
 //  GEMM
