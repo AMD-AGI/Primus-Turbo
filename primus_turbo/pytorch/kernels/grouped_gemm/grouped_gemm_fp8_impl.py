@@ -11,6 +11,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     KernelBackend,
+    PrecisionType,
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import (
@@ -568,7 +569,7 @@ def grouped_gemm_fp8_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -609,7 +610,7 @@ def grouped_gemm_fp8_variable_k_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend()
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
