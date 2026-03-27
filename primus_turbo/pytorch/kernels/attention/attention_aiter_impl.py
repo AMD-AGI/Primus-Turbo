@@ -213,9 +213,10 @@ class AttnBwdAiterBackend(KernelBackend):
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                True,  # USE_INT64_STRIDES
+                USE_INT64_STRIDES=True,
                 sink=sink,
                 dsink=dsink,
+                sliding_window=window_size_left if window_size_left >= 0 else 0,
             )
 
         return result

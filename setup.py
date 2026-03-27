@@ -30,7 +30,7 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-AITER_COMMIT = "e83f9903c07001a0ec29e85d223f6e6cdbe00859"
+AITER_COMMIT = "93f05e19a8024938c320d82854e307d602b5a05d"
 
 # ---------- ORIGAMI (rocm-libraries) ------------
 # Pin to commit. Installed during build via clone + pip install (avoids pip resolution
