@@ -48,14 +48,33 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
     return o_ref
 
 
-def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal):
-    """Reference implementation of attention with sink."""
+def _construct_local_mask(seqlen_q, seqlen_k, window_size, device):
+    """Build the local attention mask using the same indexing rule as aiter."""
+    row_idx = torch.arange(seqlen_q, device=device).view(-1, 1)
+    col_idx = torch.arange(seqlen_k, device=device)
+    shift = seqlen_k - seqlen_q
+
+    if window_size[0] < 0:
+        return col_idx > row_idx + shift + window_size[1]
+
+    max_col_idx = torch.full_like(col_idx, seqlen_k)
+    return torch.logical_or(
+        col_idx > torch.minimum(row_idx + shift + window_size[1], max_col_idx),
+        col_idx < row_idx + shift - window_size[0],
+    )
+
+
+def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-1, -1)):
+    """Reference implementation of attention with sink and optional sliding window."""
 
     dtype_og = q.dtype
     q, k, v = q.float(), k.float(), v.float()
     sink = sink.float()
 
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    if causal:
+        window_size = (window_size[0], 0)
+
     # Expand k, v for GQA
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
@@ -63,12 +82,9 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal):
     # Use provided sm_scale
     scores = torch.einsum("bthd,bshd->bhts", q * sm_scale, k)
 
-    # Apply causal mask
-    if causal:
-        row_idx = torch.arange(seqlen_q, device=q.device).view(-1, 1)
-        col_idx = torch.arange(seqlen_k, device=q.device)
-        causal_mask = col_idx > row_idx + seqlen_k - seqlen_q
-        scores = scores.masked_fill(causal_mask, float("-inf"))
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = _construct_local_mask(seqlen_q, seqlen_k, window_size, q.device)
+        scores = scores.masked_fill(local_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
 
     # Concatenate sink scores
     batch_size = scores.shape[0]
