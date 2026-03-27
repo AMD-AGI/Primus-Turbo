@@ -318,7 +318,7 @@ def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
         x_2d,
         dest_dtype,
         granularity=granularity,
-        block_size=MXFP4_BLOCK_SIZE,
+        block_size=MXFP8_BLOCK_SIZE,
         scaling_recipe=scaling_recipe,
         scaling_recipe_for_trans=scaling_recipe,
     )
