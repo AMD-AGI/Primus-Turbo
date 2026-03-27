@@ -42,6 +42,14 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool use_2d_block, bool use_sr, bool use_rht, "
           "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
 
+    // ********* MXFP8 Quantization *********
+    m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool colwise_use_2d_block, "
+          "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
+          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
+    m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
+          "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+
     // ********* Shuffle *********
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
     m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
@@ -84,6 +92,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
 
+    // ********* MXFP8 Quantization *********
+    m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
+    m.impl("quantize_mxfp8", quantize_mxfp8);
+
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl);
     m.impl("shuffle_weight", shuffle_weight_impl);
@@ -116,6 +128,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
+
+    // ********* MXFP8 Quantization *********
+    m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
+    m.impl("quantize_mxfp8", quantize_mxfp8_meta);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
