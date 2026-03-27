@@ -32,10 +32,8 @@ import origami
 import torch
 import triton
 import triton.language as tl
-from primus_turbo.triton.utils.hardware_helper import (
-    _is_gfx950,
-    _set_knobs_gfx950,
-)
+
+from primus_turbo.triton.utils.hardware_helper import is_gfx950, set_knobs_gfx950
 
 # Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
 _ORIGAMI_DTYPE_TO_STR = {
@@ -275,7 +273,7 @@ def _estimate_lds_bytes_async_copy(block_m, block_n, block_k, elem_bytes_a, elem
 
 def _calculate_lds_usage(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
     """LDS usage with auto-detection of async_copy mode."""
-    if _is_gfx950():
+    if is_gfx950():
         return _estimate_lds_bytes_async_copy(
             block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages
         )
@@ -313,7 +311,7 @@ def _get_valid_tiles(hardware, block_mn_range, block_k_range, mi_dim, elem_bytes
     should verify with _calculate_lds_usage for their actual num_stages.
     """
     lds_cap = hardware.lds_capacity
-    use_async = _is_gfx950()
+    use_async = is_gfx950()
     valid = []
     for bm, bn, bk in (
         (bm, bn, bk) for bm in block_mn_range for bn in block_mn_range for bk in block_k_range
@@ -606,8 +604,8 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
 
         # gfx950 BF16 config from 164-entry tuning data.
         # TN layout with large K → BLK_K=64, stages=2; all other cases → 32/3.

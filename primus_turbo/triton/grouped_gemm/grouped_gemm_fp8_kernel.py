@@ -47,10 +47,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     _get_num_cus,
     _grouped_variable_k_gemm_kernel,
 )
-from primus_turbo.triton.utils.hardware_helper import (
-    _is_gfx950,
-    _set_knobs_gfx950,
-)
+from primus_turbo.triton.utils.hardware_helper import is_gfx950, set_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper
@@ -115,7 +112,7 @@ def _get_gg_fp8_tw_fwd_config(
     stride_bk,
 ):
     """Cached kernel config for FP8 tensorwise grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k = 128
         num_stages_val = 2
@@ -177,7 +174,7 @@ def _get_gg_fp8_tw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 tensorwise grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k, num_stages_val = 64, 3
         group_m = 4
@@ -235,7 +232,7 @@ def _get_gg_fp8_rw_fwd_config(
     stride_bk,
 ):
     """Cached kernel config for FP8 rowwise grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k = 128
         num_stages_val = 2
@@ -284,7 +281,7 @@ def _get_gg_fp8_rw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 rowwise grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k, num_stages_val = 64, 3
         group_m = 4
@@ -546,8 +543,8 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
         _get_gg_fp8_tw_fwd_config(
             avg_m,
@@ -638,8 +635,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_tw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -900,8 +897,8 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_fwd_config(
         avg_m,
         N,
@@ -1141,8 +1138,8 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -1544,8 +1541,8 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     else:
         _set_amd_knobs(enable=True)
 
@@ -1655,8 +1652,8 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     else:
         _set_amd_knobs(enable=False)
 

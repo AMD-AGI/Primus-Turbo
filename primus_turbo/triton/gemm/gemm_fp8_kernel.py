@@ -43,10 +43,7 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _get_hardware,
     _select_params_origami,
 )
-from primus_turbo.triton.utils.hardware_helper import (
-    _is_gfx950,
-    _set_knobs_gfx950,
-)
+from primus_turbo.triton.utils.hardware_helper import is_gfx950, set_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -315,8 +312,8 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
 
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
         block_m, block_n, block_k = 256, 256, 128
@@ -621,8 +618,8 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
 
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
         block_m, block_n, block_k = 256, 256, 128
@@ -962,8 +959,8 @@ def _blockwise_nt(
     trans_c: bool,
 ) -> torch.Tensor:
     """NT/RCR forward: C = A[M,K] @ B[N,K].T, 2D B_scales."""
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     else:
         _set_amd_knobs(enable=True)
 
@@ -1022,8 +1019,8 @@ def _blockwise_nn(
     trans_c: bool,
 ) -> torch.Tensor:
     """NN/RRR grad_X: C = A[M,K] @ B[K,N], 2D B_scales (transposed internally)."""
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     else:
         _set_amd_knobs(enable=True)
 
@@ -1089,8 +1086,8 @@ def _blockwise_tn(
       a_scale_inv: [K//128, M]
       b_scale_inv: [K//128, N]
     """
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     else:
         _set_amd_knobs(enable=False)
 

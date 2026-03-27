@@ -27,12 +27,14 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_fp8_tensorwise_cpp_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
+from primus_turbo.triton.quantization.quant_fp8_tensorwise import _BufferCache
 from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
-    _BufferCache,
-    _should_use_triton_fp8_tensorwise,
-    quantize_fp8_tensorwise as _quant_fp8_tw,
+    quantize_fp8_tensorwise as triton_quantize_fp8_tensorwise,
 )
-from primus_turbo.triton.utils.hardware_helper import _is_mi355_quant_device
+from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
+    should_use_triton_fp8_tensorwise,
+)
+from primus_turbo.triton.utils.hardware_helper import is_mi355_quant_device
 
 __all__ = [
     "grouped_gemm_fp8",
@@ -330,12 +332,12 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         a_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
         b_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
-        use_triton_shape_gate = _should_use_triton_fp8_tensorwise(a) and _should_use_triton_fp8_tensorwise(b)
-        use_mi355_quant = use_triton_shape_gate and _is_mi355_quant_device(a.device)
+        use_triton_shape_gate = should_use_triton_fp8_tensorwise(a) and should_use_triton_fp8_tensorwise(b)
+        use_mi355_quant = use_triton_shape_gate and is_mi355_quant_device(a.device)
         if use_mi355_quant:
             (a_fp8, a_scale_inv), (b_fp8, b_scale_inv) = (
-                _quant_fp8_tw(a, a_dtype, buf_cache=_tw_cache_a),
-                _quant_fp8_tw(b, b_dtype, buf_cache=_tw_cache_b),
+                triton_quantize_fp8_tensorwise(a, a_dtype, buf_cache=_tw_cache_a),
+                triton_quantize_fp8_tensorwise(b, b_dtype, buf_cache=_tw_cache_b),
             )
         else:
             (a_fp8, a_scale_inv), (b_fp8, b_scale_inv) = (
@@ -375,9 +377,9 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
 
         # For grad_a
         grad_out_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(ctx.config.format, False)
-        use_triton_quant_grad = ctx.use_mi355_quant and _should_use_triton_fp8_tensorwise(grad_out)
+        use_triton_quant_grad = ctx.use_mi355_quant and should_use_triton_fp8_tensorwise(grad_out)
         if use_triton_quant_grad:
-            grad_out_fp8, grad_out_scale_inv = _quant_fp8_tw(
+            grad_out_fp8, grad_out_scale_inv = triton_quantize_fp8_tensorwise(
                 grad_out, grad_out_dtype, buf_cache=_tw_cache_grad
             )
         else:

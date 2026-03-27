@@ -13,10 +13,12 @@ prototype: use the fused 2-kernel path for small/medium tensors, switch to the
 MI355X-specific `waves_per_eu` tuning in the profitable ranges.
 """
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
-
+from torch.library import custom_op
 
 FP8_MAX_MAP = {
     torch.float8_e4m3fn: 448.0,
@@ -28,6 +30,7 @@ FP8_MAX_MAP = {
 FUSE_THRESHOLD = 70_000_000
 TRITON_USE_MIN_NUMEL = 8_000_000
 TRITON_USE_MAX_NUMEL = 600_000_000
+
 
 @triton.jit
 def _amax_partial_kernel(
@@ -145,11 +148,7 @@ class _BufferCache:
         self.max_tiles = 0
 
     def get(self, device, num_tiles):
-        if (
-            self.partial_buf is None
-            or self.max_tiles < num_tiles
-            or self.partial_buf.device != device
-        ):
+        if self.partial_buf is None or self.max_tiles < num_tiles or self.partial_buf.device != device:
             self.max_tiles = max(num_tiles, 1024)
             self.partial_buf = torch.empty(self.max_tiles, dtype=torch.float32, device=device)
             self.scale_buf = torch.empty(2, dtype=torch.float32, device=device)
@@ -159,10 +158,28 @@ class _BufferCache:
 _cache = _BufferCache()
 
 
-def _should_use_triton_fp8_tensorwise(x: torch.Tensor) -> bool:
+def should_use_triton_fp8_tensorwise(x: torch.Tensor) -> bool:
     """Conservative MI355 gate from direct C++ vs Triton quant sweeps."""
     n = x.numel()
     return TRITON_USE_MIN_NUMEL <= n <= TRITON_USE_MAX_NUMEL
+
+
+@custom_op("primus_turbo::quantize_fp8_tensorwise_triton_impl", mutates_args=())
+def triton_quantize_fp8_tensorwise_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Avoid the module-global cache here so torch.compile / cudagraph bookkeeping
+    # sees only the actual op outputs, not persistent scratch buffers.
+    return quantize_fp8_tensorwise(x, out_dtype, scale, buf_cache=_BufferCache())
+
+
+@triton_quantize_fp8_tensorwise_impl.register_fake
+def triton_quantize_fp8_tensorwise_impl_meta(
+    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_fp8 = torch.empty_like(x, dtype=out_dtype)
+    scale_inv = torch.empty((), dtype=torch.float32, device=x.device)
+    return x_fp8, scale_inv
 
 
 def _select_strategy(n: int):
