@@ -24,25 +24,12 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
-    quantize_fp8_tensorwise_cpp_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
-from primus_turbo.triton.quantization.quant_fp8_tensorwise import _BufferCache
-from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
-    quantize_fp8_tensorwise as triton_quantize_fp8_tensorwise,
-)
-from primus_turbo.triton.quantization.quant_fp8_tensorwise import (
-    should_use_triton_fp8_tensorwise,
-)
-from primus_turbo.triton.utils.hardware_helper import is_mi355_quant_device
 
 __all__ = [
     "grouped_gemm_fp8",
 ]
-
-_tw_cache_a = _BufferCache()
-_tw_cache_b = _BufferCache()
-_tw_cache_grad = _BufferCache()
 
 
 def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
@@ -332,18 +319,8 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         a_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
         b_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(config.format, True)
-        use_triton_shape_gate = should_use_triton_fp8_tensorwise(a) and should_use_triton_fp8_tensorwise(b)
-        use_mi355_quant = use_triton_shape_gate and is_mi355_quant_device(a.device)
-        if use_mi355_quant:
-            (a_fp8, a_scale_inv), (b_fp8, b_scale_inv) = (
-                triton_quantize_fp8_tensorwise(a, a_dtype, buf_cache=_tw_cache_a),
-                triton_quantize_fp8_tensorwise(b, b_dtype, buf_cache=_tw_cache_b),
-            )
-        else:
-            (a_fp8, a_scale_inv), (b_fp8, b_scale_inv) = (
-                quantize_fp8_tensorwise_cpp_impl(a, a_dtype),
-                quantize_fp8_tensorwise_cpp_impl(b, b_dtype),
-            )
+        a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
+        b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
 
         out = grouped_gemm_fp8_impl(
             a_fp8,
@@ -358,7 +335,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.CK.value,
-            maybe_pre_sync=not use_mi355_quant,
+            maybe_pre_sync=True,
         )
 
         ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs)
@@ -367,7 +344,6 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = a.dtype
         ctx.num_cu = num_cu
-        ctx.use_mi355_quant = use_mi355_quant
         return out
 
     @staticmethod
@@ -377,13 +353,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
 
         # For grad_a
         grad_out_dtype = GroupedGemmFP8TensorFunc.get_fp8_dtype(ctx.config.format, False)
-        use_triton_quant_grad = ctx.use_mi355_quant and should_use_triton_fp8_tensorwise(grad_out)
-        if use_triton_quant_grad:
-            grad_out_fp8, grad_out_scale_inv = triton_quantize_fp8_tensorwise(
-                grad_out, grad_out_dtype, buf_cache=_tw_cache_grad
-            )
-        else:
-            grad_out_fp8, grad_out_scale_inv = quantize_fp8_tensorwise_cpp_impl(grad_out, grad_out_dtype)
+        grad_out_fp8, grad_out_scale_inv = quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity)
         grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8,
             b_fp8,
