@@ -59,6 +59,8 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
     ):
         assert bias is None
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
 
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
@@ -248,6 +250,8 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
         assert (
             dist.get_world_size(ring_group) == 1
         ), "currently ring attention not supported for fp8, since triton implementation does not use the standard flash attention interface"
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
 
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
