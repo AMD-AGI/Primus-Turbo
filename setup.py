@@ -269,7 +269,8 @@ def build_kernels_extension():
     ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
-    kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
+    # kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
+    kernels_sources = [kernels_source_files / "cco" / "ep" / "intranode.cu"]
 
     include_dirs = [
         Path(PROJECT_ROOT / "csrc"),
@@ -323,7 +324,11 @@ def build_torch_extension():
 
     # CPP
     pytorch_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
-    sources = all_files_in_dir(pytorch_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
+    # sources = all_files_in_dir(pytorch_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
+    sources = [
+        pytorch_csrc_source_files / "cco" / "ep.cpp",
+        pytorch_csrc_source_files / "bindings_pytorch.cpp",
+    ]
 
     return CUDAExtension(
         name="primus_turbo.pytorch._C",

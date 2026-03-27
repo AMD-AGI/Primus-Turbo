@@ -290,7 +290,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
     EP_DEVICE_ASSERT(num_topk <= WARP_SIZE);
 
-    return;
     // EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     // EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
@@ -320,22 +319,26 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         int total_offset, num_tokens_to_recv;
         // `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (lane_id == 0 and send_warp_id_in_rank == 0) {
-            total_offset =
-                -(responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels +
-                                                                  responsible_channel - 1]
-                                          : 0) -
-                1;
+        if (lane_id == 0) {
+            total_offset = responsible_channel > 0
+                               ? channel_prefix_matrix[responsible_rank * num_channels +
+                                                       responsible_channel - 1]
+                               : 0;
             num_tokens_to_recv =
-                -(channel_prefix_matrix[responsible_rank * num_channels + responsible_channel]) - 1;
+                channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
+            num_tokens_to_recv -= total_offset;
         }
         __syncwarp();
 
         total_offset = __shfl_sync(WARP_MASK, total_offset, 0);
         total_offset += rank_offset;
+        num_tokens_to_recv = __shfl_sync(WARP_MASK, num_tokens_to_recv, 0);
 
-        PRINT_DEBUG("total_offset: %d, rank_offset: %d\n", total_offset, rank_offset);
-        return;
+        // PRINT_DEBUG("total_offset: %d, num_tokens_to_recv: %d\n", total_offset,
+        // num_tokens_to_recv);
+
+        if (num_tokens_to_recv <= 0)
+            return;
 
         // Iterate over all tokens and send tokens to symmetric buffer
         int chunk_idx = 0;
@@ -348,49 +351,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Copy data
-            auto dst_slot_idx           = total_offset + chunk_idx;
+            auto dst_slot_idx = total_offset + chunk_idx;
+            // EP_DEVICE_ASSERT(dst_slot_idx * hidden_int4 < 1000000000 and dst_slot_idx);
             auto shifted_recv_x_buffers = recv_x_buffer.buffer() + dst_slot_idx * hidden_int4;
             auto shifted_x              = x + token_idx * hidden_int4;
             UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_buffers, shifted_x, __ldg,
                                st_na_global);
 
-            // Copy source index
-            //             if (lane_id == 0)
-            //                 channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
-
-            //             // Copy `topk_idx` and `topk_weights` with transformed index
-            //             if (lane_id < num_topk) {
-            //                 // Top-k index
-            //                 int recv_expert_begin = responsible_rank * num_experts_per_rank,
-            //                     recv_expert_end   = (responsible_rank + 1) *
-            //                     num_experts_per_rank;
-            //                 auto idx_value        = __ldg(topk_idx + token_idx * num_topk +
-            //                 lane_id); idx_value = (idx_value >= recv_expert_begin and idx_value <
-            //                 recv_expert_end)
-            //                                 ? idx_value - recv_expert_begin
-            //                                 : -1;
-            //                 channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] =
-            //                 idx_value;
-
-            //                 // Top-k weights
-            //                 auto weight_value = __ldg(topk_weights + token_idx * num_topk +
-            //                 lane_id); weight_value      = (idx_value >= 0) ? weight_value : 0.0f;
-            //                 channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-            //                 weight_value;
-            //             }
-
-            // // Copy `x_scales`
-            // #pragma unroll
-            //             for (int i = lane_id; i < num_scales; i += WARP_SIZE) {
-            //                 auto offset = token_idx * scale_token_stride + i *
-            //                 scale_hidden_stride; channel_x_scales_buffers[dst_slot_idx *
-            //                 num_scales + i] = __ldg(x_scales + offset);
-            //             }
-
             chunk_idx++;
         }
     } else {
-        return;
     }
 }
 

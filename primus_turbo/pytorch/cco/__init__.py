@@ -39,7 +39,7 @@ def _fused_dispatch_groupedgemm(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
-    workspace_size = int(1e9)
+    workspace_size = int(4096 * 7168 * 8 * 4)
     symm = _symm_mem.get_symm_mem_workspace(group_name, workspace_size)
     rank = symm.rank
     workspace = symm.get_buffer(rank, [workspace_size], torch.uint8)
