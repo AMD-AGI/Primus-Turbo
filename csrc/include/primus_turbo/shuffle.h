@@ -15,6 +15,10 @@ namespace detail {
 constexpr int MXFP4_SHUFFLE_BN     = 16; // Block size for N dimension
 constexpr int MXFP4_SHUFFLE_BK     = 32; // Block size for K dimension
 constexpr int MXFP4_SHUFFLE_K_ELEM = 16; // Elements per K sub-block
+
+constexpr int MXFP8_SHUFFLE_BN     = 16; // Block size for N dimension
+constexpr int MXFP8_SHUFFLE_BK     = 32; // Block size for K dimension
+constexpr int MXFP8_SHUFFLE_K_ELEM = 16; // Elements per K sub-block
 } // namespace detail
 
 void shuffle_e8m0_scale(uint8_t *scale, uint8_t *shuffled_scale, int tile_m, int tile_n,

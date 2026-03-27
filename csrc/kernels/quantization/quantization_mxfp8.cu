@@ -3,21 +3,21 @@
 // See LICENSE for license information.
 
 /*
- * MXFP4 Quantization Kernel (CUDA/HIP)
+ * MXFP8 Quantization Kernel (CUDA/HIP)
  * =========================================
  *
- * This kernel performs fused casting to MXFP4 format with optional transpose,
+ * This kernel performs fused casting to MXFP8 format with optional transpose,
  * supporting both rowwise and colwise quantization.
  *
  * Block/Tile Structure:
  *   - Block size: 64x64 (BLOCK_M x BLOCK_N)
- *   - MXFP4 tile: 32x32 elements per quantization block
+ *   - MXFP8 tile: 32x32 elements per quantization block
  *   - Thread block: 256 threads (4 warps of 64 threads each)
  *
  * Memory Layout:
  *   - Input: bfloat16 or half matrix (M x N)
- *   - Rowwise output: FP4 packed (M x N/2) + E8M0 scales (M x N/32)
- *   - Colwise output: FP4 packed (N x M/2) + E8M0 scales (N x M/32)
+ *   - Rowwise output: FP8 (M x N) + E8M0 scales (M x N/32)
+ *   - Colwise output: FP8 (N x M) + E8M0 scales (N x M/32)
  */
 
 #include "primus_turbo/common.h"
@@ -46,97 +46,29 @@ constexpr int BLOCK_M = 64; // Rows per thread block
 constexpr int BLOCK_N = 64; // cols per thread block
 
 // Derived tile counts
-constexpr int NUM_CHUNKS_M = BLOCK_M / MXFP4_BLOCK_SIZE; // 2 chunks in M
-constexpr int NUM_CHUNKS_N = BLOCK_N / MXFP4_BLOCK_SIZE; // 2 chunks in N
+constexpr int NUM_CHUNKS_M = BLOCK_M / MXFP8_BLOCK_SIZE; // 2 chunks in M
+constexpr int NUM_CHUNKS_N = BLOCK_N / MXFP8_BLOCK_SIZE; // 2 chunks in N
 
 // Thread work distribution within 32-element rows
 constexpr int ELEMS_PER_THREAD = 4; // Elements per thread
 constexpr int THREADS_PER_ROW =
-    MXFP4_BLOCK_SIZE / ELEMS_PER_THREAD; // Threads cooperating on one row
+    MXFP8_BLOCK_SIZE / ELEMS_PER_THREAD; // Threads cooperating on one row
 
 // Shared memory optimization
 constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
 
-// Stochastic rounding parameters
-// NOTE: Hardcode the seed of stochastic rounding to 0 to make it deterministic
-constexpr uint32_t SR_SEED = 0;
-
 // ============================================================================
-// HADAMARD TRANSFORM - 16-Point In-Place Transform
-// ============================================================================
-
-/*
- * 16-Point Hadamard Transform
- * ----------------------------
- * Performs a fast Hadamard transform across 4 threads (16 elements total).
- * This can improve quantization quality by decorrelating values.
- *
- * Structure:
- *   - Stage 1: Local 4-point Hadamard within each thread's values
- *   - Stage 2: Cross-thread exchange (XOR 1) for second dimension
- *   - Stage 3: Cross-thread exchange (XOR 2) for third dimension
- *   - Normalization: Scale by 1/sqrt(16) = 0.25
- *
- * Note: 16-point Hadamard empirically shows better performance than 32-point
- */
-__device__ __forceinline__ void rht16_inplace(float &v0, float &v1, float &v2, float &v3,
-                                              int thread_in_row) {
-    const int tid = thread_in_row & 3;
-
-    // Stage 1: Local 4-point Hadamard transform
-    // H4 = [[1, 1, 1, 1],
-    //       [1,-1, 1,-1],
-    //       [1, 1,-1,-1],
-    //       [1,-1,-1, 1]]
-    float a0 = v0 + v1, a1 = v0 - v1;
-    float a2 = v2 + v3, a3 = v2 - v3;
-    v0 = a0 + a2;
-    v2 = a0 - a2;
-    v1 = a1 + a3;
-    v3 = a1 - a3;
-
-    // Stage 2: Cross-thread exchange (XOR 1) - combine pairs
-    float p0 = ds_swizzle_xor1(v0);
-    float p1 = ds_swizzle_xor1(v1);
-    float p2 = ds_swizzle_xor1(v2);
-    float p3 = ds_swizzle_xor1(v3);
-
-    bool sign2 = (tid & 1);
-    v0         = sign2 ? (p0 - v0) : (p0 + v0);
-    v1         = sign2 ? (p1 - v1) : (p1 + v1);
-    v2         = sign2 ? (p2 - v2) : (p2 + v2);
-    v3         = sign2 ? (p3 - v3) : (p3 + v3);
-
-    // Stage 3: Cross-thread exchange (XOR 2) - final combination
-    p0 = ds_swizzle_xor2(v0);
-    p1 = ds_swizzle_xor2(v1);
-    p2 = ds_swizzle_xor2(v2);
-    p3 = ds_swizzle_xor2(v3);
-
-    bool  sign3 = (tid >> 1) & 1;
-    float t0    = sign3 ? (p0 - v0) : (p0 + v0);
-    float t1    = sign3 ? (p1 - v1) : (p1 + v1);
-    float t2    = sign3 ? (p2 - v2) : (p2 + v2);
-    float t3    = sign3 ? (p3 - v3) : (p3 + v3);
-
-    // Normalization by 1/sqrt(16) = 0.25
-    v0 = t0 * 0.25f;
-    v1 = t1 * 0.25f;
-    v2 = t2 * 0.25f;
-    v3 = t3 * 0.25f;
-}
-
-// ============================================================================
-// QUANTIZATION - E8M0 Scale Computation and FP4 Conversion
+// QUANTIZATION - E8M0 Scale Computation and FP8 Conversion
 // ============================================================================
 
 /*
  * E8M0 Scale Computation
  * ----------------------
- * Computes the E8M0 format scale factor for MXFP4 quantization.
+ * Computes the E8M0 format scale factor for MXFP8 quantization.
  * E8M0 = 8-bit exponent only (no mantissa), representing powers of 2.
  *
  */
+template <typename DType>
 __device__ __forceinline__ void compute_tile_scale(float r_amax, float &r_scale_native,
                                                    uint8_t &r_scale_e8m0) {
     using namespace primus_turbo::detail;
@@ -145,8 +77,12 @@ __device__ __forceinline__ void compute_tile_scale(float r_amax, float &r_scale_
     constexpr int hp_ebits    = FP32_EXPONENT_BITS;
     constexpr int hp_exp_bias = FP32_EXPONENT_EXP_BIAS;
 
-    constexpr int mbits              = FP4_MANTISSA_BITS;
-    constexpr int target_max_pow2    = FP4_TARGET_MAX_POW2;
+    constexpr int mbits =
+        std::is_same_v<DType, dtype::float8_e5m2> ? FP8E5M2_MANTISSA_BITS : FP8E4M3_MANTISSA_BITS;
+    constexpr int target_max_pow2 = std::is_same_v<DType, dtype::float8_e5m2>
+                                        ? FP8E5M2_TARGET_MAX_POW2
+                                        : FP8E4M3_TARGET_MAX_POW2;
+
     constexpr int e8m0_exponent_bias = E8M0_EXPONENT_BIAS;
 
     uint32_t amax_bits = float_as_uint(r_amax);
@@ -172,35 +108,66 @@ __device__ __forceinline__ void compute_tile_scale(float r_amax, float &r_scale_
 }
 
 /*
- * FP32 to FP4 Conversion
+ * FP32 to FP8 Conversion
  * ----------------------
- * Converts 4 FP32 values to 4 FP4 values using AMD hardware instruction.
+ * Converts 4 FP32 values to 4 FP8 values using AMD hardware instruction.
  *
- * v_cvt_scalef32_pk_fp4_f32:
- *   - Converts 2 FP32 inputs to 2 FP4 outputs (packed in 8 bits)
+ * v_cvt_scalef32_pk_fp8_f32:
+ *   - Converts 4 FP32 inputs to 4 FP8 outputs (packed in 32 bits)
+ *   - Scaled conversion uses fval / scale (overflow -> NaN if |fval/scale| > fp8 max; see CK
+ * mxf8_utils)
+ *   - FP8 format: E4M3 (1 sign bit + 4 exponent bits + 3 mantissa bits)
+ *
+ * v_cvt_scalef32_pk_bf8_f32:
+ *   - Converts 4 FP32 inputs to 4 BF8 outputs (packed in 32 bits)
  *   - Applies scaling during conversion
- *   - FP4 format: E2M1 (1 sign bit + 2 exponent bits + 1 mantissa bit)
+ *   - BF8 format: E5M2 (1 sign bit + 5 exponent bits + 2 mantissa bits)
  *
- * Reference: AMD CDNA4 ISA, v_cvt_scalef32_pk_fp4_f32 (page 390)
+ * Reference: AMD CDNA4 ISA, v_cvt_scalef32_pk_fp8_f32, v_cvt_scalef32_pk_bf8_f32 (page 380)
  */
-__device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(float v0, float v1, float v2, float v3,
+template <typename DType>
+__device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float v2, float v3,
                                                        float scale) {
 #if defined(__gfx950__)
-    uint16_t result = 0;
+    uint32_t result = 0;
+    if constexpr (std::is_same_v<DType, dtype::float8_e4m3>) {
+        // If fval / scale > max fp8, returns Nan, Do soft clamping to avoid NaN.
+        const float lim = FP8E4M3_MAX * scale;
+        const float v0c = fminf(fmaxf(v0, -lim), lim);
+        const float v1c = fminf(fmaxf(v1, -lim), lim);
+        const float v2c = fminf(fmaxf(v2, -lim), lim);
+        const float v3c = fminf(fmaxf(v3, -lim), lim);
 
-    // Convert first pair (v0, v1) to 8-bit packed FP4
-    asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3"
-                 : "+v"(result)
-                 : "v"(v0), "v"(v1), "v"(scale));
+        uint16_t tmp0 = 0;
+        asm volatile("v_cvt_scalef32_pk_fp8_f32 %0, %1, %2, %3"
+                     : "+v"(tmp0)
+                     : "v"(v0c), "v"(v1c), "v"(scale));
 
-    // Convert second pair (v2, v3) to 8-bit packed FP4
-    uint16_t tmp = 0;
-    asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3"
-                 : "+v"(tmp)
-                 : "v"(v2), "v"(v3), "v"(scale));
+        uint16_t tmp1 = 0;
+        asm volatile("v_cvt_scalef32_pk_fp8_f32 %0, %1, %2, %3"
+                     : "+v"(tmp1)
+                     : "v"(v2c), "v"(v3c), "v"(scale));
 
-    // Combine into 16-bit result (4 FP4 values)
-    result |= (tmp << 8);
+        result = tmp1;
+        result = (result << 16) | tmp0;
+    } else if constexpr (std::is_same_v<DType, dtype::float8_e5m2>) {
+        uint16_t tmp0 = 0;
+        // Convert first pair (v0, v1) to 16-bit packed BF8 (E5M2)
+        asm volatile("v_cvt_scalef32_pk_bf8_f32 %0, %1, %2, %3"
+                     : "+v"(tmp0)
+                     : "v"(v0), "v"(v1), "v"(scale));
+
+        // Convert second pair (v2, v3) to 16-bit packed BF8 (E5M2)
+        uint16_t tmp1 = 0;
+        asm volatile("v_cvt_scalef32_pk_bf8_f32 %0, %1, %2, %3"
+                     : "+v"(tmp1)
+                     : "v"(v2), "v"(v3), "v"(scale));
+
+        // Combine into 32-bit result: [v0, v1] in low 16 bits, [v2, v3] in high 16 bits
+        result = tmp1;
+        result = (result << 16) | tmp0;
+    }
+
     return result;
 #else
     __builtin_trap();
@@ -209,72 +176,30 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(float v0, float v1, float
 }
 
 /*
- * FP32 to FP4 Conversion with Stochastic Rounding
- * ----------------------
- * Converts 4 FP32 values to 4 FP4 values using AMD hardware instruction.
- *
- * v_cvt_scalef32_sr_pk_fp4_f32:
- *   - Converts 2 FP32 inputs to 2 FP4 outputs (packed in 8 bits)
- *   - Applies scaling during conversion
- *   - FP4 format: E2M1 (1 sign bit + 2 exponent bits + 1 mantissa bit)
- *
- * Reference: AMD CDNA4 ISA, v_cvt_scalef32_pk_fp4_f32 (page 390)
- */
-__device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(float v0, float v1, float v2, float v3,
-                                                          float scale, uint32_t rng) {
-#if defined(__gfx950__)
-    uint16_t result = 0;
-
-    uint64_t v0_v1_packed = ((uint64_t) float_as_uint(v1) << 32) | (uint64_t) float_as_uint(v0);
-    uint64_t v2_v3_packed = ((uint64_t) float_as_uint(v3) << 32) | (uint64_t) float_as_uint(v2);
-
-    // Convert first pair (v0, v1) to 8-bit packed FP4
-    asm volatile("v_cvt_scalef32_sr_pk_fp4_f32 %0, %1, %2, %3"
-                 : "+v"(result)
-                 : "v"(v0_v1_packed), "v"(rng), "v"(scale));
-
-    // Convert second pair (v2, v3) to 8-bit packed FP4
-    uint16_t tmp = 0;
-    asm volatile("v_cvt_scalef32_sr_pk_fp4_f32 %0, %1, %2, %3"
-                 : "+v"(tmp)
-                 : "v"(v2_v3_packed), "v"(rng), "v"(scale));
-
-    // Combine into 16-bit result (4 FP4 values)
-    result |= (tmp << 8);
-    return result;
-#else
-    __builtin_trap();
-    return 0;
-#endif
-}
-
-/*
- * MXFP4 Single-Direction Quantization Kernel
+ * MXFP8 Single-Direction Quantization Kernel
  * ----------------------------------------------
  * Supports rowwise (horizontal) or colwise (vertical) quantization,
  * selected at compile-time via the MODE template parameter.
  *
  * Template Parameters (compile-time):
- *   DType:          Data type of input (float16 or bfloat16)
+ *   IType:          Data type of input (float16 or bfloat16)
+ *   OType:          Data type of output (float8_e5m2 or float8_e4m3)
  *   MODE:           QuantizeMode::ROWWISE or QuantizeMode::COLWISE
- *   USE_RHT:        Apply Reduced Hadamard Transform before quantization
  *   USE_2D_BLOCK:   Use 2D block (tile-level) r_amax reduction for scale computation
- *   USE_SR:         Use stochastic rounding for FP4 conversion
  *
- * Rowwise mode:  reads from registers horizontally, stores FP4 in row-major layout.
- * Colwise mode:  reads from shared memory (transposed), stores FP4 in col-major layout.
+ * Rowwise mode:  reads from registers horizontally, stores FP8 in row-major layout.
+ * Colwise mode:  reads from shared memory (transposed), stores FP8 in col-major layout.
  */
-template <typename DType, QuantizeMode MODE, bool USE_RHT = false, bool USE_2D_BLOCK = false,
-          bool USE_SR = false>
-__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
-    const DType *__restrict__ input, uint8_t *__restrict__ out_fp4, uint8_t *__restrict__ out_scale,
+template <typename IType, typename OType, QuantizeMode MODE, bool USE_2D_BLOCK = false>
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
+    const IType *__restrict__ input, OType *__restrict__ out_fp8, uint8_t *__restrict__ out_scale,
     const int M, const int N, const int M_pad, const int N_pad, const int scale_stride,
     const int scale_N, const int scale_M_pad, const int scale_N_pad, const bool shuffle_out,
     const bool shuffle_scale) {
     // ========================================================================
     // Thread and Block Identification
     // ========================================================================
-    constexpr bool kIsHalf    = std::is_same_v<DType, dtype::float16>;
+    constexpr bool kIsHalf    = std::is_same_v<IType, dtype::float16>;
     constexpr bool kIsRowwise = (MODE == QuantizeMode::ROWWISE);
 
     const int tid           = threadIdx.x;
@@ -288,17 +213,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
     const int base_m  = block_m * BLOCK_M;
     const int base_n  = block_n * BLOCK_N;
 
-    // Rowwise: output is [M, N_pad/2], stride = N_pad/2
-    // Colwise: output is [N, M_pad/2], stride = M_pad/2
-    const int output_packed_stride = kIsRowwise ? (N_pad / 2) : (M_pad / 2);
+    // FP8: 1 byte per element. Output stride is the padded dimension.
+    // Rowwise: output is [M, N_pad], stride = N_pad
+    // Colwise: output is [N, M_pad], stride = M_pad
+    const int output_packed_stride = kIsRowwise ? N_pad : M_pad;
 
     constexpr int ROWS_PER_PASS   = WARP_SIZE / THREADS_PER_ROW;
-    constexpr int PASSES_PER_TILE = MXFP4_BLOCK_SIZE / ROWS_PER_PASS;
+    constexpr int PASSES_PER_TILE = MXFP8_BLOCK_SIZE / ROWS_PER_PASS;
     constexpr int TOTAL_CHUNKS    = NUM_CHUNKS_M * NUM_CHUNKS_N;
 
     // Shared memory for colwise transposed reads (minimized for rowwise mode)
-    constexpr int       s_tile_DEPTH = kIsRowwise ? 1 : (MXFP4_BLOCK_SIZE + SMEM_PADDING);
-    __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP4_BLOCK_SIZE][s_tile_DEPTH];
+    constexpr int       s_tile_DEPTH = kIsRowwise ? 1 : (MXFP8_BLOCK_SIZE + SMEM_PADDING);
+    __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP8_BLOCK_SIZE][s_tile_DEPTH];
 
     // ========================================================================
     // Main Loop - Each Warp Processes One 32x32 Chunk Independently
@@ -310,8 +236,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
 
         const int chunk_m = chunk_index / NUM_CHUNKS_N;
         const int chunk_n = chunk_index % NUM_CHUNKS_N;
-        const int tile_m  = base_m + chunk_m * MXFP4_BLOCK_SIZE;
-        const int tile_n  = base_n + chunk_n * MXFP4_BLOCK_SIZE;
+        const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+        const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
 
         // ================================================================
         // Load Tile: Global → registers (+ shared memory for colwise)
@@ -368,7 +294,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
         }
 
         // ================================================================
-        // Step 1: Unpack values + Apply RHT + Compute absolute max
+        // Step 1: Unpack values + Compute absolute max
         // ================================================================
         float r_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
         float r_amax[PASSES_PER_TILE];
@@ -387,11 +313,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                         packed_uint16x4_to_floatx4<kIsHalf>(r_tile[pass], r_vals[pass][0],
                                                             r_vals[pass][1], r_vals[pass][2],
                                                             r_vals[pass][3]);
-
-                        if constexpr (USE_RHT) {
-                            rht16_inplace(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
-                                          r_vals[pass][3], thread_in_row);
-                        }
 
                         float local_amax =
                             fmaxf(fmaxf(fabsf(r_vals[pass][0]), fabsf(r_vals[pass][1])),
@@ -413,11 +334,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                             uint16_to_float<kIsHalf>(s_tile[warp_id][row_base + 2][local_col]);
                         r_vals[pass][3] =
                             uint16_to_float<kIsHalf>(s_tile[warp_id][row_base + 3][local_col]);
-
-                        if constexpr (USE_RHT) {
-                            rht16_inplace(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
-                                          r_vals[pass][3], thread_in_row);
-                        }
 
                         float local_amax =
                             fmaxf(fmaxf(fabsf(r_vals[pass][0]), fabsf(r_vals[pass][1])),
@@ -442,7 +358,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
             tile_amax = warp_reduce_max_64_dpp(tile_amax);
             float   tile_scale_native;
             uint8_t tile_scale_e8m0;
-            compute_tile_scale(tile_amax, tile_scale_native, tile_scale_e8m0);
+            compute_tile_scale<OType>(tile_amax, tile_scale_native, tile_scale_e8m0);
 #pragma unroll
             for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
                 r_scale_native[pass] = tile_scale_native;
@@ -451,27 +367,21 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
         } else {
 #pragma unroll
             for (int pass = 0; pass < PASSES_PER_TILE; pass++)
-                compute_tile_scale(r_amax[pass], r_scale_native[pass], r_scale_e8m0[pass]);
+                compute_tile_scale<OType>(r_amax[pass], r_scale_native[pass], r_scale_e8m0[pass]);
         }
 
         // ================================================================
-        // Step 3: Quantize + Store FP4 and Scale
+        // Step 3: Quantize + Store FP8 and Scale
         // ================================================================
         {
 #pragma unroll
             for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
-                uint16_t fp4x4;
-                if constexpr (USE_SR) {
-                    uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
-                    fp4x4 = cvt_f32x4_to_fp4x4_sr(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
-                                                  r_vals[pass][3], r_scale_native[pass], rng);
-                } else {
-                    fp4x4 = cvt_f32x4_to_fp4x4(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
-                                               r_vals[pass][3], r_scale_native[pass]);
-                }
+                uint32_t fp8x4 =
+                    cvt_f32x4_to_fp8x4<OType>(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
+                                              r_vals[pass][3], r_scale_native[pass]);
 
                 if constexpr (kIsRowwise) {
-                    // ---- Rowwise: iterate rows, store FP4 in row-major ----
+                    // ---- Rowwise: iterate rows, store FP8 in row-major ----
                     const int col_base   = thread_in_row * ELEMS_PER_THREAD;
                     const int global_col = tile_n + col_base;
                     const int local_row  = pass * ROWS_PER_PASS + row_in_warp;
@@ -480,14 +390,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                     if (global_row < M) {
                         if (global_col < N_pad) {
                             if (shuffle_out) {
-                                int packed_col     = global_col / 2;
-                                int shuffled_index = compute_shuffled_index<dtype::float4x2_e2m1>(
-                                    global_row, packed_col, output_packed_stride);
-                                *reinterpret_cast<uint16_t *>(out_fp4 + shuffled_index) = fp4x4;
+                                int shuffled_index = compute_shuffled_index<OType>(
+                                    global_row, global_col, output_packed_stride);
+                                *reinterpret_cast<uint32_t *>(out_fp8 + shuffled_index) = fp8x4;
                             } else {
-                                *reinterpret_cast<uint16_t *>(
-                                    out_fp4 + global_row * output_packed_stride + global_col / 2) =
-                                    fp4x4;
+                                *reinterpret_cast<uint32_t *>(
+                                    out_fp8 + global_row * output_packed_stride + global_col) =
+                                    fp8x4;
                             }
                         }
 
@@ -521,7 +430,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                     }
 
                 } else {
-                    // ---- Colwise: iterate cols, store FP4 in col-major ----
+                    // ---- Colwise: iterate cols, store FP8 in col-major ----
                     const int row_base        = thread_in_row * ELEMS_PER_THREAD;
                     const int global_row_base = tile_m + row_base;
                     const int local_col       = pass * ROWS_PER_PASS + row_in_warp;
@@ -530,14 +439,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                     if (global_col < N) {
                         if (global_row_base < M_pad) {
                             if (shuffle_out) {
-                                int packed_col     = global_row_base / 2;
-                                int shuffled_index = compute_shuffled_index<dtype::float4x2_e2m1>(
-                                    global_col, packed_col, output_packed_stride);
-                                *reinterpret_cast<uint16_t *>(out_fp4 + shuffled_index) = fp4x4;
+                                int shuffled_index = compute_shuffled_index<OType>(
+                                    global_col, global_row_base, output_packed_stride);
+                                *reinterpret_cast<uint32_t *>(out_fp8 + shuffled_index) = fp8x4;
                             } else {
-                                *reinterpret_cast<uint16_t *>(out_fp4 +
-                                                              global_col * output_packed_stride +
-                                                              global_row_base / 2) = fp4x4;
+                                *reinterpret_cast<uint32_t *>(
+                                    out_fp8 + global_col * output_packed_stride + global_row_base) =
+                                    fp8x4;
                             }
                         }
 
@@ -576,20 +484,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
 }
 
 /*
- * MXFP4 Quantization Kernel with dual mode
+ * MXFP8 Quantization Kernel with dual mode
  * ----------------------------------------------
  * Template Parameters (compile-time):
- *   DType:                                       Data type of input
- *   ROWWISE_USE_RHT / COLWISE_USE_RHT:           Apply RHT before quantization
+ *   IType:                                       Data type of input
+ *   OType:                                       Data type of output
  *   ROWWISE_USE_2D_BLOCK / COLWISE_USE_2D_BLOCK: Use 2D block for r_amax reduction
- *   ROWWISE_USE_SR / COLWISE_USE_SR:             Use stochastic rounding for FP4 conversion
  */
-template <typename DType, bool ROWWISE_USE_RHT = false, bool COLWISE_USE_RHT = false,
-          bool ROWWISE_USE_2D_BLOCK = false, bool COLWISE_USE_2D_BLOCK = false,
-          bool ROWWISE_USE_SR = false, bool COLWISE_USE_SR = false>
-__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kernel(
-    const DType *__restrict__ input, uint8_t *__restrict__ rowwise_fp4,
-    uint8_t *__restrict__ rowwise_scale, uint8_t *__restrict__ colwise_fp4,
+template <typename IType, typename OType, bool ROWWISE_USE_2D_BLOCK = false,
+          bool COLWISE_USE_2D_BLOCK = false>
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kernel(
+    const IType *__restrict__ input, OType *__restrict__ rowwise_fp8,
+    uint8_t *__restrict__ rowwise_scale, OType *__restrict__ colwise_fp8,
     uint8_t *__restrict__ colwise_scale, const int M, const int N, const int M_pad, const int N_pad,
     const int rowwise_scale_stride, const int colwise_scale_stride, const int rowwise_scale_N,
     const int rowwise_scale_M_pad, const int rowwise_scale_N_pad, const int colwise_scale_M,
@@ -599,7 +505,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     // ========================================================================
     // Thread and Block Identification
     // ========================================================================
-    constexpr bool kIshalf = std::is_same_v<DType, dtype::float16>;
+    constexpr bool kIshalf = std::is_same_v<IType, dtype::float16>;
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
@@ -617,18 +523,20 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     const int base_m = block_m * BLOCK_M;
     const int base_n = block_n * BLOCK_N;
 
-    // Packed dimensions (2 FP4 values per byte), using padded sizes for output stride
-    const int K_packed = N_pad / 2;
-    const int M_packed = M_pad / 2;
+    // FP8: 1 byte per element. Output stride is the padded dimension.
+    // Rowwise: output is [M, N_pad], stride = N_pad
+    // Colwise: output is [N, M_pad], stride = M_pad
+    const int K_packed = N_pad;
+    const int M_packed = M_pad;
 
     constexpr int ROWS_PER_PASS   = WARP_SIZE / THREADS_PER_ROW;
-    constexpr int PASSES_PER_TILE = MXFP4_BLOCK_SIZE / ROWS_PER_PASS;
+    constexpr int PASSES_PER_TILE = MXFP8_BLOCK_SIZE / ROWS_PER_PASS;
     constexpr int TOTAL_CHUNKS    = NUM_CHUNKS_M * NUM_CHUNKS_N;
 
     // ========================================================================
     // Shared Memory - Per-Warp 32x32 Tiles
     // ========================================================================
-    __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP4_BLOCK_SIZE][MXFP4_BLOCK_SIZE + SMEM_PADDING];
+    __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP8_BLOCK_SIZE][MXFP8_BLOCK_SIZE + SMEM_PADDING];
 
     // ========================================================================
     // Main Loop - Each Warp Processes One 32x32 Chunk Independently
@@ -641,8 +549,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
 
         const int chunk_m = chunk_idx / NUM_CHUNKS_N;
         const int chunk_n = chunk_idx % NUM_CHUNKS_N;
-        const int tile_m  = base_m + chunk_m * MXFP4_BLOCK_SIZE;
-        const int tile_n  = base_n + chunk_n * MXFP4_BLOCK_SIZE;
+        const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+        const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
 
         // ================================================================
         // Load Tile: Global → smem + packed regs
@@ -687,8 +595,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
         }
 
         // ================================================================
-        // Rowwise Quantization (Horizantal Processing)
-        // Step 1: Apply RHT + compute per-row r_amax
+        // Rowwise Quantization (Horizontal Processing)
+        // Step 1: Unpack values + compute per-row r_amax
         // ================================================================
         float r_rowwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
         float r_rowwise_amax[PASSES_PER_TILE];
@@ -708,12 +616,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                         r_tile[pass], r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
                         r_rowwise_vals[pass][2], r_rowwise_vals[pass][3]);
 
-                    if constexpr (ROWWISE_USE_RHT) {
-                        rht16_inplace(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
-                                      r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
-                                      thread_in_row);
-                    }
-
                     float local_amax = fmaxf(
                         fmaxf(fabsf(r_rowwise_vals[pass][0]), fabsf(r_rowwise_vals[pass][1])),
                         fmaxf(fabsf(r_rowwise_vals[pass][2]), fabsf(r_rowwise_vals[pass][3])));
@@ -723,8 +625,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
         }
 
         // ================================================================
-        // Rowwise Quantization (Horizantal Processing)
-        // Step 2: Compute scale — per-row or per-tile(2D Block)
+        // Rowwise Quantization (Horizontal Processing)
+        // Step 2: Compute scale — per-row or per-tile (2D Block)
         // ================================================================
         float   r_rowwise_scale_native[PASSES_PER_TILE];
         uint8_t r_rowwise_scale_e8m0[PASSES_PER_TILE];
@@ -737,7 +639,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
             tile_amax = warp_reduce_max_64_dpp(tile_amax);
             float   r_scale_native;
             uint8_t r_scale_e8m0;
-            compute_tile_scale(tile_amax, r_scale_native, r_scale_e8m0);
+            compute_tile_scale<OType>(tile_amax, r_scale_native, r_scale_e8m0);
 #pragma unroll
             for (int p = 0; p < PASSES_PER_TILE; p++) {
                 r_rowwise_scale_native[p] = r_scale_native;
@@ -746,13 +648,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
         } else {
 #pragma unroll
             for (int p = 0; p < PASSES_PER_TILE; p++)
-                compute_tile_scale(r_rowwise_amax[p], r_rowwise_scale_native[p],
-                                   r_rowwise_scale_e8m0[p]);
+                compute_tile_scale<OType>(r_rowwise_amax[p], r_rowwise_scale_native[p],
+                                          r_rowwise_scale_e8m0[p]);
         }
 
         // ================================================================
-        // Rowwise Quantization (Horizantal Processing)
-        // Step 3: Quantize from regs + Store FP4 / Scale
+        // Rowwise Quantization (Horizontal Processing)
+        // Step 3: Quantize from regs + Store FP8 / Scale
         // ================================================================
         {
             const int col_base   = thread_in_row * ELEMS_PER_THREAD;
@@ -765,29 +667,19 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                 const int global_row = tile_m + local_row;
 
                 if (global_row < M) {
-                    uint16_t fp4x4;
-                    // Convert packed FP32 to FP4
-                    if constexpr (ROWWISE_USE_SR) {
-                        uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
-                        fp4x4 =
-                            cvt_f32x4_to_fp4x4_sr(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
-                                                  r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
-                                                  r_rowwise_scale_native[pass], rng);
-                    } else {
-                        fp4x4 = cvt_f32x4_to_fp4x4(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
-                                                   r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
-                                                   r_rowwise_scale_native[pass]);
-                    }
+                    uint32_t fp8x4;
+                    fp8x4 = cvt_f32x4_to_fp8x4<OType>(
+                        r_rowwise_vals[pass][0], r_rowwise_vals[pass][1], r_rowwise_vals[pass][2],
+                        r_rowwise_vals[pass][3], r_rowwise_scale_native[pass]);
 
                     if (global_col < N_pad) {
                         if (shuffle_rowwise) {
-                            int packed_col   = global_col / 2;
-                            int shuffled_idx = compute_shuffled_index<dtype::float4x2_e2m1>(
-                                global_row, packed_col, K_packed);
-                            *reinterpret_cast<uint16_t *>(rowwise_fp4 + shuffled_idx) = fp4x4;
+                            int shuffled_idx =
+                                compute_shuffled_index<OType>(global_row, global_col, K_packed);
+                            *reinterpret_cast<uint32_t *>(rowwise_fp8 + shuffled_idx) = fp8x4;
                         } else {
-                            *reinterpret_cast<uint16_t *>(rowwise_fp4 + global_row * K_packed +
-                                                          global_col / 2) = fp4x4;
+                            *reinterpret_cast<uint32_t *>(rowwise_fp8 + global_row * K_packed +
+                                                          global_col) = fp8x4;
                         }
                     }
 
@@ -816,7 +708,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
 
         // ================================================================
         // Colwise Quantization (Vertical Processing)
-        // Step 1: Read smem (transposed) + Apply RHT + compute per-col r_amax
+        // Step 1: Read smem (transposed) + compute per-col r_amax
         // ================================================================
         float r_colwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
         float r_colwise_amax[PASSES_PER_TILE];
@@ -844,12 +736,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                     r_colwise_vals[pass][3] =
                         uint16_to_float<kIshalf>(s_tile[warp_id][row_base + 3][local_col]);
 
-                    if constexpr (COLWISE_USE_RHT) {
-                        rht16_inplace(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
-                                      r_colwise_vals[pass][2], r_colwise_vals[pass][3],
-                                      thread_in_row);
-                    }
-
                     float local_amax = fmaxf(
                         fmaxf(fabsf(r_colwise_vals[pass][0]), fabsf(r_colwise_vals[pass][1])),
                         fmaxf(fabsf(r_colwise_vals[pass][2]), fabsf(r_colwise_vals[pass][3])));
@@ -860,7 +746,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
 
         // ================================================================
         // Colwise Quantization (Vertical Processing)
-        // Step 2: Compute scale — per-col or per-tile(2D Block)
+        // Step 2: Compute scale — per-col or per-tile (2D Block)
         // ================================================================
         float   r_colwise_scale_native[PASSES_PER_TILE];
         uint8_t r_colwise_scale_e8m0[PASSES_PER_TILE];
@@ -873,7 +759,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
             tile_amax = warp_reduce_max_64_dpp(tile_amax);
             float   r_scale_native;
             uint8_t r_scale_e8m0;
-            compute_tile_scale(tile_amax, r_scale_native, r_scale_e8m0);
+            compute_tile_scale<OType>(tile_amax, r_scale_native, r_scale_e8m0);
 #pragma unroll
             for (int p = 0; p < PASSES_PER_TILE; p++) {
                 r_colwise_scale_native[p] = r_scale_native;
@@ -882,13 +768,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
         } else {
 #pragma unroll
             for (int p = 0; p < PASSES_PER_TILE; p++)
-                compute_tile_scale(r_colwise_amax[p], r_colwise_scale_native[p],
-                                   r_colwise_scale_e8m0[p]);
+                compute_tile_scale<OType>(r_colwise_amax[p], r_colwise_scale_native[p],
+                                          r_colwise_scale_e8m0[p]);
         }
 
         // ================================================================
         // Colwise Quantization (Vertical Processing)
-        // Step 3: Quantize from regs + Store FP4 / Scale
+        // Step 3: Quantize from regs + Store FP8 / Scale
         // ================================================================
         {
             const int row_base        = thread_in_row * ELEMS_PER_THREAD;
@@ -901,29 +787,19 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                 const int global_col = tile_n + local_col;
 
                 if (global_col < N) {
-                    uint16_t fp4x4;
-                    // Convert packed FP32 to FP4
-                    if constexpr (COLWISE_USE_SR) {
-                        uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
-                        fp4x4 =
-                            cvt_f32x4_to_fp4x4_sr(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
-                                                  r_colwise_vals[pass][2], r_colwise_vals[pass][3],
-                                                  r_colwise_scale_native[pass], rng);
-                    } else {
-                        fp4x4 = cvt_f32x4_to_fp4x4(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
-                                                   r_colwise_vals[pass][2], r_colwise_vals[pass][3],
-                                                   r_colwise_scale_native[pass]);
-                    }
+                    // Convert packed FP32 to FP8
+                    uint32_t fp8x4 = cvt_f32x4_to_fp8x4<OType>(
+                        r_colwise_vals[pass][0], r_colwise_vals[pass][1], r_colwise_vals[pass][2],
+                        r_colwise_vals[pass][3], r_colwise_scale_native[pass]);
 
                     if (global_row_base < M_pad) {
                         if (shuffle_colwise) {
-                            int packed_col   = global_row_base / 2;
-                            int shuffled_idx = compute_shuffled_index<dtype::float4x2_e2m1>(
-                                global_col, packed_col, M_packed);
-                            *reinterpret_cast<uint16_t *>(colwise_fp4 + shuffled_idx) = fp4x4;
+                            int shuffled_idx = compute_shuffled_index<OType>(
+                                global_col, global_row_base, M_packed);
+                            *reinterpret_cast<uint32_t *>(colwise_fp8 + shuffled_idx) = fp8x4;
                         } else {
-                            *reinterpret_cast<uint16_t *>(colwise_fp4 + global_col * M_packed +
-                                                          global_row_base / 2) = fp4x4;
+                            *reinterpret_cast<uint32_t *>(colwise_fp8 + global_col * M_packed +
+                                                          global_row_base) = fp8x4;
                         }
                     }
 
@@ -949,170 +825,139 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     }
 }
 
-template <typename DType>
-void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
-                              uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
-                              uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
-                              int rowwise_scale_stride, int colwise_scale_stride,
-                              int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
-                              int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
-                              int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
-                              MXScalingRecipe colwise_recipe, hipStream_t stream) {
+template <typename IType, typename OType>
+void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
+                              OType *colwise_output, uint8_t *colwise_scale, int M, int N,
+                              int M_pad, int N_pad, int rowwise_scale_stride,
+                              int colwise_scale_stride, int rowwise_scale_N,
+                              int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
+                              int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+                              MXScalingRecipe rowwise_recipe, MXScalingRecipe colwise_recipe,
+                              hipStream_t stream) {
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
-#define QUANTIZE_MXFP4_DUAL                                                                        \
-    input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
-        reinterpret_cast<uint8_t *>(colwise_output), colwise_scale, M, N, M_pad, N_pad,            \
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_sr == false, "MXFP8 not support SR");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_sr == false, "MXFP8 not support SR");
+
+#define QUANTIZE_MXFP8_DUAL                                                                        \
+    input, rowwise_output, rowwise_scale, colwise_output, colwise_scale, M, N, M_pad, N_pad,       \
         rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
         rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
-        colwise_scale_N_pad, rowwise_recipe.shuffle_scale, rowwise_recipe.shuffle_out,             \
-        colwise_recipe.shuffle_scale, colwise_recipe.shuffle_out
+        colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale
 
-#define QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,  \
-                                          COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR)    \
-    quantize_mxfp4_dual_kernel<DType, ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,      \
-                               COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR>               \
-        <<<grid, block, 0, stream>>>(QUANTIZE_MXFP4_DUAL)
+#define QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)              \
+    quantize_mxfp8_dual_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>           \
+        <<<grid, block, 0, stream>>>(QUANTIZE_MXFP8_DUAL)
 
-#define DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_SR,     \
-                                             COLWISE_USE_SR)                                       \
+#define DISPATCH_QUANTIZE_MXFP8_DUAL_WITH_2D()                                                     \
     if (rowwise_recipe.use_2d_block) {                                                             \
         if (colwise_recipe.use_2d_block) {                                                         \
-            QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, true, true,        \
-                                              ROWWISE_USE_SR, COLWISE_USE_SR);                     \
+            QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(true, true);                                         \
         } else {                                                                                   \
-            QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, true, false,       \
-                                              ROWWISE_USE_SR, COLWISE_USE_SR);                     \
+            QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(true, false);                                        \
         }                                                                                          \
     } else {                                                                                       \
         if (colwise_recipe.use_2d_block) {                                                         \
-            QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, false, true,       \
-                                              ROWWISE_USE_SR, COLWISE_USE_SR);                     \
+            QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(false, true);                                        \
         } else {                                                                                   \
-            QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, false, false,      \
-                                              ROWWISE_USE_SR, COLWISE_USE_SR);                     \
+            QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(false, false);                                       \
         }                                                                                          \
     }
-
-#define DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT(ROWWISE_USE_SR, COLWISE_USE_SR)                   \
-    if (rowwise_recipe.use_rht) {                                                                  \
-        if (colwise_recipe.use_rht) {                                                              \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(true, true, ROWWISE_USE_SR, COLWISE_USE_SR);      \
-        } else {                                                                                   \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(true, false, ROWWISE_USE_SR, COLWISE_USE_SR);     \
-        }                                                                                          \
-    } else {                                                                                       \
-        if (colwise_recipe.use_rht) {                                                              \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(false, true, ROWWISE_USE_SR, COLWISE_USE_SR);     \
-        } else {                                                                                   \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D(false, false, ROWWISE_USE_SR, COLWISE_USE_SR);    \
-        }                                                                                          \
-    }
-
-#define DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR()                                              \
-    if (rowwise_recipe.use_sr) {                                                                   \
-        if (colwise_recipe.use_sr) {                                                               \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT(true, true);                                  \
-        } else {                                                                                   \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT(true, false);                                 \
-        }                                                                                          \
-    } else {                                                                                       \
-        if (colwise_recipe.use_sr) {                                                               \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT(false, true);                                 \
-        } else {                                                                                   \
-            DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT(false, false);                                \
-        }                                                                                          \
-    }
-
     // launch kernel
-    DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR()
+    DISPATCH_QUANTIZE_MXFP8_DUAL_WITH_2D()
 
-#undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D
-#undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT
-#undef DISPATCH_QUANTIZE_MXFP4_DUAL_WITH_2D_RHT_SR
-#undef QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL
-#undef QUANTIZE_MXFP4_DUAL
+#undef DISPATCH_QUANTIZE_MXFP8_DUAL_WITH_2D
+#undef QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL
+#undef QUANTIZE_MXFP8_DUAL
 }
 
-template void quantize_mxfp4_dual_impl<dtype::float16>(
-    const dtype::float16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad,
-    int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+template void quantize_mxfp8_dual_impl<dtype::float16, dtype::float8_e5m2>(
+    const dtype::float16 *x, dtype::float8_e5m2 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e5m2 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
     MXScalingRecipe colwise_recipe, hipStream_t stream);
-template void quantize_mxfp4_dual_impl<dtype::bfloat16>(
-    const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad,
-    int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+template void quantize_mxfp8_dual_impl<dtype::bfloat16, dtype::float8_e5m2>(
+    const dtype::bfloat16 *x, dtype::float8_e5m2 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e5m2 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    MXScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp8_dual_impl<dtype::float16, dtype::float8_e4m3>(
+    const dtype::float16 *x, dtype::float8_e4m3 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e4m3 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
+    MXScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp8_dual_impl<dtype::bfloat16, dtype::float8_e4m3>(
+    const dtype::bfloat16 *x, dtype::float8_e4m3 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e4m3 *colwise_output, uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, MXScalingRecipe rowwise_recipe,
     MXScalingRecipe colwise_recipe, hipStream_t stream);
 
-template <typename DType>
-void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
-                         QuantizeMode mode, int M, int N, int M_pad, int N_pad, int scale_stride,
-                         int scale_N, int scale_M_pad, int scale_N_pad, MXScalingRecipe recipe,
+template <typename IType, typename OType>
+void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale, QuantizeMode mode,
+                         int M, int N, int M_pad, int N_pad, int scale_stride, int scale_N,
+                         int scale_M_pad, int scale_N_pad, MXScalingRecipe recipe,
                          hipStream_t stream) {
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
-#define QUANTIZE_MXFP4_KERNEL_ARGS                                                                 \
-    input, reinterpret_cast<uint8_t *>(output), scale, M, N, M_pad, N_pad, scale_stride, scale_N,  \
-        scale_M_pad, scale_N_pad, recipe.shuffle_out, recipe.shuffle_scale
+    PRIMUS_TURBO_CHECK(recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(recipe.use_sr == false, "MXFP8 not support SR");
 
-#define QUANTIZE_MXFP4_LAUNCH_KERNEL(USE_RHT, USE_2D_BLOCK, USE_SR)                                \
+#define QUANTIZE_MXFP8_KERNEL_ARGS                                                                 \
+    input, output, scale, M, N, M_pad, N_pad, scale_stride, scale_N, scale_M_pad, scale_N_pad,     \
+        recipe.shuffle_out, recipe.shuffle_scale
+
+#define QUANTIZE_MXFP8_LAUNCH_KERNEL(USE_2D_BLOCK)                                                 \
     if (mode == QuantizeMode::ROWWISE) {                                                           \
-        quantize_mxfp4_kernel<DType, QuantizeMode::ROWWISE, USE_RHT, USE_2D_BLOCK, USE_SR>         \
-            <<<grid, block, 0, stream>>>(QUANTIZE_MXFP4_KERNEL_ARGS);                              \
+        quantize_mxfp8_kernel<IType, OType, QuantizeMode::ROWWISE, USE_2D_BLOCK>                   \
+            <<<grid, block, 0, stream>>>(QUANTIZE_MXFP8_KERNEL_ARGS);                              \
     } else {                                                                                       \
-        quantize_mxfp4_kernel<DType, QuantizeMode::COLWISE, USE_RHT, USE_2D_BLOCK, USE_SR>         \
-            <<<grid, block, 0, stream>>>(QUANTIZE_MXFP4_KERNEL_ARGS);                              \
+        quantize_mxfp8_kernel<IType, OType, QuantizeMode::COLWISE, USE_2D_BLOCK>                   \
+            <<<grid, block, 0, stream>>>(QUANTIZE_MXFP8_KERNEL_ARGS);                              \
     }
 
-#define DISPATCH_QUANTIZE_MXFP4_WITH_2D(USE_RHT, USE_SR)                                           \
+#define DISPATCH_QUANTIZE_MXFP8_WITH_2D()                                                          \
     if (recipe.use_2d_block) {                                                                     \
-        QUANTIZE_MXFP4_LAUNCH_KERNEL(USE_RHT, true, USE_SR);                                       \
+        QUANTIZE_MXFP8_LAUNCH_KERNEL(true);                                                        \
     } else {                                                                                       \
-        QUANTIZE_MXFP4_LAUNCH_KERNEL(USE_RHT, false, USE_SR);                                      \
-    }
-
-#define DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT(USE_SR)                                                \
-    if (recipe.use_rht) {                                                                          \
-        DISPATCH_QUANTIZE_MXFP4_WITH_2D(true, USE_SR);                                             \
-    } else {                                                                                       \
-        DISPATCH_QUANTIZE_MXFP4_WITH_2D(false, USE_SR);                                            \
-    }
-
-#define DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT_SR()                                                   \
-    if (recipe.use_sr) {                                                                           \
-        DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT(true);                                                 \
-    } else {                                                                                       \
-        DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT(false);                                                \
+        QUANTIZE_MXFP8_LAUNCH_KERNEL(false);                                                       \
     }
 
     // launch kernel
-    DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT_SR()
+    DISPATCH_QUANTIZE_MXFP8_WITH_2D()
 
-#undef DISPATCH_QUANTIZE_MXFP4_WITH_2D
-#undef DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT
-#undef DISPATCH_QUANTIZE_MXFP4_WITH_2D_RHT_SR
-#undef QUANTIZE_MXFP4_LAUNCH_KERNEL
-#undef QUANTIZE_MXFP4_KERNEL_ARGS
+#undef DISPATCH_QUANTIZE_MXFP8_WITH_2D
+#undef QUANTIZE_MXFP8_LAUNCH_KERNEL
+#undef QUANTIZE_MXFP8_KERNEL_ARGS
 }
 
-template void quantize_mxfp4_impl<dtype::float16>(const dtype::float16 *x,
-                                                  dtype::float4x2_e2m1 *output, uint8_t *scale,
-                                                  QuantizeMode mode, int M, int N, int M_pad,
-                                                  int N_pad, int scale_stride, int scale_N,
-                                                  int scale_M_pad, int scale_N_pad,
-                                                  MXScalingRecipe recipe, hipStream_t stream);
-template void quantize_mxfp4_impl<dtype::bfloat16>(const dtype::bfloat16 *x,
-                                                   dtype::float4x2_e2m1 *output, uint8_t *scale,
-                                                   QuantizeMode mode, int M, int N, int M_pad,
-                                                   int N_pad, int scale_stride, int scale_N,
-                                                   int scale_M_pad, int scale_N_pad,
-                                                   MXScalingRecipe recipe, hipStream_t stream);
+template void quantize_mxfp8_impl<dtype::float16, dtype::float8_e5m2>(
+    const dtype::float16 *x, dtype::float8_e5m2 *output, uint8_t *scale, QuantizeMode mode, int M,
+    int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
+    MXScalingRecipe recipe, hipStream_t stream);
+template void quantize_mxfp8_impl<dtype::bfloat16, dtype::float8_e5m2>(
+    const dtype::bfloat16 *x, dtype::float8_e5m2 *output, uint8_t *scale, QuantizeMode mode, int M,
+    int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
+    MXScalingRecipe recipe, hipStream_t stream);
+template void quantize_mxfp8_impl<dtype::float16, dtype::float8_e4m3>(
+    const dtype::float16 *x, dtype::float8_e4m3 *output, uint8_t *scale, QuantizeMode mode, int M,
+    int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
+    MXScalingRecipe recipe, hipStream_t stream);
+template void quantize_mxfp8_impl<dtype::bfloat16, dtype::float8_e4m3>(
+    const dtype::bfloat16 *x, dtype::float8_e4m3 *output, uint8_t *scale, QuantizeMode mode, int M,
+    int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
+    MXScalingRecipe recipe, hipStream_t stream);
 
 } // namespace primus_turbo
