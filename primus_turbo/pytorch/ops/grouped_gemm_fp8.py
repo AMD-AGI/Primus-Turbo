@@ -299,7 +299,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
     ):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
-        assert a.ndim == 2, "Input tensor must be 3-dimensions."
+        assert a.ndim == 2, "Input tensor must be 2-dimensional."
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
