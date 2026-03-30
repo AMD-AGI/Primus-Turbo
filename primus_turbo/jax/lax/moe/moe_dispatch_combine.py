@@ -267,7 +267,7 @@ def _moe_dispatch_bwd(expert_alignment, num_experts, config, ctx, grad_output):
     if isinstance(grad_x, tuple):
         grad_x, _ = grad_x
 
-    (grad_x, grad_topk_weights), _ = _moe_combine_fwd(grad_x, handle)
+    (grad_x, grad_topk_weights), _ = _moe_combine_fwd(grad_x, handle, topk_weights=grad_topk_weights)
     return grad_x, None, grad_topk_weights, None
 
 
