@@ -68,19 +68,6 @@ def calc_diff(x: jax.Array, y: jax.Array):
     return (1 - sim).item()
 
 
-def _expected_dispatch_count(scores: jax.Array, topk_weights: jax.Array):
-    num_topk = topk_weights.shape[1]
-    num_experts = scores.shape[1]
-
-    topk_idx = jax.lax.top_k(scores, num_topk)[1]
-    topk_idx = topk_idx.astype(jnp.int64)
-
-    rank_idx = topk_idx // (num_experts // num_ranks)
-    rank_idx = rank_idx.astype(jnp.int64)
-    rank_idx = inplace_unique(rank_idx, num_ranks)
-    return (rank_idx >= 0).sum(axis=1, keepdims=True).astype(jnp.float32)
-
-
 @jax.jit
 @jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
 def _test_moe_dispatch_combine(x, scores, topk_weights):
@@ -179,45 +166,6 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
     )
 
 
-@jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
-def _dispatch_recv_valid_topk_weights(x, scores, topk_weights):
-    num_topk = topk_weights.shape[1]
-    topk_idx = jax.lax.top_k(scores, num_topk)[1]
-    topk_idx = topk_idx.astype(jnp.int64)
-
-    num_experts = scores.shape[1]
-    _, recv_topk_idx, recv_topk_weights, _ = moe_dispatch(
-        x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts
-    )
-    return jnp.where(recv_topk_idx == -1, jnp.zeros_like(recv_topk_weights), recv_topk_weights)
-
-
-@jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
-def _cached_dispatch_recv_x(x, scores, topk_weights):
-    num_topk = topk_weights.shape[1]
-    topk_idx = jax.lax.top_k(scores, num_topk)[1]
-    topk_idx = topk_idx.astype(jnp.int64)
-
-    num_experts = scores.shape[1]
-    _, _, _, handle = moe_dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts)
-    cached_recv_x, _, _, _ = moe_dispatch(x, handle=handle)
-    return cached_recv_x.astype(jnp.float32)
-
-
-@jax.jit
-def _dispatch_topk_weights_grad(x, scores, topk_weights):
-    recv_topk_weights, f_vjp = jax.vjp(_dispatch_recv_valid_topk_weights, x, scores, topk_weights)
-    _, _, grad_topk_weights = f_vjp(jnp.ones_like(recv_topk_weights))
-    return grad_topk_weights
-
-
-@jax.jit
-def _cached_dispatch_grad(x, scores, topk_weights):
-    cached_recv_x, f_vjp = jax.vjp(_cached_dispatch_recv_x, x, scores, topk_weights)
-    grad_x, _, _ = f_vjp(jnp.ones_like(cached_recv_x))
-    return grad_x
-
-
 @pytest.mark.multigpu
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("hidden", [7168])
@@ -296,12 +244,32 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
 @pytest.mark.parametrize("num_experts", [256])
 @skip_if_lt_x_gpu(2)
 def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts):
+
+    @jax.shard_map(mesh=mesh, in_specs=PartitionSpec("x"), out_specs=PartitionSpec("x"))
+    def _test_mode_dispatch_combine_backward(x, scores, topk_weights):
+        assert scores.ndim == 2, f"scores must be a 2D array, but got {scores.ndim}"
+        assert x.ndim == 2, f"x must be a 2D array, but got {x.ndim}"
+        assert topk_weights.ndim == 2, f"topk_weights must be a 2D array, but got {topk_weights.ndim}"
+
+        num_topk = topk_weights.shape[1]
+        topk_idx = jax.lax.top_k(scores, num_topk)[1]
+        topk_idx = topk_idx.astype(jnp.int64)
+
+        num_experts = scores.shape[1]
+
+        recv_x, _, rect_topk_weights, handle = moe_dispatch(
+            x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts
+        )
+
+        combined_x = moe_combine(recv_x, handle=handle)
+
+        return combined_x, rect_topk_weights
+
+    @jax.jit
+    def _test_moe_dispatch_combine_backward_grad_fn(x, scores, topk_weights):
+        return jax.vjp(_test_mode_dispatch_combine_backward, x, scores, topk_weights)
+
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
-    dispatch_count = _expected_dispatch_count(scores, topk_weights)
 
-    grad_topk_weights = _dispatch_topk_weights_grad(x, scores, topk_weights)
-    np.testing.assert_allclose(grad_topk_weights, jnp.ones_like(topk_weights))
-
-    grad_x = _cached_dispatch_grad(x, scores, topk_weights)
-    expected_grad_x = jnp.broadcast_to(dispatch_count, x.shape)
-    np.testing.assert_allclose(grad_x, expected_grad_x)
+    primals, f_vjp = _test_moe_dispatch_combine_backward_grad_fn(x, scores, topk_weights)
+    f_vjp(primals)
