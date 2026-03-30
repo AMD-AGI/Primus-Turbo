@@ -121,7 +121,7 @@ def _moe_cached_dispatch_abstract_eval(
     recv_x = ShapedArray((num_recv_tokens, hidden_size), x.dtype)
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_recv_tokens)
     recv_channel_prefix_matrix = ShapedArray((num_ranks, num_channels), jnp.int32)
-    recv_src_idx = ShapedArray((num_ranks, num_channels), jnp.int32)
+    recv_src_idx = ShapedArray((num_recv_tokens,), jnp.int32)
     send_head = ShapedArray((num_tokens, num_ranks), jnp.int32)
     return recv_x, recv_x_scales, recv_channel_prefix_matrix, recv_src_idx, send_head
 
