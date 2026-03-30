@@ -108,7 +108,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # symm = symm_mem.get_symm_mem_workspace(group.group_name, int(1e9))
     # print(symm)
 
-    for i in (64,):
+    for i in (2,):
         test_main(args, i, local_rank, num_ranks, rank, group)
         if local_rank == 0:
             print("", flush=True)

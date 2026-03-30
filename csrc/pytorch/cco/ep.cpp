@@ -193,7 +193,7 @@ fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> 
         recv_topk_weights_ptrs, recv_channel_offset_ptrs, send_head.data_ptr<int>(), x.data_ptr(),
         x_scales_ptr, topk_idx_ptr, topk_weights_ptr, is_token_in_rank.data_ptr<bool>(),
         channel_prefix_matrix.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(), num_tokens,
-        static_cast<int>(hidden * num_recv_tokens / sizeof(int4)), num_topk, num_experts,
+        static_cast<int>(hidden * x.element_size() / sizeof(int4)), num_topk, num_experts,
         num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms);
 
     // Return values

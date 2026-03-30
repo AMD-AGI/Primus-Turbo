@@ -311,9 +311,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                token_end_idx);
 
         // Calculate offset first
-        int rank_offset = responsible_rank > 0
-                              ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank]
-                              : 0;
+        int rank_offset =
+            rank > 0 ? rank_prefix_matrix[(rank - 1) * kNumRanks + responsible_rank] : 0;
 
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
@@ -353,12 +352,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Copy data
             auto dst_slot_idx = total_offset + chunk_idx;
             // EP_DEVICE_ASSERT(dst_slot_idx * hidden_int4 < 1000000000 and dst_slot_idx);
+            PRINT_DEBUG("dst_slot_idx: %d\n", dst_slot_idx);
             auto shifted_recv_x_buffers = recv_x_buffer.buffer() + dst_slot_idx * hidden_int4;
             auto shifted_x              = x + token_idx * hidden_int4;
-            UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_buffers, shifted_x, __ldg,
-                               st_na_global);
+            // UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_buffers, shifted_x, __ldg,
+            //                    st_na_global);
 
             chunk_idx++;
+            token_idx++;
         }
     } else {
     }
