@@ -12,6 +12,10 @@ import pytest
 from jax.sharding import PartitionSpec
 
 from primus_turbo.jax.lax.moe import get_dispatch_config, moe_combine, moe_dispatch
+from primus_turbo.jax.lax.moe.moe_dispatch_combine import (
+    _moe_combine_impl,
+    _moe_dispatch_impl,
+)
 from primus_turbo.jax.primitive.moe.moe_dispatch import moe_dispatch_p
 from tests.jax.test_utils import skip_if_lt_x_gpu
 
@@ -127,9 +131,7 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
     gbl_num_tokens_per_rank = jax.lax.psum(num_tokens_per_rank, "x")
 
     # 3. Test Dispatch
-    recv_x, recv_topk_idx, recv_topk_weights, handle = moe_dispatch(
-        x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts
-    )
+    recv_x, recv_topk_idx, recv_topk_weights, handle = moe_dispatch(x, topk_idx, topk_weights, num_experts)
     rank_prefix_matrix = handle[0]
     recv_topk_weights_copy = jnp.copy(recv_topk_weights)
     amax_recv_topk_weights = jnp.broadcast_to(
@@ -140,12 +142,12 @@ def _test_moe_dispatch_combine(x, scores, topk_weights):
     )
 
     # 4. Test cached dispatch (must without top-k staffs)
-    cached_recv_x, _, _, _ = moe_dispatch(x, handle=handle)
+    cached_recv_x, _, _, _ = _moe_dispatch_impl(x, handle=handle)
 
     # 5. Test Combine
-    combined_x, combined_topk_weights = moe_combine(
-        recv_x, handle=handle, topk_weights=check_recv_topk_weights
-    )
+    combined_x = moe_combine(recv_x, handle)
+    _, combined_topk_weights = _moe_combine_impl(recv_x, handle, topk_weights=check_recv_topk_weights)
+
     check_combine_x = combined_x.astype(jnp.float32) / jnp.expand_dims(
         ref_is_token_in_rank.sum(axis=1), axis=1
     )
@@ -267,11 +269,9 @@ def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts
 
         num_experts = scores.shape[1]
 
-        recv_x, _, rect_topk_weights, handle = moe_dispatch(
-            x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=num_experts
-        )
+        recv_x, _, rect_topk_weights, handle = moe_dispatch(x, topk_idx, topk_weights, num_experts)
 
-        combined_x = moe_combine(recv_x, handle=handle)
+        combined_x = moe_combine(recv_x, handle)
 
         return combined_x, rect_topk_weights
 
