@@ -264,10 +264,108 @@ class GEMMFP8TritonBackend(KernelBackend):
             raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")
 
 
+_tk_module = None
+
+
+def _get_tk_module():
+    global _tk_module
+    if _tk_module is None:
+        import tk_fp8_layouts
+
+        _tk_module = tk_fp8_layouts
+    return _tk_module
+
+
+class GEMMFP8HipKittensBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_DTYPES = {
+        (float8_e4m3, float8_e4m3, torch.bfloat16),
+    }
+
+    @staticmethod
+    def _normalize_layout(trans_a: bool, trans_b: bool, trans_c: bool) -> Tuple[bool, bool]:
+        if trans_c:
+            return (not trans_b, not trans_a)
+        return (trans_a, trans_b)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        if granularity not in GEMMFP8HipKittensBackend.SUPPORTED_GRANULARITIES:
+            return False
+        if (a.dtype, b.dtype, out_dtype) not in GEMMFP8HipKittensBackend.SUPPORTED_DTYPES:
+            return False
+        if not a.is_contiguous() or not b.is_contiguous():
+            return False
+        if a_scale_inv.numel() != 1 or b_scale_inv.numel() != 1:
+            return False
+        trans_lhs, trans_rhs = GEMMFP8HipKittensBackend._normalize_layout(trans_a, trans_b, trans_c)
+        return (trans_lhs, trans_rhs) in {
+            (False, True),   # RCR
+            (False, False),  # RRR
+            (True, False),   # CRR
+        }
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        tk = _get_tk_module()
+
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
+            trans_lhs = not trans_b
+            trans_rhs = not trans_a
+        else:
+            lhs, rhs = a, b
+            lhs_scale_inv, rhs_scale_inv = a_scale_inv, b_scale_inv
+            trans_lhs = trans_a
+            trans_rhs = trans_b
+
+        M, N, _ = get_gemm_logical_shape(lhs, rhs, trans_lhs, trans_rhs)
+        scale = (lhs_scale_inv * rhs_scale_inv).float().item()
+        c_buf = torch.empty(M, N, dtype=torch.bfloat16, device=a.device)
+
+        if not trans_lhs and trans_rhs:
+            tk.gemm_rcr(lhs, rhs, c_buf, scale)
+        elif not trans_lhs and not trans_rhs:
+            tk.gemm_rrr(lhs, rhs, c_buf, scale)
+        elif trans_lhs and not trans_rhs:
+            tk.gemm_crr(lhs, rhs, c_buf, scale)
+        else:
+            raise ValueError(
+                f"Unsupported transpose combination for HipKittens: "
+                f"(trans_lhs={trans_lhs}, trans_rhs={trans_rhs})"
+            )
+
+        if c_buf.dtype != out_dtype:
+            c_buf = c_buf.to(out_dtype)
+        return c_buf
+
+
 _GEMM_FP8_BACKENDS = {
     BackendType.HIPBLASLT: BackendEntry(GEMMFP8HipBLASLtBackend),
     BackendType.CK: BackendEntry(GEMMFP8CKBackend),
     BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),
+    BackendType.HIPKITTENS: BackendEntry(GEMMFP8HipKittensBackend, autotune=False),
 }
 
 
