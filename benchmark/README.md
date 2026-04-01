@@ -24,3 +24,9 @@ export MASTER_PORT=
 
 torchrun --nproc_per_node 1 --nnodes "${NNODES}" -node_rank "${NODE_RANK}" --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}"  benchmark/ops/deep_ep/bench_internode.py
 ```
+
+## Symmetric Memory
+
+```bash
+python3 benchmark/ops/bench_symmetric_memory.py --num-processes 8
+```

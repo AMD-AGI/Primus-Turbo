@@ -1,6 +1,6 @@
 import torch
 
-import primus_turbo.pytorch._C
+# import primus_turbo.pytorch._C
 
 # import primus_turbo.pytorch.deep_ep
 # import primus_turbo.pytorch.modules
