@@ -25,8 +25,10 @@ _default_num_sms = 64
 
 P = jax.sharding.PartitionSpec
 
-# DeepEP topk_idx are int64, so we need to enable x64 precision.
-jax.config.update("jax_enable_x64", True)
+# x64 is enabled locally via jax.experimental.enable_x64() context managers
+# in the MaxText integration (moe.py) where DeepEP FFI requires int64 topk_idx.
+# Do NOT set it globally here -- it contaminates default dtypes for the entire
+# training pipeline (loss, optimizer, LR schedule) causing convergence drift.
 
 
 def set_default_num_sms(num_sms: int):
@@ -268,7 +270,7 @@ def _moe_dispatch_bwd(expert_alignment, num_experts, config, ctx, grad_output):
         grad_x, _ = grad_x
 
     (grad_x, grad_topk_weights), _ = _moe_combine_fwd(grad_x, handle, topk_weights=grad_topk_weights)
-    return grad_x, None, grad_topk_weights, None
+    return grad_x, None, None, grad_topk_weights
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
