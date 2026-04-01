@@ -232,6 +232,7 @@ def get_common_flags():
         # "-amdgpu-function-calls=false",
         "-std=c++20",
         "-fgpu-rdc",
+        # "-mprintf-kind=buffered",
     ]
 
     # Check and add optional compiler flags (for ROCm version compatibility)
@@ -270,7 +271,10 @@ def build_kernels_extension():
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
     # kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
-    kernels_sources = [kernels_source_files / "cco" / "ep" / "intranode.cu"]
+    kernels_sources = [kernels_source_files / "cco" / "ep" / "intranode.cu",
+                       kernels_source_files / "deep_ep" / "intranode.cu",
+                       kernels_source_files / "deep_ep" / "layout.cu",
+                       kernels_source_files / "deep_ep" / "runtime.cu"]
 
     include_dirs = [
         Path(PROJECT_ROOT / "csrc"),

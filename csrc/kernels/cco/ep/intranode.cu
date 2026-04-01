@@ -9,140 +9,13 @@
         printf(__VA_ARGS__);
 
 namespace primus_turbo::cco::ep {
-template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
-__global__ void get_dispatch_layout(int64_t const *topk_idx, int *num_tokens_per_rank,
-                                    int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
-                                    bool *is_token_in_rank, int num_tokens, int num_topk,
-                                    int num_ranks, int num_experts) {
-    auto sm_id     = static_cast<int>(blockIdx.x);
-    auto thread_id = static_cast<int>(threadIdx.x);
-
-    // Count expert statistics
-    __shared__ int num_tokens_per_expert_per_thread[kNumThreads][kNumExpertsPerSM];
-    int            expert_begin_idx = sm_id * kNumExpertsPerSM,
-        expert_end_idx              = min(expert_begin_idx + kNumExpertsPerSM, num_experts);
-    if (expert_begin_idx < expert_end_idx) {
-// Per-thread count
-#pragma unroll
-        for (int i = 0; i < kNumExpertsPerSM; ++i)
-            num_tokens_per_expert_per_thread[thread_id][i] = 0;
-#pragma unroll
-        for (int i = thread_id; i < num_tokens; i += kNumThreads) {
-            auto shifted_topk_idx = topk_idx + i * num_topk;
-#pragma unroll
-            for (int j = 0, expert_idx; j < num_topk; ++j) {
-                expert_idx = static_cast<int>(shifted_topk_idx[j]);
-                if (expert_begin_idx <= expert_idx and expert_idx < expert_end_idx)
-                    ++num_tokens_per_expert_per_thread[thread_id][expert_idx - expert_begin_idx];
-            }
-        }
-        __syncthreads();
-
-        // Sum up
-        EP_STATIC_ASSERT(kNumExpertsPerSM <= kNumThreads, "Too many experts per SM");
-        if (expert_begin_idx + thread_id < expert_end_idx) {
-            int sum = 0;
-#pragma unroll
-            for (int i = 0; i < kNumThreads; ++i)
-                sum += num_tokens_per_expert_per_thread[i][thread_id];
-            num_tokens_per_expert[expert_begin_idx + thread_id] = sum;
-        }
-        return;
-    }
-
-    if (num_tokens_per_rdma_rank != nullptr)
-        EP_DEVICE_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0 and num_ranks > NUM_MAX_NVL_PEERS);
-
-    // Count rank statistics
-    constexpr int  kNumRDMARanksPerSM = kNumRanksPerSM / NUM_MAX_NVL_PEERS;
-    __shared__ int num_tokens_per_rank_per_thread[kNumThreads][kNumRanksPerSM];
-    __shared__ int num_tokens_per_rdma_rank_per_thread[kNumThreads][kNumRDMARanksPerSM];
-    auto           sm_begin       = (num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM;
-    int            rank_begin_idx = (sm_id - sm_begin) * kNumRanksPerSM,
-        rank_end_idx              = min(rank_begin_idx + kNumRanksPerSM, num_ranks);
-    int rdma_rank_begin_idx       = rank_begin_idx / NUM_MAX_NVL_PEERS,
-        rdma_rank_end_idx         = rank_end_idx / NUM_MAX_NVL_PEERS;
-    if (rank_begin_idx < rank_end_idx) {
-        auto const num_expert_per_rank = num_experts / num_ranks;
-        auto       expert_begin        = rank_begin_idx * num_expert_per_rank;
-        auto       expert_end          = rank_end_idx * num_expert_per_rank;
-
-// Per-thread count
-#pragma unroll
-        for (int i = 0; i < kNumRanksPerSM; ++i)
-            num_tokens_per_rank_per_thread[thread_id][i] = 0;
-#pragma unroll
-        for (int i = 0; i < kNumRDMARanksPerSM; ++i)
-            num_tokens_per_rdma_rank_per_thread[thread_id][i] = 0;
-#pragma unroll
-        for (int i = thread_id; i < num_tokens; i += kNumThreads) {
-            auto shifted_topk_idx           = topk_idx + i * num_topk;
-            int  is_in_rank[kNumRanksPerSM] = {0}, is_in_rdma_rank[kNumRDMARanksPerSM] = {0};
-#pragma unroll
-            for (int j = 0, expert_idx, rank_idx; j < num_topk; ++j) {
-                expert_idx = static_cast<int>(shifted_topk_idx[j]);
-                if (expert_begin <= expert_idx and expert_idx < expert_end) {
-                    // Count single rank
-                    rank_idx = expert_idx / num_expert_per_rank - rank_begin_idx;
-                    is_in_rank[rank_idx]++, is_in_rdma_rank[rank_idx / NUM_MAX_NVL_PEERS]++;
-                }
-            }
-
-            auto shifted_is_token_in_rank = is_token_in_rank + i * num_ranks;
-#pragma unroll
-            for (int j = 0; j + rank_begin_idx < rank_end_idx; ++j) {
-                shifted_is_token_in_rank[j + rank_begin_idx] = (is_in_rank[j] > 0);
-                num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0);
-            }
-
-#pragma unroll
-            for (int j = 0; j + rdma_rank_begin_idx < rdma_rank_end_idx; ++j)
-                num_tokens_per_rdma_rank_per_thread[thread_id][j] += (is_in_rdma_rank[j] > 0);
-        }
-        __syncthreads();
-
-        // Sum up
-        EP_STATIC_ASSERT(kNumRanksPerSM <= kNumThreads, "Too many ranks per SM");
-        if (rank_begin_idx + thread_id < rank_end_idx) {
-            int sum = 0;
-#pragma unroll
-            for (int i = 0; i < kNumThreads; ++i)
-                sum += num_tokens_per_rank_per_thread[i][thread_id];
-            num_tokens_per_rank[rank_begin_idx + thread_id] = sum;
-        }
-
-        if (num_tokens_per_rdma_rank != nullptr and
-            rdma_rank_begin_idx + thread_id < rdma_rank_end_idx) {
-            int sum = 0;
-#pragma unroll
-            for (int i = 0; i < kNumThreads; ++i)
-                sum += num_tokens_per_rdma_rank_per_thread[i][thread_id];
-            num_tokens_per_rdma_rank[rdma_rank_begin_idx + thread_id] = sum;
-        }
-    }
-}
-
-void get_dispatch_layout(int64_t const *topk_idx, int *num_tokens_per_rank,
-                         int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
-                         bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
-                         int num_experts, cudaStream_t stream) {
-    constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
-    int           num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) +
-                  (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
-    EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");
-
-    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    LAUNCH_KERNEL(&cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
-                  topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
-                  is_token_in_rank, num_tokens, num_topk, num_ranks, num_experts);
-}
 namespace intranode {
 
 template <int kNumRanks>
 __global__ void
-notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
-                int const *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
-                int num_experts, int num_tokens, int num_channels, bool const *is_token_in_rank,
+notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter,
+                const int *num_tokens_per_expert, int *moe_recv_expert_counter, int num_experts,
+                int num_tokens, int num_channels, const bool *is_token_in_rank,
                 int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
                 int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank) {
     auto sm_id     = static_cast<int>(blockIdx.x);
@@ -161,15 +34,12 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
         }
 
         // After this loop:
-        //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i
-        //  to rank j
-        //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i
-        //  to local expert j
+        //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
+        //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert
+        //  j
         int num_experts_per_rank = num_experts / kNumRanks;
         if (thread_id < kNumRanks) {
-#pragma unroll
-            for (int i = 0; i < kNumRanks; ++i)
-                per_rank_buffer[rank * kNumRanks + i] = num_tokens_per_rank[i];
+            per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
 #pragma unroll
             for (int i = 0; i < num_experts_per_rank; ++i)
                 per_expert_buffer[rank * num_experts_per_rank + i] =
@@ -188,8 +58,7 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
                 local_per_rank_buffer[i * kNumRanks + thread_id] +=
                     local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
             if (thread_id == rank)
-                *moe_recv_counter_mapped =
-                    local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
+                *moe_recv_counter = local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
         }
 
         // Sum per-experts counts and return to CPU
@@ -200,7 +69,7 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
             for (int i = 0; i < kNumRanks; ++i)
                 sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id];
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
-            moe_recv_expert_counter_mapped[thread_id] = sum;
+            moe_recv_expert_counter[thread_id] = sum;
         }
         __syncthreads();
 
@@ -243,15 +112,15 @@ notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped,
     }
 }
 
-void notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
-                     int const *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
-                     int num_experts, int num_tokens, bool const *is_token_in_rank,
+void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter, int num_ranks,
+                     const int *num_tokens_per_expert, int *moe_recv_expert_counter,
+                     int num_experts, int num_tokens, const bool *is_token_in_rank,
                      int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
                      int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
                      cudaStream_t stream, int num_channels) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                         \
-    LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, num_tokens_per_rank, moe_recv_counter_mapped,      \
-                  num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, num_tokens,  \
+    LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, num_tokens_per_rank, moe_recv_counter,             \
+                  num_tokens_per_expert, moe_recv_expert_counter, num_experts, num_tokens,         \
                   num_channels, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix_copy,  \
                   num_memset_int, expert_alignment, buffer_ptrs, barrier_signal_ptrs, rank);       \
     break
@@ -267,132 +136,131 @@ void notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mappe
 
 template <int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
-    dispatch(int4 **recv_x, float **recv_x_scales, int **recv_src_idx, int64_t **recv_topk_idx,
-             float **recv_topk_weights, int **recv_channel_offset, int *send_head, int4 const *x,
-             float const *x_scales, int64_t const *topk_idx, float const *topk_weights,
-             bool const *is_token_in_rank, int const *channel_prefix_matrix,
-             int const *rank_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
+    dispatch(void **workspace_ptrs, int4 const *x, float const *x_scales, int64_t const *topk_idx,
+             float const *topk_weights, bool const *is_token_in_rank,
+             int const *channel_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
              int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
-             int rank) {
+             int rank, int num_max_tokens) {
     auto const num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     auto const thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
-    bool const is_sender = sm_id % 2 == 0;
-    EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
     // Several warps are response for a single rank
     auto const num_threads_per_rank = kNumThreads / kNumRanks;
-    auto const num_channels         = num_sms / 2;
+    auto const num_channels         = num_sms;
     auto const responsible_rank     = (static_cast<int>(thread_id)) / num_threads_per_rank;
-    // Even-numbered blocks for sending, odd-numbered blocks for receiving.
-    auto const responsible_channel = sm_id / 2;
+    auto const responsible_channel  = sm_id;
 
     int num_experts_per_rank = num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
     EP_DEVICE_ASSERT(num_topk <= WARP_SIZE);
 
-    // EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
-    // EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
+    EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
 
-    auto ptr           = reinterpret_cast<void *>(recv_x[is_sender ? responsible_rank : rank]);
-    auto recv_x_buffer = Buffer<int4>(ptr, 128);
+    auto       ptr                      = workspace_ptrs[responsible_rank];
+    auto       rank_prefix_matrix       = Buffer<int>(ptr, kNumRanks * kNumRanks);
+    auto const num_recv_x_total         = num_max_tokens * hidden_int4;
+    auto       recv_x_buffer            = Buffer<int4>(ptr, num_recv_x_total);
+    auto       recv_topk_idx_buffer     = Buffer<int64_t>(ptr, num_max_tokens * num_topk);
+    auto       recv_topk_weights_buffer = Buffer<float>(ptr, num_max_tokens * num_topk);
 
-    if (is_sender) {
-        // Workers for sending
-        constexpr int num_send_warps          = kNumThreads / WARP_SIZE;
-        constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
-        auto const    send_thread_id          = thread_id;
-        auto const    send_warp_id_in_rank    = send_thread_id % num_threads_per_rank / WARP_SIZE;
-        EP_DEVICE_ASSERT(kNumRanks <= WARP_SIZE);
-        EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
+    // Workers for sending
+    constexpr int num_send_warps          = kNumThreads / WARP_SIZE;
+    constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
+    auto const    send_thread_id          = thread_id;
+    auto const    send_warp_id_in_rank    = send_thread_id % num_threads_per_rank / WARP_SIZE;
+    EP_DEVICE_ASSERT(kNumRanks <= WARP_SIZE);
+    EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
-        // Get tasks
-        int token_start_idx, token_end_idx;
-        get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx,
-                               token_end_idx);
+    // Get tasks
+    int token_start_idx, token_end_idx;
+    get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx,
+                           token_end_idx);
 
-        // Calculate offset first
-        int rank_offset =
-            rank > 0 ? rank_prefix_matrix[(rank - 1) * kNumRanks + responsible_rank] : 0;
+    // Calculate offset first
+    int rank_offset =
+        rank > 0 ? rank_prefix_matrix[(rank - 1) * kNumRanks + responsible_rank] : 0;
 
-        // Receive channel offset
-        int total_offset, num_tokens_to_recv;
-        // `-value - 1`, e.g. 0 -> -1, 1 -> -2
-        // NOTES: this is for distinguishing zero tokens
-        if (lane_id == 0) {
-            total_offset = responsible_channel > 0
-                               ? channel_prefix_matrix[responsible_rank * num_channels +
-                                                       responsible_channel - 1]
-                               : 0;
-            num_tokens_to_recv =
-                channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
-            num_tokens_to_recv -= total_offset;
-        }
-        __syncwarp();
+    // Receive channel offset
+    int total_offset, num_tokens_to_recv;
+    // `-value - 1`, e.g. 0 -> -1, 1 -> -2
+    // NOTES: this is for distinguishing zero tokens
+    total_offset =
+        responsible_channel > 0
+            ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1]
+            : 0;
+    num_tokens_to_recv =
+        channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
+    num_tokens_to_recv -= total_offset;
 
-        total_offset = __shfl_sync(WARP_MASK, total_offset, 0);
-        total_offset += rank_offset;
-        num_tokens_to_recv = __shfl_sync(WARP_MASK, num_tokens_to_recv, 0);
+    total_offset += rank_offset;
 
-        // PRINT_DEBUG("total_offset: %d, num_tokens_to_recv: %d\n", total_offset,
-        // num_tokens_to_recv);
+    if (num_tokens_to_recv <= 0)
+        return;
 
-        if (num_tokens_to_recv <= 0)
-            return;
+    // Iterate over all tokens and send tokens to symmetric buffer
+    int chunk_idx = -1;
 
-        // Iterate over all tokens and send tokens to symmetric buffer
-        int chunk_idx = 0;
-        for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
+    for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
+        // Skip if not selected
+        // TODO(zhenhuang12): use __ldg
+        if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank])
+            continue;
+        ++chunk_idx;
 
-            // Skip if not selected
-            if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
-                token_idx++;
-                continue;
-            }
+        // Distribute selected tokens by selected-token index for better balance.
+        if (chunk_idx % num_send_warps_per_rank != send_warp_id_in_rank)
+            continue;
 
-            // Copy data
-            auto dst_slot_idx = total_offset + chunk_idx;
-            // EP_DEVICE_ASSERT(dst_slot_idx * hidden_int4 < 1000000000 and dst_slot_idx);
-            PRINT_DEBUG("dst_slot_idx: %d\n", dst_slot_idx);
-            auto shifted_recv_x_buffers = recv_x_buffer.buffer() + dst_slot_idx * hidden_int4;
-            auto shifted_x              = x + token_idx * hidden_int4;
-            // UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_buffers, shifted_x, __ldg,
-            //                    st_na_global);
+        // Copy data
+        auto dst_slot_idx   = total_offset + chunk_idx;
+        auto shifted_recv_x = recv_x_buffer.buffer() + dst_slot_idx * hidden_int4;
+        auto shifted_x      = x + token_idx * hidden_int4;
+        UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x, shifted_x, __ldg,
+                           st_na_global);
 
-            chunk_idx++;
-            token_idx++;
-        }
-    } else {
+        // Copy `topk_idx` and `topk_weights`
+        // if (lane_id < num_topk) {
+        //     // Top-k index
+        //     int recv_expert_begin = responsible_rank * num_experts_per_rank,
+        //         recv_expert_end   = (responsible_rank + 1) * num_experts_per_rank;
+        //     auto idx_value        = __ldg(topk_idx + token_idx * num_topk + lane_id);
+        //     idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end)
+        //                     ? idx_value - recv_expert_begin
+        //                     : -1;
+        //     recv_topk_idx_buffer[dst_slot_idx * num_topk + lane_id] = idx_value;
+
+        //     // Top-k weights
+        //     auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
+        //     weight_value      = (idx_value >= 0) ? weight_value : 0.0f;
+        //     recv_topk_weights_buffer[dst_slot_idx * num_topk + lane_id] = weight_value;
+        // }
+        // __syncwarp();
+
+        // Copy `x_scales`
     }
+    EP_DEVICE_ASSERT(chunk_idx + 1 == num_tokens_to_recv);
 }
 
-void dispatch(void **recv_x, float **recv_x_scales, int **recv_src_idx, int64_t **recv_topk_idx,
-              float **recv_topk_weights, int **recv_channel_offset, int *send_head, void const *x,
-              float const *x_scales, int64_t const *topk_idx, float const *topk_weights,
-              bool const *is_token_in_rank, int const *channel_prefix_matrix,
-              int const *rank_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
+void dispatch(void **workspace_ptrs, void const *x, float const *x_scales, int64_t const *topk_idx,
+              float const *topk_weights, bool const *is_token_in_rank,
+              int const *channel_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
               int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
-              int rank, int num_ranks, cudaStream_t stream, int num_sms) {
+              int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens) {
     constexpr int kNumThreads = 1024;
-
-    // Make sure never OOB
-    // EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride <
-    //                std::numeric_limits<int>::max());
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
         auto kernel = dispatch<ranks, kNumThreads>;                                                \
-        LAUNCH_KERNEL(&cfg, kernel, reinterpret_cast<int4 **>(recv_x), recv_x_scales,              \
-                      recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset,         \
-                      send_head, reinterpret_cast<int4 const *>(x), x_scales, topk_idx,            \
-                      topk_weights, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix,   \
-                      num_tokens, hidden_int4, num_topk, num_experts, num_scales,                  \
-                      scale_token_stride, scale_hidden_stride, rank);                              \
+        LAUNCH_KERNEL(&cfg, kernel, workspace_ptrs, reinterpret_cast<int4 const *>(x), x_scales,   \
+                      topk_idx, topk_weights, is_token_in_rank, channel_prefix_matrix, num_tokens, \
+                      hidden_int4, num_topk, num_experts, num_scales, scale_token_stride,          \
+                      scale_hidden_stride, rank, num_max_tokens);                                  \
     }                                                                                              \
     break
 
-    // Even-numbered blocks for sending, odd-numbered blocks for receiving.
+    // Sender-only kernel: one block per channel.
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    SETUP_LAUNCH_CONFIG(num_sms / 2, kNumThreads, stream);
     SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }

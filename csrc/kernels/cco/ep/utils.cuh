@@ -25,12 +25,6 @@ using f32_gptr = __attribute__((address_space(1))) float *;
     __hip_atomic_fetch_add((ptr), (val), (order), (scope))
 #endif
 
-#ifdef DISABLE_BUILTIN_SHLF_SYNC
-// use __shlf instead of __shlf_sync will speed up combine performance
-#define __shfl_xor_sync(mask, var, srcLane) __shfl_xor((var), (srcLane))
-#define __shfl_sync(mask, var, srcLane) __shfl((var), (srcLane))
-#endif
-
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #define __syncwarp(...) __builtin_amdgcn_wave_barrier()
 #endif

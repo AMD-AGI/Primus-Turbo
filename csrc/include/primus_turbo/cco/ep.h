@@ -23,12 +23,10 @@ void cached_notify_dispatch(int const *rank_prefix_matrix, int num_memset_int, v
                             int **barrier_signal_ptrs, int rank, int num_ranks,
                             cudaStream_t stream);
 
-void dispatch(void **recv_x, float **recv_x_scales, int **recv_src_idx, int64_t **recv_topk_idx,
-              float **recv_topk_weights, int **recv_channel_offset, int *send_head, void const *x,
-              float const *x_scales, int64_t const *topk_idx, float const *topk_weights,
-              bool const *is_token_in_rank, int const *channel_prefix_matrix,
-              int const *rank_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
+void dispatch(void **workspace_ptrs, void const *x, float const *x_scales, int64_t const *topk_idx,
+              float const *topk_weights, bool const *is_token_in_rank,
+              int const *channel_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
               int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
-              int rank, int num_ranks, cudaStream_t stream, int num_sms);
+              int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens);
 } // namespace intranode
 } // namespace primus_turbo::cco::ep

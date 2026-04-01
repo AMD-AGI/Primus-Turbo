@@ -62,10 +62,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     //     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 
     // ********* CCO *********
-    m.def("fused_dispatch_groupedgemm(Tensor x, Tensor? x_scales, Tensor? topk_idx, Tensor? "
-          "topk_weights, "
-          "int num_experts, Tensor workspace, str group_name, int num_sms) -> (Tensor, Tensor, "
-          "Tensor, Tensor, Tensor, Tensor)");
+    // m.def("fused_dispatch_groupedgemm(Tensor x, Tensor? x_scales, Tensor? topk_idx, Tensor? "
+    //       "topk_weights, "
+    //       "int num_experts, Tensor workspace, str group_name, int num_sms) -> (Tensor, Tensor, "
+    //       "Tensor, Tensor, Tensor, Tensor, Tensor)");
 
     // ********* CCO *********
 }
@@ -96,7 +96,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     //     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
 
     // ********* CCO *********
-    m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm);
+    // m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -124,7 +124,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     //     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
 
     // ********* CCO *********
-    m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm_meta);
+    // m.impl("fused_dispatch_groupedgemm", fused_dispatch_groupedgemm_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -188,6 +188,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     //     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     //     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
     //     runtime_module.def("destroy_stream", &destroy_stream);
+
+    // ********* CCO *********
+
+    m.def("fused_dispatch_groupedgemm", primus_turbo::pytorch::fused_dispatch_groupedgemm);
+    m.def("get_dispatch_layout", primus_turbo::pytorch::get_dispatch_layout);
+    m.def("fused_dispatch", primus_turbo::pytorch::fused_dispatch);
 }
 
 /********************************************/

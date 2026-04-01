@@ -184,18 +184,30 @@ void destroy_stream(const int device_id, const int64_t stream_ptr);
 //  CCO
 //==================================================================
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
+get_dispatch_layout(const torch::Tensor &topk_idx, const std::string &group_name, int num_experts,
+                    const torch::Tensor &workspace);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                            const std::optional<at::Tensor> &topk_idx,
                            const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
                            const at::Tensor &workspace, const std::string &group_name,
                            const int64_t num_sms);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
 fused_dispatch_groupedgemm_meta(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                                 const std::optional<at::Tensor> &topk_idx,
                                 const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
                                 const at::Tensor &workspace, const std::string &group_name,
                                 const int64_t num_sms);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
+fused_dispatch(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
+               const std::optional<at::Tensor> &topk_idx,
+               const std::optional<at::Tensor> &topk_weights, torch::Tensor &workspace,
+               const std::string &group_name, int num_experts, int expert_alignment, int num_sms);
 
 } // namespace primus_turbo::pytorch
