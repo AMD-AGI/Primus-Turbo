@@ -1,0 +1,178 @@
+[
+  {
+    "batch": 1,
+    "seqlen_q": 1,
+    "seqlen_k": 2048,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=1 cache=2K",
+    "ms": 1.1281,
+    "tflops": 0.03
+  },
+  {
+    "batch": 1,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=1 cache=4K",
+    "ms": 1.1062,
+    "tflops": 0.06
+  },
+  {
+    "batch": 1,
+    "seqlen_q": 1,
+    "seqlen_k": 8192,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=1 cache=8K",
+    "ms": 1.1248,
+    "tflops": 0.12
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1,
+    "seqlen_k": 2048,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=4 cache=2K",
+    "ms": 1.1201,
+    "tflops": 0.12
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=4 cache=4K",
+    "ms": 1.3113,
+    "tflops": 0.2
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1,
+    "seqlen_k": 8192,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=4 cache=8K",
+    "ms": 2.4745,
+    "tflops": 0.22
+  },
+  {
+    "batch": 8,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=8 cache=4K",
+    "ms": 2.343,
+    "tflops": 0.23
+  },
+  {
+    "batch": 16,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "decode B=16 cache=4K",
+    "ms": 4.7935,
+    "tflops": 0.22
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 8,
+    "head_dim": 128,
+    "desc": "decode GQA B=4",
+    "ms": 1.1139,
+    "tflops": 0.24
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1,
+    "seqlen_k": 4096,
+    "nheads_q": 64,
+    "nheads_kv": 8,
+    "head_dim": 128,
+    "desc": "decode GQA B=4 64h",
+    "ms": 1.3299,
+    "tflops": 0.4
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 4,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "short-pf sq=4",
+    "ms": 1.3197,
+    "tflops": 0.81
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 16,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "short-pf sq=16",
+    "ms": 1.3147,
+    "tflops": 3.27
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 32,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "short-pf sq=32",
+    "ms": 1.3253,
+    "tflops": 6.48
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 64,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "short-pf sq=64",
+    "ms": 1.3203,
+    "tflops": 13.01
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 256,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "prefill sq=256 (ref)",
+    "ms": 1.374,
+    "tflops": 50.01
+  },
+  {
+    "batch": 4,
+    "seqlen_q": 1024,
+    "seqlen_k": 4096,
+    "nheads_q": 32,
+    "nheads_kv": 32,
+    "head_dim": 128,
+    "desc": "prefill sq=1024 (ref)",
+    "ms": 1.9365,
+    "tflops": 141.95
+  }
+]

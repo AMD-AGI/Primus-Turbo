@@ -33,7 +33,11 @@ def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_
     if use_fp8:
         tensor = tensor.permute(0, 2, 1, 3)  # [B, H, L, D]
         B, H, L, D = tensor.shape
-        tensor = tensor.reshape(B, H, L // BLOCK_M, BLOCK_M, D).reshape(B, H, L // BLOCK_M, BLOCK_M * D)
+        padded_L = ((L + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+        if padded_L != L:
+            tensor = torch.nn.functional.pad(tensor, (0, 0, 0, padded_L - L))
+        num_blocks = padded_L // BLOCK_M
+        tensor = tensor.reshape(B, H, num_blocks, BLOCK_M, D).reshape(B, H, num_blocks, BLOCK_M * D)
         MAX_E4M3 = torch.finfo(float8_dtype).max
         tensor_max = tensor.abs().max(dim=-1)[0]
         tensor_max = torch.where(tensor_max == 0, MAX_E4M3, tensor_max)
@@ -41,7 +45,7 @@ def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_
         tensor = tensor * scale.reshape(scale.shape + (1,))
         tensor = tensor.clamp(-MAX_E4M3, MAX_E4M3)
         tensor = tensor.to(float8_dtype)
-        tensor = tensor.reshape(B, H, L, D).permute(0, 2, 1, 3).contiguous()
+        tensor = tensor.reshape(B, H, padded_L, D)[:, :, :L, :].permute(0, 2, 1, 3).contiguous()
         # [B, L, H, D]
         return tensor, 1.0 / scale.to(torch.float32).contiguous()
     else:
