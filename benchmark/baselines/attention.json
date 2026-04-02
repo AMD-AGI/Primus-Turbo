@@ -1,0 +1,399 @@
+{
+  "operator": "attention",
+  "gpu": "MI300X",
+  "date": "2026-04-02",
+  "num_configs": 78,
+  "geomean_ms": 2.5354,
+  "configs": [
+    {
+      "label": "1 | Batch=1 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 0.57,
+      "tflops": 481.97
+    },
+    {
+      "label": "2 | Batch=2 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 1.13,
+      "tflops": 487.13
+    },
+    {
+      "label": "3 | Batch=4 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 2.2,
+      "tflops": 498.98
+    },
+    {
+      "label": "4 | Batch=1 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.1,
+      "tflops": 498.68
+    },
+    {
+      "label": "5 | Batch=2 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.1,
+      "tflops": 523.78
+    },
+    {
+      "label": "6 | Batch=4 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.24,
+      "tflops": 519.11
+    },
+    {
+      "label": "7 | Batch=1 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.17,
+      "tflops": 506.0
+    },
+    {
+      "label": "8 | Batch=2 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.15,
+      "tflops": 529.34
+    },
+    {
+      "label": "9 | Batch=4 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 8.48,
+      "tflops": 518.89
+    },
+    {
+      "label": "10 | Batch=1 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 8.46,
+      "tflops": 520.07
+    },
+    {
+      "label": "11 | Batch=2 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 16.72,
+      "tflops": 526.05
+    },
+    {
+      "label": "12 | Batch=4 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 33.62,
+      "tflops": 523.24
+    },
+    {
+      "label": "13 | Batch=1 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 1.84,
+      "tflops": 521.9
+    },
+    {
+      "label": "14 | Batch=2 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 3.7,
+      "tflops": 519.95
+    },
+    {
+      "label": "15 | Batch=4 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 7.47,
+      "tflops": 515.15
+    },
+    {
+      "label": "16 | Batch=1 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.29,
+      "tflops": 512.76
+    },
+    {
+      "label": "17 | Batch=2 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 8.7,
+      "tflops": 505.7
+    },
+    {
+      "label": "18 | Batch=4 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 17.15,
+      "tflops": 512.99
+    },
+    {
+      "label": "19 | Batch=1 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 0.58,
+      "tflops": 470.0
+    },
+    {
+      "label": "20 | Batch=2 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.15,
+      "tflops": 476.7
+    },
+    {
+      "label": "21 | Batch=4 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.22,
+      "tflops": 496.33
+    },
+    {
+      "label": "22 | Batch=1 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 3.36,
+      "tflops": 408.56
+    },
+    {
+      "label": "23 | Batch=2 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 6.78,
+      "tflops": 405.3
+    },
+    {
+      "label": "24 | Batch=4 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 13.72,
+      "tflops": 400.56
+    },
+    {
+      "label": "25 | Batch=1 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 0.37,
+      "tflops": 460.86
+    },
+    {
+      "label": "26 | Batch=2 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 0.74,
+      "tflops": 465.13
+    },
+    {
+      "label": "27 | Batch=4 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 1.4,
+      "tflops": 489.69
+    },
+    {
+      "label": "28 | Batch=1 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 1.38,
+      "tflops": 397.97
+    },
+    {
+      "label": "29 | Batch=2 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 2.74,
+      "tflops": 401.04
+    },
+    {
+      "label": "30 | Batch=4 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 5.4,
+      "tflops": 407.49
+    },
+    {
+      "label": "31 | Batch=1 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 2.74,
+      "tflops": 401.95
+    },
+    {
+      "label": "32 | Batch=2 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 5.39,
+      "tflops": 408.34
+    },
+    {
+      "label": "33 | Batch=4 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 10.78,
+      "tflops": 408.01
+    },
+    {
+      "label": "34 | Batch=1 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 3.37,
+      "tflops": 489.65
+    },
+    {
+      "label": "35 | Batch=2 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 6.63,
+      "tflops": 497.41
+    },
+    {
+      "label": "36 | Batch=4 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 12.92,
+      "tflops": 510.79
+    },
+    {
+      "label": "37 | Batch=1 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 1.43,
+      "tflops": 480.08
+    },
+    {
+      "label": "38 | Batch=2 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 2.93,
+      "tflops": 468.46
+    },
+    {
+      "label": "39 | Batch=4 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 5.87,
+      "tflops": 467.93
+    },
+    {
+      "label": "40 | Batch=1 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 0.33,
+      "tflops": 421.03
+    },
+    {
+      "label": "41 | Batch=2 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 0.63,
+      "tflops": 433.77
+    },
+    {
+      "label": "42 | Batch=4 | SeqLen=4096 | num_head_q=32 | num_head_kv=32 | head_dim_qk=128",
+      "mean_ms": 1.3,
+      "tflops": 421.44
+    },
+    {
+      "label": "43 | Batch=1 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 0.63,
+      "tflops": 435.23
+    },
+    {
+      "label": "44 | Batch=2 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.28,
+      "tflops": 428.35
+    },
+    {
+      "label": "45 | Batch=4 | SeqLen=4096 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.45,
+      "tflops": 449.69
+    },
+    {
+      "label": "46 | Batch=1 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.19,
+      "tflops": 463.66
+    },
+    {
+      "label": "47 | Batch=2 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.41,
+      "tflops": 456.82
+    },
+    {
+      "label": "48 | Batch=4 | SeqLen=8192 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.6,
+      "tflops": 478.5
+    },
+    {
+      "label": "49 | Batch=1 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.57,
+      "tflops": 481.63
+    },
+    {
+      "label": "50 | Batch=2 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 9.26,
+      "tflops": 474.92
+    },
+    {
+      "label": "51 | Batch=4 | SeqLen=8192 | num_head_q=128 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 18.16,
+      "tflops": 484.27
+    },
+    {
+      "label": "52 | Batch=1 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 1.12,
+      "tflops": 430.69
+    },
+    {
+      "label": "53 | Batch=2 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 1.98,
+      "tflops": 486.24
+    },
+    {
+      "label": "54 | Batch=4 | SeqLen=8192 | num_head_q=28 | num_head_kv=4 | head_dim_qk=128",
+      "mean_ms": 3.99,
+      "tflops": 482.65
+    },
+    {
+      "label": "55 | Batch=1 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 2.41,
+      "tflops": 455.34
+    },
+    {
+      "label": "56 | Batch=2 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 4.61,
+      "tflops": 477.15
+    },
+    {
+      "label": "57 | Batch=4 | SeqLen=8192 | num_head_q=64 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 9.35,
+      "tflops": 470.43
+    },
+    {
+      "label": "58 | Batch=1 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 0.33,
+      "tflops": 421.37
+    },
+    {
+      "label": "59 | Batch=2 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 0.64,
+      "tflops": 431.27
+    },
+    {
+      "label": "60 | Batch=4 | SeqLen=4096 | num_head_q=32 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.29,
+      "tflops": 424.73
+    },
+    {
+      "label": "61 | Batch=1 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 1.73,
+      "tflops": 397.36
+    },
+    {
+      "label": "62 | Batch=2 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 3.53,
+      "tflops": 389.6
+    },
+    {
+      "label": "63 | Batch=4 | SeqLen=4096 | num_head_q=128 | num_head_kv=128 | head_dim_qk=192",
+      "mean_ms": 7.08,
+      "tflops": 388.32
+    },
+    {
+      "label": "64 | Batch=1 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 0.2,
+      "tflops": 423.93
+    },
+    {
+      "label": "65 | Batch=2 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 0.38,
+      "tflops": 446.45
+    },
+    {
+      "label": "66 | Batch=4 | SeqLen=4096 | num_head_q=16 | num_head_kv=16 | head_dim_qk=192",
+      "mean_ms": 0.78,
+      "tflops": 439.9
+    },
+    {
+      "label": "67 | Batch=1 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 0.75,
+      "tflops": 367.74
+    },
+    {
+      "label": "68 | Batch=2 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 1.47,
+      "tflops": 372.96
+    },
+    {
+      "label": "69 | Batch=4 | SeqLen=8192 | num_head_q=32 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 2.95,
+      "tflops": 373.11
+    },
+    {
+      "label": "70 | Batch=1 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 1.46,
+      "tflops": 377.51
+    },
+    {
+      "label": "71 | Batch=2 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 2.91,
+      "tflops": 377.28
+    },
+    {
+      "label": "72 | Batch=4 | SeqLen=8192 | num_head_q=64 | num_head_kv=4 | head_dim_qk=64",
+      "mean_ms": 5.84,
+      "tflops": 376.56
+    },
+    {
+      "label": "73 | Batch=1 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 1.73,
+      "tflops": 475.93
+    },
+    {
+      "label": "74 | Batch=2 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 3.62,
+      "tflops": 455.49
+    },
+    {
+      "label": "75 | Batch=4 | SeqLen=8192 | num_head_q=48 | num_head_kv=8 | head_dim_qk=128",
+      "mean_ms": 7.03,
+      "tflops": 469.53
+    },
+    {
+      "label": "76 | Batch=1 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 0.78,
+      "tflops": 440.76
+    },
+    {
+      "label": "77 | Batch=2 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 1.6,
+      "tflops": 429.08
+    },
+    {
+      "label": "78 | Batch=4 | SeqLen=4096 | num_head_q=64 | num_head_kv=64 | head_dim_qk=192",
+      "mean_ms": 3.17,
+      "tflops": 432.92
+    }
+  ]
+}

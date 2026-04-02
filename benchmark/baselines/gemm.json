@@ -1,0 +1,429 @@
+{
+  "operator": "gemm",
+  "gpu": "MI300X",
+  "date": "2026-04-02",
+  "num_configs": 84,
+  "geomean_ms": 3.5342,
+  "configs": [
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=1 | M=4096 | N=12288 | K=4096",
+      "mean_ms": 0.67,
+      "tflops": 615.33
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=1 | M=4096 | N=4096 | K=4096",
+      "mean_ms": 0.22,
+      "tflops": 614.68
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=1 | M=4096 | N=22016 | K=4096",
+      "mean_ms": 1.25,
+      "tflops": 592.68
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=1 | M=4096 | N=4096 | K=11008",
+      "mean_ms": 0.58,
+      "tflops": 640.47
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=2 | M=8192 | N=12288 | K=4096",
+      "mean_ms": 1.29,
+      "tflops": 638.59
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=2 | M=8192 | N=4096 | K=4096",
+      "mean_ms": 0.43,
+      "tflops": 631.97
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=2 | M=8192 | N=22016 | K=4096",
+      "mean_ms": 2.35,
+      "tflops": 629.75
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=2 | M=8192 | N=4096 | K=11008",
+      "mean_ms": 1.15,
+      "tflops": 645.13
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=4 | M=16384 | N=12288 | K=4096",
+      "mean_ms": 2.58,
+      "tflops": 638.85
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=4 | M=16384 | N=4096 | K=4096",
+      "mean_ms": 0.87,
+      "tflops": 635.35
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=4 | M=16384 | N=22016 | K=4096",
+      "mean_ms": 4.68,
+      "tflops": 631.69
+    },
+    {
+      "label": "Llama-2-7B | Case=Llama-2-7B | MBS=4 | M=16384 | N=4096 | K=11008",
+      "mean_ms": 2.39,
+      "tflops": 617.19
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=1 | M=4096 | N=10240 | K=8192",
+      "mean_ms": 1.07,
+      "tflops": 643.94
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=1 | M=4096 | N=8192 | K=8192",
+      "mean_ms": 0.86,
+      "tflops": 635.93
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=1 | M=4096 | N=57344 | K=8192",
+      "mean_ms": 6.23,
+      "tflops": 617.81
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=1 | M=4096 | N=8192 | K=28672",
+      "mean_ms": 3.32,
+      "tflops": 578.81
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=2 | M=8192 | N=10240 | K=8192",
+      "mean_ms": 2.14,
+      "tflops": 640.78
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=2 | M=8192 | N=8192 | K=8192",
+      "mean_ms": 1.68,
+      "tflops": 655.93
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=2 | M=8192 | N=57344 | K=8192",
+      "mean_ms": 12.63,
+      "tflops": 609.19
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=2 | M=8192 | N=8192 | K=28672",
+      "mean_ms": 6.65,
+      "tflops": 579.12
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=4 | M=16384 | N=10240 | K=8192",
+      "mean_ms": 4.33,
+      "tflops": 634.16
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=4 | M=16384 | N=8192 | K=8192",
+      "mean_ms": 3.45,
+      "tflops": 636.72
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=4 | M=16384 | N=57344 | K=8192",
+      "mean_ms": 25.48,
+      "tflops": 604.2
+    },
+    {
+      "label": "Llama-2-70B | Case=Llama-2-70B | MBS=4 | M=16384 | N=8192 | K=28672",
+      "mean_ms": 13.4,
+      "tflops": 574.38
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=1 | M=8192 | N=6144 | K=4096",
+      "mean_ms": 0.66,
+      "tflops": 621.04
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=1 | M=8192 | N=4096 | K=4096",
+      "mean_ms": 0.44,
+      "tflops": 621.98
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=1 | M=8192 | N=28672 | K=4096",
+      "mean_ms": 3.06,
+      "tflops": 628.88
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=1 | M=8192 | N=4096 | K=14336",
+      "mean_ms": 1.54,
+      "tflops": 624.23
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=2 | M=16384 | N=6144 | K=4096",
+      "mean_ms": 1.32,
+      "tflops": 623.13
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=2 | M=16384 | N=4096 | K=4096",
+      "mean_ms": 0.88,
+      "tflops": 622.43
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=2 | M=16384 | N=28672 | K=4096",
+      "mean_ms": 6.19,
+      "tflops": 622.17
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=2 | M=16384 | N=4096 | K=14336",
+      "mean_ms": 3.17,
+      "tflops": 606.13
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=4 | M=32768 | N=6144 | K=4096",
+      "mean_ms": 2.61,
+      "tflops": 632.0
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=4 | M=32768 | N=4096 | K=4096",
+      "mean_ms": 1.77,
+      "tflops": 621.97
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=4 | M=32768 | N=28672 | K=4096",
+      "mean_ms": 12.38,
+      "tflops": 621.92
+    },
+    {
+      "label": "Llama-3.1-8B | Case=Llama-3.1-8B | MBS=4 | M=32768 | N=4096 | K=14336",
+      "mean_ms": 6.15,
+      "tflops": 625.32
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=1 | M=8192 | N=18432 | K=16384",
+      "mean_ms": 8.75,
+      "tflops": 565.4
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=1 | M=8192 | N=16384 | K=16384",
+      "mean_ms": 7.88,
+      "tflops": 558.48
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=1 | M=8192 | N=106496 | K=16384",
+      "mean_ms": 48.14,
+      "tflops": 593.82
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=1 | M=8192 | N=16384 | K=53248",
+      "mean_ms": 25.33,
+      "tflops": 564.37
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=2 | M=16384 | N=18432 | K=16384",
+      "mean_ms": 17.15,
+      "tflops": 576.9
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=2 | M=16384 | N=16384 | K=16384",
+      "mean_ms": 14.52,
+      "tflops": 605.89
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=2 | M=16384 | N=106496 | K=16384",
+      "mean_ms": 97.24,
+      "tflops": 587.98
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=2 | M=16384 | N=16384 | K=53248",
+      "mean_ms": 48.02,
+      "tflops": 595.3
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=4 | M=32768 | N=18432 | K=16384",
+      "mean_ms": 34.27,
+      "tflops": 577.55
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=4 | M=32768 | N=16384 | K=16384",
+      "mean_ms": 29.05,
+      "tflops": 605.68
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=4 | M=32768 | N=106496 | K=16384",
+      "mean_ms": 195.04,
+      "tflops": 586.28
+    },
+    {
+      "label": "Llama-3.1-405B | Case=Llama-3.1-405B | MBS=4 | M=32768 | N=16384 | K=53248",
+      "mean_ms": 96.27,
+      "tflops": 593.9
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=1 | M=8192 | N=4608 | K=3584",
+      "mean_ms": 0.46,
+      "tflops": 587.22
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=1 | M=8192 | N=3584 | K=3584",
+      "mean_ms": 0.34,
+      "tflops": 616.45
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=1 | M=8192 | N=37888 | K=3584",
+      "mean_ms": 3.77,
+      "tflops": 590.66
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=1 | M=8192 | N=3584 | K=18944",
+      "mean_ms": 1.86,
+      "tflops": 599.57
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=2 | M=16384 | N=4608 | K=3584",
+      "mean_ms": 0.91,
+      "tflops": 592.32
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=2 | M=16384 | N=3584 | K=3584",
+      "mean_ms": 0.68,
+      "tflops": 615.36
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=2 | M=16384 | N=37888 | K=3584",
+      "mean_ms": 7.57,
+      "tflops": 587.85
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=2 | M=16384 | N=3584 | K=18944",
+      "mean_ms": 3.74,
+      "tflops": 595.6
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=4 | M=32768 | N=4608 | K=3584",
+      "mean_ms": 1.79,
+      "tflops": 605.5
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=4 | M=32768 | N=3584 | K=3584",
+      "mean_ms": 1.36,
+      "tflops": 617.12
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=4 | M=32768 | N=37888 | K=3584",
+      "mean_ms": 15.33,
+      "tflops": 580.47
+    },
+    {
+      "label": "Qwen2.5-7B | Case=Qwen2.5-7B | MBS=4 | M=32768 | N=3584 | K=18944",
+      "mean_ms": 7.45,
+      "tflops": 597.34
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=1 | M=8192 | N=10240 | K=8192",
+      "mean_ms": 2.2,
+      "tflops": 625.47
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=1 | M=8192 | N=8192 | K=8192",
+      "mean_ms": 1.74,
+      "tflops": 630.43
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=1 | M=8192 | N=59136 | K=8192",
+      "mean_ms": 13.36,
+      "tflops": 594.22
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=1 | M=8192 | N=8192 | K=29568",
+      "mean_ms": 6.9,
+      "tflops": 575.18
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=2 | M=16384 | N=10240 | K=8192",
+      "mean_ms": 4.44,
+      "tflops": 619.48
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=2 | M=16384 | N=8192 | K=8192",
+      "mean_ms": 3.51,
+      "tflops": 626.02
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=2 | M=16384 | N=59136 | K=8192",
+      "mean_ms": 26.97,
+      "tflops": 588.65
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=2 | M=16384 | N=8192 | K=29568",
+      "mean_ms": 14.23,
+      "tflops": 557.92
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=4 | M=32768 | N=10240 | K=8192",
+      "mean_ms": 12.27,
+      "tflops": 448.16
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=4 | M=32768 | N=8192 | K=8192",
+      "mean_ms": 6.95,
+      "tflops": 632.94
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=4 | M=32768 | N=59136 | K=8192",
+      "mean_ms": 53.56,
+      "tflops": 592.72
+    },
+    {
+      "label": "Qwen2.5-72B | Case=Qwen2.5-72B | MBS=4 | M=32768 | N=8192 | K=29568",
+      "mean_ms": 26.07,
+      "tflops": 608.99
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=1 | M=4096 | N=6144 | K=4096",
+      "mean_ms": 0.35,
+      "tflops": 586.83
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=1 | M=4096 | N=4096 | K=4096",
+      "mean_ms": 0.23,
+      "tflops": 594.57
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=1 | M=4096 | N=28672 | K=4096",
+      "mean_ms": 1.57,
+      "tflops": 614.15
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=1 | M=4096 | N=4096 | K=14336",
+      "mean_ms": 0.78,
+      "tflops": 618.74
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=2 | M=8192 | N=6144 | K=4096",
+      "mean_ms": 0.68,
+      "tflops": 609.38
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=2 | M=8192 | N=4096 | K=4096",
+      "mean_ms": 0.45,
+      "tflops": 611.27
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=2 | M=8192 | N=28672 | K=4096",
+      "mean_ms": 3.11,
+      "tflops": 617.76
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=2 | M=8192 | N=4096 | K=14336",
+      "mean_ms": 1.56,
+      "tflops": 618.25
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=4 | M=16384 | N=6144 | K=4096",
+      "mean_ms": 1.34,
+      "tflops": 614.09
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=4 | M=16384 | N=4096 | K=4096",
+      "mean_ms": 0.9,
+      "tflops": 614.11
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=4 | M=16384 | N=28672 | K=4096",
+      "mean_ms": 6.29,
+      "tflops": 611.87
+    },
+    {
+      "label": "Mistral-7B | Case=Mistral-7B | MBS=4 | M=16384 | N=4096 | K=14336",
+      "mean_ms": 3.23,
+      "tflops": 596.19
+    }
+  ]
+}

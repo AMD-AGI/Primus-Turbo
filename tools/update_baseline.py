@@ -43,15 +43,43 @@ def parse_csv(csv_path: str) -> list[dict]:
     with open(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            label = row.get("label", row.get("Case", row.get("config", "")))
-            mean_ms = float(row.get("mean_ms", row.get("Mean(ms)", 0)))
-            std_ms = float(row.get("std_ms", row.get("Std(ms)", 0)))
+            label_parts = []
+            for key in ("Case", "label", "config", "TestID"):
+                if key in row and row[key]:
+                    label_parts.append(row[key])
+                    break
+            extra_keys = [k for k in row if k not in (
+                "TestID", "Platform", "GPU", "Check", "Deterministic",
+                "Deterministic Check",
+            ) and "Time" not in k and "TFLOPS" not in k and "FLOPS" not in k]
+            for k in extra_keys[:5]:
+                if row.get(k):
+                    label_parts.append(f"{k}={row[k]}")
+            label = " | ".join(label_parts)
+
+            mean_ms = 0.0
+            for col in ("mean_ms", "Mean(ms)", "Forward Time (ms)", "Time (ms)"):
+                if col in row:
+                    try:
+                        mean_ms = float(row[col])
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+            fwd_tflops = 0.0
+            for col in ("Forward TFLOPS", "TFLOPS"):
+                if col in row:
+                    try:
+                        fwd_tflops = float(row[col])
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
             if mean_ms > 0:
-                configs.append({
-                    "label": label,
-                    "mean_ms": round(mean_ms, 4),
-                    "std_ms": round(std_ms, 4),
-                })
+                entry = {"label": label, "mean_ms": round(mean_ms, 4)}
+                if fwd_tflops > 0:
+                    entry["tflops"] = round(fwd_tflops, 2)
+                configs.append(entry)
     return configs
 
 
