@@ -69,7 +69,7 @@ def _moe_dispatch_abstract_eval(
     num_channels = num_sms // 2
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_worst_tokens)
     recv_x = ShapedArray((num_worst_tokens, hidden_size), x.dtype)
-    recv_topk_idx = ShapedArray((num_worst_tokens, num_topk), jnp.int64)
+    recv_topk_idx = ShapedArray((num_worst_tokens, num_topk), jnp.int32)
     recv_topk_weights = ShapedArray((num_worst_tokens, num_topk), jnp.float32)
     is_token_in_rank = ShapedArray((num_tokens, num_ranks), jnp.bool_)
     num_tokens_per_rank = ShapedArray((num_ranks,), jnp.int32)

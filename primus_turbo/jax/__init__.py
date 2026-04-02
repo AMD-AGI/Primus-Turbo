@@ -40,6 +40,5 @@ def initialize():
     # for primitive, func in TRANSPOSE_TABLE.items():
     #     ad.primitive_transposes[primitive] = func
 
-    # print("[Primus-Turbo/Jax] : primitive_batchers")
-    # for primitive, func in BATCHING_TABLE.items():
-    #     batching.primitive_batchers[primitive] = func
+    for primitive, func in BATCHING_TABLE.items():
+        batching.primitive_batchers[primitive] = func

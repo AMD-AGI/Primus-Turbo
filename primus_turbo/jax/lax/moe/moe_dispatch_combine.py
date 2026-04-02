@@ -25,9 +25,6 @@ _default_num_sms = 64
 
 P = jax.sharding.PartitionSpec
 
-# DeepEP topk_idx are int64, so we need to enable x64 precision.
-jax.config.update("jax_enable_x64", True)
-
 
 def set_default_num_sms(num_sms: int):
     """Set the default number of SMS.
@@ -118,16 +115,12 @@ def moe_dispatch(
             - If a tuple, the first element must be `[num_tokens, hidden]` with dtype `jnp.float8_e4m3fn`,
               and the second element must be `[num_tokens, hidden // 128]` (where hidden is divisible by 128)
               with dtype `jnp.float32`.
-        handle: An optional communication handle. If provided, the function reuses the cached layout
-            information to reduce computation overhead. When `handle` is specified, `topk_idx` and
-            `topk_weights` must be `None`.
-        topk_idx: A `jnp.ndarray` of shape `[num_tokens, num_topk]` and dtype `jnp.int64`, representing
+        topk_idx: A `jnp.ndarray` of shape `[num_tokens, num_topk]` and dtype `jnp.int32`, representing
             the expert indices selected by each token. A value of `-1` indicates no selection.
-            Required when `handle` is `None`.
         topk_weights: A `jnp.ndarray` of shape `[num_tokens, num_topk]` and dtype `jnp.float32`,
-            representing the routing weights for each token's selected experts. Required when `handle` is `None`.
+            representing the routing weights for each token's selected experts.
+        num_experts: The total number of experts across all ranks.
         expert_alignment: An integer specifying the alignment for the number of tokens received by each local expert.
-        num_experts: The total number of experts across all ranks. Required when `handle` is `None`.
         config: An optional performance tuning configuration. If `None`, the default configuration from
             `get_dispatch_config()` is used.
 
@@ -215,7 +208,8 @@ def _moe_dispatch_impl(
             num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
             num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
         )
-        return (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x, None, None, None
+        recv = (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x
+        return recv, None, None, None
     else:
         assert topk_idx is not None and topk_weights is not None
         assert num_experts is not None
@@ -281,12 +275,12 @@ def _moe_dispatch_fwd(
         config=config,
     )
 
-    ctx = (handle, config)
+    ctx = (handle,)
     return (recv_x, recv_topk_idx, recv_topk_weights, handle), ctx
 
 
-def _moe_dispatch_bwd(ctx, grad_output):
-    handle, config = ctx
+def _moe_dispatch_bwd(num_experts, expert_alignment, config, ctx, grad_output):
+    (handle,) = ctx
     grad_x, _, grad_topk_weights, _ = grad_output
 
     if isinstance(grad_x, tuple):
@@ -337,7 +331,7 @@ def moe_combine(
     return _moe_combine(x, handle, config)
 
 
-@jax.custom_vjp
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _moe_combine(
     x: jnp.ndarray,
     handle: Tuple,
@@ -401,15 +395,16 @@ def _moe_combine_fwd(
     config: Optional[Config] = None,
 ) -> jnp.ndarray:
     combine_x, _ = _moe_combine_impl(x, handle, config=config)
-    ctx = (handle, config)
+    ctx = (handle,)
     return combine_x, ctx
 
 
-def _moe_combine_bwd(ctx, grad_output):
-    handle, config = ctx
+def _moe_combine_bwd(config, ctx, grad_output):
+    (handle,) = ctx
 
     recv_grad_x, _, _, _ = _moe_dispatch_impl(grad_output, handle=handle, config=config)
-    return recv_grad_x, None, None
+    handle_grad = jax.tree_util.tree_map(jnp.zeros_like, handle)
+    return recv_grad_x, handle_grad
 
 
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
