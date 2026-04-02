@@ -54,7 +54,7 @@ python3 tools/check_regression.py --baseline benchmark/baselines/ --current outp
 # 更新基线（仅在有效优化后）
 python3 tools/update_baseline.py --results output/ --output benchmark/baselines/
 ```
-并追加优化日志到 `docs/optimization-log.md`。
+并追加优化日志到 `agent_docs/optimization-log.md`。
 
 ## Benchmark 最佳实践
 - 确保 GPU 空闲，无其他任务占用显存

@@ -186,8 +186,8 @@ Phase 2 优化目标 (按优先级排序):
 
 | 文档 | 路径 | 说明 |
 |------|------|------|
-| 优化计划 v2 | `docs/agent-optimization-plan.md` | Agent Loop 整体计划 |
-| Phase 1 报告 | `docs/phase1-attention-report.md` | Attention 5 轮优化详情 |
-| MI300X vs MI355X | `docs/mi300x-vs-mi355x-baseline.md` | 三平台性能对比 |
-| CK Attention 评估 | `docs/eval-ck-attention.md` | CK_Tile 集成复杂度评估 |
-| Q1 Report | `docs/report.pdf` | MI355X 原始 benchmark 数据 |
+| 优化计划 v2 | `agent_docs/agent-optimization-plan.md` | Agent Loop 整体计划 |
+| Phase 1 报告 | `agent_docs/phase1-attention-report.md` | Attention 5 轮优化详情 |
+| MI300X vs MI355X | `agent_docs/mi300x-vs-mi355x-baseline.md` | 三平台性能对比 |
+| CK Attention 评估 | `agent_docs/eval-ck-attention.md` | CK_Tile 集成复杂度评估 |
+| Q1 Report | `agent_docs/report.pdf` | MI355X 原始 benchmark 数据 |

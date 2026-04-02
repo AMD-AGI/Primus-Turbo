@@ -65,7 +65,7 @@ python3 tools/check_regression.py --baseline benchmark/baselines/
 - 部分配置退化 > 5%: 需要条件化处理或放弃
 
 ### Step 7: Log（记录）
-- 每次有效优化追加到 `docs/optimization-log.md`
+- 每次有效优化追加到 `agent_docs/optimization-log.md`
 - 更新 `benchmark/baselines/` 中的性能基线
 - commit message 包含: 优化项、geomean 变化、目标算子
 
