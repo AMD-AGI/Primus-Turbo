@@ -1,0 +1,193 @@
+---
+description: Agent Loop 会话记忆 — Phase 1 完成，Phase 2 待执行。迁移到 MI355X 时自动加载此上下文。
+globs:
+  - "benchmark/**"
+  - "primus_turbo/triton/**"
+  - "primus_turbo/pytorch/kernels/**"
+  - "tools/**"
+alwaysApply: false
+---
+
+# Agent Optimization Loop — 会话记忆
+
+## 1. 项目状态总览
+
+| 项 | 状态 |
+|----|------|
+| **当前分支** | `agent-optimize` |
+| **Phase 1 (Attention)** | ✅ 已完成, commit `23e36d6` |
+| **Phase 2 (GEMM/Grouped GEMM)** | ⏳ 待开始 |
+| **Phase 3 (MoE/Quantization)** | 📋 计划中 |
+
+## 2. 已完成工作 (MI300X)
+
+### Phase 1: Triton FlashAttention 优化 (5 轮迭代)
+
+**核心修改文件:**
+- `primus_turbo/triton/attention/attention_kernel.py`
+  - 新增 `select_block_sizes()` — 根据 head_dim/seqlen 动态选择 BLOCK_M/BLOCK_N
+  - `get_autotune_fwd_configs()` — 从 1 个扩展到 6 个配置 (num_warps 4/8, PRE_LOAD_V, num_stages 1/2)
+  - `get_autotune_bwd_configs()` — 从 1 个扩展到 4 个配置
+- `primus_turbo/pytorch/kernels/attention/attention_triton_impl.py`
+  - forward/backward 均使用 `select_block_sizes()` 替代固定 BLOCK_M=64
+
+**性能结果 (MI300X, Triton BF16):**
+- head_dim=128: Fwd +91%, Bwd +45% (S=4096, causal)
+- head_dim=192 (MLA): 改进有限 (受 padded_dim=256 限制, 只能用 64x64)
+- 与 AITER ASM 仍有 2.2-5.5x 差距 (AITER 是手写 ASM, 非 Triton 可比)
+- 所有正确性测试通过 (SNR > 52dB)
+
+**关键发现:**
+- BF16 `flash_attn_func()` 默认走 AITER 后端, Triton 仅用于 FP8 路径
+- Grouped GEMM 场景下 Triton 是 MI355X 上的最优后端 (超 HipBLASLt/CK)
+- FP8 Blockwise 是最大短板 (落后 GB200 30-50%), DeepSeek 训练常用
+
+### Baseline 数据
+
+**MI300X BF16 (Peak 1307.4 TFLOPS):**
+
+| 算子 | Fwd TFLOPS | Bwd TFLOPS | Fwd 利用率 |
+|------|:----------:|:----------:|:----------:|
+| Attention (AITER) | 456.1 | 313.3 | 34.9% |
+| GEMM | 607.4 | 578.1 | 46.5% |
+| Grouped GEMM | 475.4 | 377.4 | 36.4% |
+
+**MI355X BF16 (Peak 2500 TFLOPS, from report.pdf):**
+
+| 算子 | Turbo Best Fwd | 利用率 | vs GB200 |
+|------|:--------------:|:------:|:--------:|
+| GEMM | 1534.6 (HipBLASLt) | 61.4% | +7% |
+| Grouped GEMM | 1098.7 (Triton) | 43.9% | -3% |
+| GEMM FP8 TW | 2297.8 (HipBLASLt) | 45.9% | +10% |
+| Grouped GEMM FP8 TW | 1203.1 (AutoTune) | — | +21% |
+| GEMM FP8 BW | 1350.8 (Triton) | — | **-30%** |
+
+Baseline JSON: `benchmark/baselines/{attention,gemm,grouped_gemm}.json`
+
+## 3. Harness 基础设施
+
+### 已创建的规则和技能文件
+
+```
+.cursor/rules/
+├── project-conventions.mdc     # 项目约定 (已有)
+├── triton-kernel-patterns.mdc  # Triton 编码模式 (已有)
+├── benchmark-workflow.mdc      # Benchmark 工作流 (增强)
+├── agent-optimization-loop.mdc # Agent 优化循环规则 (新建)
+├── performance-regression.mdc  # 性能回归检测 (新建)
+└── agent-loop-memory.mdc       # 本文件
+
+.cursor/skills/
+├── amd-gpu-architecture/       # AMD GPU 架构知识 (已有)
+├── kernel-profiling/           # Profiling 工作流 (增强)
+├── triton-attention-optimize/  # Attention 优化指南 (增强)
+├── triton-gemm-optimize/       # GEMM 优化指南 (新建)
+├── moe-optimize/               # MoE 优化指南 (新建)
+└── sota-knowledge-base/        # SOTA 知识库 (新建)
+```
+
+### 已创建的工具脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `tools/update_baseline.py` | 解析 benchmark CSV → JSON baseline |
+| `tools/check_regression.py` | 对比当前性能与 baseline, 检测回归 |
+| `tools/quick_verify.sh` | 快速正确性验证 |
+
+### Benchmark 脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `benchmark/ops/bench_attention_turbo.py` | Attention 全量 benchmark |
+| `benchmark/ops/bench_gemm_turbo.py` | GEMM benchmark |
+| `benchmark/ops/bench_grouped_gemm_turbo.py` | Grouped GEMM benchmark |
+| `benchmark/ops/bench_attention_triton_vs_aiter.py` | Triton vs AITER 对比 (新建) |
+
+## 4. 迁移到 MI355X 的快速启动指南
+
+### Step 1: 环境确认
+
+```bash
+# 确认 GPU 型号
+rocm-smi --showproductname
+# 期望看到 gfx950 / MI355X
+
+# 确认 ROCm 版本
+rocminfo | grep -i "gfx"
+
+# 确认 Python/PyTorch
+python3 -c "import torch; print(torch.__version__); print(torch.cuda.get_device_name(0))"
+```
+
+### Step 2: 编译
+
+```bash
+cd /path/to/Primus-Turbo
+git checkout agent-optimize
+pip3 install --no-build-isolation -e . -v
+```
+
+### Step 3: 运行 Baseline (MI355X)
+
+```bash
+# Attention
+python3 benchmark/ops/bench_attention_turbo.py 2>&1 | tee output/baseline_attention_mi355x.csv
+
+# GEMM (包含 BF16 + FP8 各种 granularity)
+python3 benchmark/ops/bench_gemm_turbo.py 2>&1 | tee output/baseline_gemm_mi355x.csv
+
+# Grouped GEMM
+python3 benchmark/ops/bench_grouped_gemm_turbo.py 2>&1 | tee output/baseline_grouped_gemm_mi355x.csv
+
+# 更新 baseline
+python3 tools/update_baseline.py
+```
+
+### Step 4: 正确性验证
+
+```bash
+# Attention
+pytest tests/pytorch/ops/test_attention.py -x -v
+
+# GEMM FP8
+pytest tests/pytorch/ops/test_gemm_fp8.py -x -v
+
+# Grouped GEMM FP8
+pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -x -v
+```
+
+### Step 5: 开始 Phase 2 优化
+
+Phase 2 优化目标 (按优先级排序):
+
+1. **GEMM FP8 Blockwise** — MI355X 落后 GB200 30%, 最大短板
+2. **GEMM BF16 Triton** — MI355X Triton (1147T) 落后 HipBLASLt (1535T) 25%
+3. **Grouped GEMM BF16** — Triton 已是最优后端, 继续调优
+4. **Grouped GEMM FP8 Blockwise** — 落后 GB200 33-50%
+5. **MXFP8 GEMM** — 落后 GB200 48%, 需排查原因
+
+每算子 5 轮迭代后总结汇报, 确认是否继续。
+
+## 5. MI300X vs MI355X 关键差异 (优化时注意)
+
+| 特性 | MI300X (gfx942) | MI355X (gfx950) |
+|------|:---:|:---:|
+| BF16 Peak | 1307 T | 2500 T |
+| FP8 格式 | `e4m3fnuz` (AMD 私有) | `e4m3fn` (OCP 标准) |
+| MXFP8/MXFP4 | ❌ | ✅ |
+| FP8 Blockwise 后端 | CK / Triton | CK / Triton / HipBLASLt |
+| HBM BW | 5.3 TB/s | 8.0 TB/s |
+| CU 数量 | 304 | 256 |
+| Wavefront | 64 | 64 |
+| 最佳 num_warps (Attention) | 4-8 | 待测试 |
+| 最佳 BLOCK_M (Attention) | 128 (head_dim≤128) | 待测试 |
+
+## 6. 相关文档索引
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| 优化计划 v2 | `docs/agent-optimization-plan.md` | Agent Loop 整体计划 |
+| Phase 1 报告 | `docs/phase1-attention-report.md` | Attention 5 轮优化详情 |
+| MI300X vs MI355X | `docs/mi300x-vs-mi355x-baseline.md` | 三平台性能对比 |
+| CK Attention 评估 | `docs/eval-ck-attention.md` | CK_Tile 集成复杂度评估 |
+| Q1 Report | `docs/report.pdf` | MI355X 原始 benchmark 数据 |
