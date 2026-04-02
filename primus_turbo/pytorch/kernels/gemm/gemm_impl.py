@@ -101,6 +101,26 @@ class GEMMKernelDispatcher(AutoKernelDispatcher):
         return (M, N, Ka, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c)
 
 
+def _shape_preferred_backend(a, trans_a, b, trans_b):
+    """Select the statistically best backend based on (M, N, K) shape.
+
+    Rules derived from MI300X benchmarks (hipBLASLt vs Triton, BF16):
+      - Very large K (>=40000): Triton persistent kernel hides latency better
+      - Very large N (>=65536) with M>=8192: Triton tile scheduling wins
+    Only overrides the default when the expected gain is significant (>5%).
+    """
+    if a.dtype not in _COMMON_SUPPORTED_DTYPES:
+        return None
+    M = a.shape[1] if trans_a else a.shape[0]
+    K = a.shape[0] if trans_a else a.shape[1]
+    N = b.shape[0] if trans_b else b.shape[1]
+    if K >= 40000:
+        return BackendType.TRITON
+    if N >= 65536 and M >= 8192:
+        return BackendType.TRITON
+    return None
+
+
 @_torch_custom_op_wrapper("primus_turbo::gemm_impl", mutates_args=(), device_types="cuda")
 def gemm_impl(
     a: torch.Tensor,
@@ -113,6 +133,11 @@ def gemm_impl(
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32)
+
+    if user_backend_enum is None and not GlobalBackendManager.auto_tune_enabled():
+        shape_hint = _shape_preferred_backend(a, trans_a, b, trans_b)
+        if shape_hint is not None:
+            default_backend_enum = shape_hint
 
     kwargs = dict(
         a=a,
