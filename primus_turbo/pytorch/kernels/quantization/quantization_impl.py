@@ -286,9 +286,6 @@ def quant_fp8_blockwise_for_weight_impl_meta(
     return w_fp8, w_scales
 
 
-_MXFP8_PADDING_ALIGN_SIZE = 128
-
-
 def quantize_mxfp8_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
@@ -298,7 +295,7 @@ def quantize_mxfp8_impl(
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    # NOTE: quantize fp4 kernel use the ISA which only available on cdna4.
+    # NOTE: quantize fp8 kernel use the ISA which only available on cdna4.
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
 
@@ -392,9 +389,6 @@ def dequantize_mxfp8_impl(
     )
 
     return y
-
-
-_MXFP4_PADDING_ALIGN_SIZE = 128
 
 
 def quantize_mxfp4_impl(

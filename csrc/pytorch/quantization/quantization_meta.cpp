@@ -179,15 +179,15 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
     const int64_t M_pad = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
     const int64_t N_pad = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
 
-    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by 32");
+    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
 
     if (shuffle_rowwise) {
-        PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0,
-                           "M must be divisible by 16 for shuffled rowwise FP8");
+        PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0, "M must be divisible by ", MXFP8_SHUFFLE_BN,
+                           " for shuffled rowwise FP8");
     }
     if (shuffle_colwise) {
-        PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0,
-                           "N must be divisible by 16 for shuffled colwise FP8");
+        PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0, "N must be divisible by ", MXFP8_SHUFFLE_BN,
+                           " for shuffled colwise FP8");
     }
 
     int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
@@ -239,6 +239,7 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
                        "Output must be Float8_e4m3fn or Float8_e5m2");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
 
     const bool    is_rowwise = (axis == 1);
     const int64_t M          = input.size(0);
@@ -246,15 +247,15 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
     const int64_t M_pad      = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
     const int64_t N_pad      = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
 
-    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by 32");
+    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
 
     if (shuffle_out) {
         if (is_rowwise) {
-            PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0,
-                               "M must be divisible by 16 for shuffled rowwise FP8");
+            PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0, "M must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled rowwise FP8");
         } else {
-            PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0,
-                               "N must be divisible by 16 for shuffled colwise FP8");
+            PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0, "N must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled colwise FP8");
         }
     }
 

@@ -10,7 +10,7 @@
  * supporting both rowwise and colwise quantization.
  *
  * Block/Tile Structure:
- *   - Block size: 64x64 (BLOCK_M x BLOCK_N)
+ *   - Block size: 128x32 (BLOCK_M x BLOCK_N)
  *   - MXFP8 tile: 32x32 elements per quantization block
  *   - Thread block: 256 threads (4 warps of 64 threads each)
  *
