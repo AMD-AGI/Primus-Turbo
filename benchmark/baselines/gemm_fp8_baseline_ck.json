@@ -1,0 +1,302 @@
+[
+  {
+    "m": 256,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "tensorwise",
+    "ms": 0.3715,
+    "tflops": 11.56,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "rowwise",
+    "ms": 0.4121,
+    "tflops": 10.42,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "tensorwise",
+    "ms": 0.3722,
+    "tflops": 23.08,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "rowwise",
+    "ms": 0.4149,
+    "tflops": 20.7,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "tensorwise",
+    "ms": 0.3794,
+    "tflops": 45.28,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 4096,
+    "k": 2048,
+    "desc": "small-M n%256",
+    "granularity": "rowwise",
+    "ms": 0.4108,
+    "tflops": 41.82,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 2048,
+    "n": 4096,
+    "k": 2048,
+    "desc": "med-M n%256",
+    "granularity": "tensorwise",
+    "ms": 0.3861,
+    "tflops": 88.98,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 2048,
+    "n": 4096,
+    "k": 2048,
+    "desc": "med-M n%256",
+    "granularity": "rowwise",
+    "ms": 0.4242,
+    "tflops": 80.99,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "tensorwise",
+    "ms": 0.1063,
+    "tflops": 39.14,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "rowwise",
+    "ms": 0.1432,
+    "tflops": 29.06,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "tensorwise",
+    "ms": 0.1137,
+    "tflops": 73.18,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "rowwise",
+    "ms": 0.1482,
+    "tflops": 56.13,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "tensorwise",
+    "ms": 0.1163,
+    "tflops": 143.05,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 3968,
+    "k": 2048,
+    "desc": "small-M n%128",
+    "granularity": "rowwise",
+    "ms": 0.1495,
+    "tflops": 111.3,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "tensorwise",
+    "ms": 0.5319,
+    "tflops": 32.3,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "rowwise",
+    "ms": 0.5838,
+    "tflops": 29.43,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "tensorwise",
+    "ms": 0.5402,
+    "tflops": 63.61,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "rowwise",
+    "ms": 0.5921,
+    "tflops": 58.03,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "tensorwise",
+    "ms": 0.5583,
+    "tflops": 123.1,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 1024,
+    "n": 8192,
+    "k": 4096,
+    "desc": "small-M large-N",
+    "granularity": "rowwise",
+    "ms": 0.6108,
+    "tflops": 112.51,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 8192,
+    "n": 4096,
+    "k": 2048,
+    "desc": "large-M baseline",
+    "granularity": "tensorwise",
+    "ms": 0.6008,
+    "tflops": 228.75,
+    "m_aware_triggered": "NO"
+  },
+  {
+    "m": 8192,
+    "n": 4096,
+    "k": 2048,
+    "desc": "large-M baseline",
+    "granularity": "rowwise",
+    "ms": 0.6611,
+    "tflops": 207.91,
+    "m_aware_triggered": "NO"
+  },
+  {
+    "m": 16384,
+    "n": 4096,
+    "k": 2048,
+    "desc": "large-M baseline",
+    "granularity": "tensorwise",
+    "ms": 0.9894,
+    "tflops": 277.82,
+    "m_aware_triggered": "NO"
+  },
+  {
+    "m": 16384,
+    "n": 4096,
+    "k": 2048,
+    "desc": "large-M baseline",
+    "granularity": "rowwise",
+    "ms": 1.0962,
+    "tflops": 250.76,
+    "m_aware_triggered": "NO"
+  },
+  {
+    "m": 128,
+    "n": 4096,
+    "k": 4096,
+    "desc": "llm prefill bs=1",
+    "granularity": "tensorwise",
+    "ms": 0.5102,
+    "tflops": 8.42,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 128,
+    "n": 4096,
+    "k": 4096,
+    "desc": "llm prefill bs=1",
+    "granularity": "rowwise",
+    "ms": 0.5588,
+    "tflops": 7.69,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 14336,
+    "k": 4096,
+    "desc": "llm prefill Llama70B gate",
+    "granularity": "tensorwise",
+    "ms": 0.5723,
+    "tflops": 52.53,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 256,
+    "n": 14336,
+    "k": 4096,
+    "desc": "llm prefill Llama70B gate",
+    "granularity": "rowwise",
+    "ms": 0.6544,
+    "tflops": 45.94,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 14336,
+    "k": 4096,
+    "desc": "llm prefill Llama70B gate",
+    "granularity": "tensorwise",
+    "ms": 0.5869,
+    "tflops": 102.44,
+    "m_aware_triggered": "YES"
+  },
+  {
+    "m": 512,
+    "n": 14336,
+    "k": 4096,
+    "desc": "llm prefill Llama70B gate",
+    "granularity": "rowwise",
+    "ms": 0.6679,
+    "tflops": 90.03,
+    "m_aware_triggered": "YES"
+  }
+]
