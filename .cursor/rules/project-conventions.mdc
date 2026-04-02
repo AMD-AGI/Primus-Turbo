@@ -1,0 +1,31 @@
+---
+description: Primus-Turbo 项目的通用编码和工作流约定
+alwaysApply: true
+---
+
+# Primus-Turbo 项目约定
+
+## 项目概述
+Primus-Turbo 是 AMD GPU (MI300X/MI325X/MI350X/MI355X) 高性能加速库，覆盖 GEMM、Attention、GroupedGEMM、MoE、量化等核心算子。
+
+## 关键路径
+- Triton kernel: `primus_turbo/triton/`
+- HIP C++ kernel: `csrc/kernels/`
+- PyTorch 封装: `primus_turbo/pytorch/kernels/`
+- 高级 API: `primus_turbo/pytorch/ops/`
+- Benchmark: `benchmark/ops/`
+- 精度测试: `benchmark/accuracy/`
+- 单元测试: `tests/pytorch/`
+
+## 修改 kernel 后的必要步骤
+1. 重新编译: `pip3 install --no-build-isolation -e . -v`
+2. 正确性验证: `pytest tests/pytorch/ -k "相关测试"`
+3. 性能测量: `python3 benchmark/ops/bench_xxx_turbo.py`
+4. 每次有效优化必须 git commit 并记录性能数据
+
+## AMD GPU vs NVIDIA GPU 关键差异
+- Wavefront = 64 线程（NVIDIA Warp = 32）
+- 使用 HIP（不是 CUDA），但 API 高度相似
+- Matrix Core（不是 Tensor Core），通过 MFMA 指令访问
+- 共享内存称为 LDS (Local Data Share)，每 CU 64KB
+- 后端选择: CK (Composable Kernel) / hipBLASLt / Triton

@@ -1,0 +1,27 @@
+---
+description: Triton kernel 编写和优化的规范与模式
+globs: "primus_turbo/triton/**/*.py"
+alwaysApply: false
+---
+
+# Triton Kernel 编写规范
+
+## 环境变量
+- `PRIMUS_TURBO_TRITON_AMD_AUTOTUNE=1`: 启用 Triton autotune
+- `PRIMUS_TURBO_GEMM_BACKEND=TRITON`: 指定 GEMM 使用 Triton 后端
+- `PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON`: 指定 GroupedGEMM 使用 Triton 后端
+- `PRIMUS_TURBO_ATTENTION_TRITON_AMD_DEBUG=1`: Attention kernel 调试模式
+- `PRIMUS_TURBO_ATTENTION_TRITON_AMD_PERF=1`: Attention kernel 性能模式
+
+## 优化优先级
+1. **算法级 (>50% 收益)**: kernel 融合、减少 HBM 访问、tiling 策略
+2. **内存级 (20-50%)**: 合并访问、向量化加载 (tl.load + eviction_policy)、LDS 利用
+3. **计算级 (10-20%)**: block size 调优、占用率平衡、warp 级原语
+4. **指令级 (<10%)**: 循环展开、混合精度、指令级并行
+
+## AMD Triton 注意事项
+- wavefront_size=64 影响 reduction 操作的设计
+- `tl.dot` 映射到 MFMA 指令，注意支持的矩阵形状
+- 使用 `tl.load(..., eviction_policy="evict_last")` 控制缓存行为
+- BF16 精度: `torch.allclose(atol=1e-2, rtol=1e-2)`
+- FP8 精度: `torch.allclose(atol=1e-1, rtol=1e-1)`
