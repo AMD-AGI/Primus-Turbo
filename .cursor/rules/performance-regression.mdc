@@ -1,0 +1,52 @@
+---
+description: 性能回归检测规则，修改 kernel 或 benchmark 时自动应用
+globs: "primus_turbo/**/*.py,csrc/**/*,benchmark/**/*.py"
+alwaysApply: false
+---
+
+# 性能回归检测
+
+## 基线管理
+
+基线文件位于 `benchmark/baselines/`，JSON 格式:
+```json
+{
+  "operator": "attention",
+  "gpu": "MI300X",
+  "date": "2026-04-02",
+  "geomean_ms": 1.100,
+  "configs": [
+    {"label": "...", "mean_ms": 1.234, "std_ms": 0.012}
+  ]
+}
+```
+
+## 回归检测标准
+
+| 级别 | 条件 | 行动 |
+|------|------|------|
+| ✅ 通过 | 所有配置变化 ≤ ±5%, geomean 提升 | 可以 commit |
+| ⚠️ 警告 | 个别配置退化 5-10%, 但 geomean 提升 | 需解释原因 |
+| ❌ 失败 | 任何配置退化 > 10%, 或 geomean 退化 > 2% | 必须修复或回滚 |
+
+## 运行回归检测
+
+```bash
+# 对比当前结果与基线
+python3 tools/check_regression.py --baseline benchmark/baselines/ --current <results_csv>
+
+# 更新基线（仅在确认优化有效后）
+python3 tools/update_baseline.py --results <results_csv> --output benchmark/baselines/
+```
+
+## 基线更新时机
+
+1. 新的有效优化 commit 后
+2. ROCm/Triton 版本升级后（重新建立基线）
+3. 硬件平台切换后（MI300X → MI350X）
+
+## 异常检测
+
+- geomean 提升超过 50%: 可能是测量问题，需复查
+- 标准差 > 均值的 20%: 测量不稳定，增加运行次数
+- 某配置突然从 1ms 变为 0.01ms: 可能 kernel 没有真正执行

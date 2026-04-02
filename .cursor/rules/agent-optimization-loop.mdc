@@ -1,0 +1,90 @@
+---
+description: Agent 驱动的算子优化标准闭环流程，所有优化工作必须遵循此规则
+alwaysApply: true
+---
+
+# Agent 优化循环规则
+
+## 核心原则
+
+**原子性**: 每次只做一个优化点，便于归因和回滚。
+**可验证性**: 每个修改都必须通过精度验证和性能度量。
+**可追溯性**: 每次有效优化都留下结构化日志。
+
+## 标准闭环流程
+
+```
+Profile → Analyze → Plan → Implement → Verify → Decide → Log
+   ↑                                                    |
+   └────────────────── 迭代 ───────────────────────────┘
+```
+
+### Step 1: Profile（度量基线）
+- 运行目标算子的 benchmark: `python3 benchmark/ops/bench_<op>_turbo.py`
+- 如需深入分析: `bash .cursor/skills/kernel-profiling/scripts/quick_profile.sh`
+- 记录 geomean 和各配置的 mean_ms
+
+### Step 2: Analyze（瓶颈诊断）
+- 判断瓶颈类型: 计算受限 / 内存受限 / 延迟受限
+- 计算 arithmetic intensity，对比 roofline 平衡点
+- MI300X BF16 平衡点: ~247 FLOP/Byte, FP8: ~494 FLOP/Byte
+
+### Step 3: Plan（策略选择）
+- 查阅对应 Skill 文件获取 SOTA 技术参考
+- 从 `skills/sota-knowledge-base/SKILL.md` 匹配适用技术
+- 按预估收益排序，选择最高优先级的一个策略
+
+### Step 4: Implement（原子性修改）
+- 每次修改只引入一个优化点
+- 修改前确认理解现有代码逻辑
+- 遵循 `rules/triton-kernel-patterns.mdc` 中的编码规范
+
+### Step 5: Verify（三级验证）
+
+**Level 1 快速验证（每次修改后）:**
+```bash
+pip3 install --no-build-isolation -e . -v
+pytest tests/pytorch/ops/test_<target>.py -x
+```
+
+**Level 2 完整验证（commit 前）:**
+```bash
+python3 benchmark/accuracy/eval_<op>_accuracy.py
+python3 benchmark/ops/bench_<op>_turbo.py
+```
+
+**Level 3 回归验证（Phase 完成后）:**
+```bash
+python3 benchmark/ops/run_suite.py -d output/
+python3 tools/check_regression.py --baseline benchmark/baselines/
+```
+
+### Step 6: Decide（决策）
+- geomean 提升 ≥ 2%: commit + 记录
+- 无变化: 回滚，分析原因，换策略
+- 部分配置退化 > 5%: 需要条件化处理或放弃
+
+### Step 7: Log（记录）
+- 每次有效优化追加到 `docs/optimization-log.md`
+- 更新 `benchmark/baselines/` 中的性能基线
+- commit message 包含: 优化项、geomean 变化、目标算子
+
+## 精度标准
+| dtype | atol | rtol |
+|-------|------|------|
+| FP32 | 1e-4 | 1e-4 |
+| FP16 | 1e-2 | 1e-2 |
+| BF16 | 1e-2 | 1e-2 |
+| FP8 | 1e-1 | 1e-1 |
+
+## 迭代限制
+- 单策略内循环: 最多 5 次编辑-验证迭代
+- 单算子策略尝试: 最多 3 个不同策略
+- 连续 3 策略无效: 暂停，请求人类 review
+
+## 禁止行为
+- 跳过精度验证直接 commit
+- 一次修改多个独立优化点（难以归因）
+- 不运行 benchmark 就声称性能提升
+- 修改 kernel 后不重新编译
+- 放宽精度标准而不通知人类

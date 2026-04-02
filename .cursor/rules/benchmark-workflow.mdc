@@ -1,20 +1,40 @@
 ---
-description: 性能 benchmark 和精度验证的标准工作流
+description: 性能 benchmark、精度验证和回归检测的标准工作流
 globs: "benchmark/**/*.py"
 alwaysApply: false
 ---
 
 # Benchmark 工作流
 
-## 运行 Benchmark
+## 完整工作流
+
+```
+1. 精度验证（必须先通过）
+       ↓
+2. 性能 benchmark（记录各配置数据）
+       ↓
+3. 基线对比（检测回归）
+       ↓
+4. 记录结果（更新基线 + 优化日志）
+```
+
+## Step 1: 精度验证
 ```bash
-# 按算子组运行
+python3 benchmark/accuracy/eval_attention_accuracy.py
+python3 benchmark/accuracy/eval_gemm_accuracy.py
+python3 benchmark/accuracy/eval_sf_accuracy.py
+```
+精度不通过，禁止进入性能测试。
+
+## Step 2: 性能 Benchmark
+```bash
+# 按算子组运行（推荐，带 GPU 池调度）
 python3 benchmark/ops/run_suite.py -d output/ -g attention
 python3 benchmark/ops/run_suite.py -d output/ -g gemm_bf16
 python3 benchmark/ops/run_suite.py -d output/ -g gemm_fp8
 python3 benchmark/ops/run_suite.py -d output/ -g grouped_gemm_bf16
 
-# 单个脚本
+# 单个脚本（快速验证）
 python3 benchmark/ops/bench_attention_turbo.py
 python3 benchmark/ops/bench_gemm_turbo.py
 python3 benchmark/ops/bench_grouped_gemm_turbo.py
@@ -23,16 +43,32 @@ python3 benchmark/ops/bench_grouped_gemm_turbo.py
 python3 benchmark/ops/summarize_results.py
 ```
 
-## 精度验证
+## Step 3: 基线对比
 ```bash
-python3 benchmark/accuracy/eval_attention_accuracy.py
-python3 benchmark/accuracy/eval_gemm_accuracy.py
+python3 tools/check_regression.py --baseline benchmark/baselines/ --current output/
 ```
+回归标准见 `rules/performance-regression.mdc`。
 
-## 注意事项
+## Step 4: 记录结果
+```bash
+# 更新基线（仅在有效优化后）
+python3 tools/update_baseline.py --results output/ --output benchmark/baselines/
+```
+并追加优化日志到 `docs/optimization-log.md`。
+
+## Benchmark 最佳实践
 - 确保 GPU 空闲，无其他任务占用显存
 - 多次运行取平均值（至少 3 次），关注标准差
 - 关注 **geomean** 而非单个配置的极端值
 - 记录 GPU 型号、ROCm 版本、driver 版本
 - 配置定义在 `benchmark/ops/config.py` 和 `benchmark_suite.yaml` 中
+- 模型配置覆盖: Llama-2/3, Qwen2.5/3, DeepSeek-V2/V3, Mixtral, Kimi-K2, Grok-2
 - 每次迭代都进行文档记录，并进行定期复盘
+
+## 环境变量
+```bash
+PRIMUS_TURBO_TRITON_AMD_AUTOTUNE=1     # 启用 autotune
+PRIMUS_TURBO_GEMM_BACKEND=TRITON       # 指定 GEMM 后端
+PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON
+PRIMUS_TURBO_ATTENTION_TRITON_AMD_PERF=1  # Attention 性能模式
+```
