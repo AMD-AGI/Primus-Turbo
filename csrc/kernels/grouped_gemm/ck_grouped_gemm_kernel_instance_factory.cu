@@ -19,7 +19,24 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
-        if (n % 256 == 0) {
+        constexpr ck_tile::index_t NUM_CU = 304;
+        const ck_tile::index_t m_tiles_256 = (m + 255) / 256;
+        const ck_tile::index_t n_tiles_256 = (n + 255) / 256;
+        const ck_tile::index_t total_tiles = group_num * m_tiles_256 * n_tiles_256;
+        const bool use_small_tile = (total_tiles < NUM_CU && group_num >= 2);
+        if (use_small_tile) {
+            if (n % 128 == 0) {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            }
+        } else if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
@@ -86,7 +103,24 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
-        if (n % 256 == 0) {
+        constexpr ck_tile::index_t NUM_CU = 256;
+        const ck_tile::index_t m_tiles_256 = (m + 255) / 256;
+        const ck_tile::index_t n_tiles_256 = (n + 255) / 256;
+        const ck_tile::index_t total_tiles = group_num * m_tiles_256 * n_tiles_256;
+        const bool use_small_tile = (total_tiles < NUM_CU && group_num >= 2);
+        if (use_small_tile) {
+            if (n % 128 == 0) {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            }
+        } else if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
