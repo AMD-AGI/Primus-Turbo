@@ -1,0 +1,12 @@
+Round 7 Accuracy Verification
+==============================
+Date: 2026-04-03
+Platform: MI300X (gfx942)
+
+Test Command:
+  pytest tests/pytorch/ops/test_gemm_fp8.py -k "blockwise and not mx_blockwise" -x --tb=short
+
+Result:
+  192 passed, 496 skipped, 13312 deselected, 7 warnings in 29.86s
+
+All blockwise FP8 GEMM accuracy tests PASSED.

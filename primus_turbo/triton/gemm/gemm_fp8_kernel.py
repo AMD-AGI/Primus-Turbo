@@ -980,6 +980,12 @@ def _blockwise_fp8_persistent_kernel(
             loop_k = loop_k - 1
 
         for ki in range(loop_k):
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+
             if A_K_CONTIGUOUS:
                 a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
             else:
@@ -992,13 +998,9 @@ def _blockwise_fp8_persistent_kernel(
 
             partial = tl.dot(a, b, input_precision="ieee")
 
-            a_s = tl.load(as_ptrs + ki * stride_as_k)
-
             if SCALE_2D_B:
-                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
                 acc += partial * (a_s * b_s)[:, None]
             else:
-                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
                 acc += partial * a_s[:, None] * b_s[None, :]
 
             if A_K_CONTIGUOUS:
