@@ -942,6 +942,10 @@ def _blockwise_fp8_persistent_kernel(
     tl.assume(stride_bn > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
+    tl.assume(stride_as_k > 0)
+    tl.assume(stride_as_m > 0)
+    tl.assume(stride_bs_0 > 0)
+    tl.assume(stride_bs_1 > 0)
 
     for tid in range(pid, total, NUM_SMS):
         gid = tid // grp
@@ -1019,6 +1023,12 @@ def _blockwise_fp8_persistent_kernel(
             mask_k_col = rk[None, :] < k_remaining
             mask_k_row = rk[:, None] < k_remaining
 
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+
             if A_K_CONTIGUOUS:
                 a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             else:
@@ -1031,12 +1041,9 @@ def _blockwise_fp8_persistent_kernel(
 
             partial = tl.dot(a, b, input_precision="ieee")
 
-            a_s = tl.load(as_ptrs + ki * stride_as_k)
             if SCALE_2D_B:
-                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
                 acc += partial * (a_s * b_s)[:, None]
             else:
-                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
                 acc += partial * a_s[:, None] * b_s[None, :]
 
         offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1222,7 +1229,7 @@ def _blockwise_nn(
     if _is_gfx950():
         _set_knobs_gfx950()
     else:
-        _set_amd_knobs(enable=True)
+        _set_amd_knobs(enable=False)
 
     M, K = a.shape
     _, N = b.shape
