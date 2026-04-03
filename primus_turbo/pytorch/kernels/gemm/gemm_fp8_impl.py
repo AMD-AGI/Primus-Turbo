@@ -272,6 +272,22 @@ _GEMM_FP8_BACKENDS = {
 }
 
 
+def _blockwise_preferred_backend(
+    a: torch.Tensor, b: torch.Tensor, trans_a: bool, trans_b: bool
+) -> BackendType:
+    """Shape-based backend selection for blockwise FP8 GEMM.
+
+    Based on MI300X profiling data:
+    - Forward (NT): CK better for K<8192, Triton better for K>=8192
+    - Backward (NN/TN): Triton always better (+40% geomean)
+    """
+    _, _, K = get_gemm_logical_shape(a, b, trans_a, trans_b)
+    is_nt = not trans_a and trans_b
+    if is_nt and K < 8192:
+        return BackendType.CK
+    return BackendType.TRITON
+
+
 class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_FP8_BACKENDS
     _cache = TuneCache(1024)
@@ -298,6 +314,13 @@ def gemm_fp8_impl(
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
+
+    if (
+        granularity_enum == ScalingGranularity.BLOCKWISE
+        and user_backend_enum is None
+        and not GlobalBackendManager.auto_tune_enabled()
+    ):
+        default_backend_enum = _blockwise_preferred_backend(a, b, trans_a, trans_b)
 
     kwargs = dict(
         a=a,
