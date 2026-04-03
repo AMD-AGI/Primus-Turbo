@@ -1243,7 +1243,6 @@ def _blockwise_nn(
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
     A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
-    b_scale_inv_t = b_scale_inv.T.contiguous()
 
     block_m, block_n, block_k, group_m, num_sms, chunk = _select_blockwise_config(
         M, N, K, a_k_contiguous=True, b_k_contiguous=False
@@ -1255,7 +1254,7 @@ def _blockwise_nn(
         b,
         out,
         A_scales_t,
-        b_scale_inv_t,
+        b_scale_inv,
         M,
         N,
         K,
@@ -1267,8 +1266,8 @@ def _blockwise_nn(
         stride_cn,
         A_scales_t.stride(0),
         A_scales_t.stride(1),
-        b_scale_inv_t.stride(0),
-        b_scale_inv_t.stride(1),
+        b_scale_inv.stride(1),
+        b_scale_inv.stride(0),
         num_k,
         A_K_CONTIGUOUS=True,
         B_K_CONTIGUOUS=False,
