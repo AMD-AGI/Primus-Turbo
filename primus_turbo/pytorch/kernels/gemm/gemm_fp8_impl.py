@@ -277,14 +277,9 @@ def _blockwise_preferred_backend(
 ) -> BackendType:
     """Shape-based backend selection for blockwise FP8 GEMM.
 
-    Based on MI300X profiling data:
-    - Forward (NT): CK better for K<8192, Triton better for K>=8192
-    - Backward (NN/TN): Triton always better (+40% geomean)
+    After num_warps=8 optimization (Rounds 3-4), Triton outperforms CK
+    for all blockwise FP8 shapes on MI300X (forward +8-25%, backward +40%).
     """
-    _, _, K = get_gemm_logical_shape(a, b, trans_a, trans_b)
-    is_nt = not trans_a and trans_b
-    if is_nt and K < 8192:
-        return BackendType.CK
     return BackendType.TRITON
 
 

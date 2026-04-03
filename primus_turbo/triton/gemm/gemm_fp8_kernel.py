@@ -1047,19 +1047,18 @@ def _blockwise_fp8_persistent_kernel(
 def _select_blockwise_config(M, N, K, a_k_contiguous, b_k_contiguous):
     """Offline config selection for blockwise FP8 GEMM on MI300X."""
     block_m, block_n, block_k = 128, 128, 128
+    cu_count = _get_hardware().N_CU
 
     tiles_m = (M + block_m - 1) // block_m
     tiles_n = (N + block_n - 1) // block_n
     total_tiles = tiles_m * tiles_n
-
-    cu_count = _get_hardware().N_CU
 
     num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
 
     if min(tiles_m, tiles_n) < 16:
         group_m = 8
     elif a_k_contiguous and b_k_contiguous:
-        group_m = 4
+        group_m = 6 if tiles_n > 2 * tiles_m else 4
     else:
         group_m = 5
 
@@ -1200,7 +1199,7 @@ def _blockwise_nt(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
@@ -1275,7 +1274,7 @@ def _blockwise_nn(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
@@ -1354,7 +1353,7 @@ def _blockwise_tn(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=".ca",
         CACHE_MODIFIER_B=".ca",
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
