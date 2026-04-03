@@ -890,6 +890,188 @@ def _blockwise_fp8_autotune_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Persistent block-wise FP8 GEMM kernel — NUM_SMS is constexpr for better codegen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@triton.jit
+def _blockwise_fp8_persistent_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    A_scales_ptr,
+    B_scales_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak_val,
+    stride_bk_val,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_as_k,
+    stride_as_m,
+    stride_bs_0,
+    stride_bs_1,
+    NUM_K_BLOCKS,
+    A_K_CONTIGUOUS: tl.constexpr,
+    B_K_CONTIGUOUS: tl.constexpr,
+    SCALE_2D_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK)
+
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    total = num_m * num_n
+    grp = GROUP_M * num_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for tid in range(pid, total, NUM_SMS):
+        gid = tid // grp
+        fm = gid * GROUP_M
+        gs = min(num_m - fm, GROUP_M)
+        pm = fm + (tid % grp) % gs
+        pn = (tid % grp) // gs
+        tl.assume(pm >= 0)
+        tl.assume(pn >= 0)
+
+        rm = tl.max_contiguous(tl.multiple_of((pm * BLOCK_M + tl.arange(0, BLOCK_M)) % M, BLOCK_M), BLOCK_M)
+        rn = tl.max_contiguous(tl.multiple_of((pn * BLOCK_N + tl.arange(0, BLOCK_N)) % N, BLOCK_N), BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+
+        if A_K_CONTIGUOUS:
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64)
+        else:
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak_val
+
+        if B_K_CONTIGUOUS:
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) + rn[None, :].to(tl.int64) * stride_bn
+        else:
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) * stride_bk_val + rn[None, :].to(tl.int64) * stride_bn
+
+        as_ptrs = A_scales_ptr + rm * stride_as_m
+
+        if SCALE_2D_B:
+            bs_ptr_base = B_scales_ptr + pn * stride_bs_0
+        else:
+            bs_ptrs = B_scales_ptr + rn * stride_bs_0
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        loop_k = NUM_K_BLOCKS
+        if not EVEN_K:
+            loop_k = loop_k - 1
+
+        for ki in range(loop_k):
+            if A_K_CONTIGUOUS:
+                a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+            else:
+                a = tl.load(tl.multiple_of(a_ptrs, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+
+            if B_K_CONTIGUOUS:
+                b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+            else:
+                b = tl.load(tl.multiple_of(b_ptrs, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+
+            partial = tl.dot(a, b, input_precision="ieee")
+
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+                acc += partial * (a_s * b_s)[:, None]
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+                acc += partial * a_s[:, None] * b_s[None, :]
+
+            if A_K_CONTIGUOUS:
+                a_ptrs += BLOCK_K
+            else:
+                a_ptrs += BLOCK_K * stride_ak_val
+
+            if B_K_CONTIGUOUS:
+                b_ptrs += BLOCK_K
+            else:
+                b_ptrs += BLOCK_K * stride_bk_val
+
+        if not EVEN_K:
+            ki = loop_k
+            k_remaining = K - ki * BLOCK_K
+            mask_k_col = rk[None, :] < k_remaining
+            mask_k_row = rk[:, None] < k_remaining
+
+            if A_K_CONTIGUOUS:
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            else:
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+
+            if B_K_CONTIGUOUS:
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+            else:
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+
+            partial = tl.dot(a, b, input_precision="ieee")
+
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+                acc += partial * (a_s * b_s)[:, None]
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+                acc += partial * a_s[:, None] * b_s[None, :]
+
+        offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = C_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :].to(tl.int64) * stride_cn
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+
+
+def _select_blockwise_config(M, N, K, a_k_contiguous, b_k_contiguous):
+    """Offline config selection for blockwise FP8 GEMM on MI300X."""
+    block_m, block_n, block_k = 128, 128, 128
+
+    tiles_m = (M + block_m - 1) // block_m
+    tiles_n = (N + block_n - 1) // block_n
+    total_tiles = tiles_m * tiles_n
+
+    cu_count = _get_hardware().N_CU
+
+    num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+
+    if min(tiles_m, tiles_n) < 16:
+        group_m = 8
+    elif a_k_contiguous and b_k_contiguous:
+        group_m = 4
+    else:
+        group_m = 5
+
+    if num_sms < total_tiles:
+        chunk = min(32, max(1, num_sms // NUM_XCDS))
+    else:
+        chunk = 64
+
+    return block_m, block_n, block_k, group_m, num_sms, chunk
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Unified Public API — Block-wise FP8 GEMM
 # Interface consistent with CK blockwise backend.
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -979,11 +1161,13 @@ def _blockwise_nt(
     A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
     B_t = b.T  # view [K, N]
 
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
+    block_m, block_n, block_k, group_m, num_sms, chunk = _select_blockwise_config(
+        M, N, K, a_k_contiguous=True, b_k_contiguous=True
+    )
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    even_k = K % block_k == 0
+
+    _blockwise_fp8_persistent_kernel[(num_sms,)](
         a,
         B_t,
         out,
@@ -1002,11 +1186,25 @@ def _blockwise_nt(
         A_scales_t.stride(1),
         b_scale_inv.stride(0),
         b_scale_inv.stride(1),
-        NUM_SMS,
         num_k,
         A_K_CONTIGUOUS=True,
         B_K_CONTIGUOUS=True,
         SCALE_2D_B=True,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK=chunk,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=4,
+        num_stages=2,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return out
 
@@ -1037,15 +1235,14 @@ def _blockwise_nn(
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
     A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
-    # B_scales from quantization: [dim0_blocks, dim1_blocks] for weight stored as [N_fwd, K_fwd].
-    # Kernel expects [N_output_blocks, K_inner_blocks] indexing → transpose.
     b_scale_inv_t = b_scale_inv.T.contiguous()
 
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
+    block_m, block_n, block_k, group_m, num_sms, chunk = _select_blockwise_config(
+        M, N, K, a_k_contiguous=True, b_k_contiguous=False
+    )
+    even_k = K % block_k == 0
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_persistent_kernel[(num_sms,)](
         a,
         b,
         out,
@@ -1064,11 +1261,25 @@ def _blockwise_nn(
         A_scales_t.stride(1),
         b_scale_inv_t.stride(0),
         b_scale_inv_t.stride(1),
-        NUM_SMS,
         num_k,
         A_K_CONTIGUOUS=True,
         B_K_CONTIGUOUS=False,
         SCALE_2D_B=True,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK=chunk,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=4,
+        num_stages=2,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return out
 
@@ -1105,11 +1316,12 @@ def _blockwise_tn(
 
     A_view = a.T  # [M, K] view with strided K
 
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
+    block_m, block_n, block_k, group_m, num_sms, chunk = _select_blockwise_config(
+        M, N, K, a_k_contiguous=False, b_k_contiguous=False
+    )
+    even_k = K % block_k == 0
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_persistent_kernel[(num_sms,)](
         A_view,
         b,
         out,
@@ -1125,13 +1337,27 @@ def _blockwise_tn(
         stride_cm,
         stride_cn,
         a_scale_inv.stride(0),
-        a_scale_inv.stride(1),  # [K//128, M]: stride_as_k=M, stride_as_m=1
+        a_scale_inv.stride(1),
         b_scale_inv.stride(1),
-        b_scale_inv.stride(0),  # [K//128, N]: stride_bs_0=1(rn), stride_bs_1=N(ki)
-        NUM_SMS,
+        b_scale_inv.stride(0),
         num_k,
         A_K_CONTIGUOUS=False,
         B_K_CONTIGUOUS=False,
         SCALE_2D_B=False,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=group_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK=chunk,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=4,
+        num_stages=2,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return out

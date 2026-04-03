@@ -69,6 +69,17 @@ python3 tools/check_regression.py --baseline benchmark/baselines/
 - 更新 `benchmark/baselines/` 中的性能基线
 - commit message 包含: 优化项、geomean 变化、目标算子
 
+### 专项优化的文件夹结构
+对于连续多轮优化同一算子/特性，必须在 `agent_docs/<topic>/roundN/` 下创建：
+```
+agent_docs/<topic>/roundN/
+├── baseline.json     # 优化前 baseline 数据
+├── optimized.json    # 优化后性能数据
+├── report.md         # 详细优化报告（目标/分析/方案/实现/精度/性能/结论）
+└── accuracy.log      # 精度验证输出
+```
+不因实现复杂而放弃有收益的优化。预估有性能收益时，必须完整实现并验证。
+
 ## 精度标准
 | dtype | atol | rtol |
 |-------|------|------|

@@ -1,0 +1,85 @@
+---
+description: Blockwise FP8 优化专项规则，定义每轮优化的标准化产出和工作流
+alwaysApply: true
+---
+
+# Blockwise FP8 优化规则
+
+## 背景
+Blockwise FP8 (ScalingGranularity.BLOCKWISE, block_size=128) 是 LLM 推理中精度与性能的平衡点。
+本规则定义针对 blockwise FP8 GEMM / Grouped GEMM / Attention 的多轮优化标准流程。
+
+## 每轮优化标准产出
+
+每轮优化必须在 `agent_docs/blockwise-fp8/roundN/` 下创建以下文件：
+
+```
+agent_docs/blockwise-fp8/roundN/
+├── baseline.json          # 优化前 baseline 数据（本轮目标算子）
+├── optimized.json         # 优化后数据（同样的 shape/配置）
+├── report.md              # 本轮优化详细报告
+└── accuracy.log           # 精度验证日志
+```
+
+### baseline.json 格式
+```json
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI300X",
+  "date": "YYYY-MM-DD",
+  "commit": "<git hash before optimization>",
+  "configs": [
+    {"label": "M=1024 N=4096 K=2048", "mean_ms": 0.xx, "tflops": xx.xx}
+  ]
+}
+```
+
+### report.md 必须包含
+1. **目标**: 本轮优化的具体目标
+2. **分析**: 性能瓶颈分析（roofline / profiling 数据）
+3. **方案**: 优化策略的详细技术说明（含公式/图）
+4. **实现**: 修改的文件和关键代码变更
+5. **精度验证**: 测试用例数 + PASS/FAIL
+6. **性能对比**: baseline vs optimized 逐条对比表
+7. **结论**: 是否合入 + 理由
+
+## 关键原则
+
+1. **不因实现复杂放弃有收益的优化** — 预估有性能收益时，必须完整实现并验证
+2. **原子性提交** — 每轮只做一个优化点
+3. **必须有实测数据** — 不允许仅凭推测判断性能
+4. **保留 baseline** — 优化前先采集并保存 baseline 数据
+5. **精度优先** — 精度不通过时不允许合入
+
+## Blockwise FP8 量化背景
+
+$$\text{block\_size} = 128, \quad \text{scale}_{ij} = \frac{\max(|X_{block_{ij}}|)}{E4M3\_MAX}$$
+
+- 每 128 个连续元素共享一个 scale factor
+- 相比 tensorwise/rowwise，blockwise 精度更高但 scale 计算开销更大
+- CK 后端使用 `ABQuantGrouped` 模式
+- 关键路径: `csrc/kernels/gemm/ck_gemm_kernel_instance_factory.{hip,cu}`
+
+## Benchmark 配置
+
+### GEMM FP8 Blockwise
+```bash
+python3 benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise
+```
+
+### Grouped GEMM FP8 Blockwise
+```bash
+python3 benchmark/ops/bench_grouped_gemm_turbo.py --dtype fp8 --granularity blockwise
+```
+
+### 精度验证
+```bash
+pytest tests/pytorch/ops/test_gemm_fp8.py -k "blockwise" -x
+pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -k "blockwise" -x
+```
+
+## MI300X Blockwise FP8 性能特点
+- CK ABQuantGrouped 路径: scale 在 kernel 内部读取，与矩阵乘融合
+- HIPBLASLt: 不原生支持 blockwise，需要外部 dequant
+- Triton: 支持 blockwise，但需要 tl.load scale tensor
+- 关键瓶颈: scale tensor 的额外内存访问 + shared memory 占用
