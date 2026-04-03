@@ -1276,7 +1276,7 @@ def _blockwise_nn(
         CACHE_MODIFIER_B=".ca",
         num_warps=8,
         num_stages=2,
-        waves_per_eu=0,
+        waves_per_eu=2,
         matrix_instr_nonkdim=16,
         kpack=2,
     )
@@ -1355,7 +1355,7 @@ def _blockwise_tn(
         CACHE_MODIFIER_B=".ca",
         num_warps=8,
         num_stages=2,
-        waves_per_eu=0,
+        waves_per_eu=2,
         matrix_instr_nonkdim=16,
         kpack=2,
     )
