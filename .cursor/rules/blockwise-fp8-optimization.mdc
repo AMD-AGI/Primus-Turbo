@@ -50,6 +50,10 @@ agent_docs/blockwise-fp8/roundN/
 3. **必须有实测数据** — 不允许仅凭推测判断性能
 4. **保留 baseline** — 优化前先采集并保存 baseline 数据
 5. **精度优先** — 精度不通过时不允许合入
+6. **accuracy.log 必须保存** — 每轮精度验证必须通过 `tee` 或重定向将完整 pytest 输出保存到 `accuracy.log`，例如：
+   ```bash
+   pytest tests/pytorch/ops/test_gemm_fp8.py -k "blockwise" -v --tb=short 2>&1 | tee agent_docs/blockwise-fp8/roundN/accuracy.log
+   ```
 
 ## Blockwise FP8 量化背景
 
