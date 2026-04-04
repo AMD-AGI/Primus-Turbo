@@ -1,0 +1,14 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "arch": "gfx950 (CDNA4)",
+  "date": "2026-04-03",
+  "commit": "333b68d (main)",
+  "branch": "main",
+  "summary": {
+    "avg_fwd_tflops": 488.08,
+    "avg_bwd_tflops": 228.99,
+    "total_tests": 84,
+    "pass_rate": "84/84 (100%)"
+  }
+}

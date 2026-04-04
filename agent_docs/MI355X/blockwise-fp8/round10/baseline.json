@@ -1,0 +1,8 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "date": "2026-04-03",
+  "commit": "round2 optimized (BLOCK_M=256, BLOCK_N=128)",
+  "avg_fwd_tflops": 1297.4,
+  "avg_bwd_tflops": 976.8
+}

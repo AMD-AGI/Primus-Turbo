@@ -1,0 +1,20 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "arch": "gfx950 (CDNA4)",
+  "date": "2026-04-03",
+  "commit": "15f4aad (agent-optimize)",
+  "branch": "agent-optimize",
+  "summary": {
+    "avg_fwd_tflops": 866.37,
+    "avg_bwd_tflops": 813.68,
+    "total_tests": 84,
+    "pass_rate": "84/84 (100%)"
+  },
+  "vs_baseline": {
+    "baseline_fwd_tflops": 488.08,
+    "baseline_bwd_tflops": 228.99,
+    "fwd_speedup": "1.775x (+77.5%)",
+    "bwd_speedup": "3.553x (+255.3%)"
+  }
+}

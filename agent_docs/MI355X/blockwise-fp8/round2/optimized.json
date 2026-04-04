@@ -1,0 +1,11 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "date": "2026-04-03",
+  "optimization": "BLOCK_M=256 tile for M>=2048 on gfx950",
+  "avg_fwd_tflops": 1297.4,
+  "avg_bwd_tflops": 976.8,
+  "delta_fwd": "+49.7%",
+  "delta_bwd": "+20.0%",
+  "accuracy": "26/26 PASS (standalone, per-test seed reset)"
+}

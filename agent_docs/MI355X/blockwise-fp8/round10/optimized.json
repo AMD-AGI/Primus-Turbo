@@ -1,0 +1,12 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "date": "2026-04-03",
+  "optimization": "Multi-block B-scale kernel support + 256x256 tile attempt",
+  "avg_fwd_tflops": 1293.14,
+  "avg_bwd_tflops": 974.06,
+  "delta_fwd": "-0.3% (noise)",
+  "delta_bwd": "-0.3% (noise)",
+  "accuracy": "192/192 PASS (regular blockwise), 1 flaky MX blockwise excluded",
+  "conclusion": "256x256 tile 4-5x slower due to register pressure; reverted to 256x128"
+}

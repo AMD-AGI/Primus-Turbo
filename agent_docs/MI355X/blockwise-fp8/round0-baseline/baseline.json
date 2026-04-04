@@ -1,0 +1,29 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "arch": "gfx950 (CDNA4)",
+  "date": "2026-04-03",
+  "commit": "333b68d (main)",
+  "branch": "main",
+  "summary": {
+    "avg_fwd_tflops": 488.08,
+    "avg_bwd_tflops": 228.99,
+    "total_tests": 84,
+    "pass_rate": "84/84 (100%)"
+  },
+  "hardware": {
+    "gpu_model": "AMD Instinct MI355X",
+    "cu_count": 256,
+    "xcd_count": 8,
+    "hbm_capacity_gb": 288,
+    "hbm_bandwidth_tbs": 8.0,
+    "lds_per_cu_kb": 160,
+    "fp8_peak_tflops": 5000,
+    "bf16_peak_tflops": 2500
+  },
+  "utilization": {
+    "fwd_fp8_util": "9.76%",
+    "bwd_fp8_util": "4.58%",
+    "comment": "FP8 utilization calculated against 5000 TFLOPS peak"
+  }
+}

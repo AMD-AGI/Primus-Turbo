@@ -1,0 +1,9 @@
+{
+  "operator": "gemm_fp8_blockwise",
+  "gpu": "MI355X",
+  "date": "2026-04-03",
+  "commit": "15f4aad (agent-optimize, round1 MI300X port)",
+  "source": "round1-mi300x-port baseline",
+  "avg_fwd_tflops": 866.4,
+  "avg_bwd_tflops": 813.7
+}

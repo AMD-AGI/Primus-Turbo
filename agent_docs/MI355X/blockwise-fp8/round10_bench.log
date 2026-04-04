@@ -1,0 +1,840 @@
+[aiter] import [module_aiter_enum] under /workspace/aiter/aiter/jit/module_aiter_enum.so
+/opt/venv/lib/python3.10/site-packages/torch/library.py:356: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: primus_turbo::attention_triton_backward_impl(Tensor do, Tensor q, Tensor k, Tensor v, Tensor o, Tensor q_descale, Tensor k_descale, Tensor v_descale, float p_scale, Tensor softmax_lse_delta, Tensor(a10!)? dq, Tensor(a11!)? dk, Tensor(a12!)? dv, SymInt cu_seqlens_q, SymInt cu_seqlens_k, SymInt max_seqlen_q, SymInt max_seqlen_k, float softmax_scale, bool causal, SymInt window_size_left, SymInt window_size_right, Tensor? alibi_slopes, bool use_fp8) -> (Tensor, Tensor, Tensor)
+    registered at /opt/venv/lib/python3.10/site-packages/torch/_library/custom_ops.py:922
+  dispatch key: ADInplaceOrView
+  previous kernel: no debug info
+       new kernel: registered at /opt/venv/lib/python3.10/site-packages/torch/_library/custom_ops.py:922 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+
+============================================================
+TestID: 1, Case: Llama-2-7B, MBS: 1, M: 4096, N: 12288, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.311 ms | TFLOPS: 1324.47
+Backward Mean time: 0.876 ms | TFLOPS: 941.53
+
+============================================================
+TestID: 2, Case: Llama-2-7B, MBS: 1, M: 4096, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.177 ms | TFLOPS: 778.22
+Backward Mean time: 0.351 ms | TFLOPS: 782.90
+
+============================================================
+TestID: 3, Case: Llama-2-7B, MBS: 1, M: 4096, N: 22016, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.568 ms | TFLOPS: 1299.98
+Backward Mean time: 1.583 ms | TFLOPS: 933.39
+
+============================================================
+TestID: 4, Case: Llama-2-7B, MBS: 1, M: 4096, N: 4096, K: 11008, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.296 ms | TFLOPS: 1249.56
+Backward Mean time: 0.879 ms | TFLOPS: 840.07
+
+============================================================
+TestID: 5, Case: Llama-2-7B, MBS: 2, M: 8192, N: 12288, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.583 ms | TFLOPS: 1415.12
+Backward Mean time: 1.708 ms | TFLOPS: 965.64
+
+============================================================
+TestID: 6, Case: Llama-2-7B, MBS: 2, M: 8192, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.214 ms | TFLOPS: 1282.88
+Backward Mean time: 0.604 ms | TFLOPS: 909.44
+
+============================================================
+TestID: 7, Case: Llama-2-7B, MBS: 2, M: 8192, N: 22016, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.089 ms | TFLOPS: 1356.98
+Backward Mean time: 3.029 ms | TFLOPS: 975.66
+
+============================================================
+TestID: 8, Case: Llama-2-7B, MBS: 2, M: 8192, N: 4096, K: 11008, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.606 ms | TFLOPS: 1218.61
+Backward Mean time: 1.673 ms | TFLOPS: 883.08
+
+============================================================
+TestID: 9, Case: Llama-2-7B, MBS: 4, M: 16384, N: 12288, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.193 ms | TFLOPS: 1382.89
+Backward Mean time: 3.294 ms | TFLOPS: 1001.47
+
+============================================================
+TestID: 10, Case: Llama-2-7B, MBS: 4, M: 16384, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.422 ms | TFLOPS: 1303.39
+Backward Mean time: 1.255 ms | TFLOPS: 876.06
+
+============================================================
+TestID: 11, Case: Llama-2-7B, MBS: 4, M: 16384, N: 22016, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 2.029 ms | TFLOPS: 1456.53
+Backward Mean time: 5.885 ms | TFLOPS: 1004.18
+
+============================================================
+TestID: 12, Case: Llama-2-7B, MBS: 4, M: 16384, N: 4096, K: 11008, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.314 ms | TFLOPS: 1124.07
+Backward Mean time: 3.230 ms | TFLOPS: 914.97
+
+============================================================
+TestID: 13, Case: Llama-2-70B, MBS: 1, M: 4096, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.519 ms | TFLOPS: 1323.56
+Backward Mean time: 1.434 ms | TFLOPS: 958.42
+
+============================================================
+TestID: 14, Case: Llama-2-70B, MBS: 1, M: 4096, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.412 ms | TFLOPS: 1334.55
+Backward Mean time: 1.168 ms | TFLOPS: 941.76
+
+============================================================
+TestID: 15, Case: Llama-2-70B, MBS: 1, M: 4096, N: 57344, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.072 ms | TFLOPS: 1252.85
+Backward Mean time: 7.691 ms | TFLOPS: 1000.78
+
+============================================================
+TestID: 16, Case: Llama-2-70B, MBS: 1, M: 4096, N: 8192, K: 28672, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.622 ms | TFLOPS: 1186.13
+Backward Mean time: 3.827 ms | TFLOPS: 1005.52
+
+============================================================
+TestID: 17, Case: Llama-2-70B, MBS: 2, M: 8192, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.958 ms | TFLOPS: 1434.67
+Backward Mean time: 2.707 ms | TFLOPS: 1015.26
+
+============================================================
+TestID: 18, Case: Llama-2-70B, MBS: 2, M: 8192, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.835 ms | TFLOPS: 1317.52
+Backward Mean time: 2.180 ms | TFLOPS: 1008.52
+
+============================================================
+TestID: 19, Case: Llama-2-70B, MBS: 2, M: 8192, N: 57344, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 5.787 ms | TFLOPS: 1330.04
+Backward Mean time: 14.589 ms | TFLOPS: 1055.14
+
+============================================================
+TestID: 20, Case: Llama-2-70B, MBS: 2, M: 8192, N: 8192, K: 28672, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.234 ms | TFLOPS: 1189.91
+Backward Mean time: 7.326 ms | TFLOPS: 1050.61
+
+============================================================
+TestID: 21, Case: Llama-2-70B, MBS: 4, M: 16384, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.933 ms | TFLOPS: 1422.20
+Backward Mean time: 5.307 ms | TFLOPS: 1035.89
+
+============================================================
+TestID: 22, Case: Llama-2-70B, MBS: 4, M: 16384, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.803 ms | TFLOPS: 1219.93
+Backward Mean time: 4.268 ms | TFLOPS: 1030.59
+
+============================================================
+TestID: 23, Case: Llama-2-70B, MBS: 4, M: 16384, N: 57344, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 11.166 ms | TFLOPS: 1378.52
+Backward Mean time: 28.472 ms | TFLOPS: 1081.28
+
+============================================================
+TestID: 24, Case: Llama-2-70B, MBS: 4, M: 16384, N: 8192, K: 28672, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 6.278 ms | TFLOPS: 1226.03
+Backward Mean time: 14.395 ms | TFLOPS: 1069.32
+
+============================================================
+TestID: 25, Case: Llama-3.1-8B, MBS: 1, M: 8192, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.317 ms | TFLOPS: 1301.48
+Backward Mean time: 0.925 ms | TFLOPS: 891.59
+
+============================================================
+TestID: 26, Case: Llama-3.1-8B, MBS: 1, M: 8192, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.217 ms | TFLOPS: 1264.45
+Backward Mean time: 0.659 ms | TFLOPS: 834.52
+
+============================================================
+TestID: 27, Case: Llama-3.1-8B, MBS: 1, M: 8192, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.365 ms | TFLOPS: 1409.24
+Backward Mean time: 3.953 ms | TFLOPS: 973.63
+
+============================================================
+TestID: 28, Case: Llama-3.1-8B, MBS: 1, M: 8192, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.809 ms | TFLOPS: 1189.43
+Backward Mean time: 2.050 ms | TFLOPS: 938.46
+
+============================================================
+TestID: 29, Case: Llama-3.1-8B, MBS: 2, M: 16384, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.607 ms | TFLOPS: 1357.79
+Backward Mean time: 1.761 ms | TFLOPS: 936.29
+
+============================================================
+TestID: 30, Case: Llama-3.1-8B, MBS: 2, M: 16384, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.422 ms | TFLOPS: 1301.51
+Backward Mean time: 1.254 ms | TFLOPS: 876.90
+
+============================================================
+TestID: 31, Case: Llama-3.1-8B, MBS: 2, M: 16384, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 2.565 ms | TFLOPS: 1500.14
+Backward Mean time: 7.460 ms | TFLOPS: 1031.72
+
+============================================================
+TestID: 32, Case: Llama-3.1-8B, MBS: 2, M: 16384, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.643 ms | TFLOPS: 1171.16
+Backward Mean time: 3.937 ms | TFLOPS: 977.37
+
+============================================================
+TestID: 33, Case: Llama-3.1-8B, MBS: 4, M: 32768, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.252 ms | TFLOPS: 1317.74
+Backward Mean time: 3.556 ms | TFLOPS: 927.59
+
+============================================================
+TestID: 34, Case: Llama-3.1-8B, MBS: 4, M: 32768, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.962 ms | TFLOPS: 1143.37
+Backward Mean time: 2.495 ms | TFLOPS: 881.34
+
+============================================================
+TestID: 35, Case: Llama-3.1-8B, MBS: 4, M: 32768, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 5.092 ms | TFLOPS: 1511.56
+Backward Mean time: 14.842 ms | TFLOPS: 1037.17
+
+============================================================
+TestID: 36, Case: Llama-3.1-8B, MBS: 4, M: 32768, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.185 ms | TFLOPS: 1208.22
+Backward Mean time: 7.895 ms | TFLOPS: 974.91
+
+============================================================
+TestID: 37, Case: Llama-3.1-405B, MBS: 1, M: 8192, N: 18432, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.720 ms | TFLOPS: 1330.19
+Backward Mean time: 9.001 ms | TFLOPS: 1099.42
+
+============================================================
+TestID: 38, Case: Llama-3.1-405B, MBS: 1, M: 8192, N: 16384, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.300 ms | TFLOPS: 1332.87
+Backward Mean time: 7.992 ms | TFLOPS: 1100.60
+
+============================================================
+TestID: 39, Case: Llama-3.1-405B, MBS: 1, M: 8192, N: 106496, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 20.518 ms | TFLOPS: 1393.27
+Backward Mean time: 51.655 ms | TFLOPS: 1106.86
+
+============================================================
+TestID: 40, Case: Llama-3.1-405B, MBS: 1, M: 8192, N: 16384, K: 53248, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 11.136 ms | TFLOPS: 1283.54
+Backward Mean time: 25.460 ms | TFLOPS: 1122.84
+
+============================================================
+TestID: 41, Case: Llama-3.1-405B, MBS: 2, M: 16384, N: 18432, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 7.193 ms | TFLOPS: 1375.71
+Backward Mean time: 18.013 ms | TFLOPS: 1098.69
+
+============================================================
+TestID: 42, Case: Llama-3.1-405B, MBS: 2, M: 16384, N: 16384, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 6.740 ms | TFLOPS: 1305.00
+Backward Mean time: 15.971 ms | TFLOPS: 1101.48
+
+============================================================
+TestID: 43, Case: Llama-3.1-405B, MBS: 2, M: 16384, N: 106496, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 39.706 ms | TFLOPS: 1439.96
+Backward Mean time: 101.271 ms | TFLOPS: 1129.14
+
+============================================================
+TestID: 44, Case: Llama-3.1-405B, MBS: 2, M: 16384, N: 16384, K: 53248, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 22.213 ms | TFLOPS: 1286.96
+Backward Mean time: 50.988 ms | TFLOPS: 1121.34
+
+============================================================
+TestID: 45, Case: Llama-3.1-405B, MBS: 4, M: 32768, N: 18432, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 14.556 ms | TFLOPS: 1359.69
+Backward Mean time: 36.442 ms | TFLOPS: 1086.16
+
+============================================================
+TestID: 46, Case: Llama-3.1-405B, MBS: 4, M: 32768, N: 16384, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 13.216 ms | TFLOPS: 1331.13
+Backward Mean time: 32.436 ms | TFLOPS: 1084.73
+
+============================================================
+TestID: 47, Case: Llama-3.1-405B, MBS: 4, M: 32768, N: 106496, K: 16384, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 78.041 ms | TFLOPS: 1465.25
+Backward Mean time: 208.922 ms | TFLOPS: 1094.66
+
+============================================================
+TestID: 48, Case: Llama-3.1-405B, MBS: 4, M: 32768, N: 16384, K: 53248, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 43.786 ms | TFLOPS: 1305.79
+Backward Mean time: 104.380 ms | TFLOPS: 1095.51
+
+============================================================
+TestID: 49, Case: Qwen2.5-7B, MBS: 1, M: 8192, N: 4608, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.236 ms | TFLOPS: 1145.59
+Backward Mean time: 0.645 ms | TFLOPS: 838.40
+
+============================================================
+TestID: 50, Case: Qwen2.5-7B, MBS: 1, M: 8192, N: 3584, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.197 ms | TFLOPS: 1066.62
+Backward Mean time: 0.558 ms | TFLOPS: 753.81
+
+============================================================
+TestID: 51, Case: Qwen2.5-7B, MBS: 1, M: 8192, N: 37888, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.606 ms | TFLOPS: 1385.38
+Backward Mean time: 4.930 ms | TFLOPS: 902.52
+
+============================================================
+TestID: 52, Case: Qwen2.5-7B, MBS: 1, M: 8192, N: 3584, K: 18944, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.010 ms | TFLOPS: 1101.56
+Backward Mean time: 2.467 ms | TFLOPS: 901.76
+
+============================================================
+TestID: 53, Case: Qwen2.5-7B, MBS: 2, M: 16384, N: 4608, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.414 ms | TFLOPS: 1306.59
+Backward Mean time: 1.290 ms | TFLOPS: 839.15
+
+============================================================
+TestID: 54, Case: Qwen2.5-7B, MBS: 2, M: 16384, N: 3584, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.336 ms | TFLOPS: 1251.66
+Backward Mean time: 1.095 ms | TFLOPS: 768.72
+
+============================================================
+TestID: 55, Case: Qwen2.5-7B, MBS: 2, M: 16384, N: 37888, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.164 ms | TFLOPS: 1406.23
+Backward Mean time: 9.085 ms | TFLOPS: 979.49
+
+============================================================
+TestID: 56, Case: Qwen2.5-7B, MBS: 2, M: 16384, N: 3584, K: 18944, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.818 ms | TFLOPS: 1223.45
+Backward Mean time: 4.754 ms | TFLOPS: 935.90
+
+============================================================
+TestID: 57, Case: Qwen2.5-7B, MBS: 4, M: 32768, N: 4608, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.938 ms | TFLOPS: 1154.27
+Backward Mean time: 2.533 ms | TFLOPS: 854.54
+
+============================================================
+TestID: 58, Case: Qwen2.5-7B, MBS: 4, M: 32768, N: 3584, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.693 ms | TFLOPS: 1214.87
+Backward Mean time: 2.220 ms | TFLOPS: 758.32
+
+============================================================
+TestID: 59, Case: Qwen2.5-7B, MBS: 4, M: 32768, N: 37888, K: 3584, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 6.316 ms | TFLOPS: 1409.10
+Backward Mean time: 18.148 ms | TFLOPS: 980.74
+
+============================================================
+TestID: 60, Case: Qwen2.5-7B, MBS: 4, M: 32768, N: 3584, K: 18944, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.426 ms | TFLOPS: 1298.84
+Backward Mean time: 9.706 ms | TFLOPS: 916.87
+
+============================================================
+TestID: 61, Case: Qwen2.5-72B, MBS: 1, M: 8192, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.960 ms | TFLOPS: 1432.14
+Backward Mean time: 2.696 ms | TFLOPS: 1019.75
+
+============================================================
+TestID: 62, Case: Qwen2.5-72B, MBS: 1, M: 8192, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.833 ms | TFLOPS: 1319.45
+Backward Mean time: 2.171 ms | TFLOPS: 1012.86
+
+============================================================
+TestID: 63, Case: Qwen2.5-72B, MBS: 1, M: 8192, N: 59136, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 6.123 ms | TFLOPS: 1296.21
+Backward Mean time: 15.223 ms | TFLOPS: 1042.77
+
+============================================================
+TestID: 64, Case: Qwen2.5-72B, MBS: 1, M: 8192, N: 8192, K: 29568, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.321 ms | TFLOPS: 1194.92
+Backward Mean time: 7.668 ms | TFLOPS: 1035.05
+
+============================================================
+TestID: 65, Case: Qwen2.5-72B, MBS: 2, M: 16384, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.918 ms | TFLOPS: 1433.18
+Backward Mean time: 5.242 ms | TFLOPS: 1048.78
+
+============================================================
+TestID: 66, Case: Qwen2.5-72B, MBS: 2, M: 16384, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.765 ms | TFLOPS: 1246.12
+Backward Mean time: 4.254 ms | TFLOPS: 1033.81
+
+============================================================
+TestID: 67, Case: Qwen2.5-72B, MBS: 2, M: 16384, N: 59136, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 11.927 ms | TFLOPS: 1330.99
+Backward Mean time: 29.828 ms | TFLOPS: 1064.39
+
+============================================================
+TestID: 68, Case: Qwen2.5-72B, MBS: 2, M: 16384, N: 8192, K: 29568, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 6.516 ms | TFLOPS: 1218.09
+Backward Mean time: 15.456 ms | TFLOPS: 1027.08
+
+============================================================
+TestID: 69, Case: Qwen2.5-72B, MBS: 4, M: 32768, N: 10240, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.754 ms | TFLOPS: 1464.59
+Backward Mean time: 10.605 ms | TFLOPS: 1036.77
+
+============================================================
+TestID: 70, Case: Qwen2.5-72B, MBS: 4, M: 32768, N: 8192, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 3.492 ms | TFLOPS: 1259.38
+Backward Mean time: 8.707 ms | TFLOPS: 1010.21
+
+============================================================
+TestID: 71, Case: Qwen2.5-72B, MBS: 4, M: 32768, N: 59136, K: 8192, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 22.747 ms | TFLOPS: 1395.69
+Backward Mean time: 60.701 ms | TFLOPS: 1046.06
+
+============================================================
+TestID: 72, Case: Qwen2.5-72B, MBS: 4, M: 32768, N: 8192, K: 29568, dtype: fp8, granularity: blockwise
+============================================================
+/opt/venv/lib/python3.10/site-packages/triton/backends/amd/compiler.py:79: UserWarning: kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = 2 will be overwritten to 1 to make transitioning easier.
+  warnings.warn(
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 12.831 ms | TFLOPS: 1237.19
+Backward Mean time: 31.084 ms | TFLOPS: 1021.39
+
+============================================================
+TestID: 73, Case: Mistral-7B, MBS: 1, M: 4096, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.175 ms | TFLOPS: 1181.01
+Backward Mean time: 0.458 ms | TFLOPS: 900.47
+
+============================================================
+TestID: 74, Case: Mistral-7B, MBS: 1, M: 4096, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.173 ms | TFLOPS: 795.67
+Backward Mean time: 0.325 ms | TFLOPS: 846.52
+
+============================================================
+TestID: 75, Case: Mistral-7B, MBS: 1, M: 4096, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.723 ms | TFLOPS: 1330.98
+Backward Mean time: 2.007 ms | TFLOPS: 958.71
+
+============================================================
+TestID: 76, Case: Mistral-7B, MBS: 1, M: 4096, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.383 ms | TFLOPS: 1256.73
+Backward Mean time: 1.095 ms | TFLOPS: 878.54
+
+============================================================
+TestID: 77, Case: Mistral-7B, MBS: 2, M: 8192, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.310 ms | TFLOPS: 1329.04
+Backward Mean time: 0.887 ms | TFLOPS: 929.67
+
+============================================================
+TestID: 78, Case: Mistral-7B, MBS: 2, M: 8192, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.214 ms | TFLOPS: 1283.38
+Backward Mean time: 0.606 ms | TFLOPS: 906.65
+
+============================================================
+TestID: 79, Case: Mistral-7B, MBS: 2, M: 8192, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.340 ms | TFLOPS: 1436.37
+Backward Mean time: 3.834 ms | TFLOPS: 1003.73
+
+============================================================
+TestID: 80, Case: Mistral-7B, MBS: 2, M: 8192, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.809 ms | TFLOPS: 1189.00
+Backward Mean time: 2.049 ms | TFLOPS: 938.95
+
+============================================================
+TestID: 81, Case: Mistral-7B, MBS: 4, M: 16384, N: 6144, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.608 ms | TFLOPS: 1357.03
+Backward Mean time: 1.762 ms | TFLOPS: 935.84
+
+============================================================
+TestID: 82, Case: Mistral-7B, MBS: 4, M: 16384, N: 4096, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 0.421 ms | TFLOPS: 1305.75
+Backward Mean time: 1.254 ms | TFLOPS: 876.58
+
+============================================================
+TestID: 83, Case: Mistral-7B, MBS: 4, M: 16384, N: 28672, K: 4096, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 2.563 ms | TFLOPS: 1501.26
+Backward Mean time: 7.456 ms | TFLOPS: 1032.22
+
+============================================================
+TestID: 84, Case: Mistral-7B, MBS: 4, M: 16384, N: 4096, K: 14336, dtype: fp8, granularity: blockwise
+============================================================
+Correctness Check: PASS (out=28.6, da=28.6, db=28.8) threshold=25
+Forward  Mean time: 1.642 ms | TFLOPS: 1171.63
+Backward Mean time: 3.930 ms | TFLOPS: 979.22
+
+Final Results:
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|   TestID | Platform   | GPU    | Case           |   MBS |     M |      N |     K | Dtype   | Granularity   | Check   |   Forward Time (ms) |   Forward TFLOPS |   Backward Time (ms) |   Backward TFLOPS |
++==========+============+========+================+=======+=======+========+=======+=========+===============+=========+=====================+==================+======================+===================+
+|        1 | ROCm       | MI355X | Llama-2-7B     |     1 |  4096 |  12288 |  4096 | fp8     | blockwise     | PASS    |                0.31 |          1324.47 |                 0.88 |            941.53 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        2 | ROCm       | MI355X | Llama-2-7B     |     1 |  4096 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.18 |           778.22 |                 0.35 |            782.9  |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        3 | ROCm       | MI355X | Llama-2-7B     |     1 |  4096 |  22016 |  4096 | fp8     | blockwise     | PASS    |                0.57 |          1299.98 |                 1.58 |            933.39 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        4 | ROCm       | MI355X | Llama-2-7B     |     1 |  4096 |   4096 | 11008 | fp8     | blockwise     | PASS    |                0.3  |          1249.56 |                 0.88 |            840.07 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        5 | ROCm       | MI355X | Llama-2-7B     |     2 |  8192 |  12288 |  4096 | fp8     | blockwise     | PASS    |                0.58 |          1415.12 |                 1.71 |            965.64 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        6 | ROCm       | MI355X | Llama-2-7B     |     2 |  8192 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.21 |          1282.88 |                 0.6  |            909.44 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        7 | ROCm       | MI355X | Llama-2-7B     |     2 |  8192 |  22016 |  4096 | fp8     | blockwise     | PASS    |                1.09 |          1356.98 |                 3.03 |            975.66 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        8 | ROCm       | MI355X | Llama-2-7B     |     2 |  8192 |   4096 | 11008 | fp8     | blockwise     | PASS    |                0.61 |          1218.61 |                 1.67 |            883.08 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|        9 | ROCm       | MI355X | Llama-2-7B     |     4 | 16384 |  12288 |  4096 | fp8     | blockwise     | PASS    |                1.19 |          1382.89 |                 3.29 |           1001.47 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       10 | ROCm       | MI355X | Llama-2-7B     |     4 | 16384 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.42 |          1303.39 |                 1.26 |            876.06 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       11 | ROCm       | MI355X | Llama-2-7B     |     4 | 16384 |  22016 |  4096 | fp8     | blockwise     | PASS    |                2.03 |          1456.53 |                 5.89 |           1004.18 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       12 | ROCm       | MI355X | Llama-2-7B     |     4 | 16384 |   4096 | 11008 | fp8     | blockwise     | PASS    |                1.31 |          1124.07 |                 3.23 |            914.97 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       13 | ROCm       | MI355X | Llama-2-70B    |     1 |  4096 |  10240 |  8192 | fp8     | blockwise     | PASS    |                0.52 |          1323.56 |                 1.43 |            958.42 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       14 | ROCm       | MI355X | Llama-2-70B    |     1 |  4096 |   8192 |  8192 | fp8     | blockwise     | PASS    |                0.41 |          1334.55 |                 1.17 |            941.76 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       15 | ROCm       | MI355X | Llama-2-70B    |     1 |  4096 |  57344 |  8192 | fp8     | blockwise     | PASS    |                3.07 |          1252.85 |                 7.69 |           1000.78 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       16 | ROCm       | MI355X | Llama-2-70B    |     1 |  4096 |   8192 | 28672 | fp8     | blockwise     | PASS    |                1.62 |          1186.13 |                 3.83 |           1005.52 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       17 | ROCm       | MI355X | Llama-2-70B    |     2 |  8192 |  10240 |  8192 | fp8     | blockwise     | PASS    |                0.96 |          1434.67 |                 2.71 |           1015.26 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       18 | ROCm       | MI355X | Llama-2-70B    |     2 |  8192 |   8192 |  8192 | fp8     | blockwise     | PASS    |                0.83 |          1317.52 |                 2.18 |           1008.52 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       19 | ROCm       | MI355X | Llama-2-70B    |     2 |  8192 |  57344 |  8192 | fp8     | blockwise     | PASS    |                5.79 |          1330.04 |                14.59 |           1055.14 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       20 | ROCm       | MI355X | Llama-2-70B    |     2 |  8192 |   8192 | 28672 | fp8     | blockwise     | PASS    |                3.23 |          1189.91 |                 7.33 |           1050.61 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       21 | ROCm       | MI355X | Llama-2-70B    |     4 | 16384 |  10240 |  8192 | fp8     | blockwise     | PASS    |                1.93 |          1422.2  |                 5.31 |           1035.89 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       22 | ROCm       | MI355X | Llama-2-70B    |     4 | 16384 |   8192 |  8192 | fp8     | blockwise     | PASS    |                1.8  |          1219.93 |                 4.27 |           1030.59 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       23 | ROCm       | MI355X | Llama-2-70B    |     4 | 16384 |  57344 |  8192 | fp8     | blockwise     | PASS    |               11.17 |          1378.52 |                28.47 |           1081.28 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       24 | ROCm       | MI355X | Llama-2-70B    |     4 | 16384 |   8192 | 28672 | fp8     | blockwise     | PASS    |                6.28 |          1226.03 |                14.4  |           1069.32 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       25 | ROCm       | MI355X | Llama-3.1-8B   |     1 |  8192 |   6144 |  4096 | fp8     | blockwise     | PASS    |                0.32 |          1301.48 |                 0.92 |            891.59 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       26 | ROCm       | MI355X | Llama-3.1-8B   |     1 |  8192 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.22 |          1264.45 |                 0.66 |            834.52 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       27 | ROCm       | MI355X | Llama-3.1-8B   |     1 |  8192 |  28672 |  4096 | fp8     | blockwise     | PASS    |                1.37 |          1409.24 |                 3.95 |            973.63 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       28 | ROCm       | MI355X | Llama-3.1-8B   |     1 |  8192 |   4096 | 14336 | fp8     | blockwise     | PASS    |                0.81 |          1189.43 |                 2.05 |            938.46 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       29 | ROCm       | MI355X | Llama-3.1-8B   |     2 | 16384 |   6144 |  4096 | fp8     | blockwise     | PASS    |                0.61 |          1357.79 |                 1.76 |            936.29 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       30 | ROCm       | MI355X | Llama-3.1-8B   |     2 | 16384 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.42 |          1301.51 |                 1.25 |            876.9  |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       31 | ROCm       | MI355X | Llama-3.1-8B   |     2 | 16384 |  28672 |  4096 | fp8     | blockwise     | PASS    |                2.57 |          1500.14 |                 7.46 |           1031.72 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       32 | ROCm       | MI355X | Llama-3.1-8B   |     2 | 16384 |   4096 | 14336 | fp8     | blockwise     | PASS    |                1.64 |          1171.16 |                 3.94 |            977.37 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       33 | ROCm       | MI355X | Llama-3.1-8B   |     4 | 32768 |   6144 |  4096 | fp8     | blockwise     | PASS    |                1.25 |          1317.74 |                 3.56 |            927.59 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       34 | ROCm       | MI355X | Llama-3.1-8B   |     4 | 32768 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.96 |          1143.37 |                 2.5  |            881.34 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       35 | ROCm       | MI355X | Llama-3.1-8B   |     4 | 32768 |  28672 |  4096 | fp8     | blockwise     | PASS    |                5.09 |          1511.56 |                14.84 |           1037.17 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       36 | ROCm       | MI355X | Llama-3.1-8B   |     4 | 32768 |   4096 | 14336 | fp8     | blockwise     | PASS    |                3.19 |          1208.22 |                 7.89 |            974.91 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       37 | ROCm       | MI355X | Llama-3.1-405B |     1 |  8192 |  18432 | 16384 | fp8     | blockwise     | PASS    |                3.72 |          1330.19 |                 9    |           1099.42 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       38 | ROCm       | MI355X | Llama-3.1-405B |     1 |  8192 |  16384 | 16384 | fp8     | blockwise     | PASS    |                3.3  |          1332.87 |                 7.99 |           1100.6  |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       39 | ROCm       | MI355X | Llama-3.1-405B |     1 |  8192 | 106496 | 16384 | fp8     | blockwise     | PASS    |               20.52 |          1393.27 |                51.65 |           1106.86 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       40 | ROCm       | MI355X | Llama-3.1-405B |     1 |  8192 |  16384 | 53248 | fp8     | blockwise     | PASS    |               11.14 |          1283.54 |                25.46 |           1122.84 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       41 | ROCm       | MI355X | Llama-3.1-405B |     2 | 16384 |  18432 | 16384 | fp8     | blockwise     | PASS    |                7.19 |          1375.71 |                18.01 |           1098.69 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       42 | ROCm       | MI355X | Llama-3.1-405B |     2 | 16384 |  16384 | 16384 | fp8     | blockwise     | PASS    |                6.74 |          1305    |                15.97 |           1101.48 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       43 | ROCm       | MI355X | Llama-3.1-405B |     2 | 16384 | 106496 | 16384 | fp8     | blockwise     | PASS    |               39.71 |          1439.96 |               101.27 |           1129.14 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       44 | ROCm       | MI355X | Llama-3.1-405B |     2 | 16384 |  16384 | 53248 | fp8     | blockwise     | PASS    |               22.21 |          1286.96 |                50.99 |           1121.34 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       45 | ROCm       | MI355X | Llama-3.1-405B |     4 | 32768 |  18432 | 16384 | fp8     | blockwise     | PASS    |               14.56 |          1359.69 |                36.44 |           1086.16 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       46 | ROCm       | MI355X | Llama-3.1-405B |     4 | 32768 |  16384 | 16384 | fp8     | blockwise     | PASS    |               13.22 |          1331.13 |                32.44 |           1084.73 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       47 | ROCm       | MI355X | Llama-3.1-405B |     4 | 32768 | 106496 | 16384 | fp8     | blockwise     | PASS    |               78.04 |          1465.25 |               208.92 |           1094.66 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       48 | ROCm       | MI355X | Llama-3.1-405B |     4 | 32768 |  16384 | 53248 | fp8     | blockwise     | PASS    |               43.79 |          1305.79 |               104.38 |           1095.51 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       49 | ROCm       | MI355X | Qwen2.5-7B     |     1 |  8192 |   4608 |  3584 | fp8     | blockwise     | PASS    |                0.24 |          1145.59 |                 0.65 |            838.4  |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       50 | ROCm       | MI355X | Qwen2.5-7B     |     1 |  8192 |   3584 |  3584 | fp8     | blockwise     | PASS    |                0.2  |          1066.62 |                 0.56 |            753.81 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       51 | ROCm       | MI355X | Qwen2.5-7B     |     1 |  8192 |  37888 |  3584 | fp8     | blockwise     | PASS    |                1.61 |          1385.38 |                 4.93 |            902.52 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       52 | ROCm       | MI355X | Qwen2.5-7B     |     1 |  8192 |   3584 | 18944 | fp8     | blockwise     | PASS    |                1.01 |          1101.56 |                 2.47 |            901.76 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       53 | ROCm       | MI355X | Qwen2.5-7B     |     2 | 16384 |   4608 |  3584 | fp8     | blockwise     | PASS    |                0.41 |          1306.59 |                 1.29 |            839.15 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       54 | ROCm       | MI355X | Qwen2.5-7B     |     2 | 16384 |   3584 |  3584 | fp8     | blockwise     | PASS    |                0.34 |          1251.66 |                 1.1  |            768.72 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       55 | ROCm       | MI355X | Qwen2.5-7B     |     2 | 16384 |  37888 |  3584 | fp8     | blockwise     | PASS    |                3.16 |          1406.23 |                 9.09 |            979.49 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       56 | ROCm       | MI355X | Qwen2.5-7B     |     2 | 16384 |   3584 | 18944 | fp8     | blockwise     | PASS    |                1.82 |          1223.45 |                 4.75 |            935.9  |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       57 | ROCm       | MI355X | Qwen2.5-7B     |     4 | 32768 |   4608 |  3584 | fp8     | blockwise     | PASS    |                0.94 |          1154.27 |                 2.53 |            854.54 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       58 | ROCm       | MI355X | Qwen2.5-7B     |     4 | 32768 |   3584 |  3584 | fp8     | blockwise     | PASS    |                0.69 |          1214.87 |                 2.22 |            758.32 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       59 | ROCm       | MI355X | Qwen2.5-7B     |     4 | 32768 |  37888 |  3584 | fp8     | blockwise     | PASS    |                6.32 |          1409.1  |                18.15 |            980.74 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       60 | ROCm       | MI355X | Qwen2.5-7B     |     4 | 32768 |   3584 | 18944 | fp8     | blockwise     | PASS    |                3.43 |          1298.84 |                 9.71 |            916.87 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       61 | ROCm       | MI355X | Qwen2.5-72B    |     1 |  8192 |  10240 |  8192 | fp8     | blockwise     | PASS    |                0.96 |          1432.14 |                 2.7  |           1019.75 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       62 | ROCm       | MI355X | Qwen2.5-72B    |     1 |  8192 |   8192 |  8192 | fp8     | blockwise     | PASS    |                0.83 |          1319.45 |                 2.17 |           1012.86 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       63 | ROCm       | MI355X | Qwen2.5-72B    |     1 |  8192 |  59136 |  8192 | fp8     | blockwise     | PASS    |                6.12 |          1296.21 |                15.22 |           1042.77 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       64 | ROCm       | MI355X | Qwen2.5-72B    |     1 |  8192 |   8192 | 29568 | fp8     | blockwise     | PASS    |                3.32 |          1194.92 |                 7.67 |           1035.05 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       65 | ROCm       | MI355X | Qwen2.5-72B    |     2 | 16384 |  10240 |  8192 | fp8     | blockwise     | PASS    |                1.92 |          1433.18 |                 5.24 |           1048.78 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       66 | ROCm       | MI355X | Qwen2.5-72B    |     2 | 16384 |   8192 |  8192 | fp8     | blockwise     | PASS    |                1.76 |          1246.12 |                 4.25 |           1033.81 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       67 | ROCm       | MI355X | Qwen2.5-72B    |     2 | 16384 |  59136 |  8192 | fp8     | blockwise     | PASS    |               11.93 |          1330.99 |                29.83 |           1064.39 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       68 | ROCm       | MI355X | Qwen2.5-72B    |     2 | 16384 |   8192 | 29568 | fp8     | blockwise     | PASS    |                6.52 |          1218.09 |                15.46 |           1027.08 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       69 | ROCm       | MI355X | Qwen2.5-72B    |     4 | 32768 |  10240 |  8192 | fp8     | blockwise     | PASS    |                3.75 |          1464.59 |                10.61 |           1036.77 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       70 | ROCm       | MI355X | Qwen2.5-72B    |     4 | 32768 |   8192 |  8192 | fp8     | blockwise     | PASS    |                3.49 |          1259.38 |                 8.71 |           1010.21 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       71 | ROCm       | MI355X | Qwen2.5-72B    |     4 | 32768 |  59136 |  8192 | fp8     | blockwise     | PASS    |               22.75 |          1395.69 |                60.7  |           1046.06 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       72 | ROCm       | MI355X | Qwen2.5-72B    |     4 | 32768 |   8192 | 29568 | fp8     | blockwise     | PASS    |               12.83 |          1237.19 |                31.08 |           1021.39 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       73 | ROCm       | MI355X | Mistral-7B     |     1 |  4096 |   6144 |  4096 | fp8     | blockwise     | PASS    |                0.17 |          1181.01 |                 0.46 |            900.47 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       74 | ROCm       | MI355X | Mistral-7B     |     1 |  4096 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.17 |           795.67 |                 0.32 |            846.52 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       75 | ROCm       | MI355X | Mistral-7B     |     1 |  4096 |  28672 |  4096 | fp8     | blockwise     | PASS    |                0.72 |          1330.98 |                 2.01 |            958.71 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       76 | ROCm       | MI355X | Mistral-7B     |     1 |  4096 |   4096 | 14336 | fp8     | blockwise     | PASS    |                0.38 |          1256.73 |                 1.1  |            878.54 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       77 | ROCm       | MI355X | Mistral-7B     |     2 |  8192 |   6144 |  4096 | fp8     | blockwise     | PASS    |                0.31 |          1329.04 |                 0.89 |            929.67 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       78 | ROCm       | MI355X | Mistral-7B     |     2 |  8192 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.21 |          1283.38 |                 0.61 |            906.65 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       79 | ROCm       | MI355X | Mistral-7B     |     2 |  8192 |  28672 |  4096 | fp8     | blockwise     | PASS    |                1.34 |          1436.37 |                 3.83 |           1003.73 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       80 | ROCm       | MI355X | Mistral-7B     |     2 |  8192 |   4096 | 14336 | fp8     | blockwise     | PASS    |                0.81 |          1189    |                 2.05 |            938.95 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       81 | ROCm       | MI355X | Mistral-7B     |     4 | 16384 |   6144 |  4096 | fp8     | blockwise     | PASS    |                0.61 |          1357.03 |                 1.76 |            935.84 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       82 | ROCm       | MI355X | Mistral-7B     |     4 | 16384 |   4096 |  4096 | fp8     | blockwise     | PASS    |                0.42 |          1305.75 |                 1.25 |            876.58 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       83 | ROCm       | MI355X | Mistral-7B     |     4 | 16384 |  28672 |  4096 | fp8     | blockwise     | PASS    |                2.56 |          1501.26 |                 7.46 |           1032.22 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+|       84 | ROCm       | MI355X | Mistral-7B     |     4 | 16384 |   4096 | 14336 | fp8     | blockwise     | PASS    |                1.64 |          1171.63 |                 3.93 |            979.22 |
++----------+------------+--------+----------------+-------+-------+--------+-------+---------+---------------+---------+---------------------+------------------+----------------------+-------------------+
+
+Average Forward TFLOPS: 1293.14
+Average Backward TFLOPS: 974.06
+Results saved to gemm_turbo_fp8_blockwise_20260403_MI355X.csv
