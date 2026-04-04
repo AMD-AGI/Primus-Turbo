@@ -1,13 +1,84 @@
+import warnings
+from typing import Optional, Sequence
+from functools import reduce
+import operator
 import torch
 import torch.distributed as dist
+from torch._tensor import _dtype_to_typestr
 from primus_turbo.pytorch.cco.pyhip_runtime_wrapper import HIPRuntimeLibrary, hipMemcpyKindEnum
 
 
+_group_name_to_workspace_tensor = {}
+
+# ---------------------------------------------------------------------------
+# Zero-copy GPU tensor from raw device pointer via __cuda_array_interface__
+#
+# torch.as_tensor() natively consumes objects exposing this protocol (even on
+# ROCm where the HIPified code path handles it identically).
+#
+# Typestr generation reuses torch._tensor._dtype_to_typestr (the same mapping
+# that Tensor.__cuda_array_interface__ uses for export).  However, the C++
+# import path (tensor_from_cuda_array_interface) parses the typestr via the
+# NumPy C API (PyArray_DescrConverter) and then maps the numpy type_num to a
+# torch ScalarType (numpy_dtype_to_aten).  That mapping only covers standard
+# numpy type codes and rejects void ("V").  bfloat16's typestr is "<V2", so
+# we override it with "<u2" (uint16, same byte width) and .view() back.
+# ---------------------------------------------------------------------------
+
+_PROXY_TYPESTR: dict[torch.dtype, str] = {
+    torch.bfloat16: "<u2",
+}
+
+
+class _DeviceArrayView:
+    """Lightweight wrapper exposing ``__cuda_array_interface__`` for a raw
+    GPU pointer so that ``torch.as_tensor`` can consume it zero-copy."""
+
+    __slots__ = ("__cuda_array_interface__",)
+
+    def __init__(self, ptr: int, shape: tuple[int, ...], typestr: str):
+        self.__cuda_array_interface__ = {
+            "version": 3,
+            "shape": shape,
+            "typestr": typestr,
+            "data": (ptr, False),
+            "strides": None,
+        }
+
+
+def _tensor_from_device_ptr(
+    ptr_int: int,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device_id: int,
+) -> torch.Tensor:
+    """Create a non-owning PyTorch tensor backed by an existing device pointer.
+
+    Equivalent to ``at::for_blob(ptr, sizes).options(opts).make_tensor()``
+    in C++, implemented purely in Python via ``__cuda_array_interface__``.
+    """
+    typestr = _PROXY_TYPESTR.get(dtype) or _dtype_to_typestr(dtype)
+    view = _DeviceArrayView(ptr_int, tuple(shape), typestr)
+    tensor = torch.as_tensor(view, device=torch.device("cuda", device_id))
+    if tensor.dtype != dtype:
+        tensor = tensor.view(dtype)
+    return tensor
+
+
 class SymmetricMemory:
+    """GPU symmetric memory backed by HIP IPC.
+
+    The caller must set the correct CUDA device (via torch.cuda.set_device
+    with the *local* rank) before constructing this object.
+    """
+
     def __init__(self, group: dist.ProcessGroup, alloc_size: int, signal_pad_size: int = 1024):
         if alloc_size <= 0:
             raise ValueError(
                 f"requested alloc size must be greater than 0, got {alloc_size}")
+        if signal_pad_size <= 0:
+            raise ValueError(
+                f"requested signal_pad_size must be greater than 0, got {signal_pad_size}")
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "SymmetricMemory requires CUDA/HIP device support.")
@@ -15,78 +86,259 @@ class SymmetricMemory:
         self.lib = HIPRuntimeLibrary()
         self.group = group
         self.rank = group.rank()
-        self.num_ranks = group.size()
+        self.world_size = group.size()
         self.buffer_size = alloc_size
+        self.signal_pad_size = signal_pad_size
+        self.device = torch.cuda.current_device()
 
-        # set device to rank
-        torch.cuda.set_device(self.rank)
-
-        # allocate memory and rendezvous on memory
-        buffer_ptr = self.lib.hipMalloc(alloc_size)
-        signal_pad_ptr = self.lib.hipMalloc(signal_pad_size)
-        self.lib.hipMemset(buffer_ptr, 0, alloc_size)
-        self.lib.hipMemset(signal_pad_ptr, 0, signal_pad_size)
-
-        def rendezvous(ptr):
-            mem_handle = self.lib.hipIpcGetMemHandle(ptr)
-            mem_handle_bytes = self.lib.mem_handle_to_bytes(
-                mem_handle)
-            mem_handle_list = [None] * self.num_ranks
-            dist.all_gather_object(
-                mem_handle_list, mem_handle_bytes, group=self.group)
-
-            ptr_list = [None] * self.num_ranks
-            for rank in range(self.num_ranks):
-                if rank == self.rank:
-                    ptr_list[rank] = ptr
-                else:
-                    ptr_list[rank] = self.lib.hipIpcOpenMemHandle(
-                        mem_handle_list[rank]).value
-            return ptr_list
-
-        self.buffer_ptrs = rendezvous(buffer_ptr)
-        self.signal_pad_ptrs = rendezvous(signal_pad_ptr)
-
-        def _ptr_to_int(ptr):
-            assert ptr is not None, "ptr is None"
-            if hasattr(ptr, "value"):
-                return 0 if ptr.value is None else int(ptr.value)
-            return int(ptr)
-
-        self.buffer_ptrs_dev = torch.tensor(
-            [_ptr_to_int(ptr) for ptr in self.buffer_ptrs],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        self.signal_pad_ptrs_dev = torch.tensor(
-            [_ptr_to_int(ptr) for ptr in self.signal_pad_ptrs],
-            dtype=torch.int64,
-            device="cuda",
-        )
-
+        self.buffer_ptrs: list[int] = []
+        self.signal_pad_ptrs: list[int] = []
+        self.buffer_ptrs_dev: torch.Tensor = None
+        self.signal_pad_ptrs_dev: torch.Tensor = None
         self.is_destroyed = False
 
-        # barrier on buffer and signal pad
+        buffer_ptr = None
+        signal_pad_ptr = None
+        try:
+            buffer_ptr = self.lib.hipMalloc(alloc_size)
+            signal_pad_ptr = self.lib.hipMalloc(signal_pad_size)
+            self.lib.hipMemset(buffer_ptr, 0, alloc_size)
+            self.lib.hipMemset(signal_pad_ptr, 0, signal_pad_size)
+
+            self.buffer_ptrs = self._rendezvous(buffer_ptr)
+            self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
+        except Exception:
+            if not self.buffer_ptrs and buffer_ptr is not None:
+                self._try_free(buffer_ptr)
+            if not self.signal_pad_ptrs and signal_pad_ptr is not None:
+                self._try_free(signal_pad_ptr)
+            self._cleanup_ptrs()
+            self.is_destroyed = True
+            raise
+
+        self.buffer_ptrs_dev = torch.tensor(
+            self.buffer_ptrs, dtype=torch.int64, device="cuda",
+        )
+        self.signal_pad_ptrs_dev = torch.tensor(
+            self.signal_pad_ptrs, dtype=torch.int64, device="cuda",
+        )
+
         self.group.barrier()
 
+    @staticmethod
+    def _c_void_p_to_int(ptr) -> int:
+        """Convert a ctypes.c_void_p to a plain Python int.
+
+        c_void_p.value is *None* (not 0) when the pointer is NULL — this is
+        an easy-to-miss ctypes gotcha.  By normalizing to int once at storage
+        time, the rest of the code only ever deals with plain ints.
+        """
+        val = ptr.value
+        if val is None or val == 0:
+            raise ValueError(f"NULL device pointer: {ptr!r}")
+        return val
+
+    def _rendezvous(self, ptr) -> list[int]:
+        """Exchange IPC handles across all ranks and open remote memory.
+
+        Returns a ``list[int]`` of device-pointer values (one per rank),
+        uniformly typed to avoid mixed c_void_p / int issues downstream.
+        """
+        mem_handle = self.lib.hipIpcGetMemHandle(ptr)
+        mem_handle_bytes = self.lib.mem_handle_to_bytes(mem_handle)
+        mem_handle_list = [None] * self.world_size
+        dist.all_gather_object(
+            mem_handle_list, mem_handle_bytes, group=self.group)
+
+        ptr_list: list[int] = [0] * self.world_size
+        opened_ranks: list[int] = []
+        try:
+            for rank in range(self.world_size):
+                if rank == self.rank:
+                    ptr_list[rank] = self._c_void_p_to_int(ptr)
+                else:
+                    ipc_ptr = self.lib.hipIpcOpenMemHandle(
+                        mem_handle_list[rank])
+                    ptr_list[rank] = self._c_void_p_to_int(ipc_ptr)
+                    opened_ranks.append(rank)
+        except Exception:
+            for r in opened_ranks:
+                try:
+                    self.lib.hipIpcCloseMemHandle(ptr_list[r])
+                except Exception:
+                    pass
+            raise
+        return ptr_list
+
+    def _try_free(self, ptr):
+        try:
+            self.lib.hipFree(ptr)
+        except Exception as e:
+            warnings.warn(f"hipFree failed during cleanup: {e}")
+
+    def _cleanup_ptrs(self):
+        """Release all allocated memory and IPC handles, tolerating individual failures."""
+        for ptrs in (self.buffer_ptrs, self.signal_pad_ptrs):
+            for rank in range(min(self.world_size, len(ptrs))):
+                if ptrs[rank] == 0:
+                    continue
+                try:
+                    if rank == self.rank:
+                        self.lib.hipFree(ptrs[rank])
+                    else:
+                        self.lib.hipIpcCloseMemHandle(ptrs[rank])
+                except Exception as e:
+                    warnings.warn(
+                        f"SymmetricMemory cleanup error for rank {rank}: {e}")
+        self.buffer_ptrs = []
+        self.signal_pad_ptrs = []
+
+    # ------------------------------------------------------------------
+    #  get_buffer / get_signal_pad  –  mirror of the C++ SymmetricMemory API
+    # ------------------------------------------------------------------
+
+    def get_buffer(
+        self,
+        rank: int,
+        sizes: Sequence[int],
+        dtype: torch.dtype,
+        storage_offset: int = 0,
+    ) -> torch.Tensor:
+        """Return a zero-copy tensor view into *rank*'s buffer.
+
+        Mirrors ``SymmetricMemory::get_buffer`` in
+        ``torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.cpp``.
+
+        Args:
+            rank: peer rank whose buffer to access.
+            sizes: desired tensor shape.
+            dtype: desired tensor dtype.
+            storage_offset: offset in *elements* (not bytes) from the start
+                of the buffer.
+        """
+        if not (0 <= rank < self.world_size):
+            raise ValueError(f"Invalid peer rank: {rank}")
+
+        element_size = dtype.itemsize
+        offset_bytes = storage_offset * element_size
+        numel = 1
+        for s in sizes:
+            numel *= s
+        req_bytes = offset_bytes + numel * element_size
+        if req_bytes > self.buffer_size:
+            raise ValueError(
+                f"SymmetricMemory.get_buffer: the requested size "
+                f"({req_bytes} bytes) exceeds the allocated size "
+                f"({self.buffer_size} bytes)")
+
+        return _tensor_from_device_ptr(
+            self.buffer_ptrs[rank] + offset_bytes,
+            tuple(sizes), dtype, self.device,
+        )
+
+    def get_signal_pad(
+        self,
+        rank: int,
+        sizes: Optional[Sequence[int]] = None,
+        dtype: Optional[torch.dtype] = None,
+        storage_offset: int = 0,
+    ) -> torch.Tensor:
+        """Return a zero-copy tensor view into *rank*'s signal pad.
+
+        Args:
+            rank: peer rank whose signal pad to access.
+            sizes: desired tensor shape.  When *None*, the signal pad is
+                treated as a flat 1-D tensor of ``signal_pad_size / elem``
+                elements.
+            dtype: defaults to ``torch.uint32``.
+            storage_offset: offset in *elements*.
+        """
+        if not (0 <= rank < self.world_size):
+            raise ValueError(f"Invalid peer rank: {rank}")
+
+        if dtype is None:
+            dtype = torch.uint32
+        element_size = dtype.itemsize
+
+        if sizes is None:
+            shape: tuple[int, ...] = (self.signal_pad_size // element_size,)
+        else:
+            shape = tuple(sizes)
+
+        numel = reduce(operator.mul, shape, 1)
+        offset_bytes = storage_offset * element_size
+        req_bytes = offset_bytes + numel * element_size
+        if req_bytes > self.signal_pad_size:
+            raise ValueError(
+                f"SymmetricMemory.get_signal_pad: the requested size "
+                f"({req_bytes} bytes) exceeds the allocated size "
+                f"({self.signal_pad_size} bytes)")
+
+        return _tensor_from_device_ptr(
+            self.signal_pad_ptrs[rank] + offset_bytes,
+            shape, dtype, self.device,
+        )
+
     def destroy(self):
+        """Release all memory and IPC handles.
+
+        Callers should ensure all GPU operations on symmetric memory are
+        complete (torch.cuda.synchronize) and all ranks are synchronized
+        (group.barrier) before calling destroy.
+        """
         if self.is_destroyed:
             return
         self.is_destroyed = True
-        for rank in range(self.num_ranks):
-            if rank == self.rank:
-                self.lib.hipFree(self.buffer_ptrs[rank])
-                self.lib.hipFree(self.signal_pad_ptrs[rank])
-            else:
-                self.lib.hipIpcCloseMemHandle(self.buffer_ptrs[rank])
-                self.lib.hipIpcCloseMemHandle(self.signal_pad_ptrs[rank])
+        self._cleanup_ptrs()
+        self.buffer_ptrs_dev = None
+        self.signal_pad_ptrs_dev = None
 
     def __del__(self):
         try:
             self.destroy()
         except Exception:
-            # Avoid throwing from destructor path.
             pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.destroy()
+        return False
+
+
+def get_symm_mem_workspace(
+    group: dist.ProcessGroup, min_size: int
+) -> SymmetricMemory:
+    """
+    Get the symmetric memory workspace associated with the process group. If
+    ``min_size`` is greater than the workspace associated with ``group_name``,
+    the workspace will be re-allocated and re-rendezvous'd.
+
+    Args:
+        group_name (str): the name of the process group.
+        min_size (int): the size requirement for the workspace in bytes.
+
+    Returns:
+        _SymmetricMemory: the symmetric memory workspace associated with the
+        group.
+    """
+    symm_mem = _group_name_to_workspace_tensor.get(group.group_name, None)
+    size = symm_mem.buffer_size if symm_mem is not None else 0
+    if symm_mem is None or size < min_size:
+        if torch.cuda.is_current_stream_capturing():
+            curr_size = 0 if symm_mem is None else symm_mem.buffer_size
+            # Growing the workspace is not safe during CUDA graph capture.
+            raise RuntimeError(
+                "get_symm_mem_workspace(): cannot resize the symmetric-memory "
+                f"workspace during CUDA graph capture. Requested {min_size} bytes, "
+                f"but the current workspace is {curr_size} bytes. Call "
+                f"`get_symm_mem_workspace(group={group.group_name!r}, "
+                f"min_size={min_size})` before starting graph capture."
+            )
+        symm_mem = SymmetricMemory(group, max(size, min_size))
+        _group_name_to_workspace_tensor[group.group_name] = symm_mem
+    return symm_mem
 
 
 if __name__ == "__main__":
@@ -120,7 +372,6 @@ if __name__ == "__main__":
                             dtype=torch.int32, device="cuda")
         recv = torch.zeros(1, dtype=torch.int32, device="cuda")
 
-        # Write local marker to next rank's buffer[0:4].
         symm.lib.hipMemcpyAsync(
             symm.buffer_ptrs[dst_rank],
             int(send.data_ptr()),
@@ -131,7 +382,6 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         symm.group.barrier()
 
-        # Read local buffer[0:4] back to tensor and verify from previous rank.
         symm.lib.hipMemcpyAsync(
             int(recv.data_ptr()),
             symm.buffer_ptrs[symm.rank],

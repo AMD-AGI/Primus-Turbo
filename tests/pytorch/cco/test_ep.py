@@ -9,9 +9,9 @@ import time
 
 import torch
 import torch.distributed as dist
-from utils import init_dist, inplace_unique, per_token_cast_to_fp8, bench_kineto
+from utils import init_dist, inplace_unique, per_token_cast_to_fp8, bench_kineto, indices_to_map, permute
 
-from primus_turbo.pytorch.cco import _fused_dispatch
+from primus_turbo.pytorch.cco import _fused_dispatch_with_permute
 
 
 def test_main(
@@ -45,6 +45,7 @@ def test_main(
                          dtype=torch.float32, device="cuda").abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1,
                           largest=True, sorted=False)[1]
+    routing_map, _ = indices_to_map(topk_idx, None, num_tokens, num_experts)
     topk_weights = torch.ones((num_tokens, num_topk),
                               dtype=torch.float32, device="cuda") * rank
     topk_weights_pure_rand = torch.randn(
@@ -89,41 +90,85 @@ def test_main(
             check_start = check_end
 
     (
-        ref_rank_prefix_matrix,
-        ref_channel_prefix_matrix,
-        ref_send_head,
-        ref_num_tokens_per_rank,
-        ref_num_tokens_per_expert,
-        ref_is_token_in_rank,
-        num_moe_recv_tokens,
-        recv_num_tokens_per_expert,
-        ref_recv_x,
+        ref_permuted_x,
+        ref_recv_x_scales,
         ref_recv_topk_idx,
         ref_recv_topk_weights,
-    ) = _fused_dispatch(
-        x, group.group_name, topk_idx, topk_weights, num_experts, num_sms=num_sms
+        ref_moe_recv_counter,
+        ref_moe_recv_expert_counter,
+        ref_rank_prefix_matrix,
+        ref_channel_prefix_matrix,
+        ref_recv_channel_prefix_matrix,
+        ref_recv_src_idx,
+        ref_send_head
+    ), handle, ref_recv_x = _fused_dispatch_with_permute(
+        x, group, routing_map, topk_idx, topk_weights, num_experts, num_sms=num_sms
     )
     group.barrier()
 
     time.sleep(1)
 
-    num_moe_recv_tokens = num_moe_recv_tokens.item()
-    recv_num_tokens_per_expert_list = recv_num_tokens_per_expert.tolist()
+    num_moe_recv_tokens = ref_moe_recv_counter.item()
+    recv_num_tokens_per_expert_list = ref_moe_recv_expert_counter.tolist()
 
     assert (
         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
         == recv_num_tokens_per_expert_list
     )
 
-    assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
-    assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
-    assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
+    # assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
+    # assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
+    # assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
 
+    ref_recv_x = ref_recv_x[:num_moe_recv_tokens, :]
     # check recv_x
-    # check_data(ref_recv_x[:num_moe_recv_tokens, :], ref_rank_prefix_matrix)
+    check_data(ref_recv_x, ref_rank_prefix_matrix)
 
-    ref_recv_topk_idx = ref_recv_topk_idx[:num_moe_recv_tokens]
-    ref_recv_topk_weights = ref_recv_topk_weights[:num_moe_recv_tokens]
+    num_out_tokens = sum(recv_num_tokens_per_expert_list)
+
+    local_routing = handle.local_expert_routing_map[:num_moe_recv_tokens]
+
+    ref_permuted_x = ref_permuted_x[:num_out_tokens, :]
+    permuted_x, _, _, _, _ = permute(
+        ref_recv_x, local_routing, num_out_tokens=num_out_tokens)
+
+    if local_rank == 0:
+        rim = handle.row_id_map[:num_moe_recv_tokens]
+        print(f"[dbg] num_moe_recv_tokens={num_moe_recv_tokens}, num_out_tokens={num_out_tokens}", flush=True)
+        print(f"[dbg] row_id_map nonzero={(rim != 0).sum().item()}, max={rim.max().item()}", flush=True)
+
+        k_amin = ref_permuted_x.amin(dim=1)
+        k_amax = ref_permuted_x.amax(dim=1)
+        non_uniform = ~torch.isclose(k_amin, k_amax)
+        print(f"[dbg] kernel non-uniform rows: {non_uniform.sum().item()} / {num_out_tokens}", flush=True)
+        if non_uniform.any():
+            nu_idx = non_uniform.nonzero(as_tuple=True)[0]
+            for idx in nu_idx[:5]:
+                i = idx.item()
+                row = ref_permuted_x[i]
+                uniq = row.unique()
+                print(f"[dbg]   row {i}: unique_vals={uniq.tolist()[:6]}, "
+                      f"count_zero={(row == 0).sum().item()}/{hidden}", flush=True)
+
+        diff = (ref_permuted_x != permuted_x)
+        mm_rows = diff.any(dim=1).sum().item()
+        print(f"[dbg] kernel vs python mismatch rows: {mm_rows} / {num_out_tokens}", flush=True)
+        if mm_rows > 0:
+            mm_idx = diff.any(dim=1).nonzero(as_tuple=True)[0]
+            for idx in mm_idx[:3]:
+                i = idx.item()
+                col_diffs = diff[i].nonzero(as_tuple=True)[0]
+                print(f"[dbg]   row {i}: {col_diffs.numel()} cols differ, "
+                      f"first_diff_col={col_diffs[0].item()}, "
+                      f"kernel_val={ref_permuted_x[i, col_diffs[0]].item()}, "
+                      f"python_val={permuted_x[i, col_diffs[0]].item()}", flush=True)
+
+    assert torch.allclose(ref_permuted_x.amin(dim=1),
+                          ref_permuted_x.amax(dim=1)), "ref_permuted_x rows not uniform"
+    assert torch.allclose(ref_permuted_x, permuted_x), "ref_permuted_x != permuted_x"
+
+    # ref_recv_topk_idx = ref_recv_topk_idx[:num_moe_recv_tokens]
+    # ref_recv_topk_weights = ref_recv_topk_weights[:num_moe_recv_tokens]
 
     # Check `topk_idx`
     # assert (
@@ -133,7 +178,7 @@ def test_main(
     # for i, count in enumerate(recv_num_tokens_per_expert_list):
     #     assert ref_recv_topk_idx.eq(i).sum().item() == count
 
-    # # Check `topk_weights`
+    # Check `topk_weights`
     # ref_recv_topk_weights[ref_recv_topk_idx.eq(-1)] = ref_recv_topk_weights.amax(
     #     dim=1, keepdim=True
     # ).expand_as(ref_recv_topk_weights)[ref_recv_topk_idx.eq(-1)]
@@ -142,15 +187,17 @@ def test_main(
     # benchmark performance
     nvl_recv_bytes = num_moe_recv_tokens * hidden * 2
 
-    kwargs = {"x": x, "group_name": group.group_name, "topk_idx": topk_idx,
+    kwargs = {"x": x, "group": group, "routing_map": routing_map, "topk_idx": topk_idx,
               "topk_weights": topk_weights, "num_experts": num_experts, "num_sms": num_sms}
-    t, notify_t, layout_t = bench_kineto(lambda: _fused_dispatch(
-        **kwargs), ("intranode::dispatch", "intranode::notify_dispatch", "get_dispatch_layout"))
 
-    if local_rank == 0:
-        print(f"SMs {num_sms}: {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us + {notify_t * 1e6:.2f} us + {layout_t * 1e6:.2f} us",
-              flush=True,
-              )
+    for num_max_send_tokens in range(1, 33, 4):
+        t, notify_t, layout_t = bench_kineto(lambda: _fused_dispatch_with_permute(
+            **kwargs, num_max_send_tokens=num_max_send_tokens), ("cco::ep::intranode::dispatch_with_permute", "deep_ep::intranode::notify_dispatch", "deep_ep::layout::get_dispatch_layout"), suppress_kineto_output=True)
+
+        if local_rank == 0:
+            print(f"SMs {num_sms}: num_max_send_tokens={num_max_send_tokens}: {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us + {notify_t * 1e6:.2f} us + {layout_t * 1e6:.2f} us",
+                  flush=True,
+                  )
 
 
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
@@ -158,7 +205,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     torch.manual_seed(rank)
 
-    for i in (64,):
+    for i in (32, 64):
         test_main(args, i, local_rank, num_ranks, rank, group)
         if local_rank == 0:
             print("", flush=True)

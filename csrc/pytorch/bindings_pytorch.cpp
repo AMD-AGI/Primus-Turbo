@@ -191,9 +191,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // ********* CCO *********
 
-    m.def("fused_dispatch_groupedgemm", primus_turbo::pytorch::fused_dispatch_groupedgemm);
+    // m.def("fused_dispatch_groupedgemm", primus_turbo::pytorch::fused_dispatch_groupedgemm);
+    // m.def("fused_dispatch", primus_turbo::pytorch::fused_dispatch);
     m.def("get_dispatch_layout", primus_turbo::pytorch::get_dispatch_layout);
-    m.def("fused_dispatch", primus_turbo::pytorch::fused_dispatch);
+    m.def("intranode_dispatch_with_permute", primus_turbo::pytorch::intranode_dispatch_with_permute);
 }
 
 /********************************************/

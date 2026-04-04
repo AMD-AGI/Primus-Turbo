@@ -28,5 +28,13 @@ void dispatch(void **workspace_ptrs, void const *x, float const *x_scales, int64
               int const *channel_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
               int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
               int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens);
+
+void dispatch_with_permute(void **workspace_ptrs, void const *x, float const *x_scales,
+                           int64_t const *topk_idx, float const *topk_weights,
+                           bool const *is_token_in_rank, int const *channel_prefix_matrix,
+                           int const *row_id_map, void *recv_x, int num_tokens, int hidden_int4,
+                           int num_topk, int num_experts, int num_scales, int scale_token_stride,
+                           int scale_hidden_stride, int rank, int num_ranks, cudaStream_t stream,
+                           int num_sms, int num_max_tokens, int num_max_send_tokens);
 } // namespace intranode
 } // namespace primus_turbo::cco::ep

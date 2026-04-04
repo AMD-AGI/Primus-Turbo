@@ -17,7 +17,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from .utils import (
+from utils import (
     bench,
     calc_diff,
     get_deep_ep_backend,
