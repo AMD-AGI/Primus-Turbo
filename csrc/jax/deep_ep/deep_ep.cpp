@@ -270,7 +270,6 @@ void Buffer::IntranodeDispatch(
     float *x_scales_ptr = nullptr;
     int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
-        PRIMUS_TURBO_CHECK(x_scales->element_count() == num_tokens);
         PRIMUS_TURBO_CHECK(x_scales->dimensions().size() == 2);
         PRIMUS_TURBO_CHECK(x_scales->dimensions()[0] == num_tokens);
         num_scales =
