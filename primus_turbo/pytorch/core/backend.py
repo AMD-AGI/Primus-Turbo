@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import json
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -36,6 +37,7 @@ _ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
 _ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 _ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 _ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
+_ENV_AUTOTUNE_CACHE_DIR_KEY = "PRIMUS_TURBO_AUTOTUNE_CACHE_DIR"
 
 
 class PrecisionType(Enum):
@@ -269,11 +271,17 @@ class BackendEntry:
 
 
 class TuneCache:
-    """LRU cache for storing tuned backend results."""
+    """LRU cache for storing tuned backend results.
+
+    When ``PRIMUS_TURBO_AUTOTUNE_CACHE_DIR`` is set, results are
+    persisted to JSON files so subsequent process launches skip
+    re-profiling for previously-seen shapes.
+    """
 
     def __init__(self, capacity: int = 1024):
         self._capacity = capacity
         self._cache: OrderedDict[Hashable, Type[KernelBackend]] = OrderedDict()
+        self._dirty = False
 
     def get(self, key: Hashable) -> Optional[Type[KernelBackend]]:
         if key in self._cache:
@@ -293,15 +301,63 @@ class TuneCache:
             )
             self._cache.popitem(last=False)
         self._cache[key] = value
+        self._dirty = True
 
     def clear(self) -> None:
         self._cache.clear()
+        self._dirty = False
 
     def __len__(self) -> int:
         return len(self._cache)
 
     def __contains__(self, key: Hashable) -> bool:
         return key in self._cache
+
+    # ── Persistent cache ──
+
+    def save_to_file(self, path: str, backend_map: Dict["BackendType", "BackendEntry"]) -> None:
+        """Serialize cache entries to a JSON file."""
+        if not self._dirty:
+            return
+        impl_to_name = {}
+        for bt, entry in backend_map.items():
+            impl_to_name[id(entry.impl)] = bt.name
+        data = {}
+        for key, impl in self._cache.items():
+            name = impl_to_name.get(id(impl))
+            if name is not None:
+                data[json.dumps(key, default=str)] = name
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            self._dirty = False
+        except OSError:
+            pass
+
+    def load_from_file(self, path: str, backend_map: Dict["BackendType", "BackendEntry"]) -> int:
+        """Deserialize cache entries from a JSON file.  Returns count loaded."""
+        if not os.path.isfile(path):
+            return 0
+        name_to_impl = {bt.name: entry.impl for bt, entry in backend_map.items()}
+        loaded = 0
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for key_str, bt_name in data.items():
+                impl = name_to_impl.get(bt_name)
+                if impl is None:
+                    continue
+                try:
+                    key = tuple(json.loads(key_str))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if key not in self._cache:
+                    self._cache[key] = impl
+                    loaded += 1
+        except (OSError, json.JSONDecodeError):
+            pass
+        return loaded
 
 
 class AutoKernelDispatcher(ABC):
@@ -314,6 +370,7 @@ class AutoKernelDispatcher(ABC):
     _warmup_iters: int = 10
     _profile_iters: int = 20
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
+    _persistent_loaded: bool = False
 
     @staticmethod
     def _is_graph_capturing() -> bool:
@@ -332,6 +389,7 @@ class AutoKernelDispatcher(ABC):
             cls._backends = {}
         if "_cache" not in cls.__dict__:
             cls._cache = TuneCache()
+        cls._persistent_loaded = False
         AutoKernelDispatcher._subclasses.append(cls)
 
     @classmethod
@@ -340,6 +398,32 @@ class AutoKernelDispatcher(ABC):
         for subclass in cls._subclasses:
             if subclass._cache is not None:
                 subclass._cache.clear()
+
+    @classmethod
+    def _persistent_cache_path(cls) -> Optional[str]:
+        cache_dir = os.environ.get(_ENV_AUTOTUNE_CACHE_DIR_KEY, "")
+        if not cache_dir:
+            return None
+        return os.path.join(cache_dir, f"{cls.__name__}.json")
+
+    @classmethod
+    def _ensure_persistent_loaded(cls) -> None:
+        if cls._persistent_loaded:
+            return
+        cls._persistent_loaded = True
+        path = cls._persistent_cache_path()
+        if path and cls._cache is not None:
+            n = cls._cache.load_from_file(path, cls._backends)
+            if n > 0:
+                logger.info(f"Loaded {n} cached auto-tune entries for {cls.__name__}")
+
+    @classmethod
+    def save_all_persistent_caches(cls) -> None:
+        """Save all dirty caches to disk (call at shutdown or periodically)."""
+        for subclass in cls._subclasses:
+            path = subclass._persistent_cache_path()
+            if path and subclass._cache is not None:
+                subclass._cache.save_to_file(path, subclass._backends)
 
     @classmethod
     def make_key(cls, **kwargs) -> Hashable:
@@ -368,6 +452,7 @@ class AutoKernelDispatcher(ABC):
     @classmethod
     def tune(cls, **kwargs) -> Optional[Type[KernelBackend]]:
         """Profile all compatible backends and cache the fastest one."""
+        cls._ensure_persistent_loaded()
         key = cls.make_key(**kwargs)
 
         cached_backend = cls._cache.get(key)
@@ -393,6 +478,9 @@ class AutoKernelDispatcher(ABC):
 
         if best_backend is not None:
             cls._cache.put(key, best_backend)
+            path = cls._persistent_cache_path()
+            if path:
+                cls._cache.save_to_file(path, cls._backends)
         return best_backend
 
     @classmethod
