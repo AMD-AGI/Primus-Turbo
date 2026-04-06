@@ -18,8 +18,6 @@ from torch._library import wrap_triton
 from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
 from primus_turbo.triton.attention.attention_kernel import (
     DEBUG,
-    FIXED_BLOCK_M,
-    FIXED_BLOCK_N,
     USE_FP8E5M2_BWD,
     _bwd_kernel_dkdv,
     _bwd_kernel_dq,
@@ -31,6 +29,7 @@ from primus_turbo.triton.attention.attention_kernel import (
     get_tl_f8_bwd_dtype,
     philox_offset,
     philox_seed,
+    select_block_sizes,
 )
 
 fwd_torch_dtype: tl.constexpr = torch.bfloat16
@@ -133,7 +132,9 @@ def attention_triton_forward_impl(
     padded_d_model_qk = get_padded_head_dim(head_size_qk)
     padded_d_model_v = get_padded_head_dim(head_size_v)
 
-    grid = (triton.cdiv(max_seqlens_q, FIXED_BLOCK_M), nheads_q, batch)
+    block_m, block_n = select_block_sizes(head_size_qk, head_size_v, seqlen_q)
+
+    grid = (triton.cdiv(max_seqlens_q, block_m), nheads_q, batch)
 
     if return_scores:
         scores = torch.zeros(
@@ -261,8 +262,8 @@ def attention_triton_forward_impl(
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
-        BLOCK_M=FIXED_BLOCK_M,
-        BLOCK_N=FIXED_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
     )
 
     return o, softmax_lse, exp_scores
@@ -395,6 +396,8 @@ def attention_triton_backward_impl(
     padded_d_model_qk = get_padded_head_dim(head_size_qk)
     padded_d_model_v = get_padded_head_dim(head_size_v)
 
+    block_m, block_n = select_block_sizes(head_size_qk, head_size_v, max_seqlen_q)
+
     # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
     copy_back = {"dq": False, "dk": False, "dv": False}
 
@@ -448,7 +451,7 @@ def attention_triton_backward_impl(
 
     if use_fp8:
         do_fp8 = torch.empty_like(do, dtype=get_f8_bwd_dtype())
-        _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
+        _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, block_m))
         do_descale = torch.empty(_shape, dtype=torch.float32, device=q.device)
         stride_descalez, stride_descaleh, stride_descalem = do_descale.stride()
         stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
@@ -473,7 +476,7 @@ def attention_triton_backward_impl(
             padded_vscale_block_num,
         ) = (None, None, None, None)
 
-    grid_prebwd = (triton.cdiv(max_seqlen_q, FIXED_BLOCK_M), batch_headsize_q)
+    grid_prebwd = (triton.cdiv(max_seqlen_q, block_m), batch_headsize_q)
     wrap_triton(_bwd_preprocess_use_o)[grid_prebwd](
         o,
         do,
@@ -500,7 +503,7 @@ def attention_triton_backward_impl(
         max_seqlen_k,
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        BLOCK_M=FIXED_BLOCK_M,
+        BLOCK_M=block_m,
         N_CTX_Q=max_seqlen_q,
         Z=batch,
         HQ=nheads_q,
@@ -536,10 +539,10 @@ def attention_triton_backward_impl(
         print("USE_EXP2:", use_exp2)
 
     log_p_scale = math.log(p_scale)
-    num_block_m = triton.cdiv(max_seqlen_q, FIXED_BLOCK_M)
+    num_block_m = triton.cdiv(max_seqlen_q, block_m)
     grid_bwd = (
         batch_headsize_q,
-        triton.cdiv(max_seqlen_q, FIXED_BLOCK_M) if sequence_parallel else 1,
+        triton.cdiv(max_seqlen_q, block_m) if sequence_parallel else 1,
     )
     wrap_triton(_bwd_kernel_dq)[grid_bwd](
         q,
@@ -601,8 +604,8 @@ def attention_triton_backward_impl(
         max_seqlen_q,
         max_seqlen_k,
         num_block_m=num_block_m,
-        BLOCK_M=FIXED_BLOCK_M,
-        BLOCK_N=FIXED_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
@@ -618,7 +621,7 @@ def attention_triton_backward_impl(
 
     grid_bwd_dkdv = (
         batch_headsize_k,
-        triton.cdiv(max_seqlen_k, FIXED_BLOCK_N) if sequence_parallel else 1,
+        triton.cdiv(max_seqlen_k, block_n) if sequence_parallel else 1,
     )
     wrap_triton(_bwd_kernel_dkdv)[grid_bwd_dkdv](
         q,
@@ -676,8 +679,8 @@ def attention_triton_backward_impl(
         max_seqlen_q,
         max_seqlen_k,
         num_block_m=num_block_m,
-        BLOCK_M=FIXED_BLOCK_M,
-        BLOCK_N=FIXED_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,

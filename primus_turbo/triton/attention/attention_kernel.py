@@ -54,6 +54,30 @@ FIXED_BLOCK_N = 64
 USE_FP8E5M2_BWD = False
 
 
+def select_block_sizes(head_size_qk, head_size_v, seqlen_q):
+    """Select optimal BLOCK_M/BLOCK_N based on GPU architecture and problem dimensions.
+
+    BLOCK_M=128 improves Q data reuse across more K iterations, doubling
+    arithmetic intensity. Only safe when padded head dims fit in 128
+    to avoid excessive register spill.
+
+    Architecture differences:
+      - gfx942 (MI300X, 64 KB LDS):  BLOCK_M=128 when seqlen_q >= 256
+      - gfx950 (MI355X, 160 KB LDS): BLOCK_M=128 with lower seqlen_q threshold (64)
+                                       thanks to larger LDS reducing spill pressure
+    """
+    from primus_turbo.triton.gemm.gemm_kernel import _get_gpu_arch
+
+    padded_qk = 1 << (head_size_qk - 1).bit_length()
+    padded_v = 1 << (head_size_v - 1).bit_length()
+    if padded_qk <= 128 and padded_v <= 128:
+        arch = _get_gpu_arch()
+        min_sq = 64 if arch == "gfx950" else 256
+        if seqlen_q >= min_sq:
+            return 128, 64
+    return FIXED_BLOCK_M, FIXED_BLOCK_N
+
+
 def get_shape_from_layout(
     q, k, v, layout, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None
 ):
@@ -429,13 +453,12 @@ def _attn_fwd_inner(
 
 def get_autotune_fwd_configs():
     return [
-        triton.Config(
-            {
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
+        triton.Config({"PRE_LOAD_V": False}, num_stages=1, num_warps=4),
+        triton.Config({"PRE_LOAD_V": True}, num_stages=1, num_warps=4),
+        triton.Config({"PRE_LOAD_V": False}, num_stages=1, num_warps=8),
+        triton.Config({"PRE_LOAD_V": True}, num_stages=1, num_warps=8),
+        triton.Config({"PRE_LOAD_V": False}, num_stages=2, num_warps=4),
+        triton.Config({"PRE_LOAD_V": False}, num_stages=2, num_warps=8),
     ], [
         "IS_CAUSAL",
         "dropout_p",
@@ -1049,11 +1072,10 @@ def _bwd_preprocess_use_o(
 
 def get_autotune_bwd_configs():
     return [
-        triton.Config(
-            {},
-            num_stages=1,
-            num_warps=4,
-        ),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=8),
     ], [
         "BLOCK_DMODEL",
         "ACTUAL_BLOCK_DMODEL_QK",
