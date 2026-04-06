@@ -156,13 +156,21 @@ def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
 
 
 @functools.lru_cache(maxsize=1)
-def _is_gfx950() -> bool:
-    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
+def _get_gpu_arch() -> str:
+    """Return the base GPU architecture string (e.g. 'gfx950', 'gfx942')."""
     try:
         target = triton.runtime.driver.active.get_current_target()
-        return target is not None and target.backend == "hip" and target.arch == "gfx950"
+        if target is not None and target.backend == "hip":
+            return target.arch
     except (AttributeError, TypeError):
-        return False
+        pass
+    return "unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx950() -> bool:
+    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
+    return _get_gpu_arch() == "gfx950"
 
 
 _KNOBS_SET = False
