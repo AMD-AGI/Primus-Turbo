@@ -634,6 +634,32 @@ Defined in `config/optimizer.yaml` under the `knowledge` section. Per-operator s
 
 ## 9. Terminal Dashboard
 
+### Launch Mechanism
+
+The Dashboard is a **standalone read-only process**, fully decoupled from the Coordinator. It reads `optimizer-state.json` and `activity.jsonl` files — no IPC or shared memory needed.
+
+**Automatic launch**: When Coordinator starts, it spawns the Dashboard as a background process and prints the attach command:
+
+```
+Coordinator: Dashboard started. Attach in another terminal:
+  python primus-optimizer/tools/dashboard.py --state agent_docs/mi355x/optimizer-state.json
+```
+
+**Manual launch**: The user can start it independently at any time:
+
+```bash
+# In a separate terminal (while /optimize is running in Claude Code)
+python primus-optimizer/tools/dashboard.py \
+    --state agent_docs/mi355x/optimizer-state.json \
+    --activity "agent_docs/mi355x/*/activity.jsonl"
+```
+
+**Dashboard lifecycle**:
+- Dashboard starts in watch mode by default, polling files for updates
+- If `optimizer-state.json` doesn't exist yet, Dashboard waits until it appears
+- When all Workers reach terminal state (`completed`/`failed`), Dashboard shows final summary and exits (or stays with `--keep-alive`)
+- Dashboard crashing or being closed has **zero impact** on the optimization — Coordinator and Workers continue independently
+
 ### Layout
 
 ```
@@ -970,7 +996,13 @@ Edit `config/optimizer.yaml` to customize:
 
 ### Monitoring
 
-The terminal Dashboard starts automatically when `/optimize` is invoked. Key interactions:
+When `/optimize` starts, the Coordinator prints a Dashboard attach command. Open a **separate terminal** and run it:
+
+```bash
+python primus-optimizer/tools/dashboard.py --state agent_docs/mi355x/optimizer-state.json
+```
+
+The Dashboard is read-only and fully independent — closing it does not affect the optimization. Key interactions:
 
 | Key | Action |
 |-----|--------|
