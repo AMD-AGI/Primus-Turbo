@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 
 import origami
 import torch
 import triton
 import triton.language as tl
+
+from primus_turbo.triton.utils.hardware_helper import is_gfx950, set_knobs_gfx950
 
 # Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
 _ORIGAMI_DTYPE_TO_STR = {
@@ -155,35 +156,6 @@ def _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, cu_count, elem_bytes_out=2):
     return sk_grid
 
 
-@functools.lru_cache(maxsize=1)
-def _is_gfx950() -> bool:
-    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
-    try:
-        target = triton.runtime.driver.active.get_current_target()
-        return target is not None and target.backend == "hip" and target.arch == "gfx950"
-    except (AttributeError, TypeError):
-        return False
-
-
-_KNOBS_SET = False
-
-
-def _set_knobs_gfx950():
-    """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize)."""
-    global _KNOBS_SET
-    if _KNOBS_SET:
-        return
-    _KNOBS_SET = True
-    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
-        triton.knobs.amd.use_async_copy = True
-        triton.knobs.amd.scalarize_packed_fops = True
-        triton.knobs.amd.use_block_pingpong = True
-    else:
-        os.environ.setdefault("TRITON_HIP_USE_ASYNC_COPY", "1")
-        os.environ.setdefault("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
-        os.environ.setdefault("TRITON_HIP_USE_BLOCK_PINGPONG", "1")
-
-
 @triton.jit
 def _chiplet_transform_chunked(
     pid,
@@ -301,7 +273,7 @@ def _estimate_lds_bytes_async_copy(block_m, block_n, block_k, elem_bytes_a, elem
 
 def _calculate_lds_usage(block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages):
     """LDS usage with auto-detection of async_copy mode."""
-    if _is_gfx950():
+    if is_gfx950():
         return _estimate_lds_bytes_async_copy(
             block_m, block_n, block_k, elem_bytes_a, elem_bytes_b, num_stages
         )
@@ -339,7 +311,7 @@ def _get_valid_tiles(hardware, block_mn_range, block_k_range, mi_dim, elem_bytes
     should verify with _calculate_lds_usage for their actual num_stages.
     """
     lds_cap = hardware.lds_capacity
-    use_async = _is_gfx950()
+    use_async = is_gfx950()
     valid = []
     for bm, bn, bk in (
         (bm, bn, bk) for bm in block_mn_range for bn in block_mn_range for bk in block_k_range
@@ -632,8 +604,8 @@ def gemm_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
 
         # gfx950 BF16 config from 164-entry tuning data.
         # TN layout with large K → BLK_K=64, stages=2; all other cases → 32/3.

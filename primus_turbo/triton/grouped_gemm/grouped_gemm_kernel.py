@@ -28,11 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import (
-    _is_gfx950,
-    _select_params_origami,
-    _set_knobs_gfx950,
-)
+from primus_turbo.triton.gemm.gemm_kernel import _select_params_origami
+from primus_turbo.triton.utils.hardware_helper import is_gfx950, set_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants (lazy init)
@@ -58,7 +55,7 @@ def _get_num_cus() -> int:
 @functools.lru_cache(maxsize=256)
 def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
     """Cached kernel config for BF16 grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         is_tn = not trans_b
         BLOCK_M, BLOCK_N = 256, 256
         if is_tn:
@@ -112,7 +109,7 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
 @functools.lru_cache(maxsize=256)
 def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms):
     """Cached kernel config for BF16 grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         BLOCK_M, BLOCK_N = 256, 256
         BLOCK_K, num_stages_val = 32, 3
         group_m = 4
@@ -381,8 +378,8 @@ def grouped_gemm_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
         _get_gg_bf16_fwd_config(avg_m, N, K, a.dtype, b.dtype, trans_b, G, num_sms)
     )
@@ -618,8 +615,8 @@ def grouped_gemm_variable_k_triton_kernel(
     num_sms = _get_num_cus()
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_bf16_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
