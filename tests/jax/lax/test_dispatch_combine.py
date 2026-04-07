@@ -193,7 +193,9 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
 
     def check_dispatch(ref_check_x, ref_rank_prefix_matrix, ref_size_tensor):
         ref_recv_check_x = np.asarray(jnp.reshape(ref_check_x, (num_ranks, num_ranks * num_tokens, -1)))
-        ref_rank_prefix_matrix = np.asarray(jnp.reshape(ref_rank_prefix_matrix, (num_ranks, num_ranks, num_ranks)))
+        ref_rank_prefix_matrix = np.asarray(
+            jnp.reshape(ref_rank_prefix_matrix, (num_ranks, num_ranks, num_ranks))
+        )
         ref_size_tensor = np.asarray(jnp.reshape(ref_size_tensor, (num_ranks, num_ranks)))
         for rank in range(num_ranks):
             check_x = ref_recv_check_x[rank]
@@ -211,8 +213,12 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts):
         check_dispatch(base, ref, size_tensor)
 
     def check_topk_idx(ref_topk_idx, ref_gbl_num_tokens_per_expert):
-        ref_recv_topk_idx = np.asarray(jnp.reshape(ref_topk_idx, (num_ranks, num_ranks * num_tokens, num_topk)))
-        ref_gbl_num_tokens_per_expert = np.asarray(jnp.reshape(ref_gbl_num_tokens_per_expert, (num_ranks, num_experts)))
+        ref_recv_topk_idx = np.asarray(
+            jnp.reshape(ref_topk_idx, (num_ranks, num_ranks * num_tokens, num_topk))
+        )
+        ref_gbl_num_tokens_per_expert = np.asarray(
+            jnp.reshape(ref_gbl_num_tokens_per_expert, (num_ranks, num_experts))
+        )
 
         for rank in range(num_ranks):
             recv_topk_idx = ref_recv_topk_idx[rank]
