@@ -1,0 +1,65 @@
+gpu_pool:
+  device_type: hip
+  device_ids: [0, 1, 2, 3]
+
+defaults:
+  max_rounds: 10
+  bottleneck_threshold: 0.02
+  bottleneck_patience: 3
+  accuracy_snr_bf16: 30
+  accuracy_snr_fp8: 20
+  monitor_interval: 60
+
+profiles:
+  mi355x-priority:
+    hw: mi355x
+    tasks:
+      - operator: gemm
+        backend: ck
+        max_rounds: 10
+      - operator: attention
+        backend: triton
+        max_rounds: 8
+
+  mi300x-full-sweep:
+    hw: mi300x
+    operators: [gemm, grouped_gemm, attention]
+    backends: [triton, ck, hipblaslt]
+    max_rounds: 5
+
+  blockwise-fp8:
+    hw: mi355x
+    tasks:
+      - operator: gemm
+        backend: triton
+        dtype: fp8
+        quant: blockwise
+        max_rounds: 12
+
+knowledge:
+  search_templates:
+    gemm:
+      queries:
+        - "{backend} GEMM optimization AMD {arch} site:github.com"
+        - "matrix multiplication kernel optimization rocm 2026"
+        - "GEMM persistent kernel split-k AMD"
+      repos_to_check:
+        - ROCm/composable_kernel
+        - ROCm/aiter
+        - ROCm/hipBLASLt
+        - triton-lang/triton
+    attention:
+      queries:
+        - "flash attention optimization AMD MI300 MI350"
+        - "triton attention kernel CDNA"
+      repos_to_check:
+        - Dao-AILab/flash-attention
+        - ROCm/aiter
+        - linkedin/Liger-Kernel
+    grouped_gemm:
+      queries:
+        - "grouped GEMM MoE optimization AMD"
+        - "batched matrix multiplication variable sizes GPU"
+      repos_to_check:
+        - ROCm/composable_kernel
+        - vllm-project/vllm
