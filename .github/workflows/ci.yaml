@@ -10,7 +10,7 @@ on:
   pull_request:
 
 env:
-  UCCL_WHEEL_DIR: /wekafs/primus_turbo/uccl-wheel
+  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel
 
 jobs:
   code-lint:
@@ -55,7 +55,7 @@ jobs:
           options: "--check --diff --color --verbose --line-length=110"
 
   install-dependencies:
-    runs-on: turbo-pt-gfx942-261-sl2f9
+    runs-on: turbo-runner-tas-torch
     env:
         UCCL_COMMIT: 69a21407d261a8ff0f01f83bb0f5b35da059876d #  [rdma] Make CQ Ex flags configurable for NIC compatibility. (#689)
         UCCL_PY_VER: 3.12
@@ -116,9 +116,9 @@ jobs:
 
   unittest-pytorch-gfx942:
     needs: [code-lint, install-dependencies]
-    runs-on: turbo-pt-gfx942-261-sl2f9
+    runs-on: turbo-runner-tas-torch
     env:
-      PRIMUS_TURBO_WORKDIR: /wekafs/primus_turbo/k8s_ci_pytorch
+      PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-torch
     steps:
       - run: echo "🎉 Begin Primus-Turbo PyTorch Framework Unit Test."
       - name: Change owner
