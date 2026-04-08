@@ -43,7 +43,7 @@ public:
 
     int local_device_id() const { return device_id_; }
 
-    void DispatchLayout(hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, int num_experts,
+    void DispatchLayout(hipStream_t stream, ffi::Buffer<ffi::S32> topk_idx, int num_experts,
                         ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank,
                         std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> num_tokens_per_rdma_rank,
                         ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert,
@@ -51,7 +51,7 @@ public:
 
     void IntranodeDispatch(hipStream_t stream, ffi::AnyBuffer x,
                            std::optional<ffi::Buffer<ffi::F32>> x_scales,
-                           std::optional<ffi::Buffer<ffi::S64>> topk_idx,
+                           std::optional<ffi::Buffer<ffi::S32>> topk_idx,
                            std::optional<ffi::Buffer<ffi::F32>> topk_weights,
                            std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
                            ffi::Buffer<ffi::PRED>               is_token_in_rank,
@@ -62,7 +62,7 @@ public:
                            int expert_alignment, int num_worst_tokens,
                            primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
                            std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
-                           std::optional<ffi::Result<ffi::Buffer<ffi::S64>>> recv_topk_idx,
+                           std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
                            std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
                            std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rank_prefix_matrix,
                            std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> channel_prefix_matrix,

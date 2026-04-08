@@ -395,14 +395,14 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
-          int kNumDispatchRDMASenderWarps,
+          int kNumDispatchRDMASenderWarps, typename topk_idx_t,
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
 __global__ void
 __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarpSize), 1)
-    dispatch(int4 *recv_x, float *recv_x_scales, int64_t *recv_topk_idx, float *recv_topk_weights,
-             SourceMeta *recv_src_meta, const int4 *x, const float *x_scales,
-             const int64_t *topk_idx, const float *topk_weights, int *send_rdma_head,
-             int *send_nvl_head, int *recv_rdma_channel_prefix_matrix,
+    dispatch(int4 *recv_x, float *recv_x_scales, topk_idx_t *recv_topk_idx,
+             float *recv_topk_weights, SourceMeta *recv_src_meta, const int4 *x,
+             const float *x_scales, const topk_idx_t *topk_idx, const float *topk_weights,
+             int *send_rdma_head, int *send_nvl_head, int *recv_rdma_channel_prefix_matrix,
              int *recv_gbl_channel_prefix_matrix, const int *rdma_channel_prefix_matrix,
              const int *recv_rdma_rank_prefix_sum, const int *gbl_channel_prefix_matrix,
              const int *recv_gbl_rank_prefix_sum, const bool *is_token_in_rank, int num_tokens,
@@ -1127,7 +1127,7 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
                     auto recv_idx   = recv_token_idx * num_topk + lane_id;
                     auto buffer_idx = token_idx_in_buffer * num_topk + lane_id;
                     st_na_global(recv_topk_idx + recv_idx,
-                                 static_cast<int64_t>(
+                                 static_cast<topk_idx_t>(
                                      ld_nc_global(nvl_channel_topk_idx.buffer() + buffer_idx)));
                     st_na_global(recv_topk_weights + recv_idx,
                                  ld_nc_global(nvl_channel_topk_weights.buffer() + buffer_idx));
@@ -1154,31 +1154,34 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
     }
 }
 
-void dispatch(void *recv_x, float *recv_x_scales, int64_t *recv_topk_idx, float *recv_topk_weights,
-              void *recv_src_meta, const void *x, const float *x_scales, const int64_t *topk_idx,
-              const float *topk_weights, int *send_rdma_head, int *send_nvl_head,
-              int *recv_rdma_channel_prefix_matrix, int *recv_gbl_channel_prefix_matrix,
-              const int *rdma_channel_prefix_matrix, const int *recv_rdma_rank_prefix_sum,
-              const int *gbl_channel_prefix_matrix, const int *recv_gbl_rank_prefix_sum,
-              const bool *is_token_in_rank, int num_tokens, int num_worst_tokens, int hidden_int4,
-              int num_scales, int num_topk, int num_experts, int scale_token_stride,
-              int scale_hidden_stride, void *rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
-              int num_max_rdma_chunked_recv_tokens, void **buffer_ptrs,
-              int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank,
-              int num_ranks, bool is_cached_dispatch, hipStream_t stream, int num_channels,
-              bool low_latency_mode) {
+template <typename topk_idx_t>
+void dispatch(void *recv_x, float *recv_x_scales, topk_idx_t *recv_topk_idx,
+              float *recv_topk_weights, void *recv_src_meta, const void *x, const float *x_scales,
+              const topk_idx_t *topk_idx, const float *topk_weights, int *send_rdma_head,
+              int *send_nvl_head, int *recv_rdma_channel_prefix_matrix,
+              int *recv_gbl_channel_prefix_matrix, const int *rdma_channel_prefix_matrix,
+              const int *recv_rdma_rank_prefix_sum, const int *gbl_channel_prefix_matrix,
+              const int *recv_gbl_rank_prefix_sum, const bool *is_token_in_rank, int num_tokens,
+              int num_worst_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts,
+              int scale_token_stride, int scale_hidden_stride, void *rdma_buffer_ptr,
+              int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+              void **buffer_ptrs, int num_max_nvl_chunked_send_tokens,
+              int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks, bool is_cached_dispatch,
+              hipStream_t stream, int num_channels, bool low_latency_mode) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                       \
     {                                                                                              \
         auto dispatch_func =                                                                       \
             low_latency_mode                                                                       \
-                ? (is_cached_dispatch                                                              \
-                       ? dispatch<true, num_rdma_ranks, true, kNumDispatchRDMASenderWarps>         \
-                       : dispatch<true, num_rdma_ranks, false, kNumDispatchRDMASenderWarps>)       \
-                : (is_cached_dispatch                                                              \
-                       ? dispatch<false, num_rdma_ranks, true, kNumDispatchRDMASenderWarps>        \
-                       : dispatch<false, num_rdma_ranks, false, kNumDispatchRDMASenderWarps>);     \
+                ? (is_cached_dispatch ? dispatch<true, num_rdma_ranks, true,                       \
+                                                 kNumDispatchRDMASenderWarps, topk_idx_t>          \
+                                      : dispatch<true, num_rdma_ranks, false,                      \
+                                                 kNumDispatchRDMASenderWarps, topk_idx_t>)         \
+                : (is_cached_dispatch ? dispatch<false, num_rdma_ranks, true,                      \
+                                                 kNumDispatchRDMASenderWarps, topk_idx_t>          \
+                                      : dispatch<false, num_rdma_ranks, false,                     \
+                                                 kNumDispatchRDMASenderWarps, topk_idx_t>);        \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_topk_idx,   \
             recv_topk_weights, reinterpret_cast<SourceMeta *>(recv_src_meta),                      \
@@ -1201,6 +1204,16 @@ void dispatch(void *recv_x, float *recv_x_scales, int64_t *recv_topk_idx, float 
     SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
+
+#define INSTANTIATE_INTERNODE_DISPATCH(topk_idx_t)                                                 \
+    template void dispatch<topk_idx_t>(                                                            \
+        void *, float *, topk_idx_t *, float *, void *, const void *, const float *,               \
+        const topk_idx_t *, const float *, int *, int *, int *, int *, const int *, const int *,   \
+        const int *, const int *, const bool *, int, int, int, int, int, int, int, int, void *,    \
+        int, int, void **, int, int, int, int, bool, hipStream_t, int, bool);
+INSTANTIATE_INTERNODE_DISPATCH(int32_t)
+INSTANTIATE_INTERNODE_DISPATCH(int64_t)
+#undef INSTANTIATE_INTERNODE_DISPATCH
 
 template <bool kLowLatencyMode>
 __global__ void

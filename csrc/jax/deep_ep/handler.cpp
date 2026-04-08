@@ -15,7 +15,7 @@ int64_t get_hidden_bytes(ffi::AnyBuffer x) {
 }
 
 ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi::F32> x_scales,
-                          ffi::Buffer<ffi::S64> topk_idx, ffi::Buffer<ffi::F32> topk_weights,
+                          ffi::Buffer<ffi::S32> topk_idx, ffi::Buffer<ffi::F32> topk_weights,
                           /* attributes */
                           int64_t num_experts, int64_t expert_alignment, int64_t num_worst_tokens,
                           /*dispatch config*/
@@ -26,7 +26,7 @@ ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi:
                           /* dispatched outputs */
                           ffi::Result<ffi::AnyBuffer>         recv_x,
                           ffi::Result<ffi::Buffer<ffi::F32>>  recv_x_scales,
-                          ffi::Result<ffi::Buffer<ffi::S64>>  recv_topk_idx,
+                          ffi::Result<ffi::Buffer<ffi::S32>>  recv_topk_idx,
                           ffi::Result<ffi::Buffer<ffi::F32>>  recv_topk_weights,
                           ffi::Result<ffi::Buffer<ffi::PRED>> is_token_in_rank,
                           ffi::Result<ffi::Buffer<ffi::S32>>  num_tokens_per_rank,
@@ -159,7 +159,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<ffi::PlatformStream<hipStream_t>>()           // stream
         .Arg<ffi::AnyBuffer>()                             // x
         .Arg<ffi::Buffer<ffi::F32>>()                      // x_scales
-        .Arg<ffi::Buffer<ffi::S64>>()                      // topk_idx
+        .Arg<ffi::Buffer<ffi::S32>>()                      // topk_idx
         .Arg<ffi::Buffer<ffi::F32>>()                      // topk_weights
         .Attr<int64_t>("num_experts")                      // num_experts
         .Attr<int64_t>("expert_alignment")                 // expert_alignment
@@ -171,7 +171,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("num_max_rdma_chunked_recv_tokens") // num_max_rdma_chunked_recv_tokens
         .Ret<ffi::AnyBuffer>()                             // recv_x
         .Ret<ffi::Buffer<ffi::F32>>()                      // recv_x_scales
-        .Ret<ffi::Buffer<ffi::S64>>()                      // recv_topk_idx
+        .Ret<ffi::Buffer<ffi::S32>>()                      // recv_topk_idx
         .Ret<ffi::Buffer<ffi::F32>>()                      // recv_topk_weights
         .Ret<ffi::Buffer<ffi::PRED>>()                     // is_token_in_rank
         .Ret<ffi::Buffer<ffi::S32>>()                      // num_tokens_per_rank
