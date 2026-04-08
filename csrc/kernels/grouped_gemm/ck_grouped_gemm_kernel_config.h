@@ -72,6 +72,13 @@ using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
 using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
     256, 128, 64, 32, 32, 16, 2, 2, 1, false, true
 >;
+// 128x128 tiles for small per-expert M scenarios (MoE decode)
+using CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
+    128, 128, 64, 32, 32, 16, 2, 2, 1, false, false
+>;
+using CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
+    128, 128, 64, 32, 32, 16, 2, 2, 1, false, true
+>;
 // ***********************************************
 // ****** GFX942 Tile Config Specialization ******
 // FP8

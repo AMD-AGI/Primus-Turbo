@@ -16,10 +16,27 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
     if (get_current_arch() != GPUArch::GFX942) {
         PRIMUS_TURBO_ERROR("Currently Arch != gfx942");
     }
+    constexpr ck_tile::index_t NUM_CU = 304;
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
-        if (n % 256 == 0) {
+        const ck_tile::index_t m_tiles_256 = (m + 255) / 256;
+        const ck_tile::index_t n_tiles_256 = (n + 255) / 256;
+        const ck_tile::index_t total_tiles = group_num * m_tiles_256 * n_tiles_256;
+        const bool use_small_tile = (total_tiles < NUM_CU && group_num >= 2);
+        if (use_small_tile) {
+            if (n % 128 == 0) {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            }
+        } else if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
@@ -37,7 +54,6 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
         }
     } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
                          std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
         if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
             using TileConfig = GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
@@ -45,8 +61,17 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
                                                             TileConfig, QuantMode, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else {
-            // For other quant modes, use dynamic tile selection
-            if (n % 256 == 0) {
+            const ck_tile::index_t fp8_m_tiles = (m + 255) / 256;
+            const ck_tile::index_t fp8_n_tiles = (n + 255) / 256;
+            const ck_tile::index_t fp8_total = group_num * fp8_m_tiles * fp8_n_tiles;
+            const bool fp8_small = (fp8_total < NUM_CU && group_num >= 2 && n % 128 == 0);
+            if (fp8_small) {
+                using TileConfig = GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1;
+                using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
+                                                                CDataType, ALayout, BLayout, CLayout,
+                                                                TileConfig, QuantMode, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else if (n % 256 == 0) {
                 using TileConfig = GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1;
                 using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
                                                                 CDataType, ALayout, BLayout, CLayout,
@@ -83,10 +108,27 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
     if (get_current_arch() != GPUArch::GFX950) {
         PRIMUS_TURBO_ERROR("Currently Arch != gfx950");
     }
+    constexpr ck_tile::index_t NUM_CU = 256;
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
-        if (n % 256 == 0) {
+        const ck_tile::index_t m_tiles_256 = (m + 255) / 256;
+        const ck_tile::index_t n_tiles_256 = (n + 255) / 256;
+        const ck_tile::index_t total_tiles = group_num * m_tiles_256 * n_tiles_256;
+        const bool use_small_tile = (total_tiles < NUM_CU && group_num >= 2);
+        if (use_small_tile) {
+            if (n % 128 == 0) {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else {
+                using TileConfig = CKGroupedGemmTileCfg_128x128x64_32x32x16_2x2x1_padding;
+                using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
+                                                   CLayout, TileConfig, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            }
+        } else if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
@@ -104,7 +146,6 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
         }
     } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
                          std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
         if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
             using TileConfig = GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType,
@@ -112,8 +153,17 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
                                                             TileConfig, QuantMode, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else {
-            // For other quant modes, use dynamic tile selection
-            if (n % 256 == 0) {
+            const ck_tile::index_t fp8_m_tiles = (m + 255) / 256;
+            const ck_tile::index_t fp8_n_tiles = (n + 255) / 256;
+            const ck_tile::index_t fp8_total = group_num * fp8_m_tiles * fp8_n_tiles;
+            const bool fp8_small = (fp8_total < NUM_CU && group_num >= 2);
+            if (fp8_small) {
+                using TileConfig = GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1;
+                using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType,
+                                                                CDataType, ALayout, BLayout, CLayout,
+                                                                TileConfig, QuantMode, AccDataType>;
+                runner       = std::make_unique<Runner>();
+            } else if (n % 256 == 0) {
                 using TileConfig = GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1;
                 using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX950, ADataType, BDataType,
                                                                 CDataType, ALayout, BLayout, CLayout,
