@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
+#include "primus_turbo/dtype.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
@@ -77,5 +78,18 @@ struct CKGemmFP8Params {
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           ck_tile::QuantType QuantMode>
 void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
+
+//==================================================================
+//  Turbo GEMM
+//==================================================================
+
+size_t turbo_gemm_mxfp8_workspace_size(int32_t m, int32_t n, int32_t k);
+
+template <typename AType, typename BType, typename CType>
+void turbo_gemm_mxfp8_impl(const AType *a_ptr, const BType *b_ptr,
+                           const dtype::float8_e8m0 *a_scale_ptr,
+                           const dtype::float8_e8m0 *b_scale_ptr, CType *c_ptr, int32_t m,
+                           int32_t n, int32_t k, void *workspace, size_t workspace_size,
+                           hipStream_t stream);
 
 } // namespace primus_turbo

@@ -23,6 +23,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
           "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
+    m.def(
+        "turbo_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
+
     // ********* Quantization *********
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
           "Tensor[]");
@@ -83,6 +87,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);
     m.impl("hipblaslt_gemm_fp4", hipblaslt_gemm_fp4);
     m.impl("ck_gemm_fp8", ck_gemm_fp8);
+    m.impl("turbo_gemm_fp8", turbo_gemm_fp8);
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
@@ -119,6 +124,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("hipblaslt_gemm", hipblaslt_gemm_meta);
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8_meta);
     m.impl("ck_gemm_fp8", ck_gemm_fp8_meta);
+    m.impl("turbo_gemm_fp8", turbo_gemm_fp8_meta);
 
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
