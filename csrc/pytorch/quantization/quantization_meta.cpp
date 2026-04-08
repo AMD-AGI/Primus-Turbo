@@ -155,4 +155,130 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
 }
 
+std::vector<at::Tensor>
+quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype,
+                         const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
+                         const bool shuffle_rowwise_scale, const bool shuffle_rowwise,
+                         const bool shuffle_colwise_scale, const bool shuffle_colwise) {
+    using namespace primus_turbo::detail;
+
+    std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
+        return (a + b - 1) / b;
+    };
+
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
+                       "Output must be Float8_e4m3fn or Float8_e5m2");
+
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+
+    const int64_t M_pad = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+    const int64_t N_pad = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+
+    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
+
+    if (shuffle_rowwise) {
+        PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0, "M must be divisible by ", MXFP8_SHUFFLE_BN,
+                           " for shuffled rowwise FP8");
+    }
+    if (shuffle_colwise) {
+        PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0, "N must be divisible by ", MXFP8_SHUFFLE_BN,
+                           " for shuffled colwise FP8");
+    }
+
+    int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
+    int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
+    int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
+
+    at::Tensor rowwise_scale;
+    if (shuffle_rowwise_scale) {
+        rowwise_scale = at::empty({rowwise_scale_M_pad, rowwise_scale_N_pad},
+                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else {
+        rowwise_scale =
+            at::empty({M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    }
+
+    at::Tensor rowwise_output =
+        at::empty({M, N_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
+    int64_t colwise_scale_N     = cdiv(M_pad, MXFP8_BLOCK_SIZE);
+    int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
+
+    at::Tensor colwise_scale;
+    if (shuffle_colwise_scale) {
+        colwise_scale = at::empty({colwise_scale_M_pad, colwise_scale_N_pad},
+                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else {
+        colwise_scale =
+            at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    }
+
+    at::Tensor colwise_output =
+        at::empty({N, M_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
+            colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu)};
+}
+
+std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
+                                            const int64_t axis, const bool use_2d_block,
+                                            const bool shuffle_scale, const bool shuffle_out) {
+    using namespace primus_turbo::detail;
+
+    auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
+
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
+                       "Output must be Float8_e4m3fn or Float8_e5m2");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+
+    const bool    is_rowwise = (axis == 1);
+    const int64_t M          = input.size(0);
+    const int64_t N          = input.size(1);
+    const int64_t M_pad      = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+    const int64_t N_pad      = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+
+    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
+
+    if (shuffle_out) {
+        if (is_rowwise) {
+            PRIMUS_TURBO_CHECK(M % MXFP8_SHUFFLE_BN == 0, "M must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled rowwise FP8");
+        } else {
+            PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0, "N must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled colwise FP8");
+        }
+    }
+
+    int64_t scale_outer = is_rowwise ? M : N;
+    int64_t scale_N = is_rowwise ? cdiv(N_pad, MXFP8_BLOCK_SIZE) : cdiv(M_pad, MXFP8_BLOCK_SIZE);
+    int64_t scale_M_pad = cdiv(scale_outer, 256) * 256;
+    int64_t scale_N_pad = cdiv(scale_N, 8) * 8;
+
+    at::Tensor scale_tensor;
+    if (shuffle_scale) {
+        scale_tensor = at::empty({scale_M_pad, scale_N_pad},
+                                 at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else {
+        scale_tensor = at::empty({scale_outer, scale_N},
+                                 at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    }
+
+    int64_t    output_rows = is_rowwise ? M : N;
+    int64_t    output_cols = is_rowwise ? N_pad : M_pad;
+    at::Tensor output      = at::empty({output_rows, output_cols},
+                                       at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    return {output.view(dest_dtype), scale_tensor.view(at::kFloat8_e8m0fnu)};
+}
+
 } // namespace primus_turbo::pytorch
