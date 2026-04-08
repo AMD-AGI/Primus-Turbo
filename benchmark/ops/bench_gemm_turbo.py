@@ -24,6 +24,11 @@ from config import (
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Float8QuantConfig,
@@ -222,8 +227,27 @@ def profile_gemm_fp4(M, N, K, dtype, config, trans_b):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+def _set_backend(backend_name, dtype_name):
+    """Set GEMM backend via GlobalBackendManager."""
+    if backend_name == "default":
+        return
+    backend = BackendType[backend_name.upper()]
+    if dtype_name == "fp8":
+        GlobalBackendManager.set_gemm_backend(backend, PrecisionType.FP8)
+    elif dtype_name == "fp4":
+        GlobalBackendManager.set_gemm_backend(backend, PrecisionType.FP4)
+    else:
+        GlobalBackendManager.set_gemm_backend(backend, PrecisionType.BF16_FP16_FP32)
+
+
+def benchmark_gemm_turbo(
+    dtype_name="bf16", granularity_name="tensorwise", output_csv=None, backend_name="default"
+):
     platform, gpu_name = get_platform_info()
+
+    _set_backend(backend_name, dtype_name)
+    if backend_name != "default":
+        print(f"Backend: {backend_name.upper()}")
 
     is_fp8 = dtype_name == "fp8"
     is_fp4 = dtype_name == "fp4"
@@ -376,6 +400,13 @@ if __name__ == "__main__":
         help="FP8 scaling granularity (only used when dtype=fp8 or fp4, default: tensorwise)",
     )
     parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["default", "ck", "triton", "hipblaslt"],
+        default="default",
+        help="Force a specific backend: ck, triton, hipblaslt, or default (auto-dispatch)",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         type=str,
@@ -383,4 +414,9 @@ if __name__ == "__main__":
         help="Output CSV filename",
     )
     args = parser.parse_args()
-    benchmark_gemm_turbo(dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output)
+    benchmark_gemm_turbo(
+        dtype_name=args.dtype,
+        granularity_name=args.granularity,
+        output_csv=args.output,
+        backend_name=args.backend,
+    )
