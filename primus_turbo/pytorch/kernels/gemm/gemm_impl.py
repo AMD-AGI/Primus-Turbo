@@ -101,6 +101,44 @@ class GEMMKernelDispatcher(AutoKernelDispatcher):
         return (M, N, Ka, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c)
 
 
+def _shape_preferred_backend(a, trans_a, b, trans_b):
+    """Hardware-aware shape-based backend selection for BF16 GEMM.
+
+    Thresholds differ by GPU architecture because Triton codegen and
+    memory hierarchy characteristics vary between CDNA generations.
+
+    gfx942 (MI300X, 64 KB LDS):
+      - K >= 40000: Triton persistent kernel hides latency better
+      - N >= 65536 with M >= 8192: Triton tile scheduling wins
+
+    gfx950 (MI355X, 160 KB LDS):
+      - K >= 16384: larger tiles exploit 160 KB LDS for better reuse
+      - N >= 28672 with M >= 4096: more aggressive Triton dispatch
+
+    Only overrides when expected gain > 5%.
+    """
+    from primus_turbo.triton.gemm.gemm_kernel import _get_gpu_arch
+
+    if a.dtype not in _COMMON_SUPPORTED_DTYPES:
+        return None
+    M = a.shape[1] if trans_a else a.shape[0]
+    K = a.shape[0] if trans_a else a.shape[1]
+    N = b.shape[0] if trans_b else b.shape[1]
+
+    arch = _get_gpu_arch()
+    if arch == "gfx950":
+        if K >= 16384:
+            return BackendType.TRITON
+        if N >= 28672 and M >= 4096:
+            return BackendType.TRITON
+    elif arch == "gfx942":
+        if K >= 40000:
+            return BackendType.TRITON
+        if N >= 65536 and M >= 8192:
+            return BackendType.TRITON
+    return None
+
+
 @_torch_custom_op_wrapper("primus_turbo::gemm_impl", mutates_args=(), device_types="cuda")
 def gemm_impl(
     a: torch.Tensor,
@@ -113,6 +151,11 @@ def gemm_impl(
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32)
+
+    if user_backend_enum is None and not GlobalBackendManager.auto_tune_enabled():
+        shape_hint = _shape_preferred_backend(a, trans_a, b, trans_b)
+        if shape_hint is not None:
+            default_backend_enum = shape_hint
 
     kwargs = dict(
         a=a,
