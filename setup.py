@@ -30,7 +30,9 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-AITER_COMMIT = "e83f9903c07001a0ec29e85d223f6e6cdbe00859"
+# NOTE(ruibin): custom branch for aiter to support sbhd format
+# https://github.com/ROCm/aiter/commits/dev/zhangrb/fa_fwd_add_out_args/
+AITER_COMMIT = "cdbfb4fc3da76c39bfd43e6688b2b8f78046d18a"
 
 # ---------- ORIGAMI (rocm-libraries) ------------
 # Pin to commit. Installed during build via clone + pip install (avoids pip resolution

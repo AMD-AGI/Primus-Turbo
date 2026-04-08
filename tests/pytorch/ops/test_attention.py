@@ -45,8 +45,12 @@ test_cases = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("enable_sink", [False, True])
-def test_attention_16bit(batch, dtype, config, causal, enable_sink):
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
+def test_attention_16bit(batch, dtype, config, causal, enable_sink, qkv_format):
+    if qkv_format == "sbhd" and enable_sink:
+        pytest.skip("Sink attention is not supported for sbhd format")
+
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -67,13 +71,21 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
     torch.cuda.manual_seed_all(42)
 
     print(
-        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}"
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}, Format={qkv_format}"
     )
 
-    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
-    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
+    if qkv_format == "sbhd":
+        q_layout = (seqlen_q, batch, num_head_q, head_dim_qk)
+        k_layout = (seqlen_kv, batch, num_head_kv, head_dim_qk)
+        v_layout = (seqlen_kv, batch, num_head_kv, head_dim_v)
+        o_layout = (seqlen_q, batch, num_head_q, head_dim_v)
+    elif qkv_format == "bshd":
+        q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
+        k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
+        v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+        o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
+    else:
+        assert False, f"Unsupported qkv format: {qkv_format}"
 
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
     key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
@@ -90,9 +102,14 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
     if enable_sink:
         sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
         sink_ref = sink.clone().detach().requires_grad_()
-        o_ref = attention_with_sink_ref_impl(query_ref, key_ref, value_ref, sink_ref, sm_scale, causal)
+        o_ref = attention_with_sink_ref_impl(
+            query_ref, key_ref, value_ref, sink_ref, sm_scale, causal, qkv_format
+        )
     else:
-        o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
+        o_ref = attention_vanilla_forward_pytorch_ref_impl(
+            query_ref, key_ref, value_ref, sm_scale, causal, qkv_format
+        )
+
     o_ref.backward(grad_out)
     o = flash_attn_func(
         query,
@@ -108,6 +125,7 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
         return_lse=False,
         return_attn_probs=False,
         sink=sink,
+        qkv_format=qkv_format,
     )
     o.backward(grad_out)
 

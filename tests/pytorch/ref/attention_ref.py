@@ -36,20 +36,42 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+    elif layout == "sbhd":
+        num_heads = q.shape[2]
+        n_kv_heads = k.shape[2]
+        n_rep = num_heads // n_kv_heads
+
+        q = q.permute(1, 2, 0, 3).contiguous()
+        k = k.permute(1, 2, 0, 3).contiguous()
+        v = v.permute(1, 2, 0, 3).contiguous()
+    elif layout == "bhsd":
+        num_heads = q.shape[1]
+        n_kv_heads = k.shape[1]
+        n_rep = num_heads // n_kv_heads
     else:
         raise ValueError(f"Unknown layout {layout}")
 
     with sdpa_kernel(ATTN_BACKENDS):
+        # NOTE: expect input layout is bhsd.
         o_ref = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
         )
     if layout == "bshd":
-        o_ref = o_ref.transpose(1, 2)
+        o_ref = o_ref.transpose(1, 2).contiguous()
+    elif layout == "sbhd":
+        o_ref = o_ref.permute(2, 0, 1, 3).contiguous()
     return o_ref
 
 
-def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal):
+def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, layout="bshd"):
     """Reference implementation of attention with sink."""
+
+    if layout == "sbhd":
+        q = q.permute(1, 0, 2, 3).contiguous()
+        k = k.permute(1, 0, 2, 3).contiguous()
+        v = v.permute(1, 0, 2, 3).contiguous()
+    elif layout != "bshd":
+        raise ValueError(f"Unknown layout {layout}")
 
     dtype_og = q.dtype
     q, k, v = q.float(), k.float(), v.float()
@@ -85,7 +107,10 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal):
     # Compute output
     output = torch.einsum("bhts,bshd->bthd", attention, v)
 
-    return output.to(dtype=dtype_og)
+    output = output.to(dtype=dtype_og)
+    if layout == "sbhd":
+        output = output.permute(1, 0, 2, 3).contiguous()
+    return output
 
 
 class TurboAttentionRef(torch.nn.Module):

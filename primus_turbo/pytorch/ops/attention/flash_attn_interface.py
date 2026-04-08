@@ -57,6 +57,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         is_v3_atomic_fp32: Optional[bool] = None,
         how_v3_bf16_cvt: Optional[int] = 1,
         sink: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = "bshd",
     ):
         assert not (deterministic and sink is not None), (
             "deterministic and sink cannot be enabled together currently; "
@@ -83,6 +84,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
+        seq_dim = 0 if qkv_format == "sbhd" else 1
         out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
             q=q,
             k=k,
@@ -96,9 +98,10 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
+            max_seqlen_q=q.shape[seq_dim],
+            max_seqlen_k=k.shape[seq_dim],
             sink=sink,
+            qkv_format=qkv_format,
         )
 
         if is_grad:
@@ -115,6 +118,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
             ctx.sink = sink
+            ctx.qkv_format = qkv_format
 
         out = out_padded[..., :head_size_v_og]
 
@@ -167,12 +171,31 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
             sink=sink,
             dsink=dsink,
+            qkv_format=ctx.qkv_format,
         )
 
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv_padded[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None, None, dsink
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dsink,
+            None,
+        )
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -292,6 +315,7 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = "bshd",
 ):
     return AiterFlashAttnFunc.apply(
         q,
@@ -310,6 +334,7 @@ def flash_attn_func(
         None,  # is_v3_atomic_fp32
         1,  # how_v3_bf16_cvt
         sink,
+        qkv_format,
     )
 
 
