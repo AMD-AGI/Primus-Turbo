@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import operator
 import warnings
 from functools import reduce
@@ -49,6 +55,10 @@ _group_name_to_workspace_tensor = {}
 
 _PROXY_TYPESTR: dict[torch.dtype, str] = {
     torch.bfloat16: "<u2",
+    torch.float8_e4m3fn: "|u1",
+    torch.float8_e5m2: "|u1",
+    torch.float8_e4m3fnuz: "|u1",
+    torch.float8_e5m2fnuz: "|u1",
 }
 
 
@@ -87,6 +97,9 @@ def _tensor_from_device_ptr(
     return tensor
 
 
+_DEFAULT_SIGNAL_PAD_SIZE = 1024
+
+
 class SymmetricMemory:
     """GPU symmetric memory backed by HIP IPC.
 
@@ -94,7 +107,9 @@ class SymmetricMemory:
     with the *local* rank) before constructing this object.
     """
 
-    def __init__(self, group: dist.ProcessGroup, alloc_size: int, signal_pad_size: int = 1024):
+    def __init__(
+        self, group: dist.ProcessGroup, alloc_size: int, signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE
+    ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
         if signal_pad_size <= 0:
@@ -120,9 +135,9 @@ class SymmetricMemory:
         signal_pad_ptr = None
         try:
             buffer_ptr = self.lib.hipMalloc(alloc_size)
-            signal_pad_ptr = self.lib.hipMalloc(signal_pad_size)
+            signal_pad_ptr = self.lib.hipMalloc(self.signal_pad_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
-            self.lib.hipMemset(signal_pad_ptr, 0, signal_pad_size)
+            self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
 
             self.buffer_ptrs = self._rendezvous(buffer_ptr)
             self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
@@ -349,34 +364,49 @@ class SymmetricMemory:
         return False
 
 
-def get_symm_mem_workspace(group: dist.ProcessGroup, min_size: int) -> SymmetricMemory:
+def get_symm_mem_workspace(
+    group: dist.ProcessGroup,
+    min_size: int,
+    min_signal_pad_size: int = 0,
+) -> SymmetricMemory:
     """
     Get the symmetric memory workspace associated with the process group. If
     ``min_size`` is greater than the workspace associated with ``group_name``,
     the workspace will be re-allocated and re-rendezvous'd.
 
     Args:
-        group_name (str): the name of the process group.
-        min_size (int): the size requirement for the workspace in bytes.
+        group: the process group.
+        min_size: the size requirement for the buffer workspace in bytes.
+        min_signal_pad_size: the size requirement for the per-rank signal pad
+            in bytes.  When zero the default (1024 B) is used for new
+            allocations.
 
     Returns:
-        _SymmetricMemory: the symmetric memory workspace associated with the
+        SymmetricMemory: the symmetric memory workspace associated with the
         group.
     """
     symm_mem = _group_name_to_workspace_tensor.get(group.group_name, None)
-    size = symm_mem.buffer_size if symm_mem is not None else 0
-    if symm_mem is None or size < min_size:
+    buf_size = symm_mem.buffer_size if symm_mem is not None else 0
+    sig_size = symm_mem.signal_pad_size if symm_mem is not None else 0
+    needs_realloc = symm_mem is None or buf_size < min_size or sig_size < min_signal_pad_size
+    if needs_realloc:
         if torch.cuda.is_current_stream_capturing():
-            curr_size = 0 if symm_mem is None else symm_mem.buffer_size
             raise RuntimeError(
                 "get_symm_mem_workspace(): cannot resize the symmetric-memory "
-                f"workspace during CUDA graph capture. Requested {min_size} bytes, "
-                f"but the current workspace is {curr_size} bytes. Call "
+                f"workspace during CUDA graph capture. Requested {min_size} buffer bytes "
+                f"and {min_signal_pad_size} signal-pad bytes, "
+                f"but the current workspace has {buf_size} buffer bytes "
+                f"and {sig_size} signal-pad bytes. Call "
                 f"`get_symm_mem_workspace(group={group.group_name!r}, "
-                f"min_size={min_size})` before starting graph capture."
+                f"min_size={min_size}, min_signal_pad_size={min_signal_pad_size})` "
+                f"before starting graph capture."
             )
         old_symm_mem = symm_mem
-        symm_mem = SymmetricMemory(group, max(size, min_size))
+        symm_mem = SymmetricMemory(
+            group,
+            max(buf_size, min_size),
+            signal_pad_size=max(sig_size, min_signal_pad_size, _DEFAULT_SIGNAL_PAD_SIZE),
+        )
         _group_name_to_workspace_tensor[group.group_name] = symm_mem
         if old_symm_mem is not None:
             old_symm_mem.destroy()

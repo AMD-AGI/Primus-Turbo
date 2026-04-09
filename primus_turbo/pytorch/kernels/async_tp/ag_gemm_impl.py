@@ -115,15 +115,25 @@ def pipelined_all_gather_copy_send(
     return _CustomHandle
 
 
-@lru_cache
+_symm_shard_buf_cache: dict = {}
+
+
 def get_symm_shard_buf_and_chunk(
     shard_info: Tuple[Tuple[torch.Size, torch.dtype]],
     group_name: int,
     p2p_workspace_size_req: int,
     num_splits: int,
 ):
+    key = (shard_info, group_name, p2p_workspace_size_req, num_splits)
+    cached = _symm_shard_buf_cache.get(key)
+    if cached is not None and not cached[0].is_destroyed:
+        return cached
+
     group = c10d._resolve_process_group(group_name)
-    symm_mem = get_symm_mem_workspace(group, min_size=p2p_workspace_size_req)
+    signal_pad_size_req = num_splits * group.size() * 4
+    symm_mem = get_symm_mem_workspace(
+        group, min_size=p2p_workspace_size_req, min_signal_pad_size=signal_pad_size_req
+    )
     local_shard_buf_chunk = [[] for _ in range(num_splits)]
     shard_buf = [[] for _ in range(symm_mem.world_size)]
     offset = 0
@@ -142,7 +152,9 @@ def get_symm_shard_buf_and_chunk(
 
         offset += buf.nbytes
 
-    return symm_mem, shard_buf, local_shard_buf_chunk
+    result = (symm_mem, shard_buf, local_shard_buf_chunk)
+    _symm_shard_buf_cache[key] = result
+    return result
 
 
 def _pipelined_multi_all_gather_and_consume(
@@ -172,7 +184,7 @@ def _pipelined_multi_all_gather_and_consume(
     for t in shard:
         p2p_workspace_size_req += t.nbytes * (num_ranks - 1)
 
-    shard_info = (None if s is None else (s.shape, s.dtype) for s in shard)
+    shard_info = tuple(None if s is None else (s.shape, s.dtype) for s in shard)
 
     symm_mem, shard_buf, local_shard_buf_chunk = get_symm_shard_buf_and_chunk(
         shard_info, group_name, p2p_workspace_size_req, num_splits

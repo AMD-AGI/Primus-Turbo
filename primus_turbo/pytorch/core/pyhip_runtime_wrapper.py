@@ -1,3 +1,7 @@
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+
 import ctypes
 import platform
 from dataclasses import dataclass
@@ -110,12 +114,10 @@ class HIPRuntimeLibrary:
             self.lib = HIPRuntimeLibrary.path_to_library_cache[so_file]
         except Exception as e:
             print(
-                "Failed to load HIP runtime library from %s. "
-                "This is expected if you are not running on ROCm GPUs. "
-                "Otherwise, the HIP runtime library might not exist, be corrupted, "
-                "or does not support the current platform %s.",
-                so_file,
-                platform.platform(),
+                f"Failed to load HIP runtime library from {so_file}. "
+                f"This is expected if you are not running on ROCm GPUs. "
+                f"Otherwise, the HIP runtime library might not exist, be corrupted, "
+                f"or does not support the current platform {platform.platform()}."
             )
             raise e
 

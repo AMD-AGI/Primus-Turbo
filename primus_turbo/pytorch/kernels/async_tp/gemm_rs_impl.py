@@ -117,7 +117,7 @@ def _tiled_fused_matmul_scatter_out_impl(
     p2p_workspace_size_req = M * N * input.element_size()
     symm_mem = get_symm_mem_workspace(group, min_size=p2p_workspace_size_req)
     scatter_bufs = [symm_mem.get_buffer(i, [M, N], out_dtype) for i in range(num_ranks)]
-    scatter_bufs_ptr = get_scatter_buf_ptrs((t.data_ptr() for t in scatter_bufs))
+    scatter_bufs_ptr = get_scatter_buf_ptrs(tuple(t.data_ptr() for t in scatter_bufs))
 
     symm_mem.barrier()
     matmul_fuse_scatter(input, weight, scatter_bufs_ptr, rank, num_ranks, transpose_weight=False)
