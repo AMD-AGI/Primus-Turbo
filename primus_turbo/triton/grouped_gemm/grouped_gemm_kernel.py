@@ -55,6 +55,15 @@ def _get_num_cus() -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _estimate_total_tiles(avg_m, N, G, block_m, block_n):
+    """Estimate total tile count for all groups to check CU utilization."""
+    import math
+
+    tiles_m = math.ceil(avg_m / block_m)
+    tiles_n = math.ceil(N / block_n)
+    return G * tiles_m * tiles_n
+
+
 @functools.lru_cache(maxsize=256)
 def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
     """Cached kernel config for BF16 grouped GEMM forward."""
@@ -84,6 +93,15 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
             if min(om, on) >= 128 and ok == BLOCK_K:
                 BLOCK_M, BLOCK_N, group_m = om, on, ogm
                 cache_a, cache_b = oc_a, oc_b
+
+        total_tiles = _estimate_total_tiles(avg_m, N, G, BLOCK_M, BLOCK_N)
+        if total_tiles < num_sms * 3 // 5:
+            for bm, bn in [(128, 256), (256, 128), (128, 128)]:
+                cand_tiles = _estimate_total_tiles(avg_m, N, G, bm, bn)
+                if cand_tiles >= num_sms:
+                    BLOCK_M, BLOCK_N = bm, bn
+                    group_m = min(8, max(2, group_m))
+                    break
     else:
         BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
         group_m = 4
@@ -106,7 +124,26 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
             if ogm >= 2 and om * on >= 256 * 256:
                 BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = (om, on, ok, ogm, oc_a, oc_b)
 
-    return BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size
+        total_tiles = _estimate_total_tiles(avg_m, N, G, BLOCK_M, BLOCK_N)
+        if total_tiles < num_sms * 3 // 5:
+            for bm, bn in [(128, 256), (256, 128), (128, 128)]:
+                cand_tiles = _estimate_total_tiles(avg_m, N, G, bm, bn)
+                if cand_tiles >= num_sms:
+                    BLOCK_M, BLOCK_N = bm, bn
+                    group_m = min(8, max(2, group_m))
+                    break
+            else:
+                best_bm, best_bn, best_tiles = BLOCK_M, BLOCK_N, total_tiles
+                for bm, bn in [(128, 256), (256, 128), (128, 128)]:
+                    cand_tiles = _estimate_total_tiles(avg_m, N, G, bm, bn)
+                    if cand_tiles > best_tiles:
+                        best_bm, best_bn, best_tiles = bm, bn, cand_tiles
+                if best_tiles > total_tiles * 2:
+                    BLOCK_M, BLOCK_N = best_bm, best_bn
+                    group_m = min(8, max(2, group_m))
+
+    num_warps = 4 if BLOCK_M * BLOCK_N <= 128 * 128 else 8
+    return BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_warps
 
 
 @functools.lru_cache(maxsize=256)
@@ -134,6 +171,15 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
             if min(om, on) >= 128 and ok == BLOCK_K:
                 BLOCK_M, BLOCK_N, group_m = om, on, ogm
                 cache_a, cache_b = oc_a, oc_b
+
+        total_tiles = _estimate_total_tiles(OUT_M, OUT_N, G, BLOCK_M, BLOCK_N)
+        if total_tiles < num_sms * 3 // 5:
+            for bm, bn in [(128, 256), (256, 128), (128, 128)]:
+                cand_tiles = _estimate_total_tiles(OUT_M, OUT_N, G, bm, bn)
+                if cand_tiles >= num_sms:
+                    BLOCK_M, BLOCK_N = bm, bn
+                    group_m = min(8, max(2, group_m))
+                    break
     else:
         BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
         group_m = 4
@@ -141,7 +187,36 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 64 if num_sms >= NUM_XCDS * 64 else 32
 
-    return BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size
+        origami_params = _select_params_origami(
+            OUT_M,
+            OUT_N,
+            avg_k,
+            dtype_lhs,
+            dtype_lhs,
+            dtype_rhs,
+            trans_a=True,
+            trans_b=False,
+        )
+        if origami_params is not None:
+            om, on, ok, ogm, oc_a, oc_b = origami_params
+            if ogm >= 2 and om * on >= 256 * 256:
+                BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b = (om, on, ok, ogm, oc_a, oc_b)
+
+        import math
+
+        tiles_m = math.ceil(OUT_M / BLOCK_M)
+        tiles_n = math.ceil(OUT_N / BLOCK_N)
+        total_tiles = G * tiles_m * tiles_n
+        if total_tiles < num_sms * 3 // 5:
+            for bm, bn in [(128, 256), (256, 128), (128, 128)]:
+                ct = G * math.ceil(OUT_M / bm) * math.ceil(OUT_N / bn)
+                if ct >= num_sms:
+                    BLOCK_M, BLOCK_N = bm, bn
+                    group_m = min(8, max(2, group_m))
+                    break
+
+    num_warps = 4 if BLOCK_M * BLOCK_N <= 128 * 128 else 8
+    return BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_warps
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -380,10 +455,10 @@ def grouped_gemm_triton_kernel(
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
-    avg_m = max(M_total // max(G, 1), 256)
+    avg_m = M_total // max(G, 1)
     if _is_gfx950():
         _set_knobs_gfx950()
-    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
+    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size, nwarps = (
         _get_gg_bf16_fwd_config(avg_m, N, K, a.dtype, b.dtype, trans_b, G, num_sms)
     )
     even_k = K % BLOCK_K == 0
@@ -413,7 +488,7 @@ def grouped_gemm_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        num_warps=8,
+        num_warps=nwarps,
         num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
@@ -620,9 +695,9 @@ def grouped_gemm_variable_k_triton_kernel(
 
     if _is_gfx950():
         _set_knobs_gfx950()
-    avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
-    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_bf16_vk_config(
-        OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
+    avg_m_g = lhs.shape[0] // max(G, 1)
+    BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size, nwarps = (
+        _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms)
     )
 
     _grouped_variable_k_gemm_kernel[(num_sms,)](
@@ -652,7 +727,7 @@ def grouped_gemm_variable_k_triton_kernel(
         IS_FP8=False,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        num_warps=8,
+        num_warps=nwarps,
         num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
