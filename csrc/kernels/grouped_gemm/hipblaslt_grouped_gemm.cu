@@ -146,8 +146,18 @@ private:
         }
 
         const char *a_ptr = static_cast<const char *>(params.a_ptr);
-        const char *b_ptr = static_cast<const char *>(params.b_ptr);
+        const char *b_ptr = static_cast<const char *>(params.b_ptr);  // sequential ptr (wgrad only)
         char       *c_ptr = static_cast<char *>(params.c_ptr);
+
+        // For fwd/dgrad (transA=False): b is [G, K, N] — each expert has a fixed K×N weight block.
+        // Use absolute per-expert offset (b_base + i * b_expert_stride) so that skipping cold
+        // experts (len==0) does not shift the pointer and corrupt subsequent hot experts.
+        // For wgrad (transA=True): b is flat [M_total, OUT_N] — advance sequentially per hot group.
+        const int64_t b_expert_stride = params.transA
+            ? 0
+            : get_dim(params.b_shape, -1) * get_dim(params.b_shape, -2) *
+                  hipblaslt_dtype_bytes(params.b_type);
+
         gemm_ptrs_.resize(valid_group_num);
         ld_a_.resize(valid_group_num);
         ld_b_.resize(valid_group_num);
@@ -178,7 +188,11 @@ private:
 
             // pointers
             gemm_ptrs_[write_idx].a_ptr = a_ptr;
-            gemm_ptrs_[write_idx].b_ptr = b_ptr;
+            // fwd/dgrad: absolute per-expert offset avoids desync on cold experts
+            // wgrad:     sequential advance through the flat b tensor
+            gemm_ptrs_[write_idx].b_ptr = params.transA
+                ? b_ptr
+                : static_cast<const char *>(params.b_ptr) + static_cast<int64_t>(i) * b_expert_stride;
             gemm_ptrs_[write_idx].c_ptr = c_ptr;
             if (params.use_low_precision) {
                 // TODO(xiaobochen): support variable scale mode
@@ -199,7 +213,10 @@ private:
             cols_c_[write_idx] = params.transA ? get_dim(params.c_shape, -2) : len;
             // advance the pointers
             a_ptr += rows_a_[write_idx] * cols_a_[write_idx] * hipblaslt_dtype_bytes(params.a_type);
-            b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);
+            if (params.transA) {
+                // wgrad only: advance b_ptr through the flat tensor
+                b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);
+            }
             c_ptr += rows_c_[write_idx] * cols_c_[write_idx] * hipblaslt_dtype_bytes(params.c_type);
             write_idx++;
         }

@@ -90,12 +90,13 @@ def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, fp8_form
     return correct
 
 
-def profile_grouped_gemm(B, M, N, K, dtype):
+def profile_grouped_gemm(B, M, N, K, dtype, balance=True, num_topk=None):
     """Profile BF16 Grouped GEMM."""
     device = "cuda"
-    x = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
+    group_lens = gen_grouped_gemm_group_lens(B, M, balance=balance, num_topk=num_topk).to(device)
+    total_m = group_lens.sum().item()
+    x = torch.randn((total_m, K), dtype=dtype, device=device, requires_grad=True)
     w = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
-    group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
 
     out = turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
     grad_out = torch.randn_like(out)
@@ -109,15 +110,15 @@ def profile_grouped_gemm(B, M, N, K, dtype):
     fwd_total_flops = 2 * B * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
-    for _ in range(20):
+    for _ in range(100):
         fwd_func()
         bwd_func()
     torch.cuda.synchronize()
 
     fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
     bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
-    fwd_measurement = fwd_timer.timeit(100)
-    bwd_measurement = bwd_timer.timeit(100)
+    fwd_measurement = fwd_timer.timeit(200)
+    bwd_measurement = bwd_timer.timeit(200)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
     bwd_mean_time_ms = bwd_measurement.mean * 1e3
@@ -148,15 +149,15 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
     fwd_total_flops = 2 * B * M * N * K
     bwd_total_flops = 2 * fwd_total_flops
 
-    for _ in range(20):
+    for _ in range(100):
         fwd_func()
         bwd_func()
     torch.cuda.synchronize()
 
     fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func})
     bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func})
-    fwd_measurement = fwd_timer.timeit(100)
-    bwd_measurement = bwd_timer.timeit(100)
+    fwd_measurement = fwd_timer.timeit(200)
+    bwd_measurement = bwd_timer.timeit(200)
 
     fwd_mean_time_ms = fwd_measurement.mean * 1e3
     bwd_mean_time_ms = bwd_measurement.mean * 1e3
@@ -183,14 +184,16 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
         dtype = case["dtype"]
 
+        balance = case.get("balance", True)
+        balance_str = "balanced" if balance else "unbalanced"
         print(f"\n{'='*60}")
         if is_fp8:
             print(
                 f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, "
-                f"dtype: fp8, granularity: {granularity_name}"
+                f"dtype: fp8, granularity: {granularity_name}, {balance_str}"
             )
         else:
-            print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16")
+            print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}")
         print(f"{'='*60}")
 
         try:
@@ -200,7 +203,9 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 )
             else:
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm(
-                    B=B, M=M, N=N, K=K, dtype=dtype
+                    B=B, M=M, N=N, K=K, dtype=dtype,
+                    balance=case.get("balance", True),
+                    num_topk=case.get("num_topk"),
                 )
 
             row = {
@@ -213,6 +218,7 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 "N": N,
                 "K": K,
                 "Dtype": dtype_name,
+                "Balance": "Y" if balance else "N",
             }
             if is_fp8:
                 row["Granularity"] = granularity_name
@@ -239,6 +245,7 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 "N": N,
                 "K": K,
                 "Dtype": dtype_name,
+                "Balance": "Y" if balance else "N",
             }
             if is_fp8:
                 row["Granularity"] = granularity_name

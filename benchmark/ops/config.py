@@ -162,139 +162,35 @@ MoEModelConfigs = {
         "num_experts": 256,
         "num_topk": 8,
     },
-    # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
-    "DeepSeek-V2": {
-        "n_routed_experts": 160,
-        "moe_intermediate_size": 1536,
-        "hidden_size": 5120,
-        # MLA attention config
-        "num_attention_heads": 128,
-        "num_key_value_heads": 128,
-        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
-        "head_dim_v": 128,
-        "seqlen": 4096,
-        "num_experts": 160,
-        "num_topk": 8,
-    },
-    # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite/file/view/master/config.json
-    "DeepSeek-V2-Lite": {
-        "n_routed_experts": 64,
-        "moe_intermediate_size": 1408,
-        "hidden_size": 2048,
-        # MLA attention config
-        "num_attention_heads": 16,
-        "num_key_value_heads": 16,
-        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
-        "head_dim_v": 128,
-        "seqlen": 4096,
-        "num_experts": 64,
-        "num_topk": 8,
-    },
-    # https://huggingface.co/xai-org/grok-2/blob/main/config.json
-    "Grok-2": {
-        "n_routed_experts": 8,
-        "moe_intermediate_size": 16384,
-        "hidden_size": 8192,
-        # Standard MHA
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "seqlen": 8192,
-        "num_experts": 8,
-        "num_topk": 2,
-    },
-    # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
-    "Qwen3-30B-A3B": {
-        "n_routed_experts": 128,
-        "moe_intermediate_size": 2048,
+    # https://huggingface.co/LiquidAI/LFM2-8B-A1B
+    "LFM2-8B-A1B": {
+        "n_routed_experts": 32,
+        "moe_intermediate_size": 1792,
         "hidden_size": 2048,
         # GQA attention config
         "num_attention_heads": 32,
-        "num_key_value_heads": 4,
-        "head_dim": 64,
-        "seqlen": 8192,
-        "num_experts": 128,
-        "num_topk": 8,
-    },
-    # https://modelscope.cn/models/Qwen/Qwen3-235B-A22B-Instruct-2507
-    "Qwen3-235B-A22B": {
-        "n_routed_experts": 128,
-        "moe_intermediate_size": 4096,
-        "hidden_size": 4096,
-        # GQA attention config
-        "num_attention_heads": 64,
-        "num_key_value_heads": 4,
-        "head_dim": 64,
-        "seqlen": 8192,
-        "num_experts": 128,
-        "num_topk": 8,
-    },
-    # https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json
-    "Mixtral-8x7B": {
-        "n_routed_experts": 8,  # num_local_experts
-        "moe_intermediate_size": 14336,
-        "hidden_size": 4096,
-        # GQA attention config
-        "num_attention_heads": 32,
         "num_key_value_heads": 8,
-        "head_dim": 128,
+        "head_dim": 128,  # kv_channels
         "seqlen": 4096,
-        "num_experts": 8,
-        "num_topk": 2,
+        "num_experts": 32,
+        "num_topk": 4,
+        "ep_size_list": [8, 1],  # EP=8→B=4, EP=1→B=32
     },
-    # https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/blob/main/config.json
-    "Mixtral-8x22B": {
-        "n_routed_experts": 8,  # num_local_experts
-        "moe_intermediate_size": 16384,
-        "hidden_size": 6144,
+    # /shared_nfs/kyle/test/Primus/examples/megatron/configs/MI300X/gpt_oss_20B-BF16-pretrain.yaml
+    "gpt_oss_20B": {
+        "n_routed_experts": 32,
+        "moe_intermediate_size": 2880,
+        "hidden_size": 2880,
         # GQA attention config
-        "num_attention_heads": 48,
+        "num_attention_heads": 64,
         "num_key_value_heads": 8,
-        "head_dim": 128,
-        "seqlen": 8192,
-        "num_experts": 8,
-        "num_topk": 2,
-    },
-    # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
-    "Kimi-K2": {
-        "n_routed_experts": 384,
-        "moe_intermediate_size": 2048,
-        "hidden_size": 7168,
-        # MLA attention config
-        "num_attention_heads": 64,
-        "num_key_value_heads": 64,
-        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
-        "head_dim_v": 128,
+        "head_dim_qk": 128,  # qk_head_dim
+        "head_dim_v": 64,    # kv_channels
         "seqlen": 4096,
-        "num_experts": 384,
-        "num_topk": 8,
+        "num_experts": 32,
+        "num_topk": 4,
+        "ep_size_list": [8, 1],  # EP=8→B=4, EP=1→B=32
     },
-    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_1T.yaml
-    # 1T total params, 44B active params
-    "MoE-1T": {
-        "n_routed_experts": 224,
-        "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
-        "hidden_size": 8192,
-        # GQA attention config
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,  # num_query_groups
-        "head_dim": 128,
-        "seqlen": 4096,
-        "num_experts": 224,
-        "num_topk": 8,
-    },
-    # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
-    # 2T total params, 80B active params
-    # "MoE-2T": {
-    #     "n_routed_experts": 448,
-    #     "moe_intermediate_size": 1920,  # moe_ffn_hidden_size
-    #     "hidden_size": 8192,
-    #     # GQA attention config
-    #     "num_attention_heads": 64,
-    #     "num_key_value_heads": 8,  # num_query_groups
-    #     "head_dim": 128,
-    #     "seqlen": 4096,
-    # },
 }
 
 ###############################################################################
@@ -304,8 +200,8 @@ MoEModelConfigs = {
 BATCH_SIZE_LIST = [1, 2, 4]
 
 # Grouped GEMM (MoE) configurations
-GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
-GROUPED_GEMM_EP_SIZE_LIST = [32, 16, 8]
+GROUPED_GEMM_M_SIZE_LIST = [2048, 4096]
+GROUPED_GEMM_EP_SIZE_LIST = [16, 8]
 
 ###############################################################################
 # Test Case Generators
@@ -340,16 +236,23 @@ def gen_gemm_test_cases(model_config):
     return gemm_shape_list
 
 
-def gen_grouped_gemm_group_lens(b, m, balance: bool = True):
-    """Generate group lengths for grouped GEMM."""
+def gen_grouped_gemm_group_lens(b, m, balance: bool = True, num_topk: int = None):
+    """Generate group lengths for grouped GEMM.
+
+    balance=True : all experts get exactly m tokens (uniform).
+    balance=False: simulate extreme topk MoE routing — only num_topk experts
+                   receive tokens (total/num_topk each), the rest get 0.
+                   Matches the skewed distribution observed in real training logs.
+    """
     if balance:
         return torch.full((b,), m, dtype=torch.int64)
     else:
-        dist = 0.2 + 0.8 * torch.rand(b)
-        dist /= dist.sum()
-        group_lens = (dist * b * m).to(torch.int64)
-        error = b * m - group_lens.sum()
-        group_lens[-1] += error
+        total = b * m
+        k = num_topk if (num_topk is not None and num_topk < b) else max(1, b // 8)
+        group_lens = torch.zeros(b, dtype=torch.int64)
+        hot = torch.randperm(b)[:k]
+        group_lens[hot] = total // k
+        group_lens[hot[0]] += total - group_lens.sum()  # fix rounding
         return group_lens
 
 
@@ -358,15 +261,20 @@ def _generate_moe_test_cases(
     n_routed_experts: int,
     moe_intermediate_size: int,
     hidden_size: int,
+    ep_size_list=None,
+    num_topk: int = None,
 ):
     """Generate MoE test cases for grouped GEMM benchmark."""
+    if ep_size_list is None:
+        ep_size_list = GROUPED_GEMM_EP_SIZE_LIST
+
     test_cases = []
     shapes_dict = {
         f"{name_prefix}-GateUP": (2 * moe_intermediate_size, hidden_size),
         f"{name_prefix}-Down": (hidden_size, moe_intermediate_size),
     }
 
-    for ep in GROUPED_GEMM_EP_SIZE_LIST:
+    for ep in ep_size_list:
         if n_routed_experts % ep != 0:
             continue
         B = n_routed_experts // ep
@@ -375,16 +283,19 @@ def _generate_moe_test_cases(
         for M in GROUPED_GEMM_M_SIZE_LIST:
             for name, (N, K) in shapes_dict.items():
                 for dtype in [torch.bfloat16]:
-                    test_cases.append(
-                        {
-                            "Case": name,
-                            "B": B,
-                            "M": M,
-                            "N": N,
-                            "K": K,
-                            "dtype": dtype,
-                        }
-                    )
+                    for balance in [True, False]:
+                        test_cases.append(
+                            {
+                                "Case": name,
+                                "B": B,
+                                "M": M,
+                                "N": N,
+                                "K": K,
+                                "dtype": dtype,
+                                "balance": balance,
+                                "num_topk": None if balance else num_topk,
+                            }
+                        )
     return test_cases
 
 
@@ -397,6 +308,8 @@ def gen_grouped_gemm_test_cases():
             n_routed_experts=config["n_routed_experts"],
             moe_intermediate_size=config["moe_intermediate_size"],
             hidden_size=config["hidden_size"],
+            ep_size_list=config.get("ep_size_list"),
+            num_topk=config.get("num_topk"),
         )
         all_test_cases.extend(test_cases)
     return all_test_cases
