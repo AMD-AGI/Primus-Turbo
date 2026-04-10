@@ -75,7 +75,7 @@ git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
 pip3 install -r requirements.txt
-pip3 install --no-build-isolation -e . -v
+
 
 # (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
 GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v

@@ -273,13 +273,23 @@ def _get_tk_gemm_fn(layout: str):
         return None
     return getattr(_tk_fp8_layouts, f"gemm_{layout}", None)
 
+
+def _tk_supports_shape(m: int, n: int, k: int) -> bool:
+    if _tk_fp8_layouts is None:
+        return False
+    supports_shape = getattr(_tk_fp8_layouts, "supports_shape", None)
+    if supports_shape is None:
+        return True
+    return bool(supports_shape(m, n, k))
+
 class GEMMFP8HipKittensBackend(KernelBackend):
-    """HipKittens bridge for tensorwise RCR/RRR/CRR paths."""
+    """HipKittens bridge for the tensorwise exact-shape FP8 path."""
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
     SUPPORTED_DTYPES = {
         (float8_e4m3, float8_e4m3, torch.bfloat16),
     }
+    SUPPORTED_LAYOUTS = {"rcr", "rrr", "crr"}
     BLK = 256
     BK = 128
 
@@ -345,6 +355,8 @@ class GEMMFP8HipKittensBackend(KernelBackend):
             return False
 
         layout, lhs, _, trans_lhs, rhs, _, trans_rhs = request
+        if layout not in GEMMFP8HipKittensBackend.SUPPORTED_LAYOUTS:
+            return False
         gemm_fn = _get_tk_gemm_fn(layout)
         if gemm_fn is None:
             return False
@@ -354,6 +366,7 @@ class GEMMFP8HipKittensBackend(KernelBackend):
             m % GEMMFP8HipKittensBackend.BLK == 0
             and n % GEMMFP8HipKittensBackend.BLK == 0
             and k % GEMMFP8HipKittensBackend.BK == 0
+            and _tk_supports_shape(m, n, k)
         )
 
     @staticmethod
