@@ -72,9 +72,12 @@ public:
     }
 
     void run(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-        if (pre_sync) {
-            PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
-        }
+        // Always synchronize before compute_args: group_lens_ptr is a device
+        // pointer read directly from the CPU.  Without this sync, writes made
+        // by upstream GPU kernels (e.g. the MoE router) may not be visible to
+        // the host, causing stale-zero reads and silent no-ops.
+        PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
+        (void) pre_sync; // kept for API compatibility
 
         // Check
         check(params);
@@ -138,11 +141,20 @@ private:
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
-        // TODO(xiaobochen): group_lens_ptr is device pointer, but host can access
-        // it directly on MI300/MI350. Need to investigate why this works.
+        // Copy group_lens from device to host via hipMemcpy so the ROCm runtime
+        // handles GPU cache flushing / coherence correctly.  Direct CPU
+        // dereference of a device pointer can read stale L2-cached data even
+        // after hipStreamSynchronize, causing valid_group_num=0 and skipping the
+        // algo-cache warm-up, which then triggers a 500+ ms heuristic search on
+        // the first *timed* iteration and produces catastrophically low TFLOPS.
+        group_lens_host_.resize(params.group_num);
+        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(group_lens_host_.data(), params.group_lens_ptr,
+                                         params.group_num * sizeof(int64_t),
+                                         hipMemcpyDeviceToHost));
+
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
-            valid_group_num += params.group_lens_ptr[i] > 0 ? 1 : 0;
+            valid_group_num += group_lens_host_[i] > 0 ? 1 : 0;
         }
 
         const char *a_ptr = static_cast<const char *>(params.a_ptr);
@@ -171,7 +183,7 @@ private:
 
         int write_idx = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
-            int64_t len = params.group_lens_ptr[i];
+            int64_t len = group_lens_host_[i];
 
             // For grad_b (transA), if the group len is 0, set the output memory to 0
             // c shape is [group_num, k, n], so each group's c size is k * n
@@ -243,6 +255,9 @@ private:
 
     // Gemm Pointers
     std::vector<GemmPtr> gemm_ptrs_;
+
+    // host-side copy of group_lens (avoids GPU cache coherence issues)
+    std::vector<int64_t> group_lens_host_;
 
     // workspace
     std::vector<void *> workspaces_;
