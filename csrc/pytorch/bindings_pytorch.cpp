@@ -158,12 +158,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "rendezvous_shmem",
-        [](const std::string &group_name, const std::vector<int64_t> &shape,
-           c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
-        py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
-
     // ********* DeepEP *********
     auto deep_ep_module =
         m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");

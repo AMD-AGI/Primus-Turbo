@@ -10,15 +10,16 @@ from typing import List
 import torch
 import torch.distributed.distributed_c10d as c10d
 import triton
-from hip import hip
 
+from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
+    get_hip_runtime_lib,
+    hipMemcpyKindEnum,
+)
+from primus_turbo.pytorch.core.symm_mem import get_symm_mem_workspace
 from primus_turbo.triton.async_tp.gemm_rs_kernel import (
     kernel_gemm_rs_producer_fuse_scatter,
 )
 from primus_turbo.triton.reduce.reduce_kernel import kernel_consumer_reduce_async_tp
-
-from .amd_symmetric_memory import get_amd_symm_mem_workspace
-from .common_ops import hip_check
 
 
 def matmul_fuse_scatter(a, b, scatter_bufs_ptr, rank, num_ranks, transpose_weight):
@@ -114,9 +115,9 @@ def _tiled_fused_matmul_scatter_out_impl(
     num_ranks = group.size()
 
     p2p_workspace_size_req = M * N * input.element_size()
-    symm_mem = get_amd_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    symm_mem = get_symm_mem_workspace(group, min_size=p2p_workspace_size_req)
     scatter_bufs = [symm_mem.get_buffer(i, [M, N], out_dtype) for i in range(num_ranks)]
-    scatter_bufs_ptr = get_scatter_buf_ptrs((t.data_ptr() for t in scatter_bufs))
+    scatter_bufs_ptr = get_scatter_buf_ptrs(tuple(t.data_ptr() for t in scatter_bufs))
 
     symm_mem.barrier()
     matmul_fuse_scatter(input, weight, scatter_bufs_ptr, rank, num_ranks, transpose_weight=False)
@@ -193,13 +194,14 @@ def _pipeline_matmul_scatter_out_impl(
     group = c10d._resolve_process_group(group_name)
     rank = group.rank()
     num_ranks = group.size()
+    lib = get_hip_runtime_lib()
     if enable_sdma:
-        hip_memcpy_kind = hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
+        hip_memcpy_kind = hipMemcpyKindEnum.hipMemcpyDeviceToDeviceNoCU
     else:
-        hip_memcpy_kind = hip.hipMemcpyKind.hipMemcpyDeviceToDevice
+        hip_memcpy_kind = hipMemcpyKindEnum.hipMemcpyDeviceToDevice
 
     p2p_workspace_size_req = M * N * input.element_size()
-    symm_mem = get_amd_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    symm_mem = get_symm_mem_workspace(group, min_size=p2p_workspace_size_req)
     scatter_bufs = [symm_mem.get_buffer(i, [M, N], out_dtype) for i in range(num_ranks)]
 
     m_per_rank = M // num_ranks
@@ -236,14 +238,13 @@ def _pipeline_matmul_scatter_out_impl(
             dst_ptr = scatter_bufs[remote_rank].data_ptr() + M_dst_start_pos * N * data_elem_size
 
             nbytes = m_per_chunk * N * data_elem_size
-            cp_res = hip.hipMemcpyAsync(
+            lib.hipMemcpyAsync(
                 dst_ptr,
                 src_ptr,
                 nbytes,
                 hip_memcpy_kind,
                 comm_stream.cuda_stream,
             )
-            hip_check(cp_res)
 
     for stream in stream_pool:
         current_stream.wait_stream(stream)

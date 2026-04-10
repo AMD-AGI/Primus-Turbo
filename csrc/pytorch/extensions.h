@@ -153,10 +153,6 @@ at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
                                at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
                                bool transB, bool transC, const std::string &granularity);
 
-std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
-                                            const std::vector<int64_t> &shape,
-                                            c10::ScalarType             dtype);
-
 //==================================================================
 //  Normalization
 //==================================================================
