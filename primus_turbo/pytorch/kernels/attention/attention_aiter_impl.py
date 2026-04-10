@@ -29,6 +29,13 @@ def _is_power_of_2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+def _normalize_sink_window(causal: bool, window_size_left: int, window_size_right: int) -> Tuple[int, int]:
+    """Map GPT-OSS style causal window_size=(left, 0) to the aiter Triton sentinel."""
+    if causal and window_size_right == 0:
+        return window_size_left, -1
+    return window_size_left, window_size_right
+
+
 # =============================================================================
 # Forward Backend
 # =============================================================================
@@ -94,6 +101,9 @@ class AttnFwdAiterBackend(KernelBackend):
                 max_seqlen_q = q.shape[1]
             if max_seqlen_k is None:
                 max_seqlen_k = k.shape[1]
+            window_size_left, window_size_right = _normalize_sink_window(
+                causal, window_size_left, window_size_right
+            )
             out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
                 q,
                 k,
@@ -213,9 +223,10 @@ class AttnBwdAiterBackend(KernelBackend):
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                True,  # USE_INT64_STRIDES
+                USE_INT64_STRIDES=True,
                 sink=sink,
                 dsink=dsink,
+                sliding_window=window_size_left if window_size_left >= 0 else 0,
             )
 
         return result
