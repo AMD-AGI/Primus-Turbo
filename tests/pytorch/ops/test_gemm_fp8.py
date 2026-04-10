@@ -204,11 +204,13 @@ def _run_gemm_fp8_deterministic_test(
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if format == Format.HYBRID and backend == BackendType.CK:
+        pytest.skip("CK backend does not yet support HYBRID format")
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -226,11 +228,13 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if format == Format.HYBRID and backend == BackendType.CK:
+        pytest.skip("CK backend does not yet support HYBRID format")
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -248,12 +252,14 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
 @pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("k", [256, 1024, 4096])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+    if format == Format.HYBRID and backend == BackendType.CK:
+        pytest.skip("CK backend does not yet support HYBRID format")
     _run_gemm_fp8_test(
         m=m,
         n=n,
