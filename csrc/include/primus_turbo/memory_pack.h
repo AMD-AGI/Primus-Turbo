@@ -11,8 +11,8 @@
 namespace primus_turbo {
 
 namespace pack_config {
-constexpr size_t MAX_PACKED_BYTE = 16;
-constexpr size_t MAX_PACKED_SIZE = 8;
+constexpr size_t MAX_PACKED_BYTE = 32;
+constexpr size_t MAX_PACKED_SIZE = 16;
 } // namespace pack_config
 
 template <typename T, int N> constexpr size_t valid_pack() {
