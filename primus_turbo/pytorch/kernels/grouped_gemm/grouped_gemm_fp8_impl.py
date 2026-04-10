@@ -311,7 +311,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 grouped GEMM (CPU-sync-free).
 
     Supports:
-      - TENSORWISE: per-tensor scaling
+      - TENSORWISE: per-tensor scaling, including HYBRID format
       - ROWWISE: per-row/per-col vector scaling
       - BLOCKWISE: block-wise scaling (2D B_scales per group)
     """
@@ -322,7 +322,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
@@ -428,7 +428,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward).
 
     Supports:
-      - TENSORWISE: per-tensor scaling
+      - TENSORWISE: per-tensor scaling, including HYBRID format
       - ROWWISE: per-row/per-col vector scaling
       - BLOCKWISE: 1D+1D block-wise scaling (TN/CRR layout)
     """
@@ -439,7 +439,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
