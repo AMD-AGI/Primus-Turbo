@@ -397,8 +397,8 @@ def test_grouped_gemm_fp8_blockwise_triton_deterministic(
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     if format == Format.HYBRID:
         # TODO(ruibin): Remove skip after CK backend supports hybrid format.
-        if backend != BackendType.HIPBLASLT or auto_tune:
-            pytest.skip("HYBRID format requires HIPBLASLt backend")
+        if backend not in (BackendType.HIPBLASLT, BackendType.TRITON) or auto_tune:
+            pytest.skip("HYBRID format requires HIPBLASLT or TRITON backend without auto_tune")
 
     # FIXME(ruibin): CK backend has numerical issues.
     if backend == BackendType.CK or backend == None:
@@ -434,12 +434,14 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", [False])
 @pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False])
 def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
+    if format == Format.HYBRID and backend == BackendType.CK:
+        pytest.skip("CK backend does not yet support HYBRID format")
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
@@ -460,7 +462,7 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance,
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
@@ -469,6 +471,8 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance,
 def test_grouped_gemm_fp8_blockwise(
     B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend, auto_tune
 ):
+    if format == Format.HYBRID and backend == BackendType.CK:
+        pytest.skip("CK backend does not yet support HYBRID format")
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
