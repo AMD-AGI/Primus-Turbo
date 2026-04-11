@@ -114,8 +114,12 @@ inline hipDataType FFIDataTypeToHIPDataType(const ffi::DataType &data_type) {
         return HIP_R_64I;
     case ffi::BF16:
         return HIP_R_16BF;
+    case ffi::F8E4M3FN:
+        return HIP_R_8F_E4M3;
     case ffi::F8E4M3FNUZ:
         return HIP_R_8F_E4M3_FNUZ;
+    case ffi::F8E5M2:
+        return HIP_R_8F_E5M2;
     case ffi::F8E5M2FNUZ:
         return HIP_R_8F_E5M2_FNUZ;
     default:

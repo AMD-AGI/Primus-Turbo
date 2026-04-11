@@ -10,19 +10,19 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed.distributed_c10d as c10d
-from hip import hip
 from torch.distributed._symmetric_memory import (
     _check_and_verify_fp8_all_gather_scale_mode,
     _ScaleMode,
 )
 
-from .amd_symmetric_memory import get_amd_symm_mem_workspace
-from .common_ops import (
-    hip_check,
-    ipc_create_tensor_lists,
-    put_signal_rel_sys,
-    wait_signal_acq_sys,
+from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
+    HIPRuntimeLibrary,
+    get_hip_runtime_lib,
+    hipMemcpyKindEnum,
 )
+from primus_turbo.pytorch.core.symm_mem import get_symm_mem_workspace
+
+from .common_ops import put_signal_rel_sys, wait_signal_acq_sys
 
 
 @lru_cache
@@ -66,15 +66,6 @@ def get_comm_event():
     return comm_event
 
 
-@lru_cache
-def get_barriers_tensors(group_name: str, num_splits: int) -> List[torch.Tensor]:
-    group = c10d._resolve_process_group(group_name)
-    m_chunk_num = group.size() * num_splits
-    barriers = ipc_create_tensor_lists(group, [m_chunk_num], torch.int32)
-    barriers[group.rank()].fill_(0)
-    return barriers
-
-
 def pipelined_all_gather_copy_send(
     dst_ptrs: list[list[int]],
     src_ptrs: list[list[int]],
@@ -84,6 +75,7 @@ def pipelined_all_gather_copy_send(
     rank,
     num_ranks,
     comm_kind_type,
+    lib: HIPRuntimeLibrary,
 ):
 
     num_ag = len(send_n_bytes)
@@ -98,14 +90,12 @@ def pipelined_all_gather_copy_send(
         ag_stream = next(stream_generator)
 
         for i in range(num_ag):
-            hip_check(
-                hip.hipMemcpyAsync(
-                    dst_ptrs[dst_rank][i] + dst_offset * send_n_bytes[i],
-                    src_ptrs[i],
-                    send_n_bytes[i],
-                    comm_kind_type,
-                    ag_stream.cuda_stream,
-                )
+            lib.hipMemcpyAsync(
+                dst_ptrs[dst_rank][i] + dst_offset * send_n_bytes[i],
+                src_ptrs[i],
+                send_n_bytes[i],
+                comm_kind_type,
+                ag_stream.cuda_stream,
             )
 
             dst_ptrs[dst_rank][i] += send_n_bytes[i] * (num_ranks - 1)
@@ -125,14 +115,25 @@ def pipelined_all_gather_copy_send(
     return _CustomHandle
 
 
-@lru_cache
+_symm_shard_buf_cache: dict = {}
+
+
 def get_symm_shard_buf_and_chunk(
     shard_info: Tuple[Tuple[torch.Size, torch.dtype]],
     group_name: int,
     p2p_workspace_size_req: int,
     num_splits: int,
 ):
-    symm_mem = get_amd_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    key = (shard_info, group_name, p2p_workspace_size_req, num_splits)
+    cached = _symm_shard_buf_cache.get(key)
+    if cached is not None and not cached[0].is_destroyed:
+        return cached
+
+    group = c10d._resolve_process_group(group_name)
+    signal_pad_size_req = num_splits * group.size() * 4
+    symm_mem = get_symm_mem_workspace(
+        group, min_size=p2p_workspace_size_req, min_signal_pad_size=signal_pad_size_req
+    )
     local_shard_buf_chunk = [[] for _ in range(num_splits)]
     shard_buf = [[] for _ in range(symm_mem.world_size)]
     offset = 0
@@ -151,7 +152,9 @@ def get_symm_shard_buf_and_chunk(
 
         offset += buf.nbytes
 
-    return symm_mem, shard_buf, local_shard_buf_chunk
+    result = (symm_mem, shard_buf, local_shard_buf_chunk)
+    _symm_shard_buf_cache[key] = result
+    return result
 
 
 def _pipelined_multi_all_gather_and_consume(
@@ -168,10 +171,11 @@ def _pipelined_multi_all_gather_and_consume(
     enable_sdma: bool = False,
     skip_copy_local_ag_out: bool = False,
 ) -> None:
+    lib = get_hip_runtime_lib()
     comm_kind_type = (
-        hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
+        hipMemcpyKindEnum.hipMemcpyDeviceToDeviceNoCU
         if enable_sdma
-        else hip.hipMemcpyKind.hipMemcpyDeviceToDevice
+        else hipMemcpyKindEnum.hipMemcpyDeviceToDevice
     )
     group = c10d._resolve_process_group(group_name)
     rank = group.rank()
@@ -180,15 +184,14 @@ def _pipelined_multi_all_gather_and_consume(
     for t in shard:
         p2p_workspace_size_req += t.nbytes * (num_ranks - 1)
 
-    shard_info = (None if s is None else (s.shape, s.dtype) for s in shard)
+    shard_info = tuple(None if s is None else (s.shape, s.dtype) for s in shard)
 
-    _, shard_buf, local_shard_buf_chunk = get_symm_shard_buf_and_chunk(
+    symm_mem, shard_buf, local_shard_buf_chunk = get_symm_shard_buf_and_chunk(
         shard_info, group_name, p2p_workspace_size_req, num_splits
     )
     shard_buf_ptrs = [[buf.data_ptr() for buf in bufs] for bufs in shard_buf]
     shard_stride = [s.nbytes // num_splits for s in shard]
-    barrier_tensors = get_barriers_tensors(group_name, num_splits)
-    barrier_ptrs = [t.data_ptr() for t in barrier_tensors]
+    barrier_ptrs = list(symm_mem.signal_pad_ptrs)
     cpu_indices = get_cpu_split_indices(group_name, num_splits)
     stream_pool = gemm_stream_pool + comm_stream_pool + copy_stream_pool
     gemm_stream_generator = cycle(gemm_stream_pool)
@@ -225,6 +228,7 @@ def _pipelined_multi_all_gather_and_consume(
             rank=rank,
             num_ranks=num_ranks,
             comm_kind_type=comm_kind_type,
+            lib=lib,
         )
 
         with gemm_stream:
@@ -239,14 +243,12 @@ def _pipelined_multi_all_gather_and_consume(
                         dst_ptr = ag_ptr + idx * ag_stride
                         src_ptr = ptr + i * chunk_size
 
-                        hip_check(
-                            hip.hipMemcpyAsync(
-                                dst_ptr,
-                                src_ptr,
-                                chunk_size,
-                                hip.hipMemcpyKind.hipMemcpyDeviceToDevice,
-                                copy_stream.cuda_stream,
-                            )
+                        lib.hipMemcpyAsync(
+                            dst_ptr,
+                            src_ptr,
+                            chunk_size,
+                            hipMemcpyKindEnum.hipMemcpyDeviceToDevice,
+                            copy_stream.cuda_stream,
                         )
 
             tmp_outputs = shard_consumer(local_shard_buf_chunk[step])
@@ -258,14 +260,12 @@ def _pipelined_multi_all_gather_and_consume(
                 for i, idx in enumerate(cpu_indices[step]):
                     dst_ptr = o_ptr + idx * o_stride
                     src_ptr = t_o.data_ptr() + i * chunk_out_stride
-                    hip_check(
-                        hip.hipMemcpyAsync(
-                            dst_ptr,
-                            src_ptr,
-                            chunk_out_stride,
-                            hip.hipMemcpyKind.hipMemcpyDeviceToDevice,
-                            copy_stream.cuda_stream,
-                        )
+                    lib.hipMemcpyAsync(
+                        dst_ptr,
+                        src_ptr,
+                        chunk_out_stride,
+                        hipMemcpyKindEnum.hipMemcpyDeviceToDevice,
+                        copy_stream.cuda_stream,
                     )
 
         barrier_ptrs[rank] += num_ranks * 4
@@ -278,14 +278,12 @@ def _pipelined_multi_all_gather_and_consume(
                     idx = rank * num_splits + i
                     dst_ptr = ag_ptr + ag_stride * idx
                     src_ptr = s.data_ptr() + i * shard_stride[j]
-                    hip_check(
-                        hip.hipMemcpyAsync(
-                            dst_ptr,
-                            src_ptr,
-                            shard_stride[j],
-                            hip.hipMemcpyKind.hipMemcpyDeviceToDevice,
-                            copy_stream.cuda_stream,
-                        )
+                    lib.hipMemcpyAsync(
+                        dst_ptr,
+                        src_ptr,
+                        shard_stride[j],
+                        hipMemcpyKindEnum.hipMemcpyDeviceToDevice,
+                        copy_stream.cuda_stream,
                     )
 
     for st in stream_pool:

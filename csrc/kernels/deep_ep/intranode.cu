@@ -175,11 +175,11 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, bool kUseCheapFence>
+template <int kNumRanks, int kNumThreads, bool kUseCheapFence, typename topk_idx_t>
 __global__ void __launch_bounds__(kNumThreads, 1)
-    dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *recv_topk_idx,
+    dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
-             const float *x_scales, const int64_t *topk_idx, const float *topk_weights,
+             const float *x_scales, const topk_idx_t *topk_idx, const float *topk_weights,
              const bool *is_token_in_rank, const int *channel_prefix_matrix, int num_tokens,
              int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
              int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
@@ -236,8 +236,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens,
                                                channel_rank_offset * num_recv_buffer_tokens);
     auto channel_topk_idx_buffers =
-        Buffer<int64_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk,
-                        channel_rank_offset * num_recv_buffer_tokens * num_topk);
+        Buffer<topk_idx_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk,
+                           channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_topk_weights_buffers =
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk,
                       channel_rank_offset * num_recv_buffer_tokens * num_topk);
@@ -518,9 +518,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     }
 }
 
-void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *recv_topk_idx,
+template <typename topk_idx_t>
+void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
               float *recv_topk_weights, int *recv_channel_offset, int *send_head, const void *x,
-              const float *x_scales, const int64_t *topk_idx, const float *topk_weights,
+              const float *x_scales, const topk_idx_t *topk_idx, const float *topk_weights,
               const bool *is_token_in_rank, const int *channel_prefix_matrix, int num_tokens,
               int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
               int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
@@ -536,8 +537,8 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
-        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true>                  \
-                                             : dispatch<ranks, kNumThreads, false>;                \
+        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true, topk_idx_t>      \
+                                             : dispatch<ranks, kNumThreads, false, topk_idx_t>;    \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
             recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
@@ -975,6 +976,15 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
 }
+
+#define INSTANTIATE_INTRANODE_DISPATCH(topk_idx_t)                                                 \
+    template void dispatch<topk_idx_t>(                                                            \
+        void *, float *, int *, topk_idx_t *, float *, int *, int *, const void *, const float *,  \
+        const topk_idx_t *, const float *, const bool *, const int *, int, int, int, int, int,     \
+        int, int, int, void **, int, int, hipStream_t, int, int, int);
+INSTANTIATE_INTRANODE_DISPATCH(int32_t)
+INSTANTIATE_INTRANODE_DISPATCH(int64_t)
+#undef INSTANTIATE_INTRANODE_DISPATCH
 
 } // namespace intranode
 

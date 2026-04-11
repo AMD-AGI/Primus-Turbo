@@ -5,8 +5,8 @@ namespace primus_turbo::deep_ep {
 
 namespace layout {
 
-template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
-__global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
+template <typename topk_idx_t, int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
+__global__ void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                                     int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                                     bool *is_token_in_rank, int num_tokens, int num_topk,
                                     int num_ranks, int num_experts) {
@@ -119,7 +119,8 @@ __global__ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per
     }
 }
 
-void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
+template <typename topk_idx_t>
+void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                          int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                          bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
                          int num_experts, hipStream_t stream) {
@@ -131,10 +132,17 @@ void get_dispatch_layout(const int64_t *topk_idx, int *num_tokens_per_rank,
 
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     LAUNCH_KERNEL_NON_COOPERATIVE(
-        &cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>), topk_idx,
-        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
-        num_tokens, num_topk, num_ranks, num_experts);
+        &cfg, (get_dispatch_layout<topk_idx_t, kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
+        topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
+        is_token_in_rank, num_tokens, num_topk, num_ranks, num_experts);
 }
+
+#define INSTANTIATE_GET_DISPATCH_LAYOUT(topk_idx_t)                                                \
+    template void get_dispatch_layout<topk_idx_t>(const topk_idx_t *, int *, int *, int *, bool *, \
+                                                  int, int, int, int, hipStream_t);
+INSTANTIATE_GET_DISPATCH_LAYOUT(int32_t)
+INSTANTIATE_GET_DISPATCH_LAYOUT(int64_t)
+#undef INSTANTIATE_GET_DISPATCH_LAYOUT
 
 } // namespace layout
 

@@ -34,6 +34,11 @@ using uint32 = uint32_t;
 using uint16 = uint16_t;
 using uint8  = uint8_t;
 
+// Vector types (GCC vector extension, for inline asm / builtins)
+using float32x4 = __attribute__((vector_size(16))) float;
+using int32x4   = __attribute__((vector_size(16))) int;
+using int32x8   = __attribute__((vector_size(32))) int;
+
 } // namespace dtype
 
 } // namespace primus_turbo

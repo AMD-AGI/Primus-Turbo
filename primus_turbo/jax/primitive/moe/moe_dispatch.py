@@ -69,7 +69,7 @@ def _moe_dispatch_abstract_eval(
     num_channels = num_sms // 2
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_worst_tokens)
     recv_x = ShapedArray((num_worst_tokens, hidden_size), x.dtype)
-    recv_topk_idx = ShapedArray((num_worst_tokens, num_topk), jnp.int64)
+    recv_topk_idx = ShapedArray((num_worst_tokens, num_topk), jnp.int32)
     recv_topk_weights = ShapedArray((num_worst_tokens, num_topk), jnp.float32)
     is_token_in_rank = ShapedArray((num_tokens, num_ranks), jnp.bool_)
     num_tokens_per_rank = ShapedArray((num_ranks,), jnp.int32)
@@ -112,7 +112,7 @@ def _moe_cached_dispatch_abstract_eval(
     num_max_rdma_chunked_recv_tokens: int,
 ):
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
-    _, hidden_size = x.shape
+    num_tokens, hidden_size = x.shape
     num_channels = num_sms // 2
 
     num_ranks = jax.local_device_count()
@@ -121,8 +121,8 @@ def _moe_cached_dispatch_abstract_eval(
     recv_x = ShapedArray((num_recv_tokens, hidden_size), x.dtype)
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_recv_tokens)
     recv_channel_prefix_matrix = ShapedArray((num_ranks, num_channels), jnp.int32)
-    recv_src_idx = ShapedArray((num_ranks, num_channels), jnp.int32)
-    send_head = ShapedArray((num_ranks, num_channels), jnp.int32)
+    recv_src_idx = ShapedArray((num_recv_tokens,), jnp.int32)
+    send_head = ShapedArray((num_tokens, num_ranks), jnp.int32)
     return recv_x, recv_x_scales, recv_channel_prefix_matrix, recv_src_idx, send_head
 
 

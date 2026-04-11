@@ -75,6 +75,28 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
                                             const bool shuffle_scale = false,
                                             const bool shuffle_out   = false);
 
+std::vector<at::Tensor>
+quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
+                    const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
+                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp8_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
+    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+    const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
+                                       const int64_t axis, const bool use_2d_block,
+                                       const bool shuffle_scale = false,
+                                       const bool shuffle_out   = false);
+
+std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
+                                            const int64_t axis, const bool use_2d_block,
+                                            const bool shuffle_scale = false,
+                                            const bool shuffle_out   = false);
+
 //==================================================================
 //  Shuffle
 //==================================================================
@@ -123,9 +145,13 @@ at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                             at::Tensor &b_scales, const bool transA, const bool transB,
                             at::ScalarType out_dtype, const std::string &granularity);
 
-std::vector<torch::Tensor> rendezvous_shmem(const std::string          &group_name,
-                                            const std::vector<int64_t> &shape,
-                                            c10::ScalarType             dtype);
+at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
+                          const at::ScalarType out_dtype, bool transA, bool transB, bool transC,
+                          const std::string &granularity);
+
+at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
+                               bool transB, bool transC, const std::string &granularity);
 
 //==================================================================
 //  Normalization

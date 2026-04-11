@@ -4,22 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import torch
 import triton
 import triton.language as tl
-from hip import hip
-
-import primus_turbo
-
-
-def hip_check(call_result):
-    err = call_result[0]
-    result = call_result[1:]
-    if len(result) == 1:
-        result = result[0]
-    if isinstance(err, hip.hipError_t) and err != hip.hipError_t.hipSuccess:
-        raise RuntimeError(str(err))
-    return result
 
 
 @triton.jit
@@ -39,32 +25,3 @@ def put_signal_rel_sys(barrier_ptr):
         pass
 
     tl.debug_barrier()
-
-
-@triton.jit
-def barrier_all_ipc(rank, num_ranks, comm_buf_base_ptrs):
-    for i in range(num_ranks):
-        remote_base_ptr = tl.load(comm_buf_base_ptrs + i).to(tl.pointer_type(tl.int32))
-        while tl.atomic_cas(remote_base_ptr + rank, 0, 1, scope="sys", sem="release") != 0:
-            pass
-
-    for i in range(num_ranks):
-        local_base_ptr = tl.load(comm_buf_base_ptrs + rank).to(tl.pointer_type(tl.int32))
-        while tl.atomic_cas(local_base_ptr + i, 1, 0, scope="sys", sem="acquire") != 1:
-            pass
-
-    tl.debug_barrier()
-
-
-def barrier_all_on_stream(
-    rank,
-    num_ranks,
-    sync_bufs_ptr,
-    stream,
-):
-    with torch.cuda.stream(stream):
-        barrier_all_ipc[(1,)](rank, num_ranks, sync_bufs_ptr)
-
-
-def ipc_create_tensor_lists(group: torch.distributed.ProcessGroup, shape: list[int], dtype: torch.dtype):
-    return primus_turbo.pytorch._C.rendezvous_shmem(group.group_name, shape, dtype)

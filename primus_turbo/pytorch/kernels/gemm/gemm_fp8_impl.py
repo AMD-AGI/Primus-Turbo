@@ -265,7 +265,58 @@ class GEMMFP8TritonBackend(KernelBackend):
             raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")
 
 
+class GEMMFP8TurboBackend(KernelBackend):
+    """Hand-tuned MXFP8 GEMM kernel for GFX950 (MI350/MI355).
+
+    Supports MX_BLOCKWISE only. NT layout. Tile 256x256x128.
+    Shape constraints: m,n % 16 == 0, k % 128 == 0, k >= 384.
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        supported = True
+        supported &= granularity in GEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TurboBackend.SUPPORTED_DTYPES
+        supported &= not trans_a and trans_b and not trans_c
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        supported &= m % 16 == 0 and n % 16 == 0 and k % 128 == 0 and k >= 384
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        return torch.ops.primus_turbo_cpp_extension.turbo_gemm_fp8(
+            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+        )
+
+
 _GEMM_FP8_BACKENDS = {
+    BackendType.TURBO: BackendEntry(GEMMFP8TurboBackend),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP8HipBLASLtBackend),
     BackendType.CK: BackendEntry(GEMMFP8CKBackend),
     BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),

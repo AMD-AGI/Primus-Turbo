@@ -44,9 +44,9 @@ PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffle_scale_index(int row, int
 }
 
 /*
- * FP4 Data Shuffle Index Computation
+ *  Data Shuffle Index Computation
  * -----------------------------------
- * Computes the shuffled memory index for FP4 quantized data.
+ * Computes the shuffled memory index for MXFP4/MXFP8 quantized data.
  * This layout is optimized for GEMM performance by improving cache locality.
  *
  * Structure:
@@ -54,8 +54,16 @@ PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffle_scale_index(int row, int
  *   - Each K=32 block is split into two K=16 sub-blocks
  *   - Data is stored in (BN=16, BK=32) tiles
  */
-PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffled_fp4_index_2bytes(int row, int col,
-                                                                          int K_packed) {
+template <typename DType>
+PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffled_index(int row, int col, int K_packed) {
+    static_assert(std::is_same_v<DType, dtype::float4x2_e2m1> ||
+                      std::is_same_v<DType, dtype::float8_e4m3> ||
+                      std::is_same_v<DType, dtype::float8_e5m2>,
+                  "compute_shuffled_index: unsupported DType");
+
+    constexpr int k_elem_stride =
+        std::is_same_v<DType, dtype::float4x2_e2m1> ? MXFP4_SHUFFLE_K_ELEM : MXFP8_SHUFFLE_K_ELEM;
+
     int N_block      = row >> 4;          // row // 16
     int row_in_block = row & 15;          // row % 16
     int K_block      = col >> 5;          // col // 32
@@ -64,6 +72,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffled_fp4_index_2bytes(int ro
     int k_elem       = col_in_block & 15; // Position within sub-block
 
     return N_block * (K_packed << 4) + K_block * 512 + sub_block * 256 +
-           row_in_block * MXFP4_SHUFFLE_K_ELEM + k_elem;
+           row_in_block * k_elem_stride + k_elem;
 }
+
 } // namespace primus_turbo

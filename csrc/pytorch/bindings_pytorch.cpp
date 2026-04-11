@@ -23,6 +23,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
           "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
+    m.def(
+        "turbo_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
+
     // ********* Quantization *********
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
           "Tensor[]");
@@ -41,6 +45,14 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp4(Tensor input, ScalarType dest_dtype, int axis, "
           "bool use_2d_block, bool use_sr, bool use_rht, "
           "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+
+    // ********* MXFP8 Quantization *********
+    m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool colwise_use_2d_block, "
+          "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
+          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
+    m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
+          "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
 
     // ********* Shuffle *********
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
@@ -75,6 +87,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);
     m.impl("hipblaslt_gemm_fp4", hipblaslt_gemm_fp4);
     m.impl("ck_gemm_fp8", ck_gemm_fp8);
+    m.impl("turbo_gemm_fp8", turbo_gemm_fp8);
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
@@ -83,6 +96,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
+
+    // ********* MXFP8 Quantization *********
+    m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
+    m.impl("quantize_mxfp8", quantize_mxfp8);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl);
@@ -107,6 +124,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("hipblaslt_gemm", hipblaslt_gemm_meta);
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8_meta);
     m.impl("ck_gemm_fp8", ck_gemm_fp8_meta);
+    m.impl("turbo_gemm_fp8", turbo_gemm_fp8_meta);
 
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
@@ -116,6 +134,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
+
+    // ********* MXFP8 Quantization *********
+    m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
+    m.impl("quantize_mxfp8", quantize_mxfp8_meta);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
@@ -136,12 +158,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "rendezvous_shmem",
-        [](const std::string &group_name, const std::vector<int64_t> &shape,
-           c10::ScalarType dtype) { return rendezvous_shmem(group_name, shape, dtype); },
-        py::arg("group_name"), py::arg("shape"), py::arg("dtype"));
-
     // ********* DeepEP *********
     auto deep_ep_module =
         m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");

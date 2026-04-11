@@ -394,9 +394,7 @@ if __name__ == "__main__":
 
     # Entry points and Install Requires
     entry_points = {}
-    install_requires = [
-        "hip-python",
-    ]
+    install_requires = []
 
     # Conditionally add aiter if torch_ext is being built and aiter is not already installed
     if torch_ext is not None and not is_package_installed("aiter"):
