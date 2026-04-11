@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
 from typing import Optional
 
 import torch
@@ -23,6 +22,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
 )
@@ -31,12 +31,6 @@ __all__ = ["flash_attn_func", "flash_attn_fp8_func"]
 
 
 class AiterFlashAttnFunc(torch.autograd.Function):
-    @staticmethod
-    def _resolve_is_v3_atomic_fp32(is_v3_atomic_fp32: Optional[bool]) -> bool:
-        if is_v3_atomic_fp32 in [True, False]:
-            return is_v3_atomic_fp32
-        val = os.getenv("PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32", "1")
-        return val == "1" if val in ("0", "1") else True
 
     @staticmethod
     def forward(
@@ -54,7 +48,6 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = None,
         how_v3_bf16_cvt: Optional[int] = 1,
         sink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
@@ -65,7 +58,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         )
         # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
         # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
-        is_v3_atomic_fp32 = AiterFlashAttnFunc._resolve_is_v3_atomic_fp32(is_v3_atomic_fp32)
+        is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
 
         # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
         if get_device_compute_capability() >= (9, 5):
@@ -317,6 +310,9 @@ def flash_attn_func(
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
 ):
+    _SUPPORTED_QKV_FORMATS = ("bshd", "sbhd")
+    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
+
     return AiterFlashAttnFunc.apply(
         q,
         k,
@@ -331,7 +327,6 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        None,  # is_v3_atomic_fp32
         1,  # how_v3_bf16_cvt
         sink,
         qkv_format,
@@ -352,7 +347,11 @@ def flash_attn_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
+    qkv_format: Optional[str] = "bshd",
 ):
+    _SUPPORTED_QKV_FORMATS = ("bshd",)
+    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
+
     # Default config: blockwise with block_size=64
     if fp8_config is None:
         fp8_config = Float8QuantConfig(

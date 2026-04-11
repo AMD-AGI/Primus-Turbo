@@ -64,10 +64,14 @@ def _update_out_and_lse(
     lse: torch.Tensor,
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
+    is_sbhd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     block_out = block_out.to(torch.float32)
-    block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+    if is_sbhd:
+        block_lse = block_lse.permute(2, 0, 1).unsqueeze(dim=-1)
+    else:
+        block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
 
     # new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
     # torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
@@ -84,19 +88,25 @@ def update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
     slice_=None,
+    is_sbhd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         if slice_ is not None:
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
 
         out = block_out.to(torch.float32)
-        lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        if is_sbhd:
+            lse = block_lse.permute(2, 0, 1).unsqueeze(dim=-1)
+        else:
+            lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
-        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse)
+        slice_out, slice_lse = _update_out_and_lse(
+            slice_out, slice_lse, block_out, block_lse, is_sbhd=is_sbhd
+        )
         out[slice_], lse[slice_] = slice_out, slice_lse
     else:
-        out, lse = _update_out_and_lse(out, lse, block_out, block_lse)
+        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, is_sbhd=is_sbhd)
     return out, lse
 
 
@@ -112,6 +122,10 @@ def ring_attn_fwd(
         return attn_func(q, k, v, **kwargs)
 
     arg_causal = kwargs.pop("causal", False)
+    qkv_format = kwargs.get("qkv_format", "bshd")
+    if qkv_format not in ("bshd", "sbhd"):
+        raise ValueError(f"Unsupported qkv format: {qkv_format}")
+    is_sbhd = qkv_format == "sbhd"
     comm = RingComm(process_group)
 
     out = None
@@ -134,7 +148,7 @@ def ring_attn_fwd(
                 **kwargs,
             )
             output_dtype = block_out.dtype
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse, is_sbhd=is_sbhd)
 
         if step + 1 != comm.world_size:
             comm.wait()
@@ -142,7 +156,10 @@ def ring_attn_fwd(
             v = next_v
 
     out = out.to(output_dtype)
-    lse = lse.squeeze(dim=-1).transpose(1, 2)
+    if is_sbhd:
+        lse = lse.squeeze(dim=-1).permute(1, 2, 0)
+    else:
+        lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse, *results
 
 
@@ -157,6 +174,10 @@ def ring_attn_bwd(
     softmax_lse,
     **kwargs,
 ):
+    qkv_format = kwargs.get("qkv_format", "bshd")
+    if qkv_format not in ("bshd", "sbhd"):
+        raise ValueError(f"Unsupported qkv format: {qkv_format}")
+
     block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     block_dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     block_dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)

@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
@@ -22,6 +23,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
 )
@@ -54,22 +56,36 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         is_grad_enabled,
         ulysses_group,
         ring_group,
-        is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
+        qkv_format: Optional[str] = "bshd",
     ):
+        # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
+        # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
+        is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
+
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        if get_device_compute_capability() >= (9, 5):
+            how_v3_bf16_cvt = 0
+
         assert bias is None
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
         n = ulysses_group.size()
-        b, s, h_q, d_qk = q.shape
-        _, _, h_kv, d_v = v.shape
+        if qkv_format == "bshd":
+            b, s, h_q, d_qk = q.shape
+            _, _, h_kv, d_v = v.shape
+            seq_dim = 1
+        elif qkv_format == "sbhd":
+            s, b, h_q, d_qk = q.shape
+            _, _, h_kv, d_v = v.shape
+            seq_dim = 0
+        else:
+            raise ValueError(f"Unsupported qkv format: {qkv_format}")
         s = s * n
         assert h_q % n == 0
         assert h_kv % n == 0
-        # bshd only
-        seq_dim = 1
         attn_helper = get_attention_cp_a2a_helper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n)
 
         qkv = attn_helper.combine_qkv_before_a2a(q, k, v)
@@ -100,6 +116,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
+            qkv_format=qkv_format,
         )
 
         if is_grad:
@@ -120,6 +137,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             ctx.ulysses_group = ulysses_group
             ctx.ring_group = ring_group
             ctx.seq_dim = seq_dim
+            ctx.qkv_format = qkv_format
 
         output_local_heads = out_padded[..., :d_v]
         output_local_heads = attn_helper.reshape_o_before_a2a(output_local_heads)
@@ -189,6 +207,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            qkv_format=ctx.qkv_format,
         )
 
         dq = dq[..., :d_qk]  # We could have padded the head dimension
@@ -209,6 +228,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             None,
             None,
             dbias,
+            None,
             None,
             None,
             None,
@@ -421,10 +441,14 @@ def flash_attn_usp_func(
     return_attn_probs=False,
     ulysses_group=None,
     ring_group=None,
+    qkv_format: Optional[str] = "bshd",
 ):
+    _SUPPORTED_QKV_FORMATS = ("bshd", "sbhd")
     assert (
         ulysses_group and ring_group
     ), "ulysses_group and ring_group must be set while calling usp attention"
+    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
+
     return AttentionCKFunctionCPA2A.apply(
         q,
         k,
@@ -441,6 +465,8 @@ def flash_attn_usp_func(
         torch.is_grad_enabled(),
         ulysses_group,
         ring_group,
+        1,
+        qkv_format,
     )
 
 
@@ -460,10 +486,13 @@ def flash_attn_fp8_usp_func(
     fp8_config: Optional[Float8QuantConfig] = None,
     ulysses_group=None,
     ring_group=None,
+    qkv_format: Optional[str] = "bshd",
 ):
+    _SUPPORTED_QKV_FORMATS = ("bshd",)
     assert (
         ulysses_group and ring_group
     ), "ulysses_group and ring_group must be set while calling usp attention"
+    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
