@@ -237,7 +237,6 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 

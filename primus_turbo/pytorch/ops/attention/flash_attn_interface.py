@@ -185,7 +185,6 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
-            None,
             dsink,
             None,
         )

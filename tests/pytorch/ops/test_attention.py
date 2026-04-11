@@ -63,6 +63,9 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
     if not enable_sink and window_size_left != -1:
         pytest.skip("window_size_left only applies when sink is enabled")
 
+    if enable_sink and qkv_format == "sbhd":
+        pytest.skip("Sink attention is not supported for sbhd format")
+
     # Sink attention constraints / runtime control (skip early to avoid big allocations).
     if enable_sink:
         # Triton kernel limitation for sink: requires same qk/v head dim and head dim > 32
