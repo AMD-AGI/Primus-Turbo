@@ -13,28 +13,47 @@
 
 namespace primus_turbo {
 
+static constexpr size_t kMaxNumStreams = 8;
+
+// Per-expert token threshold: above this, individual GEMMs are large enough
+// to saturate the GPU, so serial dispatch avoids resource contention.
+// Below this, GEMMs are small and benefit from concurrent multi-stream
+// dispatch to overlap kernel launch overhead.
+static constexpr size_t kSerialThreshold = 512;
+
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
-    // Single-stream dispatch: only one workspace needed.
-    return get_hipblaslt_workspace_size_in_byte();
+    // Multi-stream path needs one workspace per stream.
+    return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
 }
 
 class HipblasltGroupedGemm {
 public:
     HipblasltGroupedGemm() {
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handle_));
+        PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event_, hipEventDisableTiming));
+
+        for (size_t i = 0; i < kMaxNumStreams; ++i) {
+            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&par_handles_[i]));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipStreamCreateWithPriority(&par_streams_[i], hipStreamNonBlocking, -1));
+            PRIMUS_TURBO_CHECK_HIP(
+                hipEventCreateWithFlags(&par_events_[i], hipEventDisableTiming));
+        }
     }
 
     ~HipblasltGroupedGemm() {
-        if (handle_) {
-            (void)hipblasLtDestroy(handle_);
+        if (sync_event_) (void)hipEventDestroy(sync_event_);
+        for (size_t i = 0; i < kMaxNumStreams; ++i) {
+            if (par_streams_[i]) (void)hipStreamDestroy(par_streams_[i]);
+            if (par_handles_[i]) (void)hipblasLtDestroy(par_handles_[i]);
+            if (par_events_[i])  (void)hipEventDestroy(par_events_[i]);
         }
+        if (handle_) (void)hipblasLtDestroy(handle_);
     }
 
     void check(const HipblasltGroupedGemmParams &params) {
         PRIMUS_TURBO_CHECK(params.a_shape.size() == 2);
         if (params.transA) {
-            // For a * grad_c = grad_b
-            // [m, k]^T * [m, n] = [b, k, n]
             PRIMUS_TURBO_CHECK(params.b_shape.size() == 2);
             PRIMUS_TURBO_CHECK(params.c_shape.size() == 3);
             PRIMUS_TURBO_CHECK(params.a_shape[0] == params.b_shape[0]);
@@ -42,7 +61,6 @@ public:
             PRIMUS_TURBO_CHECK(params.c_shape[1] == params.a_shape[1]);
             PRIMUS_TURBO_CHECK(params.c_shape[2] == params.b_shape[1]);
         } else {
-            // For a * b = c and grad_c * b = grad_a
             PRIMUS_TURBO_CHECK(params.b_shape.size() == 3);
             PRIMUS_TURBO_CHECK(params.c_shape.size() == 2);
             PRIMUS_TURBO_CHECK(params.b_shape[0] == params.group_num);
@@ -50,23 +68,35 @@ public:
     }
 
     void run(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-        // Always synchronize before compute_args: group_lens_ptr is a device
-        // pointer read directly from the CPU.  Without this sync, writes made
-        // by upstream GPU kernels (e.g. the MoE router) may not be visible to
-        // the host, causing stale-zero reads and silent no-ops.
         PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
-        (void) pre_sync; // kept for API compatibility
+        (void) pre_sync;
 
-        // Check
         check(params);
-        // Compute arguments
         compute_args(params);
 
-        const size_t num_gemms{gemm_ptrs_.size()};
+        const size_t num_gemms = gemm_ptrs_.size();
+        if (num_gemms == 0) return;
 
-        // Dispatch all expert GEMMs sequentially on the caller's stream.
-        // This avoids GPU resource contention that occurs when 4 concurrent
-        // streams each launch large GEMMs competing for CUs/L2/register file.
+        // Determine max per-expert token count to choose dispatch strategy.
+        size_t max_tokens = 0;
+        for (size_t i = 0; i < num_gemms; ++i) {
+            // fwd/dgrad: cols_c = token count; wgrad: cols_a = token count
+            size_t tokens = params.transA ? cols_b_[i] : cols_c_[i];
+            max_tokens = std::max(max_tokens, tokens);
+        }
+
+        if (max_tokens >= kSerialThreshold || num_gemms <= kMaxNumStreams) {
+            // Large GEMMs or few experts: serial on caller's stream avoids
+            // GPU resource contention from concurrent large kernels.
+            dispatch_serial(params, num_gemms);
+        } else {
+            // Many small GEMMs: multi-stream overlaps kernel launch overhead.
+            dispatch_parallel(params, num_gemms);
+        }
+    }
+
+private:
+    void dispatch_serial(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
         for (size_t idx = 0; idx < num_gemms; ++idx) {
             // clang-format off
             hipblaslt_gemm_impl(
@@ -87,7 +117,45 @@ public:
         }
     }
 
-private:
+    void dispatch_parallel(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
+        const size_t num_streams = std::min(kMaxNumStreams, num_gemms);
+        char *workspace_base = static_cast<char *>(params.workspace);
+
+        // Fork: make compute streams wait for the caller's stream.
+        PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
+        for (size_t s = 0; s < num_streams; ++s) {
+            PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(par_streams_[s], sync_event_, 0));
+        }
+
+        // Round-robin dispatch across streams.
+        for (size_t idx = 0; idx < num_gemms; ++idx) {
+            const size_t s = idx % kMaxNumStreams;
+            void *ws = workspace_base + s * get_hipblaslt_workspace_size_in_byte();
+            // clang-format off
+            hipblaslt_gemm_impl(
+                gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
+                gemm_ptrs_[idx].b_scale_ptr,
+                params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                gemm_ptrs_[idx].a_ptr, params.a_type, rows_a_[idx], cols_a_[idx], ld_a_[idx],
+                gemm_ptrs_[idx].a_scale_ptr,
+                params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
+                ws, get_hipblaslt_workspace_size_in_byte(),
+                params.use_low_precision,
+                params.scale_mode,
+                par_handles_[s],
+                par_streams_[s]
+            );
+            // clang-format on
+        }
+
+        // Join: caller's stream waits for all compute streams.
+        for (size_t s = 0; s < num_streams; ++s) {
+            PRIMUS_TURBO_CHECK_HIP(hipEventRecord(par_events_[s], par_streams_[s]));
+            PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(params.stream, par_events_[s], 0));
+        }
+    }
+
     struct GemmPtr {
         const void *a_ptr       = nullptr;
         const void *a_scale_ptr = nullptr;
@@ -99,11 +167,7 @@ private:
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
         // Copy group_lens from device to host via hipMemcpy so the ROCm runtime
-        // handles GPU cache flushing / coherence correctly.  Direct CPU
-        // dereference of a device pointer can read stale L2-cached data even
-        // after hipStreamSynchronize, causing valid_group_num=0 and skipping the
-        // algo-cache warm-up, which then triggers a 500+ ms heuristic search on
-        // the first *timed* iteration and produces catastrophically low TFLOPS.
+        // handles GPU cache flushing / coherence correctly.
         group_lens_host_.resize(params.group_num);
         PRIMUS_TURBO_CHECK_HIP(hipMemcpy(group_lens_host_.data(), params.group_lens_ptr,
                                          params.group_num * sizeof(int64_t),
@@ -115,13 +179,9 @@ private:
         }
 
         const char *a_ptr = static_cast<const char *>(params.a_ptr);
-        const char *b_ptr = static_cast<const char *>(params.b_ptr);  // sequential ptr (wgrad only)
+        const char *b_ptr = static_cast<const char *>(params.b_ptr);
         char       *c_ptr = static_cast<char *>(params.c_ptr);
 
-        // For fwd/dgrad (transA=False): b is [G, K, N] — each expert has a fixed K×N weight block.
-        // Use absolute per-expert offset (b_base + i * b_expert_stride) so that skipping cold
-        // experts (len==0) does not shift the pointer and corrupt subsequent hot experts.
-        // For wgrad (transA=True): b is flat [M_total, OUT_N] — advance sequentially per hot group.
         const int64_t b_expert_stride = params.transA
             ? 0
             : get_dim(params.b_shape, -1) * get_dim(params.b_shape, -2) *
@@ -142,8 +202,6 @@ private:
         for (size_t i = 0; i < params.group_num; ++i) {
             int64_t len = group_lens_host_[i];
 
-            // For grad_b (transA), if the group len is 0, set the output memory to 0
-            // c shape is [group_num, k, n], so each group's c size is k * n
             if (params.transA && len == 0) {
                 int64_t c_rows_t = get_dim(params.c_shape, -1);
                 int64_t c_cols_t = get_dim(params.c_shape, -2);
@@ -155,35 +213,28 @@ private:
             if (len == 0)
                 continue;
 
-            // pointers
             gemm_ptrs_[write_idx].a_ptr = a_ptr;
-            // fwd/dgrad: absolute per-expert offset avoids desync on cold experts
-            // wgrad:     sequential advance through the flat b tensor
             gemm_ptrs_[write_idx].b_ptr = params.transA
                 ? b_ptr
                 : static_cast<const char *>(params.b_ptr) + static_cast<int64_t>(i) * b_expert_stride;
             gemm_ptrs_[write_idx].c_ptr = c_ptr;
             if (params.use_low_precision) {
-                // TODO(xiaobochen): support variable scale mode
                 gemm_ptrs_[write_idx].a_scale_ptr = params.a_scale_ptr;
                 gemm_ptrs_[write_idx].b_scale_ptr = params.b_scale_ptr;
             }
 
-            // leading dimension
             ld_a_[write_idx] = get_dim(params.a_shape, -1);
             ld_b_[write_idx] = get_dim(params.b_shape, -1);
             ld_c_[write_idx] = get_dim(params.c_shape, -1);
-            // rows and cols of matrices
             rows_a_[write_idx] = get_dim(params.a_shape, -1);
             cols_a_[write_idx] = len;
             rows_b_[write_idx] = get_dim(params.b_shape, -1);
             cols_b_[write_idx] = params.transA ? len : get_dim(params.b_shape, -2);
             rows_c_[write_idx] = get_dim(params.c_shape, -1);
             cols_c_[write_idx] = params.transA ? get_dim(params.c_shape, -2) : len;
-            // advance the pointers
+
             a_ptr += rows_a_[write_idx] * cols_a_[write_idx] * hipblaslt_dtype_bytes(params.a_type);
             if (params.transA) {
-                // wgrad only: advance b_ptr through the flat tensor
                 b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);
             }
             c_ptr += rows_c_[write_idx] * cols_c_[write_idx] * hipblaslt_dtype_bytes(params.c_type);
@@ -198,8 +249,14 @@ private:
         return shape.at(idx);
     }
 
-    // Single handle (algo caching is inside hipblaslt_gemm_impl)
+    // Primary handle for serial dispatch
     hipblasLtHandle_t handle_{};
+
+    // Parallel dispatch infrastructure
+    hipblasLtHandle_t par_handles_[kMaxNumStreams]{};
+    hipStream_t       par_streams_[kMaxNumStreams]{};
+    hipEvent_t        par_events_[kMaxNumStreams]{};
+    hipEvent_t        sync_event_{nullptr};
 
     // Gemm Pointers
     std::vector<GemmPtr> gemm_ptrs_;
