@@ -121,7 +121,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    // Look up algo cache; run heuristic search only on first encounter of this shape.
+    // Look up algo cache; on first encounter, autotune across top-N heuristic
+    // candidates to find the fastest kernel for this shape.
     AlgoKey key{rows_a,  cols_a,   lda,   rows_b,    cols_b,    ldb,
                 rows_d,  cols_d,   ldd,   A_type,    B_type,    D_type,
                 transA,  transB,   use_low_precision, scale_mode, handle};
@@ -131,7 +132,9 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     if (it != algo_cache.end()) {
         algo_result = it->second;
     } else {
-        const int request_solutions = 1;
+        static constexpr int kMaxCandidates = 8;
+        static constexpr int kBenchIters    = 5;
+        hipblasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
         int returnedAlgoCount = 0;
         hipblasLtMatmulPreference_t preference = nullptr;
 
@@ -142,11 +145,49 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulAlgoGetHeuristic(
             handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference,
-            request_solutions, &algo_result, &returnedAlgoCount));
+            kMaxCandidates, candidates, &returnedAlgoCount));
         PRIMUS_TURBO_CHECK(returnedAlgoCount > 0,
                            "hipBLASLt: no valid algorithm found for current matmul config");
 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
+
+        if (returnedAlgoCount == 1) {
+            algo_result = candidates[0];
+        } else {
+            // Autotune: benchmark each candidate, pick fastest.
+            const float a1 = 1.0f, b0 = 0.0f;
+            hipEvent_t ev_start, ev_stop;
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&ev_start));
+            PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&ev_stop));
+
+            float best_ms = 1e30f;
+            int   best_idx = 0;
+            for (int c = 0; c < returnedAlgoCount; ++c) {
+                // warm-up
+                (void)hipblasLtMatmul(handle, operation_desc, &a1,
+                    A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
+                    &candidates[c].algo, workspace, workspace_size, stream);
+
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_start, stream));
+                for (int i = 0; i < kBenchIters; ++i) {
+                    (void)hipblasLtMatmul(handle, operation_desc, &a1,
+                        A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
+                        &candidates[c].algo, workspace, workspace_size, stream);
+                }
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_stop, stream));
+                PRIMUS_TURBO_CHECK_HIP(hipEventSynchronize(ev_stop));
+
+                float ms = 0;
+                PRIMUS_TURBO_CHECK_HIP(hipEventElapsedTime(&ms, ev_start, ev_stop));
+                if (ms < best_ms) {
+                    best_ms  = ms;
+                    best_idx = c;
+                }
+            }
+            PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_start));
+            PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_stop));
+            algo_result = candidates[best_idx];
+        }
 
         algo_cache[key] = algo_result;
     }
