@@ -13,42 +13,20 @@
 
 namespace primus_turbo {
 
-static constexpr size_t kMaxNumStreams = 4;
-
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
-    return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
+    // Single-stream dispatch: only one workspace needed.
+    return get_hipblaslt_workspace_size_in_byte();
 }
 
 class HipblasltGroupedGemm {
 public:
     HipblasltGroupedGemm() {
-        PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event_, hipEventDisableTiming));
-
-        for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipEventCreateWithFlags(&hipblaslt_events_[i], hipEventDisableTiming));
-        }
-        workspaces_.resize(kMaxNumStreams);
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handle_));
     }
 
     ~HipblasltGroupedGemm() {
-        if (sync_event_ != nullptr) {
-            (void) hipEventDestroy(sync_event_);
-        }
-
-        for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            if (compute_streams_[i] != nullptr) {
-                (void) hipStreamDestroy(compute_streams_[i]);
-            }
-            if (handles_[i] != nullptr) {
-                (void) hipblasLtDestroy(handles_[i]);
-            }
-            if (hipblaslt_events_[i] != nullptr) {
-                (void) hipEventDestroy(hipblaslt_events_[i]);
-            }
+        if (handle_) {
+            (void)hipblasLtDestroy(handle_);
         }
     }
 
@@ -85,48 +63,27 @@ public:
         compute_args(params);
 
         const size_t num_gemms{gemm_ptrs_.size()};
-        const size_t num_stream_used{std::min<size_t>(kMaxNumStreams, num_gemms)};
 
-        if (num_gemms > 0) {
-            // wait for current stream to finish
-            PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
-
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
-            }
-
-            for (size_t idx = 0; idx < num_gemms; ++idx) {
-                const auto stream_idx = idx % kMaxNumStreams;
-                auto       stream     = compute_streams_[stream_idx];
-                auto       handle     = handles_[stream_idx];
-                auto       workspace  = workspaces_[stream_idx];
-                // clang-format off
-                hipblaslt_gemm_impl(
-                    gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
-                    gemm_ptrs_[idx].b_scale_ptr,
-                    params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                    gemm_ptrs_[idx].a_ptr, params.a_type, rows_a_[idx], cols_a_[idx], ld_a_[idx],
-                    gemm_ptrs_[idx].a_scale_ptr,
-                    params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                    gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
-                    workspace, get_hipblaslt_workspace_size_in_byte(),
-                    params.use_low_precision,
-                    params.scale_mode,
-                    handle,
-                    stream
-                );
-                // clang-format on
-            }
-
-            // record events on compute streams
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
-            }
-
-            // wait for all compute streams to finish
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
-            }
+        // Dispatch all expert GEMMs sequentially on the caller's stream.
+        // This avoids GPU resource contention that occurs when 4 concurrent
+        // streams each launch large GEMMs competing for CUs/L2/register file.
+        for (size_t idx = 0; idx < num_gemms; ++idx) {
+            // clang-format off
+            hipblaslt_gemm_impl(
+                gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
+                gemm_ptrs_[idx].b_scale_ptr,
+                params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                gemm_ptrs_[idx].a_ptr, params.a_type, rows_a_[idx], cols_a_[idx], ld_a_[idx],
+                gemm_ptrs_[idx].a_scale_ptr,
+                params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
+                params.workspace, get_hipblaslt_workspace_size_in_byte(),
+                params.use_low_precision,
+                params.scale_mode,
+                handle_,
+                params.stream
+            );
+            // clang-format on
         }
     }
 
@@ -232,11 +189,6 @@ private:
             c_ptr += rows_c_[write_idx] * cols_c_[write_idx] * hipblaslt_dtype_bytes(params.c_type);
             write_idx++;
         }
-
-        char *workspace_ptr = static_cast<char *>(params.workspace);
-        for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            workspaces_[i] = workspace_ptr + i * get_hipblaslt_workspace_size_in_byte();
-        }
     }
 
     template <typename T> T get_dim(const std::vector<T> &shape, int idx) {
@@ -246,21 +198,14 @@ private:
         return shape.at(idx);
     }
 
-    // Handles, events, streams, heuristic, epilogue
-    hipblasLtHandle_t   handles_[kMaxNumStreams]{};
-    hipEvent_t          sync_event_{nullptr};
-    hipStream_t         compute_streams_[kMaxNumStreams]{};
-    hipEvent_t          hipblaslt_events_[kMaxNumStreams]{};
-    hipblasLtEpilogue_t epilogue_{HIPBLASLT_EPILOGUE_DEFAULT};
+    // Single handle (algo caching is inside hipblaslt_gemm_impl)
+    hipblasLtHandle_t handle_{};
 
     // Gemm Pointers
     std::vector<GemmPtr> gemm_ptrs_;
 
     // host-side copy of group_lens (avoids GPU cache coherence issues)
     std::vector<int64_t> group_lens_host_;
-
-    // workspace
-    std::vector<void *> workspaces_;
 
     // Leading dimensions
     std::vector<int64_t> ld_a_;
