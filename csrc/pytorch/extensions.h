@@ -6,15 +6,15 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/miopen/Handle.h>
 #include <ATen/native/DispatchStub.h>
 #include <c10/macros/Macros.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
-#include <ATen/hip/HIPGraphsUtils.cuh>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include "deep_ep/deep_ep.hpp"
 #include "primus_turbo/common.h"
