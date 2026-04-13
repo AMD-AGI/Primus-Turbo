@@ -67,9 +67,10 @@ struct HipblasltGroupedGemmParams {
     hipDataType          c_type;
     std::vector<int64_t> c_shape;
 
-    const int64_t *group_lens_ptr = nullptr;
-    const int64_t *group_offs_ptr = nullptr;
-    bool           transA         = false;
+    const int64_t *group_lens_ptr     = nullptr;
+    const int64_t *group_offs_ptr     = nullptr;
+    bool           group_lens_on_host = false;
+    bool           transA             = false;
     bool           transB         = false;
     int32_t        group_num      = 0;
     hipStream_t    stream         = nullptr;

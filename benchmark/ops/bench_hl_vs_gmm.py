@@ -58,11 +58,14 @@ def bench_case(case):
     balance   = case["balance"]
     num_topk  = case.get("num_topk")
 
-    group_lens     = gen_grouped_gemm_group_lens(B, M, balance=balance, num_topk=num_topk).to(DEVICE)
-    group_lens_cpu = group_lens.cpu()
+    group_lens_cpu = gen_grouped_gemm_group_lens(B, M, balance=balance, num_topk=num_topk)
+    group_lens     = group_lens_cpu.to(DEVICE)
     group_offs     = torch.cat([torch.zeros(1, dtype=torch.int64, device=DEVICE),
                                 group_lens.cumsum(0)])
-    M_total = int(group_lens.sum().item())
+    # Use CPU group_lens for hipBLASLt to avoid blocking hipMemcpy(D2H)
+    group_offs_cpu = torch.cat([torch.zeros(1, dtype=torch.int64),
+                                group_lens_cpu.cumsum(0)])
+    M_total = int(group_lens_cpu.sum().item())
 
     results = {}
 
@@ -71,7 +74,7 @@ def bench_case(case):
     b_fwd = torch.randn(B, K, N, dtype=DTYPE, device=DEVICE)
 
     hl_us  = timeit_us(lambda: grouped_gemm_impl(
-        a_fwd, b_fwd, group_lens, group_offs, False, False, None, HL))
+        a_fwd, b_fwd, group_lens_cpu, group_offs_cpu, False, False, None, HL))
     gmm_us = timeit_us(lambda: gmm_ops.gmm(a_fwd, b_fwd, group_lens_cpu, trans_b=False))
 
     results["fwd"] = (tflops(M_total, N, K, hl_us), tflops(M_total, N, K, gmm_us))
@@ -81,7 +84,7 @@ def bench_case(case):
     b_dgrad = torch.randn(B, N, K, dtype=DTYPE, device=DEVICE)
 
     hl_us  = timeit_us(lambda: grouped_gemm_impl(
-        a_dgrad, b_dgrad, group_lens, group_offs, False, True, None, HL))
+        a_dgrad, b_dgrad, group_lens_cpu, group_offs_cpu, False, True, None, HL))
     gmm_us = timeit_us(lambda: gmm_ops.gmm(a_dgrad, b_dgrad, group_lens_cpu, trans_b=True))
 
     results["dgrad"] = (tflops(M_total, N, K, hl_us), tflops(M_total, N, K, gmm_us))
@@ -91,7 +94,7 @@ def bench_case(case):
     rhs = torch.randn(M_total, N, dtype=DTYPE, device=DEVICE)
 
     hl_us  = timeit_us(lambda: grouped_gemm_variable_k_impl(
-        lhs, rhs, group_lens, group_offs, True, False, False, None, HL))
+        lhs, rhs, group_lens_cpu, group_offs_cpu, True, False, False, None, HL))
     gmm_us = timeit_us(lambda: gmm_backend.gmm(lhs, rhs, group_lens_cpu, True, False))
 
     results["wgrad"] = (tflops(M_total, K, N, hl_us), tflops(M_total, K, N, gmm_us))

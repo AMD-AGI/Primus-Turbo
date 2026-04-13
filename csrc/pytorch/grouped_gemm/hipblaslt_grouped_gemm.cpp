@@ -34,14 +34,15 @@ make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at:
     params.c_type  = get_hipblaslt_dtype(c.scalar_type());
     params.c_shape = c.sizes().vec();
 
-    params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-    params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-    params.transA         = transA;
-    params.transB         = transB;
-    params.group_num      = group_lens.numel();
-    params.stream         = at::cuda::getCurrentCUDAStream();
-    params.workspace      = workspace.data_ptr();
-    params.handle         = at::cuda::getCurrentCUDABlasLtHandle();
+    params.group_lens_ptr     = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+    params.group_offs_ptr     = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+    params.group_lens_on_host = group_lens.is_cpu();
+    params.transA             = transA;
+    params.transB             = transB;
+    params.group_num          = group_lens.numel();
+    params.stream             = at::cuda::getCurrentCUDAStream();
+    params.workspace          = workspace.data_ptr();
+    params.handle             = at::cuda::getCurrentCUDABlasLtHandle();
     return params;
 }
 
@@ -65,13 +66,14 @@ inline HipblasltGroupedGemmParams make_hipblaslt_grouped_gemm_fp8_params(
     params.c_type  = get_hipblaslt_dtype(c.scalar_type());
     params.c_shape = c.sizes().vec();
 
-    params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-    params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-    params.transA         = transA;
-    params.transB         = transB;
-    params.group_num      = group_lens.numel();
-    params.stream         = at::cuda::getCurrentCUDAStream();
-    params.workspace      = workspace.data_ptr();
+    params.group_lens_ptr     = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+    params.group_offs_ptr     = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+    params.group_lens_on_host = group_lens.is_cpu();
+    params.transA             = transA;
+    params.transB             = transB;
+    params.group_num          = group_lens.numel();
+    params.stream             = at::cuda::getCurrentCUDAStream();
+    params.workspace          = workspace.data_ptr();
 
     params.use_low_precision = true;
 
