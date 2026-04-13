@@ -69,6 +69,18 @@ struct AlgoKeyHash {
 
 static thread_local std::unordered_map<AlgoKey, hipblasLtMatmulHeuristicResult_t, AlgoKeyHash>
     algo_cache;
+
+// ── descriptor cache ────────────────────────────────────────────────────────
+// Cache matrix layouts and matmul descriptors to avoid per-call create/destroy
+// overhead (11 API calls saved per cache hit).
+struct DescCache {
+    hipblasLtMatrixLayout_t A_desc = nullptr;
+    hipblasLtMatrixLayout_t B_desc = nullptr;
+    hipblasLtMatrixLayout_t D_desc = nullptr;
+    hipblasLtMatmulDesc_t   op_desc = nullptr;
+};
+
+static thread_local std::unordered_map<AlgoKey, DescCache, AlgoKeyHash> desc_cache;
 // ─────────────────────────────────────────────────────────────────────────────
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
@@ -80,53 +92,57 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
                          const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
                          hipblasLtHandle_t handle, hipStream_t stream) {
-    hipblasLtMatmulDesc_t   operation_desc = nullptr;
-    hipblasLtMatrixLayout_t A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
-    hipblasLtEpilogue_t     epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
-    hipblasComputeType_t    gemm_compute_type = HIPBLAS_COMPUTE_32F;
-
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&A_desc, A_type, rows_a, cols_a, lda));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&B_desc, B_type, rows_b, cols_b, ldb));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, rows_d, cols_d, ldd));
-
-    PRIMUS_TURBO_CHECK_HIPBLAS(
-        hipblasLtMatmulDescCreate(&operation_desc, gemm_compute_type, HIP_R_32F));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-        operation_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-        operation_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-        operation_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-
-    if (use_low_precision) {
-        if (scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0) {
-            PRIMUS_TURBO_CHECK(
-                is_gfx950(),
-                "The HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 only support on gfx950.");
-        }
-        PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
-        PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
-
-        hipblasLtMatmulDescAttributes_t scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
-        hipblasLtMatmulDescAttributes_t scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
-
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, scaleA_inv_ptr_desc, &scaleA_inv, sizeof(scaleA_inv)));
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
-    }
-
-    // Look up algo cache; on first encounter, autotune across top-N heuristic
-    // candidates to find the fastest kernel for this shape.
+    // Look up or create cached descriptors for this shape.
     AlgoKey key{rows_a,  cols_a,   lda,   rows_b,    cols_b,    ldb,
                 rows_d,  cols_d,   ldd,   A_type,    B_type,    D_type,
                 transA,  transB,   use_low_precision, scale_mode, handle};
 
+    auto &dc = desc_cache[key];
+    if (dc.op_desc == nullptr) {
+        hipblasLtEpilogue_t  epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
+        hipblasComputeType_t gemm_compute_type = HIPBLAS_COMPUTE_32F;
+
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.A_desc, A_type, rows_a, cols_a, lda));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.B_desc, B_type, rows_b, cols_b, ldb));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.D_desc, D_type, rows_d, cols_d, ldd));
+
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatmulDescCreate(&dc.op_desc, gemm_compute_type, HIP_R_32F));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            dc.op_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            dc.op_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            dc.op_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
+        if (use_low_precision) {
+            if (scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0) {
+                PRIMUS_TURBO_CHECK(
+                    is_gfx950(),
+                    "The HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 only support on gfx950.");
+            }
+            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+                dc.op_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+                dc.op_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        }
+    }
+
+    hipblasLtMatmulDesc_t   operation_desc = dc.op_desc;
+    hipblasLtMatrixLayout_t A_desc = dc.A_desc, B_desc = dc.B_desc, D_desc = dc.D_desc;
+
+    // Scale pointers change per call — must update every time for FP8.
+    if (use_low_precision) {
+        PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
+        PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA_inv, sizeof(scaleA_inv)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB_inv, sizeof(scaleB_inv)));
+    }
+
+    // Look up algo cache; on first encounter, autotune across top-N heuristic
+    // candidates to find the fastest kernel for this shape.
     hipblasLtMatmulHeuristicResult_t algo_result{};
     auto it = algo_cache.find(key);
     if (it != algo_cache.end()) {
@@ -212,10 +228,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         stream));
     // clang-format on
 
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(D_desc));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(B_desc));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(A_desc));
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescDestroy(operation_desc));
+    // Descriptors are cached — no destroy needed per call.
 }
 
 } // namespace primus_turbo
