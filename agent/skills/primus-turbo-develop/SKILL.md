@@ -24,6 +24,8 @@ pip install -r requirements.txt
 GPU_ARCHS=gfx942 pip install --no-build-isolation -e . -v
 ```
 
+**`pip install -r requirements.txt` must be run before install** — it pins critical dependency versions (triton, torch, etc.). Skipping it causes version mismatches that break tests and benchmarks.
+
 `--no-build-isolation` is required; otherwise, the build environment will lack already-installed dependencies (e.g., triton, torch).
 
 **Difference between the two**: `pip install .` copies the code into site-packages — source changes have no effect. `pip install -e .` is editable mode — Python code (including Triton kernels) takes effect immediately after modification, with no reinstall needed. C++ extensions require compilation in both modes.
@@ -275,20 +277,24 @@ benchmark/ops/                   # Operator benchmarks
 
 ### 环境验证（优化前必做）
 
-开始优化前，用 `pip show primus_turbo` 确认包是从**当前仓库**以 **editable mode** 安装的（`Editable project location` 指向当前仓库）。若不符，按 [Build](#build) 节重新 editable install。
+开始优化前，用 `pip show primus_turbo` 检查安装状态：
+- **未安装**：按 [Build](#build) 节执行完整安装（`pip install -r requirements.txt` → editable install）
+- **已安装但非 editable 或路径不是当前仓库**：同上，重新安装
+- **已安装且正确**：仍需确认 `requirements.txt` 中的关键依赖（如 triton）版本一致
 
 ### 流程总览
 
-1. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
-2. **按需求清单收集项目信息**（从本文件各节获取）
+1. **环境验证**（见 [环境验证](#环境验证优化前必做)）
+2. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
+3. **按需求清单收集项目信息**（从本文件各节获取）
    - kernel 源文件路径：从 [Code Structure](#code-structure-quick-reference) 和 [Key GEMM-Related Files](#key-gemm-related-files) 查到
    - focused test 命令 + quick test 命令：从 [Testing](#testing) 和 [Quick 验证](#quick-验证) 组装
    - focused benchmark 命令 + quick benchmark 命令：从 [Benchmark](#benchmark) 和 [Quick 验证](#quick-验证) 组装
    - benchmark 输出格式和可用性能指标：从 [Output Metrics](#output-metrics) 查到
    - 评分规则：从下方 [优化评分](#优化评分) 获取
    - `execution_mode` 建议和 rebuild 要求：从下方 [优化环境](#优化环境) 获取
-3. **交给 `kernel-optimize/SKILL.md`**，带着上述信息，由其自主完成优化闭环并输出报告
-4. **验收**：优化完成后，回到项目视角做最终确认
+4. **交给 `kernel-optimize/SKILL.md`**，带着上述信息，由其自主完成优化闭环并输出报告
+5. **验收**：优化完成后，回到项目视角做最终确认
    - 在主仓跑**完整测试**（不只是 focused test），确保无回归：`pytest tests/pytorch/ops/ -v`
    - 审查优化报告：性能提升是否达标、改动是否合理、是否有遗留风险
    - 确认代码已正确 commit 到主仓，diff 干净
