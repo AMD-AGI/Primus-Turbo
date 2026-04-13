@@ -273,6 +273,10 @@ benchmark/ops/                   # Operator benchmarks
 
 收到算子优化需求时，本节是 agent 的**第一站**。
 
+### 环境验证（优化前必做）
+
+开始优化前，用 `pip show primus_turbo` 确认包是从**当前仓库**以 **editable mode** 安装的（`Editable project location` 指向当前仓库）。若不符，按 [Build](#build) 节重新 editable install。
+
 ### 流程总览
 
 1. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
