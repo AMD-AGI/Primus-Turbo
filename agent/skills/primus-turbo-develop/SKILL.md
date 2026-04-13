@@ -269,9 +269,98 @@ benchmark/ops/                   # Operator benchmarks
 
 ---
 
-## Related Skills
+## 算子优化
 
-- **Operator performance optimization**: `.cursor/skills/kernel-optimize/SKILL.md` (optimization loop, workflow, Triton/HIP strategies)<!-- TODO: this skill has not been created yet -->
+收到算子优化需求时，本节是 agent 的**第一站**。
+
+### 流程总览
+
+1. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
+2. **按需求清单收集项目信息**（从本文件各节获取）
+   - kernel 源文件路径：从 [Code Structure](#code-structure-quick-reference) 和 [Key GEMM-Related Files](#key-gemm-related-files) 查到
+   - focused test 命令 + quick test 命令：从 [Testing](#testing) 和 [Quick 验证](#quick-验证) 组装
+   - focused benchmark 命令 + quick benchmark 命令：从 [Benchmark](#benchmark) 和 [Quick 验证](#quick-验证) 组装
+   - benchmark 输出格式和可用性能指标：从 [Output Metrics](#output-metrics) 查到
+   - 评分规则：从下方 [优化评分](#优化评分) 获取
+   - `execution_mode` 建议和 rebuild 要求：从下方 [优化环境](#优化环境) 获取
+3. **交给 `kernel-optimize/SKILL.md`**，带着上述信息，由其自主完成优化闭环并输出报告
+4. **验收**：优化完成后，回到项目视角做最终确认
+   - 在主仓跑**完整测试**（不只是 focused test），确保无回归：`pytest tests/pytorch/ops/ -v`
+   - 审查优化报告：性能提升是否达标、改动是否合理、是否有遗留风险
+   - 确认代码已正确 commit 到主仓，diff 干净
+
+### 优化环境
+
+由 agent 根据任务特点判断使用 `repo-mode`（直接在仓库改）还是 `workspace-mode`（搭建最小开发环境，优化后再集成回来）。以下是 Primus-Turbo 的参考建议：
+
+- **Triton kernel**：通常 `repo-mode`。Editable install 下改完即生效，无需 rebuild，迭代很快。
+- **HIP / C++ kernel**：视情况。改动面小、调参为主时可 `repo-mode`（增量 rebuild：`GPU_ARCHS=<arch> pip install --no-build-isolation -e . -v`）；若需要大规模试错或从头写新 kernel，`workspace-mode` 可能更合适，避免每次都跑主仓的完整构建链路。
+
+`workspace-mode` 的搭建规范由 `kernel-optimize/SKILL.md` 定义。
+
+### 优化评分
+
+性能指标取决于算子类型，由 benchmark 输出列决定。常见指标：
+
+| 算子类型 | 典型指标 |
+|---------|---------|
+| Compute-bound（GEMM 等） | `Forward TFLOPS`、`Backward TFLOPS` |
+| Memory-bound（elementwise、quantization 等） | `Forward GB/s`、`Backward GB/s` |
+
+用户在优化开始时确认需要优化哪些指标（`primary_metric`）。优化闭环中以所有目标 shape 的指定指标 **几何平均**作为 `aggregate score`，任一 shape `Check = FAIL` 则该候选直接拒绝。
+
+Benchmark 的输出格式、shape 来源、测量方式见上方 [Benchmark](#benchmark) 节。
+
+### Quick 验证
+
+每轮 VALIDATE 默认使用 quick 验证（代表性 shape subset），加速迭代。BASELINE 和最终验收使用 full 验证。
+
+**代表性 shape 选取原则**：agent 在 BASELINE 阶段从 full benchmark 结果中选取 3-5 个代表性 shape，覆盖小/中/大规模。选取标准：
+- 至少包含 1 个小 shape（容易暴露 launch overhead 问题）
+- 至少包含 1 个大 shape（容易暴露 memory / compute 瓶颈）
+- 优先选择性能差异大的 shape（更敏感，能快速检测退步）
+
+选出的 shape 列表记录在 `manifest.yaml` 的 `representative_shapes` 字段中。
+
+**Quick test**：使用 focused test 命令加 `--maxfail=3` 快速失败，侧重快速拦截明显问题。
+
+**Quick benchmark**：如果 benchmark 脚本支持 shape 过滤参数，则只跑代表性 shape；如果不支持，跑 full benchmark 后从结果中提取代表性 shape 的数据做快速判断。
+
+### Demo：优化 blockwise FP8 GEMM Triton on MI300X
+
+以下以 blockwise FP8 GEMM Triton on MI300X 为例。
+
+**1. 读 `kernel-optimize/SKILL.md` 的前置信息需求**
+
+得知优化框架需要：kernel 源文件、focused test/quick test、focused benchmark/quick benchmark、benchmark 输出格式、评分规则、execution_mode 建议、rebuild 要求。
+
+**2. 按需求清单收集项目信息**
+
+从本文件各节获取：
+- Kernel 源文件：`primus_turbo/triton/gemm/gemm_fp8_kernel.py`（查 [Key GEMM-Related Files](#key-gemm-related-files)）
+- Focused test：`pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`（查 [Testing](#testing)）
+- Quick test：同上 + `--maxfail=3`（查 [Quick 验证](#quick-验证)）
+- Focused benchmark：`PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`（查 [Benchmark](#benchmark)）
+- Quick benchmark：同上，从 full 结果中提取代表性 shape 数据（查 [Quick 验证](#quick-验证)）
+- 可用指标：`Forward TFLOPS`、`Backward TFLOPS`，`Check` 为正确性门控（查 [优化评分](#优化评分)）
+- 环境建议：Triton → `repo-mode`，无需 rebuild（查 [优化环境](#优化环境)）
+
+**3. 交给 `kernel-optimize/SKILL.md`**
+
+带着以上信息，由其完成 DEFINE_TARGET（含向用户确认目标）、PREPARE_ENVIRONMENT、优化闭环并输出报告。
+
+**4. 验收**
+
+回到项目视角做最终确认：
+- 在主仓跑完整测试（不只是 focused test）：`pytest tests/pytorch/ops/ -v`
+- 审查优化报告：性能提升是否达标、改动是否合理
+- 确认代码已正确 commit（若 `git_commit=true`），diff 干净
+
+---
+
+## 相关 Skills
+
+- **算子性能优化**: `kernel-optimize/SKILL.md`（优化闭环、工作流、Triton/HIP 策略）
 
 ## Additional References
 
