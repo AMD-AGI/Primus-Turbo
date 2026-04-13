@@ -58,7 +58,7 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
 //  hipBLASLt Grouped GEMM Meta
 //==================================================================
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const bool transA, const bool transB,
+                                       const bool transA, const bool transB,
                                        const bool pre_sync) {
     if (transA) {
         const int64_t bs = group_lens.numel();

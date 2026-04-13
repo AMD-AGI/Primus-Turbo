@@ -213,11 +213,11 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
                                                c10::optional<int64_t> num_cu);
 
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                  at::Tensor &group_offs, const bool transA, const bool transB,
+                                  const bool transA, const bool transB,
                                   const bool pre_sync);
 
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const bool transA, const bool transB,
+                                       const bool transA, const bool transB,
                                        const bool pre_sync);
 
 at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,

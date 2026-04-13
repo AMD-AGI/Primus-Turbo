@@ -168,18 +168,10 @@ private:
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
+        // group_lens is always on host (guaranteed by the Python execute() layer).
         group_lens_host_.resize(params.group_num);
-        if (params.group_lens_on_host) {
-            // group_lens already on host — direct memcpy, no GPU sync needed.
-            std::memcpy(group_lens_host_.data(), params.group_lens_ptr,
-                        params.group_num * sizeof(int64_t));
-        } else {
-            // Copy group_lens from device to host via hipMemcpy so the ROCm
-            // runtime handles GPU cache flushing / coherence correctly.
-            PRIMUS_TURBO_CHECK_HIP(hipMemcpy(group_lens_host_.data(), params.group_lens_ptr,
-                                             params.group_num * sizeof(int64_t),
-                                             hipMemcpyDeviceToHost));
-        }
+        std::memcpy(group_lens_host_.data(), params.group_lens_ptr,
+                    params.group_num * sizeof(int64_t));
 
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
