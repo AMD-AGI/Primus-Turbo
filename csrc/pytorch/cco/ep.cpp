@@ -138,31 +138,31 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
                            dense_to_expert_map);
 }
 
-torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,
-                                      const torch::Tensor &permuted_weights,
-                                      const torch::Tensor &dense_to_expert_map,
-                                      const torch::Tensor &expert_offsets,
-                                      const torch::Tensor &buffer_ptrs_dev, int num_recv_tokens,
-                                      int num_experts, int rank, int num_ranks, int num_sms) {
-    EP_HOST_ASSERT(permuted_x.dim() == 2 and permuted_x.is_contiguous());
-    EP_HOST_ASSERT((permuted_x.size(1) * permuted_x.element_size()) % sizeof(int4) == 0);
+// torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,
+//                                       const torch::Tensor &permuted_weights,
+//                                       const torch::Tensor &dense_to_expert_map,
+//                                       const torch::Tensor &expert_offsets,
+//                                       const torch::Tensor &buffer_ptrs_dev, int num_recv_tokens,
+//                                       int num_experts, int rank, int num_ranks, int num_sms) {
+//     EP_HOST_ASSERT(permuted_x.dim() == 2 and permuted_x.is_contiguous());
+//     EP_HOST_ASSERT((permuted_x.size(1) * permuted_x.element_size()) % sizeof(int4) == 0);
 
-    void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
+//     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
 
-    auto hidden              = static_cast<int>(permuted_x.size(1));
-    auto num_experts_per_rank = num_experts / num_ranks;
-    auto num_topk            = static_cast<int>(dense_to_expert_map.size(1));
+//     auto hidden              = static_cast<int>(permuted_x.size(1));
+//     auto num_experts_per_rank = num_experts / num_ranks;
+//     auto num_topk            = static_cast<int>(dense_to_expert_map.size(1));
 
-    auto stream     = at::cuda::getCurrentCUDAStream();
-    auto combined_x = torch::zeros({num_recv_tokens, hidden}, permuted_x.options());
+//     auto stream     = at::cuda::getCurrentCUDAStream();
+//     auto combined_x = torch::zeros({num_recv_tokens, hidden}, permuted_x.options());
 
-    primus_turbo::cco::ep::intranode::fused_unpermute_combine(
-        buffer_ptrs_gpu, permuted_x.data_ptr(), permuted_weights.data_ptr<float>(),
-        dense_to_expert_map.data_ptr<int>(), expert_offsets.data_ptr<int>(), combined_x.data_ptr(),
-        num_recv_tokens, static_cast<int>(hidden * permuted_x.element_size() / sizeof(int4)),
-        num_topk, num_experts_per_rank, rank, num_ranks, stream, num_sms);
+//     primus_turbo::cco::ep::intranode::fused_unpermute_combine(
+//         buffer_ptrs_gpu, permuted_x.data_ptr(), permuted_weights.data_ptr<float>(),
+//         dense_to_expert_map.data_ptr<int>(), expert_offsets.data_ptr<int>(), combined_x.data_ptr(),
+//         num_recv_tokens, static_cast<int>(hidden * permuted_x.element_size() / sizeof(int4)),
+//         num_topk, num_experts_per_rank, rank, num_ranks, stream, num_sms);
 
-    return combined_x;
-}
+//     return combined_x;
+// }
 
 } // namespace primus_turbo::pytorch::cco::intranode

@@ -206,17 +206,13 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
                        int num_worst_tokens, int num_permuted_tokens, int num_experts, int rank,
                        int num_ranks, int num_sms, int num_max_send_tokens);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-moe_permute_atomic(const torch::Tensor &recv_x, const torch::Tensor &recv_topk_idx,
-                   const torch::Tensor &recv_topk_weights, const torch::Tensor &expert_offsets,
-                   int num_local_experts, int total_permuted_tokens, int num_sms);
 
-torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,
-                                      const torch::Tensor &permuted_weights,
-                                      const torch::Tensor &dense_to_expert_map,
-                                      const torch::Tensor &expert_offsets,
-                                      const torch::Tensor &buffer_ptrs_dev, int num_recv_tokens,
-                                      int num_experts, int rank, int num_ranks, int num_sms);
+// torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,
+//                                       const torch::Tensor &permuted_weights,
+//                                       const torch::Tensor &dense_to_expert_map,
+//                                       const torch::Tensor &expert_offsets,
+//                                       const torch::Tensor &buffer_ptrs_dev, int num_recv_tokens,
+//                                       int num_experts, int rank, int num_ranks, int num_sms);
 
 } // namespace intranode
 

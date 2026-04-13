@@ -17,11 +17,11 @@ void fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *r
                             int num_sms, int num_max_tokens, int num_max_send_tokens);
 
 
-void fused_unpermute_combine(void **buffer_ptrs, void const *permuted_x,
-                             float const *permuted_weights, int const *dense_to_expert_map,
-                             int const *expert_offsets, void *combined_x, int num_recv_tokens,
-                             int hidden_int4, int num_topk, int num_experts_per_rank, int rank,
-                             int num_ranks, cudaStream_t stream, int num_sms);
+// void fused_unpermute_combine(void **buffer_ptrs, void const *permuted_x,
+//                              float const *permuted_weights, int const *dense_to_expert_map,
+//                              int const *expert_offsets, void *combined_x, int num_recv_tokens,
+//                              int hidden_int4, int num_topk, int num_experts_per_rank, int rank,
+//                              int num_ranks, cudaStream_t stream, int num_sms);
 
 } // namespace intranode
 } // namespace primus_turbo::cco::ep
