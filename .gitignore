@@ -10,3 +10,5 @@ test-reports/
 *_hip.cpp
 *_hip.hpp
 *_hip.cuh
+agent/tmp/
+agent/workspace/
