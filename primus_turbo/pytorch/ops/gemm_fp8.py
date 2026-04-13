@@ -351,7 +351,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.TURBO.value,
         )
 
         ctx.save_for_backward(a_t_fp8, a_t_scale_inv, b_t_fp8, b_t_scale_inv)
@@ -379,7 +379,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
         )
 
-        # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
+        # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
         grad_a = gemm_fp8_impl(
             grad_out_fp8,
             grad_out_scale_inv,
@@ -390,10 +390,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.TURBO.value,
         )
 
-        # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout on hipblaslt.
+        # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout.
         grad_b = gemm_fp8_impl(
             grad_out_t_fp8,
             grad_out_t_scale_inv,
@@ -404,7 +404,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=BackendType.TURBO.value,
         )
 
         return grad_a, grad_b, None, None, None, None

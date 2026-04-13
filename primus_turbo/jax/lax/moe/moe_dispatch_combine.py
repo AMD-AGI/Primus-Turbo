@@ -25,9 +25,6 @@ _default_num_sms = 64
 
 P = jax.sharding.PartitionSpec
 
-# DeepEP topk_idx are int64, so we need to enable x64 precision.
-jax.config.update("jax_enable_x64", True)
-
 
 def set_default_num_sms(num_sms: int):
     """Set the default number of SMS.
@@ -92,73 +89,75 @@ def get_combine_config() -> Config:
 
 def moe_dispatch(
     x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
-    handle: Optional[Tuple] = None,
-    topk_idx: Optional[jnp.ndarray] = None,
-    topk_weights: Optional[jnp.ndarray] = None,
+    topk_idx: jnp.ndarray,
+    topk_weights: jnp.ndarray,
+    num_experts: int,
     expert_alignment: int = 1,
-    num_experts: Optional[int] = None,
     config: Optional[Config] = None,
-) -> Tuple[
-    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
-]:
+) -> Tuple[Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], jnp.ndarray, jnp.ndarray, Tuple]:
     """
     Dispatch tokens to their selected experts in a Mixture of Experts (MoE) model.
 
-    In MoE models, each token dynamically selects top-k experts based on routing scores. This function
-    performs the all-to-all communication to dispatch tokens from all ranks to the ranks where their
-    selected experts reside. It supports both intranode communication via NVLink and internode
-    communication via RDMA, enabling efficient expert parallelism across multiple GPUs and nodes.
+    In MoE models, tokens dynamically select their top-k experts based on routing scores. This function
+    executes the all-to-all communication required to dispatch tokens from all ranks to the specific ranks
+    hosting their chosen experts. It leverages both intra-node communication (e.g., NVLink) and inter-node
+    communication (e.g., RDMA) to facilitate efficient expert parallelism across multiple GPUs and nodes.
 
-    The dispatch process handles:
-    - Token routing based on top-k expert selection
-    - Cross-rank communication to send tokens to appropriate expert locations
-    - Layout computation and caching for performance optimization
-    - Support for both standard (bfloat16) and low-precision (float8) datatypes
+    Key functionalities of the dispatch process include:
+    - Routing tokens based on top-k expert assignments.
+    - Performing cross-rank communication to deliver tokens to their designated expert locations.
+    - Computing and caching communication layouts to optimize performance.
+    - Supporting both standard precision (bfloat16) and low precision (float8) data types.
 
-    Arguments:
-        x: `jnp.ndarray` or tuple of `jnp.ndarray`, for the first type, the shape must be `[num_tokens, hidden]`,
-            and type must be `jnp.bfloat16`; for the second type, the first element of the tuple must be shaped as
-            `[num_tokens, hidden]` with type `jnp.float8_e4m3fn`, the second must be `[num_tokens, hidden // 128]`
-             (requiring divisible) with type `jnp.float32`.
-        handle: an optional communication handle, if set, the function will reuse the layout information to save
-            computation time. When handle is provided, topk_idx and topk_weights must be None.
-        topk_idx: `[num_tokens, num_topk]` with `jnp.int64`, the expert indices selected by each token,
-            `-1` means no selections. Required when handle is None.
-        topk_weights: `[num_tokens, num_topk]` with `jnp.float32`, the expert weights of each token to dispatch.
-            Required when handle is None.
-        expert_alignment: align the number of tokens received by each local expert to this variable.
-        num_experts: total number of experts across all ranks. Required when handle is None.
-        config: the performance tuning config. If None, will use the default config from get_dispatch_config().
+    Args:
+        x: A `jnp.ndarray` or a tuple of `jnp.ndarray`s.
+            - If a single array, it must have a shape of `[num_tokens, hidden]` and a dtype of `jnp.bfloat16`.
+            - If a tuple, the first element must be `[num_tokens, hidden]` with dtype `jnp.float8_e4m3fn`,
+              and the second element must be `[num_tokens, hidden // 128]` (where hidden is divisible by 128)
+              with dtype `jnp.float32`.
+        topk_idx: A `jnp.ndarray` of shape `[num_tokens, num_topk]` and dtype `jnp.int32`, representing
+            the expert indices selected by each token. A value of `-1` indicates no selection.
+        topk_weights: A `jnp.ndarray` of shape `[num_tokens, num_topk]` and dtype `jnp.float32`,
+            representing the routing weights for each token's selected experts.
+        num_experts: The total number of experts across all ranks.
+        expert_alignment: An integer specifying the alignment for the number of tokens received by each local expert.
+        config: An optional performance tuning configuration. If `None`, the default configuration from
+            `get_dispatch_config()` is used.
 
     Returns:
-        recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
-            received token count.
-        recv_topk_idx: received expert indices with shape `[num_recv_tokens, num_topk]`, or None if handle is provided.
-        recv_topk_weights: received expert weights with shape `[num_recv_tokens, num_topk]`, or None if handle is provided.
-        handle: the communication handle containing layout information (rank_prefix_matrix, channel_prefix_matrix,
-            recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head), which can be reused in subsequent
-            calls to avoid recomputing the dispatch layout.
+        recv_x: The received tokens, matching the type and structure of the input `x`, but with the
+            token dimension updated to reflect the total number of received tokens.
+        recv_topk_idx: The received expert indices with shape `[num_recv_tokens, num_topk]`, or `None`
+            if `handle` was provided.
+        recv_topk_weights: The received expert weights with shape `[num_recv_tokens, num_topk]`, or `None`
+            if `handle` was provided.
+        handle: A communication handle containing the computed layout information (e.g., `rank_prefix_matrix`,
+            `channel_prefix_matrix`, `recv_channel_prefix_matrix`, `recv_src_idx`, `is_token_in_rank`,
+            `send_head`). This handle can be passed to subsequent calls to bypass layout recomputation.
     """
-    return _moe_dispatch(x, handle, topk_idx, topk_weights, expert_alignment, num_experts, config)
+    return _moe_dispatch(x, topk_idx, topk_weights, num_experts, expert_alignment, config)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
 def _moe_dispatch(
     x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
-    handle: Optional[Tuple] = None,
-    topk_idx: Optional[jnp.ndarray] = None,
-    topk_weights: Optional[jnp.ndarray] = None,
+    topk_idx: jnp.ndarray,
+    topk_weights: jnp.ndarray,
+    num_experts: int,
     expert_alignment: int = 1,
-    num_experts: Optional[int] = None,
     config: Optional[Config] = None,
-) -> Tuple[
-    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
-]:
-    out, _ = _moe_dispatch_fwd(x, handle, topk_idx, topk_weights, expert_alignment, num_experts, config)
-    return out
+) -> Tuple[Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], jnp.ndarray, jnp.ndarray, Tuple]:
+    return _moe_dispatch_impl(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        expert_alignment=expert_alignment,
+        num_experts=num_experts,
+        config=config,
+    )
 
 
-def _moe_dispatch_fwd(
+def _moe_dispatch_impl(
     x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
     handle: Optional[Tuple] = None,
     topk_idx: Optional[jnp.ndarray] = None,
@@ -167,7 +166,10 @@ def _moe_dispatch_fwd(
     num_experts: Optional[int] = None,
     config: Optional[Config] = None,
 ) -> Tuple[
-    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray], Optional[jnp.ndarray], Optional[jnp.ndarray], Tuple
+    Union[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+    Optional[jnp.ndarray],
+    Optional[jnp.ndarray],
+    Optional[Tuple],
 ]:
     if isinstance(x, tuple):
         x, x_scales = x
@@ -206,12 +208,8 @@ def _moe_dispatch_fwd(
             num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
             num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
         )
-        return (
-            (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
-            None,
-            None,
-            None,
-        ), (None, None, None, None)
+        recv = (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x
+        return recv, None, None, None
     else:
         assert topk_idx is not None and topk_weights is not None
         assert num_experts is not None
@@ -257,18 +255,46 @@ def _moe_dispatch_fwd(
             recv_topk_idx,
             recv_topk_weights,
             handle,
-        ), (handle, expert_alignment, num_experts, config)
+        )
 
 
-def _moe_dispatch_bwd(expert_alignment, num_experts, config, ctx, grad_output):
-    handle, _, _, _ = ctx
+def _moe_dispatch_fwd(
+    x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
+    topk_idx: jnp.ndarray,
+    topk_weights: jnp.ndarray,
+    num_experts: int,
+    expert_alignment: int = 1,
+    config: Optional[Config] = None,
+):
+    recv_x, recv_topk_idx, recv_topk_weights, handle = _moe_dispatch_impl(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        expert_alignment=expert_alignment,
+        config=config,
+    )
+
+    ctx = (handle,)
+    return (recv_x, recv_topk_idx, recv_topk_weights, handle), ctx
+
+
+def _moe_dispatch_bwd(num_experts, expert_alignment, config, ctx, grad_output):
+    (handle,) = ctx
     grad_x, _, grad_topk_weights, _ = grad_output
 
     if isinstance(grad_x, tuple):
-        grad_x, _ = grad_x
+        grad_x_main, _ = grad_x
+        grad_x_main, grad_topk_weights = _moe_combine_impl(
+            grad_x_main, handle, topk_weights=grad_topk_weights, config=config
+        )
+        grad_x = (grad_x_main, None)
+    else:
+        grad_x, grad_topk_weights = _moe_combine_impl(
+            grad_x, handle, topk_weights=grad_topk_weights, config=config
+        )
 
-    (grad_x, grad_topk_weights), _ = _moe_combine_fwd(grad_x, handle)
-    return grad_x, None, grad_topk_weights, None
+    return grad_x, None, grad_topk_weights
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
@@ -277,10 +303,8 @@ _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
 def moe_combine(
     x: jnp.ndarray,
     handle: Tuple,
-    topk_weights: Optional[jnp.ndarray] = None,
-    bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
-) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+) -> jnp.ndarray:
     """
     Combine (reduce) tokens from different experts back to their original ranks in a Mixture of Experts (MoE) model.
 
@@ -298,34 +322,26 @@ def moe_combine(
         handle: a required communication handle obtained from the moe_dispatch function, containing layout
             information (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
             is_token_in_rank, send_head) needed for the reverse communication.
-        topk_weights: `[num_recv_tokens, num_topk]` with `jnp.float32`, the tokens' top-k weights for reducing
-            back to their original ranks. If None, only tokens will be reduced without weights.
-        bias: optional bias to add during combination. Can be a single `jnp.ndarray` or a tuple of two arrays
-            for separate bias terms. The dtype should match the input `x`.
         config: the performance tuning config. If None, will use the default config from get_combine_config().
 
     Returns:
         combined_x: the reduced tokens from all expert ranks, gathered back to original token positions with
             shape `[num_tokens, hidden]`, aggregated via addition across all ranks.
-        combined_topk_weights: the reduced top-k weights from all expert ranks with shape `[num_tokens, num_topk]`,
-            or None if topk_weights was not provided.
     """
-    return _moe_combine(x, handle, topk_weights, bias, config)
+    return _moe_combine(x, handle, config)
 
 
-@jax.custom_vjp
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _moe_combine(
     x: jnp.ndarray,
     handle: Tuple,
-    topk_weights: Optional[jnp.ndarray] = None,
-    bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
-) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-    out, _ = _moe_combine_fwd(x, handle, topk_weights, bias, config)
-    return out
+) -> jnp.ndarray:
+    combine_x, _ = _moe_combine_impl(x, handle, config=config)
+    return combine_x
 
 
-def _moe_combine_fwd(
+def _moe_combine_impl(
     x: jnp.ndarray,
     handle: Tuple,
     topk_weights: Optional[jnp.ndarray] = None,
@@ -370,15 +386,25 @@ def _moe_combine_fwd(
         num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
         num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
     )
-    return (combined_x, combined_topk_weights), (handle, bias, config)
+    return combined_x, combined_topk_weights
 
 
-def _moe_combine_bwd(residuals, grad_output):
-    handle, _, _ = residuals
-    grad_x, _ = grad_output
+def _moe_combine_fwd(
+    x: jnp.ndarray,
+    handle: Tuple,
+    config: Optional[Config] = None,
+) -> jnp.ndarray:
+    combine_x, _ = _moe_combine_impl(x, handle, config=config)
+    ctx = (handle,)
+    return combine_x, ctx
 
-    (recv_grad_x, _, _, _), _ = _moe_dispatch_fwd(grad_x, handle=handle)
-    return recv_grad_x, None, None, None, None
+
+def _moe_combine_bwd(config, ctx, grad_output):
+    (handle,) = ctx
+
+    recv_grad_x, _, _, _ = _moe_dispatch_impl(grad_output, handle=handle, config=config)
+    handle_grad = jax.tree_util.tree_map(jnp.zeros_like, handle)
+    return recv_grad_x, handle_grad
 
 
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)

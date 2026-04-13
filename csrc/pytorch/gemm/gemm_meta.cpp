@@ -34,4 +34,10 @@ at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
     return c;
 }
 
+at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
+                               bool transB, bool transC, const std::string &granularity) {
+    return hipblaslt_gemm_meta(A, B, out_dtype, transA, transB, transC);
+}
+
 } // namespace primus_turbo::pytorch

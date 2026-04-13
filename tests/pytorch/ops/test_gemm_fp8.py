@@ -274,7 +274,7 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tune):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
@@ -284,6 +284,13 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
+
+    if backend == BackendType.TURBO:
+        if layout != "NT" or m % 16 != 0 or n % 16 != 0 or k % 128 != 0 or k < 384:
+            pytest.skip("TURBO backend requires NT layout, m/n%16==0, k%128==0, k>=384")
+        # Backward GEMMs use m and n as their k dimension; they must also satisfy TURBO constraints
+        if m % 128 != 0 or m < 384 or n % 128 != 0 or n < 384:
+            pytest.skip("TURBO backward GEMMs require m,n%128==0 and m,n>=384")
 
     _run_gemm_fp8_test(
         m=m,

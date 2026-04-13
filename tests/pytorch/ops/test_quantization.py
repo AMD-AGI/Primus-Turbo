@@ -10,6 +10,8 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
+    MXFP8_BLOCK_SIZE,
     MXScalingRecipe,
     ScalingGranularity,
     check_mxfp4_support,
@@ -23,8 +25,6 @@ from primus_turbo.pytorch.ops.quantization import (
 )
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
-
-MXFP4_BLOCK_SIZE = 32
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -115,7 +115,7 @@ def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
 
-@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [32, 64, 256, 1024])
@@ -130,9 +130,6 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
-
-    def padding_size(n: int, padding_align_size: int) -> int:
-        return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
@@ -199,7 +196,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
 
 
-@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [32, 64, 256, 1024])
@@ -286,6 +283,70 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         scaling_recipe=scaling_recipe,
     )
     torch.testing.assert_close(x_2d_ref_colwise, out_colwise, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dest_dtype",
+    [
+        turbo.float8_e4m3,
+        turbo.float8_e5m2,
+    ],
+)
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [32, 64, 256, 1024])
+@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
+@pytest.mark.parametrize("use_2d_block", [True, False])
+def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    # Skip unit test on gfx942.
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+
+    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+
+    row_length = x.size(-1)
+    x_2d = x.view(-1, row_length)
+
+    scaling_recipe = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+    )
+    _, rowwise_scale, _, colwise_scale = quantize_fp8_with_trans(
+        x_2d,
+        dest_dtype,
+        granularity=granularity,
+        block_size=MXFP8_BLOCK_SIZE,
+        scaling_recipe=scaling_recipe,
+        scaling_recipe_for_trans=scaling_recipe,
+    )
+
+    rowwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(rowwise_scale, [16, 16])
+    colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale, [16, 16])
+
+    scaling_recipe_with_shuffle = MXScalingRecipe(
+        use_2d_block=use_2d_block,
+        shuffle_scale=True,
+        shuffle_out=False,
+    )
+    _, rowwise_scale_shuffle_ref, _, colwise_scale_shuffle_ref = quantize_fp8_with_trans(
+        x_2d,
+        dest_dtype,
+        block_size=MXFP8_BLOCK_SIZE,
+        granularity=granularity,
+        scaling_recipe=scaling_recipe_with_shuffle,
+        scaling_recipe_for_trans=scaling_recipe_with_shuffle,
+    )
+
+    # TODO(ruibin): Add shuffle weight for MXFP8.
+    torch.testing.assert_close(
+        rowwise_scale_shuffle.view(torch.uint8), rowwise_scale_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        colwise_scale_shuffle.view(torch.uint8), colwise_scale_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])

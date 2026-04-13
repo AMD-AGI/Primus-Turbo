@@ -46,7 +46,8 @@ test_cases = [
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("enable_sink", [False, True])
-def test_attention_16bit(batch, dtype, config, causal, enable_sink):
+@pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
+def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_left):
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -57,17 +58,25 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
         config.head_dim_v,
     )
 
-    # Sink attention constraints / runtime control (skip early to avoid big allocations)
+    # Sliding window coverage only applies when sink attention is enabled.
+    if not enable_sink and window_size_left != -1:
+        pytest.skip("window_size_left only applies when sink is enabled")
+
+    # Sink attention constraints / runtime control (skip early to avoid big allocations).
     if enable_sink:
         # Triton kernel limitation for sink: requires same qk/v head dim and head dim > 32
         if head_dim_qk != head_dim_v or head_dim_qk < 32:
             pytest.skip("Sink attention requires head_dim_qk == head_dim_v and head_dim >= 32")
+        if window_size_left != -1 and not causal:
+            pytest.skip("sink sliding window coverage only applies to causal attention")
 
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
+    window_size = (window_size_left, -1) if enable_sink and window_size_left != -1 else (-1, -1)
 
     print(
-        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}"
+        f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, "
+        f"HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}, WindowLeft={window_size_left}"
     )
 
     q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
@@ -90,7 +99,15 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
     if enable_sink:
         sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
         sink_ref = sink.clone().detach().requires_grad_()
-        o_ref = attention_with_sink_ref_impl(query_ref, key_ref, value_ref, sink_ref, sm_scale, causal)
+        o_ref = attention_with_sink_ref_impl(
+            query_ref,
+            key_ref,
+            value_ref,
+            sink_ref,
+            sm_scale,
+            causal,
+            window_size=window_size,
+        )
     else:
         o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
     o_ref.backward(grad_out)
@@ -101,7 +118,7 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink):
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
-        window_size=(-1, -1),
+        window_size=window_size,
         bias=None,
         alibi_slopes=None,
         deterministic=False,

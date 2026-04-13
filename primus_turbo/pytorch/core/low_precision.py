@@ -90,6 +90,9 @@ except AttributeError:
 
 ###################################################
 
+MXFP4_BLOCK_SIZE = 32
+MXFP8_BLOCK_SIZE = 32
+
 
 class Format(Enum):
     """
@@ -165,7 +168,7 @@ class Float8QuantConfig:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
-            mx_support_block_size = [32]
+            mx_support_block_size = [MXFP8_BLOCK_SIZE]
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
@@ -189,7 +192,7 @@ class Float4QuantConfig:
             self.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
 
-        mx_support_block_size = [32]
+        mx_support_block_size = [MXFP4_BLOCK_SIZE]
         assert (
             self.block_size in mx_support_block_size
         ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"

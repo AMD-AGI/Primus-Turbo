@@ -166,7 +166,7 @@ bool Buffer::is_internode_available() const {
 }
 
 void Buffer::DispatchLayout(
-    hipStream_t stream, ffi::Buffer<ffi::S64> topk_idx, int num_experts,
+    hipStream_t stream, ffi::Buffer<ffi::S32> topk_idx, int num_experts,
     ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> num_tokens_per_rdma_rank,
     ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert,
@@ -189,7 +189,7 @@ void Buffer::DispatchLayout(
 
 void Buffer::IntranodeDispatch(
     hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> x_scales,
-    std::optional<ffi::Buffer<ffi::S64>> topk_idx,
+    std::optional<ffi::Buffer<ffi::S32>> topk_idx,
     std::optional<ffi::Buffer<ffi::F32>> topk_weights,
     std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
     ffi::Buffer<ffi::PRED>               is_token_in_rank,
@@ -198,7 +198,7 @@ void Buffer::IntranodeDispatch(
     std::optional<ffi::Buffer<ffi::S32>> cached_channel_prefix_matrix, int expert_alignment,
     int num_worst_tokens, primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S64>>> recv_topk_idx,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rank_prefix_matrix,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> channel_prefix_matrix,
@@ -251,7 +251,7 @@ void Buffer::IntranodeDispatch(
 
     // Top-k checks
     int      num_topk         = 0;
-    int64_t *topk_idx_ptr     = nullptr;
+    int32_t *topk_idx_ptr     = nullptr;
     float   *topk_weights_ptr = nullptr;
     PRIMUS_TURBO_CHECK(topk_idx.has_value() == topk_weights.has_value());
     if (topk_idx.has_value()) {
@@ -270,7 +270,6 @@ void Buffer::IntranodeDispatch(
     float *x_scales_ptr = nullptr;
     int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
-        PRIMUS_TURBO_CHECK(x_scales->element_count() == num_tokens);
         PRIMUS_TURBO_CHECK(x_scales->dimensions().size() == 2);
         PRIMUS_TURBO_CHECK(x_scales->dimensions()[0] == num_tokens);
         num_scales =
@@ -348,7 +347,7 @@ void Buffer::IntranodeDispatch(
     }
 
     // Assign pointers
-    int64_t *recv_topk_idx_ptr     = nullptr;
+    int32_t *recv_topk_idx_ptr     = nullptr;
     float   *recv_topk_weights_ptr = nullptr;
     float   *recv_x_scales_ptr     = nullptr;
 
@@ -371,7 +370,7 @@ void Buffer::IntranodeDispatch(
                              num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
                                  sizeof(int) + // Source index buffer
                              num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
-                                 num_topk * sizeof(int64_t) + // Top-k index buffer
+                                 num_topk * sizeof(int32_t) + // Top-k index buffer
                              num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
                                  num_topk * sizeof(float) + // Top-k weight buffer
                              num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
