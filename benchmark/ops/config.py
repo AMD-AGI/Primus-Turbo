@@ -236,17 +236,25 @@ def gen_gemm_test_cases(model_config):
     return gemm_shape_list
 
 
-def gen_grouped_gemm_group_lens(b, m, balance: bool = True, num_topk: int = None):
+def gen_grouped_gemm_group_lens(b, m, balance: str = "balanced", num_topk: int = None):
     """Generate group lengths for grouped GEMM.
 
-    balance=True : all experts get exactly m tokens (uniform).
-    balance=False: simulate extreme topk MoE routing — only num_topk experts
-                   receive tokens (total/num_topk each), the rest get 0.
-                   Matches the skewed distribution observed in real training logs.
+    balance="balanced" : all experts get exactly m tokens (uniform).
+    balance="mild"     : random distribution, every expert gets tokens
+                         (0.2 + 0.8*rand, normalized). Realistic MoE routing.
+    balance="extreme"  : only num_topk experts receive tokens, rest get 0.
+                         Simulates heavily skewed topk routing.
     """
-    if balance:
+    if balance == "balanced":
         return torch.full((b,), m, dtype=torch.int64)
-    else:
+    elif balance == "mild":
+        dist = 0.2 + 0.8 * torch.rand(b)
+        dist /= dist.sum()
+        group_lens = (dist * b * m).to(torch.int64)
+        error = b * m - group_lens.sum()
+        group_lens[-1] += error
+        return group_lens
+    else:  # extreme
         total = b * m
         k = num_topk if (num_topk is not None and num_topk < b) else max(1, b // 8)
         group_lens = torch.zeros(b, dtype=torch.int64)
@@ -283,7 +291,7 @@ def _generate_moe_test_cases(
         for M in GROUPED_GEMM_M_SIZE_LIST:
             for name, (N, K) in shapes_dict.items():
                 for dtype in [torch.bfloat16]:
-                    for balance in [True, False]:
+                    for balance in ["balanced", "mild", "extreme"]:
                         test_cases.append(
                             {
                                 "Case": name,
@@ -293,7 +301,7 @@ def _generate_moe_test_cases(
                                 "K": K,
                                 "dtype": dtype,
                                 "balance": balance,
-                                "num_topk": None if balance else num_topk,
+                                "num_topk": num_topk if balance == "extreme" else None,
                             }
                         )
     return test_cases

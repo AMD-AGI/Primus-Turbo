@@ -112,18 +112,20 @@ def model_tag(case_name):
 def main():
     test_cases = gen_grouped_gemm_test_cases()
 
-    print(f"\n{'hipBLASLt vs GMM — all models, balanced & unbalanced':^80}")
-    print(f"{'BF16, MI355X':^80}")
-    print("=" * 80)
+    bal_labels = {"balanced": "B", "mild": "M", "extreme": "E"}
+
+    print(f"\n{'hipBLASLt vs GMM — balanced / mild-unbal / extreme-unbal':^90}")
+    print(f"{'BF16, MI355X':^90}")
+    print("=" * 90)
     hdr = f"{'Model':>5} {'B':>3} {'M':>5} {'N':>5} {'K':>5} {'bal':>3}  "
     hdr += f"{'op':>5}  {'HL(T)':>7} {'GMM(T)':>7} {'ratio':>7}  result"
     print(hdr)
-    print("-" * 80)
+    print("-" * 90)
 
     all_rows = []
     for case in test_cases:
         tag     = model_tag(case["Case"])
-        bal_str = "Y" if case["balance"] else "N"
+        bal_str = bal_labels[case["balance"]]
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
 
         res = bench_case(case)
@@ -135,26 +137,25 @@ def main():
                        hl_T=hl_T, gmm_T=gmm_T, ratio=ratio, beat=beat)
             all_rows.append(row)
             status = "BEAT" if beat else "BEHIND"
-            print(f"{tag:>5} {B:>3} {M:>5} {N:>5} {K:>5} {bal_str:>3}  "
+            print(f"{tag:>5} {B:>3} {M:>5} {N:>5} {K:>5}   {bal_str}  "
                   f"{op:>5}  {hl_T:>7.0f} {gmm_T:>7.0f} {ratio:>7.3f}x  {status}")
 
     # Summary
-    print("=" * 80)
+    print("=" * 90)
     n_beat  = sum(r["beat"] for r in all_rows)
     n_total = len(all_rows)
     print(f"\nOVERALL: {n_beat}/{n_total} BEAT GMM\n")
 
     # Per-model per-balance summary
     for model in ("DSV3", "20B", "LFM2"):
-        for bal in ("Y", "N"):
+        for bal, bal_name in [("B", "balanced"), ("M", "mild-unbal"), ("E", "extreme-unbal")]:
             sub = [r for r in all_rows if r["model"] == model and r["bal"] == bal]
             if not sub:
                 continue
             n_b = sum(r["beat"] for r in sub)
             avg_hl  = sum(r["hl_T"]  for r in sub) / len(sub)
             avg_gmm = sum(r["gmm_T"] for r in sub) / len(sub)
-            bal_name = "balanced" if bal == "Y" else "unbalanced"
-            print(f"  {model:>5} {bal_name:>10}: {n_b:>2}/{len(sub):>2} BEAT  "
+            print(f"  {model:>5} {bal_name:>14}: {n_b:>2}/{len(sub):>2} BEAT  "
                   f"avg HL={avg_hl:.0f}T  avg GMM={avg_gmm:.0f}T  "
                   f"ratio={avg_hl/avg_gmm:.3f}x")
 
