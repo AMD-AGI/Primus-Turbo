@@ -399,6 +399,9 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
     if backend == BackendType.CK or backend == None:
         pytest.skip("CK backend has numerical issues currently")
 
+    if backend == BackendType.TRITON and format == Format.HYBRID:
+        pytest.skip("TRITON backend not support HYBRID format currently")
+
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
     # This has been observed under pytest; root cause not yet identified. MI355 works normally.
     # Skip also when auto_tune=True because the tuner may select hipBLASLt.
