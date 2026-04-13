@@ -25,7 +25,61 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
 // new shape.  Cache the winning algo per (shape, dtype, trans, handle) tuple
 // so subsequent calls for the same problem are free.
 
+// ── Algo cache key: M-invariant ──────────────────────────────────────────────
+// hipBLASLt kernel tile selection depends on N, K, dtype, trans — NOT on M.
+// M only affects the grid launch size, not which kernel is fastest.
+// By excluding M-dependent dimensions (rows_a, lda, rows_d, ldd) from the key,
+// the autotuned algo is reused across different per-expert token counts,
+// avoiding re-autotune on every grouped GEMM call in training.
 struct AlgoKey {
+    int64_t cols_a;             // K (M-invariant)
+    int64_t rows_b, cols_b, ldb; // weight matrix shape (fixed per layer)
+    int64_t cols_d;             // N (M-invariant)
+    hipDataType A_type, B_type, D_type;
+    hipblasOperation_t transA, transB;
+    bool use_low_precision;
+    hipblasLtMatmulMatrixScale_t scale_mode;
+    hipblasLtHandle_t handle;
+
+    bool operator==(const AlgoKey &o) const {
+        return cols_a == o.cols_a &&
+               rows_b == o.rows_b && cols_b == o.cols_b && ldb == o.ldb &&
+               cols_d == o.cols_d &&
+               A_type == o.A_type && B_type == o.B_type && D_type == o.D_type &&
+               transA == o.transA && transB == o.transB &&
+               use_low_precision == o.use_low_precision && scale_mode == o.scale_mode &&
+               handle == o.handle;
+    }
+};
+
+struct AlgoKeyHash {
+    size_t operator()(const AlgoKey &k) const {
+        size_t s = 0;
+        auto hc  = [&s](auto v) {
+            s ^= std::hash<decltype(v)>{}(v) + 0x9e3779b9u + (s << 6) + (s >> 2);
+        };
+        hc(k.cols_a);
+        hc(k.rows_b); hc(k.cols_b); hc(k.ldb);
+        hc(k.cols_d);
+        hc(static_cast<int>(k.A_type));
+        hc(static_cast<int>(k.B_type));
+        hc(static_cast<int>(k.D_type));
+        hc(static_cast<int>(k.transA));
+        hc(static_cast<int>(k.transB));
+        hc(k.use_low_precision);
+        hc(static_cast<int>(k.scale_mode));
+        hc(reinterpret_cast<uintptr_t>(k.handle));
+        return s;
+    }
+};
+
+static thread_local std::unordered_map<AlgoKey, hipblasLtMatmulHeuristicResult_t, AlgoKeyHash>
+    algo_cache;
+
+// ── Descriptor cache key: includes full shape (M-dependent) ─────────────────
+// Matrix layouts must match exact dimensions, so descriptors are cached per
+// full shape. Same-shape experts (balanced routing) still get cache hits.
+struct DescKey {
     int64_t rows_a, cols_a, lda;
     int64_t rows_b, cols_b, ldb;
     int64_t rows_d, cols_d, ldd;
@@ -35,7 +89,7 @@ struct AlgoKey {
     hipblasLtMatmulMatrixScale_t scale_mode;
     hipblasLtHandle_t handle;
 
-    bool operator==(const AlgoKey &o) const {
+    bool operator==(const DescKey &o) const {
         return rows_a == o.rows_a && cols_a == o.cols_a && lda == o.lda &&
                rows_b == o.rows_b && cols_b == o.cols_b && ldb == o.ldb &&
                rows_d == o.rows_d && cols_d == o.cols_d && ldd == o.ldd &&
@@ -46,8 +100,8 @@ struct AlgoKey {
     }
 };
 
-struct AlgoKeyHash {
-    size_t operator()(const AlgoKey &k) const {
+struct DescKeyHash {
+    size_t operator()(const DescKey &k) const {
         size_t s = 0;
         auto hc  = [&s](auto v) {
             s ^= std::hash<decltype(v)>{}(v) + 0x9e3779b9u + (s << 6) + (s >> 2);
@@ -67,12 +121,6 @@ struct AlgoKeyHash {
     }
 };
 
-static thread_local std::unordered_map<AlgoKey, hipblasLtMatmulHeuristicResult_t, AlgoKeyHash>
-    algo_cache;
-
-// ── descriptor cache ────────────────────────────────────────────────────────
-// Cache matrix layouts and matmul descriptors to avoid per-call create/destroy
-// overhead (11 API calls saved per cache hit).
 struct DescCache {
     hipblasLtMatrixLayout_t A_desc = nullptr;
     hipblasLtMatrixLayout_t B_desc = nullptr;
@@ -80,7 +128,7 @@ struct DescCache {
     hipblasLtMatmulDesc_t   op_desc = nullptr;
 };
 
-static thread_local std::unordered_map<AlgoKey, DescCache, AlgoKeyHash> desc_cache;
+static thread_local std::unordered_map<DescKey, DescCache, DescKeyHash> desc_cache;
 // ─────────────────────────────────────────────────────────────────────────────
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
@@ -92,12 +140,12 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
                          const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
                          hipblasLtHandle_t handle, hipStream_t stream) {
-    // Look up or create cached descriptors for this shape.
-    AlgoKey key{rows_a,  cols_a,   lda,   rows_b,    cols_b,    ldb,
-                rows_d,  cols_d,   ldd,   A_type,    B_type,    D_type,
-                transA,  transB,   use_low_precision, scale_mode, handle};
+    // Look up or create cached descriptors for this exact shape.
+    DescKey dkey{rows_a, cols_a, lda, rows_b, cols_b, ldb,
+                 rows_d, cols_d, ldd, A_type, B_type, D_type,
+                 transA, transB, use_low_precision, scale_mode, handle};
 
-    auto &dc = desc_cache[key];
+    auto &dc = desc_cache[dkey];
     if (dc.op_desc == nullptr) {
         hipblasLtEpilogue_t  epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
         hipblasComputeType_t gemm_compute_type = HIPBLAS_COMPUTE_32F;
@@ -141,10 +189,14 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    // Look up algo cache; on first encounter, autotune across top-N heuristic
-    // candidates to find the fastest kernel for this shape.
+    // Look up algo cache; M-invariant key so different per-expert token counts
+    // reuse the same autotuned algo (kernel tile depends on N/K, not M).
+    AlgoKey akey{cols_a, rows_b, cols_b, ldb, cols_d,
+                 A_type, B_type, D_type, transA, transB,
+                 use_low_precision, scale_mode, handle};
+
     hipblasLtMatmulHeuristicResult_t algo_result{};
-    auto it = algo_cache.find(key);
+    auto it = algo_cache.find(akey);
     if (it != algo_cache.end()) {
         algo_result = it->second;
     } else {
@@ -208,7 +260,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             algo_result = candidates[best_idx];
         }
 
-        algo_cache[key] = algo_result;
+        algo_cache[akey] = algo_result;
     }
 
     const float alpha = 1.0;
