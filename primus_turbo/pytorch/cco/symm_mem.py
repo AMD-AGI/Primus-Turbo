@@ -5,7 +5,10 @@ import operator
 import torch
 import torch.distributed as dist
 from torch._tensor import _dtype_to_typestr
-from primus_turbo.pytorch.cco.pyhip_runtime_wrapper import HIPRuntimeLibrary, hipMemcpyKindEnum
+from primus_turbo.pytorch.cco.pyhip_runtime_wrapper import (
+    HIPRuntimeLibrary,
+    hipMemcpyKindEnum,
+)
 
 
 _group_name_to_workspace_tensor = {}
@@ -100,8 +103,8 @@ class SymmetricMemory:
         buffer_ptr = None
         signal_pad_ptr = None
         try:
-            buffer_ptr = self.lib.hipMalloc(alloc_size)
-            signal_pad_ptr = self.lib.hipMalloc(signal_pad_size)
+            buffer_ptr = self.lib.hipMallocUncached(alloc_size)
+            signal_pad_ptr = self.lib.hipMallocUncached(signal_pad_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.lib.hipMemset(signal_pad_ptr, 0, signal_pad_size)
 
@@ -328,7 +331,6 @@ def get_symm_mem_workspace(
     if symm_mem is None or size < min_size:
         if torch.cuda.is_current_stream_capturing():
             curr_size = 0 if symm_mem is None else symm_mem.buffer_size
-            # Growing the workspace is not safe during CUDA graph capture.
             raise RuntimeError(
                 "get_symm_mem_workspace(): cannot resize the symmetric-memory "
                 f"workspace during CUDA graph capture. Requested {min_size} bytes, "
@@ -336,8 +338,11 @@ def get_symm_mem_workspace(
                 f"`get_symm_mem_workspace(group={group.group_name!r}, "
                 f"min_size={min_size})` before starting graph capture."
             )
+        old_symm_mem = symm_mem
         symm_mem = SymmetricMemory(group, max(size, min_size))
         _group_name_to_workspace_tensor[group.group_name] = symm_mem
+        if old_symm_mem is not None:
+            old_symm_mem.destroy()
     return symm_mem
 
 
@@ -353,7 +358,7 @@ if __name__ == "__main__":
 
     def self_test_ring_write(symm: SymmetricMemory, base_value: int = 1000):
         """Write to next rank's buffer_ptr via IPC and verify local receive."""
-        if symm.num_ranks < 2:
+        if symm.world_size < 2:
             if symm.rank == 0:
                 print("Skip IPC ring-write self-test: world_size < 2")
             return
@@ -364,8 +369,8 @@ if __name__ == "__main__":
                 f"buffer_size={symm.buffer_size} is too small for self-test ({bytes_needed} bytes)"
             )
 
-        dst_rank = (symm.rank + 1) % symm.num_ranks
-        src_rank = (symm.rank - 1 + symm.num_ranks) % symm.num_ranks
+        dst_rank = (symm.rank + 1) % symm.world_size
+        src_rank = (symm.rank - 1 + symm.world_size) % symm.world_size
         stream_ptr = torch.cuda.current_stream().cuda_stream
 
         send = torch.tensor([base_value + symm.rank],
@@ -395,7 +400,7 @@ if __name__ == "__main__":
         got = int(recv.item())
         ok = got == expected
 
-        gathered = [None] * symm.num_ranks
+        gathered = [None] * symm.world_size
         dist.all_gather_object(
             gathered, (symm.rank, got, expected, ok), group=symm.group)
         if symm.rank == 0:

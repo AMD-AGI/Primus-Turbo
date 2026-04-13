@@ -273,6 +273,37 @@ def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
 
 
+def indices_to_multihot(num_local_experts, indices, probs):
+    """
+    Converts a tensor of indices to a multihot vector.
+
+    Args:
+        indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
+        probs (torch.Tensor): [num_tokens, topk] token probabilities.
+
+    Returns:
+        A tuple of (routing_map, probs), where routing_map is the multihot vector
+        and probs is the multihot probabilities.
+    """
+    batch_size = indices.shape[0]
+    multihot_routing_map = torch.zeros(
+        (batch_size, num_local_experts), dtype=torch.long, device=indices.device
+    )
+
+    multihot_probs = torch.zeros(
+        (batch_size, num_local_experts), dtype=torch.float, device=indices.device
+    )
+
+    mask = indices != -1
+    valid_indices = indices[mask]
+    row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
+        mask.sum(dim=1)
+    )
+    multihot_routing_map[row_indices, valid_indices] = 1
+    multihot_probs[row_indices, valid_indices] = probs[mask]
+    return multihot_routing_map.bool(), multihot_probs
+
+
 def permute(
     tokens: torch.Tensor,
     routing_map: torch.Tensor,

@@ -4,37 +4,24 @@
 #include <cuda_runtime.h>
 
 namespace primus_turbo::cco::ep {
-
-void get_dispatch_layout(int64_t const *topk_idx, int *num_tokens_per_rank,
-                         int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
-                         bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
-                         int num_experts, cudaStream_t stream);
-
 namespace intranode {
 
-void notify_dispatch(int const *num_tokens_per_rank, int *moe_recv_counter_mapped, int num_ranks,
-                     int const *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
-                     int num_experts, int num_tokens, bool const *is_token_in_rank,
-                     int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
-                     int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
-                     cudaStream_t stream, int num_channels);
+void fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
+                            int *permute_src_row_id, int *dense_to_expert_map,
+                            void const *x, float const *x_scales, int64_t const *topk_idx,
+                            float const *topk_weights, bool const *is_token_in_rank,
+                            int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,
+                            void *recv_x, int num_tokens, int hidden_int4, int num_topk,
+                            int num_experts, int num_scales, int scale_token_stride,
+                            int scale_hidden_stride, int rank, int num_ranks, cudaStream_t stream,
+                            int num_sms, int num_max_tokens, int num_max_send_tokens);
 
-void cached_notify_dispatch(int const *rank_prefix_matrix, int num_memset_int, void **buffer_ptrs,
-                            int **barrier_signal_ptrs, int rank, int num_ranks,
-                            cudaStream_t stream);
 
-void dispatch(void **workspace_ptrs, void const *x, float const *x_scales, int64_t const *topk_idx,
-              float const *topk_weights, bool const *is_token_in_rank,
-              int const *channel_prefix_matrix, int num_tokens, int hidden_int4, int num_topk,
-              int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
-              int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens);
+void fused_unpermute_combine(void **buffer_ptrs, void const *permuted_x,
+                             float const *permuted_weights, int const *dense_to_expert_map,
+                             int const *expert_offsets, void *combined_x, int num_recv_tokens,
+                             int hidden_int4, int num_topk, int num_experts_per_rank, int rank,
+                             int num_ranks, cudaStream_t stream, int num_sms);
 
-void dispatch_with_permute(void **workspace_ptrs, void const *x, float const *x_scales,
-                           int64_t const *topk_idx, float const *topk_weights,
-                           bool const *is_token_in_rank, int const *channel_prefix_matrix,
-                           int const *row_id_map, void *recv_x, int num_tokens, int hidden_int4,
-                           int num_topk, int num_experts, int num_scales, int scale_token_stride,
-                           int scale_hidden_stride, int rank, int num_ranks, cudaStream_t stream,
-                           int num_sms, int num_max_tokens, int num_max_send_tokens);
 } // namespace intranode
 } // namespace primus_turbo::cco::ep

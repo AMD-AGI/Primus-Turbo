@@ -18,6 +18,13 @@ class hipMemcpyKindEnum:
     hipMemcpyDeviceToDevice = 3
     hipMemcpyDefault = 4
 
+class hipExtMallocFlagsEnum:
+    hipDeviceMallocDefault = 0x0
+    hipDeviceMallocFinegrained = 0x1
+    hipMallocSignalMemory = 0x2
+    hipDeviceMallocUncached = 0x3
+    hipDeviceMallocContiguous = 0x4
+
 
 class hipIpcMemFlagsEnum:
     hipIpcMemLazyEnablePeerAccess = 1
@@ -75,6 +82,8 @@ class HIPRuntimeLibrary:
         ),
         # hipError_t hipMalloc(void** ptr, size_t size)
         Function("hipMalloc", hipError_t, [ctypes.POINTER(buffer_type), ctypes.c_size_t]),
+        # hipError_t hipExtMallocWithFlags(void** ptr, size_t size, unsigned int flags)
+        Function("hipExtMallocWithFlags", hipError_t, [ctypes.POINTER(buffer_type), ctypes.c_size_t, ctypes.c_uint]),
         # hipError_t hipFree(void* ptr)
         Function("hipFree", hipError_t, [buffer_type]),
         # hipError_t hipMemset(void* ptr, int value, size_t sizeBytes)
@@ -163,6 +172,14 @@ class HIPRuntimeLibrary:
     def hipMalloc(self, size_bytes: int) -> buffer_type:
         ptr = buffer_type()
         self.HIP_CHECK(self._funcs["hipMalloc"](ctypes.byref(ptr), size_bytes))
+        return ptr
+    
+    def hipMallocUncached(self, size_bytes: int) -> buffer_type:
+        return self.hipExtMallocWithFlags(size_bytes, hipExtMallocFlagsEnum.hipDeviceMallocUncached)
+    
+    def hipExtMallocWithFlags(self, size_bytes: int, flags: hipExtMallocFlagsEnum) -> buffer_type:
+        ptr = buffer_type()
+        self.HIP_CHECK(self._funcs["hipExtMallocWithFlags"](ctypes.byref(ptr), size_bytes, flags))
         return ptr
 
     def hipFree(self, ptr: int | buffer_type) -> None:

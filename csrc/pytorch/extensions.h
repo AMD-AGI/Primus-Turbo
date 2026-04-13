@@ -180,50 +180,45 @@ int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint3
 
 void destroy_stream(const int device_id, const int64_t stream_ptr);
 
+namespace cco {
+
+namespace intranode {
+
 //==================================================================
 //  CCO
 //==================================================================
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-fused_dispatch_groupedgemm(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
-                           const std::optional<at::Tensor> &topk_idx,
-                           const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
-                           const at::Tensor &workspace, const std::string &group_name,
-                           const int64_t num_sms);
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           at::Tensor>
-fused_dispatch_groupedgemm_meta(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
-                                const std::optional<at::Tensor> &topk_idx,
-                                const std::optional<at::Tensor> &topk_weights, int64_t num_experts,
-                                const at::Tensor &workspace, const std::string &group_name,
-                                const int64_t num_sms);
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           at::Tensor>
-fused_dispatch(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
-               const std::optional<at::Tensor> &topk_idx,
-               const std::optional<at::Tensor> &topk_weights, torch::Tensor &workspace,
-               const std::string &group_name, int num_experts, int expert_alignment, int num_sms);
-
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
-get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, int num_ranks,
-                    int num_rdma_ranks);
-
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor>
-intranode_dispatch_with_permute(
-    const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
-    const torch::Tensor &row_id_map, const std::optional<torch::Tensor> &topk_idx,
-    const std::optional<torch::Tensor> &topk_weights,
-    const std::optional<torch::Tensor> &num_tokens_per_rank, const torch::Tensor &is_token_in_rank,
-    const std::optional<torch::Tensor> &num_tokens_per_expert, int cached_num_recv_tokens,
-    const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
-    const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
-    const torch::Tensor &buffer_ptrs_dev, const torch::Tensor &barrier_signal_ptrs_dev,
-    const torch::Tensor &moe_recv_counter, const torch::Tensor &moe_recv_expert_counter,
-    int expert_alignment, int num_worst_tokens, int num_permuted_tokens, int rank, int num_ranks,
-    int num_sms, int num_max_send_tokens = 32);
+fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
+                                  const torch::Tensor &buffer_ptrs_dev,
+                                  const torch::Tensor &barrier_signal_ptrs_dev,
+                                  torch::Tensor        moe_recv_counter,
+                                  torch::Tensor moe_recv_expert_counter, int num_experts,
+                                  int expert_alignment, int num_worst_tokens, int rank,
+                                  int num_ranks, int num_sms);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+                       const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
+                       const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
+                       const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
+                       int num_worst_tokens, int num_permuted_tokens, int num_experts, int rank,
+                       int num_ranks, int num_sms, int num_max_send_tokens);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+moe_permute_atomic(const torch::Tensor &recv_x, const torch::Tensor &recv_topk_idx,
+                   const torch::Tensor &recv_topk_weights, const torch::Tensor &expert_offsets,
+                   int num_local_experts, int total_permuted_tokens, int num_sms);
+
+torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,
+                                      const torch::Tensor &permuted_weights,
+                                      const torch::Tensor &dense_to_expert_map,
+                                      const torch::Tensor &expert_offsets,
+                                      const torch::Tensor &buffer_ptrs_dev, int num_recv_tokens,
+                                      int num_experts, int rank, int num_ranks, int num_sms);
+
+} // namespace intranode
+
+} // namespace cco
 } // namespace primus_turbo::pytorch

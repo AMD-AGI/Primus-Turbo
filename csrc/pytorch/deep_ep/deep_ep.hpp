@@ -37,10 +37,10 @@ private:
     void   *rdma_buffer_ptr = nullptr;
 
     // Device info and communication
-    int               device_id;
-    int               num_device_sms;
-    int               rank, rdma_rank, nvl_rank;
-    int               num_ranks, num_rdma_ranks, num_nvl_ranks;
+    int                device_id;
+    int                num_device_sms;
+    int                rank, rdma_rank, nvl_rank;
+    int                num_ranks, num_rdma_ranks, num_nvl_ranks;
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
@@ -197,6 +197,20 @@ public:
 
     torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                                       int hidden, int num_experts) const;
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor>
+    intranode_dispatch_with_permute(
+        const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+        const std::optional<torch::Tensor> &topk_idx,
+        const std::optional<torch::Tensor> &topk_weights,
+        const std::optional<torch::Tensor> &num_tokens_per_rank,
+        const torch::Tensor                &is_token_in_rank,
+        const std::optional<torch::Tensor> &num_tokens_per_expert, int cached_num_recv_tokens,
+        const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
+        const std::optional<torch::Tensor> &cached_channel_prefix_matrix, int expert_alignment,
+        int num_worst_tokens, int num_permuted_tokens, const primus_turbo::deep_ep::Config &config);
 };
 
 } // namespace primus_turbo::pytorch::deep_ep

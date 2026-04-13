@@ -7,15 +7,15 @@ using i32_gptr = __attribute__((address_space(1))) int *;
 using u8_gptr  = __attribute__((address_space(1))) uint8_t *;
 using f32_gptr = __attribute__((address_space(1))) float *;
 
-#ifdef DISABLE_BUILTIN_SHLF_SYNC
-// use __shlf instead of __shlf_sync will speed up combine performance
-#define __shfl_xor_sync(mask, var, srcLane) __shfl_xor((var), (srcLane))
-#define __shfl_sync(mask, var, srcLane) __shfl((var), (srcLane))
-#endif
+// #ifdef DISABLE_BUILTIN_SHLF_SYNC
+// // use __shlf instead of __shlf_sync will speed up combine performance
+// #define __shfl_xor_sync(mask, var, srcLane) __shfl_xor((var), (srcLane))
+// #define __shfl_sync(mask, var, srcLane) __shfl((var), (srcLane))
+// #endif
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
-#endif
+// #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+// #define __syncwarp(...) __builtin_amdgcn_wave_barrier()
+// #endif
 
 // workgroup-level barrier sync used shared memory
 namespace amd {
@@ -312,6 +312,28 @@ __device__ __forceinline__ void mbarrier_init(uint64_t *mbar_ptr, uint32_t arriv
 template <uint32_t kNumLanes = WARP_SIZE, typename T>
 __forceinline__ __device__ T warp_reduce_sum(T value) {
     return warp_reduce<kNumLanes, T>(value, ReduceSum<T>{});
+}
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+using warp_mask_t = unsigned long long;
+#else
+using warp_mask_t = unsigned int;
+#endif
+
+__device__ __forceinline__ warp_mask_t warp_ballot(bool pred) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __ballot(pred);
+#else
+    return __ballot_sync(WARP_MASK, pred);
+#endif
+}
+
+__device__ __forceinline__ int warp_find_first_set(warp_mask_t mask) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __ffsll(static_cast<long long>(mask)) - 1;
+#else
+    return __ffs(static_cast<int>(mask)) - 1;
+#endif
 }
 
 __forceinline__ __device__ int fast_log2_ceil(float x) {

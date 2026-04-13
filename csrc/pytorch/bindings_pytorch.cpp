@@ -190,11 +190,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     //     runtime_module.def("destroy_stream", &destroy_stream);
 
     // ********* CCO *********
-
-    // m.def("fused_dispatch_groupedgemm", primus_turbo::pytorch::fused_dispatch_groupedgemm);
-    // m.def("fused_dispatch", primus_turbo::pytorch::fused_dispatch);
-    m.def("get_dispatch_layout", primus_turbo::pytorch::get_dispatch_layout);
-    m.def("intranode_dispatch_with_permute", primus_turbo::pytorch::intranode_dispatch_with_permute);
+    m.def("fused_dispatch_permute_preprocess", cco::intranode::fused_dispatch_permute_preprocess);
+    m.def("fused_dispatch_permute", cco::intranode::fused_dispatch_permute);
+    m.def("fused_unpermute_combine", cco::intranode::fused_unpermute_combine);
 }
 
 /********************************************/

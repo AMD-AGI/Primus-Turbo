@@ -528,6 +528,24 @@ class Buffer:
                 EventOverlap(event),
             )
 
+
+    def dispatch_with_permute(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        handle: Optional[Tuple] = None,
+        num_tokens_per_rank: Optional[torch.Tensor] = None,
+        num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+        is_token_in_rank: Optional[torch.Tensor] = None,
+        num_tokens_per_expert: Optional[torch.Tensor] = None,
+        topk_idx: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        expert_alignment: int = 1,
+        num_worst_tokens: int = 0,
+        num_permuted_tokens: int = 0,
+        config: Optional[Config] = None,
+    ) :
+        pass
+
     # noinspection PyTypeChecker
     def combine(
         self,
