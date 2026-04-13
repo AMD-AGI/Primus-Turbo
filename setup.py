@@ -1,3 +1,4 @@
+import importlib.metadata
 import importlib.util
 import os
 import platform
@@ -84,8 +85,17 @@ def check_submodules():
 
 
 def is_package_installed(package_name):
-    """Check if a package is installed in the current Python environment."""
-    return importlib.util.find_spec(package_name) is not None
+    """Check if a package is properly installed (has distribution metadata).
+
+    Uses importlib.metadata instead of importlib.util.find_spec to avoid
+    false positives from namespace packages or stale JIT cache directories
+    that lack proper pip metadata.
+    """
+    try:
+        importlib.metadata.distribution(package_name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 
 def all_files_in_dir(path, name_extensions=None):
