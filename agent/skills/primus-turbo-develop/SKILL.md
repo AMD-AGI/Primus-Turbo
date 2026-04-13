@@ -269,98 +269,98 @@ benchmark/ops/                   # Operator benchmarks
 
 ---
 
-## 算子优化
+## Operator Optimization
 
-收到算子优化需求时，本节是 agent 的**第一站**。
+This section is the agent's **first stop** when receiving an operator optimization request.
 
-### 流程总览
+### Process Overview
 
-1. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
-2. **按需求清单收集项目信息**（从本文件各节获取）
-   - kernel 源文件路径：从 [Code Structure](#code-structure-quick-reference) 和 [Key GEMM-Related Files](#key-gemm-related-files) 查到
-   - focused test 命令 + quick test 命令：从 [Testing](#testing) 和 [Quick 验证](#quick-验证) 组装
-   - focused benchmark 命令 + quick benchmark 命令：从 [Benchmark](#benchmark) 和 [Quick 验证](#quick-验证) 组装
-   - benchmark 输出格式和可用性能指标：从 [Output Metrics](#output-metrics) 查到
-   - 评分规则：从下方 [优化评分](#优化评分) 获取
-   - `execution_mode` 建议和 rebuild 要求：从下方 [优化环境](#优化环境) 获取
-3. **交给 `kernel-optimize/SKILL.md`**，带着上述信息，由其自主完成优化闭环并输出报告
-4. **验收**：优化完成后，回到项目视角做最终确认
-   - 在主仓跑**完整测试**（不只是 focused test），确保无回归：`pytest tests/pytorch/ops/ -v`
-   - 审查优化报告：性能提升是否达标、改动是否合理、是否有遗留风险
-   - 确认代码已正确 commit 到主仓，diff 干净
+1. **Read `kernel-optimize/SKILL.md`'s "Prerequisite Information"** to understand what the optimization framework needs from the project
+2. **Collect project information per the requirement checklist** (from sections in this file)
+   - Kernel source file path: look up in [Code Structure](#code-structure-quick-reference) and [Key GEMM-Related Files](#key-gemm-related-files)
+   - Focused test command + quick test command: assemble from [Testing](#testing) and [Quick Validation](#quick-validation)
+   - Focused benchmark command + quick benchmark command: assemble from [Benchmark](#benchmark) and [Quick Validation](#quick-validation)
+   - Benchmark output format and available performance metrics: look up in [Output Metrics](#output-metrics)
+   - Scoring rules: from [Optimization Scoring](#optimization-scoring) below
+   - `execution_mode` recommendation and rebuild requirements: from [Optimization Environment](#optimization-environment) below
+3. **Hand off to `kernel-optimize/SKILL.md`** with the above information; it autonomously completes the optimization loop and outputs a report
+4. **Acceptance**: After optimization is complete, return to the project perspective for final confirmation
+   - Run **full tests** in the main repo (not just focused tests) to ensure no regressions: `pytest tests/pytorch/ops/ -v`
+   - Review the optimization report: whether performance improvement meets targets, whether changes are reasonable, whether there are residual risks
+   - Confirm code is correctly committed to the main repo with a clean diff
 
-### 优化环境
+### Optimization Environment
 
-由 agent 根据任务特点判断使用 `repo-mode`（直接在仓库改）还是 `workspace-mode`（搭建最小开发环境，优化后再集成回来）。以下是 Primus-Turbo 的参考建议：
+The agent decides whether to use `repo-mode` (modify directly in the repository) or `workspace-mode` (set up a minimal development environment, then integrate back after optimization) based on task characteristics. Here are Primus-Turbo's recommendations:
 
-- **Triton kernel**：通常 `repo-mode`。Editable install 下改完即生效，无需 rebuild，迭代很快。
-- **HIP / C++ kernel**：视情况。改动面小、调参为主时可 `repo-mode`（增量 rebuild：`GPU_ARCHS=<arch> pip install --no-build-isolation -e . -v`）；若需要大规模试错或从头写新 kernel，`workspace-mode` 可能更合适，避免每次都跑主仓的完整构建链路。
+- **Triton kernel**: Typically `repo-mode`. Under editable install, changes take effect immediately with no rebuild needed, enabling fast iteration.
+- **HIP / C++ kernel**: Depends on the situation. For small scope changes focused on parameter tuning, `repo-mode` works (incremental rebuild: `GPU_ARCHS=<arch> pip install --no-build-isolation -e . -v`). For extensive trial-and-error or writing a new kernel from scratch, `workspace-mode` may be more appropriate to avoid running the main repo's full build pipeline each time.
 
-`workspace-mode` 的搭建规范由 `kernel-optimize/SKILL.md` 定义。
+The setup specification for `workspace-mode` is defined in `kernel-optimize/SKILL.md`.
 
-### 优化评分
+### Optimization Scoring
 
-性能指标取决于算子类型，由 benchmark 输出列决定。常见指标：
+Performance metrics depend on the operator type and are determined by the benchmark output columns. Common metrics:
 
-| 算子类型 | 典型指标 |
-|---------|---------|
-| Compute-bound（GEMM 等） | `Forward TFLOPS`、`Backward TFLOPS` |
-| Memory-bound（elementwise、quantization 等） | `Forward GB/s`、`Backward GB/s` |
+| Operator Type | Typical Metrics |
+|--------------|-----------------|
+| Compute-bound (GEMM, etc.) | `Forward TFLOPS`, `Backward TFLOPS` |
+| Memory-bound (elementwise, quantization, etc.) | `Forward GB/s`, `Backward GB/s` |
 
-用户在优化开始时确认需要优化哪些指标（`primary_metric`）。优化闭环中以所有目标 shape 的指定指标 **几何平均**作为 `aggregate score`，任一 shape `Check = FAIL` 则该候选直接拒绝。
+The user confirms which metrics to optimize (`primary_metric`) at the start of optimization. The optimization loop uses the **geometric mean** of the specified metrics across all target shapes as the `aggregate score`. Any shape with `Check = FAIL` results in immediate rejection of that candidate.
 
-Benchmark 的输出格式、shape 来源、测量方式见上方 [Benchmark](#benchmark) 节。
+For benchmark output format, shape sources, and measurement methodology, see the [Benchmark](#benchmark) section above.
 
-### Quick 验证
+### Quick Validation
 
-每轮 VALIDATE 默认使用 quick 验证（代表性 shape subset），加速迭代。BASELINE 和最终验收使用 full 验证。
+Each VALIDATE round defaults to quick validation (representative shape subset) to accelerate iteration. BASELINE and final acceptance use full validation.
 
-**代表性 shape 选取原则**：agent 在 BASELINE 阶段从 full benchmark 结果中选取 3-5 个代表性 shape，覆盖小/中/大规模。选取标准：
-- 至少包含 1 个小 shape（容易暴露 launch overhead 问题）
-- 至少包含 1 个大 shape（容易暴露 memory / compute 瓶颈）
-- 优先选择性能差异大的 shape（更敏感，能快速检测退步）
+**Representative shape selection criteria**: During the BASELINE phase, the agent selects 3-5 representative shapes from the full benchmark results, covering small/medium/large scales. Selection criteria:
+- Include at least 1 small shape (prone to exposing launch overhead issues)
+- Include at least 1 large shape (prone to exposing memory / compute bottlenecks)
+- Prefer shapes with large performance variance (more sensitive, can quickly detect regressions)
 
-选出的 shape 列表记录在 `manifest.yaml` 的 `representative_shapes` 字段中。
+The selected shape list is recorded in the `representative_shapes` field of `manifest.yaml`.
 
-**Quick test**：使用 focused test 命令加 `--maxfail=3` 快速失败，侧重快速拦截明显问题。
+**Quick test**: Use the focused test command with `--maxfail=3` for fast failure, focusing on quickly intercepting obvious issues.
 
-**Quick benchmark**：如果 benchmark 脚本支持 shape 过滤参数，则只跑代表性 shape；如果不支持，跑 full benchmark 后从结果中提取代表性 shape 的数据做快速判断。
+**Quick benchmark**: If the benchmark script supports shape filtering parameters, run only the representative shapes. If not, run the full benchmark and extract the representative shapes' data from the results for quick assessment.
 
-### Demo：优化 blockwise FP8 GEMM Triton on MI300X
+### Demo: Optimizing blockwise FP8 GEMM Triton on MI300X
 
-以下以 blockwise FP8 GEMM Triton on MI300X 为例。
+The following uses blockwise FP8 GEMM Triton on MI300X as an example.
 
-**1. 读 `kernel-optimize/SKILL.md` 的前置信息需求**
+**1. Read `kernel-optimize/SKILL.md`'s prerequisite information**
 
-得知优化框架需要：kernel 源文件、focused test/quick test、focused benchmark/quick benchmark、benchmark 输出格式、评分规则、execution_mode 建议、rebuild 要求。
+Learn that the optimization framework needs: kernel source file, focused test/quick test, focused benchmark/quick benchmark, benchmark output format, scoring rules, execution_mode recommendation, rebuild requirements.
 
-**2. 按需求清单收集项目信息**
+**2. Collect project information per the requirement checklist**
 
-从本文件各节获取：
-- Kernel 源文件：`primus_turbo/triton/gemm/gemm_fp8_kernel.py`（查 [Key GEMM-Related Files](#key-gemm-related-files)）
-- Focused test：`pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`（查 [Testing](#testing)）
-- Quick test：同上 + `--maxfail=3`（查 [Quick 验证](#quick-验证)）
-- Focused benchmark：`PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`（查 [Benchmark](#benchmark)）
-- Quick benchmark：同上，从 full 结果中提取代表性 shape 数据（查 [Quick 验证](#quick-验证)）
-- 可用指标：`Forward TFLOPS`、`Backward TFLOPS`，`Check` 为正确性门控（查 [优化评分](#优化评分)）
-- 环境建议：Triton → `repo-mode`，无需 rebuild（查 [优化环境](#优化环境)）
+Gather from sections in this file:
+- Kernel source file: `primus_turbo/triton/gemm/gemm_fp8_kernel.py` (see [Key GEMM-Related Files](#key-gemm-related-files))
+- Focused test: `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` (see [Testing](#testing))
+- Quick test: same as above + `--maxfail=3` (see [Quick Validation](#quick-validation))
+- Focused benchmark: `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` (see [Benchmark](#benchmark))
+- Quick benchmark: same as above, extract representative shape data from full results (see [Quick Validation](#quick-validation))
+- Available metrics: `Forward TFLOPS`, `Backward TFLOPS`, `Check` as correctness gate (see [Optimization Scoring](#optimization-scoring))
+- Environment recommendation: Triton → `repo-mode`, no rebuild needed (see [Optimization Environment](#optimization-environment))
 
-**3. 交给 `kernel-optimize/SKILL.md`**
+**3. Hand off to `kernel-optimize/SKILL.md`**
 
-带着以上信息，由其完成 DEFINE_TARGET（含向用户确认目标）、PREPARE_ENVIRONMENT、优化闭环并输出报告。
+With the above information, it completes DEFINE_TARGET (including target confirmation with user), PREPARE_ENVIRONMENT, the optimization loop, and outputs a report.
 
-**4. 验收**
+**4. Acceptance**
 
-回到项目视角做最终确认：
-- 在主仓跑完整测试（不只是 focused test）：`pytest tests/pytorch/ops/ -v`
-- 审查优化报告：性能提升是否达标、改动是否合理
-- 确认代码已正确 commit（若 `git_commit=true`），diff 干净
+Return to the project perspective for final confirmation:
+- Run full tests in the main repo (not just focused tests): `pytest tests/pytorch/ops/ -v`
+- Review the optimization report: whether performance improvement meets targets, whether changes are reasonable
+- Confirm code is correctly committed (if `git_commit=true`) with a clean diff
 
 ---
 
 ## 相关 Skills
 
-- **算子性能优化**: `kernel-optimize/SKILL.md`（优化闭环、工作流、Triton/HIP 策略）
+- **Operator performance optimization**: `kernel-optimize/SKILL.md` (optimization loop, workflow, Triton/HIP strategies)
 
 ## Additional References
 
