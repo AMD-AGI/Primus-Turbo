@@ -68,8 +68,9 @@ public:
     }
 
     void run(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-        PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
-        (void) pre_sync;
+        if (pre_sync) {
+            PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
+        }
 
         check(params);
         compute_args(params);

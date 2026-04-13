@@ -133,7 +133,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         algo_result = it->second;
     } else {
         static constexpr int kMaxCandidates = 8;
-        static constexpr int kBenchIters    = 5;
+        static constexpr int kWarmupIters   = 10;
+        static constexpr int kBenchIters    = 30;
         hipblasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
         int returnedAlgoCount = 0;
         hipblasLtMatmulPreference_t preference = nullptr;
@@ -164,9 +165,11 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             int   best_idx = 0;
             for (int c = 0; c < returnedAlgoCount; ++c) {
                 // warm-up
-                (void)hipblasLtMatmul(handle, operation_desc, &a1,
-                    A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
-                    &candidates[c].algo, workspace, workspace_size, stream);
+                for (int w = 0; w < kWarmupIters; ++w) {
+                    (void)hipblasLtMatmul(handle, operation_desc, &a1,
+                        A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
+                        &candidates[c].algo, workspace, workspace_size, stream);
+                }
 
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_start, stream));
                 for (int i = 0; i < kBenchIters; ++i) {
