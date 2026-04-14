@@ -204,11 +204,14 @@ def _run_gemm_fp8_deterministic_test(
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if backend == BackendType.TRITON and format == Format.HYBRID:
+        pytest.skip("TRITON backend does not support HYBRID format currently.")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,

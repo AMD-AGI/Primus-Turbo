@@ -47,6 +47,48 @@ template <> struct TorchToCKTileType<at::kFloat> {
     using type = float32;
 };
 
+#define TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F8(scalar_type, NAME, ...)                        \
+    switch (scalar_type) {                                                                         \
+    case at::kFloat8_e4m3fnuz: {                                                                   \
+        using NAME = typename TorchToCKTileType<at::kFloat8_e4m3fnuz>::type;                       \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    case at::kFloat8_e4m3fn: {                                                                     \
+        using NAME = typename TorchToCKTileType<at::kFloat8_e4m3fn>::type;                         \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    case at::kFloat8_e5m2fnuz: {                                                                   \
+        using NAME = typename TorchToCKTileType<at::kFloat8_e5m2fnuz>::type;                       \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    case at::kFloat8_e5m2: {                                                                       \
+        using NAME = typename TorchToCKTileType<at::kFloat8_e5m2>::type;                           \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    default:                                                                                       \
+        PRIMUS_TURBO_ERROR("Invalid scalar type");                                                 \
+    }
+
+#define TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F16(scalar_type, NAME, ...)                       \
+    switch (scalar_type) {                                                                         \
+    case at::kHalf: {                                                                              \
+        using NAME = typename TorchToCKTileType<at::kHalf>::type;                                  \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    case at::kBFloat16: {                                                                          \
+        using NAME = typename TorchToCKTileType<at::kBFloat16>::type;                              \
+        __VA_ARGS__                                                                                \
+        break;                                                                                     \
+    }                                                                                              \
+    default:                                                                                       \
+        PRIMUS_TURBO_ERROR("Invalid scalar type");                                                 \
+    }
+
 //==================================================================
 //  DataType Mapping : at::ScalarType -> HipBLASLt Type
 //==================================================================

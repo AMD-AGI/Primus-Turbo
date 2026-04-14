@@ -63,7 +63,7 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
 
     at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
 
-    auto stream = at::hip::getCurrentHIPStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
 
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
@@ -189,7 +189,7 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
 
     at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
 
-    auto stream = at::hip::getCurrentHIPStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
 
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
@@ -312,7 +312,7 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
 
     at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
 
-    auto stream = at::hip::getCurrentHIPStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
 
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;

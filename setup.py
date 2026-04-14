@@ -203,6 +203,8 @@ def get_common_flags():
         f"-L/usr/lib/{arch}-linux-gnu",
         "-fgpu-rdc",
         "--hip-link",
+        "-Xoffload-linker",
+        "--allow-multiple-definition",
     ]
 
     cxx_flags = [
