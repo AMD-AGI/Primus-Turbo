@@ -6,8 +6,8 @@
  * See LICENSE for license information.
  */
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/HIPDataType.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
 #include <chrono>
 #include <hip/hip_runtime.h>
 #include <pybind11/functional.h>
@@ -24,9 +24,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
                bool use_default_stream_as_comm_stream)
     : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes), rank(rank), num_ranks(num_ranks),
-      comm_stream(use_default_stream_as_comm_stream
-                      ? at::hip::getCurrentHIPStreamMasqueradingAsCUDA()
-                      : at::hip::getStreamFromPoolMasqueradingAsCUDA(true)),
+      comm_stream(use_default_stream_as_comm_stream ? at::cuda::getCurrentCUDAStream()
+                                                    : at::cuda::getStreamFromPool(true)),
       explicitly_destroy(explicitly_destroy),
       use_default_stream_as_comm_stream(use_default_stream_as_comm_stream) {
     // Metadata memory
@@ -299,10 +298,10 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(comm_stream);
+        at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
     if (not use_default_stream_as_comm_stream) {
@@ -356,7 +355,7 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(compute_stream);
+        at::cuda::setCurrentCUDAStream(compute_stream);
 
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
             event};
@@ -461,10 +460,10 @@ Buffer::intranode_dispatch(
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(comm_stream);
+        at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
     // Wait previous tasks to be finished
@@ -634,7 +633,7 @@ Buffer::intranode_dispatch(
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(compute_stream);
+        at::cuda::setCurrentCUDAStream(compute_stream);
 
     // Return values
     return {recv_x,
@@ -688,10 +687,10 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(comm_stream);
+        at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
     // Wait previous tasks to be finished
@@ -778,7 +777,7 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::hip::setCurrentHIPStreamMasqueradingAsCUDA(compute_stream);
+        at::cuda::setCurrentCUDAStream(compute_stream);
 
     return {recv_x, recv_topk_weights, event};
 }
