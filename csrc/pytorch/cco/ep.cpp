@@ -71,7 +71,7 @@ fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
             channel_prefix_matrix, expert_prefix,           channel_expert_prefix};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
                        const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
@@ -119,14 +119,12 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
     auto recv_topk_weights =
         torch::empty({num_worst_tokens, num_topk},
                      torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-    auto permute_src_row_id = torch::empty({num_permuted_tokens}, int32_opts);
-    // dense_to_expert_map: [num_worst_tokens, num_experts_per_rank] initialized to -1
-    auto dense_to_expert_map =
-        torch::full({num_worst_tokens, num_experts_per_rank}, -1, int32_opts);
+    auto dispatch_to_expert_map =
+        torch::full({num_worst_tokens, num_topk}, -1, int32_opts);
 
     primus_turbo::cco::ep::intranode::fused_dispatch_permute(
         buffer_ptrs_gpu, recv_topk_idx.data_ptr<int64_t>(), recv_topk_weights.data_ptr<float>(),
-        permute_src_row_id.data_ptr<int>(), dense_to_expert_map.data_ptr<int>(), x.data_ptr(),
+        dispatch_to_expert_map.data_ptr<int>(), x.data_ptr(),
         x_scales_ptr, topk_idx.data_ptr<int64_t>(), topk_weights_ptr,
         is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
         num_recv_tokens_per_expert.data_ptr<int>(), recv_x.data_ptr(), num_tokens,
@@ -134,8 +132,7 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
         num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms,
         num_worst_tokens, num_max_send_tokens);
 
-    return std::make_tuple(recv_x, recv_topk_idx, recv_topk_weights, permute_src_row_id,
-                           dense_to_expert_map);
+    return std::make_tuple(recv_x, recv_topk_idx, recv_topk_weights, dispatch_to_expert_map);
 }
 
 // torch::Tensor fused_unpermute_combine(const torch::Tensor &permuted_x,

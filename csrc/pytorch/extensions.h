@@ -198,7 +198,7 @@ fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
                                   int expert_alignment, int num_worst_tokens, int rank,
                                   int num_ranks, int num_sms);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
                        const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
                        const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,

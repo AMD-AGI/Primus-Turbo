@@ -4,22 +4,19 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-#define NUM_MAX_LOCAL_EXPERTS 256
-
 namespace primus_turbo::cco::ep {
 namespace intranode {
 
 template <int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
     fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
-                           int *permute_src_row_id, int *dense_to_expert_map, int4 const *x,
-                           float const *x_scales, int64_t const *topk_idx,
-                           float const *topk_weights, bool const *is_token_in_rank,
-                           int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,
-                           int4 *recv_x, int num_tokens, int hidden_int4, int num_topk,
-                           int num_experts, int num_scales, int scale_token_stride,
-                           int scale_hidden_stride, int rank, int num_max_tokens,
-                           int num_max_send_tokens) {
+                           int *dispatch_to_expert_map, int4 const *x, float const *x_scales,
+                           int64_t const *topk_idx, float const *topk_weights,
+                           bool const *is_token_in_rank, int const *channel_prefix_matrix,
+                           int const *num_recv_tokens_per_expert, int4 *recv_x, int num_tokens,
+                           int hidden_int4, int num_topk, int num_experts, int num_scales,
+                           int scale_token_stride, int scale_hidden_stride, int rank,
+                           int num_max_tokens, int num_max_send_tokens) {
     auto const num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     auto const thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -181,9 +178,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         if (thread_id < num_experts_per_rank)
             shared_expert_prefix_sum[thread_id] = num_recv_tokens_per_expert[thread_id];
         __syncthreads();
-        if (thread_id == 0)
-            for (int i = 1; i < num_experts_per_rank; i++)
-                shared_expert_prefix_sum[i] += shared_expert_prefix_sum[i - 1];
+        if (thread_id == 0) {
+            int prev = 0;
+            for (int i = 0; i < num_experts_per_rank; i++) {
+                int curr                    = shared_expert_prefix_sum[i];
+                shared_expert_prefix_sum[i] = prev;
+                prev += curr;
+            }
+        }
         __syncthreads();
 
         auto start_time              = clock64();
@@ -221,35 +223,43 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 auto shifted_buffer_x_int4 =
                     dispatched_x_buffers.buffer() + src_slot_idx * hidden_int4;
 
-                // Copy `topk_idx` and `topk_weights`
 #pragma unroll
-                for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk;
-                     idx += WARP_SIZE * num_recv_warps_per_rank) {
-                    int  chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
-                    int  src_slot_idx = total_offset + chunk_idx;
-                    auto mapped_idx =
-                        static_cast<int64_t>(src_slot_idx) * num_topk + token_topk_idx;
-                    recv_topk_weights[mapped_idx] =
-                        ld_nc_global(dispatched_topk_weights_buffers.buffer() + mapped_idx);
-
+                for (int i = 0; i < num_topk; i++) {
+                    auto mapped_idx = static_cast<int64_t>(src_slot_idx) * num_topk + i;
                     auto recv_topk_idx_i64 =
                         ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
-                    recv_topk_idx[mapped_idx] = recv_topk_idx_i64;
+                    int dst_slot_idx = -1;
                     if (recv_topk_idx_i64 >= 0) {
-                        int slot =
-                            atomicAdd_system(expert_slot_idx.buffer() + recv_topk_idx_i64, 1);
-                        int dst_slot_idx = shared_expert_prefix_sum[recv_topk_idx_i64] + slot;
+
+                        int slot = -1;
+                        if (lane_id == 0) {
+                            slot =
+                                atomicAdd_system(expert_slot_idx.buffer() + recv_topk_idx_i64, 1);
+                        }
+                        slot = __shfl_sync(WARP_MASK, slot, 0);
+                        EP_DEVICE_ASSERT(slot >= 0);
+                        dst_slot_idx = shared_expert_prefix_sum[recv_topk_idx_i64] + slot;
                         EP_DEVICE_ASSERT(dst_slot_idx < num_max_tokens * num_topk);
                         auto shifted_recv_x_int4 =
                             recv_x + static_cast<int64_t>(dst_slot_idx) * hidden_int4;
                         UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4,
                                            shifted_buffer_x_int4, ld_nc_global, st_na_global);
-                        permute_src_row_id[dst_slot_idx] = src_slot_idx;
-                        // Store mapping: dense_to_expert_map[src_slot_idx * E + expert_id] = dst_slot_idx
-                        dense_to_expert_map[src_slot_idx * num_experts_per_rank + recv_topk_idx_i64] =
-                            dst_slot_idx;
                     }
+                    dispatch_to_expert_map[mapped_idx] = dst_slot_idx;
                 }
+            }
+
+// Copy `topk_idx` and `topk_weights`
+#pragma unroll
+            for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk;
+                 idx += WARP_SIZE * num_recv_warps_per_rank) {
+                int  chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
+                int  src_slot_idx = total_offset + chunk_idx;
+                auto mapped_idx   = static_cast<int64_t>(src_slot_idx) * num_topk + token_topk_idx;
+                recv_topk_weights[mapped_idx] =
+                    ld_nc_global(dispatched_topk_weights_buffers.buffer() + mapped_idx);
+                recv_topk_idx[mapped_idx] =
+                    ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
             }
 
             num_tokens_to_recv -= num_recv_tokens;
@@ -260,26 +270,25 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 }
 
 void fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
-                            int *permute_src_row_id, int *dense_to_expert_map, void const *x,
-                            float const *x_scales, int64_t const *topk_idx,
-                            float const *topk_weights, bool const *is_token_in_rank,
-                            int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,
-                            void *recv_x, int num_tokens, int hidden_int4, int num_topk,
-                            int num_experts, int num_scales, int scale_token_stride,
-                            int scale_hidden_stride, int rank, int num_ranks, cudaStream_t stream,
-                            int num_sms, int num_max_tokens, int num_max_send_tokens) {
+                            int *dispatch_to_expert_map, void const *x, float const *x_scales,
+                            int64_t const *topk_idx, float const *topk_weights,
+                            bool const *is_token_in_rank, int const *channel_prefix_matrix,
+                            int const *num_recv_tokens_per_expert, void *recv_x, int num_tokens,
+                            int hidden_int4, int num_topk, int num_experts, int num_scales,
+                            int scale_token_stride, int scale_hidden_stride, int rank,
+                            int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens,
+                            int num_max_send_tokens) {
     constexpr int kNumThreads = 1024;
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
         auto kernel = fused_dispatch_permute<ranks, kNumThreads>;                                  \
         LAUNCH_KERNEL(&cfg, kernel, buffer_ptrs, recv_topk_idx, recv_topk_weights,                 \
-                      permute_src_row_id, dense_to_expert_map,                                     \
-                      reinterpret_cast<int4 const *>(x), x_scales, topk_idx, topk_weights,         \
-                      is_token_in_rank, channel_prefix_matrix, num_recv_tokens_per_expert,         \
-                      reinterpret_cast<int4 *>(recv_x), num_tokens, hidden_int4, num_topk,         \
-                      num_experts, num_scales, scale_token_stride, scale_hidden_stride, rank,      \
-                      num_max_tokens, num_max_send_tokens);                                        \
+                      dispatch_to_expert_map, reinterpret_cast<int4 const *>(x), x_scales,         \
+                      topk_idx, topk_weights, is_token_in_rank, channel_prefix_matrix,             \
+                      num_recv_tokens_per_expert, reinterpret_cast<int4 *>(recv_x), num_tokens,    \
+                      hidden_int4, num_topk, num_experts, num_scales, scale_token_stride,          \
+                      scale_hidden_stride, rank, num_max_tokens, num_max_send_tokens);             \
     }                                                                                              \
     break
 

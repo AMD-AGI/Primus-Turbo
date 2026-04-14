@@ -22,6 +22,41 @@ def permute_ref(ref_recv_x, ref_recv_topk_idx, ref_recv_topk_weights, num_local_
     return permuted_x
 
 
+def compute_recv_and_permuted_x(rank_prefix_matrix, dispatch_to_expert_map, hidden_size, num_ranks, current_rank, num_out_tokens):
+    """
+    Generate recv_x from rank_prefix_matrix, then compute permuted_x via dispatch_to_expert_map.
+
+    recv_x generation: rank_prefix_matrix[i][current_rank] rows with value i, replicated hidden_size times.
+    permuted_x is recv_x reordered according to dispatch_to_expert_map.
+    """
+    num_recv_tokens = rank_prefix_matrix[num_ranks - 1][current_rank].item()
+
+    recv_x = torch.empty((num_recv_tokens, hidden_size),
+                         dtype=torch.bfloat16, device="cuda")
+    start = 0
+    for i in range(num_ranks):
+        end = rank_prefix_matrix[i][current_rank].item()
+        recv_x[start:end, :] = i
+        start = end
+
+    d2e = dispatch_to_expert_map[:num_recv_tokens]
+    valid_mask = d2e >= 0
+
+    permuted_x = torch.empty(
+        (num_out_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+    src_tokens = torch.arange(
+        num_recv_tokens, device="cuda").unsqueeze(1).expand_as(d2e)
+    valid_dst = d2e[valid_mask]
+    valid_src = src_tokens[valid_mask]
+
+    assert valid_dst.max(
+    ) < num_out_tokens, f"valid_dst.max()={valid_dst.max()}, num_out_tokens={num_out_tokens}"
+    assert valid_src.max() < num_recv_tokens
+    permuted_x[valid_dst] = recv_x[valid_src]
+
+    return recv_x, permuted_x
+
+
 def test_main(
     args: argparse.Namespace,
     num_sms: int,
@@ -106,8 +141,7 @@ def test_main(
         ref_moe_recv_expert_counter,
         ref_rank_prefix_matrix,
         ref_channel_prefix_matrix,
-        ref_recv_channel_prefix_matrix,
-        ref_recv_src_idx,
+        ref_dispatch_to_expert_map,
         ref_send_head
     ), handle = _fused_dispatch_permute(
         x, group, topk_idx, topk_weights, num_experts, num_sms=num_sms
@@ -122,6 +156,10 @@ def test_main(
     num_moe_recv_tokens = ref_moe_recv_counter.item()
     recv_num_tokens_per_expert_list = ref_moe_recv_expert_counter.tolist()
 
+    # split out to num_moe_recv_tokens
+    ref_recv_topk_idx = ref_recv_topk_idx[:num_moe_recv_tokens, :]
+    ref_recv_topk_weights = ref_recv_topk_weights[:num_moe_recv_tokens, :]
+
     assert (
         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
         == recv_num_tokens_per_expert_list
@@ -131,40 +169,32 @@ def test_main(
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
 
-    # ref_recv_x = ref_recv_x[:num_moe_recv_tokens, :]
-    # print(ref_recv_x[:, 0])
-    # # check recv_x
-    # check_data(ref_recv_x, ref_rank_prefix_matrix)
     # Check `topk_idx`
-    # assert (
-    #     ref_recv_topk_idx.eq(-1)
-    #     | ((ref_recv_topk_idx >= 0) & (ref_recv_topk_idx < (num_experts // num_ranks)))
-    # ).sum().item() == ref_recv_topk_idx.numel()
-    # for i, count in enumerate(recv_num_tokens_per_expert_list):
-    #     assert ref_recv_topk_idx.eq(i).sum().item() == count
+    assert (ref_recv_topk_idx.eq(-1) | ((ref_recv_topk_idx >= 0) & (ref_recv_topk_idx <
+            (num_experts // num_ranks)))).sum().item() == ref_recv_topk_idx.numel()
+    for i, count in enumerate(recv_num_tokens_per_expert_list):
+        assert ref_recv_topk_idx.eq(i).sum().item() == count
 
     # Check `topk_weights`
-    # ref_recv_topk_weights[ref_recv_topk_idx.eq(-1)] = ref_recv_topk_weights.amax(
-    #     dim=1, keepdim=True
-    # ).expand_as(ref_recv_topk_weights)[ref_recv_topk_idx.eq(-1)]
-    # check_data(ref_recv_topk_weights, ref_rank_prefix_matrix)
+    ref_recv_topk_weights[ref_recv_topk_idx.eq(-1)] = (
+        ref_recv_topk_weights.amax(dim=1, keepdim=True).expand_as(
+            ref_recv_topk_weights
+        )[ref_recv_topk_idx.eq(-1)]
+    )
+    check_data(ref_recv_topk_weights, ref_rank_prefix_matrix)
 
     num_out_tokens = sum(recv_num_tokens_per_expert_list)
+    num_experts_per_rank = num_experts // num_ranks
 
-    # local_routing = handle.local_expert_routing_map[:num_moe_recv_tokens]
+    # compute permuted recv_x
+    recv_x, permuted_x = compute_recv_and_permuted_x(
+        ref_rank_prefix_matrix, ref_dispatch_to_expert_map, hidden, num_ranks, rank, num_out_tokens)
 
-    # ref_permuted_x = ref_permuted_x[:num_moe_recv_tokens, :]
-    # check_data(ref_permuted_x, ref_rank_prefix_matrix)
+    # assert torch.allclose(ref_recv_x[:num_moe_recv_tokens, :], recv_x), f"{ref_recv_x[:num_moe_recv_tokens, 0]} {recv_x[:num_moe_recv_tokens, 0]}"
+    assert torch.allclose(ref_permuted_x[:num_out_tokens, :], permuted_x), f"{ref_permuted_x[:num_out_tokens, 0]} {permuted_x[:num_out_tokens, 0]}"
 
-    # permuted_x = permute_ref(ref_recv_x, ref_recv_topk_idx,
-    #                          ref_recv_topk_weights, num_experts // num_ranks, num_out_tokens)
-
-    # assert torch.allclose(ref_permuted_x.amin(dim=1),
-    #                       ref_permuted_x.amax(dim=1)), "ref_permuted_x rows not uniform"
-    # assert torch.allclose(ref_permuted_x, permuted_x), "ref_permuted_x != permuted_x"
-
-    # ref_recv_topk_idx = ref_recv_topk_idx[:num_moe_recv_tokens]
-    # ref_recv_topk_weights = ref_recv_topk_weights[:num_moe_recv_tokens]
+    if local_rank == 0:
+        print("dispatch_permute correctness checks passed", flush=True)
 
     # benchmark performance
     nvl_recv_bytes = num_moe_recv_tokens * hidden * 2
@@ -187,7 +217,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     torch.manual_seed(rank)
 
-    for i in (32, 64):
+    for i in (48,):
         test_main(args, i, local_rank, num_ranks, rank, group)
         if local_rank == 0:
             print("", flush=True)

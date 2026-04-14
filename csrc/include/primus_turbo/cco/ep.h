@@ -7,7 +7,7 @@ namespace primus_turbo::cco::ep {
 namespace intranode {
 
 void fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
-                            int *permute_src_row_id, int *dense_to_expert_map,
+                            int *dispatch_to_expert_map,
                             void const *x, float const *x_scales, int64_t const *topk_idx,
                             float const *topk_weights, bool const *is_token_in_rank,
                             int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,

@@ -88,8 +88,7 @@ def _fused_dispatch_permute(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Ten
         (permuted_x,
          recv_topk_idx,
          recv_topk_weights,
-         permute_src_row_id,
-         dense_to_expert_map) = cpp_extensions.fused_dispatch_permute(
+         dispatch_to_expert_map) = cpp_extensions.fused_dispatch_permute(
             x,
             x_scales,
             topk_idx,
@@ -110,7 +109,6 @@ def _fused_dispatch_permute(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Ten
     offset = rank_prefix_matrix.nbytes + metadata_ints * 4
     recv_x = symm_mem.get_buffer(rank, [num_worst_tokens, hidden_size],
                                  x.dtype, storage_offset=offset // x.element_size())
-
     handle = (recv_x, num_tokens_per_rank, num_tokens_per_expert,
               rank_prefix_matrix, channel_prefix_matrix, is_token_in_rank, None, None)
 
@@ -122,7 +120,6 @@ def _fused_dispatch_permute(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Ten
             moe_recv_expert_counter,
             rank_prefix_matrix,
             channel_prefix_matrix,
-            permute_src_row_id,
-            dense_to_expert_map,
+            dispatch_to_expert_map,
             None),
             handle)
