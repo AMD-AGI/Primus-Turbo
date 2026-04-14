@@ -82,7 +82,7 @@ DEFINE_TARGET
 | **BASELINE** | Record starting correctness and performance |
 | **ANALYZE** | Read code, profile, consult skill knowledge, generate optimization hypotheses |
 | **OPTIMIZE** | Implement a single primary hypothesis with small incremental changes |
-| **VALIDATE** | Correctness hard gate + benchmark comparison; pass → accept (+ git commit if `git_commit=true`), fail → rollback; keep `results/` and `logs/optimize.md` synchronized round by round |
+| **VALIDATE** | Correctness hard gate + benchmark comparison; pass → accept (+ git commit if `git_commit=true`), fail → rollback; keep `rounds/round-N/summary.md` and `logs/optimize.md` synchronized round by round |
 | **REPORT** | Summarize best version, effective directions, failed directions, and next-step recommendations; hand back to project skill for final acceptance |
 
 For detailed optimization process, gating rules, rollback, stagnation detection, and log templates, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md).
@@ -154,12 +154,16 @@ agent/workspace/<campaign_name>/
 │   ├── optimize.md       # Optimization log (main file)
 │   └── performance_trend.md
 ├── profiles/              # Profiler output
-├── results/               # Benchmark results (.md format)
 ├── related_work.md        # Related-work / SOTA survey for this campaign
 ├── rounds/
+│   ├── round-1/
+│   │   ├── summary.md     # Baseline round summary
+│   │   ├── kernel_snapshot/
+│   │   └── artifacts/     # Optional raw benchmark/test outputs for this round
 │   └── round-N/
 │       ├── summary.md
-│       └── kernel_snapshot/
+│       ├── kernel_snapshot/
+│       └── artifacts/
 └── manifest.yaml          # Metadata
 ```
 
@@ -192,7 +196,7 @@ created: <YYYY-MM-DD HH:MM>
 
 All campaign timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
 
-The per-round artifacts required by [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) live under `<campaign_dir>/rounds/round-N/`, while the running comparison table lives at `<campaign_dir>/logs/performance_trend.md`.
+All per-round artifacts live under `<campaign_dir>/rounds/`. `round-1` is the baseline round, and optimization attempts start at `round-2`. The running comparison table lives at `<campaign_dir>/logs/performance_trend.md`.
 
 **Step 4: Generate `quick_test_bench.py`**
 
@@ -257,12 +261,16 @@ agent/workspace/<campaign_name>/
 │   ├── optimize.md
 │   └── performance_trend.md
 ├── profiles/
-├── results/
 ├── related_work.md
 ├── rounds/
+│   ├── round-1/
+│   │   ├── summary.md
+│   │   ├── kernel_snapshot/
+│   │   └── artifacts/
 │   └── round-N/
 │       ├── summary.md
-│       └── kernel_snapshot/
+│       ├── kernel_snapshot/
+│       └── artifacts/
 └── manifest.yaml
 ```
 
@@ -319,7 +327,7 @@ The optimization process must maintain structured history (referencing AVO's lin
 - Failed attempts are recorded in the campaign log but do not enter the accepted lineage
 - Accepted versions must have clear hypotheses, validation results, and acceptance rationale
 - Logs serve both humans (can check progress at any time) and the agent (trace history to avoid repeated attempts)
-- Every VALIDATE round must update `results/v<N>.md` and `logs/optimize.md` together before moving on
+- Every round must update its own `rounds/round-N/summary.md`, and every VALIDATE round must keep that summary synchronized with `logs/optimize.md`
 - Logs and profiling results are stored in `agent/workspace/<campaign_name>/`
 - For detailed log format, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md)
 
@@ -374,9 +382,10 @@ Proceed to PREPARE_ENVIRONMENT after user confirmation.
 
 1. Create optimization branch: `git checkout -b optimize/gemm_fp8_blockwise_triton_gfx942_20260412`
 2. Create `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/`
-3. Create subdirectories `logs/`, `profiles/`, `results/`, `rounds/`
+3. Create subdirectories `logs/`, `profiles/`, `rounds/`
 4. Write `manifest.yaml`
-5. Generate `quick_test_bench.py` with placeholder `SHAPES`; fill it after BASELINE selects representative shapes
+5. Create `rounds/round-1/` as the baseline round scaffold
+6. Generate `quick_test_bench.py` with placeholder `SHAPES`; fill it after BASELINE selects representative shapes
 
 **Step 5: SURVEY_RELATED_WORK**
 
@@ -388,9 +397,9 @@ Proceed to PREPARE_ENVIRONMENT after user confirmation.
 **Step 6: Enter optimization loop**
 
 Read `workflow/optimize-loop.md` and execute as defined:
-1. BASELINE: Run focused test (confirm PASS) → run focused benchmark → record baseline TFLOPS → select representative shapes and update `quick_test_bench.py`
+1. BASELINE (`round-1`): Run focused test (confirm PASS) → run focused benchmark → write `rounds/round-1/summary.md` → select representative shapes and update `quick_test_bench.py`
 2. ANALYZE: Read `related_work.md`, kernel source, consult `triton/SKILL.md` and `hardware/gfx942/`, generate optimization hypotheses
-3. OPTIMIZE → VALIDATE loop: Modify kernel → run test → run benchmark → compare → accept or rollback
+3. OPTIMIZE → VALIDATE loop (`round-2+`): Modify kernel → run test → run benchmark → write `rounds/round-N/summary.md` → compare → accept or rollback
 4. After reaching target or exhausting directions, output REPORT
 
 **Step 7: Acceptance** (return to project skill)

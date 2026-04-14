@@ -89,6 +89,8 @@ ENVIRONMENT_BASELINE
   -> REPORT
 ```
 
+Round numbering is strict: `round-1` is BASELINE, and optimization attempts start at `round-2`.
+
 ACCEPT and ROLLBACK both return to ANALYZE for the next round. Do not jump directly to REPORT unless TERMINATION_CHECK passes.
 
 In `repo-mode`, VALIDATE validates directly in the main repo with no SYNC_BACK step.
@@ -148,7 +150,7 @@ Baseline aggregate score = 285.0 → improvement = (304.8 - 285.0) / 285.0 = +6.
 
 ## Phase Descriptions
 
-### 1. ENVIRONMENT_BASELINE
+### 1. ENVIRONMENT_BASELINE (`round-1`)
 
 **Goal**: Freeze the starting point and establish a unified comparison baseline.
 
@@ -159,11 +161,12 @@ Baseline aggregate score = 285.0 → improvement = (304.8 - 285.0) / 285.0 = +6.
 **Steps**:
 1. Confirm the current environment can build and run correctly
 2. Run **full** focused test, confirm all PASS
-3. Run **full** focused benchmark, write results to `<campaign_dir>/results/baseline.md`
+3. Run **full** focused benchmark, write the canonical baseline summary to `<campaign_dir>/rounds/round-1/summary.md`, and store any raw command outputs / CSVs under `<campaign_dir>/rounds/round-1/artifacts/`
 4. Compute baseline `score vector` and `aggregate score` per scoring specification
 5. Select 3-5 `representative_shapes` from PASS-only benchmark rows, covering small / medium / large behavior
 6. Update `quick_test_bench.py` with those `representative_shapes` and record `quick_command` in the manifest
-7. Record backend configuration and key environment state
+7. Copy the current kernel into `<campaign_dir>/rounds/round-1/kernel_snapshot/` to establish the rollback root
+8. Record backend configuration and key environment state
 
 BASELINE always uses full validation to ensure the starting data is complete and reliable.
 
@@ -179,12 +182,16 @@ BASELINE always uses full validation to ensure the starting data is complete and
 
 - Aggregate score (geomean): 278.0
 - All Check: PASS
-- Detailed data: results/baseline.md
+- Detailed data: rounds/round-1/summary.md
 ```
 
 **Output**:
-- `results/baseline.md` (detailed data) + baseline aggregate score
-- Current best = baseline
+- `<campaign_dir>/rounds/round-1/summary.md` + baseline aggregate score
+- `<campaign_dir>/rounds/round-1/kernel_snapshot/` as the baseline rollback root
+- Current best = baseline (`round-1`)
+- The first optimization attempt starts at `round-2`
+
+The baseline round uses the same `summary.md` structure as later rounds. Its "Single change" section must explicitly say that no code change was made, and its "Decision" section must be `BASELINE`.
 
 ### 2. ANALYZE
 
@@ -255,7 +262,7 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 4. Compare against current best
 5. Upgrade to **full** validation when the direction completes, when results are borderline (improvement < 5%), or when changes are high-risk
 
-Write results to `<campaign_dir>/results/v<N>.md` (note the validation level).
+Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (for `N >= 2`) and place any raw benchmark/test outputs under `<campaign_dir>/rounds/round-N/artifacts/`.
 
 **Hard gates**:
 - Build failure → reject immediately
@@ -265,12 +272,12 @@ Write results to `<campaign_dir>/results/v<N>.md` (note the validation level).
 - Core shape regression > 3% → default reject
 
 **After passing**:
-1. Write this round's detailed results to `results/v<N>.md`
+1. Write this round's detailed results to `rounds/round-N/summary.md`
 2. Immediately update `logs/optimize.md` (optimization history, current best, directions to try)
 3. Update current best
 4. If `git_commit=true`: git commit (see git integration specification below)
 
-`results/v<N>.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
+`rounds/round-N/summary.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
 
 **Under `workspace-mode`**:
 Validation is split into a local gate (within minimal environment) and an integration gate (after syncing back to main repo).
@@ -293,7 +300,7 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 - List of key effective optimizations
 - List of verified ineffective directions
 - If continuing optimization, top three recommended next steps
-- Detailed data references to corresponding `.md` files under `results/`
+- Detailed data references to the corresponding `rounds/round-N/summary.md` files
 
 ## Rollback Rules
 
@@ -306,7 +313,7 @@ The following situations require rollback of the current round's candidate:
 
 Rollback operations:
 1. Revert the candidate change (`repo-mode`: `git checkout -- <modified_files>` or `git revert <commit>`; `workspace-mode`: roll back the local candidate without affecting the main repo)
-2. Write `results/v<N>.md` and mark the round as rollback with the failure reason
+2. Write `rounds/round-N/summary.md` and mark the round as rollback with the failure reason
 3. Immediately update `logs/optimize.md`, including the optimization history and verified ineffective directions
 4. Return to ANALYZE with a new direction; rollback is not, by itself, a campaign termination signal
 
@@ -319,7 +326,7 @@ When `git_commit=true`, each accepted version corresponds to a git commit, formi
 **Commit message format**:
 
 ```
-[optimize] <target_op> <target_backend> v<N>: <one-line summary>
+[optimize] <target_op> <target_backend> round-<N>: <one-line summary>
 
 Hypothesis: <optimization hypothesis for this round>
 Result: <aggregate score change>
@@ -329,7 +336,7 @@ Details: <campaign_dir>/logs/optimize.md
 Example:
 
 ```
-[optimize] gemm_fp8_blockwise TRITON v3: increase num_stages from 2 to 3
+[optimize] gemm_fp8_blockwise TRITON round-3: increase num_stages from 2 to 3
 
 Hypothesis: Increase software pipelining depth to hide memory access latency
 Result: geomean 301 -> 319 TFLOPS (+6.0%)
@@ -338,7 +345,7 @@ Details: agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/logs/optimize
 
 **Rollback**: `git revert <commit>` to roll back a single version.
 
-**Note**: The campaign directory (`agent/workspace/`) is not tracked by git by default. Only kernel code changes enter the git lineage. `.md` files under `results/` are stored only in the campaign directory.
+**Note**: The campaign directory (`agent/workspace/`) is not tracked by git by default. Only kernel code changes enter the git lineage. The `rounds/` summaries and raw artifacts are stored only in the campaign directory.
 
 ## Optimization Log Template
 
@@ -354,17 +361,18 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - Target GPU: <target_gpu>
 - Campaign: <campaign_dir>
 - Start time: <YYYY-MM-DD HH:MM>
-- Current status: Optimizing (v<N>)
+- Current status: Optimizing (round-N)
 
 ## Baseline
 | Shape (MxNxK) | Forward TFLOPS | Check |
 |---------------|---------------|-------|
 | ... | ... | ... |
 - Aggregate score: <baseline_score>
+- Detailed data: rounds/round-1/summary.md
 
 ## Optimization History
 
-### v1 — <one-line description of changes>
+### round-2 — <one-line description of changes>
 - Time: <YYYY-MM-DD HH:MM>
 - Validation level: quick / full
 - Hypothesis: <why this change was made>
@@ -372,10 +380,10 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - Result: <aggregate score change> ✅/❌
 - Test: PASS/FAIL
 - Decision: accept / rollback
-- Detailed data: results/v1.md
+- Detailed data: rounds/round-2/summary.md
 - Notes: <failure reason or key observations>
 
-### v2 — ...
+### round-3 — ...
 
 ## Current Best
 | Shape (MxNxK) | Baseline | Current Best | Improvement |
@@ -386,12 +394,12 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 ## Directions to Try
 - [ ] <Direction 1>
 - [ ] <Direction 2>
-- [x] ~~<Verified ineffective direction>~~ (verified in vN)
+- [x] ~~<Verified ineffective direction>~~ (verified in round-N)
 
 ## Verified Ineffective Directions
 | Direction | Version | Failure Reason |
 |-----------|---------|---------------|
-| ... | v<N> | ... |
+| ... | round-N | ... |
 
 ## Final Report
 (Filled in when campaign terminates)
@@ -403,33 +411,63 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - If continuing optimization, recommended next three steps: ...
 ```
 
-## Result File Template
+## Round Summary Template
 
-Detailed data from each VALIDATE round is written to `results/v<N>.md` (BASELINE is written to `results/baseline.md`).
+The canonical detailed artifact for each round is `<campaign_dir>/rounds/round-N/summary.md`.
+
+- `round-1` is the baseline round
+- `round-2+` are optimization attempts
+- If a round emits raw benchmark CSVs, command captures, or other detailed outputs, store them under `<campaign_dir>/rounds/round-N/artifacts/`
+
+The summary must follow the same round-oriented structure used by the iteration rules:
 
 ```markdown
-# v<N> — <one-line description of changes>
+## Hypothesis
 
+<For round-1: "Baseline round. No optimization change yet; record the starting correctness/performance and choose representative shapes.">
+<For round-N >= 2: optimization hypothesis for this round>
+
+## Single change
+
+<For round-1: "No code change. Freeze the starting kernel and environment state.">
+<For round-N >= 2: exact code/config change>
+
+## Results
+
+### Validation
 - Time: <YYYY-MM-DD HH:MM>
 - Validation level: quick / full
-- Hypothesis: <optimization hypothesis for this round>
+- Test command: <test command>
+- Benchmark command: <benchmark command>
+- Raw artifacts: `artifacts/<file>` (if any)
 
-## Correctness
-- Command: <test command>
-- Result: <X passed, Y failed>
+| Shape / label | M | N | K | Result | Forward TFLOPS | Backward TFLOPS | Delta vs current best |
+|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | ... |
 
-## Benchmark
-- Command: <benchmark command>
-
-| M | N | K | Forward TFLOPS | Backward TFLOPS | Check |
-|---|---|---|---------------|----------------|-------|
-| ... | ... | ... | ... | ... | ... |
-
-## Score
+### Aggregate
 - Forward aggregate (geomean): <score>
 - Backward aggregate (geomean): <score> (if applicable)
 - vs baseline: +X%
 - vs current best: +Y%
+
+## Decision
+
+`BASELINE` / `ACCEPTED` / `ROLLED BACK`
+
+<Why this round was accepted, rolled back, or recorded as the baseline>
+
+## Attribution
+
+<Why this specific round behaved this way>
+
+## Next direction
+
+<What to try next>
+
+## Rollback Analysis
+
+<Only for rolled-back rounds>
 ```
 
 ## Stagnation Detection and Conditional Intervention
@@ -510,5 +548,5 @@ A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 - When `git_commit=true`, accepted versions must be git committed, forming a traceable lineage.
 - When stagnated, switch directions — do not endlessly fine-tune in the same direction.
 - Keep logs updated in real-time so humans can check current progress and historical decisions at any time.
-- Every VALIDATE round, whether accepted or rolled back, must update both `results/v<N>.md` and `logs/optimize.md`.
+- Every round, including the baseline, must keep `rounds/round-N/summary.md` up to date; every VALIDATE round must update that summary and `logs/optimize.md` together.
 - All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
