@@ -305,9 +305,6 @@ MoEModelConfigs = {
     #     "num_key_value_heads": 8,
     #     "head_dim": 128,  # kv_channels
     #     "seqlen": 4096,
-    #     "num_experts": 32,
-    #     "num_topk": 4,
-    #     "ep_size_list": [8, 1],  # EP=8→B=4, EP=1→B=32
     # },
     # # /shared_nfs/kyle/test/Primus/examples/megatron/configs/MI300X/gpt_oss_20B-BF16-pretrain.yaml
     # "gpt_oss_20B": {
@@ -320,9 +317,6 @@ MoEModelConfigs = {
     #     "head_dim_qk": 128,  # qk_head_dim
     #     "head_dim_v": 64,    # kv_channels
     #     "seqlen": 4096,
-    #     "num_experts": 32,
-    #     "num_topk": 4,
-    #     "ep_size_list": [8, 1],  # EP=8→B=4, EP=1→B=32
     # },
 }
 

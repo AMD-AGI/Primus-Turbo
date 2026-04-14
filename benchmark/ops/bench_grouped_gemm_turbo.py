@@ -90,10 +90,10 @@ def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, fp8_form
     return correct
 
 
-def profile_grouped_gemm(B, M, N, K, dtype, balance=True, num_topk=None):
+def profile_grouped_gemm(B, M, N, K, dtype, balance=True):
     """Profile BF16 Grouped GEMM."""
     device = "cuda"
-    group_lens = gen_grouped_gemm_group_lens(B, M, balance=balance, num_topk=num_topk).to(device)
+    group_lens = gen_grouped_gemm_group_lens(B, M, balance=balance).to(device)
     total_m = group_lens.sum().item()
     x = torch.randn((total_m, K), dtype=dtype, device=device, requires_grad=True)
     w = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
@@ -169,7 +169,7 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None, balance=True):
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
@@ -184,7 +184,6 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
         dtype = case["dtype"]
 
-        balance = case.get("balance", True)
         balance_str = "balanced" if balance else "unbalanced"
         print(f"\n{'='*60}")
         if is_fp8:
@@ -204,8 +203,7 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
             else:
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm(
                     B=B, M=M, N=N, K=K, dtype=dtype,
-                    balance=case.get("balance", True),
-                    num_topk=case.get("num_topk"),
+                    balance=balance,
                 )
 
             row = {
@@ -304,7 +302,15 @@ if __name__ == "__main__":
         default=None,
         help="Output CSV filename",
     )
+    parser.add_argument(
+        "--balance",
+        type=str,
+        choices=["balanced", "unbalanced"],
+        default="balanced",
+        help="Routing balance mode (default: balanced)",
+    )
     args = parser.parse_args()
     benchmark_grouped_gemm_turbo(
-        dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output
+        dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output,
+        balance=(args.balance == "balanced"),
     )
