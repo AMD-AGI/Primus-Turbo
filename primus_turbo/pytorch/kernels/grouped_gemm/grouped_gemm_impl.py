@@ -133,7 +133,7 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         maybe_pre_sync: bool = False,
     ) -> torch.Tensor:
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            a, b, group_lens.cpu(), group_offs, trans_a, trans_b, maybe_pre_sync
+            a, b, group_lens, group_offs, trans_a, trans_b, maybe_pre_sync
         )
 
 
@@ -176,7 +176,7 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
             trans_lhs, trans_rhs = trans_a, trans_b
 
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            lhs, rhs, group_lens.cpu(), group_offs, trans_lhs, trans_rhs, maybe_pre_sync
+            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync
         )
 
 

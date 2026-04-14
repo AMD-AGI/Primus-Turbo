@@ -168,10 +168,15 @@ private:
 
     void compute_args(const HipblasltGroupedGemmParams &params) {
 
-        // group_lens is always on host (guaranteed by the Python execute() layer).
         group_lens_host_.resize(params.group_num);
-        std::memcpy(group_lens_host_.data(), params.group_lens_ptr,
-                    params.group_num * sizeof(int64_t));
+        if (params.group_lens_on_host) {
+            std::memcpy(group_lens_host_.data(), params.group_lens_ptr,
+                        params.group_num * sizeof(int64_t));
+        } else {
+            PRIMUS_TURBO_CHECK_HIP(hipMemcpy(group_lens_host_.data(), params.group_lens_ptr,
+                                             params.group_num * sizeof(int64_t),
+                                             hipMemcpyDeviceToHost));
+        }
 
         int valid_group_num = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
