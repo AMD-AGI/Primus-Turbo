@@ -288,8 +288,9 @@ benchmark/ops/                   # Operator benchmarks
 2. **读 `kernel-optimize/SKILL.md` 的「前置信息需求」**，了解优化框架需要项目提供什么
 3. **按需求清单收集项目信息**（从本文件各节获取）
    - kernel 源文件路径：从 [Code Structure](#code-structure-quick-reference) 和 [Key GEMM-Related Files](#key-gemm-related-files) 查到
-   - focused test 命令 + quick test 命令：从 [Testing](#testing) 和 [Quick 验证](#quick-验证) 组装
-   - focused benchmark 命令 + quick benchmark 命令：从 [Benchmark](#benchmark) 和 [Quick 验证](#quick-验证) 组装
+   - focused test 命令：从 [Testing](#testing) 组装
+   - focused benchmark 命令：从 [Benchmark](#benchmark) 组装
+   - quick 验证脚本模板：从 [Quick 验证](#quick-验证) 获取
    - benchmark 输出格式和可用性能指标：从 [Output Metrics](#output-metrics) 查到
    - 评分规则：从下方 [优化评分](#优化评分) 获取
    - `execution_mode` 建议和 rebuild 要求：从下方 [优化环境](#优化环境) 获取
@@ -326,15 +327,97 @@ Benchmark 的输出格式、shape 来源、测量方式见上方 [Benchmark](#be
 每轮 VALIDATE 默认使用 quick 验证（代表性 shape subset），加速迭代。BASELINE 和最终验收使用 full 验证。
 
 **代表性 shape 选取原则**：agent 在 BASELINE 阶段从 full benchmark 结果中选取 3-5 个代表性 shape，覆盖小/中/大规模。选取标准：
+- **只从 correctness PASS 的 shape 中选取**（FAIL 的 shape 不进入代表性集合）
 - 至少包含 1 个小 shape（容易暴露 launch overhead 问题）
 - 至少包含 1 个大 shape（容易暴露 memory / compute 瓶颈）
 - 优先选择性能差异大的 shape（更敏感，能快速检测退步）
 
 选出的 shape 列表记录在 `manifest.yaml` 的 `representative_shapes` 字段中。
 
-**Quick test**：使用 focused test 命令加 `--maxfail=3` 快速失败，侧重快速拦截明显问题。
+**实现方式**：agent 在 PREPARE_ENVIRONMENT 阶段（此时刚从本 skill 收集完项目信息，API 上下文最完整）根据以下模板在 campaign 目录下生成 `quick_test_bench.py`，`SHAPES` 列表暂留空。BASELINE 完成后选出代表性 shapes 并填入 `SHAPES`。运行时间从十几分钟缩短到几十秒。
 
-**Quick benchmark**：如果 benchmark 脚本支持 shape 过滤参数，则只跑代表性 shape；如果不支持，跑 full benchmark 后从结果中提取代表性 shape 的数据做快速判断。
+以下是 **FP8 blockwise GEMM** 的模板（其他算子类型由 agent 参考此模板适配）：
+
+```python
+"""Quick correctness + benchmark for representative shapes.
+Auto-generated during PREPARE_ENVIRONMENT. Run: python quick_test_bench.py
+"""
+import os
+import torch
+import torch.utils.benchmark as benchmark
+
+os.environ["PRIMUS_TURBO_GEMM_BACKEND"] = "<target_backend>"
+
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig, Format, ScalingGranularity,
+)
+
+SHAPES = [
+    # filled from representative_shapes in manifest
+    {"M": 4096, "N": 4096, "K": 4096, "label": "small"},
+    {"M": 8192, "N": 3584, "K": 3584, "label": "worst_bwd"},
+    # ...
+]
+
+CONFIG = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.BLOCKWISE,
+    block_size=128,
+)
+
+
+def compute_snr(ref, test):
+    noise = test.float() - ref.float()
+    signal_power = ref.float().norm() ** 2
+    noise_power = noise.norm() ** 2
+    if noise_power == 0:
+        return float("inf")
+    return 10 * torch.log10(signal_power / noise_power).item()
+
+
+def run_one(M, N, K):
+    device = "cuda"
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device, requires_grad=True)
+    b = torch.randn(N, K, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    # --- correctness (SNR >= 25 for E4M3) ---
+    out = turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
+    ref = a.detach().float() @ b.detach().float().T
+    ok = compute_snr(ref.to(torch.bfloat16), out.detach()) >= 25.0
+
+    # --- benchmark ---
+    grad_out = torch.randn_like(out)
+    fwd_fn = lambda: turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
+    bwd_fn = lambda: out.backward(grad_out, retain_graph=True)
+    out = fwd_fn(); bwd_fn()
+
+    for _ in range(20):
+        fwd_fn(); bwd_fn()
+    torch.cuda.synchronize()
+
+    fwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": fwd_fn}).timeit(100).mean * 1e3
+    bwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": bwd_fn}).timeit(100).mean * 1e3
+    flops = 2 * M * N * K
+    fwd_tflops = flops / fwd_ms / 1e9
+    bwd_tflops = 2 * flops / bwd_ms / 1e9
+
+    return ok, fwd_tflops, bwd_tflops
+
+
+print(f"{'Label':<12} {'Shape':<25} {'Check':<6} {'Fwd TFLOPS':>11} {'Bwd TFLOPS':>11}")
+print("-" * 68)
+all_pass = True
+for s in SHAPES:
+    ok, fwd, bwd = run_one(s["M"], s["N"], s["K"])
+    if not ok:
+        all_pass = False
+    print(f"{s['label']:<12} {s['M']}x{s['N']}x{s['K']:<15} {'PASS' if ok else 'FAIL':<6} {fwd:>11.2f} {bwd:>11.2f}")
+
+print(f"\nOverall: {'ALL PASS' if all_pass else 'HAS FAILURES'}")
+```
+
+manifest 中记录：`quick_command: "python <campaign_dir>/quick_test_bench.py"`
 
 ### Demo：优化 blockwise FP8 GEMM Triton on MI300X
 
@@ -342,16 +425,15 @@ Benchmark 的输出格式、shape 来源、测量方式见上方 [Benchmark](#be
 
 **1. 读 `kernel-optimize/SKILL.md` 的前置信息需求**
 
-得知优化框架需要：kernel 源文件、focused test/quick test、focused benchmark/quick benchmark、benchmark 输出格式、评分规则、execution_mode 建议、rebuild 要求。
+得知优化框架需要：kernel 源文件、focused test、focused benchmark、quick 验证脚本模板、benchmark 输出格式、评分规则、execution_mode 建议、rebuild 要求。
 
 **2. 按需求清单收集项目信息**
 
 从本文件各节获取：
 - Kernel 源文件：`primus_turbo/triton/gemm/gemm_fp8_kernel.py`（查 [Key GEMM-Related Files](#key-gemm-related-files)）
 - Focused test：`pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`（查 [Testing](#testing)）
-- Quick test：同上 + `--maxfail=3`（查 [Quick 验证](#quick-验证)）
 - Focused benchmark：`PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`（查 [Benchmark](#benchmark)）
-- Quick benchmark：同上，从 full 结果中提取代表性 shape 数据（查 [Quick 验证](#quick-验证)）
+- Quick 验证脚本模板：PREPARE_ENVIRONMENT 时生成 `quick_test_bench.py`（查 [Quick 验证](#quick-验证)）
 - 可用指标：`Forward TFLOPS`、`Backward TFLOPS`，`Check` 为正确性门控（查 [优化评分](#优化评分)）
 - 环境建议：Triton → `repo-mode`，无需 rebuild（查 [优化环境](#优化环境)）
 
