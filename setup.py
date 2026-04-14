@@ -30,9 +30,8 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-# NOTE(ruibin): custom branch for aiter to support sbhd format
-# https://github.com/ROCm/aiter/commits/dev/zhangrb/fa_fwd_add_out_args/
-AITER_COMMIT = "a5ec213aa08ca0ebc383bcc6b8bba7c301162960"
+# PR: feat: _flash_attn_forward add out args (#2648)
+AITER_COMMIT = "857f4d15775a29af153a2c68a2f8e8a8d696c986"
 
 # ---------- ORIGAMI (rocm-libraries) ------------
 # Pin to commit. Installed during build via clone + pip install (avoids pip resolution
@@ -87,7 +86,11 @@ def check_submodules():
 
 def is_package_installed(package_name):
     """Check if a package is installed in the current Python environment."""
-    return importlib.util.find_spec(package_name) is not None
+    try:
+        importlib.metadata.distribution(package_name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 
 def all_files_in_dir(path, name_extensions=None):
