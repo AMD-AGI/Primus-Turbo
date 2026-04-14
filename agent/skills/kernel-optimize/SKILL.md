@@ -27,8 +27,7 @@ This skill is **not responsible for**:
 | **Kernel source file path** | Location of the kernel code to optimize | Code structure / file mapping table |
 | **Focused test command** | Correctness test limited to the target operator + backend (full) | Testing section |
 | **Focused benchmark command** | Performance test limited to the target backend (full) | Benchmark section |
-| **Quick test command** | Fast correctness test limited to a small set of representative shapes | Quick validation section in project skill |
-| **Quick benchmark command** | Fast performance test limited to representative shapes | Quick validation section in project skill |
+| **Quick validation script template** | Self-contained correctness + benchmark script template generated into the campaign directory during PREPARE_ENVIRONMENT; representative shapes are filled in after BASELINE | Quick validation section in project skill |
 | **Benchmark output format** | CSV column names, which columns are performance metrics (`Forward TFLOPS`, `Backward TFLOPS`, etc.), which column is the correctness gate (`Check`) | Benchmark output description |
 | **Scoring rules** | How to compute `aggregate score` from benchmark output (e.g., geometric mean) | Operator optimization scoring section in project skill |
 | **execution_mode recommendation** | `repo-mode` vs `workspace-mode`, and the corresponding build/rebuild approach | Operator optimization environment section in project skill |
@@ -62,6 +61,7 @@ During the DEFINE_TARGET phase, the user instruction + prerequisite information 
 | `git_commit` | Whether to git commit accepted versions | `true` (default) / `false` |
 | `git_branch` | Optimization branch strategy | `auto` (default, auto-creates `optimize/<campaign>` branch) / `none` / `<custom branch name>` |
 | `max_iterations` | Maximum iteration count (optional) | `10`; if unspecified, agent decides based on termination conditions |
+| `max_duration` | Maximum campaign runtime (optional) | `"4h"` / `"90m"`; if unspecified, runtime is unbounded |
 
 ## Overall Loop
 
@@ -77,12 +77,12 @@ DEFINE_TARGET
 | Phase | What to do |
 |-------|-----------|
 | **DEFINE_TARGET** | Organize user instruction + project skill information into structured parameters, confirm completeness, **confirm target with user before starting** |
-| **PREPARE_ENVIRONMENT** | Set up campaign directory, record metadata |
+| **PREPARE_ENVIRONMENT** | Set up campaign directory, record metadata, and generate the quick validation script scaffold |
 | **SURVEY_RELATED_WORK** | Survey current SOTA implementations, docs, and competitor baselines; write findings to `related_work.md` before the first baseline run |
 | **BASELINE** | Record starting correctness and performance |
 | **ANALYZE** | Read code, profile, consult skill knowledge, generate optimization hypotheses |
 | **OPTIMIZE** | Implement a single primary hypothesis with small incremental changes |
-| **VALIDATE** | Correctness hard gate + benchmark comparison; pass → accept (+ git commit if `git_commit=true`), fail → rollback |
+| **VALIDATE** | Correctness hard gate + benchmark comparison; pass → accept (+ git commit if `git_commit=true`), fail → rollback; keep `results/` and `logs/optimize.md` synchronized round by round |
 | **REPORT** | Summarize best version, effective directions, failed directions, and next-step recommendations; hand back to project skill for final acceptance |
 
 For detailed optimization process, gating rules, rollback, stagnation detection, and log templates, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md).
@@ -106,13 +106,15 @@ When the agent reaches this point, it should have already collected all required
 | `git_commit` | Default `true`; set to `false` if user specifies no commit |
 | `git_branch` | Default `auto`; use if specified by user |
 | `max_iterations` | Use if specified by user; otherwise leave empty, controlled by termination conditions |
+| `max_duration` | Use if specified by user; otherwise leave empty, controlled by termination conditions |
 
 **Step 2: Confirm prerequisite information is complete**
 
 Do a final check against the "Prerequisite Information" section:
 - [ ] Kernel source file path
-- [ ] Focused test command + quick test command
-- [ ] Focused benchmark command + quick benchmark command
+- [ ] Focused test command
+- [ ] Focused benchmark command
+- [ ] Quick validation script template
 - [ ] Benchmark output format and available performance metric columns
 - [ ] Scoring rules (e.g., geometric mean)
 - [ ] `execution_mode` decision
@@ -129,7 +131,7 @@ List the agent's inferred key parameters and confirm with the user before starti
 - `performance_target`: Specific number or "maximize improvement"?
 - `execution_mode`: repo or workspace?
 - `git_commit` / `git_branch`
-- `max_iterations` (if applicable)
+- `max_iterations` / `max_duration` (if applicable)
 - Special constraints (e.g., cannot modify certain interfaces)
 
 The user can confirm directly or adjust parameters. After confirmation, proceed to PREPARE_ENVIRONMENT.
@@ -178,17 +180,27 @@ target_shapes: <all | shape list>
 kernel_source: <kernel source file path>
 test_command: "<focused test command>"
 benchmark_command: "<focused benchmark command>"
-quick_test_command: "<quick test command>"
-quick_benchmark_command: "<quick benchmark command>"
+quick_command: "python <campaign_dir>/quick_test_bench.py"
 representative_shapes: <representative shape list selected during BASELINE, used for quick validation>
 related_work_file: <campaign_dir>/related_work.md
 git_commit: <true | false>
 git_branch: <branch name | none>
 max_iterations: <number | null>
-created: <YYYY-MM-DD>
+max_duration: <"Nh" | null>
+created: <YYYY-MM-DD HH:MM>
 ```
 
+All campaign timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
+
 The per-round artifacts required by [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) live under `<campaign_dir>/rounds/round-N/`, while the running comparison table lives at `<campaign_dir>/logs/performance_trend.md`.
+
+**Step 4: Generate `quick_test_bench.py`**
+
+Use the template from the project skill's quick validation section to generate `<campaign_dir>/quick_test_bench.py` while the project API context is still fresh.
+
+- Leave `SHAPES` empty or fill it with temporary placeholders during PREPARE_ENVIRONMENT
+- After BASELINE, select `representative_shapes` and update both `quick_test_bench.py` and `manifest.yaml`
+- Prefer a single self-contained script that runs correctness + benchmark together for quick iteration
 
 ## SURVEY_RELATED_WORK
 
@@ -307,6 +319,7 @@ The optimization process must maintain structured history (referencing AVO's lin
 - Failed attempts are recorded in the campaign log but do not enter the accepted lineage
 - Accepted versions must have clear hypotheses, validation results, and acceptance rationale
 - Logs serve both humans (can check progress at any time) and the agent (trace history to avoid repeated attempts)
+- Every VALIDATE round must update `results/v<N>.md` and `logs/optimize.md` together before moving on
 - Logs and profiling results are stored in `agent/workspace/<campaign_name>/`
 - For detailed log format, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md)
 
@@ -319,6 +332,8 @@ When there is no improvement for multiple consecutive rounds, the agent should n
 - Re-identify bottlenecks based on profiler results
 - Switch to a fundamentally different optimization direction
 - Revisit reference implementations and hardware documentation as needed
+- Two consecutive rollbacks should trigger a stagnation review by default
+- Continuous rollback is a signal to switch direction, not a reason to terminate early
 
 For detailed stagnation detection and direction-switching rules, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md).
 
@@ -328,7 +343,7 @@ For detailed stagnation detection and direction-switching rules, see [`workflow/
 
 **Step 1: Understand requirements**
 
-Agent is directed from `primus-turbo-develop/SKILL.md` to this file. Reads "Prerequisite Information" and learns the optimization framework needs: kernel source file, focused test, focused benchmark, benchmark output format, scoring rules, execution_mode recommendation, rebuild requirements.
+Agent is directed from `primus-turbo-develop/SKILL.md` to this file. Reads "Prerequisite Information" and learns the optimization framework needs: kernel source file, focused test, focused benchmark, quick validation script template, benchmark output format, scoring rules, execution_mode recommendation, and rebuild requirements.
 
 **Step 2: Collect project information**
 
@@ -336,6 +351,7 @@ Agent returns to `primus-turbo-develop/SKILL.md` and collects per the requiremen
 - Kernel: `primus_turbo/triton/gemm/gemm_fp8_kernel.py`
 - Focused test: `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`
 - Focused benchmark: `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`
+- Quick validation template: generate `quick_test_bench.py` during PREPARE_ENVIRONMENT, then fill representative shapes after BASELINE
 - Scoring: `Forward TFLOPS` geometric mean, `Check` as correctness gate
 - Environment recommendation: Triton → `repo-mode`, no rebuild needed
 
@@ -360,6 +376,7 @@ Proceed to PREPARE_ENVIRONMENT after user confirmation.
 2. Create `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/`
 3. Create subdirectories `logs/`, `profiles/`, `results/`, `rounds/`
 4. Write `manifest.yaml`
+5. Generate `quick_test_bench.py` with placeholder `SHAPES`; fill it after BASELINE selects representative shapes
 
 **Step 5: SURVEY_RELATED_WORK**
 
@@ -371,7 +388,7 @@ Proceed to PREPARE_ENVIRONMENT after user confirmation.
 **Step 6: Enter optimization loop**
 
 Read `workflow/optimize-loop.md` and execute as defined:
-1. BASELINE: Run focused test (confirm PASS) → run focused benchmark → record baseline TFLOPS
+1. BASELINE: Run focused test (confirm PASS) → run focused benchmark → record baseline TFLOPS → select representative shapes and update `quick_test_bench.py`
 2. ANALYZE: Read `related_work.md`, kernel source, consult `triton/SKILL.md` and `hardware/gfx942/`, generate optimization hypotheses
 3. OPTIMIZE → VALIDATE loop: Modify kernel → run test → run benchmark → compare → accept or rollback
 4. After reaching target or exhausting directions, output REPORT

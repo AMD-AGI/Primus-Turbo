@@ -24,6 +24,8 @@ pip install -r requirements.txt
 GPU_ARCHS=gfx942 pip install --no-build-isolation -e . -v
 ```
 
+**`pip install -r requirements.txt` must be run before install** because it pins critical dependency versions such as Triton and PyTorch. Skipping it is a common source of environment drift that breaks tests and benchmarks.
+
 `--no-build-isolation` is required; otherwise, the build environment will lack already-installed dependencies (e.g., triton, torch).
 
 **Difference between the two**: `pip install .` copies the code into site-packages — source changes have no effect. `pip install -e .` is editable mode — Python code (including Triton kernels) takes effect immediately after modification, with no reinstall needed. C++ extensions require compilation in both modes.
@@ -273,18 +275,28 @@ benchmark/ops/                   # Operator benchmarks
 
 This section is the agent's **first stop** when receiving an operator optimization request.
 
+### Environment Verification
+
+Before optimization, check the local install with `pip show primus_turbo`:
+
+- Not installed: follow [Build](#build) and do a full editable install
+- Installed but not editable, or not pointing at this repository: reinstall in editable mode
+- Installed and correct: still confirm the pinned dependencies from `requirements.txt` are consistent with the local environment
+
 ### Process Overview
 
-1. **Read `kernel-optimize/SKILL.md`'s "Prerequisite Information"** to understand what the optimization framework needs from the project
-2. **Collect project information per the requirement checklist** (from sections in this file)
+1. **Verify the environment** (see [Environment Verification](#environment-verification))
+2. **Read `kernel-optimize/SKILL.md`'s "Prerequisite Information"** to understand what the optimization framework needs from the project
+3. **Collect project information per the requirement checklist** (from sections in this file)
    - Kernel source file path: look up in [Code Structure](#code-structure-quick-reference) and [Key GEMM-Related Files](#key-gemm-related-files)
-   - Focused test command + quick test command: assemble from [Testing](#testing) and [Quick Validation](#quick-validation)
-   - Focused benchmark command + quick benchmark command: assemble from [Benchmark](#benchmark) and [Quick Validation](#quick-validation)
+   - Focused test command: assemble from [Testing](#testing)
+   - Focused benchmark command: assemble from [Benchmark](#benchmark)
+   - Quick validation script template: use [Quick Validation](#quick-validation)
    - Benchmark output format and available performance metrics: look up in [Output Metrics](#output-metrics)
    - Scoring rules: from [Optimization Scoring](#optimization-scoring) below
    - `execution_mode` recommendation and rebuild requirements: from [Optimization Environment](#optimization-environment) below
-3. **Hand off to `kernel-optimize/SKILL.md`** with the above information; it autonomously completes the optimization loop and outputs a report
-4. **Acceptance**: After optimization is complete, return to the project perspective for final confirmation
+4. **Hand off to `kernel-optimize/SKILL.md`** with the above information; it autonomously completes the optimization loop and outputs a report
+5. **Acceptance**: After optimization is complete, return to the project perspective for final confirmation
    - Run **full tests** in the main repo (not just focused tests) to ensure no regressions: `pytest tests/pytorch/ops/ -v`
    - Review the optimization report: whether performance improvement meets targets, whether changes are reasonable, whether there are residual risks
    - Confirm code is correctly committed to the main repo with a clean diff
@@ -316,15 +328,100 @@ For benchmark output format, shape sources, and measurement methodology, see the
 Each VALIDATE round defaults to quick validation (representative shape subset) to accelerate iteration. BASELINE and final acceptance use full validation.
 
 **Representative shape selection criteria**: During the BASELINE phase, the agent selects 3-5 representative shapes from the full benchmark results, covering small/medium/large scales. Selection criteria:
+- Select only shapes whose correctness check passed in the full benchmark
 - Include at least 1 small shape (prone to exposing launch overhead issues)
 - Include at least 1 large shape (prone to exposing memory / compute bottlenecks)
 - Prefer shapes with large performance variance (more sensitive, can quickly detect regressions)
 
 The selected shape list is recorded in the `representative_shapes` field of `manifest.yaml`.
 
-**Quick test**: Use the focused test command with `--maxfail=3` for fast failure, focusing on quickly intercepting obvious issues.
+**Implementation pattern**: During PREPARE_ENVIRONMENT, generate `quick_test_bench.py` in the campaign directory while the project API context is still fresh. Leave `SHAPES` empty at first, then fill it after BASELINE chooses `representative_shapes`.
 
-**Quick benchmark**: If the benchmark script supports shape filtering parameters, run only the representative shapes. If not, run the full benchmark and extract the representative shapes' data from the results for quick assessment.
+The FP8 blockwise GEMM template below is the default reference. Adapt it for other operators as needed:
+
+```python
+"""Quick correctness + benchmark for representative shapes.
+Auto-generated during PREPARE_ENVIRONMENT. Run: python quick_test_bench.py
+"""
+import os
+
+import torch
+import torch.utils.benchmark as benchmark
+
+os.environ["PRIMUS_TURBO_GEMM_BACKEND"] = "<target_backend>"
+
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    Format,
+    ScalingGranularity,
+)
+
+SHAPES = [
+    # Fill from representative_shapes in manifest after BASELINE
+]
+
+CONFIG = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.BLOCKWISE,
+    block_size=128,
+)
+
+
+def compute_snr(ref, test):
+    noise = test.float() - ref.float()
+    signal_power = ref.float().norm() ** 2
+    noise_power = noise.norm() ** 2
+    if noise_power == 0:
+        return float("inf")
+    return 10 * torch.log10(signal_power / noise_power).item()
+
+
+def run_one(M, N, K):
+    device = "cuda"
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device, requires_grad=True)
+    b = torch.randn(N, K, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    out = turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
+    ref = a.detach().float() @ b.detach().float().T
+    ok = compute_snr(ref.to(torch.bfloat16), out.detach()) >= 25.0
+
+    grad_out = torch.randn_like(out)
+    fwd_fn = lambda: turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
+    bwd_fn = lambda: out.backward(grad_out, retain_graph=True)
+    out = fwd_fn()
+    bwd_fn()
+
+    for _ in range(20):
+        out = fwd_fn()
+        out.backward(grad_out, retain_graph=True)
+    torch.cuda.synchronize()
+
+    fwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": fwd_fn}).timeit(100).mean * 1e3
+    bwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": bwd_fn}).timeit(100).mean * 1e3
+    flops = 2 * M * N * K
+    fwd_tflops = flops / fwd_ms / 1e9
+    bwd_tflops = 2 * flops / bwd_ms / 1e9
+
+    return ok, fwd_tflops, bwd_tflops
+
+
+print(f"{'Label':<12} {'Shape':<25} {'Check':<6} {'Fwd TFLOPS':>11} {'Bwd TFLOPS':>11}")
+print("-" * 68)
+all_pass = True
+for s in SHAPES:
+    ok, fwd, bwd = run_one(s["M"], s["N"], s["K"])
+    if not ok:
+        all_pass = False
+    print(
+        f"{s['label']:<12} {s['M']}x{s['N']}x{s['K']:<15} "
+        f"{'PASS' if ok else 'FAIL':<6} {fwd:>11.2f} {bwd:>11.2f}"
+    )
+
+print(f"\nOverall: {'ALL PASS' if all_pass else 'HAS FAILURES'}")
+```
+
+Record the script invocation in the manifest as `quick_command: "python <campaign_dir>/quick_test_bench.py"`.
 
 ### Demo: Optimizing blockwise FP8 GEMM Triton on MI300X
 
@@ -332,16 +429,15 @@ The following uses blockwise FP8 GEMM Triton on MI300X as an example.
 
 **1. Read `kernel-optimize/SKILL.md`'s prerequisite information**
 
-Learn that the optimization framework needs: kernel source file, focused test/quick test, focused benchmark/quick benchmark, benchmark output format, scoring rules, execution_mode recommendation, rebuild requirements.
+Learn that the optimization framework needs: kernel source file, focused test, focused benchmark, quick validation script template, benchmark output format, scoring rules, execution_mode recommendation, and rebuild requirements.
 
 **2. Collect project information per the requirement checklist**
 
 Gather from sections in this file:
 - Kernel source file: `primus_turbo/triton/gemm/gemm_fp8_kernel.py` (see [Key GEMM-Related Files](#key-gemm-related-files))
 - Focused test: `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` (see [Testing](#testing))
-- Quick test: same as above + `--maxfail=3` (see [Quick Validation](#quick-validation))
 - Focused benchmark: `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` (see [Benchmark](#benchmark))
-- Quick benchmark: same as above, extract representative shape data from full results (see [Quick Validation](#quick-validation))
+- Quick validation template: generate `quick_test_bench.py` during PREPARE_ENVIRONMENT, then fill representative shapes after BASELINE (see [Quick Validation](#quick-validation))
 - Available metrics: `Forward TFLOPS`, `Backward TFLOPS`, `Check` as correctness gate (see [Optimization Scoring](#optimization-scoring))
 - Environment recommendation: Triton → `repo-mode`, no rebuild needed (see [Optimization Environment](#optimization-environment))
 
@@ -358,7 +454,7 @@ Return to the project perspective for final confirmation:
 
 ---
 
-## 相关 Skills
+## Related Skills
 
 - **Operator performance optimization**: `kernel-optimize/SKILL.md` (optimization loop, workflow, Triton/HIP strategies)
 

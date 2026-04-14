@@ -5,7 +5,7 @@ This file defines the **detailed optimization process** for `kernel-optimize`.
 The default prerequisite is (agent proceeds through: project skill → `../SKILL.md` (understand requirements) → project skill (collect information) → `../SKILL.md` (execute) → this file):
 - All required information has been collected from the project skill per `../SKILL.md`'s "Prerequisite Information"
 - DEFINE_TARGET (parameter structuring) and PREPARE_ENVIRONMENT (campaign directory setup) have been completed in `../SKILL.md`
-- The campaign directory for this round has been established, and `manifest.yaml` has been filled in
+- The campaign directory for this round has been established, `manifest.yaml` has been filled in, and `quick_test_bench.py` has been generated
 - `related_work.md` has been created by the `SURVEY_RELATED_WORK` step in `../SKILL.md`
 - `target_op`, `target_backend`, `target_lang`, `target_gpu`, and `execution_mode` are clearly defined
 
@@ -42,6 +42,7 @@ Before starting the optimization process, at minimum define:
 | `git_commit` | Whether to git commit accepted versions |
 | `git_branch` | Current optimization branch (or `none`) |
 | `max_iterations` | Maximum iteration count (optional) |
+| `max_duration` | Maximum runtime budget (optional, e.g. `"4h"`) |
 | `project_skill` | Corresponding project skill |
 
 ## Confirm Previously Obtained Information
@@ -53,8 +54,7 @@ The following information should have been obtained during the project skill pha
 | **Kernel source file path** | Read code during ANALYZE | `primus_turbo/triton/gemm/gemm_fp8_kernel.py` |
 | **Focused test command** | Full correctness validation | `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` |
 | **Focused benchmark command** | Full performance evaluation | `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
-| **Quick test command** | Fast correctness validation each round | `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON" --maxfail=3` |
-| **Quick benchmark command** | Fast performance evaluation each round | Run full benchmark, then extract `representative_shapes` data; or use script's shape filter parameter (if supported) |
+| **Quick validation command** | Fast correctness + benchmark each round | `python <campaign_dir>/quick_test_bench.py` (generated in PREPARE_ENVIRONMENT, filled with `representative_shapes` after BASELINE) |
 | **Benchmark output column names** | Parse results, compute scores | `Forward TFLOPS`, `Backward TFLOPS` (primary_metric), `Check` (correctness gate) |
 | **Rebuild requirements** | Whether rebuild is needed after code changes | Triton: no rebuild needed; HIP: incremental rebuild required |
 | **Related-work report** | Seed early hypotheses with external and internal baselines | `<campaign_dir>/related_work.md` |
@@ -67,10 +67,10 @@ The optimization loop uses two levels of validation:
 
 | Level | When to use | Content |
 |-------|------------|---------|
-| **quick** | Default for each VALIDATE round | Test + benchmark on a representative shape subset (3-5 shapes), for fast feedback |
-| **full** | BASELINE, final acceptance, or when agent deems necessary | Test + benchmark on all shapes |
+| **quick** | Default for each VALIDATE round | Run `quick_command`: representative-shape correctness + benchmark in one step |
+| **full** | BASELINE, end of a direction, final acceptance, or when risk/noise requires it | Focused test + focused benchmark on all `target_shapes` |
 
-The specific commands for quick and full validation are provided by the project skill and recorded in the manifest.
+The quick validation script is generated during PREPARE_ENVIRONMENT while the project API context is still fresh. After BASELINE, fill it with `representative_shapes` and record the invocation in the manifest as `quick_command`. Full validation uses the focused test / benchmark commands from the project skill.
 
 Active validation set by level:
 - **quick** → all `representative_shapes`
@@ -78,15 +78,18 @@ Active validation set by level:
 
 Within a chosen validation level, do not cherry-pick a smaller subset.
 
-The quick validation aggregate score can be used for fast accept/reject decisions. When quick results are borderline (improvement < 5%) or involve high-risk changes like loop structures, the agent should proactively upgrade to full validation for confirmation.
+Quick validation is for small-step iteration within one direction. When a direction completes, when quick results are borderline (improvement < 5%), or when changes are high-risk (control flow, data layout, etc.), upgrade to full validation for confirmation.
 
 ## Overall Flow
 
 ```text
 ENVIRONMENT_BASELINE
   -> [ANALYZE -> OPTIMIZE -> VALIDATE -> ACCEPT/ROLLBACK] (iteration loop)
+  -> TERMINATION_CHECK (exit only if at least one termination condition is satisfied)
   -> REPORT
 ```
+
+ACCEPT and ROLLBACK both return to ANALYZE for the next round. Do not jump directly to REPORT unless TERMINATION_CHECK passes.
 
 In `repo-mode`, VALIDATE validates directly in the main repo with no SYNC_BACK step.
 In `workspace-mode`, VALIDATE is split into a local gate and an integration gate, with SYNC_BACK in between.
@@ -158,7 +161,9 @@ Baseline aggregate score = 285.0 → improvement = (304.8 - 285.0) / 285.0 = +6.
 2. Run **full** focused test, confirm all PASS
 3. Run **full** focused benchmark, write results to `<campaign_dir>/results/baseline.md`
 4. Compute baseline `score vector` and `aggregate score` per scoring specification
-5. Record backend configuration and key environment state
+5. Select 3-5 `representative_shapes` from PASS-only benchmark rows, covering small / medium / large behavior
+6. Update `quick_test_bench.py` with those `representative_shapes` and record `quick_command` in the manifest
+7. Record backend configuration and key environment state
 
 BASELINE always uses full validation to ensure the starting data is complete and reliable.
 
@@ -166,7 +171,7 @@ BASELINE always uses full validation to ensure the starting data is complete and
 
 ```markdown
 ## Baseline
-- Time: <timestamp>
+- Time: <YYYY-MM-DD HH:MM>
 - Backend: <target_backend>
 - GPU: <target_gpu>
 - Commit: <git_hash>
@@ -245,11 +250,10 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 **Under `repo-mode`** (common path, no SYNC_BACK):
 
 1. Ensure backend settings are correct if needed (env var or reset)
-2. Run **quick** test
-3. After all correctness passes, run **quick** benchmark
-4. Compute `score vector` and `aggregate score` per scoring specification
-5. Compare against current best
-6. When results are borderline (improvement < 5%) or involve high-risk changes, upgrade to **full** validation for confirmation
+2. Run `quick_command` (combined representative-shape correctness + benchmark)
+3. Compute `score vector` and `aggregate score` per scoring specification
+4. Compare against current best
+5. Upgrade to **full** validation when the direction completes, when results are borderline (improvement < 5%), or when changes are high-risk
 
 Write results to `<campaign_dir>/results/v<N>.md` (note the validation level).
 
@@ -261,9 +265,12 @@ Write results to `<campaign_dir>/results/v<N>.md` (note the validation level).
 - Core shape regression > 3% → default reject
 
 **After passing**:
-- Update current best
-- If `git_commit=true`: git commit (see git integration specification below)
-- Write this round's results to campaign log
+1. Write this round's detailed results to `results/v<N>.md`
+2. Immediately update `logs/optimize.md` (optimization history, current best, directions to try)
+3. Update current best
+4. If `git_commit=true`: git commit (see git integration specification below)
+
+`results/v<N>.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
 
 **Under `workspace-mode`**:
 Validation is split into a local gate (within minimal environment) and an integration gate (after syncing back to main repo).
@@ -275,7 +282,7 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 **Goal**: Update lineage and leave reusable context for the next round.
 
 **ACCEPT required actions**:
-- Update accepted history in the campaign log
+- Confirm `logs/optimize.md` already reflects the latest accepted round
 - Record cumulative improvement relative to baseline
 - Mark which directions were effective, ineffective, or need revisiting
 - Produce candidate directions for the next round
@@ -298,9 +305,10 @@ The following situations require rollback of the current round's candidate:
 - Results are too volatile to confirm whether improvement is real
 
 Rollback operations:
-- `repo-mode`: `git checkout -- <modified_files>` or `git revert <commit>`
-- `workspace-mode`: Roll back this round's local changes without affecting the main repo
-- Rollback reason must be written to the log to avoid repeating the same mistake
+1. Revert the candidate change (`repo-mode`: `git checkout -- <modified_files>` or `git revert <commit>`; `workspace-mode`: roll back the local candidate without affecting the main repo)
+2. Write `results/v<N>.md` and mark the round as rollback with the failure reason
+3. Immediately update `logs/optimize.md`, including the optimization history and verified ineffective directions
+4. Return to ANALYZE with a new direction; rollback is not, by itself, a campaign termination signal
 
 ## Git Integration Specification
 
@@ -345,7 +353,7 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - Backend: <target_backend>
 - Target GPU: <target_gpu>
 - Campaign: <campaign_dir>
-- Start time: <timestamp>
+- Start time: <YYYY-MM-DD HH:MM>
 - Current status: Optimizing (v<N>)
 
 ## Baseline
@@ -357,7 +365,7 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 ## Optimization History
 
 ### v1 — <one-line description of changes>
-- Time: <timestamp>
+- Time: <YYYY-MM-DD HH:MM>
 - Validation level: quick / full
 - Hypothesis: <why this change was made>
 - Changes: <which files and parameters were modified>
@@ -402,7 +410,7 @@ Detailed data from each VALIDATE round is written to `results/v<N>.md` (BASELINE
 ```markdown
 # v<N> — <one-line description of changes>
 
-- Time: <timestamp>
+- Time: <YYYY-MM-DD HH:MM>
 - Validation level: quick / full
 - Hypothesis: <optimization hypothesis for this round>
 
@@ -429,16 +437,16 @@ Detailed data from each VALIDATE round is written to `results/v<N>.md` (BASELINE
 Drawing from AVO's continuous evolution approach, stagnation is not a stop signal but a trigger for intervention.
 
 Any of the following conditions can trigger intervention:
-- `N` consecutive candidates were not accepted, default `N = 5`
-- Multiple consecutive rounds of minor adjustments in the same direction with no measurable improvement
-- Profiler-identified bottleneck has remained unchanged for an extended period
+- Two consecutive candidates were rolled back
+- Multiple consecutive rounds made only minor adjustments in the same direction with no measurable improvement
+- The profiler-identified bottleneck has remained unchanged for an extended period
 - Recent rounds only show parameter jitter with no structurally new hypotheses
 
 Once triggered, a `stagnation review` must be performed:
 
 1. Review the benefit curve of recent accepted versions
 2. Review failed attempts to identify proven ineffective directions
-3. Re-examine profiler results, reference implementations, and hardware documentation
+3. Re-examine profiler results, reference implementations, and hardware documentation; if profiling has not been done yet, do it now
 4. Generate at least 3 fundamentally different new directions
 5. Prioritize directions that have not been explored recently
 
@@ -452,14 +460,33 @@ Recommended direction-switching categories:
 
 ## Termination Conditions
 
-Any of the following conditions can terminate the current optimization campaign:
-- `performance_target` has been reached
-- An acceptable hardware efficiency range has been reached
-- Recent accepted versions' gains are below the noise level
-- The hypothesis pool has been largely exhausted
-- Remaining directions have excessive risk and insufficient expected benefit
-- `max_iterations` limit has been reached (if set)
-- User requests stop, or time / compute budget is exhausted
+The campaign may terminate only when at least one of the following conditions is satisfied:
+
+| ID | Condition | Notes |
+|----|-----------|-------|
+| `T1` | `performance_target` has been reached | Explicit target met |
+| `T2` | An acceptable hardware-efficiency range has been reached | For example, a clearly acceptable fraction of peak efficiency |
+| `T3` | Recent accepted versions' gains are below the noise floor | e.g. 3+ accepted versions in a row with < 2% improvement |
+| `T4` | The hypothesis pool has been largely exhausted | No meaningful unchecked directions remain |
+| `T5` | `max_iterations` limit has been reached | Only if configured |
+| `T6` | `max_duration` limit has been reached | Only if configured |
+| `T7` | The user explicitly requests stop | Always valid |
+
+Before writing REPORT, add a termination-check block to `logs/optimize.md` and state which condition passed:
+
+```markdown
+### Termination Check
+- T1 performance_target: ❌ / ✅
+- T2 hardware efficiency: ❌ / ✅
+- T3 gains below noise floor: ❌ / ✅
+- T4 hypothesis pool exhausted: ❌ / ✅
+- T5 max_iterations reached: ❌ / ✅
+- T6 max_duration reached: ❌ / ✅
+- T7 user requested stop: ❌ / ✅
+-> Satisfied condition(s): T<N>
+```
+
+If none of the conditions are satisfied, the campaign must return to ANALYZE instead of terminating.
 
 A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 
@@ -483,3 +510,5 @@ A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 - When `git_commit=true`, accepted versions must be git committed, forming a traceable lineage.
 - When stagnated, switch directions — do not endlessly fine-tune in the same direction.
 - Keep logs updated in real-time so humans can check current progress and historical decisions at any time.
+- Every VALIDATE round, whether accepted or rolled back, must update both `results/v<N>.md` and `logs/optimize.md`.
+- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
