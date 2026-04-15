@@ -58,9 +58,7 @@ def test_attention_16bit(
     # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
     if get_device_compute_capability() == (9, 4):
         if qkv_format == "sbhd" and not is_v3_atomic_fp32:
-            pytest.skip(
-                "gfx942 has numerical issue in fp16 atomic when layout is sbhd and is_v3_atomic_fp32 is True"
-            )
+            pytest.skip("gfx942 has numerical issue in fp16 atomic when layout is sbhd.")
 
     os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
 
