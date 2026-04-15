@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
+#include <tuple>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 
@@ -79,6 +81,11 @@ public:
         const size_t num_gemms = gemm_ptrs_.size();
         if (num_gemms == 0) return;
 
+        // Warm the hipBLASLt algo cache with balanced M (total_M / group_num)
+        // so the tuned algo is representative of the average expert size,
+        // not biased by whichever expert happens to be dispatched first.
+        warm_algo_cache(params, num_gemms);
+
         // Determine max per-expert token count to choose dispatch strategy.
         size_t max_tokens = 0;
         for (size_t i = 0; i < num_gemms; ++i) {
@@ -88,16 +95,53 @@ public:
         }
 
         if (max_tokens >= kSerialThreshold || num_gemms <= kMaxNumStreams) {
-            // Large GEMMs or few experts: serial on caller's stream avoids
-            // GPU resource contention from concurrent large kernels.
             dispatch_serial(params, num_gemms);
         } else {
-            // Many small GEMMs: multi-stream overlaps kernel launch overhead.
             dispatch_parallel(params, num_gemms);
         }
     }
 
 private:
+    void warm_algo_cache(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
+        // Use (rows_b, cols_a, transA, transB) as a compact shape key.
+        // This matches the M-invariant part of AlgoKey in hipblaslt_gemm.cu.
+        auto shape_key = std::make_tuple(rows_b_[0], cols_a_[0],
+                                         params.transA, params.transB);
+        if (warmed_shapes_.count(shape_key)) return;
+
+        // Compute balanced M = total_tokens / group_num.
+        int64_t total_tokens = 0;
+        for (size_t i = 0; i < num_gemms; ++i) {
+            total_tokens += params.transA ? cols_b_[i] : cols_c_[i];
+        }
+        const int64_t balanced_m = total_tokens / params.group_num;
+        if (balanced_m <= 0) return;
+
+        // Call hipblaslt_gemm_impl with balanced M to trigger algo tuning
+        // with a representative workload size.
+        const int64_t bal_cols_a = params.transA ? rows_a_[0] : balanced_m;
+        const int64_t bal_cols_b = params.transA ? balanced_m : cols_b_[0];
+        const int64_t bal_cols_d = params.transA ? cols_c_[0] : balanced_m;
+        // clang-format off
+        hipblaslt_gemm_impl(
+            gemm_ptrs_[0].b_ptr, params.b_type, rows_b_[0], bal_cols_b, ld_b_[0],
+            gemm_ptrs_[0].b_scale_ptr,
+            params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+            gemm_ptrs_[0].a_ptr, params.a_type, rows_a_[0], bal_cols_a, ld_a_[0],
+            gemm_ptrs_[0].a_scale_ptr,
+            params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+            gemm_ptrs_[0].c_ptr, params.c_type, rows_c_[0], bal_cols_d, ld_c_[0],
+            params.workspace, get_hipblaslt_workspace_size_in_byte(),
+            params.use_low_precision,
+            params.scale_mode,
+            handle_,
+            params.stream
+        );
+        // clang-format on
+        PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(params.stream));
+        warmed_shapes_.insert(shape_key);
+    }
+
     void dispatch_serial(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
         for (size_t idx = 0; idx < num_gemms; ++idx) {
             // clang-format off
@@ -281,6 +325,10 @@ private:
     std::vector<int64_t> cols_b_;
     std::vector<int64_t> rows_c_;
     std::vector<int64_t> cols_c_;
+
+    // Track which (N,K,transA,transB) shapes have been warmed for algo tuning
+    using ShapeKey = std::tuple<int64_t, int64_t, bool, bool>;
+    std::set<ShapeKey> warmed_shapes_;
 };
 
 void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
