@@ -30,7 +30,6 @@ def check_grouped_gemm_gmm_correctness(a, b, batch_sizes, grad_out, dtype):
     """Check correctness of gmm forward and backward against reference."""
     out = gmm_ops.gmm(a, b, batch_sizes, trans_b=True)
 
-    B = b.shape[0]
     group_lens = batch_sizes.to(device=a.device, dtype=torch.int64)
     out_ref = grouped_gemm_ref(a.detach(), b.detach(), group_lens, trans_b=True)
     fwd_correct = check_allclose(out.detach(), out_ref, dtype)
@@ -116,12 +115,18 @@ def benchmark_grouped_gemm_gmm(output_csv=None):
         balance = case.get("balance", True)
         balance_str = "balanced" if balance else "unbalanced"
         print(f"\n{'='*60}")
-        print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}")
+        print(
+            f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}"
+        )
         print(f"{'='*60}")
 
         try:
             fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm_gmm(
-                B=B, M=M, N=N, K=K, dtype=dtype,
+                B=B,
+                M=M,
+                N=N,
+                K=K,
+                dtype=dtype,
                 balance=balance,
                 num_topk=case.get("num_topk"),
             )

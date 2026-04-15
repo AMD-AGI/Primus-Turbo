@@ -32,21 +32,19 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
 // the autotuned algo is reused across different per-expert token counts,
 // avoiding re-autotune on every grouped GEMM call in training.
 struct AlgoKey {
-    int64_t cols_a;             // K (M-invariant)
-    int64_t rows_b, cols_b, ldb; // weight matrix shape (fixed per layer)
-    int64_t cols_d;             // N (M-invariant)
-    hipDataType A_type, B_type, D_type;
-    hipblasOperation_t transA, transB;
-    bool use_low_precision;
+    int64_t                      cols_a;              // K (M-invariant)
+    int64_t                      rows_b, cols_b, ldb; // weight matrix shape (fixed per layer)
+    int64_t                      cols_d;              // N (M-invariant)
+    hipDataType                  A_type, B_type, D_type;
+    hipblasOperation_t           transA, transB;
+    bool                         use_low_precision;
     hipblasLtMatmulMatrixScale_t scale_mode;
-    hipblasLtHandle_t handle;
+    hipblasLtHandle_t            handle;
 
     bool operator==(const AlgoKey &o) const {
-        return cols_a == o.cols_a &&
-               rows_b == o.rows_b && cols_b == o.cols_b && ldb == o.ldb &&
-               cols_d == o.cols_d &&
-               A_type == o.A_type && B_type == o.B_type && D_type == o.D_type &&
-               transA == o.transA && transB == o.transB &&
+        return cols_a == o.cols_a && rows_b == o.rows_b && cols_b == o.cols_b && ldb == o.ldb &&
+               cols_d == o.cols_d && A_type == o.A_type && B_type == o.B_type &&
+               D_type == o.D_type && transA == o.transA && transB == o.transB &&
                use_low_precision == o.use_low_precision && scale_mode == o.scale_mode &&
                handle == o.handle;
     }
@@ -54,12 +52,14 @@ struct AlgoKey {
 
 struct AlgoKeyHash {
     size_t operator()(const AlgoKey &k) const {
-        size_t s = 0;
-        auto hc  = [&s](auto v) {
+        size_t s  = 0;
+        auto   hc = [&s](auto v) {
             s ^= std::hash<decltype(v)>{}(v) + 0x9e3779b9u + (s << 6) + (s >> 2);
         };
         hc(k.cols_a);
-        hc(k.rows_b); hc(k.cols_b); hc(k.ldb);
+        hc(k.rows_b);
+        hc(k.cols_b);
+        hc(k.ldb);
         hc(k.cols_d);
         hc(static_cast<int>(k.A_type));
         hc(static_cast<int>(k.B_type));
@@ -80,20 +80,19 @@ static thread_local std::unordered_map<AlgoKey, hipblasLtMatmulHeuristicResult_t
 // Matrix layouts must match exact dimensions, so descriptors are cached per
 // full shape. Same-shape experts (balanced routing) still get cache hits.
 struct DescKey {
-    int64_t rows_a, cols_a, lda;
-    int64_t rows_b, cols_b, ldb;
-    int64_t rows_d, cols_d, ldd;
-    hipDataType A_type, B_type, D_type;
-    hipblasOperation_t transA, transB;
-    bool use_low_precision;
+    int64_t                      rows_a, cols_a, lda;
+    int64_t                      rows_b, cols_b, ldb;
+    int64_t                      rows_d, cols_d, ldd;
+    hipDataType                  A_type, B_type, D_type;
+    hipblasOperation_t           transA, transB;
+    bool                         use_low_precision;
     hipblasLtMatmulMatrixScale_t scale_mode;
-    hipblasLtHandle_t handle;
+    hipblasLtHandle_t            handle;
 
     bool operator==(const DescKey &o) const {
-        return rows_a == o.rows_a && cols_a == o.cols_a && lda == o.lda &&
-               rows_b == o.rows_b && cols_b == o.cols_b && ldb == o.ldb &&
-               rows_d == o.rows_d && cols_d == o.cols_d && ldd == o.ldd &&
-               A_type == o.A_type && B_type == o.B_type && D_type == o.D_type &&
+        return rows_a == o.rows_a && cols_a == o.cols_a && lda == o.lda && rows_b == o.rows_b &&
+               cols_b == o.cols_b && ldb == o.ldb && rows_d == o.rows_d && cols_d == o.cols_d &&
+               ldd == o.ldd && A_type == o.A_type && B_type == o.B_type && D_type == o.D_type &&
                transA == o.transA && transB == o.transB &&
                use_low_precision == o.use_low_precision && scale_mode == o.scale_mode &&
                handle == o.handle;
@@ -102,13 +101,19 @@ struct DescKey {
 
 struct DescKeyHash {
     size_t operator()(const DescKey &k) const {
-        size_t s = 0;
-        auto hc  = [&s](auto v) {
+        size_t s  = 0;
+        auto   hc = [&s](auto v) {
             s ^= std::hash<decltype(v)>{}(v) + 0x9e3779b9u + (s << 6) + (s >> 2);
         };
-        hc(k.rows_a); hc(k.cols_a); hc(k.lda);
-        hc(k.rows_b); hc(k.cols_b); hc(k.ldb);
-        hc(k.rows_d); hc(k.cols_d); hc(k.ldd);
+        hc(k.rows_a);
+        hc(k.cols_a);
+        hc(k.lda);
+        hc(k.rows_b);
+        hc(k.cols_b);
+        hc(k.ldb);
+        hc(k.rows_d);
+        hc(k.cols_d);
+        hc(k.ldd);
         hc(static_cast<int>(k.A_type));
         hc(static_cast<int>(k.B_type));
         hc(static_cast<int>(k.D_type));
@@ -122,9 +127,9 @@ struct DescKeyHash {
 };
 
 struct DescCache {
-    hipblasLtMatrixLayout_t A_desc = nullptr;
-    hipblasLtMatrixLayout_t B_desc = nullptr;
-    hipblasLtMatrixLayout_t D_desc = nullptr;
+    hipblasLtMatrixLayout_t A_desc  = nullptr;
+    hipblasLtMatrixLayout_t B_desc  = nullptr;
+    hipblasLtMatrixLayout_t D_desc  = nullptr;
     hipblasLtMatmulDesc_t   op_desc = nullptr;
 };
 
@@ -141,18 +146,22 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
                          hipblasLtHandle_t handle, hipStream_t stream) {
     // Look up or create cached descriptors for this exact shape.
-    DescKey dkey{rows_a, cols_a, lda, rows_b, cols_b, ldb,
-                 rows_d, cols_d, ldd, A_type, B_type, D_type,
-                 transA, transB, use_low_precision, scale_mode, handle};
+    DescKey dkey{rows_a,     cols_a, lda,    rows_b, cols_b,
+                 ldb,        rows_d, cols_d, ldd,    A_type,
+                 B_type,     D_type, transA, transB, use_low_precision,
+                 scale_mode, handle};
 
     auto &dc = desc_cache[dkey];
     if (dc.op_desc == nullptr) {
         hipblasLtEpilogue_t  epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
         hipblasComputeType_t gemm_compute_type = HIPBLAS_COMPUTE_32F;
 
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.A_desc, A_type, rows_a, cols_a, lda));
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.B_desc, B_type, rows_b, cols_b, ldb));
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&dc.D_desc, D_type, rows_d, cols_d, ldd));
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatrixLayoutCreate(&dc.A_desc, A_type, rows_a, cols_a, lda));
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatrixLayoutCreate(&dc.B_desc, B_type, rows_b, cols_b, ldb));
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatrixLayoutCreate(&dc.D_desc, D_type, rows_d, cols_d, ldd));
 
         PRIMUS_TURBO_CHECK_HIPBLAS(
             hipblasLtMatmulDescCreate(&dc.op_desc, gemm_compute_type, HIP_R_32F));
@@ -183,38 +192,50 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     if (use_low_precision) {
         PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
         PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA_inv, sizeof(scaleA_inv)));
-        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
-            operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB_inv, sizeof(scaleB_inv)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                            &scaleA_inv, sizeof(scaleA_inv)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(
+            hipblasLtMatmulDescSetAttribute(operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                            &scaleB_inv, sizeof(scaleB_inv)));
     }
 
     // Look up algo cache; M-invariant key so different per-expert token counts
     // reuse the same autotuned algo (kernel tile depends on N/K, not M).
-    AlgoKey akey{cols_a, rows_b, cols_b, ldb, cols_d,
-                 A_type, B_type, D_type, transA, transB,
-                 use_low_precision, scale_mode, handle};
+    AlgoKey akey{cols_a,
+                 rows_b,
+                 cols_b,
+                 ldb,
+                 cols_d,
+                 A_type,
+                 B_type,
+                 D_type,
+                 transA,
+                 transB,
+                 use_low_precision,
+                 scale_mode,
+                 handle};
 
     hipblasLtMatmulHeuristicResult_t algo_result{};
-    auto it = algo_cache.find(akey);
+    auto                             it = algo_cache.find(akey);
     if (it != algo_cache.end()) {
         algo_result = it->second;
     } else {
-        static constexpr int kMaxCandidates = 8;
-        static constexpr int kWarmupIters   = 10;
-        static constexpr int kBenchIters    = 30;
+        static constexpr int             kMaxCandidates = 8;
+        static constexpr int             kWarmupIters   = 10;
+        static constexpr int             kBenchIters    = 30;
         hipblasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
-        int returnedAlgoCount = 0;
-        hipblasLtMatmulPreference_t preference = nullptr;
+        int                              returnedAlgoCount = 0;
+        hipblasLtMatmulPreference_t      preference        = nullptr;
 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceCreate(&preference));
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceSetAttribute(
-            preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &workspace_size, sizeof(workspace_size)));
+            preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
+            sizeof(workspace_size)));
 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulAlgoGetHeuristic(
-            handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference,
-            kMaxCandidates, candidates, &returnedAlgoCount));
+            handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference, kMaxCandidates,
+            candidates, &returnedAlgoCount));
         PRIMUS_TURBO_CHECK(returnedAlgoCount > 0,
                            "hipBLASLt: no valid algorithm found for current matmul config");
 
@@ -225,25 +246,25 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         } else {
             // Autotune: benchmark each candidate, pick fastest.
             const float a1 = 1.0f, b0 = 0.0f;
-            hipEvent_t ev_start, ev_stop;
+            hipEvent_t  ev_start, ev_stop;
             PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&ev_start));
             PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&ev_stop));
 
-            float best_ms = 1e30f;
+            float best_ms  = 1e30f;
             int   best_idx = 0;
             for (int c = 0; c < returnedAlgoCount; ++c) {
                 // warm-up
                 for (int w = 0; w < kWarmupIters; ++w) {
-                    (void)hipblasLtMatmul(handle, operation_desc, &a1,
-                        A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
-                        &candidates[c].algo, workspace, workspace_size, stream);
+                    (void) hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
+                                           D, D_desc, D, D_desc, &candidates[c].algo, workspace,
+                                           workspace_size, stream);
                 }
 
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_start, stream));
                 for (int i = 0; i < kBenchIters; ++i) {
-                    (void)hipblasLtMatmul(handle, operation_desc, &a1,
-                        A, A_desc, B, B_desc, &b0, D, D_desc, D, D_desc,
-                        &candidates[c].algo, workspace, workspace_size, stream);
+                    (void) hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
+                                           D, D_desc, D, D_desc, &candidates[c].algo, workspace,
+                                           workspace_size, stream);
                 }
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_stop, stream));
                 PRIMUS_TURBO_CHECK_HIP(hipEventSynchronize(ev_stop));

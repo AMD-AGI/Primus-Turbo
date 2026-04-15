@@ -169,7 +169,9 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None, balance=True):
+def benchmark_grouped_gemm_turbo(
+    dtype_name="bf16", granularity_name="tensorwise", output_csv=None, balance=True
+):
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
@@ -192,7 +194,9 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 f"dtype: fp8, granularity: {granularity_name}, {balance_str}"
             )
         else:
-            print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}")
+            print(
+                f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}"
+            )
         print(f"{'='*60}")
 
         try:
@@ -202,7 +206,11 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 )
             else:
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm(
-                    B=B, M=M, N=N, K=K, dtype=dtype,
+                    B=B,
+                    M=M,
+                    N=N,
+                    K=K,
+                    dtype=dtype,
                     balance=balance,
                 )
 
@@ -311,6 +319,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     benchmark_grouped_gemm_turbo(
-        dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output,
+        dtype_name=args.dtype,
+        granularity_name=args.granularity,
+        output_csv=args.output,
         balance=(args.balance == "balanced"),
     )
