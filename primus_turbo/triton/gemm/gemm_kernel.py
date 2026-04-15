@@ -474,6 +474,10 @@ def _bf16_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    A_LOAD_ALIGNED: tl.constexpr,
+    B_LOAD_ALIGNED: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
@@ -504,11 +508,15 @@ def _bf16_persistent_gemm_kernel(
         tl.assume(pid_m >= 0)
         tl.assume(pid_n >= 0)
 
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rm_raw = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn_raw = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rm = rm_raw % M
+        rn = rn_raw % N
         rk = tl.arange(0, BLOCK_SIZE_K)
-        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        if EVEN_M:
+            rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        if EVEN_N:
+            rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
         A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
         B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
@@ -516,19 +524,31 @@ def _bf16_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        tl.assume(loop_k > 0)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
-            if stride_ak == 1:
-                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+            if EVEN_M:
+                if A_LOAD_ALIGNED:
+                    if stride_ak == 1:
+                        a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+                    else:
+                        a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+                else:
+                    a = tl.load(A_BASE, cache_modifier=CACHE_MODIFIER_A)
             else:
-                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+                a = tl.load(A_BASE, mask=rm_raw[:, None] < M, other=0.0, cache_modifier=CACHE_MODIFIER_A)
 
-            if stride_bk == 1:
-                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+            if EVEN_N:
+                if B_LOAD_ALIGNED:
+                    if stride_bk == 1:
+                        b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+                    else:
+                        b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+                else:
+                    b = tl.load(B_BASE, cache_modifier=CACHE_MODIFIER_B)
             else:
-                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+                b = tl.load(B_BASE, mask=rn_raw[None, :] < N, other=0.0, cache_modifier=CACHE_MODIFIER_B)
 
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
             A_BASE += BLOCK_SIZE_K * stride_ak
@@ -539,25 +559,37 @@ def _bf16_persistent_gemm_kernel(
             rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
             A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
             B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
-            if stride_ak == 1:
-                A_BASE = tl.multiple_of(A_BASE, (1, 16))
+            a_mask_k = rk[None, :] < K
+            b_mask_k = rk[:, None] < K
+            if EVEN_M:
+                if A_LOAD_ALIGNED:
+                    if stride_ak == 1:
+                        A_BASE = tl.multiple_of(A_BASE, (1, 16))
+                    else:
+                        A_BASE = tl.multiple_of(A_BASE, (16, 1))
+                a = tl.load(A_BASE, mask=a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             else:
-                A_BASE = tl.multiple_of(A_BASE, (16, 1))
-            if stride_bk == 1:
-                B_BASE = tl.multiple_of(B_BASE, (16, 1))
+                a = tl.load(A_BASE, mask=(rm_raw[:, None] < M) & a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            if EVEN_N:
+                if B_LOAD_ALIGNED:
+                    if stride_bk == 1:
+                        B_BASE = tl.multiple_of(B_BASE, (16, 1))
+                    else:
+                        B_BASE = tl.multiple_of(B_BASE, (1, 16))
+                b = tl.load(B_BASE, mask=b_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_B)
             else:
-                B_BASE = tl.multiple_of(B_BASE, (1, 16))
-            a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
-            b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+                b = tl.load(B_BASE, mask=b_mask_k & (rn_raw[None, :] < N), other=0.0, cache_modifier=CACHE_MODIFIER_B)
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
         c = acc.to(C.type.element_ty)
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
+        c_mask = (rm_raw[:, None] < M) & (rn_raw[None, :] < N)
+        rm_s = rm_raw % M
+        rn_s = rn_raw % N
+        if EVEN_M:
+            rm_s = tl.max_contiguous(tl.multiple_of(rm_s, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        if EVEN_N:
+            rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        C_ = C + rm_s[:, None].to(tl.int64) * stride_cm + rn_s[None, :].to(tl.int64) * stride_cn
         tl.store(C_, c, c_mask)
 
 
@@ -702,7 +734,32 @@ def gemm_triton_kernel(
                 cache_a, cache_b = oca, ocb
 
     even_k = K % BLOCK_K == 0
-    args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
+    even_m = M % BLOCK_M == 0
+    even_n = N % BLOCK_N == 0
+
+    # Force row-major (K-contiguous) layout for partial M/N tiles.
+    if not even_m and A_view.stride(1) != 1:
+        A_view = A_view.contiguous()
+        s_ak = A_view.stride(1)
+    if not even_n and B_view.stride(0) != 1:
+        B_view = B_view.contiguous()
+        s_bk = B_view.stride(0)
+
+    # tl.multiple_of hints for vectorised loads are only valid when the
+    # non-contiguous stride is a multiple of 16 (so every row/col vector
+    # starts at a 16-element-aligned address).
+    stride_am = A_view.stride(0)
+    stride_bn = B_view.stride(1)
+    if s_ak == 1:
+        a_load_aligned = stride_am % 16 == 0
+    else:
+        a_load_aligned = s_ak % 16 == 0
+    if s_bk == 1:
+        b_load_aligned = stride_bn % 16 == 0
+    else:
+        b_load_aligned = s_bk % 16 == 0
+
+    args = (A_view, B_view, out, M, N, K, stride_am, stride_bn, stride_cm, stride_cn)
 
     _bf16_persistent_gemm_kernel[(num_sms,)](
         *args,
@@ -716,6 +773,10 @@ def gemm_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        EVEN_M=even_m,
+        EVEN_N=even_n,
+        A_LOAD_ALIGNED=a_load_aligned,
+        B_LOAD_ALIGNED=b_load_aligned,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
