@@ -25,12 +25,10 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
 // new shape.  Cache the winning algo per (shape, dtype, trans, handle) tuple
 // so subsequent calls for the same problem are free.
 
-// ── Algo cache key: M-invariant ──────────────────────────────────────────────
-// hipBLASLt kernel tile selection depends on N, K, dtype, trans — NOT on M.
-// M only affects the grid launch size, not which kernel is fastest.
-// By excluding M-dependent dimensions (rows_a, lda, rows_d, ldd) from the key,
-// the autotuned algo is reused across different per-expert token counts,
-// avoiding re-autotune on every grouped GEMM call in training.
+// ── Algo cache key: optimistic M-invariant fast path ─────────────────────────
+// Reusing an algo across different M values avoids re-autotuning every expert
+// shape in grouped GEMM. Some BF16 hipBLASLt configs still require an exact-M
+// override, so an exact-shape cache is checked first and populated on fallback.
 struct AlgoKey {
     int64_t                      cols_a;              // K (M-invariant)
     int64_t                      rows_b, cols_b, ldb; // weight matrix shape (fixed per layer)
@@ -134,6 +132,8 @@ struct DescCache {
 };
 
 static thread_local std::unordered_map<DescKey, DescCache, DescKeyHash> desc_cache;
+static thread_local std::unordered_map<DescKey, hipblasLtMatmulHeuristicResult_t, DescKeyHash>
+    exact_algo_cache;
 // ─────────────────────────────────────────────────────────────────────────────
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
@@ -200,31 +200,12 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                                             &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    // Look up algo cache; M-invariant key so different per-expert token counts
-    // reuse the same autotuned algo (kernel tile depends on N/K, not M).
-    AlgoKey akey{cols_a,
-                 rows_b,
-                 cols_b,
-                 ldb,
-                 cols_d,
-                 A_type,
-                 B_type,
-                 D_type,
-                 transA,
-                 transB,
-                 use_low_precision,
-                 scale_mode,
-                 handle};
-
-    hipblasLtMatmulHeuristicResult_t algo_result{};
-    auto                             it = algo_cache.find(akey);
-    if (it != algo_cache.end()) {
-        algo_result = it->second;
-    } else {
+    auto autotune_algo = [&]() -> hipblasLtMatmulHeuristicResult_t {
         static constexpr int             kMaxCandidates = 8;
         static constexpr int             kWarmupIters   = 10;
         static constexpr int             kBenchIters    = 30;
         hipblasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
+        hipblasLtMatmulHeuristicResult_t tuned_algo{};
         int                              returnedAlgoCount = 0;
         hipblasLtMatmulPreference_t      preference        = nullptr;
 
@@ -242,7 +223,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
 
         if (returnedAlgoCount == 1) {
-            algo_result = candidates[0];
+            tuned_algo = candidates[0];
         } else {
             // Autotune: benchmark each candidate, pick fastest.
             const float a1 = 1.0f, b0 = 0.0f;
@@ -278,28 +259,61 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             }
             PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_start));
             PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_stop));
-            algo_result = candidates[best_idx];
+            tuned_algo = candidates[best_idx];
         }
 
-        algo_cache[akey] = algo_result;
+        return tuned_algo;
+    };
+
+    // Check exact-shape overrides first, then fall back to the optimistic
+    // M-invariant cache to avoid repeated autotune on similar expert shapes.
+    AlgoKey akey{cols_a,
+                 rows_b,
+                 cols_b,
+                 ldb,
+                 cols_d,
+                 A_type,
+                 B_type,
+                 D_type,
+                 transA,
+                 transB,
+                 use_low_precision,
+                 scale_mode,
+                 handle};
+
+    hipblasLtMatmulHeuristicResult_t algo_result{};
+    bool                             used_shared_algo_cache = false;
+    auto                             exact_it               = exact_algo_cache.find(dkey);
+    if (exact_it != exact_algo_cache.end()) {
+        algo_result = exact_it->second;
+    } else {
+        auto it = algo_cache.find(akey);
+        if (it != algo_cache.end()) {
+            algo_result            = it->second;
+            used_shared_algo_cache = true;
+        } else {
+            algo_result      = autotune_algo();
+            algo_cache[akey] = algo_result;
+        }
     }
 
-    const float alpha = 1.0;
-    const float beta  = 0.0;
-    // clang-format off
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmul(
-        handle,
-        operation_desc,
-        &alpha,
-        A, A_desc,
-        B, B_desc,
-        &beta,
-        D, D_desc,
-        D, D_desc,
-        &algo_result.algo,
-        workspace, workspace_size,
-        stream));
-    // clang-format on
+    const float     alpha = 1.0;
+    const float     beta  = 0.0;
+    hipblasStatus_t status =
+        hipblasLtMatmul(handle, operation_desc, &alpha, A, A_desc, B, B_desc, &beta, D, D_desc, D,
+                        D_desc, &algo_result.algo, workspace, workspace_size, stream);
+
+    if (status == HIPBLAS_STATUS_INVALID_VALUE && used_shared_algo_cache) {
+        // Some configs still need an exact-shape algo even when N/K/trans/dtype
+        // match. Retune for this descriptor and remember the exact override.
+        algo_result            = autotune_algo();
+        exact_algo_cache[dkey] = algo_result;
+        status =
+            hipblasLtMatmul(handle, operation_desc, &alpha, A, A_desc, B, B_desc, &beta, D, D_desc,
+                            D, D_desc, &algo_result.algo, workspace, workspace_size, stream);
+    }
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(status);
 
     // Descriptors are cached — no destroy needed per call.
 }
