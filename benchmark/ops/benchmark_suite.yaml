@@ -141,6 +141,20 @@ tasks:
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_blockwise_triton_benchmark.csv
 
+  # ── GEMM MXFP8 ─────────────────────────────────────────
+  - label: gemm_mxfp8
+    group: gemm_fp8
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, mxfp8]
+    output: gemm_mxfp8_benchmark.csv
+
+  # ── GEMM MXFP4 ─────────────────────────────────────────
+  - label: gemm_mxfp4
+    group: gemm_fp4
+    script: bench_gemm_turbo.py
+    args: [--dtype, fp4, --granularity, mxfp4]
+    output: gemm_mxfp4_benchmark.csv
+
   # ── Grouped GEMM BF16 ────────────────────────────────────
   - label: grouped_gemm_bf16_te
     group: grouped_gemm_bf16

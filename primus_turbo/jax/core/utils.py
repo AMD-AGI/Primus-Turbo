@@ -5,6 +5,8 @@
 ###############################################################################
 
 import functools
+import logging
+import subprocess
 from typing import Tuple
 
 import jax
@@ -13,18 +15,13 @@ from jax import dtypes
 
 from primus_turbo.jax._C import DType as TurboDType
 
+logger = logging.getLogger(__name__)
 
-@functools.lru_cache
-def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
-    """Get compute capability for a specific device."""
-    devices = jax.devices("gpu")
-    if device_id >= len(devices) or device_id < 0:
-        raise ValueError(f"Device {device_id} not found")
 
-    device = devices[device_id]
-    device_kind = device.device_kind
-    if device_kind.startswith("gfx"):
-        gfx_version = device_kind[3:]
+def _parse_gfx_string(gfx_name: str) -> Tuple[int, int]:
+    """Parse a gfx architecture string (e.g. 'gfx942', 'gfx950') into (major, minor)."""
+    if gfx_name.startswith("gfx"):
+        gfx_version = gfx_name[3:]
         if len(gfx_version) >= 2:
             try:
                 major = int(gfx_version[0])
@@ -32,7 +29,53 @@ def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
                 return (major, minor)
             except ValueError:
                 pass
+    return (0, 0)
 
+
+def _get_capability_from_hip(device_id: int) -> Tuple[int, int]:
+    """Get compute capability via HIP runtime (C++ extension)."""
+    try:
+        from primus_turbo.jax._C import get_device_compute_capability as _hip_get_cc
+
+        return _hip_get_cc(device_id)
+    except (ImportError, AttributeError):
+        return (0, 0)
+
+
+def _get_capability_from_rocm_agent(device_id: int) -> Tuple[int, int]:
+    """Get compute capability via rocm_agent_enumerator (fallback)."""
+    try:
+        result = subprocess.run(
+            ["rocm_agent_enumerator", "-t", "GPU"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        agents = [l.strip() for l in result.stdout.strip().split("\n") if l.strip() and l.strip() != "gfx000"]
+        if device_id < len(agents):
+            return _parse_gfx_string(agents[device_id])
+    except Exception:
+        pass
+    return (0, 0)
+
+
+@functools.lru_cache
+def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
+    """Get compute capability for a specific device.
+
+    Tries multiple detection methods:
+      1. HIP runtime via C++ extension (most reliable)
+      2. rocm_agent_enumerator CLI tool (fallback)
+    """
+    cap = _get_capability_from_hip(device_id)
+    if cap != (0, 0):
+        return cap
+
+    cap = _get_capability_from_rocm_agent(device_id)
+    if cap != (0, 0):
+        return cap
+
+    logger.warning("Could not determine GPU compute capability for device %d", device_id)
     return (0, 0)
 
 
