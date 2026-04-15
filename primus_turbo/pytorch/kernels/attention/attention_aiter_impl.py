@@ -22,6 +22,7 @@ from aiter.ops.triton.attention.mha import (
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import KernelBackend
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 
 def _is_power_of_2(n: int) -> bool:
@@ -196,6 +197,12 @@ class AttnBwdAiterBackend(KernelBackend):
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
         supported &= head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+
+        is_v3_atomic_fp32 = kwargs["is_v3_atomic_fp32"]
+
+        # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
+        if get_device_compute_capability() == (9, 4):
+            supported &= not (qkv_format == "sbhd" and is_v3_atomic_fp32)
 
         return supported
 

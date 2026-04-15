@@ -4,9 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -48,7 +51,19 @@ test_cases = [
 @pytest.mark.parametrize("enable_sink", [False, True])
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
-def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_left, qkv_format):
+@pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
+def test_attention_16bit(
+    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
+):
+    # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
+    if get_device_compute_capability() == (9, 4):
+        if qkv_format == "sbhd" and is_v3_atomic_fp32:
+            pytest.skip(
+                "gfx942 has numerical issue in fp16 atomic when layout is sbhd and is_v3_atomic_fp32 is True"
+            )
+
+    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
+
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
