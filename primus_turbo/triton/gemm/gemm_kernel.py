@@ -569,7 +569,9 @@ def _bf16_persistent_gemm_kernel(
                         A_BASE = tl.multiple_of(A_BASE, (16, 1))
                 a = tl.load(A_BASE, mask=a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             else:
-                a = tl.load(A_BASE, mask=(rm_raw[:, None] < M) & a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+                a = tl.load(
+                    A_BASE, mask=(rm_raw[:, None] < M) & a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A
+                )
             if EVEN_N:
                 if B_LOAD_ALIGNED:
                     if stride_bk == 1:
@@ -578,7 +580,9 @@ def _bf16_persistent_gemm_kernel(
                         B_BASE = tl.multiple_of(B_BASE, (1, 16))
                 b = tl.load(B_BASE, mask=b_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_B)
             else:
-                b = tl.load(B_BASE, mask=b_mask_k & (rn_raw[None, :] < N), other=0.0, cache_modifier=CACHE_MODIFIER_B)
+                b = tl.load(
+                    B_BASE, mask=b_mask_k & (rn_raw[None, :] < N), other=0.0, cache_modifier=CACHE_MODIFIER_B
+                )
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
         c = acc.to(C.type.element_ty)
