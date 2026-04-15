@@ -524,7 +524,7 @@ def _bf16_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 0)
+        tl.assume(loop_k >= 0)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -741,27 +741,37 @@ def gemm_triton_kernel(
     even_m = M % BLOCK_M == 0
     even_n = N % BLOCK_N == 0
 
-    # Force row-major (K-contiguous) layout for partial M/N tiles.
+    # For partial M tiles with non-unit K stride (e.g. A comes from .T),
+    # force C-contiguous so s_ak becomes 1, avoiding non-deterministic
+    # interactions between strided access and modular index wrapping.
     if not even_m and A_view.stride(1) != 1:
         A_view = A_view.contiguous()
         s_ak = A_view.stride(1)
+    # For partial N tiles with non-unit K stride (e.g. B comes from .T),
+    # the K dim is dim-0; C-contiguous gives stride (N, 1) so s_bk = N,
+    # NOT 1.  We still materialise a dense copy to eliminate any exotic
+    # stride pattern, but this does NOT make K contiguous for B.
     if not even_n and B_view.stride(0) != 1:
         B_view = B_view.contiguous()
         s_bk = B_view.stride(0)
 
-    # tl.multiple_of hints for vectorised loads are only valid when the
-    # non-contiguous stride is a multiple of 16 (so every row/col vector
-    # starts at a 16-element-aligned address).
+    # tl.multiple_of hints for vectorised loads are only valid when BOTH
+    # the base pointer AND the non-contiguous stride are 16-element-aligned.
+    # Subviews from TP/MoE weight slicing can have aligned strides but a
+    # misaligned base address, which would cause garbage loads and NaN loss.
     stride_am = A_view.stride(0)
     stride_bn = B_view.stride(1)
+    elem_bytes = A_view.element_size()
+    ptr_aligned_a = A_view.data_ptr() % (16 * elem_bytes) == 0
+    ptr_aligned_b = B_view.data_ptr() % (16 * elem_bytes) == 0
     if s_ak == 1:
-        a_load_aligned = stride_am % 16 == 0
+        a_load_aligned = ptr_aligned_a and stride_am % 16 == 0
     else:
-        a_load_aligned = s_ak % 16 == 0
+        a_load_aligned = ptr_aligned_a and s_ak % 16 == 0
     if s_bk == 1:
-        b_load_aligned = stride_bn % 16 == 0
+        b_load_aligned = ptr_aligned_b and stride_bn % 16 == 0
     else:
-        b_load_aligned = s_bk % 16 == 0
+        b_load_aligned = ptr_aligned_b and s_bk % 16 == 0
 
     args = (A_view, B_view, out, M, N, K, stride_am, stride_bn, stride_cm, stride_cn)
 
