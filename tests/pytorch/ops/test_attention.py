@@ -57,7 +57,7 @@ def test_attention_16bit(
 ):
     # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
     if get_device_compute_capability() == (9, 4):
-        if qkv_format == "sbhd" and is_v3_atomic_fp32:
+        if qkv_format == "sbhd" and not is_v3_atomic_fp32:
             pytest.skip(
                 "gfx942 has numerical issue in fp16 atomic when layout is sbhd and is_v3_atomic_fp32 is True"
             )
@@ -118,6 +118,15 @@ def test_attention_16bit(
     query_ref = query.clone().detach().requires_grad_()
     key_ref = key.clone().detach().requires_grad_()
     value_ref = value.clone().detach().requires_grad_()
+    grad_out_ref = grad_out.clone().detach()
+
+    query_orig, key_orig, value_orig = query, key, value
+
+    if qkv_format == "sbhd":
+        query = query.permute(1, 0, 2, 3)
+        key = key.permute(1, 0, 2, 3)
+        value = value.permute(1, 0, 2, 3)
+        grad_out = grad_out.permute(1, 0, 2, 3)
 
     sm_scale = head_dim_qk ** (-0.5)
 
@@ -134,14 +143,13 @@ def test_attention_16bit(
             sm_scale,
             causal,
             window_size=window_size,
-            qkv_format=qkv_format,
         )
     else:
         o_ref = attention_vanilla_forward_pytorch_ref_impl(
             query_ref, key_ref, value_ref, sm_scale, causal, qkv_format
         )
 
-    o_ref.backward(grad_out)
+    o_ref.backward(grad_out_ref)
     o = flash_attn_func(
         query,
         key,
@@ -156,16 +164,19 @@ def test_attention_16bit(
         return_lse=False,
         return_attn_probs=False,
         sink=sink,
-        qkv_format=qkv_format,
     )
     o.backward(grad_out)
 
     torch.cuda.synchronize()
 
-    out_snr = compute_snr(o_ref, o)
-    query_grad_snr = compute_snr(query_ref.grad, query.grad)
-    key_grad_snr = compute_snr(key_ref.grad, key.grad)
-    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+    if qkv_format == "sbhd":
+        o_ref_cmp = o_ref.permute(1, 0, 2, 3).contiguous()
+    else:
+        o_ref_cmp = o_ref
+    out_snr = compute_snr(o_ref_cmp, o)
+    query_grad_snr = compute_snr(query_ref.grad, query_orig.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key_orig.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value_orig.grad)
     sink_grad_snr = compute_snr(sink_ref.grad, sink.grad) if enable_sink else None
     msg = f"out={out_snr:.2f}, dq={query_grad_snr:.2f}, dk={key_grad_snr:.2f}, dv={value_grad_snr:.2f}"
     if enable_sink:

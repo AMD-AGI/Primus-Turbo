@@ -22,6 +22,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _infer_qkv_format,
     _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
@@ -77,7 +78,13 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        seq_dim = 0 if qkv_format == "sbhd" else 1
+        enable_sink = sink is not None
+        if enable_sink:
+            # NOTE: Sink attention is not supported for sbhd format. Fallback to BSHD.
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+
         out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
             q=q,
             k=k,
@@ -91,11 +98,15 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
-            max_seqlen_q=q.shape[seq_dim],
-            max_seqlen_k=k.shape[seq_dim],
+            max_seqlen_q=q.size(1),
+            max_seqlen_k=k.size(1),
             sink=sink,
-            qkv_format=qkv_format,
+            qkv_format=qkv_format if not enable_sink else "bshd",
         )
+
+        if enable_sink and qkv_format == "sbhd":
+            # permute back to SBHD
+            out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -127,30 +138,26 @@ class AiterFlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = ctx.head_size_v_og
-        bias = ctx.bias
-        dbias = torch.empty_like(bias) if bias is not None else None
 
         q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
-        sink = getattr(ctx, "sink", None)
-        dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+
+        enable_sink = ctx.sink is not None
+        qkv_format = ctx.qkv_format
+
+        if enable_sink and qkv_format == "sbhd":
+            dout = dout.contiguous()
 
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
 
-        dq, dk, dv_padded = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
-
-        attention_aiter_backward_impl(
+        _, dq, dk, dv_padded, dbias, dsink = attention_aiter_backward_impl(
             dout=dout_padded,
             q=q,
             k=k,
             v=v,
             out=out_padded,
             softmax_lse=softmax_lse,
-            dq=dq,
-            dk=dk,
-            dv=dv_padded,
-            dbias=dbias,
             dropout_p=ctx.dropout_p,
             softmax_scale=ctx.softmax_scale,
             causal=ctx.causal,
@@ -162,14 +169,19 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
-            sink=sink,
-            dsink=dsink,
-            qkv_format=ctx.qkv_format,
+            sink=ctx.sink,
+            qkv_format=qkv_format if not enable_sink else "bshd",
         )
 
-        dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
+        if enable_sink and qkv_format == "sbhd":
+            dq = dq.permute(1, 0, 2, 3).contiguous()
+            dk = dk.permute(1, 0, 2, 3).contiguous()
+            dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
+
+        dq = dq[..., :head_size_q_og]
         dk = dk[..., :head_size_q_og]
         dv = dv_padded[..., :head_size_v_og]
+
         return (
             dq,
             dk,
@@ -307,10 +319,8 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
-    qkv_format: Optional[str] = "bshd",
 ):
-    _SUPPORTED_QKV_FORMATS = ("bshd", "sbhd")
-    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
+    qkv_format = _infer_qkv_format(q, k, v)
 
     return AiterFlashAttnFunc.apply(
         q,
@@ -346,10 +356,8 @@ def flash_attn_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
-    qkv_format: Optional[str] = "bshd",
 ):
-    _SUPPORTED_QKV_FORMATS = ("bshd",)
-    assert qkv_format in _SUPPORTED_QKV_FORMATS, f"Unsupported qkv format: {qkv_format}"
+    _infer_qkv_format(q, k, v)
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:

@@ -86,27 +86,15 @@ class AttnFwdAiterBackend(KernelBackend):
         out: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "sbhd",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-        if qkv_format == "sbhd":
-            seq_len, batch_size, num_heads_qk, head_dim_qk = q.shape
-            _, _, _, head_dim_v = v.shape
-        else:
-            # bshd
-            assert qkv_format == "bshd"
-            batch_size, seq_len, num_heads_qk, head_dim_qk = q.shape
-            _, _, _, head_dim_v = v.shape
+        batch_size, seq_len, num_heads_qk, head_dim_qk = q.size()
+        _, _, _, head_dim_v = v.size()
 
         out = None
         if sink is None:
             if qkv_format == "sbhd":
-                # transform shape to bshd
-                q_ = q.permute(1, 0, 2, 3)
-                k_ = k.permute(1, 0, 2, 3)
-                v_ = v.permute(1, 0, 2, 3)
-
                 out = torch.empty(
                     (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
-                )
-                out = out.permute(1, 0, 2, 3)
+                ).permute(1, 0, 2, 3)
             else:
                 # BSHD
                 assert qkv_format == "bshd"
@@ -114,12 +102,10 @@ class AttnFwdAiterBackend(KernelBackend):
                     (batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
                 )
 
-                q_, k_, v_ = q, k, v
-
             _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-                q_,
-                k_,
-                v_,
+                q,
+                k,
+                v,
                 dropout_p,
                 softmax_scale,
                 causal,
@@ -135,8 +121,6 @@ class AttnFwdAiterBackend(KernelBackend):
                 return_softmax,
                 out=out,
             )
-            if qkv_format == "sbhd":
-                out = out.permute(1, 0, 2, 3)
         else:
             assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
 
@@ -146,9 +130,9 @@ class AttnFwdAiterBackend(KernelBackend):
                 )
 
             if max_seqlen_q is None:
-                max_seqlen_q = q.shape[1]
+                max_seqlen_q = q.size(1)
             if max_seqlen_k is None:
-                max_seqlen_k = k.shape[1]
+                max_seqlen_k = k.size(1)
             window_size_left, window_size_right = _normalize_sink_window(
                 causal, window_size_left, window_size_right
             )
@@ -185,8 +169,8 @@ class AttnBwdAiterBackend(KernelBackend):
     def can_handle(**kwargs) -> bool:
         q = kwargs["q"]
         v = kwargs["v"]
-        head_dim_qk = q.shape[-1]
-        head_dim_v = v.shape[-1]
+        head_dim_qk = q.size(-1)
+        head_dim_v = v.size(-1)
 
         sink = kwargs.get("sink", None)
         qkv_format = kwargs["qkv_format"]
@@ -214,10 +198,6 @@ class AttnBwdAiterBackend(KernelBackend):
         v: torch.Tensor,
         out: torch.Tensor,
         softmax_lse: torch.Tensor,
-        dq: torch.Tensor,
-        dk: torch.Tensor,
-        dv: torch.Tensor,
-        dbias: Optional[torch.Tensor],
         dropout_p: float,
         softmax_scale: float,
         causal: bool,
@@ -230,34 +210,40 @@ class AttnBwdAiterBackend(KernelBackend):
         is_v3_atomic_fp32: bool,
         how_v3_bf16_cvt: int,
         sink: Optional[torch.Tensor] = None,
-        dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
     ):
-        if sink is None:
-            if qkv_format == "sbhd":
-                q_ = q.permute(1, 0, 2, 3)
-                k_ = k.permute(1, 0, 2, 3)
-                v_ = v.permute(1, 0, 2, 3)
-                out_ = out.permute(1, 0, 2, 3)
-                dout_ = dout.permute(1, 0, 2, 3)
-                dq_ = dq.permute(1, 0, 2, 3)
-                dk_ = dk.permute(1, 0, 2, 3)
-                dv_ = dv.permute(1, 0, 2, 3)
-            else:
-                assert qkv_format == "bshd"
-                q_, k_, v_, out_ = q, k, v, out
-                dout_, dq_, dk_, dv_ = dout, dq, dk, dv
+        batch_size, seq_len, num_heads_q, head_dim_qk = q.size()
+        _, _, num_heads_k, head_dim_k = k.size()
+        _, _, num_heads_v, head_dim_v = v.size()
+        if qkv_format == "sbhd":
+            dq = torch.ones(
+                (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
+            ).permute(1, 0, 2, 3)
+            dk = torch.empty(
+                (seq_len, batch_size, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
+            ).permute(1, 0, 2, 3)
+            dv = torch.empty(
+                (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
+            ).permute(1, 0, 2, 3)
+        else:
+            dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
+            dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
+            dv = torch.empty((batch_size, seq_len, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device)
 
+        dbias = torch.empty_like(bias) if bias is not None else None
+        dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+
+        if sink is None:
             result = _flash_attn_backward(
-                dout_,
-                q_,
-                k_,
-                v_,
-                out_,
+                dout,
+                q,
+                k,
+                v,
+                out,
                 softmax_lse,
-                dq_,
-                dk_,
-                dv_,
+                dq,
+                dk,
+                dv,
                 dbias,
                 dropout_p,
                 softmax_scale,
@@ -299,8 +285,8 @@ class AttnBwdAiterBackend(KernelBackend):
                 causal,
                 None,  # cu_seqlens_q
                 None,  # cu_seqlens_k
-                q.shape[1],  # max_seqlen_q
-                k.shape[1],  # max_seqlen_k
+                q.size(1),  # max_seqlen_q
+                k.size(1),  # max_seqlen_k
                 dropout_p,
                 philox_seed,
                 philox_offset,
@@ -310,7 +296,14 @@ class AttnBwdAiterBackend(KernelBackend):
                 sliding_window=window_size_left if window_size_left >= 0 else 0,
             )
 
-        return result
+        return (
+            result,
+            dq,
+            dk,
+            dv,
+            dbias,
+            dsink,
+        )
 
 
 def attention_aiter_forward_impl(
@@ -358,10 +351,6 @@ def attention_aiter_backward_impl(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    dbias: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -374,7 +363,6 @@ def attention_aiter_backward_impl(
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
     sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
 ):
     return AttnBwdAiterBackend.execute(
@@ -384,10 +372,6 @@ def attention_aiter_backward_impl(
         v=v,
         out=out,
         softmax_lse=softmax_lse,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dbias=dbias,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -400,6 +384,5 @@ def attention_aiter_backward_impl(
         is_v3_atomic_fp32=is_v3_atomic_fp32,
         how_v3_bf16_cvt=how_v3_bf16_cvt,
         sink=sink,
-        dsink=dsink,
         qkv_format=qkv_format,
     )

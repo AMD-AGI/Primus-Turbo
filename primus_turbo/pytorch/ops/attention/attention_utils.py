@@ -26,6 +26,51 @@ def _check_and_convert(t, scale, float8_fw):
     return (t * scale).clamp(min=finfo.min, max=finfo.max).to(dtype=float8_fw) if t.dtype != float8_fw else t
 
 
+def _infer_qkv_format(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> str:
+    """Infer whether the memory layout is ``"bshd"`` or ``"sbhd"``.
+
+    All three tensors are assumed to have **logical** shape ``[b, s, h, d]``.
+    """
+
+    def _infer_format(t: torch.Tensor) -> str:
+        """Detect the memory layout of a single ``[b, s, h, d]`` tensor.
+
+        - **bshd** contiguous: stride = (s*h*d, h*d, d, 1)
+        - **sbhd** (transposed from contiguous [s,b,h,d]): stride = (h*d, b*h*d, d, 1)
+        """
+        b, s, h, d = t.size()
+        hd = h * d
+        s0, s1 = t.stride(0), t.stride(1)
+
+        # bshd: stride[0] = dim1 * h * d,  stride[1] = h * d
+        if s0 == s * hd and s1 == hd:
+            return "bshd"
+        # sbhd: stride[0] = h * d,  stride[1] = dim0 * h * d
+        if s0 == hd and s1 == b * hd:
+            return "sbhd"
+
+        assert False, (
+            f"Cannot infer qkv layout from shape {tuple(t.size())} " f"and strides {tuple(t.stride())}"
+        )
+
+    assert q.ndim == 4, f"Expected 4-D tensor for q, got {q.ndim}-D"
+    q_format = _infer_format(q)
+
+    for name, t in (("k", k), ("v", v)):
+        assert t.ndim == 4, f"Expected 4-D tensor for {name}, got {t.ndim}-D"
+        other_format = _infer_format(t)
+        assert other_format == q_format, (
+            f"Layout mismatch: q is {q_format} but {name} is {other_format}. "
+            "All of q, k, v must share the same memory layout."
+        )
+
+    return q_format
+
+
 def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):
     """
     Used to scale tensor in per-block mode
