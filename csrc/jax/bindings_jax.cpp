@@ -76,7 +76,7 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("get_device_compute_capability", [](int32_t device_id) -> std::pair<int, int> {
         hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
+        hipError_t      err = hipGetDeviceProperties(&prop, device_id);
         if (err != hipSuccess) {
             return {0, 0};
         }

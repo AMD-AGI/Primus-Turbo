@@ -9,7 +9,6 @@ import logging
 import subprocess
 from typing import Tuple
 
-import jax
 import jax.numpy as jnp
 from jax import dtypes
 
