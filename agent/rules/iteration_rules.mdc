@@ -29,6 +29,7 @@ These rules assume `SKILL.md` has already created a campaign directory at `agent
 
 - Per-round artifacts live under `<campaign_dir>/rounds/round-N/`
 - The running trend table lives at `<campaign_dir>/logs/performance_trend.md`
+- After `related_work.md` is written and before Round 1 starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists
 - The **active validation set** depends on the chosen validation level:
   - **quick validation** → all `representative_shapes`
   - **full validation** → all `target_shapes`
@@ -114,6 +115,27 @@ Every round MUST output `<campaign_dir>/rounds/round-N/summary.md` containing:
 - Lesson learned: <what this tells us about the bottleneck>
 ```
 
+### Reusable Technical Tips Capture
+
+After every completed round, whether **ACCEPTED** or **ROLLED BACK**, decide whether the round produced reusable knowledge worth preserving outside the current campaign.
+
+If yes, append a concise entry to:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
+
+Record a tip only when the round revealed something that is likely to help future campaigns, such as:
+
+- a hardware- or backend-specific constraint
+- a compiler or autotune quirk
+- a parameter range or config pattern that reliably helps or hurts
+- a recurring failure signature and its root cause
+- a profiler signal that maps cleanly to a useful action
+- a validation or measurement trick that saves future rounds
+
+Do **not** dump the full round summary into `tips.md`. Append only the reusable takeaway.
+
 ## Rule 5: Every Round Saves a Kernel Snapshot
 
 Every round MUST copy the kernel source into `<campaign_dir>/rounds/round-N/kernel_snapshot/`, regardless of accept/rollback. This enables:
@@ -160,6 +182,14 @@ Maintain `<campaign_dir>/logs/performance_trend.md` as a running table:
 
 The "vs Baseline" column always compares against the **current best accepted** code, not the previous round (which may have been rolled back).
 
+### Append-Only Logging Rule
+
+`<campaign_dir>/logs/optimize.md` and `<campaign_dir>/logs/performance_trend.md` are **append-only**.
+
+- Do **not** delete, truncate, rewrite, or replace existing content in either file.
+- Only append new sections, rows, or correction notes.
+- If an earlier entry is wrong, keep it in place and append a clearly labeled correction instead of editing history away.
+
 ## Rule 9: Linear Chain Integrity
 
 The accepted rounds form a strict linear chain:
@@ -195,5 +225,7 @@ for round_n in range(1, max_rounds + 1):
        └─ ROLLBACK → revert to last accepted code, diagnose failure
     7. Write <campaign_dir>/rounds/round-N/summary.md with full analysis
     8. Save the kernel snapshot to <campaign_dir>/rounds/round-N/kernel_snapshot/
-    9. Update performance_trend.md
+    9. If this round produced a reusable lesson, append it to
+       agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md
+    10. Update performance_trend.md
 ```

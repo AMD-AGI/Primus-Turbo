@@ -12,3 +12,4 @@ test-reports/
 *_hip.cuh
 agent/tmp/
 agent/workspace/
+logs/

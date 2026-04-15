@@ -69,6 +69,7 @@ During the DEFINE_TARGET phase, the user instruction + prerequisite information 
 DEFINE_TARGET
   -> PREPARE_ENVIRONMENT
   -> SURVEY_RELATED_WORK
+  -> READ_HISTORICAL_TIPS
   -> BASELINE
   -> [ANALYZE -> OPTIMIZE -> VALIDATE]  (iteration loop)
   -> REPORT
@@ -79,6 +80,7 @@ DEFINE_TARGET
 | **DEFINE_TARGET** | Organize user instruction + project skill information into structured parameters, confirm completeness, **confirm target with user before starting** |
 | **PREPARE_ENVIRONMENT** | Set up campaign directory, record metadata, and generate the quick validation script scaffold |
 | **SURVEY_RELATED_WORK** | Survey current SOTA implementations, docs, and competitor baselines; write findings to `related_work.md` before the first baseline run |
+| **READ_HISTORICAL_TIPS** | If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, read it after related work and before the first round |
 | **BASELINE** | Record starting correctness and performance |
 | **ANALYZE** | Read code, profile, consult skill knowledge, generate optimization hypotheses |
 | **OPTIMIZE** | Implement a single primary hypothesis with small incremental changes |
@@ -237,6 +239,26 @@ After PREPARE_ENVIRONMENT creates the campaign directory, perform a short relate
 
 Use `related-work-template.md` as the default output structure for `<campaign_dir>/related_work.md`.
 
+## READ_HISTORICAL_TIPS
+
+After `SURVEY_RELATED_WORK` finishes and before `round-1` starts, check whether a reusable tips file already exists for the same hardware / op / backend combination.
+
+Use this path convention:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+Example:
+
+`agent/historical_experience/gfx950/gemm_fp8_blockwise/triton/tips.md`
+
+Rules:
+
+- Normalize the backend directory name to lowercase, e.g. `TRITON -> triton`, `CK -> ck`
+- If the file exists, read it before BASELINE so the first hypothesis benefits from prior experience
+- Treat it as reusable guidance, not as a substitute for current measurements, profiling, or validation
+- If the first worthy lesson has no existing tips file yet, create the missing directories and `tips.md`, then append to it
+- After every completed round, if the round produced a reusable technical lesson, append a concise tip to this same file
+
 ## Execution Environment
 
 Optimization can be performed in two modes:
@@ -295,10 +317,11 @@ Typical interaction sequence:
 3. Return to the project skill and collect project information per the requirement checklist.
 4. Return to this file with the information, execute DEFINE_TARGET → PREPARE_ENVIRONMENT.
 5. Run `SURVEY_RELATED_WORK`: create `<campaign_dir>/related_work.md`, using `agent/tmp/<campaign_name>/related-work/` for any temporary repo clones or downloaded notes.
-6. Read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) before the first BASELINE / VALIDATE round.
-7. Read [`workflow/optimize-loop.md`](workflow/optimize-loop.md) and execute the BASELINE → ANALYZE → OPTIMIZE → VALIDATE loop.
-8. Read language, hardware, profiling, and related-work survey outputs as needed during ANALYZE / OPTIMIZE phases.
-9. Output REPORT and hand back to the project skill for final acceptance.
+6. If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, read it before the first round.
+7. Read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) before the first BASELINE / VALIDATE round.
+8. Read [`workflow/optimize-loop.md`](workflow/optimize-loop.md) and execute the BASELINE → ANALYZE → OPTIMIZE → VALIDATE loop.
+9. Read language, hardware, profiling, related-work survey outputs, and historical tips as needed during ANALYZE / OPTIMIZE phases.
+10. Output REPORT and hand back to the project skill for final acceptance.
 
 ## Knowledge Reference Table
 
@@ -316,6 +339,7 @@ Read the corresponding skill as needed based on `target_lang`, `target_gpu`, and
 | Profiling methods | [../tool-rocprof/SKILL.md](../tool-rocprof/SKILL.md) |
 | Project code structure / build / test / benchmark / integration | Corresponding project skill, e.g., [../primus-turbo-develop/SKILL.md](../primus-turbo-develop/SKILL.md) |
 | Related-work report structure | [related-work-template.md](related-work-template.md) |
+| Historical reusable tips | `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` (if present) |
 | Historical optimization cases | [examples.md](examples.md) |
 
 ## Logging and Lineage General Principles
@@ -328,6 +352,7 @@ The optimization process must maintain structured history (referencing AVO's lin
 - Accepted versions must have clear hypotheses, validation results, and acceptance rationale
 - Logs serve both humans (can check progress at any time) and the agent (trace history to avoid repeated attempts)
 - Every round must update its own `rounds/round-N/summary.md`, and every VALIDATE round must keep that summary synchronized with `logs/optimize.md`
+- If a round reveals a reusable hardware / op / backend lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 - Logs and profiling results are stored in `agent/workspace/<campaign_name>/`
 - For detailed log format, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md)
 
@@ -394,15 +419,19 @@ Proceed to PREPARE_ENVIRONMENT after user confirmation.
 3. If code inspection is useful, clone temporary repos into `agent/tmp/gemm_fp8_blockwise_triton_gfx942_20260412/related-work/repos/`
 4. Write `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/related_work.md` using `related-work-template.md`
 
-**Step 6: Enter optimization loop**
+**Step 6: READ_HISTORICAL_TIPS**
+
+Read `agent/historical_experience/gfx942/gemm_fp8_blockwise/triton/tips.md` if it exists, carrying forward only reusable lessons that still need to be validated in the current environment.
+
+**Step 7: Enter optimization loop**
 
 Read `workflow/optimize-loop.md` and execute as defined:
 1. BASELINE (`round-1`): Run focused test (confirm PASS) → run focused benchmark → write `rounds/round-1/summary.md` → select representative shapes and update `quick_test_bench.py`
 2. ANALYZE: Read `related_work.md`, kernel source, consult `triton/SKILL.md` and `hardware/gfx942/`, generate optimization hypotheses
-3. OPTIMIZE → VALIDATE loop (`round-2+`): Modify kernel → run test → run benchmark → write `rounds/round-N/summary.md` → compare → accept or rollback
+3. OPTIMIZE → VALIDATE loop (`round-2+`): Modify kernel → run test → run benchmark → write `rounds/round-N/summary.md` → compare → accept or rollback → append a reusable tip if the round taught something worth preserving
 4. After reaching target or exhausting directions, output REPORT
 
-**Step 7: Acceptance** (return to project skill)
+**Step 8: Acceptance** (return to project skill)
 
 Project skill runs full tests, reviews report, confirms commits.
 

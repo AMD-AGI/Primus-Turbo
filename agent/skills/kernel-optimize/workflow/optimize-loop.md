@@ -7,6 +7,7 @@ The default prerequisite is (agent proceeds through: project skill → `../SKILL
 - DEFINE_TARGET (parameter structuring) and PREPARE_ENVIRONMENT (campaign directory setup) have been completed in `../SKILL.md`
 - The campaign directory for this round has been established, `manifest.yaml` has been filled in, and `quick_test_bench.py` has been generated
 - `related_work.md` has been created by the `SURVEY_RELATED_WORK` step in `../SKILL.md`
+- If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, it has been read after `related_work.md` and before `round-1`
 - `target_op`, `target_backend`, `target_lang`, `target_gpu`, and `execution_mode` are clearly defined
 
 Therefore, this file is **not responsible for**:
@@ -61,6 +62,25 @@ The following information should have been obtained during the project skill pha
 
 If anything is missing, refer back to the project skill or `../SKILL.md`'s manifest to fill in the gaps.
 
+## Historical Tips Bootstrap
+
+After `related_work.md` is written and before `round-1` / `ENVIRONMENT_BASELINE` starts, check whether a reusable tips file already exists for this hardware / op / backend combination.
+
+Path convention:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+Example:
+
+`agent/historical_experience/gfx950/gemm_fp8_blockwise/triton/tips.md`
+
+Rules:
+
+- Normalize the backend directory to lowercase, e.g. `TRITON -> triton`, `CK -> ck`
+- If the file exists, read it once before the first round
+- Treat it as prior experience, not as permission to skip measurement, profiling, or validation
+- Revisit it later only when the round history suggests a related pattern may apply again
+
 ## Two-Level Validation
 
 The optimization loop uses two levels of validation:
@@ -81,6 +101,8 @@ Within a chosen validation level, do not cherry-pick a smaller subset.
 Quick validation is for small-step iteration within one direction. When a direction completes, when quick results are borderline (improvement < 5%), or when changes are high-risk (control flow, data layout, etc.), upgrade to full validation for confirmation.
 
 ## Overall Flow
+
+Before `ENVIRONMENT_BASELINE`, if the corresponding historical tips file exists, read it.
 
 ```text
 ENVIRONMENT_BASELINE
@@ -276,6 +298,7 @@ Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (
 2. Immediately update `logs/optimize.md` (optimization history, current best, directions to try)
 3. Update current best
 4. If `git_commit=true`: git commit (see git integration specification below)
+5. If the round produced a reusable technical lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
 `rounds/round-N/summary.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
 
@@ -316,6 +339,35 @@ Rollback operations:
 2. Write `rounds/round-N/summary.md` and mark the round as rollback with the failure reason
 3. Immediately update `logs/optimize.md`, including the optimization history and verified ineffective directions
 4. Return to ANALYZE with a new direction; rollback is not, by itself, a campaign termination signal
+5. If the failed round exposed a reusable pitfall or signal, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+## Historical Experience Capture
+
+After every completed round, whether accepted or rolled back, evaluate whether the round is worth recording in the long-lived tips store:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
+
+Append only when the round yielded reusable knowledge beyond the local campaign, such as:
+
+- a hardware-specific constraint or backend/compiler quirk
+- a config or parameter pattern that consistently helps or hurts
+- a failure signature with a clear root cause
+- a profiler signal that maps cleanly to an actionable next step
+- a validation / measurement trick that avoids wasted rounds
+
+Do not copy the whole round summary into `tips.md`. Append only the reusable takeaway.
+
+Recommended append format:
+
+```markdown
+### <YYYY-MM-DD HH:MM> round-N — ACCEPTED / ROLLED BACK
+- Context: <shape family / kernel path / hardware scope>
+- Signal: <what was observed>
+- Takeaway: <reusable lesson>
+- Applicability: <when this tip should be reused, and when it should not>
+```
 
 ## Git Integration Specification
 
@@ -350,6 +402,12 @@ Details: agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/logs/optimize
 ## Optimization Log Template
 
 Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can check progress at any time.
+
+`logs/optimize.md` and `logs/performance_trend.md` are append-only history files:
+
+- Never delete, truncate, or rewrite existing content
+- Only append new sections, rows, or correction notes
+- If a prior entry is inaccurate, append a correction instead of erasing the original record
 
 ```markdown
 # <target_op> <target_backend> Optimization Log
@@ -504,11 +562,9 @@ The campaign may terminate only when at least one of the following conditions is
 |----|-----------|-------|
 | `T1` | `performance_target` has been reached | Explicit target met |
 | `T2` | An acceptable hardware-efficiency range has been reached | For example, a clearly acceptable fraction of peak efficiency |
-| `T3` | Recent accepted versions' gains are below the noise floor | e.g. 3+ accepted versions in a row with < 2% improvement |
-| `T4` | The hypothesis pool has been largely exhausted | No meaningful unchecked directions remain |
-| `T5` | `max_iterations` limit has been reached | Only if configured |
-| `T6` | `max_duration` limit has been reached | Only if configured |
-| `T7` | The user explicitly requests stop | Always valid |
+| `T3` | `max_iterations` limit has been reached | Only if configured |
+| `T4` | `max_duration` limit has been reached | Only if configured |
+| `T5` | The user explicitly requests stop | Always valid |
 
 Before writing REPORT, add a termination-check block to `logs/optimize.md` and state which condition passed:
 
@@ -516,11 +572,9 @@ Before writing REPORT, add a termination-check block to `logs/optimize.md` and s
 ### Termination Check
 - T1 performance_target: ❌ / ✅
 - T2 hardware efficiency: ❌ / ✅
-- T3 gains below noise floor: ❌ / ✅
-- T4 hypothesis pool exhausted: ❌ / ✅
-- T5 max_iterations reached: ❌ / ✅
-- T6 max_duration reached: ❌ / ✅
-- T7 user requested stop: ❌ / ✅
+- T3 max_iterations reached: ❌ / ✅
+- T4 max_duration reached: ❌ / ✅
+- T5 user requested stop: ❌ / ✅
 -> Satisfied condition(s): T<N>
 ```
 
@@ -539,6 +593,7 @@ A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 | ANALYZE / OPTIMIZE | Language-level optimization techniques | [`../triton/SKILL.md`](../triton/SKILL.md) or [`../hip/SKILL.md`](../hip/SKILL.md) |
 | ANALYZE / OPTIMIZE | CK template and pipeline tuning | [`../hip/ck.md`](../hip/ck.md) |
 | ANALYZE | Historical examples and cross-generation comparison | [`../examples.md`](../examples.md) and [`../../hardware/hardware-comparison.md`](../../hardware/hardware-comparison.md) |
+| Before round-1 / after each round | Historical reusable tips | `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` (if present) |
 
 ## Execution Reminders
 
@@ -548,5 +603,8 @@ A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 - When `git_commit=true`, accepted versions must be git committed, forming a traceable lineage.
 - When stagnated, switch directions — do not endlessly fine-tune in the same direction.
 - Keep logs updated in real-time so humans can check current progress and historical decisions at any time.
+- `logs/optimize.md` and `logs/performance_trend.md` are append-only; never delete old content, only append new entries or correction notes.
 - Every round, including the baseline, must keep `rounds/round-N/summary.md` up to date; every VALIDATE round must update that summary and `logs/optimize.md` together.
+- After `related_work.md` is done and before the first round starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists.
+- After every accepted or rolled-back round, append a reusable lesson to that tips file when the round is worth preserving.
 - All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
