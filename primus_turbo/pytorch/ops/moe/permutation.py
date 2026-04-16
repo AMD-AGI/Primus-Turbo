@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from primus_turbo.pytorch.core.float8_tensor import Float8Tensor
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.triton.moe import permutation
 
 __all__ = ["token_permute", "token_unpermute", "TokenPermuteMaskMap", "TokenUnpermuteMaskMap"]
@@ -20,7 +20,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        inp: Union[torch.Tensor, Float8Tensor],
+        inp: Union[torch.Tensor, QuantizedTensor],
         routing_map: torch.Tensor,
         num_out_tokens: int,
         probs: torch.Tensor,
@@ -59,7 +59,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
             ), "tokens_per_experts must be provided to the fused permute function when num_out_tokens is -1"
             num_out_tokens = tokens_per_experts.sum().item()
 
-        use_fp8 = isinstance(inp, Float8Tensor)
+        use_fp8 = isinstance(inp, QuantizedTensor)
 
         if use_fp8:
             raise ValueError("FP8 is not supported for now.")
@@ -86,7 +86,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         )
 
         if use_fp8:
-            output = Float8Tensor(
+            output = QuantizedTensor(
                 data=output,
                 scale=permuted_scale,
                 orig_dtype=inp._orig_dtype,
@@ -126,7 +126,7 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             (row_id_map,) = ctx.saved_tensors
             assert not isinstance(
-                permuted_act_grad, Float8Tensor
+                permuted_act_grad, QuantizedTensor
             ), "The backward of token_permute does not support FP8."
             act_grad, probs_grad = permutation.unpermute_with_mask_map(
                 permuted_act_grad,
@@ -177,7 +177,7 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
         assert inp.is_cuda, "Tensor device needs be CUDA."
         assert row_id_map.is_cuda, "Tensor device needs be CUDA."
 
-        assert not isinstance(inp, Float8Tensor), "The forward of moe_unpermute does not support FP8."
+        assert not isinstance(inp, QuantizedTensor), "The forward of moe_unpermute does not support FP8."
         unpermuted_output, _ = permutation.unpermute_with_mask_map(
             inp,
             row_id_map,
@@ -215,7 +215,7 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
             else:
                 (row_id_map,) = ctx.saved_tensors
 
-            use_fp8 = isinstance(unpermuted_act_grad, Float8Tensor)
+            use_fp8 = isinstance(unpermuted_act_grad, QuantizedTensor)
 
             if use_fp8:
                 fp8_scale = unpermuted_act_grad._scale
@@ -254,7 +254,7 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
                 )
 
             if use_fp8:
-                act_grad = Float8Tensor(
+                act_grad = QuantizedTensor(
                     data=act_grad,
                     scale=permuted_scale,
                     orig_dtype=unpermuted_act_grad._orig_dtype,
