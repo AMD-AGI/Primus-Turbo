@@ -10,7 +10,7 @@ on:
   pull_request:
 
 env:
-  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel
+  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel-v2602
 
 jobs:
   code-lint:
