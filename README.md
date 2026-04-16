@@ -48,10 +48,10 @@ Note: JAX support is under active development. Optim support is planned but not 
 Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm/primus/tags):
 ```bash
 # PyTorch Ecosystem
-rocm/primus:v26.1
+rocm/primus:v26.2
 
 # JAX Ecosystem
-rocm/jax-training:maxtext-v25.9
+rocm/jax-training:maxtext-v26.2
 ```
 
 #### Install from Source
