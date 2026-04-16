@@ -87,6 +87,8 @@ def _get_device_compute_capability(device_id: int) -> Tuple[int, int]:
 
 def get_device_compute_capability(device_id: int = 0) -> Tuple[int, int]:
     """Get compute capability of specified GPU or current default GPU."""
+    if device_id < 0:
+        raise ValueError(f"device_id must be non-negative, got {device_id}")
     return _get_device_compute_capability(device_id)
 
 
