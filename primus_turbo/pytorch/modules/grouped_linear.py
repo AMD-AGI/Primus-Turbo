@@ -74,9 +74,7 @@ class GroupedLinear(torch.nn.Module):
         )
 
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(out_features, **factory_kwargs)
-            )
+            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
         else:
             self.register_parameter("bias", None)
 
@@ -85,9 +83,7 @@ class GroupedLinear(torch.nn.Module):
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(
-                self.weight[0]
-            )
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight[0])
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
