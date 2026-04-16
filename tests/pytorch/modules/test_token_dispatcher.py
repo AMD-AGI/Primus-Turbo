@@ -123,8 +123,13 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
         self._init_process()
         ep_group = dist.group.WORLD
 
-        # Test with different backends
-        backends_to_test = ["TURBO", "DEEP_EP"]
+        # Test with different backends (skip DEEP_EP if external package is not installed)
+        try:
+            import deep_ep  # noqa: F401
+
+            backends_to_test = ["TURBO", "DEEP_EP"]
+        except ImportError:
+            backends_to_test = ["TURBO"]
 
         for backend in backends_to_test:
             with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
@@ -154,7 +159,7 @@ class TokenDispatcherTestBase(MultiProcessTestCase):
                         / cfg.router_topk
                     )
 
-                    (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs = (
                         dispatcher.token_dispatch(
                             hidden_states,
                             probs,

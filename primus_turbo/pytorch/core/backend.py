@@ -193,8 +193,8 @@ class GlobalBackendManager:
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
-                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
-                    f"Using default backend.",
+                    f"Precision {precision.name} not found in the environment variable "
+                    f"{_ENV_GROUPED_GEMM_BACKEND_KEY}. Using default backend.",
                     once=True,
                 )
             return backend
@@ -203,17 +203,25 @@ class GlobalBackendManager:
 
     @classmethod
     def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
-        """Get the MoE dispatch combine backend configuration. Returns None if not set."""
+        """Get the MoE dispatch combine backend configuration. Returns None if not set.
+
+        If the environment variable contains a value that is not a valid ``BackendType``
+        (e.g. a custom EP backend name like ``UCCL_EP``), this method returns ``None`` so
+        the EP-specific backend registry in ``moe_dispatch_combine_impl`` can handle it.
+        """
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend[precision]
         env_value = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
         if env_value is not None:
-            backend = cls._extract_backend_from_env(env_value).get(precision, None)
+            try:
+                backend = cls._extract_backend_from_env(env_value).get(precision, None)
+            except KeyError:
+                return None
 
             if backend is None:
                 logger.warning(
-                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
-                    f"Using default backend.",
+                    f"Precision {precision.name} not found in the environment variable "
+                    f"{_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY}. Using default backend.",
                     once=True,
                 )
 
