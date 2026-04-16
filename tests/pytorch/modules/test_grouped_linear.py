@@ -30,7 +30,7 @@ def test_grouped_linear(B, M, N_K, dtype, balance, auto_tune, enable_torch_compi
     N, K = N_K
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
 
-    primus_linear = GroupedLinear(B, K, N, device, dtype=dtype)
+    primus_linear = GroupedLinear(B, K, N, bias=False, device=device, dtype=dtype)
     torch_linear = GroupedLinearRef(B, K, N, device, dtype=dtype)
     with torch.no_grad():
         torch_linear.weight.copy_(primus_linear.weight)
