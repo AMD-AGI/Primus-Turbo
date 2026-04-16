@@ -245,6 +245,7 @@ class GlobalBackendManager:
         """Reset all backend settings and clear all dispatcher caches."""
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
+        cls._moe_dispatch_combine_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
 
