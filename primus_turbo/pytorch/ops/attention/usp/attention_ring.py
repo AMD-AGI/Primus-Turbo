@@ -68,10 +68,7 @@ def _update_out_and_lse(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     block_out = block_out.to(torch.float32)
-    if is_sbhd:
-        block_lse = block_lse.permute(2, 0, 1).unsqueeze(dim=-1)
-    else:
-        block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+    block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
 
     # new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
     # torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
@@ -95,10 +92,7 @@ def update_out_and_lse(
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
 
         out = block_out.to(torch.float32)
-        if is_sbhd:
-            lse = block_lse.permute(2, 0, 1).unsqueeze(dim=-1)
-        else:
-            lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
         slice_out, slice_lse = _update_out_and_lse(
@@ -156,10 +150,7 @@ def ring_attn_fwd(
             v = next_v
 
     out = out.to(output_dtype)
-    if is_sbhd:
-        lse = lse.squeeze(dim=-1).permute(1, 2, 0)
-    else:
-        lse = lse.squeeze(dim=-1).transpose(1, 2)
+    lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse, *results
 
 

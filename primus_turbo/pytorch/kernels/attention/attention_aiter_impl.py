@@ -198,6 +198,10 @@ class AttnBwdAiterBackend(KernelBackend):
         v: torch.Tensor,
         out: torch.Tensor,
         softmax_lse: torch.Tensor,
+        dq: torch.Tensor,
+        dk: torch.Tensor,
+        dv: torch.Tensor,
+        dbias: Optional[torch.Tensor],
         dropout_p: float,
         softmax_scale: float,
         causal: bool,
@@ -210,29 +214,9 @@ class AttnBwdAiterBackend(KernelBackend):
         is_v3_atomic_fp32: bool,
         how_v3_bf16_cvt: int,
         sink: Optional[torch.Tensor] = None,
+        dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
     ):
-        batch_size, seq_len, num_heads_q, head_dim_qk = q.size()
-        _, _, num_heads_k, head_dim_k = k.size()
-        _, _, num_heads_v, head_dim_v = v.size()
-        if qkv_format == "sbhd":
-            dq = torch.ones(
-                (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
-            ).permute(1, 0, 2, 3)
-            dk = torch.empty(
-                (seq_len, batch_size, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
-            ).permute(1, 0, 2, 3)
-            dv = torch.empty(
-                (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
-            ).permute(1, 0, 2, 3)
-        else:
-            dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
-            dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
-            dv = torch.empty((batch_size, seq_len, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device)
-
-        dbias = torch.empty_like(bias) if bias is not None else None
-        dsink = torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
-
         if sink is None:
             result = _flash_attn_backward(
                 dout,
@@ -351,6 +335,9 @@ def attention_aiter_backward_impl(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -362,6 +349,8 @@ def attention_aiter_backward_impl(
     rng_state: Optional[torch.Tensor],
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
+    dbias: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
 ):
@@ -372,6 +361,9 @@ def attention_aiter_backward_impl(
         v=v,
         out=out,
         softmax_lse=softmax_lse,
+        dq=dq,
+        dk=dk,
+        dv=dv,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -383,6 +375,8 @@ def attention_aiter_backward_impl(
         rng_state=rng_state,
         is_v3_atomic_fp32=is_v3_atomic_fp32,
         how_v3_bf16_cvt=how_v3_bf16_cvt,
+        dbias=dbias,
+        dsink=dsink,
         sink=sink,
         qkv_format=qkv_format,
     )

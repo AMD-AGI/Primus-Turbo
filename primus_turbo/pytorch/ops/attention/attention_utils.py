@@ -41,16 +41,24 @@ def _infer_qkv_format(
 
         - **bshd** contiguous: stride = (s*h*d, h*d, d, 1)
         - **sbhd** (transposed from contiguous [s,b,h,d]): stride = (h*d, b*h*d, d, 1)
-        """
-        b, s, h, d = t.size()
-        hd = h * d
-        s0, s1 = t.stride(0), t.stride(1)
 
-        # bshd: stride[0] = dim1 * h * d,  stride[1] = h * d
-        if s0 == s * hd and s1 == hd:
+        Also handles non-contiguous tensors (e.g. GQA packed-QKV slicing
+        where head-stride != d) by verifying the strict stride ordering
+        invariant: bshd requires s0 > s1 > s2, sbhd requires s1 > s0 > s2.
+        """
+        s0, s1, s2, s3 = t.stride()
+
+        assert s3 == 1, (
+            f"Expected contiguous innermost dim (stride[-1]==1), "
+            f"got shape {tuple(t.size())} strides {tuple(t.stride())}"
+        )
+
+        # General path: verify strict stride ordering
+        # bshd: batch outermost → s0 > s1 > s2
+        if s0 >= s1 >= s2:
             return "bshd"
-        # sbhd: stride[0] = h * d,  stride[1] = dim0 * h * d
-        if s0 == hd and s1 == b * hd:
+        # sbhd: sequence outermost → s1 > s0 > s2
+        if s1 >= s0 >= s2:
             return "sbhd"
 
         assert False, (

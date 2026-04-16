@@ -161,6 +161,14 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             [query, key, value], cp_group, seq_dim
         )
 
+        # flash_attn_usp_func expects shape [b, s, h, d] with format encoded
+        # in strides.  The ref tensors are actual [s, b, h, d]; transpose the
+        # sharded inputs so shape becomes [b, s_local, h, d] with sbhd strides.
+        if qkv_format == "sbhd":
+            query_local_token = query_local_token.transpose(0, 1)
+            key_local_token = key_local_token.transpose(0, 1)
+            value_local_token = value_local_token.transpose(0, 1)
+
         kwargs = {}
         if func is pt.ops.flash_attn_usp_func:
             kwargs["qkv_format"] = qkv_format
@@ -183,8 +191,12 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             **kwargs,
         )
         grad = shard_cp_input([grad_ref], cp_group, seq_dim)[0]
+        if qkv_format == "sbhd":
+            grad = grad.transpose(0, 1)
         o.backward(grad)
 
+        if qkv_format == "sbhd":
+            o = o.transpose(0, 1)
         dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group, seq_dim)
         out_snr = compute_snr(o_ref, o)
         query_grad_snr = compute_snr(dq_ref, dq)

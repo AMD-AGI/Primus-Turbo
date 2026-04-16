@@ -151,13 +151,40 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
 
-        _, dq, dk, dv_padded, dbias, dsink = attention_aiter_backward_impl(
+        bwd_qkv_format = qkv_format if not enable_sink else "bshd"
+        batch_size, seq_len, num_heads_q, head_dim_qk = q.size()
+        _, _, num_heads_k, head_dim_k = k.size()
+        _, _, num_heads_v, head_dim_v = v.size()
+
+        if bwd_qkv_format == "sbhd":
+            dq = torch.ones(
+                (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
+            ).permute(1, 0, 2, 3)
+            dk = torch.empty(
+                (seq_len, batch_size, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
+            ).permute(1, 0, 2, 3)
+            dv_padded = torch.empty(
+                (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
+            ).permute(1, 0, 2, 3)
+        else:
+            dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
+            dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
+            dv_padded = torch.empty(
+                (batch_size, seq_len, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
+            )
+        dbias = torch.empty_like(ctx.bias) if ctx.bias is not None else None
+        dsink = torch.zeros_like(ctx.sink, dtype=torch.float32) if ctx.sink is not None else None
+
+        _ = attention_aiter_backward_impl(
             dout=dout_padded,
             q=q,
             k=k,
             v=v,
             out=out_padded,
             softmax_lse=softmax_lse,
+            dq=dq,
+            dk=dk,
+            dv=dv_padded,
             dropout_p=ctx.dropout_p,
             softmax_scale=ctx.softmax_scale,
             causal=ctx.causal,
@@ -169,8 +196,10 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            dbias=dbias,
+            dsink=dsink,
             sink=ctx.sink,
-            qkv_format=qkv_format if not enable_sink else "bshd",
+            qkv_format=bwd_qkv_format,
         )
 
         if enable_sink and qkv_format == "sbhd":
@@ -357,7 +386,12 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
 ):
-    _infer_qkv_format(q, k, v)
+    qkv_format = _infer_qkv_format(q, k, v)
+
+    if qkv_format == "sbhd":
+        q = q.permute(1, 0, 2, 3).contiguous()
+        k = k.permute(1, 0, 2, 3).contiguous()
+        v = v.permute(1, 0, 2, 3).contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
@@ -376,7 +410,7 @@ def flash_attn_fp8_func(
             f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
         )
 
-    return TritonFlashAttnFunc.apply(
+    o = TritonFlashAttnFunc.apply(
         q,
         k,
         v,
@@ -391,3 +425,8 @@ def flash_attn_fp8_func(
         torch.is_grad_enabled(),
         True,
     )
+
+    if qkv_format == "sbhd":
+        o = o.permute(1, 0, 2, 3).contiguous()
+
+    return o
