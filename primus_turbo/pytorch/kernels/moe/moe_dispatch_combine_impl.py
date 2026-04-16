@@ -7,7 +7,8 @@
 
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple, Type, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
@@ -18,14 +19,67 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
 )
 
+# =========================================================================
+# Buffer configuration
+# =========================================================================
+
+
+@dataclass
+class EPBufferConfig:
+    """Configuration for EP communication buffer initialization.
+
+    Attributes:
+        num_sms: Number of SMs to use in high-throughput kernels.
+        dispatch_config: Optional user-provided dispatch config (from offline
+            benchmarking). When ``None``, the backend's default for the current
+            ``ep_size`` is used (``Buffer.get_dispatch_config(ep_size)``).
+        combine_config: Optional user-provided combine config.  Same fallback
+            behaviour as *dispatch_config*.
+    """
+
+    num_sms: int = 32
+    dispatch_config: Any = None
+    combine_config: Any = None
+
+
+_buffer_config: Optional[EPBufferConfig] = None
+
+
+def set_buffer_global_config(
+    num_use_cu: int = 32,
+    autotune_config: Optional[tuple] = None,
+) -> None:
+    """Store the SM count and optional per-operation configs.
+
+    This is typically called once by the token dispatcher during ``__init__``.
+
+    Args:
+        num_use_cu: Number of SMs (compute units) for high-throughput kernels.
+        autotune_config: Legacy parameter — a ``(dispatch_config, combine_config)``
+            tuple obtained from offline benchmarking.  ``None`` means use the
+            backend's built-in defaults for the current EP group size.
+    """
+    global _buffer_config
+    dispatch_cfg, combine_cfg = autotune_config if autotune_config is not None else (None, None)
+    _buffer_config = EPBufferConfig(
+        num_sms=num_use_cu,
+        dispatch_config=dispatch_cfg,
+        combine_config=combine_cfg,
+    )
+
+
+# =========================================================================
+# EPBackend ABC
+# =========================================================================
+
 
 class EPBackend(ABC):
     """Abstract base class for Expert-Parallel communication backends.
 
     Each backend encapsulates a specific EP library (e.g. in-tree Turbo DeepEP,
-    external ``deep_ep``, UCCL-EP, ...) and owns its own buffer lifecycle. This
-    avoids global mutable state and makes adding new backends a single-class
-    change.
+    external ``deep_ep``, UCCL-EP, ...) and owns its own buffer lifecycle.
+    Adding a new backend is a single-class change plus one
+    ``register_ep_backend()`` call.
     """
 
     @staticmethod
@@ -39,9 +93,7 @@ class EPBackend(ABC):
         self,
         group: dist.ProcessGroup,
         hidden_bytes: int,
-        num_sms: int,
-        autotune_config: Optional[tuple] = None,
-        extra_kwargs: Optional[dict] = None,
+        config: EPBufferConfig,
     ) -> None:
         """(Re-)create the communication buffer if needed."""
         ...
@@ -82,6 +134,11 @@ class EPBackend(ABC):
         ...
 
 
+# =========================================================================
+# _DeepEPLikeBackend — shared protocol for DeepEP-compatible backends
+# =========================================================================
+
+
 class _DeepEPLikeBackend(EPBackend):
     """Shared logic for all backends that follow the DeepEP Buffer protocol
     (``get_dispatch_layout`` / ``dispatch`` / ``combine`` / ``set_num_sms`` /
@@ -119,37 +176,31 @@ class _DeepEPLikeBackend(EPBackend):
         self,
         group: dist.ProcessGroup,
         hidden_bytes: int,
-        num_sms: int,
-        autotune_config: Optional[tuple] = None,
-        extra_kwargs: Optional[dict] = None,
+        config: EPBufferConfig,
     ) -> None:
         mod = self._get_module()
         BufferClass = mod.Buffer
 
-        BufferClass.set_num_sms(num_sms)
+        BufferClass.set_num_sms(config.num_sms)
 
-        dispatch_config, combine_config = autotune_config or (
-            BufferClass.get_dispatch_config(group.size()),
-            BufferClass.get_combine_config(group.size()),
-        )
+        dispatch_config = config.dispatch_config or BufferClass.get_dispatch_config(group.size())
+        combine_config = config.combine_config or BufferClass.get_combine_config(group.size())
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        for config in (dispatch_config, combine_config):
+        for cfg in (dispatch_config, combine_config):
             num_nvl_bytes = max(
-                config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
+                cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
                 num_nvl_bytes,
             )
             try:
                 num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                    cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
             except (RuntimeError, AttributeError):
                 pass
 
         buf_kwargs = self._make_buffer_kwargs(group)
-        if extra_kwargs:
-            buf_kwargs.update(extra_kwargs)
 
         if (
             self._buffer is None
@@ -159,6 +210,14 @@ class _DeepEPLikeBackend(EPBackend):
             or self._buffer.num_rdma_bytes < num_rdma_bytes
         ):
             self._buffer = BufferClass(group, num_nvl_bytes, num_rdma_bytes, **buf_kwargs)
+
+    # ----- helpers ------------------------------------------------------
+
+    def _get_event_classes(self):
+        mod = self._get_module()
+        EventOverlapClass = mod.utils.EventOverlap if hasattr(mod, "utils") else mod.EventOverlap
+        EventHandleClass = mod.utils.EventHandle if hasattr(mod, "utils") else mod.EventHandle
+        return EventOverlapClass, EventHandleClass
 
     # ----- dispatch / combine -------------------------------------------
 
@@ -173,15 +232,11 @@ class _DeepEPLikeBackend(EPBackend):
         allocate_on_comm_stream: bool = False,
         num_worst_tokens: int = 0,
     ):
-        mod = self._get_module()
-        EventOverlapClass = mod.utils.EventOverlap if hasattr(mod, "utils") else mod.EventOverlap
-        EventHandleClass = mod.utils.EventHandle if hasattr(mod, "utils") else mod.EventHandle
+        EventOverlapClass, EventHandleClass = self._get_event_classes()
         buffer = self._buffer
         assert buffer is not None, "init_buffer() must be called before dispatch()"
 
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlapClass(EventHandleClass())
+        previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
 
         if handle is None:
             assert topk_idx is not None
@@ -244,15 +299,11 @@ class _DeepEPLikeBackend(EPBackend):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ):
-        mod = self._get_module()
-        EventOverlapClass = mod.utils.EventOverlap if hasattr(mod, "utils") else mod.EventOverlap
-        EventHandleClass = mod.utils.EventHandle if hasattr(mod, "utils") else mod.EventHandle
+        EventOverlapClass, EventHandleClass = self._get_event_classes()
         buffer = self._buffer
         assert buffer is not None, "init_buffer() must be called before combine()"
 
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlapClass(EventHandleClass())
+        previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
 
         combined_x, combined_topk_weights, after_event = buffer.combine(
             x,
@@ -331,7 +382,7 @@ def _get_backend_instance(name: str) -> EPBackend:
     """Lazily create and cache a backend singleton."""
     if name not in _backend_instances:
         if name not in _BACKEND_REGISTRY:
-            raise ValueError(f"Unknown EP backend '{name}'. " f"Available: {list(_BACKEND_REGISTRY.keys())}")
+            raise ValueError(f"Unknown EP backend '{name}'. Available: {list(_BACKEND_REGISTRY.keys())}")
         cls = _BACKEND_REGISTRY[name]
         if not cls.is_available():
             raise RuntimeError(
@@ -357,7 +408,7 @@ _BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
 def _resolve_backend_name() -> str:
     """Determine which EP backend to use.
 
-    Priority (high → low):
+    Priority (high -> low):
       1. ``GlobalBackendManager`` code-level setting (via ``set_moe_dispatch_combine_backend``)
       2. ``PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND`` env var (supports names beyond ``BackendType``)
       3. Default: ``TURBO``
@@ -374,19 +425,8 @@ def _resolve_backend_name() -> str:
 
 
 # =========================================================================
-# Buffer configuration (module-level, set once by the token dispatcher)
+# Utilities
 # =========================================================================
-
-_buffer_config: Optional[Tuple[int, Optional[tuple]]] = None
-
-
-def set_buffer_global_config(
-    num_use_cu: int = 32,
-    autotune_config: Optional[tuple] = None,
-) -> None:
-    """Store the SM count and optional autotune config used by ``init_buffer``."""
-    global _buffer_config
-    _buffer_config = (num_use_cu, autotune_config)
 
 
 def get_hidden_bytes(
@@ -412,8 +452,7 @@ def _ensure_buffer(
             "set_buffer_global_config() must be called before dispatch/combine. "
             "This is typically done by the token dispatcher during __init__."
         )
-    num_sms, autotune_config = _buffer_config
-    backend.init_buffer(group, hidden_bytes, num_sms, autotune_config)
+    backend.init_buffer(group, hidden_bytes, _buffer_config)
 
 
 # =========================================================================
