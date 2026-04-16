@@ -11,9 +11,10 @@ Schedules benchmark tasks across available GPUs with automatic GPU assignment,
 log isolation, and exit code tracking.
 
 Usage:
-    python3 run_suite.py -d /path/to/output                     # run all tasks
-    python3 run_suite.py -d /path/to/output -g attention        # filter by group
-    python3 run_suite.py -d /path/to/output -g gemm_bf16 -n 4   # 4 GPUs
+    python3 run_suite.py -d /path/to/output                          # run all tasks
+    python3 run_suite.py -d /path/to/output -g attention             # filter by group
+    python3 run_suite.py -d /path/to/output -l gemm_mxfp8_turbo      # run one task by label
+    python3 run_suite.py -d /path/to/output -g gemm_bf16 -n 4        # 4 GPUs
 """
 
 import argparse
@@ -46,8 +47,8 @@ class RunningTask(NamedTuple):
     start_time: float
 
 
-def load_config(config_path, groups=None):
-    """Load and validate tasks from config, optionally filtered by group.
+def load_config(config_path, groups=None, labels=None):
+    """Load and validate tasks from config, optionally filtered by group/label.
 
     Returns (single_gpu_tasks, multi_gpu_tasks, num_gpus).
     """
@@ -65,6 +66,10 @@ def load_config(config_path, groups=None):
     if groups:
         group_set = set(groups)
         tasks = [t for t in tasks if t.get("group") in group_set]
+
+    if labels:
+        label_set = set(labels)
+        tasks = [t for t in tasks if t["label"] in label_set]
 
     single = [t for t in tasks if t.get("gpus", 1) == 1]
     multi = [t for t in tasks if t.get("gpus", 1) > 1]
@@ -216,6 +221,13 @@ def main():
         help="Only run tasks matching these group(s)",
     )
     parser.add_argument(
+        "-l",
+        "--label",
+        nargs="+",
+        default=None,
+        help="Only run tasks matching these exact label(s)",
+    )
+    parser.add_argument(
         "-n",
         "--num-gpus",
         type=int,
@@ -227,7 +239,7 @@ def main():
     config_path = args.config or os.path.join(os.path.dirname(__file__), "benchmark_suite.yaml")
     script_dir = os.path.dirname(os.path.abspath(config_path))
 
-    single_tasks, multi_tasks, num_gpus = load_config(config_path, args.group)
+    single_tasks, multi_tasks, num_gpus = load_config(config_path, args.group, args.label)
     if args.num_gpus is not None:
         num_gpus = args.num_gpus
 
@@ -243,6 +255,8 @@ def main():
     )
     if args.group:
         log(f"Filtered by group(s): {', '.join(args.group)}")
+    if args.label:
+        log(f"Filtered by label(s): {', '.join(args.label)}")
     log()
 
     os.makedirs(args.output_dir, exist_ok=True)
