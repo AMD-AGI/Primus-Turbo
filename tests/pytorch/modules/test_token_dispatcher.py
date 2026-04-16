@@ -93,9 +93,8 @@ def _run_dispatch_combine(
 
 @instantiate_parametrized_tests
 class TestTokenDispatcher(MultiProcContinuousTest):
-    @property
-    def world_size(self) -> int:
-        return torch.cuda.device_count()
+    # -2 tells MultiProcContinuousTest to use torch.cuda.device_count()
+    world_size = -2
 
     @property
     def device(self) -> torch.device:
