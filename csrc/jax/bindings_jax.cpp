@@ -4,6 +4,7 @@
 
 #include "extensions.h"
 #include "ffi.h"
+#include "primus_turbo/arch.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -72,6 +73,16 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("get_quantize_fp8_tensorwise_workspace_size", &GetQuantizeFP8TensorwiseWorkspaceSize);
     m.def("get_quantize_fp8_rowwise_workspace_size", &GetQuantizeFP8RowwiseWorkspaceSize);
+
+    m.def("get_device_compute_capability", [](int32_t device_id) -> std::pair<int, int> {
+        hipDeviceProp_t prop;
+        hipError_t      err = hipGetDeviceProperties(&prop, device_id);
+        if (err != hipSuccess) {
+            return {0, 0};
+        }
+        return {prop.major, prop.minor};
+    });
+    m.def("is_gfx950", &primus_turbo::is_gfx950);
 }
 
 } // namespace primus_turbo::jax

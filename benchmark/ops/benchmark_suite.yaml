@@ -141,6 +141,46 @@ tasks:
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_blockwise_triton_benchmark.csv
 
+  # benchmark machine is MI325, which does not support MXFP8 and MXFP4
+  # ── GEMM MXFP8 ─────────────────────────────────────────
+  # - label: gemm_mxfp8_turbo
+  #   group: gemm_mxfp8
+  #   script: bench_gemm_turbo.py
+  #   args: [--dtype, fp8, --granularity, mxfp8]
+  #   env: {PRIMUS_TURBO_GEMM_BACKEND: TURBO}
+  #   output: gemm_mxfp8_turbo_benchmark.csv
+
+  # - label: gemm_mxfp8_hipblaslt
+  #   group: gemm_mxfp8
+  #   script: bench_gemm_turbo.py
+  #   args: [--dtype, fp8, --granularity, mxfp8]
+  #   env: {PRIMUS_TURBO_GEMM_BACKEND: HIPBLASLT}
+  #   output: gemm_mxfp8_hipblaslt_benchmark.csv
+
+  # - label: gemm_mxfp8_autotune
+  #   group: gemm_mxfp8
+  #   script: bench_gemm_turbo.py
+  #   args: [--dtype, fp8, --granularity, mxfp8]
+  #   env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
+  #   output: gemm_mxfp8_autotune_benchmark.csv
+
+  # ── GEMM MXFP4 ─────────────────────────────────────────
+  # TODO: HIPBLASLT backend only support llama-7b for MXFP4
+  # FIXME(rocroller): SGPR error
+  # - label: gemm_mxfp4_hipblaslt
+  #   group: gemm_mxfp4
+  #   script: bench_gemm_turbo.py
+  #   args: [--dtype, fp4, --granularity, mxfp4]
+  #   env: {PRIMUS_TURBO_GEMM_BACKEND: HIPBLASLT}
+  #   output: gemm_mxfp4_hipblaslt_benchmark.csv
+
+  # - label: gemm_mxfp4_aiter
+  #   group: gemm_mxfp4
+  #   script: bench_gemm_turbo.py
+  #   args: [--dtype, fp4, --granularity, mxfp4]
+  #   env: {PRIMUS_TURBO_GEMM_BACKEND: AITER}
+  #   output: gemm_mxfp4_aiter_benchmark.csv
+
   # ── Grouped GEMM BF16 ────────────────────────────────────
   - label: grouped_gemm_bf16_te
     group: grouped_gemm_bf16
