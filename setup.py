@@ -1,4 +1,4 @@
-import importlib.metedata
+import importlib.metadata
 import os
 import platform
 import re
@@ -95,7 +95,6 @@ def is_package_installed(package_name):
         return True
     except importlib.metadata.PackageNotFoundError:
         return False
-
 
 
 def all_files_in_dir(path, name_extensions=None):
@@ -406,7 +405,7 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = []
 
-    # Conditionally add aiter if torch_ext is being built and aiter is not already installed
+    # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
