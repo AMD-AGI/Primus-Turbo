@@ -50,8 +50,15 @@ def _get_capability_from_rocm_agent(device_id: int) -> Tuple[int, int]:
             text=True,
             timeout=5,
         )
+        if result.returncode != 0:
+            logger.debug(
+                "rocm_agent_enumerator failed with return code %d: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return (0, 0)
         agents = [l.strip() for l in result.stdout.strip().split("\n") if l.strip() and l.strip() != "gfx000"]
-        if device_id < len(agents):
+        if 0 <= device_id < len(agents):
             return _parse_gfx_string(agents[device_id])
     except Exception:
         pass
