@@ -827,14 +827,14 @@ def _blockwise_fp8_autotune_kernel(
         rk = tl.arange(0, BLOCK_K)
 
         if A_K_CONTIGUOUS:
-            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :]
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64)
         else:
-            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak_val
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak_val
 
         if B_K_CONTIGUOUS:
-            b_ptrs = B_ptr + rk[:, None] + rn[None, :] * stride_bn
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) + rn[None, :].to(tl.int64) * stride_bn
         else:
-            b_ptrs = B_ptr + rk[:, None] * stride_bk_val + rn[None, :] * stride_bn
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) * stride_bk_val + rn[None, :].to(tl.int64) * stride_bn
 
         as_ptrs = A_scales_ptr + rm * stride_as_m
 
@@ -884,7 +884,7 @@ def _blockwise_fp8_autotune_kernel(
 
         offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
-        c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        c_ptrs = C_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :].to(tl.int64) * stride_cn
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
 

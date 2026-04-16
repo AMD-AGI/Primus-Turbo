@@ -1,0 +1,231 @@
+---
+alwaysApply: true
+---
+# Kernel Optimization Iteration Rules — Linear Mode
+
+This rule applies when you are iterating on GPU kernel performance (Triton, HIP, CK, or any other backend).
+
+These are **hard constraints**. Violating any of them makes the iteration invalid.
+
+---
+
+## Core Principle: Strictly Linear, Single-Variable Iteration
+
+```
+Round 1 (baseline)
+  │
+  ▼  one change
+Round 2 ── better? ── YES → keep, continue
+  │                    NO  → rollback to Round 1 code, try different change
+  ▼
+Round 3 ── better? ── YES → keep, continue
+  │                    NO  → rollback to Round 2 code, try different change
+  ...
+```
+
+**Every round is a single link in a linear chain.** No branching, no parallel experiments, no multi-variable changes. The codebase at any moment is the cumulative result of all accepted rounds.
+
+These rules assume `SKILL.md` has already created a campaign directory at `agent/workspace/<campaign_name>/`.
+
+- Per-round artifacts live under `<campaign_dir>/rounds/round-N/`
+- The running trend table lives at `<campaign_dir>/logs/performance_trend.md`
+- After `related_work.md` is written and before Round 1 starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists
+- The **active validation set** depends on the chosen validation level:
+  - **quick validation** → all `representative_shapes`
+  - **full validation** → all `target_shapes`
+
+Once a validation level is chosen for a round, do not cherry-pick a smaller subset inside that level.
+
+---
+
+## Rule 1: One Round = One Change = One Hypothesis
+
+Every round MUST include **exactly one** meaningful change to the kernel code.
+
+- **ONE** optimization technique per round (e.g., add LDS double buffer, OR change MFMA variant, OR add XOR swizzle — NOT all three at once).
+- If a round contains multiple independent changes, it is impossible to attribute the performance delta. **FORBIDDEN.**
+- Config-only sweeps (autotune params, tile sizes) with the same kernel code count as ONE round, not N rounds.
+- State the hypothesis BEFORE making the change: "I expect X to improve because Y."
+
+### What counts as "one change"
+
+| OK (one change) | NOT OK (multiple changes) |
+|---|---|
+| Switch MFMA variant 16x16→32x32 | Switch MFMA + add double buffer |
+| Add LDS double buffer | Add double buffer + change tile size |
+| Add XOR swizzle to LDS layout | Add swizzle + change grid mapping |
+| Change BLOCK_M from 128→256 (with analysis) | Change BLOCK_M + BLOCK_N + BLOCK_K |
+| Add persistent scheduling | Add persistent + XCD remap |
+| Hoist scale multiply out of inner loop | Hoist scale + vectorize loads |
+
+## Rule 2: Every Round Benchmarks the Active Validation Set
+
+Every round MUST benchmark all shapes in the active validation set. No exceptions within that validation level.
+
+- Different shapes in the active validation set stress different bottlenecks. Skipping shapes hides regressions.
+- If a shape fails, record the failure explicitly.
+
+## Rule 3: Accept or Rollback — No Ambiguity
+
+After benchmarking, apply this decision rule **mechanically**:
+
+```
+IF   (avg TFLOPS improved) AND (no shape regressed ≥5%):
+    ACCEPT → this round's code becomes the new baseline
+    Record: "Round N: ACCEPTED — avg +X.X%, description"
+
+ELIF (some shapes improved, some regressed <5%):
+    ACCEPT WITH NOTE → document the trade-off
+    Record: "Round N: ACCEPTED (trade-off) — avg +X.X%, shape Y regressed Z%"
+
+ELSE (avg TFLOPS did not improve) OR (any shape regressed ≥5%):
+    ROLLBACK → revert kernel code to previous round's snapshot
+    Record: "Round N: ROLLED BACK — description did not help because ..."
+    The NEXT round starts from the previous accepted code, not this failed attempt.
+```
+
+### Rollback procedure
+
+1. Copy kernel from `<campaign_dir>/rounds/round-(N-1)/kernel_snapshot/` back to the working kernel file
+2. Write `summary.md` explaining WHY the change didn't help (root cause analysis)
+3. The next round (N+1) is based on Round N-1's code, NOT Round N's failed code
+4. The rolled-back round still counts as a round number (no renumbering)
+
+## Rule 4: Every Round Produces `summary.md`
+
+Every round MUST output `<campaign_dir>/rounds/round-N/summary.md` containing:
+
+> Helper: `scripts/run_round.py` can scaffold `summary.md`, correctness/benchmark JSON, `kernel_snapshot/`, and `performance_trend.md`, but the agent must still provide the hypothesis, decision, and attribution.
+
+1. **Hypothesis**: What was changed and why (motivation)
+2. **Single change**: What exact code modification was made
+3. **Results**: Benchmark results for all shapes in the active validation set (table: TFLOPS, latency, delta vs previous accepted round, SNR)
+4. **Decision**: ACCEPTED or ROLLED BACK (with reason)
+5. **Attribution**: Why did this specific change help or not help
+6. **Next direction**: What to try next
+
+### Additional section for rolled-back rounds
+
+```markdown
+## Rollback Analysis
+- Change made: <description>
+- Expected effect: <hypothesis>
+- Actual effect: <what happened>
+- Root cause: <why it didn't work>
+- Lesson learned: <what this tells us about the bottleneck>
+```
+
+### Reusable Technical Tips Capture
+
+After every completed round, whether **ACCEPTED** or **ROLLED BACK**, decide whether the round produced reusable knowledge worth preserving outside the current campaign.
+
+If yes, append a concise entry to:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
+
+Record a tip only when the round revealed something that is likely to help future campaigns, such as:
+
+- a hardware- or backend-specific constraint
+- a compiler or autotune quirk
+- a parameter range or config pattern that reliably helps or hurts
+- a recurring failure signature and its root cause
+- a profiler signal that maps cleanly to a useful action
+- a validation or measurement trick that saves future rounds
+
+Do **not** dump the full round summary into `tips.md`. Append only the reusable takeaway.
+
+## Rule 5: Every Round Saves a Kernel Snapshot
+
+Every round MUST copy the kernel source into `<campaign_dir>/rounds/round-N/kernel_snapshot/`, regardless of accept/rollback. This enables:
+
+- Diffing any two rounds
+- Rolling back to any accepted state
+- Post-mortem analysis of failed attempts
+
+## Rule 6: Correctness Before Performance
+
+Every round MUST verify correctness on all shapes in the active validation set BEFORE benchmarking. If correctness fails, fix before proceeding. A round with broken correctness is not a valid round.
+
+## Rule 7: Rollback → MUST Diagnose Before Next Attempt
+
+When a round is rolled back:
+
+- You MUST NOT blindly try another random optimization.
+- You MUST diagnose WHY the change didn't help:
+  - Level 0: Re-read the code — did the change actually affect the hot path?
+  - Level 1: Profile if needed — is the bottleneck where you assumed?
+- You MUST state a NEW hypothesis that is **informed by the failure**.
+
+### Escalation on consecutive rollbacks
+
+| Consecutive rollbacks | Required action |
+|---|---|
+| 1 | Diagnose failure, try different approach to same bottleneck |
+| 2 | Full re-profile (`rocprofv3` + `rocprof-compute`), re-classify bottleneck |
+| 3 | ISA-level inspection (generated assembly), compare against reference |
+| 4+ | Comparative analysis vs SOTA kernel, consider fundamentally different approach |
+
+## Rule 8: Update Performance Trend Every Round
+
+Maintain `<campaign_dir>/logs/performance_trend.md` as a running table:
+
+```markdown
+| Round | Status | Description | Avg TFLOPS | Peak TFLOPS | vs Baseline | Key Finding |
+|-------|--------|-------------|------------|-------------|-------------|-------------|
+| 1 | ACCEPTED | Baseline persistent kernel | 500.0 | 800.0 | — | Memory-bound |
+| 2 | ACCEPTED | Add EVEN_K optimization | 520.0 | 850.0 | +4.0% | K masking was costly |
+| 3 | ROLLBACK | Try 256x256 tiles | 480.0 | 780.0 | -4.0% | Register spill at 256 |
+| 4 | ACCEPTED | Add XOR swizzle (from R2 code) | 550.0 | 870.0 | +5.8% | Bank conflicts reduced |
+```
+
+The "vs Baseline" column always compares against the **current best accepted** code, not the previous round (which may have been rolled back).
+
+### Append-Only Logging Rule
+
+`<campaign_dir>/logs/optimize.md` and `<campaign_dir>/logs/performance_trend.md` are **append-only**.
+
+- Do **not** delete, truncate, rewrite, or replace existing content in either file.
+- Only append new sections, rows, or correction notes.
+- If an earlier entry is wrong, keep it in place and append a clearly labeled correction instead of editing history away.
+
+## Rule 9: Linear Chain Integrity
+
+The accepted rounds form a strict linear chain:
+
+```
+R1(accepted) → R2(accepted) → R3(rollback, back to R2) → R4(accepted, from R2) → ...
+```
+
+The **working kernel** at any point is the code from the **last accepted round**. Never from a rolled-back round.
+
+To verify chain integrity, the `performance_trend.md` must show monotonically non-decreasing avg TFLOPS across ACCEPTED rounds (allowing ≤1% noise). If an accepted round is somehow worse than the previous accepted, something is wrong — investigate.
+
+## Rule 10: No Premature Termination
+
+- Below 50% of Turbo baseline: keep iterating, low-hanging fruit likely exists
+- 50-80% of Turbo baseline: methodical profiling-driven iteration
+- 80-100% of Turbo baseline: fine-grained ISA-level optimization
+- Above Turbo baseline: continue, document the techniques that worked
+- Only stop at the requested round count, or when hitting theoretical hardware peak
+
+## Summary: The Linear Iteration Loop
+
+```
+for round_n in range(1, max_rounds + 1):
+    1. Read previous accepted round's summary → identify next hypothesis
+    2. Make EXACTLY ONE code change (state hypothesis first)
+    3. Verify correctness on all shapes in the active validation set
+       └─ FAIL → fix bug, do NOT count as new round
+    4. Benchmark all shapes in the active validation set
+    5. Compare vs last ACCEPTED round
+    6. Decision: ACCEPT or ROLLBACK
+       ├─ ACCEPT → code becomes new baseline
+       └─ ROLLBACK → revert to last accepted code, diagnose failure
+    7. Write <campaign_dir>/rounds/round-N/summary.md with full analysis
+    8. Save the kernel snapshot to <campaign_dir>/rounds/round-N/kernel_snapshot/
+    9. If this round produced a reusable lesson, append it to
+       agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md
+    10. Update performance_trend.md
+```
