@@ -1,0 +1,1069 @@
+mkdir -p build
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/proxy.cpp -o build/proxy.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/rdma.cpp -o build/rdma.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/common.cpp -o build/common.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/uccl_proxy.cpp -o build/uccl_proxy.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/uccl_bench.cpp -o build/uccl_bench.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/fifo.cpp -o build/fifo.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/bench_kernel.cu -o build/bench_kernel.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/internode_ll.cu -o build/internode_ll.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/internode.cu -o build/internode.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/layout.cu -o build/layout.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/intranode.cu -o build/intranode.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -MMD -MP -c src/ep_runtime.cu -o build/ep_runtime.o
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -MMD -MP -c src/uccl_ep.cc -o build/uccl_ep.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_internals.cpp -o build/nb_nb_internals.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_func.cpp -o build/nb_nb_func.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_type.cpp -o build/nb_nb_type.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_enum.cpp -o build/nb_nb_enum.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_ndarray.cpp -o build/nb_nb_ndarray.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_static_property.cpp -o build/nb_nb_static_property.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/common.cpp -o build/nb_common.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/error.cpp -o build/nb_error.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/trampoline.cpp -o build/nb_trampoline.o
+g++ -O3 -std=c++17 -fPIC -fvisibility=hidden -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1 -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 -c /opt/venv/lib/python3.12/site-packages/nanobind/src/implicit.cpp -o build/nb_implicit.o
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: warning: warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+
+
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from /opt/venv/lib/python3.12/site-packages/nanobind/src/nb_internals.cpp:13:
+/opt/venv/lib/python3.12/site-packages/nanobind/src/nb_abi.h:81: warning: "NB_STABLE_ABI" redefined
+   81 | #  define NB_STABLE_ABI "_stable"
+      | 
+<command-line>: note: this is the location of the previous definition
+1 warning generated when compiling for gfx942.
+In file included from src/proxy.cpp:1:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+src/layout.cu:10:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+   10 | __global__ void get_dispatch_layout(int64_t const* topk_idx,
+      |                 ^
+src/layout.cu:10:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/layout.cu:10:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/layout.cu:10:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+1 warning generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from src/uccl_ep.cc:2:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/internode.cu:6:
+include/uccl_ibgda.cuh:196:10: warning: unused variable 'last_print' [-Wunused-variable]
+  196 |     auto last_print = clock64();
+      |          ^~~~~~~~~~
+In file included from src/internode_ll.cu:8:
+include/uccl_ibgda.cuh:196:10: warning: unused variable 'last_print' [-Wunused-variable]
+  196 |     auto last_print = clock64();
+      |          ^~~~~~~~~~
+src/internode.cu:725:39: warning: unused variable 'global_rdma_tail_idx' [-Wunused-variable]
+  725 |     int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
+      |                                       ^~~~~~~~~~~~~~~~~~~~
+src/internode.cu:1421:14: warning: unused variable 'tma_load_bytes' [-Wunused-variable]
+ 1421 |         auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
+      |              ^~~~~~~~~~~~~~
+src/internode_ll.cu:763:17: warning: unused variable 'hidden_bf16_int4_pad' [-Wunused-variable]
+  763 |   constexpr int hidden_bf16_int4_pad =
+      |                 ^~~~~~~~~~~~~~~~~~~~
+src/internode.cu:1540:17: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1540 |   constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+      |                 ^~~~~~~~~
+src/internode.cu:1858:13: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1858 |   int const smem_size = kNumTMABytesPerWarp * num_warps;
+      |             ^~~~~~~~~
+src/internode_ll.cu:1265:13: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1265 |   int const smem_size = kNumTMABytesPerWarp * num_warps_launch;
+      |             ^~~~~~~~~
+5 warnings generated when compiling for gfx942.
+src/internode.cu:2530:28: warning: unused variable 'rdma_wait_start' [-Wunused-variable]
+ 2530 |         unsigned long long rdma_wait_start = clock64();
+      |                            ^~~~~~~~~~~~~~~
+src/internode.cu:2555:28: warning: unused variable 'rdma_wait_end' [-Wunused-variable]
+ 2555 |         unsigned long long rdma_wait_end = clock64();
+      |                            ^~~~~~~~~~~~~
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+1 warning generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from src/uccl_ep.cc:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/proxy.cpp:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_ep.cc:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/proxy.cpp:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+1 warning generated when compiling for gfx942.
+src/uccl_bench.cpp:18:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   18 |     cudaEventDestroy(done_evt_);
+      |     ^~~~~~~~~~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+src/uccl_bench.cpp:170:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  170 |     cudaEventDestroy(done_evt_);
+      |     ^~~~~~~~~~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+src/uccl_proxy.cpp:64:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   64 |     hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+      |     ^~~~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   65 |                           hipDeviceMallocUncached);
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~
+src/uccl_proxy.cpp:85:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   85 |     cudaMemset(atomic_buffer_ptr_, 0, kAtomicBufferSize);
+      |     ^~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:22:20: note: expanded from macro 'cudaMemset'
+   22 | #define cudaMemset hipMemset
+      |                    ^~~~~~~~~
+src/uccl_proxy.cpp:100:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  100 |     hipFree(atomic_buffer_ptr_);
+      |     ^~~~~~~ ~~~~~~~~~~~~~~~~~~
+1 warning generated when compiling for host.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from src/uccl_ep.cc:7:
+include/ep_event.hpp:14:31: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   14 |       if (*ev_ptr != nullptr) cudaEventDestroy(*ev_ptr);
+      |                               ^~~~~~~~~~~~~~~~ ~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+src/uccl_ep.cc:328:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  328 |       cudaGetDevice(&device_index);
+      |       ^~~~~~~~~~~~~ ~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:44:23: note: expanded from macro 'cudaGetDevice'
+   44 | #define cudaGetDevice hipGetDevice
+      |                       ^~~~~~~~~~~~
+src/uccl_ep.cc:1266:58: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1266 |           buffer.dispatch_rdma_send_buffer, x, topk_idx, ptr0, ptr_internode0,
+      |                                                          ^
+src/uccl_ep.cc:1258:11: note: 'ptr0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |           ^
+src/uccl_ep.cc:1266:64: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1266 |           buffer.dispatch_rdma_send_buffer, x, topk_idx, ptr0, ptr_internode0,
+      |                                                                ^
+src/uccl_ep.cc:1258:17: note: 'ptr_internode0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                 ^
+src/uccl_ep.cc:1267:11: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1267 |           count0, num_tokens, hidden, num_max_dispatch_tokens_per_rank,
+      |           ^
+src/uccl_ep.cc:1258:33: note: 'count0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                                 ^
+src/uccl_ep.cc:1355:41: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                         ^
+src/uccl_ep.cc:1349:11: note: 'ptr0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |           ^
+src/uccl_ep.cc:1355:47: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                               ^
+src/uccl_ep.cc:1349:17: note: 'ptr_internode0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                 ^
+src/uccl_ep.cc:1355:63: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                                               ^
+src/uccl_ep.cc:1349:33: note: 'count0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                                 ^
+src/uccl_ep.cc:1431:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+ 1431 |       cudaMemset(atomic_buffer_ptr, 0, kAtomicBufferSize);
+      |       ^~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:22:20: note: expanded from macro 'cudaMemset'
+   22 | #define cudaMemset hipMemset
+      |                    ^~~~~~~~~
+1 warning generated when compiling for host.
+6 warnings generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+1 warning generated when compiling for host.
+7 warnings generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+1 warning generated when compiling for host.
+src/intranode.cu:12:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+   12 | __global__ void notify_dispatch(
+      |                 ^
+src/intranode.cu:12:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:12:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:12:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:12:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:150:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  150 | __global__ void cached_notify_dispatch(int const* rank_prefix_matrix,
+      |                 ^
+src/intranode.cu:150:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:150:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:150:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:150:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+4 warnings generated when compiling for gfx942.
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  187 |     dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx,
+      |     ^
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+1 warning generated when compiling for host.
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:187:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  647 | __global__ void cached_notify_combine(void** buffer_ptrs, int* send_head,
+      |                 ^
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:647:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  723 |     combine(dtype_t* recv_x, float* recv_topk_weights, dtype_t const* x,
+      |     ^
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/intranode.cu:723:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/proxy.cpp:1:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_bench.cpp:1:
+In file included from include/uccl_bench.hpp:3:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+src/uccl_bench.cpp:18:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   18 |     cudaEventDestroy(done_evt_);
+      |     ^~~~~~~~~~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+src/uccl_bench.cpp:170:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  170 |     cudaEventDestroy(done_evt_);
+      |     ^~~~~~~~~~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_proxy.cpp:1:
+In file included from include/uccl_proxy.hpp:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+src/uccl_proxy.cpp:64:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   64 |     hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+      |     ^~~~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   65 |                           hipDeviceMallocUncached);
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~
+src/uccl_proxy.cpp:85:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   85 |     cudaMemset(atomic_buffer_ptr_, 0, kAtomicBufferSize);
+      |     ^~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:22:20: note: expanded from macro 'cudaMemset'
+   22 | #define cudaMemset hipMemset
+      |                    ^~~~~~~~~
+src/uccl_proxy.cpp:100:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  100 |     hipFree(atomic_buffer_ptr_);
+      |     ^~~~~~~ ~~~~~~~~~~~~~~~~~~
+src/uccl_ep.cc:54:26: warning: unused variable 'g_next' [-Wunused-variable]
+   54 | static std::atomic<long> g_next{1};
+      |                          ^~~~~~
+src/uccl_ep.cc:55:19: warning: unused variable 'g_mu' [-Wunused-variable]
+   55 | static std::mutex g_mu;
+      |                   ^~~~
+In file included from src/proxy.cpp:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+15 warnings generated when compiling for gfx942.
+In file included from src/proxy.cpp:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+6 warnings generated when compiling for host.
+7 warnings generated when compiling for host.
+In file included from src/uccl_ep.cc:2:
+In file included from include/bench_utils.hpp:5:
+In file included from include/proxy.hpp:6:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+In file included from src/uccl_ep.cc:2:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_ep.cc:2:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/uccl_ep.cc:7:
+include/ep_event.hpp:14:31: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   14 |       if (*ev_ptr != nullptr) cudaEventDestroy(*ev_ptr);
+      |                               ^~~~~~~~~~~~~~~~ ~~~~~~~
+./include/cuda_compat/cuda_runtime.h:72:26: note: expanded from macro 'cudaEventDestroy'
+   72 | #define cudaEventDestroy hipEventDestroy
+      |                          ^~~~~~~~~~~~~~~
+src/uccl_ep.cc:328:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  328 |       cudaGetDevice(&device_index);
+      |       ^~~~~~~~~~~~~ ~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:44:23: note: expanded from macro 'cudaGetDevice'
+   44 | #define cudaGetDevice hipGetDevice
+      |                       ^~~~~~~~~~~~
+src/uccl_ep.cc:1266:58: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1266 |           buffer.dispatch_rdma_send_buffer, x, topk_idx, ptr0, ptr_internode0,
+      |                                                          ^
+src/uccl_ep.cc:1258:11: note: 'ptr0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |           ^
+src/uccl_ep.cc:1266:64: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1266 |           buffer.dispatch_rdma_send_buffer, x, topk_idx, ptr0, ptr_internode0,
+      |                                                                ^
+src/uccl_ep.cc:1258:17: note: 'ptr_internode0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                 ^
+src/uccl_ep.cc:1267:11: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1267 |           count0, num_tokens, hidden, num_max_dispatch_tokens_per_rank,
+      |           ^
+src/uccl_ep.cc:1258:33: note: 'count0' declared here
+ 1258 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                                 ^
+src/uccl_ep.cc:1355:41: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                         ^
+src/uccl_ep.cc:1349:11: note: 'ptr0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |           ^
+src/uccl_ep.cc:1355:47: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                               ^
+src/uccl_ep.cc:1349:17: note: 'ptr_internode0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                 ^
+src/uccl_ep.cc:1355:63: warning: captured structured bindings are a C++20 extension [-Wc++20-extensions]
+ 1355 |           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
+      |                                                               ^
+src/uccl_ep.cc:1349:33: note: 'count0' declared here
+ 1349 |     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
+      |                                 ^
+src/uccl_ep.cc:1431:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+ 1431 |       cudaMemset(atomic_buffer_ptr, 0, kAtomicBufferSize);
+      |       ^~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:22:20: note: expanded from macro 'cudaMemset'
+   22 | #define cudaMemset hipMemset
+      |                    ^~~~~~~~~
+4 warnings generated when compiling for host.
+src/uccl_ep.cc:54:26: warning: unused variable 'g_next' [-Wunused-variable]
+   54 | static std::atomic<long> g_next{1};
+      |                          ^~~~~~
+src/uccl_ep.cc:55:19: warning: unused variable 'g_mu' [-Wunused-variable]
+   55 | static std::mutex g_mu;
+      |                   ^~~~
+41 warnings generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+1 warning generated when compiling for host.
+15 warnings generated when compiling for host.
+src/internode_ll.cu:24:10: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+   24 |     void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
+      |          ^
+src/internode_ll.cu:24:10: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+   50 | __global__ __launch_bounds__(1024, 1) void dispatch(
+      |                                            ^
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/rdma.cpp:1:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:50:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  735 | __global__ __launch_bounds__(1024, 1) void combine(
+      |                                            ^
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/rdma.cpp:35:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/rdma.cpp:35:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+src/rdma.cpp:399:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  399 |   cudaSetDevice(gpu_idx);  // Needed.
+      |   ^~~~~~~~~~~~~ ~~~~~~~
+./include/cuda_compat/cuda_runtime.h:43:23: note: expanded from macro 'cudaSetDevice'
+   43 | #define cudaSetDevice hipSetDevice
+      |                       ^~~~~~~~~~~~
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:776:23: note: in instantiation of function template specialization '(anonymous namespace)::probe_gpu_memory_registration<(lambda at src/rdma.cpp:778:7)>' requested here
+  776 |   bool const result = probe_gpu_memory_registration(
+      |                       ^
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:833:23: note: in instantiation of function template specialization '(anonymous namespace)::probe_gpu_memory_registration<(lambda at src/rdma.cpp:835:7)>' requested here
+  833 |   bool const result = probe_gpu_memory_registration(
+      |                       ^
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+11 warnings generated when compiling for gfx942.
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode_ll.cu:735:44: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/rdma.cpp:1:
+In file included from include/rdma.hpp:7:
+In file included from ../include/util/util.h:7:
+../include/util/jring.h:104:32: warning: unknown warning group '-Wstringop-overflow', ignored [-Wunknown-warning-option]
+  104 | #pragma GCC diagnostic ignored "-Wstringop-overflow"
+      |                                ^
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+   93 | __global__ void notify_dispatch(
+      |                 ^
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+In file included from src/rdma.cpp:35:
+include/bench_utils.hpp:30:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   30 |   if (device == -1) gpuGetDevice(&devsrc/internode.cui:93ce:)17;:
+       | warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]                    ^~~~~~~~~~~~ ~~~~~~~
+
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+In file included from src/rdma.cpp:35:
+include/bench_utils.hpp:309:21: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  309 |   if (device == -1) gpuGetDevice(&device);
+      |                     ^~~~~~~~~~~~ ~~~~~~~
+../include/util/gpu_rt.h:103:22: note: expanded from macro 'gpuGetDevice'
+  103 | #define gpuGetDevice hipGetDevice
+      |                      ^~~~~~~~~~~~
+src/rdma.cpp:399:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  399 |   cudaSetDevice(gpu_idx);  // Needed.
+      |   ^~~~~~~~~~~~~ ~~~~~~~
+./include/cuda_compat/cuda_runtime.h:43:23: note: expanded from macro 'cudaSetDevice'
+   43 | #define cudaSetDevice hipSetDevice
+      |                       ^~~~~~~~~~~~
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:776:23: note: in instantiation of function template specialization '(anonymous namespace)::probe_gpu_memory_registration<(lambda at src/rdma.cpp:778:7)>' requested here
+  776 |   bool const result = probe_gpu_memory_registration(
+      |                       ^
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:697:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  697 |     cudaFree(probe_buf);
+      |     ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/rdma.cpp:833:23: note: in instantiation of function template specialization '(anonymous namespace)::probe_gpu_memory_registration<(lambda at src/rdma.cpp:835:7)>' requested here
+  833 |   bool const result = probe_gpu_memory_registration(
+      |                       ^
+src/rdma.cpp:755:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  755 |   cudaFree(probe_buf);
+      |   ^~~~~~~~ ~~~~~~~~~
+./include/cuda_compat/cuda_runtime.h:19:18: note: expanded from macro 'cudaFree'
+   19 | #define cudaFree hipFree
+      |                  ^~~~~~~
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:93:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  482 |     dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx,
+      |     ^
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+11 warnings generated when compiling for host.
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:482:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+ 1599 | __global__ void cached_notify(
+      |                 ^
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:1599:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+ 2090 |     combine(int4* combined_x, float* combined_topk_weights,
+      |     ^
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+src/internode.cu:2090:5: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+202 warnings generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from src/internode_ll.cu:8:
+include/uccl_ibgda.cuh:196:10: warning: unused variable 'last_print' [-Wunused-variable]
+  196 |     auto last_print = clock64();
+      |          ^~~~~~~~~~
+src/internode_ll.cu:763:17: warning: unused variable 'hidden_bf16_int4_pad' [-Wunused-variable]
+  763 |   constexpr int hidden_bf16_int4_pad =
+      |                 ^~~~~~~~~~~~~~~~~~~~
+src/internode_ll.cu:1265:13: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1265 |   int const smem_size = kNumTMABytesPerWarp * num_warps_launch;
+      |             ^~~~~~~~~
+4 warnings generated when compiling for host.
+164 warnings generated when compiling for gfx942.
+warning: unknown warning option '-Wno-interference-size' [-Wunknown-warning-option]
+In file included from src/internode.cu:6:
+include/uccl_ibgda.cuh:196:10: warning: unused variable 'last_print' [-Wunused-variable]
+  196 |     auto last_print = clock64();
+      |          ^~~~~~~~~~
+src/internode.cu:725:39: warning: unused variable 'global_rdma_tail_idx' [-Wunused-variable]
+  725 |     int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
+      |                                       ^~~~~~~~~~~~~~~~~~~~
+src/internode.cu:1421:14: warning: unused variable 'tma_load_bytes' [-Wunused-variable]
+ 1421 |         auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
+      |              ^~~~~~~~~~~~~~
+src/internode.cu:1540:17: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1540 |   constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+      |                 ^~~~~~~~~
+src/internode.cu:1858:13: warning: unused variable 'smem_size' [-Wunused-variable]
+ 1858 |   int const smem_size = kNumTMABytesPerWarp * num_warps;
+      |             ^~~~~~~~~
+src/internode.cu:2530:28: warning: unused variable 'rdma_wait_start' [-Wunused-variable]
+ 2530 |         unsigned long long rdma_wait_start = clock64();
+      |                            ^~~~~~~~~~~~~~~
+src/internode.cu:2555:28: warning: unused variable 'rdma_wait_end' [-Wunused-variable]
+ 2555 |         unsigned long long rdma_wait_end = clock64();
+      |                            ^~~~~~~~~~~~~
+8 warnings generated when compiling for host.
+/opt/rocm-7.1.1/bin/hipcc -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -shared -fPIC \
+    -Iinclude/cuda_compat -Iinclude -I/opt/rocm-7.1.1/include -I/usr/include -I../include -I/opt/venv/lib/python3.12/site-packages/nanobind/include -I/opt/venv/lib/python3.12/site-packages/nanobind/ext/robin_map/include -I/usr/include/python3.12 build/proxy.o build/rdma.o build/common.o build/uccl_proxy.o build/uccl_bench.o build/fifo.o build/bench_kernel.o build/internode_ll.o build/internode.o build/layout.o build/intranode.o build/ep_runtime.o build/uccl_ep.o build/nb_nb_internals.o build/nb_nb_func.o build/nb_nb_type.o build/nb_nb_enum.o build/nb_nb_ndarray.o build/nb_nb_static_property.o build/nb_common.o build/nb_error.o build/nb_trampoline.o build/nb_implicit.o \
+    -L/opt/rocm-7.1.1/lib -Wl,-rpath,/opt/rocm-7.1.1/lib \
+    -lamdhip64 -lpthread -libverbs -lnl-3 -lnl-route-3 -lnuma -L/opt/rocm-7.1.1/lib -lamdhip64 -o ep.abi3.so
