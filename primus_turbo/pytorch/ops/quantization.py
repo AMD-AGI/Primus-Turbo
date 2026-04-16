@@ -32,7 +32,6 @@ def quantize_fp8(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scale: Optional[torch.Tensor] = None,
     padding_align_size: Optional[int] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -51,15 +50,11 @@ def quantize_fp8(
             5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_impl(x, out_dtype, scale)
-
+        return quantize_fp8_tensorwise_impl(x, out_dtype)
     elif granularity == ScalingGranularity.ROWWISE:
-
-        return quantize_fp8_rowwise_impl(x, out_dtype, axis, scale)
+        return quantize_fp8_rowwise_impl(x, out_dtype, axis)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
-        assert scale is None, "The scale is not supported for MXFP8 quantization"
-
         return quantize_mxfp8_impl(
             x,
             out_dtype,
@@ -79,7 +74,6 @@ def quantize_fp8_with_trans(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scale: Optional[torch.Tensor] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -95,8 +89,6 @@ def quantize_fp8_with_trans(
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
-        assert scale is None, "The scale is not supported for MXFP8 quantization"
-
         return quantize_mxfp8_impl(
             x,
             out_dtype,
@@ -154,7 +146,6 @@ def quantize_fp4(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scale: Optional[torch.Tensor] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -169,9 +160,7 @@ def quantize_fp4(
             5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert scale is None, "The scale is not supported for MXFP4 quantization"
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
-
         return quantize_mxfp4_impl(
             x,
             out_dtype,
@@ -191,7 +180,6 @@ def quantize_fp4_with_trans(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scale: Optional[torch.Tensor] = None,
     scaling_recipe: Optional[MXScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -206,9 +194,7 @@ def quantize_fp4_with_trans(
             5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert scale is None, "The scale is not supported for MXFP4 quantization"
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP4 quantization"
-
         return quantize_mxfp4_impl(
             x,
             out_dtype,
