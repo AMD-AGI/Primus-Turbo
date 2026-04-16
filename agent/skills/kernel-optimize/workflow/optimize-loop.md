@@ -1,120 +1,162 @@
-# 优化过程执行规范
+# Optimization Process Specification
 
-本文件定义 `kernel-optimize` 的**详细优化过程**。
+This file defines the **detailed optimization process** for `kernel-optimize`.
 
-默认前提是（agent 依次经过：项目 skill → `../SKILL.md`（了解需求）→ 项目 skill（收集信息）→ `../SKILL.md`（执行）→ 本文件）：
-- 已按 `../SKILL.md` 的「前置信息需求」从项目 skill 收齐了所需信息
-- 已在 `../SKILL.md` 完成 DEFINE_TARGET（参数结构化）和 PREPARE_ENVIRONMENT（campaign 目录建立、quick 验证脚本生成）
-- 已建立本轮 campaign 目录，`manifest.yaml` 已填写，`quick_test_bench.py` 已生成（shapes 待 BASELINE 填入）
-- 已明确 `target_op`、`target_backend`、`target_lang`、`target_gpu`、`execution_mode`
+The default prerequisite is (agent proceeds through: project skill → `../SKILL.md` (understand requirements) → project skill (collect information) → `../SKILL.md` (execute) → this file):
+- All required information has been collected from the project skill per `../SKILL.md`'s "Prerequisite Information"
+- DEFINE_TARGET (parameter structuring) and PREPARE_ENVIRONMENT (campaign directory setup) have been completed in `../SKILL.md`
+- The campaign directory for this round has been established, `manifest.yaml` has been filled in, and `quick_test_bench.py` has been generated
+- `related_work.md` has been created by the `SURVEY_RELATED_WORK` step in `../SKILL.md`
+- If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, it has been read after `related_work.md` and before `round-1`
+- `target_op`, `target_backend`, `target_lang`, `target_gpu`, and `execution_mode` are clearly defined
 
-因此，本文件**不负责**：
-- 解释如何从用户指令提取参数（见 [`../SKILL.md`](../SKILL.md) 的 DEFINE_TARGET）
-- 规定 campaign 目录结构（见 [`../SKILL.md`](../SKILL.md) 的 PREPARE_ENVIRONMENT）
-- 提供某个具体项目的构建、测试、benchmark 命令（由项目 skill 提供）
+Therefore, this file is **not responsible for**:
+- Explaining how to extract parameters from user instructions (see DEFINE_TARGET in [`../SKILL.md`](../SKILL.md))
+- Specifying campaign directory structure (see PREPARE_ENVIRONMENT in [`../SKILL.md`](../SKILL.md))
+- Running the related-work / SOTA survey itself (done in `../SKILL.md` before this file starts)
+- Providing build, test, or benchmark commands for any specific project (provided by the project skill)
 
-## 输入参数
+## Iteration Contract
 
-开始执行优化过程前，至少明确：
+Before running `ENVIRONMENT_BASELINE`, read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc). Treat it as a hard constraint throughout the loop:
 
-| 参数 | 含义 |
-|------|------|
-| `target_op` | 目标算子 |
-| `target_backend` | 目标 backend |
-| `target_lang` | 实现语言 |
-| `target_gpu` | 目标 GPU 架构 |
+- one hypothesis and one meaningful kernel change per round
+- correctness before performance
+- benchmark the full active validation set
+- accept or roll back cleanly to the previous accepted baseline
+
+## Input Parameters
+
+Before starting the optimization process, at minimum define:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `target_op` | Target operator |
+| `target_backend` | Target backend |
+| `target_lang` | Implementation language |
+| `target_gpu` | Target GPU architecture |
 | `execution_mode` | `repo` / `workspace` |
-| `campaign_dir` | 本轮 campaign 目录 |
-| `target_shapes` | 本轮关注的 shape 集 |
-| `performance_target` | 目标性能 |
-| `primary_metric` | 主比较指标，可多个；取决于算子类型（如 GEMM: `Forward TFLOPS`，elementwise: `Forward GB/s`） |
-| `git_commit` | 是否对 accepted version 做 git commit |
-| `git_branch` | 当前优化分支（或 `none`） |
-| `max_iterations` | 最大迭代轮数（可选） |
-| `max_duration` | 最大运行时长（可选，如 `"4h"`） |
-| `project_skill` | 对应项目 skill |
+| `campaign_dir` | Campaign directory for this round |
+| `target_shapes` | Full shape set of interest for this round; quick validation uses `representative_shapes` as the active subset |
+| `performance_target` | Target performance; `null` means there is no explicit numeric target |
+| `primary_metric` | Primary comparison metric(s); depends on operator type (e.g., GEMM: `Forward TFLOPS`, elementwise: `Forward GB/s`) |
+| `git_commit` | Whether to git commit accepted versions |
+| `git_branch` | Current optimization branch (or `none`) |
+| `max_iterations` | Maximum iteration count (optional) |
+| `max_duration` | Maximum runtime budget (optional, e.g. `"4h"`) |
+| `project_skill` | Corresponding project skill |
 
-## 确认已获取的信息
+## Confirm Previously Obtained Information
 
-以下信息应在项目 skill 阶段和 DEFINE_TARGET 阶段已获取，开始优化循环前做最终确认：
+The following information should have been obtained during the project skill phase and DEFINE_TARGET phase. Do a final confirmation before starting the optimization loop:
 
-| 信息 | 用途 | 示例 |
-|------|------|------|
-| **kernel 源文件路径** | ANALYZE 阶段读代码 | `primus_turbo/triton/gemm/gemm_fp8_kernel.py` |
-| **focused test 命令** | full correctness 验证 | `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` |
-| **focused benchmark 命令** | full performance 评估 | `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
-| **quick_command** | 每轮快速 correctness + benchmark | 由项目 skill 模板生成，PREPARE_ENVIRONMENT 时创建脚本，BASELINE 后填入代表性 shapes 并记入 manifest |
-| **benchmark 输出列名** | 解析结果、计算分数 | `Forward TFLOPS`、`Backward TFLOPS`（primary_metric）、`Check`（correctness gate） |
-| **rebuild 要求** | 改完代码后是否需要重新构建 | Triton: 无需 rebuild；HIP: 需增量 rebuild |
+| Information | Purpose | Example |
+|-------------|---------|---------|
+| **Kernel source file path** | Read code during ANALYZE | `primus_turbo/triton/gemm/gemm_fp8_kernel.py` |
+| **Focused test command** | Full correctness validation | `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` |
+| **Focused benchmark command** | Full performance evaluation | `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
+| **Quick validation command** | Fast correctness + benchmark each round | `python <campaign_dir>/quick_test_bench.py` (generated in PREPARE_ENVIRONMENT, filled with `representative_shapes` after BASELINE) |
+| **Benchmark output column names** | Parse results, compute scores | `Forward TFLOPS`, `Backward TFLOPS` (primary_metric), `Check` (correctness gate) |
+| **Rebuild requirements** | Whether rebuild is needed after code changes | Triton: no rebuild needed; HIP: incremental rebuild required |
+| **Related-work report** | Seed early hypotheses with external and internal baselines | `<campaign_dir>/related_work.md` |
 
-若有缺失，回查项目 skill 或 `../SKILL.md` 的 manifest 补齐。
+If anything is missing, refer back to the project skill or `../SKILL.md`'s manifest to fill in the gaps.
 
-## 两级验证
+## Historical Tips Bootstrap
 
-优化循环中有两级验证：
+After `related_work.md` is written and before `round-1` / `ENVIRONMENT_BASELINE` starts, check whether a reusable tips file already exists for this hardware / op / backend combination.
 
-| 级别 | 何时使用 | 内容 |
-|------|---------|------|
-| **quick** | 每轮 VALIDATE 默认使用 | 运行 `quick_command`（代表性 shapes 的 correctness + benchmark，几十秒） |
-| **full** | BASELINE、最终验收、或 agent 判断需要时 | focused test + focused benchmark（全量 shapes，十几分钟） |
+Path convention:
 
-quick 验证脚本在 PREPARE_ENVIRONMENT 阶段生成到 campaign 目录（此时项目 API 上下文最完整），BASELINE 后选出代表性 shapes 并填入脚本。full 验证使用 manifest 中的 focused test/benchmark 命令。
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
-quick validation 用于同一优化方向内的小步快速迭代。当一个优化方向完成时（无论 accept 还是放弃），应做一次 full validation 确认全量 shapes 无退步。此外，当 quick 结果接近临界（提升 < 5%）或涉及高风险改动时，也应升级到 full。
+Example:
 
-## 总流程
+`agent/historical_experience/gfx950/gemm_fp8_blockwise/triton/tips.md`
+
+Rules:
+
+- Normalize the backend directory to lowercase, e.g. `TRITON -> triton`, `CK -> ck`
+- If the file exists, read it once before the first round
+- Treat it as prior experience, not as permission to skip measurement, profiling, or validation
+- Revisit it later only when the round history suggests a related pattern may apply again
+
+## Two-Level Validation
+
+The optimization loop uses two levels of validation:
+
+| Level | When to use | Content |
+|-------|------------|---------|
+| **quick** | Default for each VALIDATE round | Run `quick_command`: representative-shape correctness + benchmark in one step |
+| **full** | BASELINE, end of a direction, final acceptance, or when risk/noise requires it | Focused test + focused benchmark on all `target_shapes` |
+
+The quick validation script is generated during PREPARE_ENVIRONMENT while the project API context is still fresh. After BASELINE, fill it with `representative_shapes` and record the invocation in the manifest as `quick_command`. Full validation uses the focused test / benchmark commands from the project skill.
+
+Active validation set by level:
+- **quick** → all `representative_shapes`
+- **full** → all `target_shapes`
+
+Within a chosen validation level, do not cherry-pick a smaller subset.
+
+Quick validation is for small-step iteration within one direction. When a direction completes, when quick results are borderline (improvement < 5%), or when changes are high-risk (control flow, data layout, etc.), upgrade to full validation for confirmation.
+
+## Overall Flow
+
+Before `ENVIRONMENT_BASELINE`, if the corresponding historical tips file exists, read it.
 
 ```text
 ENVIRONMENT_BASELINE
-  -> [ANALYZE -> OPTIMIZE -> VALIDATE -> ACCEPT/ROLLBACK] (迭代循环)
-  -> 终止条件检查（至少一条满足才可退出循环）
+  -> [ANALYZE -> OPTIMIZE -> VALIDATE -> ACCEPT/ROLLBACK] (iteration loop)
+  -> TERMINATION_CHECK (exit only if at least one termination condition is satisfied)
   -> REPORT
 ```
 
-> **关键**：ACCEPT 和 ROLLBACK 都回到 ANALYZE 开始下一轮，不是跳到 REPORT。只有通过终止条件检查后才能退出循环写 REPORT。
+Round numbering is strict: `round-1` is BASELINE, and optimization attempts start at `round-2`.
 
-在 `repo-mode` 下，VALIDATE 即直接在主仓验证，无 SYNC_BACK 步骤。
-在 `workspace-mode` 下，VALIDATE 分 local gate 和 integration gate，中间有 SYNC_BACK。
+ACCEPT and ROLLBACK both return to ANALYZE for the next round. Do not jump directly to REPORT unless TERMINATION_CHECK passes.
 
-## 评分操作规范
+In `repo-mode`, VALIDATE validates directly in the main repo with no SYNC_BACK step.
+In `workspace-mode`, VALIDATE is split into a local gate and an integration gate, with SYNC_BACK in between.
 
-### 从 benchmark 输出到 aggregate score
+## Scoring Operations Specification
 
-**Step 1**: 执行 benchmark（quick 或 full），输出结果
+### From Benchmark Output to Aggregate Score
 
-**Step 2**: 从输出中提取每一行的 `primary_metric`（如 `Forward TFLOPS` 或 `Forward GB/s`，取决于算子类型；若多指标则分别提取）和 `Check` 列
+**Step 1**: Run benchmark (quick or full), produce output
 
-**Step 3**: correctness 门控
-- 任一行 `Check = FAIL` → 该候选 `aggregate score = 0`，直接拒绝
+**Step 2**: Extract each row's `primary_metric` (e.g., `Forward TFLOPS` or `Forward GB/s`, depending on operator type; if multiple metrics, extract each separately) and `Check` column
 
-**Step 4**: 计算 aggregate score
-- 若 `target_shapes` 只有 1 个配置：`aggregate score = 该配置的 primary_metric`
-- 若 `target_shapes` 为多个配置：`aggregate score = geometric_mean(所有配置的 primary_metric)`
+**Step 3**: Correctness gate
+- Any row with `Check = FAIL` → candidate `aggregate score = 0`, reject immediately
+
+**Step 4**: Compute aggregate score
+- If `target_shapes` has only 1 configuration: `aggregate score = that configuration's primary_metric`
+- If `target_shapes` has multiple configurations: `aggregate score = geometric_mean(all configurations' primary_metric)`
 
 ```
 geometric_mean = (x1 * x2 * ... * xn) ^ (1/n)
 ```
 
-**Step 5**: 保留 score vector（每个 shape 的原始值），避免总分掩盖局部退化
+**Step 5**: Retain the score vector (raw values per shape) to avoid the total score masking localized regressions
 
-**多指标处理**：当 `primary_metric` 包含多个指标（如 `Forward TFLOPS, Backward TFLOPS`）时，分别计算每个指标的 aggregate score。接受条件：所有指标的 aggregate score 均不退步，且至少一个指标有提升。
+**Multi-metric handling**: When `primary_metric` contains multiple metrics (e.g., `Forward TFLOPS, Backward TFLOPS`), compute the aggregate score for each metric separately. Acceptance condition: all metrics' aggregate scores must not regress, and at least one metric must show improvement.
 
-### 噪声判断
+### Noise Assessment
 
-- 提升幅度 < 2% 时，视为接近噪声区间
-- 此时必须复测至少 3 次，取均值和标准差
-- 若均值提升 > 1% 且标准差 < 提升幅度的一半，视为有效提升
-- 否则视为噪声，不接受
+- When improvement is < 2%, it is considered near the noise range
+- In this case, re-measure at least 3 times, compute mean and standard deviation
+- If mean improvement > 1% and standard deviation < half of the improvement magnitude, consider it a valid improvement
+- Otherwise, treat as noise and do not accept
 
-### 接受规则
+### Acceptance Rules
 
-- `aggregate score` 不得低于当前最佳
-- 若只是持平，则必须有明确附加价值（如更广适用范围、更稳定结果）
-- 若某个核心 shape 退步 > 3%，默认拒绝；除非本轮明确是定向 shape 优化
+- `aggregate score` must not be lower than the current best
+- If it only matches the current best, there must be a clear additional benefit (e.g., broader applicability, more stable results)
+- If any core shape regresses > 3%, default to rejection; unless this round is explicitly a targeted shape optimization
 
-### 计算示例
+### Computation Example
 
-Benchmark 结果（3 个 shape）:
+Benchmark results (3 shapes):
 
 | M | N | K | Forward TFLOPS | Check |
 |---|---|---|---------------|-------|
@@ -126,380 +168,443 @@ Benchmark 结果（3 个 shape）:
 aggregate score = (320 * 305 * 290) ^ (1/3) = 304.8
 ```
 
-Baseline aggregate score = 285.0 → 提升 = (304.8 - 285.0) / 285.0 = +6.9% → 接受。
+Baseline aggregate score = 285.0 → improvement = (304.8 - 285.0) / 285.0 = +6.9% → accept.
 
-## 阶段说明
+## Phase Descriptions
 
-### 1. ENVIRONMENT_BASELINE
+### 1. ENVIRONMENT_BASELINE (`round-1`)
 
-**目标**：冻结起点，建立统一比较标尺。
+**Goal**: Freeze the starting point and establish a unified comparison baseline.
 
-**"focused" 的含义**：
-- focused test = 限定 `target_op` + `target_backend` 的测试子集（如 `-k "blockwise and TRITON"`）
-- focused benchmark = 限定 `target_backend` 的 benchmark，覆盖所有 `target_shapes`
+**What "focused" means**:
+- Focused test = test subset limited to `target_op` + `target_backend` (e.g., `-k "blockwise and TRITON"`)
+- Focused benchmark = benchmark limited to `target_backend`, covering all `target_shapes`
 
-**操作步骤**：
-1. 确认当前环境可正常构建和运行（具体检查项由项目 skill 定义）
-2. 执行 **full** focused test，确认全部 PASS
-3. 执行 **full** focused benchmark，结果写入 `<campaign_dir>/results/baseline.md`
-4. 按评分规范计算 baseline `score vector` 和 `aggregate score`
-5. 从 full benchmark 结果中选取 3-5 个代表性 shape（**仅从 correctness PASS 的 shape 中选取**，选取原则见项目 skill），记入 `manifest.yaml` 的 `representative_shapes`
-6. 将代表性 shapes 填入 `quick_test_bench.py` 的 `SHAPES` 列表（脚本已在 PREPARE_ENVIRONMENT 阶段生成，此处只更新 shapes），并将 `quick_command` 记入 manifest
-7. 记录 backend 配置和关键环境状态
+**Steps**:
+1. Confirm the current environment can build and run correctly
+2. Run **full** focused test, confirm all PASS
+3. Run **full** focused benchmark, write the canonical baseline summary to `<campaign_dir>/rounds/round-1/summary.md`, and store any raw command outputs / CSVs under `<campaign_dir>/rounds/round-1/artifacts/`
+4. Compute baseline `score vector` and `aggregate score` per scoring specification
+5. Select 3-5 `representative_shapes` from PASS-only benchmark rows, covering small / medium / large behavior
+6. Update `quick_test_bench.py` with those `representative_shapes` and record `quick_command` in the manifest
+7. Copy the current kernel into `<campaign_dir>/rounds/round-1/kernel_snapshot/` to establish the rollback root
+8. Record backend configuration and key environment state
 
-BASELINE 始终使用 full validation，确保起点数据完整可靠。
+BASELINE always uses full validation to ensure the starting data is complete and reliable.
 
-**baseline 记录模板**（写入 `<campaign_dir>/logs/optimize.md`）：
+**Baseline record template** (write to `<campaign_dir>/logs/optimize.md`):
 
 ```markdown
 ## Baseline
-- 时间: <YYYY-MM-DD HH:MM>
+- Time: <YYYY-MM-DD HH:MM>
 - Backend: <target_backend>
 - GPU: <target_gpu>
 - Commit: <git_hash>
-- 验证级别: full
+- Validation level: full
 
 - Aggregate score (geomean): 278.0
-- 所有 Check: PASS
-- 详细数据: results/baseline.md
+- All Check: PASS
+- Detailed data: rounds/round-1/summary.md
 ```
 
-**输出物**：
-- `results/baseline.md`（详细数据） + baseline aggregate score
-- 当前 best = baseline
+**Output**:
+- `<campaign_dir>/rounds/round-1/summary.md` + baseline aggregate score
+- `<campaign_dir>/rounds/round-1/kernel_snapshot/` as the baseline rollback root
+- Current best = baseline (`round-1`)
+- The first optimization attempt starts at `round-2`
+
+The baseline round uses the same `summary.md` structure as later rounds. Its "Single change" section must explicitly say that no code change was made, and its "Decision" section must be `BASELINE`.
 
 ### 2. ANALYZE
 
-**目标**：找到下一轮最值得尝试的方向，而不是盲目调参。
+**Goal**: Find the most worthwhile direction for the next round, rather than tuning blindly.
 
-**必做项**：
-- 阅读当前 best 版本的核心实现
-- 回看最近几轮 accepted version 与失败尝试（从 campaign 日志获取）
-- 按需做 profiling 或分析 benchmark 指标，定位当前主要瓶颈
-- 按需读取语言/硬件/profiling skill
+**Required actions**:
+- Read `<campaign_dir>/related_work.md` before proposing new directions
+- Read the core implementation of the current best version
+- Review recent accepted versions and failed attempts (from campaign log)
+- Profile or analyze benchmark metrics as needed to identify the current main bottleneck
+- Read language/hardware/profiling skills as needed
 
-**瓶颈分类与优化方向映射**：
+**Bottleneck Classification and Optimization Direction Mapping**:
 
-当有 profiler 数据时，按以下框架判断瓶颈类型：
+When profiler data is available, use the following framework to classify bottlenecks:
 
-| 瓶颈信号 | 分类 | 优化方向 |
-|---------|------|---------|
-| ALU utilization 低、MFMA 指令占比低 | Compute bound | tile size 调整、指令选择（如 MFMA vs WMMA）、算法简化、减少冗余计算 |
-| Memory throughput 接近硬件峰值、大量 global load/store stall | Memory bound | 数据布局优化、prefetch / software pipelining、减少冗余访存、LDS 利用 |
-| Occupancy 低、register 或 LDS 用量过高 | Resource bound | 减少 register 压力、调整 LDS 分配、降低 tile size 换取更多 wave |
-| Kernel launch 开销占比高、总计算量小 | Launch/overhead bound | Persistent kernel、batch 多个小 kernel、减少 dispatch 次数 |
+| Bottleneck signal | Classification | Optimization direction |
+|-------------------|---------------|----------------------|
+| Low ALU utilization, low MFMA instruction ratio | Compute bound | Tile size adjustment, instruction selection (e.g., MFMA vs WMMA), algorithm simplification, reduce redundant computation |
+| Memory throughput near hardware peak, many global load/store stalls | Memory bound | Data layout optimization, prefetch / software pipelining, reduce redundant memory access, LDS utilization |
+| Low occupancy, excessive register or LDS usage | Resource bound | Reduce register pressure, adjust LDS allocation, lower tile size to trade for more waves |
+| High kernel launch overhead ratio, small total compute | Launch/overhead bound | Persistent kernel, batch multiple small kernels, reduce dispatch count |
 
-当没有 profiler 时，可从 benchmark 结果间接推断：
-- 如果 TFLOPS 远低于理论峰值且增大 shape 后效率显著提升 → 可能是 launch overhead 或 occupancy 问题
-- 如果 TFLOPS 随 K 增大而显著提升 → 可能是 memory bound（更高的计算访存比改善效率）
-- 如果不同 shape 之间效率差异小且整体偏低 → 可能是 compute bound
+When profiler data is unavailable, infer indirectly from benchmark results:
+- If TFLOPS is far below theoretical peak and efficiency improves significantly with larger shapes → likely launch overhead or occupancy issue
+- If TFLOPS improves significantly as K increases → likely memory bound (higher compute-to-memory ratio improves efficiency)
+- If efficiency difference across shapes is small and overall low → likely compute bound
 
-**每个候选方向至少要回答**：
-- 当前瓶颈是什么
-- 这轮准备改什么
-- 预计收益是什么
-- 风险是什么
-- 用什么信号来验证成败
+**Each candidate direction must answer at minimum**:
+- What is the current bottleneck
+- What will be changed this round
+- What is the expected benefit
+- What are the risks
+- What signal will verify success or failure
 
-**输出物**：
-- 有优先级的假设列表
-- 本轮首选假设
+**Output**:
+- Prioritized hypothesis list
+- Primary hypothesis for this round
 
 ### 3. OPTIMIZE
 
-**目标**：实施一次可归因、可回滚的小步改动。
+**Goal**: Implement a single attributable, rollback-able small-step change.
 
-**必做项**：
-- 每轮只推进一个主假设
-- 修改后能够明确回答"这轮到底改了什么"
-- 若涉及编译产物，按项目 skill 说明 rebuild
-- 记录本轮修改文件、关键参数、预期影响
+**Required actions**:
+- Advance only one primary hypothesis per round
+- After modification, be able to clearly answer "what exactly was changed this round"
+- If compiled artifacts are involved, rebuild per project skill instructions
+- Record modified files, key parameters, and expected impact for this round
 
-**约束**：
-- 不要把无关清理混入优化尝试
-- 不要同时引入多个正交的大改动
-- 不要破坏与上游项目约定的关键接口语义
+**Constraints**:
+- Do not mix unrelated cleanup into optimization attempts
+- Do not introduce multiple orthogonal major changes simultaneously
+- Do not break key interface semantics agreed upon with the upstream project
 
-**输出物**：
-- candidate diff
-- build 状态
+**Output**:
+- Candidate diff
+- Build status
 
 ### 4. VALIDATE
 
-**目标**：决定候选是否通过验证。
+**Goal**: Decide whether the candidate passes validation.
 
-**`repo-mode` 下**（常用路径，无 SYNC_BACK）：
+**Under `repo-mode`** (common path, no SYNC_BACK):
 
-1. 如有需要，确保 backend 设置正确（env var 或 reset）
-2. 执行 `quick_command`（一次完成 correctness + benchmark，仅代表性 shapes）
-3. 按评分规范计算 `score vector` 和 `aggregate score`
-4. 与当前 best 对比
-5. 以下情况升级到 **full** validation：
-   - **一个优化方向完成时**：该方向可能经历多个小步迭代，小步用 quick，方向结束时做 full 确认全量 shapes 无退步
-   - 结果接近临界（提升 < 5%）或涉及高风险改动（控制流、数据布局等）
+1. Ensure backend settings are correct if needed (env var or reset)
+2. Run `quick_command` (combined representative-shape correctness + benchmark)
+3. Compute `score vector` and `aggregate score` per scoring specification
+4. Compare against current best
+5. Upgrade to **full** validation when the direction completes, when results are borderline (improvement < 5%), or when changes are high-risk
 
-结果写入 `<campaign_dir>/results/v<N>.md`（标注验证级别）。
+Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (for `N >= 2`) and place any raw benchmark/test outputs under `<campaign_dir>/rounds/round-N/artifacts/`.
 
-**硬门控**：
-- build 失败 → 直接拒绝
-- correctness 失败 → 直接拒绝
-- benchmark 中 `Check = FAIL` → 直接拒绝
-- aggregate score 退步 → 默认拒绝
-- 核心 shape 退步 > 3% → 默认拒绝
+**Hard gates**:
+- Build failure → reject immediately
+- Correctness failure → reject immediately
+- `Check = FAIL` in benchmark → reject immediately
+- Aggregate score regression → default reject
+- Core shape regression > 3% → default reject
 
-**通过后（按顺序执行，不可跳过）**：
-1. 将本轮详细结果写入 `results/v<N>.md`
-2. **立即更新 `logs/optimize.md`**：在「优化历史」节追加本轮记录（按日志模板格式），同时更新「当前最佳」和「待尝试方向」节
-3. 更新当前 best
-4. 若 `git_commit=true`：git commit（见下方 git 集成规范）
+**After passing**:
+1. Write this round's detailed results to `rounds/round-N/summary.md`
+2. Immediately update `logs/optimize.md` (optimization history, current best, directions to try)
+3. Update current best
+4. If `git_commit=true`: git commit (see git integration specification below)
+5. If the round produced a reusable technical lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
-> **硬规则**：`results/v<N>.md` 和 `logs/optimize.md` 必须在同一轮 VALIDATE 结束时一起更新。禁止只写 results 不更新 log，禁止留 placeholder（如 "to be filled"）。
+`rounds/round-N/summary.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
 
-**`workspace-mode` 下**：
-验证分 local gate（最小环境内）和 integration gate（回灌主仓后）。
-只有通过 integration gate 才算真正的 accepted version。
-SYNC_BACK 步骤：只同步被接受的核心改动，不搬脚手架和临时代码。
+**Under `workspace-mode`**:
+Validation is split into a local gate (within minimal environment) and an integration gate (after syncing back to main repo).
+Only passing the integration gate counts as a truly accepted version.
+SYNC_BACK step: only sync accepted core changes — do not carry over scaffolding or temporary code.
 
 ### 5. ACCEPT / REPORT
 
-**目标**：更新 lineage，并为下一轮留下可复用上下文。
+**Goal**: Update lineage and leave reusable context for the next round.
 
-**ACCEPT 必做项**（VALIDATE 通过后已完成 log 更新，此处做增量维护）：
-- 确认 `logs/optimize.md` 的「优化历史」「当前最佳」「待尝试方向」均已更新到最新状态
-- 记录相对 baseline 的累计提升
-- 标记哪些方向有效、无效、待复查
-- 产出下一轮候选方向
+**ACCEPT required actions**:
+- Confirm `logs/optimize.md` already reflects the latest accepted round
+- Record cumulative improvement relative to baseline
+- Mark which directions were effective, ineffective, or need revisiting
+- Produce candidate directions for the next round
 
-**REPORT**（campaign 终止时输出，写入 `logs/optimize.md` 末尾的 `## Final Report` section）：
-- baseline 与最终 best 对比（含 full validation 数据）
-- 总累计提升
-- 关键有效优化列表
-- 已验证无效方向列表
-- 若继续优化，优先建议的下三步
-- 详细数据指向 `results/` 下的对应 `.md` 文件
+**REPORT** (output when campaign terminates, written to the `## Final Report` section at the end of `logs/optimize.md`):
+- Baseline vs final best comparison (with full validation data)
+- Total cumulative improvement
+- List of key effective optimizations
+- List of verified ineffective directions
+- If continuing optimization, top three recommended next steps
+- Detailed data references to the corresponding `rounds/round-N/summary.md` files
 
-## 回滚规则
+## Rollback Rules
 
-以下情况必须回滚本轮 candidate：
-- build 失败
-- correctness 失败
-- benchmark 中 `Check` 失败
-- 相比当前 best 明显退步
-- 结果波动过大，暂时无法确认提升是否真实
+The following situations require rollback of the current round's candidate:
+- Build failure
+- Correctness failure
+- `Check` failure in benchmark
+- Clear regression compared to current best
+- Results are too volatile to confirm whether improvement is real
 
-回滚操作（按顺序执行）：
-1. `repo-mode`: `git checkout -- <modified_files>` 或 `git revert <commit>`；`workspace-mode`: 回滚本轮 local 改动
-2. 将本轮结果写入 `results/v<N>.md`（标记为 rollback，含失败原因）
-3. **立即更新 `logs/optimize.md`**：在「优化历史」节追加本轮记录（标记 ❌ rollback），更新「已验证无效方向」节
-4. **回到 ANALYZE 开始下一轮**——rollback 不是终止信号，而是换方向的信号
+Rollback operations:
+1. Revert the candidate change (`repo-mode`: `git checkout -- <modified_files>` or `git revert <commit>`; `workspace-mode`: roll back the local candidate without affecting the main repo)
+2. Write `rounds/round-N/summary.md` and mark the round as rollback with the failure reason
+3. Immediately update `logs/optimize.md`, including the optimization history and verified ineffective directions
+4. Return to ANALYZE with a new direction; rollback is not, by itself, a campaign termination signal
+5. If the failed round exposed a reusable pitfall or signal, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
-## Git 集成规范
+## Historical Experience Capture
 
-当 `git_commit=true` 时，每个 accepted version 对应一个 git commit，构成 lineage（参考 AVO 的设计）。当 `git_commit=false` 时，跳过 commit，但仍在日志中记录 accepted version。
+After every completed round, whether accepted or rolled back, evaluate whether the round is worth recording in the long-lived tips store:
 
-**commit 时机**：VALIDATE 通过后，检查 `git_commit` 开关，若为 `true` 则立即 commit。
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
-**commit message 格式**：
+If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
 
-```
-[optimize] <target_op> <target_backend> v<N>: <一句话摘要>
+Append only when the round yielded reusable knowledge beyond the local campaign, such as:
 
-假设: <本轮优化假设>
-结果: <aggregate score 变化>
-详见: <campaign_dir>/logs/optimize.md
-```
+- a hardware-specific constraint or backend/compiler quirk
+- a config or parameter pattern that consistently helps or hurts
+- a failure signature with a clear root cause
+- a profiler signal that maps cleanly to an actionable next step
+- a validation / measurement trick that avoids wasted rounds
 
-示例：
+Do not copy the whole round summary into `tips.md`. Append only the reusable takeaway.
 
-```
-[optimize] gemm_fp8_blockwise TRITON v3: increase num_stages from 2 to 3
-
-假设: 增加 software pipelining 深度，隐藏访存延迟
-结果: geomean 301 -> 319 TFLOPS (+6.0%)
-详见: agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/logs/optimize.md
-```
-
-**回滚**：`git revert <commit>` 回滚单个版本。
-
-**注意**：campaign 目录（`agent/workspace/`）默认不纳入 git，只有 kernel 代码的改动进入 git lineage。results/ 下的 `.md` 文件仅沉淀在 campaign 目录中。
-
-## 优化日志模板
-
-每个 campaign 维护一个 `logs/optimize.md`，实时更新，人随时可查看进展。
+Recommended append format:
 
 ```markdown
-# <target_op> <target_backend> 优化日志
+### <YYYY-MM-DD HH:MM> round-N — ACCEPTED / ROLLED BACK
+- Context: <shape family / kernel path / hardware scope>
+- Signal: <what was observed>
+- Takeaway: <reusable lesson>
+- Applicability: <when this tip should be reused, and when it should not>
+```
 
-## 基本信息
-- 目标算子: <target_op>
-- 实现语言: <target_lang>
+## Git Integration Specification
+
+When `git_commit=true`, each accepted version corresponds to a git commit, forming a lineage (referencing AVO's design). When `git_commit=false`, skip the commit but still record the accepted version in the log.
+
+**Commit timing**: After VALIDATE passes, check the `git_commit` flag; if `true`, commit immediately.
+
+**Commit message format**:
+
+```
+[optimize] <target_op> <target_backend> round-<N>: <one-line summary>
+
+Hypothesis: <optimization hypothesis for this round>
+Result: <aggregate score change>
+Details: <campaign_dir>/logs/optimize.md
+```
+
+Example:
+
+```
+[optimize] gemm_fp8_blockwise TRITON round-3: increase num_stages from 2 to 3
+
+Hypothesis: Increase software pipelining depth to hide memory access latency
+Result: geomean 301 -> 319 TFLOPS (+6.0%)
+Details: agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/logs/optimize.md
+```
+
+**Rollback**: `git revert <commit>` to roll back a single version.
+
+**Note**: The campaign directory (`agent/workspace/`) is not tracked by git by default. Only kernel code changes enter the git lineage. The `rounds/` summaries and raw artifacts are stored only in the campaign directory.
+
+## Optimization Log Template
+
+Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can check progress at any time.
+
+`logs/optimize.md` and `logs/performance_trend.md` are append-only history files:
+
+- Never delete, truncate, or rewrite existing content
+- Only append new sections, rows, or correction notes
+- If a prior entry is inaccurate, append a correction instead of erasing the original record
+
+```markdown
+# <target_op> <target_backend> Optimization Log
+
+## Basic Information
+- Target operator: <target_op>
+- Implementation language: <target_lang>
 - Backend: <target_backend>
-- 目标 GPU: <target_gpu>
+- Target GPU: <target_gpu>
 - Campaign: <campaign_dir>
-- 开始时间: <YYYY-MM-DD HH:MM>
-- 当前状态: 优化中 (v<N>)
+- Start time: <YYYY-MM-DD HH:MM>
+- Current status: Optimizing (round-N)
 
 ## Baseline
 | Shape (MxNxK) | Forward TFLOPS | Check |
 |---------------|---------------|-------|
 | ... | ... | ... |
 - Aggregate score: <baseline_score>
+- Detailed data: rounds/round-1/summary.md
 
-## 优化历史
+## Optimization History
 
-### v1 — <一句话描述改动>
-- 时间: <YYYY-MM-DD HH:MM>
-- 验证级别: quick / full
-- 假设: <为什么做这个改动>
-- 改动: <改了哪些文件、哪些参数>
-- 结果: <aggregate score 变化> ✅/❌
-- 单测: PASS/FAIL
-- 决策: accept / rollback
-- 详细数据: results/v1.md
-- 备注: <失败原因或关键观察>
+### round-2 — <one-line description of changes>
+- Time: <YYYY-MM-DD HH:MM>
+- Validation level: quick / full
+- Hypothesis: <why this change was made>
+- Changes: <which files and parameters were modified>
+- Result: <aggregate score change> ✅/❌
+- Test: PASS/FAIL
+- Decision: accept / rollback
+- Detailed data: rounds/round-2/summary.md
+- Notes: <failure reason or key observations>
 
-### v2 — ...
+### round-3 — ...
 
-## 当前最佳
-| Shape (MxNxK) | Baseline | 当前最佳 | 提升 |
-|---------------|----------|---------|------|
+## Current Best
+| Shape (MxNxK) | Baseline | Current Best | Improvement |
+|---------------|----------|-------------|-------------|
 | ... | ... | ... | ... |
-- Aggregate score: baseline <X> → 当前 <Y> (+Z%)
+- Aggregate score: baseline <X> → current <Y> (+Z%)
 
-## 待尝试方向
-- [ ] <方向 1>
-- [ ] <方向 2>
-- [x] ~~<已验证无效的方向>~~ (vN 已验证)
+## Directions to Try
+- [ ] <Direction 1>
+- [ ] <Direction 2>
+- [x] ~~<Verified ineffective direction>~~ (verified in round-N)
 
-## 已验证无效方向
-| 方向 | 版本 | 失败原因 |
-|------|------|---------|
-| ... | v<N> | ... |
+## Verified Ineffective Directions
+| Direction | Version | Failure Reason |
+|-----------|---------|---------------|
+| ... | round-N | ... |
 
 ## Final Report
-（campaign 终止时填写）
+(Filled in when campaign terminates)
 - Baseline aggregate score: <X>
 - Final best aggregate score: <Y> (+Z%)
-- 总迭代轮数: <N>（accepted: <A>, rollback: <B>）
-- 关键有效优化: ...
-- 已验证无效方向: ...
-- 若继续优化，建议下三步: ...
+- Total iterations: <N> (accepted: <A>, rollback: <B>)
+- Key effective optimizations: ...
+- Verified ineffective directions: ...
+- If continuing optimization, recommended next three steps: ...
 ```
 
-## 结果文件模板
+## Round Summary Template
 
-每轮 VALIDATE 的详细数据写入 `results/v<N>.md`（BASELINE 写入 `results/baseline.md`）。
+The canonical detailed artifact for each round is `<campaign_dir>/rounds/round-N/summary.md`.
+
+- `round-1` is the baseline round
+- `round-2+` are optimization attempts
+- If a round emits raw benchmark CSVs, command captures, or other detailed outputs, store them under `<campaign_dir>/rounds/round-N/artifacts/`
+
+The summary must follow the same round-oriented structure used by the iteration rules:
 
 ```markdown
-# v<N> — <一句话描述改动>
+## Hypothesis
 
-- 时间: <YYYY-MM-DD HH:MM>
-- 验证级别: quick / full
-- 假设: <本轮优化假设>
+<For round-1: "Baseline round. No optimization change yet; record the starting correctness/performance and choose representative shapes.">
+<For round-N >= 2: optimization hypothesis for this round>
 
-## Correctness
-- 命令: <test 命令>
-- 结果: <X passed, Y failed>
+## Single change
 
-## Benchmark
-- 命令: <benchmark 命令>
+<For round-1: "No code change. Freeze the starting kernel and environment state.">
+<For round-N >= 2: exact code/config change>
 
-| M | N | K | Forward TFLOPS | Backward TFLOPS | Check |
-|---|---|---|---------------|----------------|-------|
-| ... | ... | ... | ... | ... | ... |
+## Results
 
-## Score
+### Validation
+- Time: <YYYY-MM-DD HH:MM>
+- Validation level: quick / full
+- Test command: <test command>
+- Benchmark command: <benchmark command>
+- Raw artifacts: `artifacts/<file>` (if any)
+
+| Shape / label | M | N | K | Result | Forward TFLOPS | Backward TFLOPS | Delta vs current best |
+|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | ... |
+
+### Aggregate
 - Forward aggregate (geomean): <score>
-- Backward aggregate (geomean): <score>（若适用）
+- Backward aggregate (geomean): <score> (if applicable)
 - vs baseline: +X%
 - vs current best: +Y%
+
+## Decision
+
+`BASELINE` / `ACCEPTED` / `ROLLED BACK`
+
+<Why this round was accepted, rolled back, or recorded as the baseline>
+
+## Attribution
+
+<Why this specific round behaved this way>
+
+## Next direction
+
+<What to try next>
+
+## Rollback Analysis
+
+<Only for rolled-back rounds>
 ```
 
-## 停滞检测与条件性干预
+## Stagnation Detection and Conditional Intervention
 
-借鉴 AVO 的 continuous evolution 思路，停滞不是停止信号，而是触发干预的信号。
+Drawing from AVO's continuous evolution approach, stagnation is not a stop signal but a trigger for intervention.
 
-满足任一条件即可触发：
-- **连续 2 次候选未被接受**（rollback）——这是最常见的触发场景，不要等到 5 次
-- 连续多轮都在同一类方向微调，但没有可测得的提升
-- profiler 指向的瓶颈长期未变化
-- 最近几轮只有参数抖动，没有结构性新假设
+Any of the following conditions can trigger intervention:
+- Two consecutive candidates were rolled back
+- Multiple consecutive rounds made only minor adjustments in the same direction with no measurable improvement
+- The profiler-identified bottleneck has remained unchanged for an extended period
+- Recent rounds only show parameter jitter with no structurally new hypotheses
 
-> **关键心态**：连续 rollback 说明当前方向走不通，不是说"优化做完了"。正确反应是换方向，不是写报告。
+Once triggered, a `stagnation review` must be performed:
 
-一旦触发，必须执行一次 `stagnation review`：
+1. Review the benefit curve of recent accepted versions
+2. Review failed attempts to identify proven ineffective directions
+3. Re-examine profiler results, reference implementations, and hardware documentation; if profiling has not been done yet, do it now
+4. Generate at least 3 fundamentally different new directions
+5. Prioritize directions that have not been explored recently
 
-1. 回顾最近若干 accepted version 的收益曲线
-2. 回顾失败尝试，找出已证明无效的方向
-3. 重新查看 profiler、参考实现和硬件文档——**如果之前没做过 profiling，此时必须做**
-4. 对照「待尝试方向」清单，检查哪些方向还没试过
-5. 生成至少 3 个**本质不同**的新方向（不是参数微调）
-6. 优先尝试近期没有覆盖过的方向
+Recommended direction-switching categories:
+- Tile / launch parameters
+- Memory layout / data movement
+- Software pipelining / overlap
+- Occupancy / register / LDS resource allocation
+- Backend switching or reference implementation comparison
+- Algorithm-level reordering, branch elimination, kernel fusion
 
-推荐换向类别：
-- tile / launch 参数
-- memory layout / 数据搬运
-- software pipelining / overlap
-- occupancy / register / LDS 资源分配
-- backend 切换或参考实现对比
-- 算法级重排、分支消除、kernel fusion
+## Termination Conditions
 
-## 终止条件
+The campaign may terminate only when at least one of the following conditions is satisfied:
 
-满足任一条件即可终止本次优化 campaign：
+| ID | Condition | Notes |
+|----|-----------|-------|
+| `T1` | `performance_target` has been reached | Only applies when `performance_target` is not `null` |
+| `T2` | An acceptable hardware-efficiency range has been reached | For example, a clearly acceptable fraction of peak efficiency |
+| `T3` | `max_iterations` limit has been reached | Only if configured; if set, it must be `< 120` |
+| `T4` | `max_duration` limit has been reached | Only if configured |
+| `T5` | The user explicitly requests stop | Always valid |
 
-| # | 条件 | 说明 |
-|---|------|------|
-| T1 | 达到 `performance_target` | 目标性能已满足 |
-| T2 | 达到可接受的硬件效率区间 | 如 >80% 峰值效率 |
-| T3 | 最近若干 accepted version 的增益已低于噪声水平 | 连续 3+ 个 accepted version 提升 < 2% |
-| T4 | 假设池已基本穷尽 | 「待尝试方向」清单为空或仅剩明确标注为"极低收益"的方向 |
-| T5 | 达到 `max_iterations` 上限 | 若已设置 |
-| T6 | 达到 `max_duration` 时长上限 | 若已设置；每轮 VALIDATE 结束后检查已用时间 |
-| T7 | 用户要求停止 | — |
-
-### 终止门控（写 REPORT 前强制执行）
-
-> **硬规则：禁止"感觉差不多了"就终止。** 写 Final Report 之前，必须在日志中逐项列出上述终止条件的检查结果，明确标注哪一条被满足。如果没有任何一条被满足，**禁止终止，必须回到 ANALYZE 继续**。
-
-检查模板（写入 `logs/optimize.md` 的 Final Report 开头）：
+Before writing REPORT, add a termination-check block to `logs/optimize.md` and state which condition passed:
 
 ```markdown
-### 终止条件检查
-- T1 performance_target: ❌ 未达到 / ✅ 已达到
-- T2 硬件效率区间: ❌ / ✅
-- T3 增益低于噪声: ❌ 最近 accepted 仍有 X% 提升 / ✅ 连续 N 个 < 2%
-- T4 假设池穷尽: ❌ 待尝试方向还剩 N 个 / ✅ 已无可行方向
-- T5 max_iterations: ❌ 当前 M/N 轮 / ✅ 已达上限
-- T6 max_duration: ❌ 已用 Xh / Yh / ✅ 已超时
-- T7 用户要求停止: ❌ / ✅
-→ 满足条件: T<N>，可以终止
+### Termination Check
+- T1 performance_target: ❌ / ✅
+- T2 hardware efficiency: ❌ / ✅
+- T3 max_iterations reached: ❌ / ✅
+- T4 max_duration reached: ❌ / ✅
+- T5 user requested stop: ❌ / ✅
+-> Satisfied condition(s): T<N>
 ```
 
-**特别注意**：
-- 连续 rollback 不是终止条件，而是触发 stagnation review 的信号（见「停滞检测」）
-- 「待尝试方向」里还有未试的方向 → T4 不满足 → 不得终止
-- `max_duration` 未到 → T6 不满足 → 不得因为"收益递减"提前终止
+If none of the conditions are satisfied, the campaign must return to ANALYZE instead of terminating.
 
-终止时必须输出 REPORT（见 ACCEPT / REPORT 阶段）。
+A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 
-## 跨 skill 查阅路径
+## Cross-Skill Reference Paths
 
-| 阶段 | 需要什么 | 去哪里读 |
-|------|----------|----------|
-| 全流程起点 | 项目信息收集 → DEFINE_TARGET → PREPARE_ENVIRONMENT | 项目 skill → [`../SKILL.md`](../SKILL.md) |
-| ENVIRONMENT_BASELINE / VALIDATE | 项目测试命令、benchmark 命令 | 对应项目 skill |
-| ANALYZE | profiling 方法 | [`../../tool-rocprof/SKILL.md`](../../tool-rocprof/SKILL.md) |
-| ANALYZE | 架构约束 | `../../hardware/<arch>/SKILL.md` + `optimization-guide.md` |
-| ANALYZE / OPTIMIZE | 语言级优化技巧 | [`../triton/SKILL.md`](../triton/SKILL.md) 或 [`../hip/SKILL.md`](../hip/SKILL.md) |
-| ANALYZE / OPTIMIZE | 算子专项策略 | `../triton/ops/*.md` 或 `../hip/ops/*.md` |
-| ANALYZE | 参考实现与论文 | `../references/*.md` |
+| Phase | What you need | Where to read |
+|-------|---------------|---------------|
+| Full workflow entry point | Project information collection → DEFINE_TARGET → PREPARE_ENVIRONMENT | Project skill → [`../SKILL.md`](../SKILL.md) |
+| ENVIRONMENT_BASELINE / VALIDATE | Project test commands, benchmark commands | Corresponding project skill |
+| ANALYZE | Profiling methods | [`../../tool-rocprof/SKILL.md`](../../tool-rocprof/SKILL.md) |
+| ANALYZE | Architecture constraints | `../../hardware/<arch>/SKILL.md` + `optimization-guide.md` |
+| ANALYZE / OPTIMIZE | Language-level optimization techniques | [`../triton/SKILL.md`](../triton/SKILL.md) or [`../hip/SKILL.md`](../hip/SKILL.md) |
+| ANALYZE / OPTIMIZE | CK template and pipeline tuning | [`../hip/ck.md`](../hip/ck.md) |
+| ANALYZE | Historical examples and cross-generation comparison | [`../examples.md`](../examples.md) and [`../../hardware/hardware-comparison.md`](../../hardware/hardware-comparison.md) |
+| Before round-1 / after each round | Historical reusable tips | `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` (if present) |
 
-## 执行提醒
+## Execution Reminders
 
-- 先过 correctness，再谈性能。
-- 每轮只推进一个主假设。
-- 当 `git_commit=true` 时，accepted version 必须 git commit，构成可追溯的 lineage。
-- 停滞时必须换向，不能无限做同方向微调。
-- **日志实时更新**：每轮 VALIDATE 结束后（无论 accept 还是 rollback），必须立即更新 `logs/optimize.md` 和 `results/v<N>.md`。禁止"先跑完再补日志"或留 placeholder。
-- **所有时间戳必须精确到分钟**（格式 `YYYY-MM-DD HH:MM`，如 `2026-04-13 14:35`）。这包括 manifest 的 `created`、日志的"开始时间"/"时间"、结果文件的"时间"等所有位置。禁止只写日期。
+- Read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc) before the first round and keep it active for the whole campaign.
+- Correctness first, then performance.
+- Advance only one primary hypothesis per round.
+- When `git_commit=true`, accepted versions must be git committed, forming a traceable lineage.
+- When stagnated, switch directions — do not endlessly fine-tune in the same direction.
+- Keep logs updated in real-time so humans can check current progress and historical decisions at any time.
+- `logs/optimize.md` and `logs/performance_trend.md` are append-only; never delete old content, only append new entries or correction notes.
+- Every round, including the baseline, must keep `rounds/round-N/summary.md` up to date; every VALIDATE round must update that summary and `logs/optimize.md` together.
+- After `related_work.md` is done and before the first round starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists.
+- After every accepted or rolled-back round, append a reusable lesson to that tips file when the round is worth preserving.
+- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.

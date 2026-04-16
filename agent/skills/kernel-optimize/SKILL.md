@@ -1,155 +1,177 @@
 ---
 name: kernel-optimize
-description: AI 驱动的算子性能优化框架。定义优化闭环、执行环境选择、知识路由与日志约定，驱动 agent 自主迭代逼近硬件极限。
+description: AI-driven operator performance optimization framework. Defines the optimization loop, execution environment selection, knowledge routing, and logging conventions to drive agent-autonomous iteration toward hardware limits.
 ---
 
-# 算子性能优化框架
+# Operator Performance Optimization Framework
 
-本 skill 定义**通用的算子优化闭环**，驱动 agent 自主迭代逼近硬件极限。
+This skill defines the **general-purpose operator optimization loop**, driving the agent to autonomously iterate toward hardware limits.
 
-本 skill 负责定义：
-- 优化所需的前置信息（接口契约）
-- 优化 campaign 的参数确认和目录结构
-- 高层优化闭环（参考 AVO: Agentic Variation Operators）
-- 知识路由方式
-- 日志、lineage、停滞处理的总原则
+This skill is responsible for defining:
+- Prerequisites needed for optimization (interface contract)
+- Parameter confirmation and directory structure for optimization campaigns
+- High-level optimization loop (reference: AVO — Agentic Variation Operators)
+- Knowledge routing approach
+- General principles for logging, lineage, and stagnation handling
 
-本 skill **不负责**：
-- 硬编码某个项目的源码路径、测试命令、benchmark 命令（由项目 skill 提供）
-- 替代语言专项、硬件专项、profiling 专项文档
+This skill is **not responsible for**:
+- Hardcoding source paths, test commands, or benchmark commands for any specific project (provided by the project skill)
+- Replacing language-specific, hardware-specific, or profiling-specific documentation
 
-## 前置信息需求
+## Prerequisite Information
 
-**本节是 kernel-optimize 对项目 skill 的接口契约。** 在启动优化前，agent 必须从对应项目 skill 收集以下信息：
+**This section is the interface contract between kernel-optimize and the project skill.** Before starting optimization, the agent must collect the following information from the corresponding project skill:
 
-| 需求项 | 说明 | 到项目 skill 哪里找 |
-|--------|------|---------------------|
-| **kernel 源文件路径** | 要优化的 kernel 代码位置 | 代码结构 / 文件映射表 |
-| **focused test 命令** | 限定目标算子 + backend 的正确性测试（全量） | Testing 节 |
-| **focused benchmark 命令** | 限定目标 backend 的性能测试（全量） | Benchmark 节 |
-| **quick 验证脚本模板** | 直接调用算子 API 对代表性 shape 做 correctness + benchmark 的自包含脚本模板；PREPARE_ENVIRONMENT 阶段生成到 campaign 目录（shapes 暂留空），BASELINE 后填入代表性 shapes | 项目 skill 的 Quick 验证节 |
-| **benchmark 输出格式** | CSV 列名，哪些列是可用性能指标（`Forward TFLOPS`、`Backward TFLOPS` 等），哪一列是正确性门控（`Check`） | Benchmark 输出说明 |
-| **评分规则** | 如何从 benchmark 输出计算 `aggregate score`（如几何平均） | 项目 skill 的算子优化评分节 |
-| **execution_mode 建议** | `repo-mode` 还是 `workspace-mode`，以及对应的构建/rebuild 方式 | 项目 skill 的算子优化环境节 |
-| **rebuild 要求** | 改完代码后是否需要重新构建，构建命令是什么 | Build 节 |
+| Requirement | Description | Where to find in project skill |
+|-------------|-------------|-------------------------------|
+| **Kernel source file path** | Location of the kernel code to optimize | Code structure / file mapping table |
+| **Focused test command** | Correctness test limited to the target operator + backend (full) | Testing section |
+| **Focused benchmark command** | Performance test limited to the target backend (full) | Benchmark section |
+| **Quick validation script template** | Self-contained correctness + benchmark script template generated into the campaign directory during PREPARE_ENVIRONMENT; representative shapes are filled in after BASELINE | Quick validation section in project skill |
+| **Benchmark output format** | CSV column names, which columns are performance metrics (`Forward TFLOPS`, `Backward TFLOPS`, etc.), which column is the correctness gate (`Check`) | Benchmark output description |
+| **Scoring rules** | How to compute `aggregate score` from benchmark output (e.g., geometric mean) | Operator optimization scoring section in project skill |
+| **execution_mode recommendation** | `repo-mode` vs `workspace-mode`, and the corresponding build/rebuild approach | Operator optimization environment section in project skill |
+| **Rebuild requirements** | Whether rebuild is needed after code changes, and the build command | Build section |
 
-agent 收齐以上信息后，再回到本文件执行 DEFINE_TARGET。
+After the agent has collected all the above information, return to this file to execute DEFINE_TARGET.
 
-## 输入参数
+Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, and accept-or-rollback lineage.
 
-DEFINE_TARGET 阶段需要将用户指令 + 前置信息整理为以下结构化参数：
+For validation scope, interpret that contract as:
+- **full validation** → run all `target_shapes`
+- **quick validation** → run all `representative_shapes`
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `target_op` | 目标算子 | `gemm_fp8_blockwise` |
-| `target_backend` | 目标 backend | `TRITON` |
-| `target_lang` | 实现语言 | `TRITON` / `HIP` |
-| `target_gpu` | 目标 GPU 架构 | `gfx942` / `gfx950` |
-| `target_shapes` | 目标测试 / benchmark 配置 | 若干代表性 shape 或 `all`（使用 benchmark 默认 shape 集） |
-| `performance_target` | 性能目标 | `>500 TFLOPS` 或 `>60% 峰值效率`；未指定时默认"相对 baseline 有可测量提升" |
-| `primary_metric` | 主性能指标（可多个，取决于算子类型） | GEMM: `"Forward TFLOPS"` / `"Forward TFLOPS, Backward TFLOPS"`；elementwise: `"Forward GB/s"` |
-| `project_skill` | 对应项目 skill | `primus-turbo-develop` |
-| `execution_mode` | 执行环境，参考项目 skill 建议，由 agent 判断 | `repo` / `workspace` |
-| `git_commit` | 是否对 accepted version 做 git commit | `true`（默认）/ `false` |
-| `git_branch` | 优化分支策略 | `auto`（默认，自动创建 `optimize/<campaign>` 分支）/ `none` / `<自定义分支名>` |
-| `max_iterations` | 最大迭代轮数（可选） | `10`；未指定时由 agent 根据终止条件判断 |
-| `max_duration` | 最大运行时长（可选） | `"4h"`、`"1.5h"`；未指定时不限时 |
+Within a chosen validation level, the agent must not cherry-pick a smaller subset.
 
-## 总体闭环
+## Input Parameters
+
+During the DEFINE_TARGET phase, the user instruction + prerequisite information must be organized into the following structured parameters:
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `target_op` | Target operator | `gemm_fp8_blockwise` |
+| `target_backend` | Target backend | `TRITON` |
+| `target_lang` | Implementation language | `TRITON` / `HIP` |
+| `target_gpu` | Target GPU architecture | `gfx942` / `gfx950` |
+| `target_shapes` | Full shape set of interest for the campaign; quick validation uses a separate representative subset recorded in `representative_shapes` | A full shape list or `all` (use benchmark default shape set) |
+| `performance_target` | Performance target | `>500 TFLOPS`, `>60% peak efficiency`, or `null`; defaults to `null` if unspecified |
+| `primary_metric` | Primary performance metric(s), depending on operator type | GEMM: `"Forward TFLOPS"` / `"Forward TFLOPS, Backward TFLOPS"`; elementwise: `"Forward GB/s"` |
+| `project_skill` | Corresponding project skill | `primus-turbo-develop` |
+| `execution_mode` | Execution environment, referencing project skill recommendation, decided by agent | `repo` / `workspace` |
+| `git_commit` | Whether to git commit accepted versions | `true` (default) / `false` |
+| `git_branch` | Optimization branch strategy | `auto` (default, auto-creates `optimize/<campaign>` branch) / `none` / `<custom branch name>` |
+| `max_iterations` | Maximum iteration count (optional) | `10`; if unspecified, leave `null` and let termination conditions decide; if set, it must be `< 120` |
+| `max_duration` | Maximum campaign runtime (optional) | `"4h"` / `"90m"`; if unspecified, runtime is unbounded |
+
+## Overall Loop
 
 ```text
 DEFINE_TARGET
   -> PREPARE_ENVIRONMENT
+  -> SURVEY_RELATED_WORK
+  -> READ_HISTORICAL_TIPS
   -> BASELINE
-  -> [ANALYZE -> OPTIMIZE -> VALIDATE]  (迭代循环)
+  -> [ANALYZE -> OPTIMIZE -> VALIDATE]  (iteration loop)
   -> REPORT
 ```
 
-| 阶段 | 做什么 |
-|------|--------|
-| **DEFINE_TARGET** | 将用户指令 + 项目 skill 已收集的信息整理为结构化参数，确认齐全，**向用户确认目标后再开始** |
-| **PREPARE_ENVIRONMENT** | 建立 campaign 目录，记录元信息，生成 quick 验证脚本（shapes 暂留空） |
-| **BASELINE** | 记录起点 correctness 与 performance |
-| **ANALYZE** | 读代码、profile、查技能知识、生成优化假设 |
-| **OPTIMIZE** | 实施单个主假设，对实现做小步修改 |
-| **VALIDATE** | correctness 硬门控 + benchmark 比较，通过则 accept（+ git commit，若 `git_commit=true`），不通过则 rollback |
-| **REPORT** | 汇总最佳版本、有效方向、失败方向和下一步建议，交还项目 skill 做最终验收 |
+| Phase | What to do |
+|-------|-----------|
+| **DEFINE_TARGET** | Organize user instruction + project skill information into structured parameters, confirm completeness, **confirm target with user before starting** |
+| **PREPARE_ENVIRONMENT** | Set up campaign directory, record metadata, and generate the quick validation script scaffold |
+| **SURVEY_RELATED_WORK** | Survey current SOTA implementations, docs, and competitor baselines; write findings to `related_work.md` before the first baseline run |
+| **READ_HISTORICAL_TIPS** | If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, read it after related work and before the first round |
+| **BASELINE** | Record starting correctness and performance |
+| **ANALYZE** | Read code, profile, consult skill knowledge, generate optimization hypotheses |
+| **OPTIMIZE** | Implement a single primary hypothesis with small incremental changes |
+| **VALIDATE** | Correctness hard gate + benchmark comparison; pass → accept (+ git commit if `git_commit=true`), fail → rollback; keep `rounds/round-N/summary.md` and `logs/optimize.md` synchronized round by round |
+| **REPORT** | Summarize best version, effective directions, failed directions, and next-step recommendations; hand back to project skill for final acceptance |
 
-详细优化过程、门控规则、回滚、停滞检测、日志模板见 [`workflow/optimize-loop.md`](workflow/optimize-loop.md)。
+For detailed optimization process, gating rules, rollback, stagnation detection, and log templates, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md).
 
 ## DEFINE_TARGET
 
-agent 到达此处时，应已按「前置信息需求」从项目 skill 收齐了所需信息。本阶段将用户指令 + 前置信息整理为结构化参数。
+When the agent reaches this point, it should have already collected all required information from the project skill per the "Prerequisite Information" section. This phase organizes the user instruction + prerequisite information into structured parameters.
 
-**Step 1: 填充参数**
+**Step 1: Populate parameters**
 
-| 参数 | 提取方式 |
-|------|---------|
-| `target_op` | 从用户指令中识别算子名称和精度 |
-| `target_backend` | 从用户指令中识别；若未指定，从项目 skill 的 backend 表中选择 |
-| `target_lang` | 由 `target_backend` 决定：`TRITON` → Triton，`CK` / `HIPBLASLT` / `TURBO` → HIP |
-| `target_gpu` | 从用户指令中识别 GPU 型号，映射到架构代号（如 MI300X → `gfx942`，MI355X → `gfx950`） |
-| `target_shapes` | 若用户指定则使用；否则使用 benchmark 默认 shape 集 |
-| `performance_target` | 若用户指定则使用；否则默认"相对 baseline 有可测量提升" |
-| `primary_metric` | 从项目 skill 的评分节获取可用指标；若用户指定则使用 |
-| `execution_mode` | 参考项目 skill 的建议，由 agent 根据任务特点判断 |
-| `git_commit` | 默认 `true`；若用户指定不 commit 则设为 `false` |
-| `git_branch` | 默认 `auto`；若用户指定则使用 |
-| `max_iterations` | 若用户指定则使用；否则留空，由终止条件控制 |
-| `max_duration` | 若用户指定则使用；否则留空，不限时 |
+| Parameter | Extraction method |
+|-----------|-------------------|
+| `target_op` | Identify operator name and precision from user instruction |
+| `target_backend` | Identify from user instruction; if unspecified, select from the project skill's backend table |
+| `target_lang` | Determined by `target_backend`: `TRITON` → Triton, `CK` / `HIPBLASLT` / `TURBO` → HIP |
+| `target_gpu` | Identify GPU model from user instruction, map to architecture codename (e.g., MI300X → `gfx942`, MI355X → `gfx950`) |
+| `target_shapes` | Use if specified by user; otherwise use the benchmark default shape set |
+| `performance_target` | Use if specified by user; otherwise default to `null` |
+| `primary_metric` | Get available metrics from the project skill's scoring section; use if specified by user |
+| `execution_mode` | Reference the project skill's recommendation, decided by agent based on task characteristics |
+| `git_commit` | Default `true`; set to `false` if user specifies no commit |
+| `git_branch` | Default `auto`; use if specified by user |
+| `max_iterations` | Use if specified by user and validate that it is `< 120`; otherwise leave empty, controlled by termination conditions |
+| `max_duration` | Use if specified by user; otherwise leave empty, controlled by termination conditions |
 
-**Step 2: 确认前置信息齐全**
+**Step 2: Confirm prerequisite information is complete**
 
-对照「前置信息需求」做最终检查：
-- [ ] kernel 源文件路径
-- [ ] focused test 命令
-- [ ] focused benchmark 命令
-- [ ] quick 验证脚本模板
-- [ ] benchmark 输出格式和可用性能指标列
-- [ ] 评分规则（如几何平均）
-- [ ] `execution_mode` 决策
-- [ ] 改动后是否需要 rebuild，rebuild 命令
+Do a final check against the "Prerequisite Information" section:
+- [ ] Kernel source file path
+- [ ] Focused test command
+- [ ] Focused benchmark command
+- [ ] Quick validation script template
+- [ ] Benchmark output format and available performance metric columns
+- [ ] Scoring rules (e.g., geometric mean)
+- [ ] `execution_mode` decision
+- [ ] Whether rebuild is needed after changes, and the rebuild command
 
-若有缺失，回查项目 skill 补齐。
+If anything is missing, go back to the project skill to fill in the gaps.
 
-**Step 3: 向用户确认目标**
+**Step 3: Confirm target with user**
 
-将 agent 推断的关键参数列出，向用户确认后再开始。至少包括：
+List the agent's inferred key parameters and confirm with the user before starting. At minimum include:
 
-- `target_op`、`target_backend`、`target_gpu`
-- `primary_metric`：只优化 forward？还是 forward + backward？还是自定义指标？
-- `performance_target`：有具体数字还是"尽量提升"？
-- `execution_mode`：repo 还是 workspace？
+- `target_op`, `target_backend`, `target_gpu`
+- `primary_metric`: Optimize forward only? Or forward + backward? Or custom metric?
+- `performance_target`: Specific number or `null`?
+- `execution_mode`: repo or workspace?
 - `git_commit` / `git_branch`
-- `max_iterations` / `max_duration`（如有）
-- 特殊约束（如不能改动某些接口）
+- `max_iterations` / `max_duration` (if applicable)
+- Special constraints (e.g., cannot modify certain interfaces)
 
-用户可以直接确认，也可以调整参数。确认后进入 PREPARE_ENVIRONMENT。
+The user can confirm directly or adjust parameters. After confirmation, proceed to PREPARE_ENVIRONMENT.
 
 ## PREPARE_ENVIRONMENT
 
-建立本轮优化的 campaign 目录，并根据 `git_branch` 参数创建优化分支。
+Set up the campaign directory for this optimization round, and create an optimization branch based on the `git_branch` parameter.
 
-**Step 1: 创建优化分支**（若 `git_branch` 不为 `none`）
+**Step 1: Create optimization branch** (if `git_branch` is not `none`)
 
-- `git_branch=auto`：`git checkout -b optimize/<campaign_name>`
-- `git_branch=<自定义>`：`git checkout -b <自定义分支名>`
-- `git_branch=none`：不切分支，在当前分支工作
+- `git_branch=auto`: `git checkout -b optimize/<campaign_name>`
+- `git_branch=<custom>`: `git checkout -b <custom branch name>`
+- `git_branch=none`: Do not switch branches, work on the current branch
 
-**Step 2: 建立 campaign 目录**
+**Step 2: Set up campaign directory**
 
 ```text
 agent/workspace/<campaign_name>/
 ├── logs/
-│   └── optimize.md       # 优化日志（主文件）
-├── profiles/              # profiler 输出
-├── results/               # benchmark 结果（.md 格式）
-└── manifest.yaml          # 元信息
+│   ├── optimize.md       # Optimization log (main file)
+│   └── performance_trend.md
+├── profiles/              # Profiler output
+├── related_work.md        # Related-work / SOTA survey for this campaign
+├── rounds/
+│   ├── round-1/
+│   │   ├── summary.md     # Baseline round summary
+│   │   ├── kernel_snapshot/
+│   │   └── artifacts/     # Optional raw benchmark/test outputs for this round
+│   └── round-N/
+│       ├── summary.md
+│       ├── kernel_snapshot/
+│       └── artifacts/
+└── manifest.yaml          # Metadata
 ```
 
-campaign 命名约定：`<op>_<backend>_<gpu>_<date>`，如 `gemm_fp8_blockwise_triton_gfx942_20260412`。
+Campaign naming convention: `<op>_<backend>_<gpu>_<date>`, e.g., `gemm_fp8_blockwise_triton_gfx942_20260412`.
 
-**Step 3: 写入 manifest.yaml**
+**Step 3: Write manifest.yaml**
 
 ```yaml
 target_op: <target_op>
@@ -158,183 +180,269 @@ target_lang: <target_lang>
 target_gpu: <target_gpu>
 execution_mode: <repo | workspace>
 project_skill: <project_skill_name>
-performance_target: "<性能目标描述>"
-primary_metric: "<主性能指标，可逗号分隔多个>"
+performance_target: <null | "performance target description">
+primary_metric: "<primary performance metric(s), comma-separated if multiple>"
 target_shapes: <all | shape list>
-kernel_source: <kernel 源文件路径>
-test_command: "<focused test 命令>"
-benchmark_command: "<focused benchmark 命令>"
-quick_command: "<BASELINE 阶段填入>"
-representative_shapes: <BASELINE 阶段选出>
+kernel_source: <kernel source file path>
+test_command: "<focused test command>"
+benchmark_command: "<focused benchmark command>"
+quick_command: "python <campaign_dir>/quick_test_bench.py"
+representative_shapes: <representative shape list selected during BASELINE, used for quick validation>
+related_work_file: <campaign_dir>/related_work.md
 git_commit: <true | false>
-git_branch: <分支名 | none>
-max_iterations: <数字 | null>
+git_branch: <branch name | none>
+max_iterations: <integer < 120 | null>
 max_duration: <"Nh" | null>
-created: <YYYY-MM-DD HH:MM>  # 必须精确到分钟，如 "2026-04-13 14:35"，禁止只写日期
+created: <YYYY-MM-DD HH:MM>
 ```
 
-> **时间精度规则**：campaign 全程所有时间戳（manifest `created`、日志中的"开始时间"/"时间"、结果文件的"时间"）都必须精确到分钟，格式 `YYYY-MM-DD HH:MM`。
+All campaign timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
 
-**Step 4: 生成 quick 验证脚本**
+All per-round artifacts live under `<campaign_dir>/rounds/`. `round-1` is the baseline round, and optimization attempts start at `round-2`. The running comparison table lives at `<campaign_dir>/logs/performance_trend.md`.
 
-根据项目 skill 提供的 quick 验证脚本模板，在 campaign 目录下生成 `quick_test_bench.py`。此时 agent 刚从项目 skill 收集完信息，项目 API 上下文最完整，是生成脚本的最佳时机。
+**Step 4: Generate `quick_test_bench.py`**
 
-- 脚本中 `SHAPES` 列表暂留空（或填入全部 shapes 作为占位）
-- BASELINE 完成后再选出代表性 shapes 并更新 `SHAPES` 列表和 manifest 中的 `quick_command` / `representative_shapes`
+Use the template from the project skill's quick validation section to generate `<campaign_dir>/quick_test_bench.py` while the project API context is still fresh.
 
-## 执行环境
+- Leave `SHAPES` empty or fill it with temporary placeholders during PREPARE_ENVIRONMENT
+- After BASELINE, select `representative_shapes` and update both `quick_test_bench.py` and `manifest.yaml`
+- Prefer a single self-contained script that runs correctness + benchmark together for quick iteration
 
-优化可在两种模式下进行：
+## SURVEY_RELATED_WORK
 
-- **`repo-mode`**：直接在上游项目中修改和验证。代码改动、测试、benchmark 都在主仓进行。
-- **`workspace-mode`**：先搭建最小开发环境，在其中高频试错，优化达标后再集成回上游项目。
+After PREPARE_ENVIRONMENT creates the campaign directory, perform a short related-work survey before BASELINE.
 
-项目 skill 会给出倾向性建议，但最终由 agent 根据任务特点判断。一般规律：
-- 改动面小、调参为主、构建快 → `repo-mode`
-- 需要大规模试错、从头写新 kernel、主仓构建链路重 → `workspace-mode`
+**Goal**: learn from current best-known implementations before spending time on blind local iteration.
 
-### workspace-mode 最小开发环境
+**What the agent may do**:
 
-当 agent 选择 `workspace-mode` 时，在 campaign 目录下搭建最小开发环境，至少包含：
+- Search the project tree for existing implementations and nearby historical results.
+- Search AMD / ROCm documentation for op-specific guidance, ISA features, and tuning constraints.
+- Search public web sources for relevant open-source implementations and reported performance.
+- Search competitor implementations and published operator performance on other stacks or chips when that comparison can reveal useful techniques or realistic ceilings.
+- If code inspection is worthwhile, clone selected GitHub repositories into `agent/tmp/<campaign_name>/related-work/repos/`.
+
+**What the agent must produce**:
+
+- Write `<campaign_dir>/related_work.md` summarizing:
+  - candidate implementations and libraries reviewed
+  - reported performance claims and the hardware / shape context behind them
+  - transferable implementation ideas worth trying in this campaign
+  - caveats about reproducibility, hidden fusion, datatype mismatch, or incompatible hardware assumptions
+  - a short shortlist of concrete optimization directions to test locally
+
+**Constraints**:
+
+- Treat `agent/tmp/<campaign_name>/related-work/` as ephemeral scratch space, not part of the accepted optimization lineage.
+- Do not allow the survey to turn into open-ended browsing; stop once the agent has enough information to guide early hypotheses.
+- The survey informs the campaign, but it does not replace the local baseline and validation loop.
+
+Use `related-work-template.md` as the default output structure for `<campaign_dir>/related_work.md`.
+
+## READ_HISTORICAL_TIPS
+
+After `SURVEY_RELATED_WORK` finishes and before `round-1` starts, check whether a reusable tips file already exists for the same hardware / op / backend combination.
+
+Use this path convention:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+Example:
+
+`agent/historical_experience/gfx950/gemm_fp8_blockwise/triton/tips.md`
+
+Rules:
+
+- Normalize the backend directory name to lowercase, e.g. `TRITON -> triton`, `CK -> ck`
+- If the file exists, read it before BASELINE so the first hypothesis benefits from prior experience
+- Treat it as reusable guidance, not as a substitute for current measurements, profiling, or validation
+- If the first worthy lesson has no existing tips file yet, create the missing directories and `tips.md`, then append to it
+- After every completed round, if the round produced a reusable technical lesson, append a concise tip to this same file
+
+## Execution Environment
+
+Optimization can be performed in two modes:
+
+- **`repo-mode`**: Modify and validate directly in the upstream project. Code changes, tests, and benchmarks are all done in the main repository.
+- **`workspace-mode`**: First set up a minimal development environment, iterate rapidly within it, then integrate back into the upstream project once optimization targets are met.
+
+The project skill provides a recommendation, but the agent makes the final decision based on task characteristics. General guidelines:
+- Small scope of changes, mainly parameter tuning, fast builds → `repo-mode`
+- Extensive trial-and-error needed, writing new kernel from scratch, heavy main repo build pipeline → `workspace-mode`
+
+### workspace-mode Minimal Development Environment
+
+When the agent selects `workspace-mode`, set up a minimal development environment within the campaign directory, containing at least:
 
 ```text
 agent/workspace/<campaign_name>/
-├── src/                   # 从上游项目抽取的最小 kernel 实现
-├── tests/                 # 定向 correctness 测试
-├── bench/                 # 定向 benchmark
+├── src/                   # Minimal kernel implementation extracted from upstream
+├── tests/                 # Targeted correctness tests
+├── bench/                 # Targeted benchmarks
 ├── logs/
-│   └── optimize.md
+│   ├── optimize.md
+│   └── performance_trend.md
 ├── profiles/
-├── results/
+├── related_work.md
+├── rounds/
+│   ├── round-1/
+│   │   ├── summary.md
+│   │   ├── kernel_snapshot/
+│   │   └── artifacts/
+│   └── round-N/
+│       ├── summary.md
+│       ├── kernel_snapshot/
+│       └── artifacts/
 └── manifest.yaml
 ```
 
-搭建原则：
-- **最小化**：只抽取目标 kernel 及其直接依赖，不搬整个项目
-- **可复现**：记录从上游项目哪个 commit 抽取、哪些文件被抽出
-- **忠实性**：测试和 benchmark 必须与上游项目的对应环节等价，确保结果可信
-- **回灌路径明确**：优化达标后，只把 kernel 核心改动同步回上游项目，不搬脚手架和临时代码
+Setup principles:
+- **Minimal**: Extract only the target kernel and its direct dependencies, not the entire project
+- **Reproducible**: Record which commit the code was extracted from and which files were extracted
+- **Faithful**: Tests and benchmarks must be equivalent to their upstream counterparts, ensuring trustworthy results
+- **Clear integration path**: After optimization targets are met, only sync core kernel changes back to upstream — do not carry over scaffolding or temporary code
 
-如何从具体项目中抽取代码、构建最小测试和 benchmark，由对应项目 skill 指导。
+How to extract code from a specific project, build minimal tests, and benchmarks is guided by the corresponding project skill.
 
-无论哪种模式，优化产物（日志、profile、benchmark 结果）统一沉淀在 campaign 目录。
+Regardless of mode, optimization artifacts (logs, profiles, benchmark results) are uniformly stored in the campaign directory.
 
-## 工作方式
+## Workflow
 
-agent 的完整路径：**项目 skill → 本文件（了解需求）→ 项目 skill（收集信息）→ 本文件（执行优化）→ optimize-loop.md → 项目 skill（验收）**。
+The agent's full path: **project skill → this file (understand requirements) → project skill (collect information) → this file (DEFINE_TARGET / PREPARE_ENVIRONMENT / SURVEY_RELATED_WORK) → `../../rules/iteration_rules.mdc` → `workflow/optimize-loop.md` → project skill (acceptance)**.
 
-典型交互序列：
+Typical interaction sequence:
 
-1. agent 从项目 skill 被引导到本文件。
-2. 读「前置信息需求」，了解优化框架需要什么。
-3. 回到项目 skill，按需求清单收集对应的项目信息。
-4. 带着信息回到本文件，执行 DEFINE_TARGET → PREPARE_ENVIRONMENT。
-5. 读取 [`workflow/optimize-loop.md`](workflow/optimize-loop.md)，执行 BASELINE → ANALYZE → OPTIMIZE → VALIDATE 循环。
-6. 在 ANALYZE / OPTIMIZE 阶段按需读取语言、硬件、profiling、reference 文档。
-7. 输出 REPORT，交还项目 skill 做最终验收。
+1. Agent is directed to this file from the project skill.
+2. Read "Prerequisite Information" to understand what the optimization framework needs.
+3. Return to the project skill and collect project information per the requirement checklist.
+4. Return to this file with the information, execute DEFINE_TARGET → PREPARE_ENVIRONMENT.
+5. Run `SURVEY_RELATED_WORK`: create `<campaign_dir>/related_work.md`, using `agent/tmp/<campaign_name>/related-work/` for any temporary repo clones or downloaded notes.
+6. If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, read it before the first round.
+7. Read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) before the first BASELINE / VALIDATE round.
+8. Read [`workflow/optimize-loop.md`](workflow/optimize-loop.md) and execute the BASELINE → ANALYZE → OPTIMIZE → VALIDATE loop.
+9. Read language, hardware, profiling, related-work survey outputs, and historical tips as needed during ANALYZE / OPTIMIZE phases.
+10. Output REPORT and hand back to the project skill for final acceptance.
 
-## 知识引用表
+## Knowledge Reference Table
 
-根据 `target_lang`、`target_gpu` 和当前阶段按需读取对应 skill。**不要一次全读**。
+Read the corresponding skill as needed based on `target_lang`, `target_gpu`, and the current phase. **Do not read everything at once.**
 
-| 需要什么 | 读哪里 |
-|---------|--------|
-| 优化过程与门控规则 | [workflow/optimize-loop.md](workflow/optimize-loop.md) |
-| Triton 通用优化技巧 | [triton/SKILL.md](triton/SKILL.md) |
-| Triton 算子专项策略 | [triton/ops/\<op\>.md](triton/ops/) |
-| HIP/CK 通用优化技巧 | [hip/SKILL.md](hip/SKILL.md) |
-| HIP 算子专项策略 | [hip/ops/\<op\>.md](hip/ops/) |
-| 硬件参数与优化策略 | [../hardware/\<arch\>/SKILL.md](../hardware/) + `optimization-guide.md` |
-| Profiling 方法 | [../tool-rocprof/SKILL.md](../tool-rocprof/SKILL.md) |
-| 项目代码结构 / 构建 / 测试 / benchmark / 集成 | 对应项目 skill，如 [../primus-turbo-develop/SKILL.md](../primus-turbo-develop/SKILL.md) |
-| 参考实现与论文 | [references/](references/) |
-| 历史优化案例 | [examples.md](examples.md) |
+| What you need | Where to find it |
+|---------------|-----------------|
+| Linear iteration contract | [../../rules/iteration_rules.mdc](../../rules/iteration_rules.mdc) |
+| Optimization process and gating rules | [workflow/optimize-loop.md](workflow/optimize-loop.md) |
+| General Triton optimization techniques | [triton/SKILL.md](triton/SKILL.md) |
+| General HIP optimization techniques | [hip/SKILL.md](hip/SKILL.md) |
+| CK template / pipeline tuning | [hip/ck.md](hip/ck.md) |
+| Hardware parameters and optimization strategies | [../hardware/\<arch\>/SKILL.md](../hardware/) + `optimization-guide.md` |
+| Cross-generation hardware comparison | [../hardware/hardware-comparison.md](../hardware/hardware-comparison.md) |
+| Profiling methods | [../tool-rocprof/SKILL.md](../tool-rocprof/SKILL.md) |
+| Project code structure / build / test / benchmark / integration | Corresponding project skill, e.g., [../primus-turbo-develop/SKILL.md](../primus-turbo-develop/SKILL.md) |
+| Related-work report structure | [related-work-template.md](related-work-template.md) |
+| Historical reusable tips | `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` (if present) |
+| Historical optimization cases | [examples.md](examples.md) |
 
-## 日志与 lineage 总原则
+## Logging and Lineage General Principles
 
-优化过程中需要保留结构化历史（参考 AVO 的 lineage 设计），以支撑长期迭代。
+The optimization process must maintain structured history (referencing AVO's lineage design) to support long-term iteration.
 
-- 当 `git_commit=true` 时，每个 accepted version 对应一个 git commit，构成 lineage
-- 当 `git_commit=false` 时，仍在日志中记录 accepted version，但不做 git commit
-- 失败尝试记录在 campaign 日志中，但不进入 accepted lineage
-- 被接受的版本必须有明确假设、验证结果和接受理由
-- 日志既服务于人（随时查看进展），也服务于 agent（回溯历史避免重复尝试）
-- **每轮 VALIDATE 结束后必须立即更新 `logs/optimize.md`**，不得延迟或留 placeholder
-- 日志和 profiling 结果沉淀在 `agent/workspace/<campaign_name>/`
-- 详细日志格式见 [`workflow/optimize-loop.md`](workflow/optimize-loop.md)
+- When `git_commit=true`, each accepted version corresponds to a git commit, forming a lineage
+- When `git_commit=false`, accepted versions are still recorded in logs but without git commits
+- Failed attempts are recorded in the campaign log but do not enter the accepted lineage
+- Accepted versions must have clear hypotheses, validation results, and acceptance rationale
+- Logs serve both humans (can check progress at any time) and the agent (trace history to avoid repeated attempts)
+- Every round must update its own `rounds/round-N/summary.md`, and every VALIDATE round must keep that summary synchronized with `logs/optimize.md`
+- If a round reveals a reusable hardware / op / backend lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+- Logs and profiling results are stored in `agent/workspace/<campaign_name>/`
+- For detailed log format, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md)
 
-## 停滞处理总原则
+## Stagnation Handling General Principles
 
-参考 AVO 的 continuous evolution 机制：**停滞不是停止信号，而是触发策略切换的信号。连续 rollback 意味着当前方向走不通，应该换方向，而不是写报告终止。**
+Referencing AVO's continuous evolution mechanism: stagnation is not a stop signal, but a trigger for strategy switching.
 
-- 连续 2 次 rollback 即触发 stagnation review
-- 必须回顾失败尝试、做 profiling（若之前没做）、生成本质不同的新方向
-- 切换方向后回到 ANALYZE 继续迭代
-- 只有满足终止条件（见 `optimize-loop.md`）才能停止
+When there is no improvement for multiple consecutive rounds, the agent should not just make minor adjustments in the same direction, but instead:
+- Review recent versions and failed attempts
+- Re-identify bottlenecks based on profiler results
+- Switch to a fundamentally different optimization direction
+- Revisit reference implementations and hardware documentation as needed
+- Two consecutive rollbacks should trigger a stagnation review by default
+- Continuous rollback is a signal to switch direction, not a reason to terminate early
 
-详细停滞检测和换向规则见 [`workflow/optimize-loop.md`](workflow/optimize-loop.md)。
+For detailed stagnation detection and direction-switching rules, see [`workflow/optimize-loop.md`](workflow/optimize-loop.md).
 
-## 端到端示例
+## End-to-End Example
 
-**用户指令**："请优化 Primus-Turbo 里的 blockwise FP8 GEMM Triton 实现，目标 GPU 是 MI300X。"
+**User instruction**: "Please optimize the blockwise FP8 GEMM Triton implementation in Primus-Turbo, target GPU is MI300X."
 
-**Step 1: 了解需求**
+**Step 1: Understand requirements**
 
-agent 从 `primus-turbo-develop/SKILL.md` 被引导到本文件，读「前置信息需求」，得知优化框架需要：kernel 源文件、focused test、focused benchmark、quick 验证脚本模板、benchmark 输出格式、评分规则、execution_mode 建议、rebuild 要求。
+Agent is directed from `primus-turbo-develop/SKILL.md` to this file. Reads "Prerequisite Information" and learns the optimization framework needs: kernel source file, focused test, focused benchmark, quick validation script template, benchmark output format, scoring rules, execution_mode recommendation, and rebuild requirements.
 
-**Step 2: 收集项目信息**
+**Step 2: Collect project information**
 
-agent 回到 `primus-turbo-develop/SKILL.md`，按需求清单收集：
+Agent returns to `primus-turbo-develop/SKILL.md` and collects per the requirement checklist:
 - Kernel: `primus_turbo/triton/gemm/gemm_fp8_kernel.py`
 - Focused test: `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`
 - Focused benchmark: `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`
-- Quick 验证脚本模板: PREPARE_ENVIRONMENT 时生成 `quick_test_bench.py`（shapes 暂留空，BASELINE 后填入）
-- 评分: `Forward TFLOPS` 几何平均，`Check` 为正确性门控
-- 环境建议: Triton → `repo-mode`，无需 rebuild
+- Quick validation template: generate `quick_test_bench.py` during PREPARE_ENVIRONMENT, then fill representative shapes after BASELINE
+- Scoring: `Forward TFLOPS` geometric mean, `Check` as correctness gate
+- Environment recommendation: Triton → `repo-mode`, no rebuild needed
 
 **Step 3: DEFINE_TARGET**
 
-整理参数：`target_op=gemm_fp8_blockwise`, `target_backend=TRITON`, `target_gpu=gfx942`, `execution_mode=repo`, `performance_target=相对 baseline 有可测量提升`。对照前置信息需求 checklist 确认齐全。
+Organize parameters: `target_op=gemm_fp8_blockwise`, `target_backend=TRITON`, `target_gpu=gfx942`, `execution_mode=repo`, `performance_target=null`. Verify completeness against the prerequisite information checklist.
 
-向用户确认：
+Confirm with user:
 
-> 确认优化目标：
-> - 算子: blockwise FP8 GEMM, backend: TRITON, GPU: MI300X (gfx942)
-> - 主性能指标: Forward TFLOPS（是否也需要优化 Backward？）
-> - 性能目标: 相对 baseline 有可测量提升
-> - 执行模式: repo-mode, git_commit=true, git_branch=auto
-> - 请确认或调整。
+> Confirm optimization target:
+> - Operator: blockwise FP8 GEMM, backend: TRITON, GPU: MI300X (gfx942)
+> - Primary metric: Forward TFLOPS (do you also want to optimize Backward?)
+> - Performance target: `null` unless you want to set a concrete target
+> - Execution mode: repo-mode, git_commit=true, git_branch=auto
+> - Please confirm or adjust.
 
-用户确认后进入 PREPARE_ENVIRONMENT。
+Proceed to PREPARE_ENVIRONMENT after user confirmation.
 
 **Step 4: PREPARE_ENVIRONMENT**
 
-1. 创建优化分支：`git checkout -b optimize/gemm_fp8_blockwise_triton_gfx942_20260412`
-2. 创建 `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/`
-3. 创建子目录 `logs/`, `profiles/`, `results/`
-4. 写入 `manifest.yaml`
-5. 根据项目 skill 的 quick 验证脚本模板，生成 `quick_test_bench.py`（shapes 暂留空，BASELINE 后填入）
+1. Create optimization branch: `git checkout -b optimize/gemm_fp8_blockwise_triton_gfx942_20260412`
+2. Create `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/`
+3. Create subdirectories `logs/`, `profiles/`, `rounds/`
+4. Write `manifest.yaml`
+5. Create `rounds/round-1/` as the baseline round scaffold
+6. Generate `quick_test_bench.py` with placeholder `SHAPES`; fill it after BASELINE selects representative shapes
 
-**Step 5: 进入优化循环**
+**Step 5: SURVEY_RELATED_WORK**
 
-读 `workflow/optimize-loop.md`，按其定义执行：
-1. BASELINE：执行 focused test（确认 PASS）→ 执行 focused benchmark → 记录 baseline TFLOPS
-2. ANALYZE：读 kernel 源码、查 `triton/SKILL.md` 和 `hardware/gfx942/`，生成优化假设
-3. OPTIMIZE → VALIDATE 循环：改 kernel → 跑 test → 跑 benchmark → 对比 → accept 或 rollback
-4. 达到目标或穷尽方向后，输出 REPORT
+1. Review local project implementations and AMD / ROCm references
+2. Search external related work and competitor baselines as needed
+3. If code inspection is useful, clone temporary repos into `agent/tmp/gemm_fp8_blockwise_triton_gfx942_20260412/related-work/repos/`
+4. Write `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/related_work.md` using `related-work-template.md`
 
-**Step 6: 验收**（回到项目 skill）
+**Step 6: READ_HISTORICAL_TIPS**
 
-项目 skill 跑完整测试、审查报告、确认 commit。
+Read `agent/historical_experience/gfx942/gemm_fp8_blockwise/triton/tips.md` if it exists, carrying forward only reusable lessons that still need to be validated in the current environment.
 
-## 相关 skill
+**Step 7: Enter optimization loop**
 
-| Skill | 说明 |
-|-------|------|
-| `workflow/optimize-loop` | 详细优化过程、门控、回滚、停滞处理 |
-| `triton` | Triton 通用优化技巧 |
-| `hip` | HIP/CK 通用优化技巧 |
-| `hardware/gfx942` | MI300X/MI325X 硬件参数与优化策略 |
-| `hardware/gfx950` | MI350X/MI355X 硬件参数与优化策略 |
-| `tool-rocprof` | rocprof profiling 工具用法 |
-| `primus-turbo-develop` | Primus-Turbo 项目的代码结构、构建、测试、benchmark 与集成方式 |
+Read `workflow/optimize-loop.md` and execute as defined:
+1. BASELINE (`round-1`): Run focused test (confirm PASS) → run focused benchmark → write `rounds/round-1/summary.md` → select representative shapes and update `quick_test_bench.py`
+2. ANALYZE: Read `related_work.md`, kernel source, consult `triton/SKILL.md` and `hardware/gfx942/`, generate optimization hypotheses
+3. OPTIMIZE → VALIDATE loop (`round-2+`): Modify kernel → run test → run benchmark → write `rounds/round-N/summary.md` → compare → accept or rollback → append a reusable tip if the round taught something worth preserving
+4. After reaching target or exhausting directions, output REPORT
+
+**Step 8: Acceptance** (return to project skill)
+
+Project skill runs full tests, reviews report, confirms commits.
+
+## Related Skills
+
+| Skill | Description |
+|-------|-------------|
+| `workflow/optimize-loop` | Detailed optimization process, gating, rollback, stagnation handling |
+| `triton` | General Triton optimization techniques |
+| `hip` | General HIP/CK optimization techniques |
+| `hardware/gfx942` | MI300X/MI325X hardware parameters and optimization strategies |
+| `hardware/gfx950` | MI350X/MI355X hardware parameters and optimization strategies |
+| `tool-rocprof` | rocprof profiling tool usage |
+| `primus-turbo-develop` | Code structure, build, test, benchmark, and integration for the Primus-Turbo project |
