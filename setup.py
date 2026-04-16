@@ -1,4 +1,4 @@
-import importlib.util
+import importlib.metadata
 import os
 import platform
 import re
@@ -85,7 +85,12 @@ def check_submodules():
 
 
 def is_package_installed(package_name):
-    """Check if a package is installed in the current Python environment."""
+    """Check if a package is properly installed (not just a namespace ghost).
+
+    Uses importlib.metadata to verify the package has real distribution
+    metadata registered with pip, avoiding false positives from leftover
+    empty directories that Python treats as implicit namespace packages.
+    """
     try:
         importlib.metadata.distribution(package_name)
         return True
@@ -208,6 +213,8 @@ def get_common_flags():
         f"-L/usr/lib/{arch}-linux-gnu",
         "-fgpu-rdc",
         "--hip-link",
+        "-Xoffload-linker",
+        "--allow-multiple-definition",
     ]
 
     cxx_flags = [
@@ -399,8 +406,8 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = []
 
-    # Conditionally add aiter if torch_ext is being built and aiter is not already installed
-    if torch_ext is not None and not is_package_installed("aiter"):
+    # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
+    if torch_ext is not None and not is_package_installed("amd-aiter"):
         print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
         install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
     else:

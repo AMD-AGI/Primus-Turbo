@@ -9,7 +9,7 @@
 #pragma once
 
 #include "primus_turbo/macros.h"
-#include <ATen/hip/HIPContext.h>
+#include <ATen/cuda/CUDAContext.h>
 
 namespace primus_turbo::pytorch::deep_ep {
 
@@ -18,7 +18,7 @@ struct EventHandle {
 
     EventHandle() {
         event = std::make_shared<torch::Event>(torch::kCUDA);
-        event->record(at::hip::getCurrentHIPStreamMasqueradingAsCUDA());
+        event->record(at::cuda::getCurrentCUDAStream());
     }
 
     explicit EventHandle(const c10::cuda::CUDAStream &stream) {
@@ -28,9 +28,7 @@ struct EventHandle {
 
     EventHandle(const EventHandle &other) = default;
 
-    void current_stream_wait() const {
-        at::hip::getCurrentHIPStreamMasqueradingAsCUDA().unwrap().wait(*event);
-    }
+    void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
 };
 
 inline torch::Event create_event(const c10::cuda::CUDAStream &s) {

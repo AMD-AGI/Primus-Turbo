@@ -9,8 +9,7 @@ namespace primus_turbo {
 #ifdef PRIMUS_TURBO_GFX942
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
           typename ALayout, typename BLayout, typename CLayout, ck_tile::QuantType QuantMode>
-std::unique_ptr<CKGroupedGemmRunnerInterFace>
-get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_tile::index_t m,
+std::unique_ptr<CKGroupedGemmRunnerInterFace> get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_tile::index_t m,
                                     const ck_tile::index_t n, const ck_tile::index_t k) {
     std::unique_ptr<CKGroupedGemmRunnerInterFace> runner = nullptr;
     if (get_current_arch() != GPUArch::GFX942) {
@@ -18,7 +17,7 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
     }
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
-                  std::is_same_v<ADataType, ck_tile::bfloat16_t>) {
+                  std::is_same_v<ADataType, ck_tile::bfloat16_t>)  {
         if (n % 256 == 0) {
             using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
@@ -35,17 +34,23 @@ get_ck_grouped_gemm_instance_gfx942(const ck_tile::index_t group_num, const ck_t
                                                CLayout, TileConfig, AccDataType>;
             runner       = std::make_unique<Runner>();
         }
-    } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
-                         std::is_same_v<ADataType, ck_tile::fp8_t>) {
-        // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
-        if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+    } else if constexpr ((std::is_same_v<ADataType, ck_tile::bf8_t> ||
+                         std::is_same_v<ADataType, ck_tile::fp8_t>) && (std::is_same_v<BDataType, ck_tile::fp8_t> || std::is_same_v<BDataType, ck_tile::bf8_t>)) {
+        if constexpr (!std::is_same_v<ADataType, BDataType>) {
+            // TODO(ruibin): tuning the tile config for mixed precision (e.g. BF8xFP8)
+            using TileConfig = GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x16_2x2x1_padding;
+            using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
+                                                            CDataType, ALayout, BLayout, CLayout,
+                                                            TileConfig, QuantMode, AccDataType>;
+            runner       = std::make_unique<Runner>();
+        } else if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
+                    // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
             using TileConfig = GFX942_CKGroupedGemmTileCfg_128x128x128_32x32x32_2x2x1;
             using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
                                                             CDataType, ALayout, BLayout, CLayout,
                                                             TileConfig, QuantMode, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else {
-            // For other quant modes, use dynamic tile selection
             if (n % 256 == 0) {
                 using TileConfig = GFX942_CKGroupedGemmTileCfg_256x256x128_32x32x32_2x2x1;
                 using Runner = CKQuantGroupedGemmRunnerWithArch<GPUArch::GFX942, ADataType, BDataType,
@@ -102,8 +107,8 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
                                                CLayout, TileConfig, AccDataType>;
             runner       = std::make_unique<Runner>();
         }
-    } else if constexpr (std::is_same_v<ADataType, ck_tile::bf8_t> ||
-                         std::is_same_v<ADataType, ck_tile::fp8_t>) {
+    } else if constexpr ((std::is_same_v<ADataType, ck_tile::bf8_t> ||
+                         std::is_same_v<ADataType, ck_tile::fp8_t>) && (std::is_same_v<BDataType, ck_tile::fp8_t> || std::is_same_v<BDataType, ck_tile::bf8_t>)) {
         // For blockwise quant (ABQuantGrouped), use fixed 128x128x128 config
         if constexpr (QuantMode == ck_tile::QuantType::ABQuantGrouped) {
             using TileConfig = GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1;
@@ -111,7 +116,7 @@ get_ck_grouped_gemm_instance_gfx950(const ck_tile::index_t group_num, const ck_t
                                                             CDataType, ALayout, BLayout, CLayout,
                                                             TileConfig, QuantMode, AccDataType>;
             runner       = std::make_unique<Runner>();
-        } else {
+        }else {
             // For other quant modes, use dynamic tile selection
             if (n % 256 == 0) {
                 using TileConfig = GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1;
@@ -150,8 +155,8 @@ get_ck_grouped_gemm_instance(const ck_tile::index_t group_num, const ck_tile::in
 #ifdef PRIMUS_TURBO_GFX942
     case GPUArch::GFX942: {
         return get_ck_grouped_gemm_instance_gfx942<ADataType, BDataType, CDataType, AccDataType,
-                                                   ALayout, BLayout, CLayout, QuantMode>(group_num,
-                                                                                         m, n, k);
+                                                    ALayout, BLayout, CLayout, QuantMode>(group_num,
+                                                                                            m, n, k);
     }
 #endif
 #ifdef PRIMUS_TURBO_GFX950
@@ -184,6 +189,14 @@ APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::fp8_t, ck_
 APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::half_t)
 // FP8_E5M2 * FP8_E5M2 = BF16
 APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t)
+// FP8_E4M3 * FP8_E5M2 = FP16
+APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t)
+// FP8_E4M3 * FP8_E5M2 = BF16
+APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t)
+// FP8_E5M2 * FP8_E4M3 = FP16
+APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t)
+// FP8_E5M2 * FP8_E4M3 = BF16
+APPLY_GET_CK_GG_INSTANCE_ALL_LAYOUT(DECL_GET_CK_GG_INSTANCE, ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t)
 
 // clang-format on
 } // namespace primus_turbo

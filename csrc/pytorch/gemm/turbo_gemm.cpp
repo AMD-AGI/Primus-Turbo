@@ -39,7 +39,7 @@ static at::Tensor launch_mxfp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
     at::Tensor   workspace =
         at::empty({(int64_t) ws_size}, torch::dtype(at::kByte).device(A.device()));
 
-    auto stream = at::hip::getCurrentHIPStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     TORCH_TYPE_SWITCH_FP8(
         A.scalar_type(), AType,

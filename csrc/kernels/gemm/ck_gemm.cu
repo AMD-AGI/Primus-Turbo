@@ -151,4 +151,55 @@ template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::bfloat16
 template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float,
                                ck_tile::QuantType::ABQuantGrouped>(
     const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float> &params);
+
+// fp8 * bf8 -> fp16 - RowColQuant
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::RowColQuant>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * bf8 -> bf16 - RowColQuant
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::RowColQuant>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float> &params);
+// fp8 * bf8 -> fp16 - TensorQuant
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::TensorQuant>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * bf8 -> bf16 - TensorQuant
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::TensorQuant>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float> &params);
+// fp8 * bf8 -> fp16 - ABQuantGrouped
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::ABQuantGrouped>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::half_t, float> &params);
+// fp8 * bf8 -> bf16 - ABQuantGrouped
+template void ck_gemm_fp8_impl<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::ABQuantGrouped>(
+    const CKGemmFP8Params<ck_tile::fp8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, float> &params);
+
+// bf8 * fp8 -> fp16 - RowColQuant
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::RowColQuant>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * fp8 -> bf16 - RowColQuant
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::RowColQuant>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float> &params);
+// bf8 * fp8 -> fp16 - TensorQuant
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::TensorQuant>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * fp8 -> bf16 - TensorQuant
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::TensorQuant>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float> &params);
+// bf8 * fp8 -> fp16 - ABQuantGrouped
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float,
+                               ck_tile::QuantType::ABQuantGrouped>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::half_t, float> &params);
+// bf8 * fp8 -> bf16 - ABQuantGrouped
+template void ck_gemm_fp8_impl<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float,
+                               ck_tile::QuantType::ABQuantGrouped>(
+    const CKGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float> &params);
+
 } // namespace primus_turbo
