@@ -141,7 +141,7 @@ tasks:
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_blockwise_triton_benchmark.csv
 
-  # benchmark machine is MI325, which dose not support MXFP8 and MXFP4
+  # benchmark machine is MI325, which does not support MXFP8 and MXFP4
   # ── GEMM MXFP8 ─────────────────────────────────────────
   # - label: gemm_mxfp8_turbo
   #   group: gemm_mxfp8
