@@ -12,8 +12,8 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
-    MXScalingRecipe,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
@@ -332,10 +332,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            scaling_recipe=MXScalingRecipe(
+            scaling_recipe=ScalingRecipe(
                 use_2d_block=True,
             ),
-            scaling_recipe_for_trans=MXScalingRecipe(
+            scaling_recipe_for_trans=ScalingRecipe(
                 use_2d_block=True,
             ),
         )
