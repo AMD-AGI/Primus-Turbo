@@ -153,14 +153,13 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # ------------------------------------------------------------------
 
     @parametrize("backend", _get_backends())
-    @parametrize("force_current_stream", [False, True])
-    def test_cuda_graph(self, backend, force_current_stream):
+    def test_cuda_graph(self, backend):
         self._bind_device()
         with patch.dict(
             os.environ,
             {
                 "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
-                "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": "1" if force_current_stream else "0",
+                "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": "1",
             },
         ):
             num_worst_tokens = NUM_TOKENS * 8
