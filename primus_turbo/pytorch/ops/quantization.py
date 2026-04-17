@@ -8,12 +8,14 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.pytorch.core.low_precision import MXScalingRecipe, ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity, ScalingRecipe
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
+    quant_fp8_blockwise_for_weight_impl,
+    quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
@@ -32,8 +34,7 @@ def quantize_fp8(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    padding_align_size: Optional[int] = None,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -46,13 +47,19 @@ def quantize_fp8(
             1. The x must be 2D tensor.
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
             3. The block size must be 32.
-            4. The out tensor will be padded in specified axis if padding_align_size is not `None`.
-            5. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
+            4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise when `with_trans` is True.
     """
     if granularity == ScalingGranularity.TENSORWISE:
         return quantize_fp8_tensorwise_impl(x, out_dtype)
     elif granularity == ScalingGranularity.ROWWISE:
         return quantize_fp8_rowwise_impl(x, out_dtype, axis)
+    elif granularity == ScalingGranularity.BLOCKWISE:
+        assert block_size is not None, "block_size must be specified for BLOCKWISE quantization"
+        if scaling_recipe is not None and scaling_recipe.use_2d_block:
+            # 2D block (for weight): ignores axis; scales along both dims.
+            return quant_fp8_blockwise_for_weight_impl(x, out_dtype, block_size=block_size)
+        assert axis is not None, "axis must be specified for 1D BLOCKWISE quantization"
+        return quant_fp8_blockwise_impl(x, out_dtype, axis=axis, block_size=block_size)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
         return quantize_mxfp8_impl(
@@ -74,8 +81,8 @@ def quantize_fp8_with_trans(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize with trans
@@ -110,7 +117,7 @@ def dequantize_fp8(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ):
     """
     FP8 DeQuantize
@@ -146,7 +153,7 @@ def quantize_fp4(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize
@@ -180,8 +187,8 @@ def quantize_fp4_with_trans(
     *,
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize with trans
@@ -216,7 +223,7 @@ def dequantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scale_inv: torch.Tensor,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> torch.Tensor:
     """
     FP4 DeQuantize

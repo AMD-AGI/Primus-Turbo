@@ -6,14 +6,18 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
-    Float8QuantConfig,
-    MXScalingRecipe,
+    MXFP4_BLOCK_SIZE,
+    MXFP8_BLOCK_SIZE,
     ScalingGranularity,
+    ScalingRecipe,
+    float4_e2m1fn_x2,
+    float8_e4m3,
+    float8_e5m2,
 )
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp8,
@@ -21,69 +25,72 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 
-SHUFFLE_LAYOUT = [16, 16]
+_SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 
 
 class QuantizedTensor(torch.Tensor):
-    """Wrapper subclass that carries low-precision quantized data, scale, and
-    optionally their hardware-shuffled counterparts.
-
-    Attributes
-    ----------
-    data            : Quantized low-precision data (e.g. fp8).
-    scale            : Per-block / per-tensor inverse scale.
-    data_t           : Transposed quantized data.
-    scale_t          : Transposed per-block / per-tensor inverse scale.
-    """
+    """Wrapper subclass that carries low-precision quantized data, scale_inv"""
 
     @staticmethod
     def __new__(
         cls,
         data: torch.Tensor,
         dest_dtype: torch.dtype,
-        config: Float8QuantConfig,
-        with_trans: bool = False,
-        scaling_recipe: Optional[MXScalingRecipe] = None,
-        scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+        granularity: ScalingGranularity,
+        block_size: Optional[int] = None,
+        scaling_recipe: Optional[ScalingRecipe] = None,
+        scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+        keep_trans_cache: bool = False,
     ):
-        assert isinstance(config, Float8QuantConfig), "config must be a Float8QuantConfig"
+        assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            if dest_dtype in [float8_e4m3, float8_e5m2]:
+                assert block_size == MXFP8_BLOCK_SIZE, "block_size must be MXFP8_BLOCK_SIZE for MX_BLOCKWISE"
+            elif dest_dtype == float4_e2m1fn_x2:
+                assert block_size == MXFP4_BLOCK_SIZE, "block_size must be MXFP4_BLOCK_SIZE for MX_BLOCKWISE"
+
+            assert scaling_recipe is not None, "scaling_recipe must be provided for MX_BLOCKWISE"
+            assert (
+                scaling_recipe_for_trans is not None
+            ), "scaling_recipe_for_trans must be provided for MX_BLOCKWISE"
 
         orig_dtype = data.dtype
 
-        data_, scale, data_t, scale_t = None, None, None, None
-        if with_trans:
-            if config.granularity == ScalingGranularity.MX_BLOCKWISE:
-                data_, scale, data_t, scale_t = quantize_fp8_with_trans(
+        data_, scale_inv, data_t, scale_inv_t = None, None, None, None
+        if keep_trans_cache:
+            if granularity == ScalingGranularity.MX_BLOCKWISE:
+                data_, scale_inv, data_t, scale_inv_t = quantize_fp8_with_trans(
                     data,
                     dest_dtype,
-                    config.granularity,
-                    block_size=config.block_size,
+                    granularity,
+                    block_size=block_size,
                     scaling_recipe=scaling_recipe,
                     scaling_recipe_for_trans=scaling_recipe_for_trans,
                 )
             else:
-                data_, scale = quantize_fp8(
+                data_, scale_inv = quantize_fp8(
                     data,
                     dest_dtype,
-                    config.granularity,
-                    block_size=config.block_size,
+                    granularity,
+                    block_size=block_size,
                     axis=1,
                     scaling_recipe=scaling_recipe,
                 )
-                data_t, scale_t = quantize_fp8(
-                    data.t(),
+                data_t, scale_inv_t = quantize_fp8(
+                    data,
                     dest_dtype,
-                    config.granularity,
-                    block_size=config.block_size,
+                    granularity,
+                    block_size=block_size,
                     axis=0,
                     scaling_recipe=scaling_recipe_for_trans,
                 )
         else:
-            data_, scale = quantize_fp8(
+            data_, scale_inv = quantize_fp8(
                 data,
                 dest_dtype,
-                config.granularity,
-                block_size=config.block_size,
+                granularity,
+                block_size=block_size,
                 axis=1,
                 scaling_recipe=scaling_recipe,
             )
@@ -99,13 +106,16 @@ class QuantizedTensor(torch.Tensor):
             device=data_.device,
         )
         self._orig_dtype = orig_dtype
+        self._dest_dtype = dest_dtype
 
-        self._config = config
+        self._keep_trans_cache = keep_trans_cache
         self._scaling_recipe = scaling_recipe
+        self._granularity = granularity
+        self._block_size = block_size
         self._scaling_recipe_for_trans = scaling_recipe_for_trans
 
-        self._data, self._scale = data_, scale
-        self._data_t, self._scale_t = data_t, scale_t
+        self._data, self._scale_inv = data_, scale_inv
+        self._data_t, self._scale_inv_t = data_t, scale_inv_t
 
         return self
 
@@ -117,15 +127,36 @@ class QuantizedTensor(torch.Tensor):
         return self._data
 
     @property
-    def scale(self) -> torch.Tensor:
-        return self._scale
+    def scale_inv(self) -> torch.Tensor:
+        return self._scale_inv
+
+    def t(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._data_t is None:
+            # TODO(ruibin): eliminate the transpose operation by low precision transpose kernel.
+            orig_data = self.dequantize()
+            orig_data_t = orig_data.t().contiguous()
+
+            data_t, scale_inv_t = quantize_fp8(
+                orig_data_t,
+                self._orig_dtype,
+                self._granularity,
+                block_size=self._block_size,
+                axis=1,
+                scaling_recipe=self._scaling_recipe_for_trans,
+            )
+
+            if self._keep_trans_cache:
+                # cache the transposed data and scale_inv
+                self._data_t = data_t
+                self._scale_inv_t = scale_inv_t
+            else:
+                return data_t, scale_inv_t
+
+        return self._data_t, self._scale_inv_t
 
     @property
-    def t(self) -> Union[torch.Tensor, torch.Tensor]:
-        assert self._data_t is not None, "data_t is not quantized"
-        assert self._scale_t is not None, "scale_t is not quantized"
-
-        return self._data_t, self._scale_t
+    def T(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.t()
 
     @property
     def dtype(self) -> torch.dtype:  # type: ignore[override]
@@ -135,15 +166,23 @@ class QuantizedTensor(torch.Tensor):
     def real_dtype(self) -> torch.dtype:
         return self._data.dtype
 
+    @property
+    def granularity(self) -> ScalingGranularity:
+        return self._granularity
+
+    @property
+    def block_size(self) -> Union[int, None]:
+        return self._block_size
+
     def dequantize(self) -> torch.Tensor:
         """Dequantize back to the original high-precision dtype."""
         return dequantize_fp8(
             self._data,
             self._orig_dtype,
-            self._config.granularity,
-            block_size=self._config.block_size,
+            self._granularity,
+            block_size=self._block_size,
             axis=1,
-            scale_inv=self._scale,
+            scale_inv=self._scale_inv,
             scaling_recipe=self._scaling_recipe,
         )
 
@@ -154,22 +193,24 @@ class QuantizedTensor(torch.Tensor):
         has_trans = self._data_t is not None
         return (
             f"QuantizedTensor(shape={list(self.shape)}, orig_dtype={self._orig_dtype}, "
-            f"real_dtype={self._data.dtype}, granularity={self._config.granularity.name}"
-            f"{', has_transpose' if has_trans else ''})"
+            f"real_dtype={self._data.dtype}, granularity={self._granularity.name}"
+            f"{', has_trans_cache' if has_trans else ''})"
         )
 
     # ------------------------------------------------------------------
     # Serialisation (torch.compile / FSDP)
     # ------------------------------------------------------------------
     def __tensor_flatten__(self):
-        tensors = {"_data": self._data, "_scale": self._scale}
+        tensors = {"_data": self._data, "_scale_inv": self._scale_inv}
         if self._data_t is not None:
             tensors["_data_t"] = self._data_t
-        if self._scale_t is not None:
-            tensors["_scale_t"] = self._scale_t
+        if self._scale_inv_t is not None:
+            tensors["_scale_inv_t"] = self._scale_inv_t
         metadata = {
             "_orig_dtype": self._orig_dtype,
-            "_config": self._config,
+            "_granularity": self._granularity,
+            "_block_size": self._block_size,
+            "_keep_trans_cache": self._keep_trans_cache,
             "_scaling_recipe": self._scaling_recipe,
             "_scaling_recipe_for_trans": self._scaling_recipe_for_trans,
         }
@@ -186,13 +227,15 @@ class QuantizedTensor(torch.Tensor):
             device=data.device,
         )
         self._orig_dtype = metadata["_orig_dtype"]
-        self._config = metadata["_config"]
+        self._granularity = metadata["_granularity"]
+        self._block_size = metadata["_block_size"]
+        self._keep_trans_cache = metadata["_keep_trans_cache"]
         self._scaling_recipe = metadata["_scaling_recipe"]
         self._scaling_recipe_for_trans = metadata["_scaling_recipe_for_trans"]
         self._data = data
-        self._scale = inner_tensors["_scale"]
+        self._scale_inv = inner_tensors["_scale_inv"]
         self._data_t = inner_tensors.get("_data_t")
-        self._scale_t = inner_tensors.get("_scale_t")
+        self._scale_inv_t = inner_tensors.get("_scale_inv_t")
         return self
 
     # ------------------------------------------------------------------

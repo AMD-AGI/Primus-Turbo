@@ -38,7 +38,7 @@ enum class QuantizeMode { ROWWISE, COLWISE };
 constexpr int MXFP4_BLOCK_SIZE = 32;
 constexpr int MXFP8_BLOCK_SIZE = 32;
 
-struct MXScalingRecipe {
+struct ScalingRecipe {
     bool use_2d_block = false;
     bool use_sr       = false;
     bool use_rht      = false;
@@ -82,14 +82,14 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int rowwise_scale_stride, int colwise_scale_stride,
                               int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
-                              int colwise_scale_N_pad, detail::MXScalingRecipe rowwise_recipe,
-                              detail::MXScalingRecipe colwise_recipe, hipStream_t stream);
+                              int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
+                              detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
                          detail::QuantizeMode mode, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         detail::MXScalingRecipe recipe, hipStream_t stream);
+                         detail::ScalingRecipe recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
@@ -98,14 +98,14 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
                               int colwise_scale_stride, int rowwise_scale_N,
                               int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
                               int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
-                              detail::MXScalingRecipe rowwise_recipe,
-                              detail::MXScalingRecipe colwise_recipe, hipStream_t stream);
+                              detail::ScalingRecipe rowwise_recipe,
+                              detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                          detail::QuantizeMode mode, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         detail::MXScalingRecipe recipe, hipStream_t stream);
+                         detail::ScalingRecipe recipe, hipStream_t stream);
 
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
