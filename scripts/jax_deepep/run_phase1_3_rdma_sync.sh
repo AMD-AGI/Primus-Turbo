@@ -1,0 +1,17 @@
+#!/bin/bash
+set -e
+echo "=== Phase 1.3: RDMA Sync Test ==="
+echo "Host: $(hostname)"
+pip install nanobind 2>&1 | tail -1
+
+echo "=== Build UCCL-EP ==="
+cd /workspace/internode-deepep/uccl/ep
+make -f Makefile.rocm_jax clean 2>&1 | tail -1
+mkdir -p build
+make -f Makefile.rocm_jax -j8 2>&1
+echo "MAKE_EXIT=$?"
+ls -la ep.abi3.so && echo "BUILD OK" || { echo "BUILD FAILED"; exit 1; }
+
+echo "=== Test: RDMA Sync ==="
+python3 -u bench/test_rdma_sync.py 2>&1
+echo "=== exit code: $? ==="
