@@ -12,20 +12,26 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
     float8_e4m3,
+    float8_e5m2,
     is_fp8_dtype,
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from tests.pytorch.test_utils import get_tolerances
 
 DEVICE = "cuda"
 M, N = 256, 512
 BLOCK_SIZE_1D = 128
 BLOCK_SIZE_2D = 128
 
+# FP8 dtypes to cover across tests.
+_FP8_DTYPES = [float8_e4m3, float8_e5m2]
+
 
 def _make_quantized_tensor(
     x: torch.Tensor,
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE,
-    block_size=None,
+    block_size: int = MXFP8_BLOCK_SIZE,
+    dest_dtype: torch.dtype = float8_e4m3,
     keep_trans_cache: bool = False,
     use_2d_block: bool = False,
 ) -> QuantizedTensor:
@@ -39,20 +45,18 @@ def _make_quantized_tensor(
     kwargs = dict(keep_trans_cache=keep_trans_cache)
 
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        bs = block_size or MXFP8_BLOCK_SIZE
         recipe = ScalingRecipe(use_2d_block=use_2d_block)
-        kwargs["block_size"] = bs
+        kwargs["block_size"] = block_size
         kwargs["scaling_recipe"] = recipe
         kwargs["scaling_recipe_for_trans"] = recipe
     elif granularity == ScalingGranularity.BLOCKWISE:
-        bs = block_size or BLOCK_SIZE_1D
-        kwargs["block_size"] = bs
+        kwargs["block_size"] = block_size
         if use_2d_block:
             kwargs["scaling_recipe"] = ScalingRecipe(use_2d_block=True)
             kwargs["scaling_recipe_for_trans"] = ScalingRecipe(use_2d_block=True)
     # TENSORWISE / ROWWISE: nothing else needed.
 
-    return QuantizedTensor(x, float8_e4m3, granularity, **kwargs)
+    return QuantizedTensor(x, dest_dtype, granularity, **kwargs)
 
 
 def _expected_scale_shape(granularity: ScalingGranularity, M_: int, N_: int, block_size, use_2d_block: bool):
@@ -85,12 +89,14 @@ _GRAN_1D_CASES = [
 class TestQuantizedTensorBasic:
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_create_and_properties(self, granularity, block_size, dtype):
+    def test_create_and_properties(self, granularity, block_size, dest_dtype, dtype):
         x = torch.randn(M, N, dtype=dtype, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
+        qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
         assert qt.dtype == dtype
+        assert qt.real_dtype == dest_dtype
         assert is_fp8_dtype(qt.real_dtype)
         assert qt.data is not None
         assert qt.scale_inv is not None
@@ -100,88 +106,69 @@ class TestQuantizedTensorBasic:
         assert qt.block_size == block_size
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
-    def test_data_is_fp8(self, granularity, block_size):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_data_is_fp8(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
+        qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
-        assert is_fp8_dtype(qt.data.dtype)
+        assert qt.data.dtype == dest_dtype
         assert qt.data.shape == torch.Size([M, N])
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
-    def test_scale_shape(self, granularity, block_size):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_scale_shape(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
+        qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
         expected = _expected_scale_shape(granularity, M, N, block_size, use_2d_block=False)
         assert (
             tuple(qt.scale_inv.shape) == expected
-        ), f"{granularity.name}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+        ), f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
 
-    def test_blockwise_2d_weight(self):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_blockwise_2d_weight(self, dest_dtype):
         """BLOCKWISE with use_2d_block=True produces a (M/bs, N/bs) weight-style scale."""
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         qt = _make_quantized_tensor(
-            x, granularity=ScalingGranularity.BLOCKWISE, block_size=BLOCK_SIZE_2D, use_2d_block=True
+            x,
+            granularity=ScalingGranularity.BLOCKWISE,
+            dest_dtype=dest_dtype,
+            block_size=BLOCK_SIZE_2D,
+            use_2d_block=True,
         )
 
-        assert is_fp8_dtype(qt.data.dtype)
+        assert qt.data.dtype == dest_dtype
         assert qt.data.shape == torch.Size([M, N])
         assert tuple(qt.scale_inv.shape) == (M // BLOCK_SIZE_2D, N // BLOCK_SIZE_2D)
 
 
 # =====================================================================
 # Dequantization accuracy
+# Uses the same tolerance policy as tests/pytorch/ops/test_quantization.py:
+#   torch.testing.assert_close(..., **get_tolerances(dest_dtype))
 # NOTE: dequantize_fp8 currently only supports TENSORWISE and MX_BLOCKWISE.
 # ROWWISE / BLOCKWISE dequantize kernels are not implemented yet.
 # =====================================================================
 _DEQUANT_CASES = [
-    (ScalingGranularity.TENSORWISE, None, 20),
-    (ScalingGranularity.MX_BLOCKWISE, MXFP8_BLOCK_SIZE, 20),
+    (ScalingGranularity.TENSORWISE, None),
+    (ScalingGranularity.MX_BLOCKWISE, MXFP8_BLOCK_SIZE),
 ]
 
 
 class TestDequantize:
 
-    @pytest.mark.parametrize("granularity,block_size,_snr", _DEQUANT_CASES)
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_dequantize_roundtrip(self, granularity, block_size, _snr, dtype):
-        x = torch.randn(M, N, dtype=dtype, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
+    @pytest.mark.parametrize("granularity,block_size", _DEQUANT_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_dequantize_roundtrip_close(self, granularity, block_size, dest_dtype):
+        """Quant -> dequant roundtrip should be close to the original within
+        FP8 tolerances (rtol=atol=1e-1), matching test_quantization.py policy.
+        """
+        torch.manual_seed(42)
+        x = torch.rand(M, N, dtype=torch.bfloat16, device=DEVICE)
+        qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
         x_recon = qt.dequantize()
-        assert x_recon.dtype == dtype
-        assert x_recon.shape == x.shape
-
-        mean_abs_err = (x - x_recon).abs().mean().item()
-        assert mean_abs_err < 0.1, f"{granularity.name}: mean abs error too high: {mean_abs_err}"
-
-    @pytest.mark.parametrize("granularity,block_size,snr_threshold", _DEQUANT_CASES)
-    def test_dequantize_snr(self, granularity, block_size, snr_threshold):
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
-
-        x_recon = qt.dequantize()
-        noise = (x - x_recon).float()
-        signal_power = x.float().pow(2).mean()
-        noise_power = noise.pow(2).mean()
-        snr_db = 10 * torch.log10(signal_power / noise_power).item()
-        assert snr_db > snr_threshold, f"{granularity.name}: SNR={snr_db:.2f} dB < threshold {snr_threshold}"
-
-    @pytest.mark.parametrize(
-        "granularity,block_size",
-        [
-            (ScalingGranularity.ROWWISE, None),
-            (ScalingGranularity.BLOCKWISE, BLOCK_SIZE_1D),
-        ],
-    )
-    def test_dequantize_raises_for_unimplemented(self, granularity, block_size):
-        """ROWWISE / BLOCKWISE dequantize kernels aren't implemented yet; verify
-        the NotImplementedError is surfaced so users get a clear signal."""
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
-
-        with pytest.raises(NotImplementedError):
-            qt.dequantize()
+        torch.testing.assert_close(x_recon, x, **get_tolerances(dest_dtype))
 
 
 # =====================================================================
@@ -190,13 +177,20 @@ class TestDequantize:
 class TestKeepTransCache:
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
-    def test_keep_trans_cache_populates_fields(self, granularity, block_size):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_keep_trans_cache_populates_fields(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size, keep_trans_cache=True)
+        qt = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+            keep_trans_cache=True,
+        )
 
         assert qt._data_t is not None
         assert qt._scale_inv_t is not None
-        assert is_fp8_dtype(qt._data_t.dtype)
+        assert qt._data_t.dtype == dest_dtype
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
     def test_no_trans_cache_leaves_fields_none(self, granularity, block_size):
@@ -268,9 +262,10 @@ class TestRepr:
 class TestSerialization:
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
-    def test_flatten_unflatten_roundtrip(self, granularity, block_size):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_flatten_unflatten_roundtrip(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size)
+        qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
         keys, metadata = qt.__tensor_flatten__()
         assert "_data" in keys
@@ -281,6 +276,7 @@ class TestSerialization:
         inner = {"_data": qt._data, "_scale_inv": qt._scale_inv}
         qt2 = QuantizedTensor.__tensor_unflatten__(inner, metadata, qt.shape, qt.stride())
         assert qt2.dtype == qt.dtype
+        assert qt2.real_dtype == dest_dtype
         assert qt2.shape == qt.shape
         assert qt2.granularity == qt.granularity
         assert qt2.block_size == qt.block_size
@@ -288,9 +284,16 @@ class TestSerialization:
         assert torch.equal(qt2._scale_inv, qt._scale_inv)
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
-    def test_flatten_unflatten_with_trans(self, granularity, block_size):
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_flatten_unflatten_with_trans(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size, keep_trans_cache=True)
+        qt = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+            keep_trans_cache=True,
+        )
 
         keys, metadata = qt.__tensor_flatten__()
         assert "_data_t" in keys
