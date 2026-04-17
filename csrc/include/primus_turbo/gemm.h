@@ -42,6 +42,7 @@ inline size_t hipblaslt_dtype_bytes(hipDataType dtype) {
 
 int64_t get_hipblaslt_workspace_size_in_byte();
 
+// Run a GEMM using the heuristic algorithm at algo_index (0 = top-ranked).
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
                          const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
                          hipblasOperation_t transA, const void *B, const hipDataType B_type,
@@ -51,7 +52,19 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
                          const bool                         use_low_precision,
                          const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
-                         hipStream_t stream);
+                         hipStream_t stream, const int algo_index = 0);
+
+// Query how many heuristic algorithms are available for this problem.
+int hipblaslt_gemm_get_algo_count(const void *A, const hipDataType A_type, const int64_t rows_a,
+                                  const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
+                                  hipblasOperation_t transA, const void *B,
+                                  const hipDataType B_type, const int64_t rows_b,
+                                  const int64_t cols_b, const int64_t ldb, const void *scaleB_inv,
+                                  hipblasOperation_t transB, const hipDataType D_type,
+                                  const int64_t rows_d, const int64_t cols_d, const int64_t ldd,
+                                  const int64_t workspace_size, const bool use_low_precision,
+                                  hipblasLtMatmulMatrixScale_t scale_mode,
+                                  hipblasLtHandle_t            handle);
 
 //==================================================================
 //  CK GEMM

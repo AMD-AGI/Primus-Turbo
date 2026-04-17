@@ -9,7 +9,7 @@
 namespace primus_turbo::pytorch {
 
 at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
-                               bool transA, bool transB, bool transC) {
+                               bool transA, bool transB, bool transC, int64_t algo_index) {
     const int64_t m = transA ? A.size(1) : A.size(0);
     const int64_t n = transB ? B.size(0) : B.size(1);
 
@@ -21,8 +21,8 @@ at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType 
 at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity) {
-    return hipblaslt_gemm_meta(A, B, out_dtype, transA, transB, transC);
+                                   const std::string &granularity, int64_t algo_index) {
+    return hipblaslt_gemm_meta(A, B, out_dtype, transA, transB, transC, algo_index);
 }
 
 at::Tensor ck_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,

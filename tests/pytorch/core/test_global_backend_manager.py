@@ -23,6 +23,7 @@ def clean_backend_state(monkeypatch):
         "PRIMUS_TURBO_GROUPED_GEMM_BACKEND",
         "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND",
         "PRIMUS_TURBO_AUTO_TUNE",
+        "PRIMUS_TURBO_HIPBLASLT_TUNE_MAX_ALGOS",
     ):
         monkeypatch.delenv(key, raising=False)
     yield
@@ -117,6 +118,36 @@ class TestGlobalBackendManagerFunction:
         assert GlobalBackendManager.auto_tune_enabled() is True
         GlobalBackendManager.set_auto_tune(False)
         assert GlobalBackendManager.auto_tune_enabled() is False
+
+    def test_set_auto_tune_levels(self):
+        """Level 0=off, 1=backend selection, 2=backend+algo tuning."""
+        GlobalBackendManager.set_auto_tune(0)
+        assert GlobalBackendManager.auto_tune_level() == 0
+        assert GlobalBackendManager.auto_tune_enabled() is False
+
+        GlobalBackendManager.set_auto_tune(1)
+        assert GlobalBackendManager.auto_tune_level() == 1
+        assert GlobalBackendManager.auto_tune_enabled() is True
+
+        GlobalBackendManager.set_auto_tune(2)
+        assert GlobalBackendManager.auto_tune_level() == 2
+        assert GlobalBackendManager.auto_tune_enabled() is True
+
+    def test_set_auto_tune_backward_compat(self):
+        """True maps to level 1, False to 0, None defers to env."""
+        GlobalBackendManager.set_auto_tune(True)
+        assert GlobalBackendManager.auto_tune_level() == 1
+
+        GlobalBackendManager.set_auto_tune(False)
+        assert GlobalBackendManager.auto_tune_level() == 0
+
+        GlobalBackendManager.set_auto_tune(None)
+        assert GlobalBackendManager.auto_tune_level() == 0  # env default is "0"
+
+    def test_auto_tune_env_level_2(self, monkeypatch):
+        monkeypatch.setenv("PRIMUS_TURBO_AUTO_TUNE", "2")
+        assert GlobalBackendManager.auto_tune_level() == 2
+        assert GlobalBackendManager.auto_tune_enabled() is True
 
     def test_reset_clears_code_settings(self):
         self._init_gemm_backend()
