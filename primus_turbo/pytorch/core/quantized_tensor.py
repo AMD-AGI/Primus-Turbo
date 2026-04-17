@@ -95,15 +95,20 @@ class QuantizedTensor(torch.Tensor):
                 scaling_recipe=scaling_recipe,
             )
 
+        # NOTE: use the *original* tensor's size / stride for the wrapper.
+        # Some quantization kernels (e.g. MXFP8) pad the inner-dim to a
+        # multiple of block_size, which would otherwise make the wrapper
+        # shape diverge from the high-precision source tensor — breaking
+        # autograd's gradient-shape check.
         self = torch.Tensor._make_wrapper_subclass(
             cls,
-            data_.size(),
-            strides=data_.stride(),
-            storage_offset=data_.storage_offset(),
+            data.size(),
+            strides=data.stride(),
+            storage_offset=data.storage_offset(),
             dtype=orig_dtype,
-            layout=data_.layout,
+            layout=data.layout,
             requires_grad=data.requires_grad,
-            device=data_.device,
+            device=data.device,
         )
         self._orig_dtype = orig_dtype
         self._dest_dtype = dest_dtype

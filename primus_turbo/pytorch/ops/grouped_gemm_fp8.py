@@ -49,7 +49,7 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
 
 
-class GroupedGemmFP8BlockFunc(torch.autograd.Function):
+class FP8GroupedGemmBlockFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -180,7 +180,7 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None
 
 
-class GroupedGemmFP8RowFunc(torch.autograd.Function):
+class FP8GroupedGemmRowFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -284,7 +284,7 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None
 
 
-class GroupedGemmFP8TensorFunc(torch.autograd.Function):
+class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -395,10 +395,10 @@ def grouped_gemm_fp8(
     args = (a, b, group_lens, group_offs, trans_b, config, num_cu)
 
     if config.granularity == ScalingGranularity.TENSORWISE:
-        return GroupedGemmFP8TensorFunc.apply(*args)
+        return FP8GroupedGemmTensorFunc.apply(*args)
     elif config.granularity == ScalingGranularity.ROWWISE:
-        return GroupedGemmFP8RowFunc.apply(*args)
+        return FP8GroupedGemmRowFunc.apply(*args)
     elif config.granularity == ScalingGranularity.BLOCKWISE:
-        return GroupedGemmFP8BlockFunc.apply(*args)
+        return FP8GroupedGemmBlockFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

@@ -14,6 +14,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
@@ -331,11 +332,19 @@ def _run_gemm_fp8_quantized_tensor_test(
     dtype: torch.dtype,
     granularity: ScalingGranularity,
     block_size: int | None = None,
-    quantize_b: bool = True,
+    backend: BackendType | None = None,
+    auto_tune: bool = False,
 ):
     """Shared helper: externally quantize a (and optionally b) into QuantizedTensor,
     pass them into gemm_fp8, and validate forward/backward SNR vs a bf16/fp16 ref.
     """
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
     device = "cuda:0"
     torch.manual_seed(42)
 
@@ -362,28 +371,50 @@ def _run_gemm_fp8_quantized_tensor_test(
         config = Float8QuantConfig(granularity=granularity, format=format)
 
     # Externally construct QuantizedTensor.
-    # TENSORWISE: keep_trans_cache not needed (scale_inv is invariant).
-    # ROWWISE/BLOCKWISE: keep_trans_cache=True to cache both row-wise and col-wise scales.
-    keep_trans = granularity != ScalingGranularity.TENSORWISE
+    #   - TENSORWISE: no trans cache (scale_inv is invariant)
+    #   - ROWWISE / BLOCKWISE: keep_trans_cache=True caches both row-wise
+    #     and col-wise scales for forward + backward
+    # Weights (b) commonly use 2D-block scaling for both BLOCKWISE and
+    # MX_BLOCKWISE. In BLOCKWISE with 2D block, the weight scale is symmetric
+    # along row/col so no trans cache is needed.
     fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
+
+    # a: activation
+    a_kwargs = dict(keep_trans_cache=granularity != ScalingGranularity.TENSORWISE)
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        a_kwargs["scaling_recipe"] = ScalingRecipe()
+        a_kwargs["scaling_recipe_for_trans"] = ScalingRecipe()
 
     qt_a = QuantizedTensor(
         a,
         fwd_dtype,
         config.granularity,
         block_size=config.block_size,
-        keep_trans_cache=keep_trans,
+        **a_kwargs,
     )
-    if quantize_b:
-        qt_b = QuantizedTensor(
-            b,
-            fwd_dtype,
-            config.granularity,
-            block_size=config.block_size,
-            keep_trans_cache=keep_trans,
-        )
+
+    b_kwargs = dict()
+    if granularity == ScalingGranularity.BLOCKWISE:
+        # 2D-block weight: scale is symmetric along row/col, no trans cache needed.
+        b_kwargs["keep_trans_cache"] = False
+        b_kwargs["scaling_recipe"] = ScalingRecipe(use_2d_block=True)
+        b_kwargs["scaling_recipe_for_trans"] = ScalingRecipe(use_2d_block=True)
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
+        # MX uses fused dual-direction kernel; cache both directions at construction time.
+        b_kwargs["keep_trans_cache"] = True
+        b_kwargs["scaling_recipe"] = ScalingRecipe(use_2d_block=True)
+        b_kwargs["scaling_recipe_for_trans"] = ScalingRecipe(use_2d_block=True)
     else:
-        qt_b = b  # BLOCKWISE: weight must stay as raw tensor (2D-block quant)
+        # TENSORWISE / ROWWISE: mirror a.
+        b_kwargs["keep_trans_cache"] = a_kwargs["keep_trans_cache"]
+
+    qt_b = QuantizedTensor(
+        b,
+        fwd_dtype,
+        config.granularity,
+        block_size=config.block_size,
+        **b_kwargs,
+    )
 
     # Reference
     a_mat = a_ref
@@ -411,12 +442,14 @@ def _run_gemm_fp8_quantized_tensor_test(
     b_grad_snr = compute_snr(b_ref.grad, b_grad)
     print(
         f"\n[QT-{granularity.name}] M={m}, N={n}, K={k}, layout={layout}, "
-        f"format={format}, dtype={dtype}: "
+        f"format={format}, dtype={dtype}, backend={backend}, auto_tune={auto_tune}: "
         f"C-SNR={c_snr:.2f} dB, AGrad-SNR={a_grad_snr:.2f} dB, BGrad-SNR={b_grad_snr:.2f} dB"
     )
     assert c_snr > snr_threshold, f"c_snr={c_snr:.2f} too low"
     assert a_grad_snr > snr_threshold, f"a_grad_snr={a_grad_snr:.2f} too low"
     assert b_grad_snr > snr_threshold, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+    GlobalBackendManager.reset()
 
 
 @pytest.mark.parametrize("m", [512, 1024])
@@ -425,7 +458,8 @@ def _run_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype):
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
+def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """TENSORWISE gemm with pre-quantized QuantizedTensor inputs."""
     _run_gemm_fp8_quantized_tensor_test(
         m=m,
@@ -435,6 +469,7 @@ def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype):
         format=format,
         dtype=dtype,
         granularity=ScalingGranularity.TENSORWISE,
+        backend=backend,
     )
 
 
@@ -444,7 +479,8 @@ def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype):
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype):
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
+def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """ROWWISE gemm with pre-quantized QuantizedTensor inputs (keep_trans_cache=True)."""
     _run_gemm_fp8_quantized_tensor_test(
         m=m,
@@ -454,6 +490,7 @@ def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype):
         format=format,
         dtype=dtype,
         granularity=ScalingGranularity.ROWWISE,
+        backend=backend,
     )
 
 
@@ -464,9 +501,12 @@ def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype):
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
-def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, block_size):
-    """BLOCKWISE gemm: a is QuantizedTensor (1D-block, keep_trans_cache=True),
-    b stays as a raw tensor since weight needs 2D-block quantization.
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
+def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, block_size, backend):
+    """BLOCKWISE gemm with pre-quantized QuantizedTensor inputs.
+
+    - a (activation): 1D-block with keep_trans_cache=True
+    - b (weight):     2D-block (use_2d_block=True), no trans cache needed
     """
     _run_gemm_fp8_quantized_tensor_test(
         m=m,
@@ -477,7 +517,7 @@ def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, blo
         dtype=dtype,
         granularity=ScalingGranularity.BLOCKWISE,
         block_size=block_size,
-        quantize_b=False,  # weight uses 2D-block quant, keep as raw tensor
+        backend=backend,
     )
 
 
@@ -488,8 +528,7 @@ def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, blo
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO])
-@pytest.mark.parametrize("auto_tune", [False, True])
-def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend, auto_tune):
+def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "m, n and k must be multiples of 16"
 
@@ -514,7 +553,6 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         dtype=dtype,
         granularity=ScalingGranularity.MX_BLOCKWISE,
         backend=backend,
-        auto_tune=auto_tune,
         block_size=32,
     )
 
