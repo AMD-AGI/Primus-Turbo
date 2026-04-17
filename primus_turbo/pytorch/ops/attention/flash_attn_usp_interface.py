@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
@@ -22,6 +23,8 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _infer_qkv_format,
+    _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
 )
@@ -54,9 +57,17 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         is_grad_enabled,
         ulysses_group,
         ring_group,
-        is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
+        qkv_format: Optional[str] = "bshd",
     ):
+        # MI355 (gfx950): better perf when is_v3_atomic_fp32=False
+        # Controlled by env var PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32
+        is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
+
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        if get_device_compute_capability() >= (9, 5):
+            how_v3_bf16_cvt = 0
+
         assert bias is None
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -65,11 +76,18 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
         _, _, h_kv, d_v = v.shape
+        # Shape is always [b, s, h, d]; sbhd is encoded in strides.
+        # transpose(0,1) yields a contiguous [s, b, h, d] view for A2A.
+        if qkv_format == "sbhd":
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+            seq_dim = 0
+        else:
+            seq_dim = 1
         s = s * n
         assert h_q % n == 0
         assert h_kv % n == 0
-        # bshd only
-        seq_dim = 1
         attn_helper = get_attention_cp_a2a_helper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n)
 
         qkv = attn_helper.combine_qkv_before_a2a(q, k, v)
@@ -82,6 +100,12 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             k_local_heads = torch.nn.functional.pad(k_local_heads, [0, 8 - d_qk % 8])
         if d_v % 8 != 0:
             v_local_heads = torch.nn.functional.pad(v_local_heads, [0, 8 - d_v % 8])
+
+        # Ring attention kernel expects shape [b, s, h, d].
+        if qkv_format == "sbhd":
+            q_local_heads = q_local_heads.transpose(0, 1)
+            k_local_heads = k_local_heads.transpose(0, 1)
+            v_local_heads = v_local_heads.transpose(0, 1)
 
         assert not return_softmax
         assert dropout_p == 0.0
@@ -100,6 +124,7 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=True,
             return_softmax=return_softmax and dropout_p > 0,
+            qkv_format=qkv_format,
         )
 
         if is_grad:
@@ -120,14 +145,20 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             ctx.ulysses_group = ulysses_group
             ctx.ring_group = ring_group
             ctx.seq_dim = seq_dim
+            ctx.qkv_format = qkv_format
 
         output_local_heads = out_padded[..., :d_v]
+        # Transpose ring-attn output back to A2A layout [s, b, h, d].
+        if qkv_format == "sbhd":
+            output_local_heads = output_local_heads.transpose(0, 1)
         output_local_heads = attn_helper.reshape_o_before_a2a(output_local_heads)
         output_local_tokens = torch.empty_like(output_local_heads)
         torch.distributed.all_to_all_single(
             output_local_tokens, output_local_heads, group=ulysses_group, async_op=False
         )
         output_local_tokens = attn_helper.reshape_o_after_a2a(output_local_tokens)
+        if qkv_format == "sbhd":
+            output_local_tokens = output_local_tokens.transpose(0, 1)
 
         result = [output_local_tokens]
         if return_lse:
@@ -149,6 +180,10 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         ) = ctx.saved_tensors
         attn_helper = ctx.attn_helper
 
+        # dout carries sbhd strides; transpose to contiguous for A2A view ops.
+        if ctx.qkv_format == "sbhd":
+            dout = dout.transpose(0, 1)
+
         dout = attn_helper.reshape_do_before_a2a(dout)
 
         dout_local_heads = torch.empty_like(dout)
@@ -167,6 +202,10 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             v_local_heads = torch.nn.functional.pad(v_local_heads, [0, d_qk - d_v])
             output_padded = torch.nn.functional.pad(output_padded, [0, d_qk - d_v])
             dout_padded = torch.nn.functional.pad(dout_local_heads, [0, d_qk - d_v])
+
+        # Transpose dout_padded back to [b, s, h, d] for ring attention kernel.
+        if ctx.qkv_format == "sbhd":
+            dout_padded = dout_padded.transpose(0, 1)
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
@@ -189,16 +228,28 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            qkv_format=ctx.qkv_format,
         )
 
         dq = dq[..., :d_qk]  # We could have padded the head dimension
         dk = dk[..., :d_qk]
         dv = dv[..., :d_v]
 
+        # Transpose back to A2A layout for gradient all-to-all.
+        if ctx.qkv_format == "sbhd":
+            dq = dq.transpose(0, 1)
+            dk = dk.transpose(0, 1)
+            dv = dv.transpose(0, 1)
+
         dqkv = attn_helper.combine_dqkv_before_a2a(dq, dk, dv)
         dqkv_out = torch.empty_like(dqkv)
         torch.distributed.all_to_all_single(dqkv_out, dqkv, group=ctx.ulysses_group)
         dq_local_tokens, dk_local_tokens, dv_local_tokens = attn_helper.split_dqkv_after_a2a(dqkv_out)
+
+        if ctx.qkv_format == "sbhd":
+            dq_local_tokens = dq_local_tokens.transpose(0, 1)
+            dk_local_tokens = dk_local_tokens.transpose(0, 1)
+            dv_local_tokens = dv_local_tokens.transpose(0, 1)
 
         return (
             dq_local_tokens,
@@ -421,10 +472,11 @@ def flash_attn_usp_func(
     return_attn_probs=False,
     ulysses_group=None,
     ring_group=None,
+    qkv_format: Optional[str] = None,
 ):
-    assert (
-        ulysses_group and ring_group
-    ), "ulysses_group and ring_group must be set while calling usp attention"
+    if qkv_format is None:
+        qkv_format = _infer_qkv_format(q, k, v)
+
     return AttentionCKFunctionCPA2A.apply(
         q,
         k,
@@ -441,6 +493,8 @@ def flash_attn_usp_func(
         torch.is_grad_enabled(),
         ulysses_group,
         ring_group,
+        1,
+        qkv_format,
     )
 
 
@@ -461,9 +515,12 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    assert (
-        ulysses_group and ring_group
-    ), "ulysses_group and ring_group must be set while calling usp attention"
+    qkv_format = _infer_qkv_format(q, k, v)
+
+    if qkv_format == "sbhd":
+        q = q.permute(1, 0, 2, 3).contiguous()
+        k = k.permute(1, 0, 2, 3).contiguous()
+        v = v.permute(1, 0, 2, 3).contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
@@ -482,7 +539,7 @@ def flash_attn_fp8_usp_func(
             f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
         )
 
-    return AttentionTritonFunctionCPA2A.apply(
+    o = AttentionTritonFunctionCPA2A.apply(
         q,
         k,
         v,
@@ -499,3 +556,8 @@ def flash_attn_fp8_usp_func(
         ulysses_group,
         ring_group,
     )
+
+    if qkv_format == "sbhd":
+        o = o.permute(1, 0, 2, 3).contiguous()
+
+    return o

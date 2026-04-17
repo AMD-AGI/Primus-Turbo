@@ -22,6 +22,7 @@ from aiter.ops.triton.attention.mha import (
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import KernelBackend
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 
 def _is_power_of_2(n: int) -> bool:
@@ -41,17 +42,29 @@ def _normalize_sink_window(causal: bool, window_size_left: int, window_size_righ
 # =============================================================================
 
 
+_SUPPORTED_QKV_FORMATS = ["sbhd", "bshd"]
+
+
 class AttnFwdAiterBackend(KernelBackend):
+
     @staticmethod
     def can_handle(**kwargs) -> bool:
         q = kwargs["q"]
         v = kwargs["v"]
-        sink = kwargs.get("sink", None)
-        if sink is None:
-            return True
         head_dim_qk = q.shape[-1]
         head_dim_v = v.shape[-1]
-        return head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+
+        sink = kwargs.get("sink", None)
+        qkv_format = kwargs["qkv_format"]
+
+        if sink is not None and qkv_format == "sbhd":
+            # sink attention is not supported for sbhd format
+            return False
+
+        supported = kwargs["qkv_format"] in _SUPPORTED_QKV_FORMATS
+        supported &= head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+
+        return supported
 
     @staticmethod
     def execute(
@@ -70,9 +83,26 @@ class AttnFwdAiterBackend(KernelBackend):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = "sbhd",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
+        batch_size, seq_len, num_heads_qk, head_dim_qk = q.size()
+        _, _, _, head_dim_v = v.size()
+
+        out = None
         if sink is None:
-            out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            if qkv_format == "sbhd":
+                out = torch.empty(
+                    (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
+                ).permute(1, 0, 2, 3)
+            else:
+                # BSHD
+                assert qkv_format == "bshd"
+                out = torch.empty(
+                    (batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
+                )
+
+            _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
                 q,
                 k,
                 v,
@@ -89,22 +119,24 @@ class AttnFwdAiterBackend(KernelBackend):
                 None,  # v_descale
                 return_lse,
                 return_softmax,
+                out=out,
             )
         else:
-            head_dim_qk = q.shape[-1]
-            head_dim_v = v.shape[-1]
+            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
+
             if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
                 raise ValueError(
                     "Triton sink attention requires head_dim_qk == head_dim_v and head_dim power-of-2"
                 )
+
             if max_seqlen_q is None:
-                max_seqlen_q = q.shape[1]
+                max_seqlen_q = q.size(1)
             if max_seqlen_k is None:
-                max_seqlen_k = k.shape[1]
+                max_seqlen_k = k.size(1)
             window_size_left, window_size_right = _normalize_sink_window(
                 causal, window_size_left, window_size_right
             )
-            out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
+            out, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
                 q,
                 k,
                 v,
@@ -123,7 +155,7 @@ class AttnFwdAiterBackend(KernelBackend):
             )
             rng_state = torch.tensor([philox_seed, philox_offset], dtype=torch.int64, device="cpu")
 
-        return out_padded, softmax_lse, S_dmask, rng_state
+        return out, softmax_lse, S_dmask, rng_state
 
 
 # =============================================================================
@@ -132,16 +164,31 @@ class AttnFwdAiterBackend(KernelBackend):
 
 
 class AttnBwdAiterBackend(KernelBackend):
+
     @staticmethod
     def can_handle(**kwargs) -> bool:
         q = kwargs["q"]
         v = kwargs["v"]
+        head_dim_qk = q.size(-1)
+        head_dim_v = v.size(-1)
+
         sink = kwargs.get("sink", None)
-        if sink is None:
-            return True
-        head_dim_qk = q.shape[-1]
-        head_dim_v = v.shape[-1]
-        return head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+        qkv_format = kwargs["qkv_format"]
+
+        if sink is not None and qkv_format == "sbhd":
+            # sink attention is not supported for sbhd format
+            return False
+
+        supported = qkv_format in _SUPPORTED_QKV_FORMATS
+        supported &= head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+
+        is_v3_atomic_fp32 = kwargs["is_v3_atomic_fp32"]
+
+        # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
+        if get_device_compute_capability() == (9, 4):
+            supported &= not (qkv_format == "sbhd" and is_v3_atomic_fp32)
+
+        return supported
 
     @staticmethod
     def execute(
@@ -168,6 +215,7 @@ class AttnBwdAiterBackend(KernelBackend):
         how_v3_bf16_cvt: int,
         sink: Optional[torch.Tensor] = None,
         dsink: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = "bshd",
     ):
         if sink is None:
             result = _flash_attn_backward(
@@ -194,6 +242,8 @@ class AttnBwdAiterBackend(KernelBackend):
                 how_v3_bf16_cvt,
             )
         else:
+            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
+
             assert (
                 isinstance(rng_state, torch.Tensor)
                 and rng_state.device.type == "cpu"
@@ -202,6 +252,7 @@ class AttnBwdAiterBackend(KernelBackend):
             ), "Triton backward requires rng_state to be a CPU int64 tensor of shape [2]"
             philox_seed = int(rng_state[0].item())
             philox_offset = int(rng_state[1].item())
+
             result = flash_attn_onekernel_backward(
                 dout,
                 q,
@@ -218,8 +269,8 @@ class AttnBwdAiterBackend(KernelBackend):
                 causal,
                 None,  # cu_seqlens_q
                 None,  # cu_seqlens_k
-                q.shape[1],  # max_seqlen_q
-                k.shape[1],  # max_seqlen_k
+                q.size(1),  # max_seqlen_q
+                k.size(1),  # max_seqlen_k
                 dropout_p,
                 philox_seed,
                 philox_offset,
@@ -229,7 +280,14 @@ class AttnBwdAiterBackend(KernelBackend):
                 sliding_window=window_size_left if window_size_left >= 0 else 0,
             )
 
-        return result
+        return (
+            result,
+            dq,
+            dk,
+            dv,
+            dbias,
+            dsink,
+        )
 
 
 def attention_aiter_forward_impl(
@@ -248,6 +306,7 @@ def attention_aiter_forward_impl(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = "bshd",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
     return AttnFwdAiterBackend.execute(
         q=q,
@@ -265,6 +324,7 @@ def attention_aiter_forward_impl(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         sink=sink,
+        qkv_format=qkv_format,
     )
 
 
@@ -278,7 +338,6 @@ def attention_aiter_backward_impl(
     dq: torch.Tensor,
     dk: torch.Tensor,
     dv: torch.Tensor,
-    dbias: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -290,8 +349,10 @@ def attention_aiter_backward_impl(
     rng_state: Optional[torch.Tensor],
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
-    sink: Optional[torch.Tensor] = None,
+    dbias: Optional[torch.Tensor] = None,
     dsink: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = "bshd",
 ):
     return AttnBwdAiterBackend.execute(
         dout=dout,
@@ -303,7 +364,6 @@ def attention_aiter_backward_impl(
         dq=dq,
         dk=dk,
         dv=dv,
-        dbias=dbias,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -315,6 +375,8 @@ def attention_aiter_backward_impl(
         rng_state=rng_state,
         is_v3_atomic_fp32=is_v3_atomic_fp32,
         how_v3_bf16_cvt=how_v3_bf16_cvt,
-        sink=sink,
+        dbias=dbias,
         dsink=dsink,
+        sink=sink,
+        qkv_format=qkv_format,
     )

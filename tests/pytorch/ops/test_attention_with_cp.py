@@ -80,10 +80,11 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "config": test_cases,
             "causal": [True, False],
             "fp8": [True, False],
+            "qkv_format": ["bshd", "sbhd"],
             "ulysses_degree": [1, 2, 4, 8],
         }
 
-        for batch, config, causal, fp8, ulysses_degree in itertools.product(
+        for batch, config, causal, fp8, qkv_format, ulysses_degree in itertools.product(
             *[test_params[k] for k in test_params]
         ):
             if self.world_size % ulysses_degree != 0:
@@ -92,12 +93,15 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             if fp8 and ring_degree != 1:
                 # Ring attention is currently not supported for FP8
                 continue
+            if fp8 and qkv_format != "bshd":
+                continue
             func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
             self.run_attn_with_cp(
                 func,
                 batch,
                 config,
                 causal,
+                qkv_format,
                 ulysses_degree,
                 ring_degree,
                 device,
@@ -105,7 +109,9 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             )
         dist.destroy_process_group()
 
-    def run_attn_with_cp(self, func, batch, config, causal, ulysses_degree, ring_degree, device, dtype):
+    def run_attn_with_cp(
+        self, func, batch, config, causal, qkv_format, ulysses_degree, ring_degree, device, dtype
+    ):
         cp_group = dist.group.WORLD
         device_mesh = init_device_mesh(
             "cuda",
@@ -121,9 +127,17 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             config.head_dim_qk,
             config.head_dim_v,
         )
-        q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-        k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-        v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+        if qkv_format == "bshd":
+            q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
+            k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
+            v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+            seq_dim = 1
+        else:
+            assert qkv_format == "sbhd"
+            q_layout = (seqlen_q, batch, num_head_q, head_dim_qk)
+            k_layout = (seqlen_kv, batch, num_head_kv, head_dim_qk)
+            v_layout = (seqlen_kv, batch, num_head_kv, head_dim_v)
+            seq_dim = 0
 
         query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
         key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
@@ -133,15 +147,31 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         value_ref = value.clone().detach().requires_grad_()
 
         sm_scale = query.shape[-1] ** (-0.5)
-        o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
+        o_ref = attention_vanilla_forward_pytorch_ref_impl(
+            query_ref, key_ref, value_ref, sm_scale, causal, qkv_format
+        )
 
         grad_ref = torch.randn(*o_ref.shape, device=device, dtype=dtype)
         o_ref.backward(grad_ref)
         o_ref, dq_ref, dk_ref, dv_ref = shard_cp_input(
-            [o_ref, query_ref.grad, key_ref.grad, value_ref.grad], cp_group
+            [o_ref, query_ref.grad, key_ref.grad, value_ref.grad], cp_group, seq_dim
         )
 
-        query_local_token, key_local_token, value_local_token = shard_cp_input([query, key, value], cp_group)
+        query_local_token, key_local_token, value_local_token = shard_cp_input(
+            [query, key, value], cp_group, seq_dim
+        )
+
+        # flash_attn_usp_func expects shape [b, s, h, d] with format encoded
+        # in strides.  The ref tensors are actual [s, b, h, d]; transpose the
+        # sharded inputs so shape becomes [b, s_local, h, d] with sbhd strides.
+        if qkv_format == "sbhd":
+            query_local_token = query_local_token.transpose(0, 1)
+            key_local_token = key_local_token.transpose(0, 1)
+            value_local_token = value_local_token.transpose(0, 1)
+
+        kwargs = {}
+        if func is pt.ops.flash_attn_usp_func:
+            kwargs["qkv_format"] = qkv_format
 
         o = func(
             query_local_token,
@@ -158,11 +188,16 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             return_attn_probs=False,
             ulysses_group=device_mesh["ulysses"].get_group(),
             ring_group=device_mesh["ring"].get_group(),
+            **kwargs,
         )
-        grad = shard_cp_input([grad_ref], cp_group)[0]
+        grad = shard_cp_input([grad_ref], cp_group, seq_dim)[0]
+        if qkv_format == "sbhd":
+            grad = grad.transpose(0, 1)
         o.backward(grad)
 
-        dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group)
+        if qkv_format == "sbhd":
+            o = o.transpose(0, 1)
+        dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group, seq_dim)
         out_snr = compute_snr(o_ref, o)
         query_grad_snr = compute_snr(dq_ref, dq)
         key_grad_snr = compute_snr(dk_ref, dk)
