@@ -100,6 +100,19 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
+    def _bind_device(self) -> None:
+        """Bind the current worker process to its own GPU.
+
+        ``MultiProcContinuousTest._init_pg`` only sets ``LOCAL_RANK`` but does
+        not call ``torch.cuda.set_device``.  Without this call every rank would
+        default to ``cuda:0``, causing NCCL to raise
+        ``Duplicate GPU detected: rank 0 and rank 1 both on CUDA device ...``
+        inside ``Buffer.__init__``'s ``all_gather_object`` and ultimately a
+        GPU memory-access fault in the ``intranode::barrier`` kernel during
+        buffer teardown.
+        """
+        torch.cuda.set_device(self.device)
+
     # ------------------------------------------------------------------
     # Basic dispatch/combine correctness
     # ------------------------------------------------------------------
@@ -108,6 +121,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
     @parametrize("expert_capacity_factor", [None, 0.5])
     def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
+        self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
@@ -123,6 +137,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("backend", _get_backends())
     @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
     def test_worst_tokens(self, backend, permute_max_token_num):
+        self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
@@ -138,8 +153,16 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # ------------------------------------------------------------------
 
     @parametrize("backend", _get_backends())
-    def test_cuda_graph(self, backend):
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+    @parametrize("force_current_stream", [False, True])
+    def test_cuda_graph(self, backend, force_current_stream):
+        self._bind_device()
+        with patch.dict(
+            os.environ,
+            {
+                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
+                "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": "1" if force_current_stream else "0",
+            },
+        ):
             num_worst_tokens = NUM_TOKENS * 8
             permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
 
@@ -183,6 +206,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
     @parametrize("backend", _get_backends())
     def test_autotune(self, backend):
+        self._bind_device()
         with patch.dict(
             os.environ,
             {

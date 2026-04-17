@@ -5,10 +5,20 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import inspect
 import os
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    Union,
+    runtime_checkable,
+)
 
 import torch
 import torch.distributed as dist
@@ -69,26 +79,27 @@ def set_buffer_global_config(
 
 
 # =========================================================================
-# EPBackend ABC
+# EPBackend Protocol
 # =========================================================================
 
 
-class EPBackend(ABC):
-    """Abstract base class for Expert-Parallel communication backends.
+@runtime_checkable
+class EPBackend(Protocol):
+    """Structural (``typing.Protocol``) interface for Expert-Parallel
+    communication backends.
 
     Each backend encapsulates a specific EP library (e.g. in-tree Turbo DeepEP,
     external ``deep_ep``, UCCL-EP, ...) and owns its own buffer lifecycle.
     Adding a new backend is a single-class change plus one
-    ``register_ep_backend()`` call.
+    ``register_ep_backend()`` call — any class that structurally conforms to
+    this Protocol is accepted; no explicit inheritance is required.
     """
 
     @staticmethod
-    @abstractmethod
     def is_available() -> bool:
         """Return True if this backend's dependencies are importable."""
         ...
 
-    @abstractmethod
     def init_buffer(
         self,
         group: dist.ProcessGroup,
@@ -98,7 +109,6 @@ class EPBackend(ABC):
         """(Re-)create the communication buffer if needed."""
         ...
 
-    @abstractmethod
     def dispatch(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -121,7 +131,6 @@ class EPBackend(ABC):
         """
         ...
 
-    @abstractmethod
     def combine(
         self,
         x: torch.Tensor,
@@ -135,14 +144,18 @@ class EPBackend(ABC):
 
 
 # =========================================================================
-# _DeepEPLikeBackend — shared protocol for DeepEP-compatible backends
+# _DeepEPLikeBackend — shared implementation for DeepEP-compatible backends
 # =========================================================================
 
 
-class _DeepEPLikeBackend(EPBackend):
+class _DeepEPLikeBackend:
     """Shared logic for all backends that follow the DeepEP Buffer protocol
     (``get_dispatch_layout`` / ``dispatch`` / ``combine`` / ``set_num_sms`` /
     ``get_dispatch_config`` / ``get_combine_config``).
+
+    This is a plain implementation base class — it does **not** inherit from
+    ``EPBackend``. Conformance to the ``EPBackend`` Protocol is checked
+    structurally by the type system.
 
     Subclasses only need to override ``is_available``, ``_get_module``, and
     optionally ``_make_buffer_kwargs`` to supply backend-specific constructor
@@ -157,12 +170,16 @@ class _DeepEPLikeBackend(EPBackend):
     # ------------------------------------------------------------------
 
     @staticmethod
-    @abstractmethod
+    def is_available() -> bool:
+        """Return True if this backend's dependencies are importable."""
+        raise NotImplementedError
+
+    @staticmethod
     def _get_module():
         """Return the Python module that exposes ``Buffer``, ``Config``,
         ``EventHandle``, ``EventOverlap`` (or a compatible ``utils`` sub-module).
         """
-        ...
+        raise NotImplementedError
 
     def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
         """Extra keyword arguments forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
@@ -358,7 +375,15 @@ class DeepEPBackend(_DeepEPLikeBackend):
         return deep_ep
 
     def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
-        return {"is_intranode": group.size() <= 8}
+        BufferClass = self._get_module().Buffer
+        try:
+            param = inspect.signature(BufferClass).parameters.get("is_intranode")
+        except (TypeError, ValueError):
+            param = None
+        if param is not None and param.default is False:
+            # uccl-ep special handle
+            return {"is_intranode": group.size() <= 8}
+        return {}
 
 
 # =========================================================================
