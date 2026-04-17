@@ -26,7 +26,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
                          const int64_t ldd, void *workspace, const int64_t workspace_size,
                          const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
-                         hipblasLtHandle_t handle, hipStream_t stream) {
+                         hipblasLtHandle_t handle, hipStream_t stream, const int algo_index) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
@@ -69,7 +69,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    const int                                     request_solutions = 1;
+    const int                                     request_solutions = algo_index + 1;
     std::vector<hipblasLtMatmulHeuristicResult_t> algos(request_solutions);
     int                                           returnedAlgoCount = 0;
 
@@ -81,8 +81,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulAlgoGetHeuristic(
         handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference, request_solutions,
         algos.data(), &returnedAlgoCount));
-    PRIMUS_TURBO_CHECK(returnedAlgoCount > 0,
-                       "hipBLASLt: no valid algorithm found for current matmul config");
+    PRIMUS_TURBO_CHECK(returnedAlgoCount > algo_index,
+                       "hipBLASLt: requested algo_index exceeds available algorithms");
 
     const float alpha = 1.0;
     const float beta  = 0.0;
@@ -96,7 +96,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
         &beta,
         D, D_desc,
         D, D_desc,
-        &algos[0].algo,
+        &algos[algo_index].algo,
         workspace, workspace_size,
         stream));
     // clang-format on
@@ -106,6 +106,75 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(A_desc));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescDestroy(operation_desc));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
+}
+
+int hipblaslt_gemm_get_algo_count(const void *A, const hipDataType A_type, const int64_t rows_a,
+                                  const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
+                                  hipblasOperation_t transA, const void *B,
+                                  const hipDataType B_type, const int64_t rows_b,
+                                  const int64_t cols_b, const int64_t ldb, const void *scaleB_inv,
+                                  hipblasOperation_t transB, const hipDataType D_type,
+                                  const int64_t rows_d, const int64_t cols_d, const int64_t ldd,
+                                  const int64_t workspace_size, const bool use_low_precision,
+                                  hipblasLtMatmulMatrixScale_t scale_mode,
+                                  hipblasLtHandle_t            handle) {
+    hipblasLtMatmulDesc_t       operation_desc = nullptr;
+    hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
+    hipblasLtMatmulPreference_t preference        = nullptr;
+    hipblasLtEpilogue_t         epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
+    hipblasComputeType_t        gemm_compute_type = HIPBLAS_COMPUTE_32F;
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&A_desc, A_type, rows_a, cols_a, lda));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&B_desc, B_type, rows_b, cols_b, ldb));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutCreate(&D_desc, D_type, rows_d, cols_d, ldd));
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(
+        hipblasLtMatmulDescCreate(&operation_desc, gemm_compute_type, HIP_R_32F));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+        operation_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+        operation_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+        operation_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
+    if (use_low_precision) {
+        PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
+        PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);
+
+        hipblasLtMatmulDescAttributes_t scaleA_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
+        hipblasLtMatmulDescAttributes_t scaleB_inv_ptr_desc = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
+
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, scaleA_inv_ptr_desc, &scaleA_inv, sizeof(scaleA_inv)));
+        PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescSetAttribute(
+            operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
+    }
+
+    const int                                     max_algos = 32768;
+    std::vector<hipblasLtMatmulHeuristicResult_t> algos(max_algos);
+    int                                           returnedAlgoCount = 0;
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceCreate(&preference));
+    PRIMUS_TURBO_CHECK_HIPBLAS(
+        hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &workspace_size, sizeof(workspace_size)));
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(
+        hipblasLtMatmulAlgoGetHeuristic(handle, operation_desc, A_desc, B_desc, D_desc, D_desc,
+                                        preference, max_algos, algos.data(), &returnedAlgoCount));
+
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(D_desc));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(B_desc));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(A_desc));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulDescDestroy(operation_desc));
+    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
+
+    return returnedAlgoCount;
 }
 
 } // namespace primus_turbo

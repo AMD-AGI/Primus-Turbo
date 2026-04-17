@@ -281,6 +281,13 @@ tasks:
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
     output: grouped_gemm_fp8_blockwise_triton_benchmark.csv
 
+  # ── Online Tuning (level 2) ──────────────────────────────
+  - label: online_tuning_all
+    group: online_tuning
+    script: bench_hipblaslt_algo_tuning.py
+    args: [--max-algos, 100]
+    output: online_tuning_all_benchmark.log
+
   # ── DeepEP (multi-GPU, placed last) ──────────────────────
   - label: deep_ep_intranode
     group: deepep

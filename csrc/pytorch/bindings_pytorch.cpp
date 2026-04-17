@@ -12,14 +12,21 @@ namespace primus_turbo::pytorch {
 
 TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ********* Gemm *********
-    m.def("hipblaslt_gemm(Tensor A, Tensor B, "
-          "ScalarType out_dtype, bool transA, bool transB, bool transC) -> Tensor");
     m.def(
-        "hipblaslt_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
-        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
-    m.def(
-        "hipblaslt_gemm_fp4(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
-        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
+        "hipblaslt_gemm(Tensor A, Tensor B, "
+        "ScalarType out_dtype, bool transA, bool transB, bool transC, int algo_index=0) -> Tensor");
+    m.def("hipblaslt_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+          "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity, int "
+          "algo_index=0) -> Tensor");
+    m.def("hipblaslt_gemm_fp4(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+          "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity, int "
+          "algo_index=0) -> Tensor");
+    m.def("hipblaslt_gemm_algo_count(Tensor A, Tensor B, "
+          "ScalarType out_dtype, bool transA, bool transB, bool transC) -> int");
+    m.def("hipblaslt_gemm_fp8_algo_count(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+          "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> int");
+    m.def("hipblaslt_gemm_fp4_algo_count(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+          "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> int");
     m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
           "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
@@ -86,6 +93,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_gemm", hipblaslt_gemm);
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);
     m.impl("hipblaslt_gemm_fp4", hipblaslt_gemm_fp4);
+    m.impl("hipblaslt_gemm_algo_count", hipblaslt_gemm_algo_count);
+    m.impl("hipblaslt_gemm_fp8_algo_count", hipblaslt_gemm_fp8_algo_count);
+    m.impl("hipblaslt_gemm_fp4_algo_count", hipblaslt_gemm_fp4_algo_count);
     m.impl("ck_gemm_fp8", ck_gemm_fp8);
     m.impl("turbo_gemm_fp8", turbo_gemm_fp8);
     // ********* Quantization *********

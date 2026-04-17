@@ -114,28 +114,43 @@ at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef lay
 //==================================================================
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
-                          bool transB, bool transC);
+                          bool transB, bool transC, int64_t algo_index = 0);
 
 at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
-                               bool transA, bool transB, bool transC);
+                               bool transA, bool transB, bool transC, int64_t algo_index = 0);
 
 at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              int64_t algo_index = 0);
 
 at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, int64_t algo_index = 0);
 
 at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              int64_t algo_index = 0);
 
 at::Tensor hipblaslt_gemm_fp4_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, int64_t algo_index = 0);
+
+int64_t hipblaslt_gemm_algo_count(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
+                                  bool transA, bool transB, bool transC);
+
+int64_t hipblaslt_gemm_fp8_algo_count(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                      at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                      bool transA, bool transB, bool transC,
+                                      const std::string &granularity);
+
+int64_t hipblaslt_gemm_fp4_algo_count(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                      at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                      bool transA, bool transB, bool transC,
+                                      const std::string &granularity);
 
 at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                        const bool transA, const bool transB, at::ScalarType out_dtype,
