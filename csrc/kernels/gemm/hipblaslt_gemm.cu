@@ -129,6 +129,54 @@ struct DescCache {
     hipblasLtMatrixLayout_t B_desc  = nullptr;
     hipblasLtMatrixLayout_t D_desc  = nullptr;
     hipblasLtMatmulDesc_t   op_desc = nullptr;
+
+    DescCache() = default;
+    DescCache(const DescCache &) = delete;
+    DescCache &operator=(const DescCache &) = delete;
+
+    DescCache(DescCache &&other) noexcept
+        : A_desc(other.A_desc), B_desc(other.B_desc), D_desc(other.D_desc), op_desc(other.op_desc) {
+        other.A_desc  = nullptr;
+        other.B_desc  = nullptr;
+        other.D_desc  = nullptr;
+        other.op_desc = nullptr;
+    }
+
+    DescCache &operator=(DescCache &&other) noexcept {
+        if (this != &other) {
+            reset();
+            A_desc       = other.A_desc;
+            B_desc       = other.B_desc;
+            D_desc       = other.D_desc;
+            op_desc      = other.op_desc;
+            other.A_desc = nullptr;
+            other.B_desc = nullptr;
+            other.D_desc = nullptr;
+            other.op_desc = nullptr;
+        }
+        return *this;
+    }
+
+    ~DescCache() { reset(); }
+
+    void reset() {
+        if (A_desc != nullptr) {
+            (void) hipblasLtMatrixLayoutDestroy(A_desc);
+            A_desc = nullptr;
+        }
+        if (B_desc != nullptr) {
+            (void) hipblasLtMatrixLayoutDestroy(B_desc);
+            B_desc = nullptr;
+        }
+        if (D_desc != nullptr) {
+            (void) hipblasLtMatrixLayoutDestroy(D_desc);
+            D_desc = nullptr;
+        }
+        if (op_desc != nullptr) {
+            (void) hipblasLtMatmulDescDestroy(op_desc);
+            op_desc = nullptr;
+        }
+    }
 };
 
 static thread_local std::unordered_map<DescKey, DescCache, DescKeyHash> desc_cache;
@@ -153,6 +201,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
     auto &dc = desc_cache[dkey];
     if (dc.op_desc == nullptr) {
+        dc.reset();
         hipblasLtEpilogue_t  epilogue          = HIPBLASLT_EPILOGUE_DEFAULT;
         hipblasComputeType_t gemm_compute_type = HIPBLAS_COMPUTE_32F;
 
@@ -232,21 +281,37 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&ev_stop));
 
             float best_ms  = 1e30f;
-            int   best_idx = 0;
+            int   best_idx = -1;
             for (int c = 0; c < returnedAlgoCount; ++c) {
+                bool             candidate_ok = true;
+                hipblasStatus_t  status       = HIPBLAS_STATUS_SUCCESS;
+
                 // warm-up
                 for (int w = 0; w < kWarmupIters; ++w) {
-                    (void) hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
-                                           D, D_desc, D, D_desc, &candidates[c].algo, workspace,
-                                           workspace_size, stream);
+                    status = hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
+                                             D, D_desc, D, D_desc, &candidates[c].algo, workspace,
+                                             workspace_size, stream);
+                    if (status != HIPBLAS_STATUS_SUCCESS) {
+                        candidate_ok = false;
+                        break;
+                    }
                 }
+                if (!candidate_ok)
+                    continue;
 
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_start, stream));
                 for (int i = 0; i < kBenchIters; ++i) {
-                    (void) hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
-                                           D, D_desc, D, D_desc, &candidates[c].algo, workspace,
-                                           workspace_size, stream);
+                    status = hipblasLtMatmul(handle, operation_desc, &a1, A, A_desc, B, B_desc, &b0,
+                                             D, D_desc, D, D_desc, &candidates[c].algo, workspace,
+                                             workspace_size, stream);
+                    if (status != HIPBLAS_STATUS_SUCCESS) {
+                        candidate_ok = false;
+                        break;
+                    }
                 }
+                if (!candidate_ok)
+                    continue;
+
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(ev_stop, stream));
                 PRIMUS_TURBO_CHECK_HIP(hipEventSynchronize(ev_stop));
 
@@ -259,6 +324,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             }
             PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_start));
             PRIMUS_TURBO_CHECK_HIP(hipEventDestroy(ev_stop));
+            PRIMUS_TURBO_CHECK(best_idx >= 0,
+                               "hipBLASLt: all autotune candidates failed during benchmarking");
             tuned_algo = candidates[best_idx];
         }
 
@@ -315,7 +382,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
     PRIMUS_TURBO_CHECK_HIPBLAS(status);
 
-    // Descriptors are cached — no destroy needed per call.
+    // Descriptors live in thread-local caches and are released when cache
+    // entries are destroyed, so no per-call destroy is needed here.
 }
 
 } // namespace primus_turbo
