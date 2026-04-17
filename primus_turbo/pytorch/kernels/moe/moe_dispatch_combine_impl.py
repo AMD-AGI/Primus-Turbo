@@ -52,7 +52,13 @@ class EPBufferConfig:
     combine_config: Any = None
 
 
-_buffer_config: Optional[EPBufferConfig] = None
+_DEFAULT_BUFFER_CONFIG = EPBufferConfig(
+    num_sms=32,
+    dispatch_config=None,
+    combine_config=None,
+)
+
+_buffer_config: EPBufferConfig = _DEFAULT_BUFFER_CONFIG
 
 
 def set_buffer_global_config(
