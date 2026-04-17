@@ -108,7 +108,13 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
         c               = at::empty({m, n}, a.options());
     }
 
-    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    const int64_t single_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+    const int64_t grouped_workspace_size =
+        group_lens.numel() * single_workspace_size;
+    const int64_t workspace_size =
+        grouped_workspace_size > primus_turbo::get_hipblaslt_grouped_gemm_workspace_size()
+            ? grouped_workspace_size
+            : primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 
@@ -153,7 +159,13 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
         c               = at::empty({m, n}, a.options().dtype(out_dtype));
     }
 
-    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    const int64_t single_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+    const int64_t grouped_workspace_size =
+        group_lens.numel() * single_workspace_size;
+    const int64_t workspace_size =
+        grouped_workspace_size > primus_turbo::get_hipblaslt_grouped_gemm_workspace_size()
+            ? grouped_workspace_size
+            : primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 

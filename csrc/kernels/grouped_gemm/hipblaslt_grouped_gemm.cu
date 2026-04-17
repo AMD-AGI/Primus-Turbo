@@ -25,7 +25,9 @@ static constexpr size_t kMaxNumStreams = 8;
 static constexpr size_t kSerialThreshold = 512;
 
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
-    // Multi-stream path needs one workspace per stream.
+    // Baseline requirement for the multi-stream path: one workspace per stream.
+    // The PyTorch wrapper may over-allocate for the serial path so each expert
+    // gets a dedicated workspace slice as well.
     return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
 }
 
@@ -149,7 +151,9 @@ private:
     }
 
     void dispatch_serial(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
+        char *workspace_base = static_cast<char *>(params.workspace);
         for (size_t idx = 0; idx < num_gemms; ++idx) {
+            void *ws = workspace_base + idx * get_hipblaslt_workspace_size_in_byte();
             // clang-format off
             hipblaslt_gemm_impl(
                 gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
@@ -159,7 +163,7 @@ private:
                 gemm_ptrs_[idx].a_scale_ptr,
                 params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                 gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
-                params.workspace, get_hipblaslt_workspace_size_in_byte(),
+                ws, get_hipblaslt_workspace_size_in_byte(),
                 params.use_low_precision,
                 params.scale_mode,
                 handle_,
