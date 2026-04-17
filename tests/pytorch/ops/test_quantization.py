@@ -165,7 +165,6 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
         granularity=granularity,
         axis=axis,
         block_size=MX_BLOCK_SIZE,
-        padding_align_size=padding_align_size,
         scaling_recipe=scaling_recipe,
     )
 
