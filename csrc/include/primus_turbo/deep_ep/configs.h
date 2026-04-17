@@ -89,10 +89,10 @@ inline static bool is_enable_cheap_fence() {
     return std::stoi(v) == 0;
 }
 
-// When enabled (default), all EP dispatch/combine kernels are launched on the
+// When enabled, all EP dispatch/combine kernels are launched on the
 // caller's current CUDA stream instead of the Buffer's internal comm stream.
 // This removes cross-stream dependencies and makes EP safe to capture inside
-// `torch.cuda.graph`.  Set `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=0` to restore
+// `torch.cuda.graph`.  Set `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=0`(default) to restore
 // the async communication stream path for compute/comm overlap.
 inline static bool is_ep_force_current_stream() {
     static uint32_t val = []() {
