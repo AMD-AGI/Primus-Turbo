@@ -147,9 +147,6 @@ def clear_origami_caches() -> None:
     _select_params_origami.cache_clear()
 
 
-atexit.register(clear_origami_caches)
-
-
 _SK_TILE_FRACTIONS = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
 _SK_SPLIT_FACTORS = [8, 6, 4, 3, 2, 1]
 _SK_MAX_WORKSPACE = 128 * 1024 * 1024
@@ -487,6 +484,9 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     #     f"BLK_M: {BLK_M}, BLK_N: {BLK_N}, BLK_K: {BLK_K}, gsize_m: {gsize_m}, cache_a: {cache_a}, cache_b: {cache_b}"
     # )
     return BLK_M, BLK_N, BLK_K, gsize_m, cache_a, cache_b
+
+
+atexit.register(clear_origami_caches)
 
 
 @triton.jit()
