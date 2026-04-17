@@ -25,14 +25,20 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 
 from __future__ import annotations
 
+import atexit
 import functools
 import math
 import os
+from dataclasses import dataclass
 
-import origami
 import torch
 import triton
 import triton.language as tl
+
+try:
+    import origami
+except ModuleNotFoundError:
+    origami = None
 
 # Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
 _ORIGAMI_DTYPE_TO_STR = {
@@ -85,15 +91,22 @@ _ARCH_HW_DEFAULTS: dict[str, tuple[int, int]] = {
 }
 
 
+@dataclass(frozen=True)
+class _FallbackHardware:
+    N_CU: int
+    lds_capacity: int
+    l2_cache_size: int = 0
+    clock_khz: int = 0
+
+
 @functools.lru_cache(maxsize=8)
 def _get_hardware(device_id=None):
-    """Cached origami hardware descriptor (align with TensorAtlas selector.py).
+    """Cached hardware descriptor for Triton GEMM config selection.
 
-    Uses origami.get_hardware_for_arch() with parameters sourced from
-    torch.cuda.get_device_properties() to avoid direct HIP C API calls inside
-    the origami C++ extension, which can segfault due to HIP runtime
-    double-initialization in certain container environments.
-    Falls back to origami.get_hardware_for_device() for unknown architectures.
+    When origami is available, return its hardware_t object and keep the
+    existing analytical selector behavior. Otherwise, fall back to a lightweight
+    descriptor built from torch device properties so offline heuristics still
+    work without the optional origami dependency.
     """
     if device_id is None:
         device_id = torch.cuda.current_device()
@@ -101,19 +114,40 @@ def _get_hardware(device_id=None):
     props = torch.cuda.get_device_properties(device_id)
     arch_full = getattr(props, "gcnArchName", "")  # e.g. "gfx950:sramecc+:xnack-"
     arch_base = arch_full.split(":")[0]  # e.g. "gfx950"
+    default_lds_capacity, default_clock_khz = _ARCH_HW_DEFAULTS.get(
+        arch_base,
+        (getattr(props, "shared_memory_per_block", 65536), getattr(props, "clock_rate", 0)),
+    )
+
+    if origami is None:
+        return _FallbackHardware(
+            N_CU=props.multi_processor_count,
+            lds_capacity=default_lds_capacity,
+            l2_cache_size=getattr(props, "L2_cache_size", 0),
+            clock_khz=default_clock_khz,
+        )
+
     arch_enum = getattr(origami.architecture_t, arch_base, None)
 
     if arch_enum is not None and arch_base in _ARCH_HW_DEFAULTS:
-        lds_capacity, clock_khz = _ARCH_HW_DEFAULTS[arch_base]
         return origami.get_hardware_for_arch(
             arch_enum,
             props.multi_processor_count,
-            lds_capacity,
+            default_lds_capacity,
             props.L2_cache_size,
-            clock_khz,
+            default_clock_khz,
         )
 
     return origami.get_hardware_for_device(device_id)
+
+
+def clear_origami_caches() -> None:
+    """Release cached nanobind-backed origami objects before interpreter shutdown."""
+    _get_hardware.cache_clear()
+    _select_params_origami.cache_clear()
+
+
+atexit.register(clear_origami_caches)
 
 
 _SK_TILE_FRACTIONS = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
@@ -404,6 +438,9 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     backward grad_a (NN) = (False, False); backward grad_b (TN) = (True, False).
     Returns (block_m, block_n, block_k, group_size_m, cache_a, cache_b) or None.
     """
+    if origami is None:
+        return None
+
     a_dtype = a_dtype if a_dtype is not None else out_dtype
     b_dtype = b_dtype if b_dtype is not None else out_dtype
 
