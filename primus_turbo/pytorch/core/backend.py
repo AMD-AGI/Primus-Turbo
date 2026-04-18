@@ -15,6 +15,7 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 import torch
 
 from primus_turbo.common.logger import logger
+from primus_turbo.triton.gemm.gemm_kernel import clear_origami_caches
 
 try:
     HAVE_DEEP_EP = True
@@ -239,6 +240,7 @@ class GlobalBackendManager:
         cls._grouped_gemm_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
+        clear_origami_caches()
 
 
 class KernelBackend(ABC):
