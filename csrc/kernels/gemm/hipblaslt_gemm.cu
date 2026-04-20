@@ -130,8 +130,8 @@ struct DescCache {
     hipblasLtMatrixLayout_t D_desc  = nullptr;
     hipblasLtMatmulDesc_t   op_desc = nullptr;
 
-    DescCache() = default;
-    DescCache(const DescCache &) = delete;
+    DescCache()                             = default;
+    DescCache(const DescCache &)            = delete;
     DescCache &operator=(const DescCache &) = delete;
 
     DescCache(DescCache &&other) noexcept
@@ -145,13 +145,13 @@ struct DescCache {
     DescCache &operator=(DescCache &&other) noexcept {
         if (this != &other) {
             reset();
-            A_desc       = other.A_desc;
-            B_desc       = other.B_desc;
-            D_desc       = other.D_desc;
-            op_desc      = other.op_desc;
-            other.A_desc = nullptr;
-            other.B_desc = nullptr;
-            other.D_desc = nullptr;
+            A_desc        = other.A_desc;
+            B_desc        = other.B_desc;
+            D_desc        = other.D_desc;
+            op_desc       = other.op_desc;
+            other.A_desc  = nullptr;
+            other.B_desc  = nullptr;
+            other.D_desc  = nullptr;
             other.op_desc = nullptr;
         }
         return *this;
@@ -183,6 +183,12 @@ static thread_local std::unordered_map<DescKey, DescCache, DescKeyHash> desc_cac
 static thread_local std::unordered_map<DescKey, hipblasLtMatmulHeuristicResult_t, DescKeyHash>
     exact_algo_cache;
 // ─────────────────────────────────────────────────────────────────────────────
+
+void clear_hipblaslt_gemm_runtime_caches() {
+    algo_cache.clear();
+    exact_algo_cache.clear();
+    desc_cache.clear();
+}
 
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
                          const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
@@ -271,7 +277,10 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 
         PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceDestroy(preference));
 
-        if (returnedAlgoCount == 1) {
+        if (returnedAlgoCount == 1 || D_type == HIP_R_32F) {
+            // Float32 coverage in CI is correctness-oriented rather than performance-critical.
+            // Avoid timing-based autotune here because mixed shared-GPU workloads can skew the
+            // ranking and make the chosen algo flaky for tiny shapes.
             tuned_algo = candidates[0];
         } else {
             // Autotune: benchmark each candidate, pick fastest.
@@ -283,8 +292,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             float best_ms  = 1e30f;
             int   best_idx = -1;
             for (int c = 0; c < returnedAlgoCount; ++c) {
-                bool             candidate_ok = true;
-                hipblasStatus_t  status       = HIPBLAS_STATUS_SUCCESS;
+                bool            candidate_ok = true;
+                hipblasStatus_t status       = HIPBLAS_STATUS_SUCCESS;
 
                 // warm-up
                 for (int w = 0; w < kWarmupIters; ++w) {

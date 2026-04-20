@@ -108,6 +108,8 @@ public:
         }
     }
 
+    void clear_runtime_state() { warmed_shapes_.clear(); }
+
 private:
     void warm_algo_cache(const HipblasltGroupedGemmParams &params, size_t num_gemms) {
         // Use (rows_b, cols_a, transA, transB) as a compact shape key.
@@ -343,9 +345,21 @@ private:
     std::set<ShapeKey> warmed_shapes_;
 };
 
-void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+namespace {
+
+HipblasltGroupedGemm &get_thread_local_grouped_gemm_instance() {
     static thread_local HipblasltGroupedGemm instance;
-    instance.run(params, pre_sync);
+    return instance;
+}
+
+} // namespace
+
+void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
+    get_thread_local_grouped_gemm_instance().run(params, pre_sync);
+}
+
+void clear_hipblaslt_grouped_gemm_runtime_state() {
+    get_thread_local_grouped_gemm_instance().clear_runtime_state();
 }
 
 } // namespace primus_turbo

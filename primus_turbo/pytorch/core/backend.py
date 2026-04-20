@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import importlib
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -240,6 +241,10 @@ class GlobalBackendManager:
         cls._grouped_gemm_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
+        runtime = importlib.import_module("primus_turbo.pytorch._C.runtime")
+
+        runtime.clear_hipblaslt_gemm_runtime_caches()
+        runtime.clear_hipblaslt_grouped_gemm_runtime_state()
         clear_origami_caches()
 
 

@@ -42,6 +42,8 @@ inline size_t hipblaslt_dtype_bytes(hipDataType dtype) {
 
 int64_t get_hipblaslt_workspace_size_in_byte();
 
+void clear_hipblaslt_gemm_runtime_caches();
+
 void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t rows_a,
                          const int64_t cols_a, const int64_t lda, const void *scaleA_inv,
                          hipblasOperation_t transA, const void *B, const hipDataType B_type,

@@ -17,6 +17,8 @@ std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
 
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size();
 
+void clear_hipblaslt_grouped_gemm_runtime_state();
+
 //==================================================================
 //  Grouped GEMM Params
 //==================================================================
