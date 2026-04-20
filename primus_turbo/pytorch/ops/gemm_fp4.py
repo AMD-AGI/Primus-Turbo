@@ -12,8 +12,8 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Format,
-    MXScalingRecipe,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp4_support,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
@@ -62,13 +62,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             a_dtype,
             config.granularity,
             block_size=config.block_size,
-            scaling_recipe=MXScalingRecipe(
+            scaling_recipe=ScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=False,
                 shuffle_scale=enable_preshuffle(),
             ),
-            scaling_recipe_for_trans=MXScalingRecipe(
+            scaling_recipe_for_trans=ScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=True,
@@ -82,14 +82,14 @@ class FP4GemmMXFunction(torch.autograd.Function):
             b_dtype,
             config.granularity,
             block_size=config.block_size,
-            scaling_recipe=MXScalingRecipe(
+            scaling_recipe=ScalingRecipe(
                 use_2d_block=True,
                 use_sr=False,
                 use_rht=False,
                 shuffle_scale=enable_preshuffle(),
                 shuffle_out=enable_preshuffle(),
             ),
-            scaling_recipe_for_trans=MXScalingRecipe(
+            scaling_recipe_for_trans=ScalingRecipe(
                 use_2d_block=True,
                 use_sr=False,
                 use_rht=False,
@@ -137,13 +137,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            scaling_recipe=MXScalingRecipe(
+            scaling_recipe=ScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=False,
                 shuffle_scale=enable_preshuffle(),
             ),
-            scaling_recipe_for_trans=MXScalingRecipe(
+            scaling_recipe_for_trans=ScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=True,
