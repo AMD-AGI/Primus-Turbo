@@ -166,17 +166,26 @@ geometric_mean = (x1 * x2 * ... * xn) ^ (1/n)
 
 Benchmark results (3 shapes):
 
-| M | N | K | Forward TFLOPS | Check |
-|---|---|---|---------------|-------|
-| 4096 | 4096 | 4096 | 320 | PASS |
-| 2048 | 8192 | 4096 | 305 | PASS |
-| 1024 | 4096 | 8192 | 290 | PASS |
+| M | N | K | Forward TFLOPS | Backward TFLOPS | Check |
+|---|---|---|----------------|-----------------|-------|
+| 4096 | 4096 | 4096 | 320 | 160 | PASS |
+| 2048 | 8192 | 4096 | 305 | 152 | PASS |
+| 1024 | 4096 | 8192 | 290 | 145 | PASS |
 
 ```
-aggregate score = (320 * 305 * 290) ^ (1/3) = 304.8
+forward aggregate  = (320 * 305 * 290) ^ (1/3)         = 304.8
+backward aggregate = (160 * 152 * 145) ^ (1/3)         = 152.3
+step geomean       = sqrt(304.8 * 152.3)               = 215.5
 ```
+Equivalently, the step geomean is the geometric mean of all six TFLOPS
+values (forward ∪ backward) across PASS shapes.
 
-Baseline aggregate score = 285.0 → improvement = (304.8 - 285.0) / 285.0 = +6.9% → accept.
+If the kernel has no backward path, fill the Backward TFLOPS column with `-`,
+skip the backward aggregate, and let `step geomean = forward aggregate`.
+
+Baseline: forward=285.0, backward=140.0, step=sqrt(285.0 * 140.0)=199.8.
+Candidate step = 215.5 → improvement = (215.5 - 199.8) / 199.8 = +7.857% → accept.
+`vs Baseline` cell on the trend row: `step +7.857%, fwd +6.947%, bwd +8.786%`.
 
 ## Phase Descriptions
 
@@ -451,10 +460,11 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - Current status: Optimizing (round-N)
 
 ## Baseline
-| Shape (MxNxK) | Forward TFLOPS | Check |
-|---------------|---------------|-------|
-| ... | ... | ... |
-- Aggregate score: <baseline_score>
+| Shape (MxNxK) | Forward TFLOPS | Backward TFLOPS | Check |
+|---------------|---------------|-----------------|-------|
+| ... | ... | ... | ... |
+- Forward aggregate: <baseline_forward_score>
+- Backward aggregate: <baseline_backward_score_or_->
 - Detailed data: rounds/round-1/summary.md
 
 ## Optimization History
