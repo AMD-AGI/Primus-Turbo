@@ -135,11 +135,11 @@ class ScalingStrategy(Enum):
 
 
 @dataclass
-class MXScalingRecipe:
+class ScalingRecipe:
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
-    - use_2d_block: Whether to use 2D block in quantization. Available in MXFP8 and MXFP4.
+    - use_2d_block: Whether to use 2D block in quantization. Available in blockwise, MXFP8 and MXFP4.
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.

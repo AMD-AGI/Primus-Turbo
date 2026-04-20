@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+
 import torch
 
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
@@ -11,10 +13,70 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
 )
 from primus_turbo.triton.attention.attention_kernel import FIXED_BLOCK_M
 
+PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32_ENV_KEY = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
+
+
+def _resolve_is_v3_atomic_fp32_from_env() -> bool:
+    val = os.getenv(PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32_ENV_KEY, "1")
+    return val == "1" if val in ("0", "1") else True
+
 
 def _check_and_convert(t, scale, float8_fw):
     finfo = torch.finfo(float8_fw)
     return (t * scale).clamp(min=finfo.min, max=finfo.max).to(dtype=float8_fw) if t.dtype != float8_fw else t
+
+
+def _infer_qkv_format(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> str:
+    """Infer whether the memory layout is ``"bshd"`` or ``"sbhd"``.
+
+    All three tensors are assumed to have **logical** shape ``[b, s, h, d]``.
+    """
+
+    def _infer_format(t: torch.Tensor) -> str:
+        """Detect the memory layout of a single ``[b, s, h, d]`` tensor.
+
+        - **bshd** contiguous: stride = (s*h*d, h*d, d, 1)
+        - **sbhd** (transposed from contiguous [s,b,h,d]): stride = (h*d, b*h*d, d, 1)
+
+        Also handles non-contiguous tensors (e.g. GQA packed-QKV slicing
+        where head-stride != d) by verifying the strict stride ordering
+        invariant: bshd requires s0 > s1 > s2, sbhd requires s1 > s0 > s2.
+        """
+        s0, s1, s2, s3 = t.stride()
+
+        assert s3 == 1, (
+            f"Expected contiguous innermost dim (stride[-1]==1), "
+            f"got shape {tuple(t.size())} strides {tuple(t.stride())}"
+        )
+
+        # General path: verify strict stride ordering
+        # bshd: batch outermost → s0 > s1 > s2
+        if s0 >= s1 >= s2:
+            return "bshd"
+        # sbhd: sequence outermost → s1 > s0 > s2
+        if s1 >= s0 >= s2:
+            return "sbhd"
+
+        assert False, (
+            f"Cannot infer qkv layout from shape {tuple(t.size())} " f"and strides {tuple(t.stride())}"
+        )
+
+    assert q.ndim == 4, f"Expected 4-D tensor for q, got {q.ndim}-D"
+    q_format = _infer_format(q)
+
+    for name, t in (("k", k), ("v", v)):
+        assert t.ndim == 4, f"Expected 4-D tensor for {name}, got {t.ndim}-D"
+        other_format = _infer_format(t)
+        assert other_format == q_format, (
+            f"Layout mismatch: q is {q_format} but {name} is {other_format}. "
+            "All of q, k, v must share the same memory layout."
+        )
+
+    return q_format
 
 
 def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):

@@ -10,7 +10,7 @@ on:
   pull_request:
 
 env:
-  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel
+  UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel-v2602
 
 jobs:
   code-lint:
@@ -55,7 +55,7 @@ jobs:
           options: "--check --diff --color --verbose --line-length=110"
 
   install-dependencies:
-    runs-on: turbo-runner-tas-torch
+    runs-on: turbo-torch-ut-v2602
     env:
         UCCL_COMMIT: 69a21407d261a8ff0f01f83bb0f5b35da059876d #  [rdma] Make CQ Ex flags configurable for NIC compatibility. (#689)
         UCCL_PY_VER: 3.12
@@ -116,7 +116,7 @@ jobs:
 
   unittest-pytorch-gfx942:
     needs: [code-lint, install-dependencies]
-    runs-on: turbo-runner-tas-torch # launch in the container primus_turbo_github_runner based on the image rocm/primus:v26.1
+    runs-on: turbo-torch-ut-v2602 # launch in the container turbo_torch_github_runner_v2602 based on the image rocm/primus:v26.2
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-torch
     steps:
@@ -206,7 +206,7 @@ jobs:
 
   unittest-jax-gfx942:
     needs: code-lint
-    runs-on: turbo-runner-tas-jax # launch in the container turbo_jax_github_runner based on the image rocm/jax-training:maxtext-v26.1
+    runs-on: turbo-jax-ut-v2602 # launch in the container turbo_jax_github_runner_v2602 based on the image rocm/jax-training:maxtext-v26.2
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-jax
     steps:

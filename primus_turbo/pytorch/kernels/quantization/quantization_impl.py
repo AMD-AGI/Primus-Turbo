@@ -11,7 +11,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
-    MXScalingRecipe,
+    ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
 )
@@ -29,24 +29,24 @@ def ceil_div(a, b):
 
 
 def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
 
 def quantize_fp8_rowwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Row-Wise
     """
     if not x.is_contiguous():
         x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, scale)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, None)
     return x_fp8, scale_inv
 
 
@@ -292,17 +292,17 @@ def quantize_mxfp8_impl(
     axis: Union[int, None],
     block_size: int,
     with_trans: bool = False,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     # NOTE: quantize fp8 kernel use the ISA which only available on cdna4.
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
 
-    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
         scaling_recipe_for_trans = (
-            MXScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
         )
     else:
         scaling_recipe_for_trans = scaling_recipe
@@ -397,17 +397,17 @@ def quantize_mxfp4_impl(
     axis: Union[int, None],
     block_size: int,
     with_trans: bool = False,
-    scaling_recipe: Optional[MXScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[MXScalingRecipe] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     # NOTE: quantize fp4 kernel use the ISA which only available on cdna4.
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
 
-    scaling_recipe = MXScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
         scaling_recipe_for_trans = (
-            MXScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
         )
     else:
         scaling_recipe_for_trans = scaling_recipe

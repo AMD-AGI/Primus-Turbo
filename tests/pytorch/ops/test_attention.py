@@ -4,9 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -47,7 +50,18 @@ test_cases = [
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("enable_sink", [False, True])
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
-def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_left):
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
+@pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
+def test_attention_16bit(
+    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
+):
+    # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
+    if get_device_compute_capability() == (9, 4):
+        if qkv_format == "sbhd" and not is_v3_atomic_fp32:
+            pytest.skip("gfx942 has numerical issue in fp16 atomic when layout is sbhd.")
+
+    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
+
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -61,6 +75,9 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
     # Sliding window coverage only applies when sink attention is enabled.
     if not enable_sink and window_size_left != -1:
         pytest.skip("window_size_left only applies when sink is enabled")
+
+    if enable_sink and qkv_format == "sbhd":
+        pytest.skip("Sink attention is not supported for sbhd format")
 
     # Sink attention constraints / runtime control (skip early to avoid big allocations).
     if enable_sink:
@@ -76,13 +93,21 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
 
     print(
         f"\nDType={dtype}, B={batch}, SeqQ={seqlen_q}, SeqKV={seqlen_kv}, NHQ={num_head_q}, NHKV={num_head_kv}, "
-        f"HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}, WindowLeft={window_size_left}"
+        f"HDQK={head_dim_qk}, HDV={head_dim_v}, Causal={causal}, Sink={enable_sink}, WindowLeft={window_size_left}, Format={qkv_format}"
     )
 
-    q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-    k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-    v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
-    o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
+    if qkv_format == "sbhd":
+        q_layout = (seqlen_q, batch, num_head_q, head_dim_qk)
+        k_layout = (seqlen_kv, batch, num_head_kv, head_dim_qk)
+        v_layout = (seqlen_kv, batch, num_head_kv, head_dim_v)
+        o_layout = (seqlen_q, batch, num_head_q, head_dim_v)
+    elif qkv_format == "bshd":
+        q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
+        k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
+        v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+        o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
+    else:
+        assert False, f"Unsupported qkv format: {qkv_format}"
 
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
     key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
@@ -91,6 +116,15 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
     query_ref = query.clone().detach().requires_grad_()
     key_ref = key.clone().detach().requires_grad_()
     value_ref = value.clone().detach().requires_grad_()
+    grad_out_ref = grad_out.clone().detach()
+
+    query_orig, key_orig, value_orig = query, key, value
+
+    if qkv_format == "sbhd":
+        query = query.permute(1, 0, 2, 3)
+        key = key.permute(1, 0, 2, 3)
+        value = value.permute(1, 0, 2, 3)
+        grad_out = grad_out.permute(1, 0, 2, 3)
 
     sm_scale = head_dim_qk ** (-0.5)
 
@@ -109,8 +143,11 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
             window_size=window_size,
         )
     else:
-        o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
-    o_ref.backward(grad_out)
+        o_ref = attention_vanilla_forward_pytorch_ref_impl(
+            query_ref, key_ref, value_ref, sm_scale, causal, qkv_format
+        )
+
+    o_ref.backward(grad_out_ref)
     o = flash_attn_func(
         query,
         key,
@@ -130,10 +167,14 @@ def test_attention_16bit(batch, dtype, config, causal, enable_sink, window_size_
 
     torch.cuda.synchronize()
 
-    out_snr = compute_snr(o_ref, o)
-    query_grad_snr = compute_snr(query_ref.grad, query.grad)
-    key_grad_snr = compute_snr(key_ref.grad, key.grad)
-    value_grad_snr = compute_snr(value_ref.grad, value.grad)
+    if qkv_format == "sbhd":
+        o_ref_cmp = o_ref.permute(1, 0, 2, 3).contiguous()
+    else:
+        o_ref_cmp = o_ref
+    out_snr = compute_snr(o_ref_cmp, o)
+    query_grad_snr = compute_snr(query_ref.grad, query_orig.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key_orig.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value_orig.grad)
     sink_grad_snr = compute_snr(sink_ref.grad, sink.grad) if enable_sink else None
     msg = f"out={out_snr:.2f}, dq={query_grad_snr:.2f}, dk={key_grad_snr:.2f}, dv={value_grad_snr:.2f}"
     if enable_sink:
