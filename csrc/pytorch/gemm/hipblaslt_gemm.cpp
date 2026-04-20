@@ -9,8 +9,9 @@
 
 namespace primus_turbo::pytorch {
 
-at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
-                          bool transB, bool transC) {
+static at::Tensor hipblaslt_gemm_core(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
+                                      bool transA, bool transB, bool transC, int64_t algo_index = 0,
+                                      int *out_algo_count = nullptr) {
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(A.scalar_type()));
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(B.scalar_type()));
     PRIMUS_TURBO_CHECK(A.scalar_type() == B.scalar_type(), "A and B dtype mismatch");
@@ -61,18 +62,30 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
         PRIMUS_TURBO_ERROR("Not support layout.");
     }
 
-    at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    auto handle = at::cuda::getCurrentCUDABlasLtHandle();
-
+    auto               handle            = at::cuda::getCurrentCUDABlasLtHandle();
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     hipblasOperation_t trans_operation_B = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     const hipDataType  A_type            = get_hipblaslt_dtype(A.scalar_type());
     const hipDataType  B_type            = get_hipblaslt_dtype(B.scalar_type());
-    const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
+    const hipDataType  D_type            = get_hipblaslt_dtype(out_dtype);
+    const int64_t      workspace_size    = get_hipblaslt_workspace_size_in_byte();
 
-    const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
+    if (out_algo_count) {
+        // clang-format off
+        *out_algo_count = hipblaslt_gemm_get_algo_count(
+            static_cast<const void *>(B.data_ptr()), B_type,
+            rows_b, cols_b, ldb, nullptr, trans_operation_B,
+            static_cast<const void *>(A.data_ptr()), A_type,
+            rows_a, cols_a, lda, nullptr, trans_operation_A,
+            D_type, rows_d, cols_d, ldd,
+            workspace_size, false, HIPBLASLT_MATMUL_MATRIX_SCALE_END, handle);
+        // clang-format on
+        return {};
+    }
+
+    at::Tensor        C      = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    auto              stream = at::hip::getCurrentHIPStream();
+    const hipDataType C_type = get_hipblaslt_dtype(C.scalar_type());
     at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
 
     // clang-format off
@@ -92,15 +105,17 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         false,
         HIPBLASLT_MATMUL_MATRIX_SCALE_END,
-        handle, stream);
+        handle, stream, static_cast<int>(algo_index));
     // clang-format on
 
     return C;
 }
 
-at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
-                              at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity) {
+static at::Tensor hipblaslt_gemm_fp8_core(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                          at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                          bool transA, bool transB, bool transC,
+                                          const std::string &granularity, int64_t algo_index = 0,
+                                          int *out_algo_count = nullptr) {
     const bool use_fp8 = is_8bit_floating_point_dtype(A.scalar_type()) &&
                          is_8bit_floating_point_dtype(B.scalar_type());
 
@@ -187,18 +202,30 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         PRIMUS_TURBO_CHECK(scaleB_inv.dim() == 2, "Scale B must be a 2-D tensor.");
     }
 
-    at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    auto handle = at::cuda::getCurrentCUDABlasLtHandle();
-
+    auto               handle            = at::cuda::getCurrentCUDABlasLtHandle();
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     hipblasOperation_t trans_operation_B = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     const hipDataType  A_type            = get_hipblaslt_dtype(A.scalar_type());
     const hipDataType  B_type            = get_hipblaslt_dtype(B.scalar_type());
-    const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
+    const hipDataType  D_type            = get_hipblaslt_dtype(out_dtype);
+    const int64_t      workspace_size    = get_hipblaslt_workspace_size_in_byte();
 
-    const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
+    if (out_algo_count) {
+        // clang-format off
+        *out_algo_count = hipblaslt_gemm_get_algo_count(
+            static_cast<const void *>(B.data_ptr()), B_type,
+            rows_b, cols_b, ldb, nullptr, trans_operation_B,
+            static_cast<const void *>(A.data_ptr()), A_type,
+            rows_a, cols_a, lda, nullptr, trans_operation_A,
+            D_type, rows_d, cols_d, ldd,
+            workspace_size, false, HIPBLASLT_MATMUL_MATRIX_SCALE_END, handle);
+        // clang-format on
+        return {};
+    }
+
+    at::Tensor        C      = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    auto              stream = at::hip::getCurrentHIPStream();
+    const hipDataType C_type = get_hipblaslt_dtype(C.scalar_type());
     at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
 
     // clang-format off
@@ -224,9 +251,11 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     return C;
 }
 
-at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
-                              at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity) {
+static at::Tensor hipblaslt_gemm_fp4_core(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                          at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                          bool transA, bool transB, bool transC,
+                                          const std::string &granularity, int64_t algo_index = 0,
+                                          int *out_algo_count = nullptr) {
     const bool use_fp4 = is_4bit_floating_point_dtype(A.scalar_type()) &&
                          is_4bit_floating_point_dtype(B.scalar_type());
 
@@ -310,18 +339,30 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         PRIMUS_TURBO_CHECK(scaleB_inv.dim() == 2, "Scale B must be a 2-D tensor.");
     }
 
-    at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    auto handle = at::cuda::getCurrentCUDABlasLtHandle();
-
+    auto               handle            = at::cuda::getCurrentCUDABlasLtHandle();
     hipblasOperation_t trans_operation_A = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     hipblasOperation_t trans_operation_B = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     const hipDataType  A_type            = get_hipblaslt_dtype(A.scalar_type());
     const hipDataType  B_type            = get_hipblaslt_dtype(B.scalar_type());
-    const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
+    const hipDataType  D_type            = get_hipblaslt_dtype(out_dtype);
+    const int64_t      workspace_size    = get_hipblaslt_workspace_size_in_byte();
 
-    const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
+    if (out_algo_count) {
+        // clang-format off
+        *out_algo_count = hipblaslt_gemm_get_algo_count(
+            static_cast<const void *>(B.data_ptr()), B_type,
+            rows_b, cols_b, ldb, nullptr, trans_operation_B,
+            static_cast<const void *>(A.data_ptr()), A_type,
+            rows_a, cols_a, lda, nullptr, trans_operation_A,
+            D_type, rows_d, cols_d, ldd,
+            workspace_size, false, HIPBLASLT_MATMUL_MATRIX_SCALE_END, handle);
+        // clang-format on
+        return {};
+    }
+
+    at::Tensor        C      = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    auto              stream = at::hip::getCurrentHIPStream();
+    const hipDataType C_type = get_hipblaslt_dtype(C.scalar_type());
     at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
 
     // clang-format off
@@ -341,10 +382,60 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         use_fp4,
         scale_mode,
-        handle, stream);
+        handle, stream, static_cast<int>(algo_index));
     // clang-format on
 
     return C;
+}
+
+// ---- Public API: thin wrappers around *_core ----
+
+at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
+                          bool transB, bool transC, int64_t algo_index) {
+    return hipblaslt_gemm_core(A, B, out_dtype, transA, transB, transC, algo_index);
+}
+
+int64_t hipblaslt_gemm_algo_count(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
+                                  bool transA, bool transB, bool transC) {
+    int count = 0;
+    hipblaslt_gemm_core(A, B, out_dtype, transA, transB, transC, 0, &count);
+    return count;
+}
+
+at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                              at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
+                              bool transB, bool transC, const std::string &granularity,
+                              int64_t algo_index) {
+    return hipblaslt_gemm_fp8_core(A, scaleA_inv, B, scaleB_inv, out_dtype, transA, transB, transC,
+                                   granularity, algo_index);
+}
+
+int64_t hipblaslt_gemm_fp8_algo_count(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                      at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                      bool transA, bool transB, bool transC,
+                                      const std::string &granularity) {
+    int count = 0;
+    hipblaslt_gemm_fp8_core(A, scaleA_inv, B, scaleB_inv, out_dtype, transA, transB, transC,
+                            granularity, 0, &count);
+    return count;
+}
+
+at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                              at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
+                              bool transB, bool transC, const std::string &granularity,
+                              int64_t algo_index) {
+    return hipblaslt_gemm_fp4_core(A, scaleA_inv, B, scaleB_inv, out_dtype, transA, transB, transC,
+                                   granularity, algo_index);
+}
+
+int64_t hipblaslt_gemm_fp4_algo_count(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
+                                      at::Tensor scaleB_inv, const at::ScalarType out_dtype,
+                                      bool transA, bool transB, bool transC,
+                                      const std::string &granularity) {
+    int count = 0;
+    hipblaslt_gemm_fp4_core(A, scaleA_inv, B, scaleB_inv, out_dtype, transA, transB, transC,
+                            granularity, 0, &count);
+    return count;
 }
 
 } // namespace primus_turbo::pytorch

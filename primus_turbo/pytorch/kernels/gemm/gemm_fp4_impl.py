@@ -105,10 +105,35 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        **kwargs,
     ):
+        algo_index = kwargs.get("algo_index", 0)
         # TODO(ruibin): Add padding
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity.name,
+            algo_index,
+        )
+
+    @staticmethod
+    def get_algo_count(**kwargs) -> int:
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4_algo_count(
+            kwargs["a"],
+            kwargs["a_scale_inv"],
+            kwargs["b"],
+            kwargs["b_scale_inv"],
+            kwargs["out_dtype"],
+            kwargs["trans_a"],
+            kwargs["trans_b"],
+            kwargs["trans_c"],
+            kwargs["granularity"].name,
         )
 
 

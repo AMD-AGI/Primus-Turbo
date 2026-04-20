@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import Any, Dict, Hashable, List, Optional, Type
+from typing import Any, Dict, Hashable, List, Optional, Tuple, Type
 
 import torch
 
@@ -34,6 +34,7 @@ __all__ = [
 ]
 
 _ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
+_ENV_HIPBLASLT_MAX_ALGOS_KEY = "PRIMUS_TURBO_HIPBLASLT_TUNE_MAX_ALGOS"
 _ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 _ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 _ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
@@ -72,7 +73,7 @@ class GlobalBackendManager:
     Priority (high to low):
     1. Code settings - set_gemm_backend(), etc.
     2. Environment variables - PRIMUS_TURBO_GEMM_BACKEND, etc.
-    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1
+    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1 (backend selection) or =2 (backend + algo tuning)
     4. Code defaults
     5. Fallback: try all backends
     """
@@ -80,7 +81,7 @@ class GlobalBackendManager:
     _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
-    _auto_tune: Optional[bool] = None
+    _auto_tune: Optional[int] = None
 
     @classmethod
     @lru_cache(maxsize=32)
@@ -162,9 +163,21 @@ class GlobalBackendManager:
             cls._grouped_gemm_backend[precision] = backend
 
     @classmethod
-    def set_auto_tune(cls, enabled: Optional[bool]) -> None:
-        """Set whether auto-tune is enabled in code."""
-        cls._auto_tune = enabled
+    def set_auto_tune(cls, level: Optional[object]) -> None:
+        """Set the auto-tune level.
+
+        Args:
+            level: ``None`` to defer to the env var, ``False``/``0`` to disable,
+                   ``True``/``1`` for backend selection only,
+                   ``2`` for backend selection **plus** intra-backend algo tuning
+                   (e.g. hipBLASLt multi-algorithm benchmark).
+        """
+        if level is None or level is False:
+            cls._auto_tune = 0 if level is False else None
+        elif level is True:
+            cls._auto_tune = 1
+        else:
+            cls._auto_tune = int(level)
 
     @classmethod
     def get_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
@@ -227,11 +240,16 @@ class GlobalBackendManager:
         return None
 
     @classmethod
-    def auto_tune_enabled(cls) -> bool:
-        """Check if auto-tune is enabled."""
+    def auto_tune_level(cls) -> int:
+        """Return the auto-tune level (0=off, 1=backend selection, 2=backend+algo tuning)."""
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get(_ENV_AUTO_TUNE_KEY, "0") == "1"
+        return int(os.environ.get(_ENV_AUTO_TUNE_KEY, "0"))
+
+    @classmethod
+    def auto_tune_enabled(cls) -> bool:
+        """Check if auto-tune is enabled (level >= 1)."""
+        return cls.auto_tune_level() >= 1
 
     @classmethod
     def reset(cls) -> None:
@@ -254,6 +272,15 @@ class KernelBackend(ABC):
     def execute(**kwargs):
         raise NotImplementedError("execute is not implemented")
 
+    @staticmethod
+    def get_algo_count(**kwargs) -> int:
+        """Number of heuristic algorithms available for the given problem.
+
+        Returns 1 by default (single algorithm, no intra-backend tuning).
+        Override in backends that support multi-algo selection (e.g. hipBLASLt).
+        """
+        return 1
+
 
 @dataclass(frozen=True)
 class BackendEntry:
@@ -271,19 +298,27 @@ class BackendEntry:
 
 
 class TuneCache:
-    """LRU cache for storing tuned backend results."""
+    """LRU cache for storing tuned backend + algo results."""
 
     def __init__(self, capacity: int = 1024):
         self._capacity = capacity
-        self._cache: OrderedDict[Hashable, Type[KernelBackend]] = OrderedDict()
+        self._cache: OrderedDict[Hashable, Tuple[Type[KernelBackend], int]] = OrderedDict()
 
     def get(self, key: Hashable) -> Optional[Type[KernelBackend]]:
+        """Get cached backend class (ignores algo_index)."""
+        result = self.get_with_algo(key)
+        if result is not None:
+            return result[0]
+        return None
+
+    def get_with_algo(self, key: Hashable) -> Optional[Tuple[Type[KernelBackend], int]]:
+        """Get cached (backend_class, algo_index) tuple."""
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
         return None
 
-    def put(self, key: Hashable, value: Type[KernelBackend]) -> None:
+    def put(self, key: Hashable, value: Type[KernelBackend], algo_index: int = -1) -> None:
         if key in self._cache:
             self._cache.move_to_end(key)
         elif len(self._cache) >= self._capacity:
@@ -294,7 +329,7 @@ class TuneCache:
                 stacklevel=2,
             )
             self._cache.popitem(last=False)
-        self._cache[key] = value
+        self._cache[key] = (value, algo_index)
 
     def clear(self) -> None:
         self._cache.clear()
@@ -353,7 +388,6 @@ class AutoKernelDispatcher(ABC):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        # warm-up
         for _ in range(cls._warmup_iters):
             backend.execute(**kwargs)
             torch.cuda.synchronize()
@@ -368,33 +402,85 @@ class AutoKernelDispatcher(ABC):
         return start.elapsed_time(end) / cls._profile_iters
 
     @classmethod
+    @torch.no_grad()
+    def _tune_algo_for_backend(cls, backend: Type[KernelBackend], **kwargs) -> Tuple[float, int]:
+        """Benchmark each heuristic algorithm for a backend (level-2 tuning).
+
+        Returns (best_time, best_algo_index).  The number of algorithms
+        tried is capped by the ``PRIMUS_TURBO_HIPBLASLT_TUNE_MAX_ALGOS``
+        environment variable (default 10).
+        """
+        max_algos = int(os.environ.get(_ENV_HIPBLASLT_MAX_ALGOS_KEY, "50"))
+        algo_count = min(backend.get_algo_count(**kwargs), max_algos)
+        if algo_count <= 1:
+            return cls.profile(backend, **kwargs), -1
+
+        best_time = float("inf")
+        best_algo = -1
+        for idx in range(algo_count):
+            algo_kwargs = {**kwargs, "algo_index": idx}
+            try:
+                t = cls.profile(backend, **algo_kwargs)
+            except Exception:
+                t = float("inf")
+            if t < best_time:
+                best_time = t
+                best_algo = idx
+            logger.info(
+                f"[AutoTune L2] {backend.__name__} algo {idx}/{algo_count}: {t:.3f} ms"
+                f"{' (best so far)' if idx == best_algo else ''}"
+            )
+        return best_time, best_algo
+
+    @classmethod
     def tune(cls, **kwargs) -> Optional[Type[KernelBackend]]:
-        """Profile all compatible backends and cache the fastest one."""
+        """Profile compatible backends and cache the fastest.
+
+        Level 1: pick the best *backend* (each backend uses its default algo).
+        Level 2: additionally benchmark multiple hipBLASLt heuristic algorithms.
+        """
         key = cls.make_key(**kwargs)
 
-        cached_backend = cls._cache.get(key)
-        if cached_backend is not None:
-            return cached_backend
+        cached = cls._cache.get_with_algo(key)
+        if cached is not None:
+            backend_cls, algo_index = cached
+            if algo_index >= 0:
+                kwargs["algo_index"] = algo_index
+            return backend_cls
 
+        level = GlobalBackendManager.auto_tune_level()
         best_backend = None
         best_time = float("inf")
+        best_algo = -1
         for entry in cls._backends.values():
             if not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **kwargs)
+                    if level >= 2:
+                        cur_time, cur_algo = cls._tune_algo_for_backend(entry.impl, **kwargs)
+                    else:
+                        cur_time, cur_algo = cls.profile(entry.impl, **kwargs), -1
                 except Exception:
-                    cur_time = float("inf")
+                    cur_time, cur_algo = float("inf"), -1
                 finally:
                     torch.cuda.synchronize()
+                logger.info(
+                    f"[AutoTune] {entry.impl.__name__}: {cur_time:.3f} ms"
+                    f"{f' (algo {cur_algo})' if cur_algo >= 0 else ''}"
+                )
                 if cur_time < best_time:
                     best_time = cur_time
                     best_backend = entry.impl
+                    best_algo = cur_algo
 
         if best_backend is not None:
-            cls._cache.put(key, best_backend)
+            cls._cache.put(key, best_backend, best_algo)
+            logger.info(
+                f"[AutoTune] Winner for key={key}: {best_backend.__name__} "
+                f"({best_time:.3f} ms{f', algo {best_algo}' if best_algo >= 0 else ''})"
+            )
         return best_backend
 
     @classmethod
@@ -419,8 +505,21 @@ class AutoKernelDispatcher(ABC):
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
         if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+            key = cls.make_key(**kwargs)
+            cached = cls._cache.get_with_algo(key)
+            if cached is not None:
+                backend_cls, algo_index = cached
+                if algo_index >= 0:
+                    return backend_cls.execute(**kwargs, algo_index=algo_index)
+                return backend_cls.execute(**kwargs)
+
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
+                cached = cls._cache.get_with_algo(key)
+                if cached is not None:
+                    _, algo_index = cached
+                    if algo_index >= 0:
+                        return backend_cls.execute(**kwargs, algo_index=algo_index)
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend

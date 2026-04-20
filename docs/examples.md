@@ -490,16 +490,31 @@ GlobalBackendManager.set_gemm_backend(None)
 
 ### 5.2 AutoTune
 
-AutoTune profiles compatible backends on the first call (per input "key", usually shape/dtype/layout) and caches the fastest choice. This is useful for stable shapes, but may add overhead if shapes change frequently.
+AutoTune profiles compatible backends on the first call (per input "key", usually shape/dtype/layout) and caches the fastest choice. Two levels are available:
+
+| Level | Description |
+|-------|-------------|
+| **0** | Disabled (default). |
+| **1** | Backend selection — profiles each backend (hipBLASLt, Triton, CK, ...) with its default algorithm and picks the fastest. |
+| **2** | Backend + algorithm tuning — additionally benchmarks multiple hipBLASLt heuristic algorithms per problem shape, then picks the best backend *and* algorithm. |
 
 NOTE: AutoTune is skipped during CUDA graph capture.
+
+NOTE: Setting an explicit backend (via `set_gemm_backend()` or `PRIMUS_TURBO_GEMM_BACKEND`) takes priority over AutoTune at any level. If you want level-2 algo tuning, do **not** set an explicit backend — let AutoTune select the backend and algorithm together.
 
 ```python
 import torch
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.backend import GlobalBackendManager
 
-GlobalBackendManager.set_auto_tune(True)  # or set PRIMUS_TURBO_AUTO_TUNE=1
+# Level 1: backend selection only (same as the old True / PRIMUS_TURBO_AUTO_TUNE=1)
+GlobalBackendManager.set_auto_tune(1)
+
+# Level 2: backend selection + hipBLASLt multi-algo tuning
+GlobalBackendManager.set_auto_tune(2)
+
+# True maps to level 1.
+GlobalBackendManager.set_auto_tune(True)
 
 # First call may be slower due to profiling; later calls hit the cache.
 # Use fixed shapes for best results.
@@ -521,8 +536,13 @@ GlobalBackendManager.reset()
 You can also control backend selection and AutoTune via environment variables:
 
 ```bash
+# AutoTune level: 0=off, 1=backend selection, 2=backend+algo tuning
 export PRIMUS_TURBO_AUTO_TUNE=1
+
 export PRIMUS_TURBO_GEMM_BACKEND=HIPBLASLT
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=CK
 export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=DEEP_EP
+
+# Cap the number of hipBLASLt heuristic algorithms tried during level-2 tuning (default: 50)
+export PRIMUS_TURBO_HIPBLASLT_TUNE_MAX_ALGOS=50
 ```
