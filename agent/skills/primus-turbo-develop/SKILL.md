@@ -316,10 +316,21 @@ Performance metrics depend on the operator type and are determined by the benchm
 
 | Operator Type | Typical Metrics |
 |--------------|-----------------|
-| Compute-bound (GEMM, etc.) | `Forward TFLOPS`, `Backward TFLOPS` |
+| Compute-bound (forward only) | `Forward TFLOPS` |
+| Compute-bound (forward + backward training path) | `Combined Step TFLOPS` (derived), with `Forward TFLOPS` / `Backward TFLOPS` retained as diagnostics |
 | Memory-bound (elementwise, quantization, etc.) | `Forward GB/s`, `Backward GB/s` |
 
-The user confirms which metrics to optimize (`primary_metric`) at the start of optimization. The optimization loop uses the **geometric mean** of the specified metrics across all target shapes as the `aggregate score`. Any shape with `Check = FAIL` results in immediate rejection of that candidate.
+The user confirms which metrics to optimize (`primary_metric`) at the start of optimization.
+
+For GEMM campaigns where the user wants both forward and backward optimized together, derive:
+- `Combined Step Time (ms) = Forward Time (ms) + Backward Time (ms)`
+- `Combined Step TFLOPS = 6 * M * N * K / (Combined Step Time (ms) * 1e-3) / 1e12`
+
+Use the **geometric mean** of `Combined Step TFLOPS` across all target shapes as the `aggregate score` for accept/rollback. Keep `Forward TFLOPS` and `Backward TFLOPS` in the per-round report as diagnostics, but do not require them to improve independently if the combined training step metric improves.
+
+If the campaign is forward-only or backward-only, use the corresponding direct metric (`Forward TFLOPS`, `Backward TFLOPS`, etc.) as the `aggregate score`.
+
+Any shape with `Check = FAIL` results in immediate rejection of that candidate.
 
 For benchmark output format, shape sources, and measurement methodology, see the [Benchmark](#benchmark) section above.
 

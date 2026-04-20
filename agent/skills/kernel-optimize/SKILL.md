@@ -55,7 +55,7 @@ During the DEFINE_TARGET phase, the user instruction + prerequisite information 
 | `target_gpu` | Target GPU architecture | `gfx942` / `gfx950` |
 | `target_shapes` | Full shape set of interest for the campaign; quick validation uses a separate representative subset recorded in `representative_shapes` | A full shape list or `all` (use benchmark default shape set) |
 | `performance_target` | Performance target | `>500 TFLOPS`, `>60% peak efficiency`, or `null`; defaults to `null` if unspecified |
-| `primary_metric` | Primary performance metric(s), depending on operator type | GEMM: `"Forward TFLOPS"` / `"Forward TFLOPS, Backward TFLOPS"`; elementwise: `"Forward GB/s"` |
+| `primary_metric` | Primary performance metric(s), depending on operator type | GEMM forward-only: `"Forward TFLOPS"`; GEMM forward+backward: `"Combined Step TFLOPS"` (or project-defined equivalent derived from forward/backward time), with forward/backward TFLOPS retained as diagnostics; elementwise: `"Forward GB/s"` |
 | `project_skill` | Corresponding project skill | `primus-turbo-develop` |
 | `execution_mode` | Execution environment, referencing project skill recommendation, decided by agent | `repo` / `workspace` |
 | `git_commit` | Whether to git commit accepted versions | `true` (default) / `false` |
@@ -103,7 +103,7 @@ When the agent reaches this point, it should have already collected all required
 | `target_gpu` | Identify GPU model from user instruction, map to architecture codename (e.g., MI300X → `gfx942`, MI355X → `gfx950`) |
 | `target_shapes` | Use if specified by user; otherwise use the benchmark default shape set |
 | `performance_target` | Use if specified by user; otherwise default to `null` |
-| `primary_metric` | Get available metrics from the project skill's scoring section; use if specified by user |
+| `primary_metric` | Get available metrics from the project skill's scoring section; use if specified by user. If the user wants both forward and backward GEMM optimized together and the project skill exposes both times, default to the project-defined combined-step metric instead of requiring forward/backward aggregates to improve independently |
 | `execution_mode` | Reference the project skill's recommendation, decided by agent based on task characteristics |
 | `git_commit` | Default `true`; set to `false` if user specifies no commit |
 | `git_branch` | Default `auto`; use if specified by user |

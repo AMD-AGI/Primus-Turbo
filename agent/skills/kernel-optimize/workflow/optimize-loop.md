@@ -139,7 +139,14 @@ geometric_mean = (x1 * x2 * ... * xn) ^ (1/n)
 
 **Step 5**: Retain the score vector (raw values per shape) to avoid the total score masking localized regressions
 
-**Multi-metric handling**: When `primary_metric` contains multiple metrics (e.g., `Forward TFLOPS, Backward TFLOPS`), compute the aggregate score for each metric separately. Acceptance condition: all metrics' aggregate scores must not regress, and at least one metric must show improvement.
+**Multi-metric handling**:
+- If `primary_metric` is a forward+backward pair for the same end-to-end workload (for example, GEMM training where benchmark output includes both forward and backward time), derive a **single combined-step primary score** and use that for accept/rollback.
+- Default combined-step derivation:
+  - `Combined Step Time (ms) = Forward Time (ms) + Backward Time (ms)`
+  - `Combined Step Score = 1 / Combined Step Time (ms)` (higher is better)
+- If the project skill defines a workload-specific equivalent throughput metric (for example, `Combined Step TFLOPS`), use that instead of the generic inverse-time score.
+- Keep `Forward TFLOPS`, `Backward TFLOPS`, or other component metrics as **secondary diagnostics** to explain trade-offs, but do not require every component aggregate to improve independently when the campaign's true objective is end-to-end step performance.
+- If no combined-step metric is defined and the metrics are genuinely independent objectives, fall back to the old rule: all metric aggregates must not regress, and at least one must improve.
 
 ### Noise Assessment
 
@@ -152,7 +159,8 @@ geometric_mean = (x1 * x2 * ... * xn) ^ (1/n)
 
 - `aggregate score` must not be lower than the current best
 - If it only matches the current best, there must be a clear additional benefit (e.g., broader applicability, more stable results)
-- If any core shape regresses > 3%, default to rejection; unless this round is explicitly a targeted shape optimization
+- If any core shape regresses > 5% on the **primary accept metric**, default to rejection; unless this round is explicitly a targeted shape optimization
+- When using a combined-step metric, judge per-shape regressions on `Combined Step Time (ms)` (or the project-defined equivalent primary score), not on the sign of individual forward/backward component metrics alone
 
 ### Computation Example
 
@@ -284,6 +292,18 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 4. Compare against current best
 5. Upgrade to **full** validation when the direction completes, when results are borderline (improvement < 5%), or when changes are high-risk
 
+**Command completion protocol**:
+- A benchmark or test command does **not** count as completed when it has merely been launched. It counts as completed only after the process exits and the expected output artifact (log, CSV, etc.) exists on disk.
+- If the shell tool backgrounds a command because of timeout, the agent MUST poll the process and/or output file until completion before doing anything else in the optimization loop.
+- Do **not** treat partial terminal output, partial CSV content, or an in-progress log file as a finished validation result.
+- Do **not** start the next `ANALYZE`, `OPTIMIZE`, or `VALIDATE` step while the current round's benchmark or test command is still running.
+
+**Polling cap**:
+- A single `sleep` / `wait` / polling call MUST NOT exceed **15 minutes (900 seconds)**. Long-running benchmarks (which commonly take 30-90 minutes on this kernel family) MUST be polled in repeated `sleep <= 900` windows, not in one multi-hour sleep.
+- Between poll windows, the agent MUST re-inspect the backgrounded terminal file and/or the expected output artifact to confirm progress (e.g. grep the latest `TestID:` line, `wc -l` the CSV, check for `exit_code` in the terminal metadata).
+- If a poll window finds no forward progress across two consecutive checks, treat the command as hung and investigate (re-read the terminal, check for OOM / driver errors) instead of continuing to sleep blindly.
+- This bounds worst-case blocking if the shell session is interrupted or if the benchmark deadlocks, and keeps the agent responsive for mid-run corrections from the user.
+
 Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (for `N >= 2`) and place any raw benchmark/test outputs under `<campaign_dir>/rounds/round-N/artifacts/`.
 
 **Hard gates**:
@@ -301,6 +321,15 @@ Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (
 5. If the round produced a reusable technical lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
 
 `rounds/round-N/summary.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
+
+Before issuing any command for the next round, the agent MUST have completed **all** of the following for the current round:
+- benchmark/test completion confirmed
+- accept/rollback decision made from finished data
+- `rounds/round-N/summary.md` written
+- `rounds/round-N/kernel_snapshot/` populated
+- `logs/optimize.md` updated
+- `logs/performance_trend.md` updated
+- reusable tip appended when applicable
 
 **Under `workspace-mode`**:
 Validation is split into a local gate (within minimal environment) and an integration gate (after syncing back to main repo).
@@ -607,4 +636,7 @@ A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 - Every round, including the baseline, must keep `rounds/round-N/summary.md` up to date; every VALIDATE round must update that summary and `logs/optimize.md` together.
 - After `related_work.md` is done and before the first round starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists.
 - After every accepted or rolled-back round, append a reusable lesson to that tips file when the round is worth preserving.
-- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`.
+- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`. **Always obtain the current time by running `date '+%Y-%m-%d %H:%M'` in the shell**; do not rely on the system prompt date or any other source, as they may lack time-of-day precision.
+- **Never pipe benchmark or test commands through `| tail`, `| head`, `| grep`, or any filter.** Piping changes stdout from line-buffered to fully-buffered, hiding all intermediate output. This makes it look like the command is hung, leading to premature kills and lost data. If you need to inspect a subset of the output, redirect the full output to a file first (`> out.txt 2>&1`), then read or search the file after the command completes.
+- **Never treat a backgrounded command as a completed round.** If a shell command times out and continues in the background, that is an unfinished round-state, not a result.
+- **Never leave a round half-closed.** If `summary.md`, `kernel_snapshot/`, `logs/optimize.md`, or `logs/performance_trend.md` are missing for the current round, the agent must finish that bookkeeping before any new optimization action.
