@@ -25,14 +25,20 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 
 from __future__ import annotations
 
+import atexit
 import functools
 import math
 import os
+from dataclasses import dataclass
 
-import origami
 import torch
 import triton
 import triton.language as tl
+
+try:
+    import origami
+except ModuleNotFoundError:
+    origami = None
 
 # Map torch dtypes to origami string (for problem_t). Align with TensorAtlas heuristics/selector.py.
 _ORIGAMI_DTYPE_TO_STR = {
@@ -85,15 +91,22 @@ _ARCH_HW_DEFAULTS: dict[str, tuple[int, int]] = {
 }
 
 
+@dataclass(frozen=True)
+class _FallbackHardware:
+    N_CU: int
+    lds_capacity: int
+    l2_cache_size: int = 0
+    clock_khz: int = 0
+
+
 @functools.lru_cache(maxsize=8)
 def _get_hardware(device_id=None):
-    """Cached origami hardware descriptor (align with TensorAtlas selector.py).
+    """Cached hardware descriptor for Triton GEMM config selection.
 
-    Uses origami.get_hardware_for_arch() with parameters sourced from
-    torch.cuda.get_device_properties() to avoid direct HIP C API calls inside
-    the origami C++ extension, which can segfault due to HIP runtime
-    double-initialization in certain container environments.
-    Falls back to origami.get_hardware_for_device() for unknown architectures.
+    When origami is available, return its hardware_t object and keep the
+    existing analytical selector behavior. Otherwise, fall back to a lightweight
+    descriptor built from torch device properties so offline heuristics still
+    work without the optional origami dependency.
     """
     if device_id is None:
         device_id = torch.cuda.current_device()
@@ -101,19 +114,37 @@ def _get_hardware(device_id=None):
     props = torch.cuda.get_device_properties(device_id)
     arch_full = getattr(props, "gcnArchName", "")  # e.g. "gfx950:sramecc+:xnack-"
     arch_base = arch_full.split(":")[0]  # e.g. "gfx950"
+    default_lds_capacity, default_clock_khz = _ARCH_HW_DEFAULTS.get(
+        arch_base,
+        (getattr(props, "shared_memory_per_block", 65536), getattr(props, "clock_rate", 0)),
+    )
+
+    if origami is None:
+        return _FallbackHardware(
+            N_CU=props.multi_processor_count,
+            lds_capacity=default_lds_capacity,
+            l2_cache_size=getattr(props, "L2_cache_size", 0),
+            clock_khz=default_clock_khz,
+        )
+
     arch_enum = getattr(origami.architecture_t, arch_base, None)
 
     if arch_enum is not None and arch_base in _ARCH_HW_DEFAULTS:
-        lds_capacity, clock_khz = _ARCH_HW_DEFAULTS[arch_base]
         return origami.get_hardware_for_arch(
             arch_enum,
             props.multi_processor_count,
-            lds_capacity,
+            default_lds_capacity,
             props.L2_cache_size,
-            clock_khz,
+            default_clock_khz,
         )
 
     return origami.get_hardware_for_device(device_id)
+
+
+def clear_origami_caches() -> None:
+    """Release cached nanobind-backed origami objects before interpreter shutdown."""
+    _get_hardware.cache_clear()
+    _select_params_origami.cache_clear()
 
 
 _SK_TILE_FRACTIONS = [0.0, 1.0 / 2.0, 1.0 / 8.0, 1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0]
@@ -404,6 +435,9 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     backward grad_a (NN) = (False, False); backward grad_b (TN) = (True, False).
     Returns (block_m, block_n, block_k, group_size_m, cache_a, cache_b) or None.
     """
+    if origami is None:
+        return None
+
     a_dtype = a_dtype if a_dtype is not None else out_dtype
     b_dtype = b_dtype if b_dtype is not None else out_dtype
 
@@ -452,6 +486,9 @@ def _select_params_origami(M, N, K, out_dtype, a_dtype=None, b_dtype=None, trans
     return BLK_M, BLK_N, BLK_K, gsize_m, cache_a, cache_b
 
 
+atexit.register(clear_origami_caches)
+
+
 @triton.jit()
 def _bf16_persistent_gemm_kernel(
     A,
@@ -474,6 +511,10 @@ def _bf16_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    A_LOAD_ALIGNED: tl.constexpr,
+    B_LOAD_ALIGNED: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
@@ -504,11 +545,15 @@ def _bf16_persistent_gemm_kernel(
         tl.assume(pid_m >= 0)
         tl.assume(pid_n >= 0)
 
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rm_raw = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn_raw = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rm = rm_raw % M
+        rn = rn_raw % N
         rk = tl.arange(0, BLOCK_SIZE_K)
-        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        if EVEN_M:
+            rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        if EVEN_N:
+            rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         # Use int64 offsets for pointer arithmetic to prevent int32 overflow with large matrices
         A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
         B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
@@ -516,19 +561,25 @@ def _bf16_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        tl.assume(loop_k >= 0)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
-            if stride_ak == 1:
-                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+            if EVEN_M and A_LOAD_ALIGNED:
+                if stride_ak == 1:
+                    a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+                else:
+                    a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
             else:
-                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_A)
+                a = tl.load(A_BASE, cache_modifier=CACHE_MODIFIER_A)
 
-            if stride_bk == 1:
-                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+            if EVEN_N and B_LOAD_ALIGNED:
+                if stride_bk == 1:
+                    b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
+                else:
+                    b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
             else:
-                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
+                b = tl.load(B_BASE, cache_modifier=CACHE_MODIFIER_B)
 
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
             A_BASE += BLOCK_SIZE_K * stride_ak
@@ -539,25 +590,31 @@ def _bf16_persistent_gemm_kernel(
             rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
             A_BASE = A + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak
             B_BASE = B + rk[:, None].to(tl.int64) * stride_bk + rn[None, :].to(tl.int64) * stride_bn
-            if stride_ak == 1:
-                A_BASE = tl.multiple_of(A_BASE, (1, 16))
-            else:
-                A_BASE = tl.multiple_of(A_BASE, (16, 1))
-            if stride_bk == 1:
-                B_BASE = tl.multiple_of(B_BASE, (16, 1))
-            else:
-                B_BASE = tl.multiple_of(B_BASE, (1, 16))
-            a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
-            b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
+            a_mask_k = rk[None, :] < K
+            b_mask_k = rk[:, None] < K
+            if EVEN_M and A_LOAD_ALIGNED:
+                if stride_ak == 1:
+                    A_BASE = tl.multiple_of(A_BASE, (1, 16))
+                else:
+                    A_BASE = tl.multiple_of(A_BASE, (16, 1))
+            a = tl.load(A_BASE, mask=a_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            if EVEN_N and B_LOAD_ALIGNED:
+                if stride_bk == 1:
+                    B_BASE = tl.multiple_of(B_BASE, (16, 1))
+                else:
+                    B_BASE = tl.multiple_of(B_BASE, (1, 16))
+            b = tl.load(B_BASE, mask=b_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_B)
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
         c = acc.to(C.type.element_ty)
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-        C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
+        c_mask = (rm_raw[:, None] < M) & (rn_raw[None, :] < N)
+        rm_s = rm_raw % M
+        rn_s = rn_raw % N
+        if EVEN_M:
+            rm_s = tl.max_contiguous(tl.multiple_of(rm_s, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        if EVEN_N:
+            rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        C_ = C + rm_s[:, None].to(tl.int64) * stride_cm + rn_s[None, :].to(tl.int64) * stride_cn
         tl.store(C_, c, c_mask)
 
 
@@ -702,7 +759,42 @@ def gemm_triton_kernel(
                 cache_a, cache_b = oca, ocb
 
     even_k = K % BLOCK_K == 0
-    args = (A_view, B_view, out, M, N, K, A_view.stride(0), B_view.stride(1), stride_cm, stride_cn)
+    even_m = M % BLOCK_M == 0
+    even_n = N % BLOCK_N == 0
+
+    # For partial M tiles with non-unit K stride (e.g. A comes from .T),
+    # force C-contiguous so s_ak becomes 1, avoiding non-deterministic
+    # interactions between strided access and modular index wrapping.
+    if not even_m and A_view.stride(1) != 1:
+        A_view = A_view.contiguous()
+        s_ak = A_view.stride(1)
+    # For partial N tiles with non-unit K stride (e.g. B comes from .T),
+    # the K dim is dim-0; C-contiguous gives stride (N, 1) so s_bk = N,
+    # NOT 1.  We still materialise a dense copy to eliminate any exotic
+    # stride pattern, but this does NOT make K contiguous for B.
+    if not even_n and B_view.stride(0) != 1:
+        B_view = B_view.contiguous()
+        s_bk = B_view.stride(0)
+
+    # tl.multiple_of hints for vectorised loads are only valid when BOTH
+    # the base pointer AND the non-contiguous stride are 16-element-aligned.
+    # Subviews from TP/MoE weight slicing can have aligned strides but a
+    # misaligned base address, which would cause garbage loads and NaN loss.
+    stride_am = A_view.stride(0)
+    stride_bn = B_view.stride(1)
+    elem_bytes = A_view.element_size()
+    ptr_aligned_a = A_view.data_ptr() % (16 * elem_bytes) == 0
+    ptr_aligned_b = B_view.data_ptr() % (16 * elem_bytes) == 0
+    if s_ak == 1:
+        a_load_aligned = ptr_aligned_a and stride_am % 16 == 0
+    else:
+        a_load_aligned = ptr_aligned_a and s_ak % 16 == 0
+    if s_bk == 1:
+        b_load_aligned = ptr_aligned_b and stride_bn % 16 == 0
+    else:
+        b_load_aligned = ptr_aligned_b and s_bk % 16 == 0
+
+    args = (A_view, B_view, out, M, N, K, stride_am, stride_bn, stride_cm, stride_cn)
 
     _bf16_persistent_gemm_kernel[(num_sms,)](
         *args,
@@ -716,6 +808,10 @@ def gemm_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        EVEN_M=even_m,
+        EVEN_N=even_n,
+        A_LOAD_ALIGNED=a_load_aligned,
+        B_LOAD_ALIGNED=b_load_aligned,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
