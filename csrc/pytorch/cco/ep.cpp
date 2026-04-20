@@ -52,7 +52,8 @@ fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
     auto channel_expert_prefix =
         torch::empty({num_ranks, num_channels, num_experts_per_rank}, int32_opts);
 
-    int num_memset_int = num_channels * num_ranks * 4;
+    int num_memset_int =
+        num_channels * num_ranks * 3 + num_experts_per_rank + num_worst_tokens * num_topk;
 
     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
     int  **barrier_signal_ptrs_gpu =
@@ -71,13 +72,14 @@ fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
             channel_prefix_matrix, expert_prefix,           channel_expert_prefix};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
-                       const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
-                       const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
-                       const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
-                       int num_worst_tokens, int num_permuted_tokens, int num_experts, int rank,
-                       int num_ranks, int num_sms, int num_max_send_tokens) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dispatch_permute(
+    const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+    const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
+    const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
+    const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
+    const torch::Tensor &expert_tail_idx, int num_worst_tokens, int num_permuted_tokens,
+    int num_experts, int rank, int num_ranks, int num_sms, int num_max_send_tokens,
+    const std::optional<torch::Tensor> &recv_x_buffer) {
 
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
@@ -85,9 +87,9 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
 
     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
 
-    auto num_tokens          = static_cast<int>(x.size(0));
-    auto hidden              = static_cast<int>(x.size(1));
-    auto num_topk            = static_cast<int>(topk_idx.size(1));
+    auto num_tokens           = static_cast<int>(x.size(0));
+    auto hidden               = static_cast<int>(x.size(1));
+    auto num_topk             = static_cast<int>(topk_idx.size(1));
     auto num_experts_per_rank = num_experts / num_ranks;
 
     float *topk_weights_ptr = nullptr;
@@ -111,7 +113,23 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
 
     auto stream     = at::cuda::getCurrentCUDAStream();
     auto int32_opts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
-    auto recv_x     = torch::zeros({num_worst_tokens * num_topk, hidden}, x.options());
+
+    // Reuse a caller-provided `recv_x` when available. Pre-allocating the
+    // ~3.5 GB permuted output once and recycling it across iterations side-
+    // steps a PyTorch HIP caching-allocator race: with per-call allocation,
+    // the allocator can mark an iter-N block free while compute_stream's
+    // gemm_N is still reading it, leading to HSA_STATUS_ERROR_EXCEPTION
+    // (0x1016 — memory aperture violation) in pipelined overlap schedules.
+    torch::Tensor recv_x;
+    if (recv_x_buffer.has_value()) {
+        EP_HOST_ASSERT(recv_x_buffer->is_contiguous());
+        EP_HOST_ASSERT(recv_x_buffer->size(0) >= num_worst_tokens * num_topk);
+        EP_HOST_ASSERT(recv_x_buffer->size(1) == hidden);
+        EP_HOST_ASSERT(recv_x_buffer->scalar_type() == x.scalar_type());
+        recv_x = *recv_x_buffer;
+    } else {
+        recv_x = torch::empty({num_worst_tokens * num_topk, hidden}, x.options());
+    }
 
     auto recv_topk_idx =
         torch::empty({num_worst_tokens, num_topk},
@@ -119,18 +137,96 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
     auto recv_topk_weights =
         torch::empty({num_worst_tokens, num_topk},
                      torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-    auto dispatch_to_expert_map =
-        torch::full({num_worst_tokens, num_topk}, -1, int32_opts);
+    auto dispatch_to_expert_map = torch::empty({num_worst_tokens, num_topk}, int32_opts);
 
     primus_turbo::cco::ep::intranode::fused_dispatch_permute(
-        buffer_ptrs_gpu, recv_topk_idx.data_ptr<int64_t>(), recv_topk_weights.data_ptr<float>(),
-        dispatch_to_expert_map.data_ptr<int>(), x.data_ptr(),
+        buffer_ptrs_gpu, expert_tail_idx.data_ptr<int>(), recv_topk_idx.data_ptr<int64_t>(),
+        recv_topk_weights.data_ptr<float>(), dispatch_to_expert_map.data_ptr<int>(), x.data_ptr(),
         x_scales_ptr, topk_idx.data_ptr<int64_t>(), topk_weights_ptr,
         is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
         num_recv_tokens_per_expert.data_ptr<int>(), recv_x.data_ptr(), num_tokens,
         static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)), num_topk, num_experts,
         num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms,
         num_worst_tokens, num_max_send_tokens);
+
+    return std::make_tuple(recv_x, recv_topk_idx, recv_topk_weights, dispatch_to_expert_map);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+expert_grouped_dispatch_permute(
+    const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+    const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
+    const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
+    const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
+    const torch::Tensor &expert_tail_idx, int num_worst_tokens, int num_permuted_tokens,
+    int num_experts, int num_experts_per_group, int rank, int num_ranks, int num_sms,
+    int num_max_send_tokens, const std::optional<torch::Tensor> &recv_x_buffer) {
+
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(num_sms % 2 == 0);
+    EP_HOST_ASSERT(num_experts_per_group > 0);
+
+    void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
+
+    auto num_tokens = static_cast<int>(x.size(0));
+    auto hidden     = static_cast<int>(x.size(1));
+    auto num_topk   = static_cast<int>(topk_idx.size(1));
+
+    float *topk_weights_ptr = nullptr;
+    if (topk_weights.has_value()) {
+        topk_weights_ptr = topk_weights->data_ptr<float>();
+    }
+
+    float *x_scales_ptr = nullptr;
+    int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (x_scales.has_value()) {
+        EP_HOST_ASSERT(x.element_size() == 1);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or
+                       x_scales->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(x_scales->dim() == 2);
+        EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
+        num_scales          = static_cast<int>(x_scales->size(1));
+        x_scales_ptr        = static_cast<float *>(x_scales->data_ptr());
+        scale_token_stride  = static_cast<int>(x_scales->stride(0));
+        scale_hidden_stride = static_cast<int>(x_scales->stride(1));
+    }
+
+    auto stream     = at::cuda::getCurrentCUDAStream();
+    auto int32_opts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+
+    // See the note in ``fused_dispatch_permute`` above: callers can supply a
+    // persistent ``recv_x_buffer`` to avoid the per-iteration 3.5 GB alloc
+    // that otherwise races with ``record_stream``-recorded compute streams
+    // in overlap benchmarks on PyTorch HIP.
+    torch::Tensor recv_x;
+    if (recv_x_buffer.has_value()) {
+        EP_HOST_ASSERT(recv_x_buffer->is_contiguous());
+        EP_HOST_ASSERT(recv_x_buffer->size(0) >= num_worst_tokens * num_topk);
+        EP_HOST_ASSERT(recv_x_buffer->size(1) == hidden);
+        EP_HOST_ASSERT(recv_x_buffer->scalar_type() == x.scalar_type());
+        recv_x = *recv_x_buffer;
+    } else {
+        recv_x = torch::empty({num_worst_tokens * num_topk, hidden}, x.options());
+    }
+
+    auto recv_topk_idx =
+        torch::empty({num_worst_tokens, num_topk},
+                     torch::TensorOptions().dtype(torch::kInt64).device(x.device()));
+    auto recv_topk_weights =
+        torch::empty({num_worst_tokens, num_topk},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    auto dispatch_to_expert_map = torch::empty({num_worst_tokens, num_topk}, int32_opts);
+
+    primus_turbo::cco::ep::intranode::expert_grouped_dispatch_permute(
+        buffer_ptrs_gpu, expert_tail_idx.data_ptr<int>(), recv_topk_idx.data_ptr<int64_t>(),
+        recv_topk_weights.data_ptr<float>(), dispatch_to_expert_map.data_ptr<int>(), x.data_ptr(),
+        x_scales_ptr, topk_idx.data_ptr<int64_t>(), topk_weights_ptr,
+        is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
+        num_recv_tokens_per_expert.data_ptr<int>(), recv_x.data_ptr(), num_tokens,
+        static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)), num_topk, num_experts,
+        num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms,
+        num_worst_tokens, num_max_send_tokens, num_experts_per_group);
 
     return std::make_tuple(recv_x, recv_topk_idx, recv_topk_weights, dispatch_to_expert_map);
 }
@@ -155,9 +251,10 @@ fused_dispatch_permute(const torch::Tensor &x, const std::optional<torch::Tensor
 
 //     primus_turbo::cco::ep::intranode::fused_unpermute_combine(
 //         buffer_ptrs_gpu, permuted_x.data_ptr(), permuted_weights.data_ptr<float>(),
-//         dense_to_expert_map.data_ptr<int>(), expert_offsets.data_ptr<int>(), combined_x.data_ptr(),
-//         num_recv_tokens, static_cast<int>(hidden * permuted_x.element_size() / sizeof(int4)),
-//         num_topk, num_experts_per_rank, rank, num_ranks, stream, num_sms);
+//         dense_to_expert_map.data_ptr<int>(), expert_offsets.data_ptr<int>(),
+//         combined_x.data_ptr(), num_recv_tokens, static_cast<int>(hidden *
+//         permuted_x.element_size() / sizeof(int4)), num_topk, num_experts_per_rank, rank,
+//         num_ranks, stream, num_sms);
 
 //     return combined_x;
 // }

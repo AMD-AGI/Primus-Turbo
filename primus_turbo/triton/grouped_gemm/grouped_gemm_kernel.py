@@ -36,6 +36,20 @@ NUM_XCDS = 8
 _NUM_CUS: Optional[int] = None
 
 
+@triton.jit
+def _wait_until_group_ready(
+    group_tail_idx_i32_ptr,
+    group_idx,
+    required_tail_idx,
+):
+    req_i32 = required_tail_idx.to(tl.int32)
+    while req_i32 >= 0:
+        current = tl.atomic_add(group_tail_idx_i32_ptr + group_idx, 0, sem="relaxed", scope="gpu")
+        if current >= req_i32:
+            req_i32 = -1
+        tl.inline_asm_elementwise("s_sleep 128\n// dummy $0", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
 def _get_num_cus() -> int:
     """Lazy initialization of CU count (avoids import-time CUDA calls)."""
     global _NUM_CUS
@@ -85,6 +99,7 @@ def _grouped_bf16_persistent_gemm_kernel(
     A,  # [M_total, K]
     B,  # [G, ?, ?]  — (K,N) or (N,K) depending on trans_b
     C,  # [M_total, N]
+    group_tail_idx_i32_ptr,  # [2*G] int32 view of [G] int64 (LE lower halves)
     group_offs_ptr,  # [G+1] int64
     # Dimensions
     G,  # number of groups (runtime)
@@ -156,7 +171,8 @@ def _grouped_bf16_persistent_gemm_kernel(
 
         # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
         local_tile = global_tile_id - tile_start
-        m_start_g = tl.load(group_offs_ptr + group_idx)  # keep int64 to avoid address overflow
+        # keep int64 to avoid address overflow
+        m_start_g = tl.load(group_offs_ptr + group_idx)
         M_g = (tl.load(group_offs_ptr + group_idx + 1) - tl.load(group_offs_ptr + group_idx)).to(tl.int32)
         tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
 
@@ -169,8 +185,22 @@ def _grouped_bf16_persistent_gemm_kernel(
         tl.assume(pid_m >= 0)
         tl.assume(pid_n >= 0)
 
+        m_tile_start = pid_m * BLOCK_SIZE_M
+        m_tile_end = tl.minimum(m_tile_start + BLOCK_SIZE_M, M_g)
+        tl.device_assert(M_g > 0, "M_g must be positive")
+
+        required_tail_idx = m_tile_end
+        tl.device_assert(required_tail_idx >= 0, "required_tail_idx must be non-negative")
+        tl.device_assert(group_idx >= 0 and group_idx < G, "group_idx must be non-negative")
+        if group_tail_idx_i32_ptr is not None:
+            _wait_until_group_ready(
+                group_tail_idx_i32_ptr,
+                group_idx,
+                required_tail_idx,
+            )
+
         # ── Address computation ──
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+        rm = (m_tile_start + tl.arange(0, BLOCK_SIZE_M)) % M_g
         rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         rk = tl.arange(0, BLOCK_SIZE_K)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
@@ -233,8 +263,11 @@ def _grouped_bf16_persistent_gemm_kernel(
 def grouped_gemm_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
-    group_offs: torch.Tensor,
+    group_tail_idx: Optional[torch.Tensor] = None,
+    group_offs: Optional[torch.Tensor] = None,
     trans_b: bool = False,
+    BLOCK_SIZE_M: int = 256,
+    num_sms: int = _get_num_cus(),
 ) -> torch.Tensor:
     """Persistent grouped GEMM (CPU-sync-free) using Triton.
 
@@ -270,6 +303,14 @@ def grouped_gemm_triton_kernel(
         stride_bn = b.stride(2)  # N is the fast dimension (=1 for contiguous)
 
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
+
+    # ``group_tail_idx`` is optional — when ``None`` the kernel's per-tile
+    # ``_wait_until_group_ready`` poll is dropped entirely (constexpr-null
+    # pointer), which is the correct thing to do when the caller has
+    # already synchronised with an outside ``wait_expert_group_ready``.
+    if group_tail_idx is not None:
+        assert group_tail_idx.dtype == torch.int32
+
     K = K_a
 
     stride_bg = b.stride(0)  # Group stride
@@ -279,7 +320,6 @@ def grouped_gemm_triton_kernel(
     out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
 
     # Kernel config
-    num_sms = _get_num_cus()
     even_k = K % 64 == 0
     group_m = 4  # Default GROUP_SIZE_M for grouped GEMM
 
@@ -287,6 +327,7 @@ def grouped_gemm_triton_kernel(
         a,
         b,
         out,
+        group_tail_idx,
         group_offs,
         G,
         N,
@@ -298,7 +339,7 @@ def grouped_gemm_triton_kernel(
         out.stride(1),  # stride_cn
         stride_ak=stride_ak,
         stride_bk=stride_bk,
-        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=256,
         BLOCK_SIZE_K=64,
         GROUP_SIZE_M=group_m,
@@ -408,7 +449,8 @@ def _grouped_variable_k_gemm_kernel(
         tl.assume(pid_n >= 0)
 
         # ── Group boundaries ──
-        m_start = tl.load(group_offs_ptr + group_idx)  # int64 to avoid overflow
+        # int64 to avoid overflow
+        m_start = tl.load(group_offs_ptr + group_idx)
         M_g = (tl.load(group_offs_ptr + group_idx + 1) - m_start).to(tl.int32)
 
         # ── Output indices ──

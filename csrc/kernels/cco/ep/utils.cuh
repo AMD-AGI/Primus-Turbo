@@ -24,7 +24,11 @@ struct SharedData {
     uint32_t barrier[MAX_NUM_BARRIERS];
 };
 
-__shared__ SharedData shared_data;
+// `static` gives this block-scope LDS slot internal linkage per TU — required
+// because multiple .cu/.hip sources (e.g. `intranode.cu`, `dispatch.cu`) that
+// include this header would otherwise produce duplicate symbols when
+// `libprimus_turbo_kernels.so` is linked with `-fgpu-rdc --hip-link`.
+static __shared__ SharedData shared_data;
 
 __device__ __forceinline__ void barrier_init(int barrier_id) {
     shared_data.barrier[barrier_id] = 0;
@@ -443,7 +447,7 @@ template <> __device__ __forceinline__ int4 ld_nc_global(int4 const *ptr) {
     int4 ret;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     using native_int4_t = int __attribute__((ext_vector_type(4)));
-    auto val = __builtin_nontemporal_load(reinterpret_cast<native_int4_t const *>(ptr));
+    auto val            = __builtin_nontemporal_load(reinterpret_cast<native_int4_t const *>(ptr));
     return *reinterpret_cast<int4 *>(&val);
 #else
     asm volatile(LD_NC_FUNC ".v4.s32 {%0, %1, %2, %3}, [%4];"
@@ -560,6 +564,13 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(uint64_t const *ptr) {
     return ret;
 }
 
+template <bool kUseAggressiveAtomic = false>
+__device__ __forceinline__ int64_t ld_acquire_sys_global(int64_t const *ptr) {
+    int64_t ret;
+    ret = amd::scoped_ld_acquire<kUseAggressiveAtomic, __HIP_MEMORY_SCOPE_SYSTEM>(ptr);
+    return ret;
+}
+
 template <typename dtype_t> __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
@@ -640,6 +651,11 @@ __device__ __forceinline__ void st_release_sys_global(int const *ptr, int val) {
 #else
     asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 #endif
+}
+
+template <bool kUseAggressiveAtomic = false>
+__device__ __forceinline__ void st_release_sys_global(int64_t const *ptr, int64_t val) {
+    amd::st_release_sys_global<kUseAggressiveAtomic>(ptr, val);
 }
 
 __device__ __forceinline__ void st_release_cta(int const *ptr, int val) {
@@ -878,4 +894,12 @@ __forceinline__ __device__ void release_lock(int *mutex) {
     // To make previous memory operations visible to other threads, we must
     // use `release` for memory semantics
     atomic_exch_cta_release(mutex, 0);
+}
+
+__forceinline__ __device__ int atomic_cas_global_release(int64_t *addr, int64_t x, int64_t y) {
+    // TODO: __hip_atomic_compare_exchange_strong or
+    // __hip_atomic_compare_exchange_weak
+    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_RELEASE, __ATOMIC_RELAXED,
+                                         __HIP_MEMORY_SCOPE_AGENT);
+    return x;
 }

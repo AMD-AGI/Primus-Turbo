@@ -9,14 +9,15 @@ namespace intranode {
 
 template <int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
-    fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
-                           int *dispatch_to_expert_map, int4 const *x, float const *x_scales,
-                           int64_t const *topk_idx, float const *topk_weights,
-                           bool const *is_token_in_rank, int const *channel_prefix_matrix,
-                           int const *num_recv_tokens_per_expert, int4 *recv_x, int num_tokens,
-                           int hidden_int4, int num_topk, int num_experts, int num_scales,
-                           int scale_token_stride, int scale_hidden_stride, int rank,
-                           int num_max_tokens, int num_max_send_tokens) {
+    fused_dispatch_permute(void **buffer_ptrs, int *expert_tail_idx, int64_t *recv_topk_idx,
+                           float *recv_topk_weights, int *dispatch_to_expert_map, int4 const *x,
+                           float const *x_scales, int64_t const *topk_idx,
+                           float const *topk_weights, bool const *is_token_in_rank,
+                           int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,
+                           int4 *recv_x, int num_tokens, int hidden_int4, int num_topk,
+                           int num_experts, int num_scales, int scale_token_stride,
+                           int scale_hidden_stride, int rank, int num_max_tokens,
+                           int num_max_send_tokens) {
     auto const num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     auto const thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -111,9 +112,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     // Copy `topk_idx` and `topk_weights` with transformed index
                     if (lane_id < num_topk) {
                         // Top-k index
-                        int  recv_expert_begin = responsible_rank * num_experts_per_rank,
-                             recv_expert_end   = (responsible_rank + 1) * num_experts_per_rank;
-                        auto idx_value         = __ldg(topk_idx + token_idx * num_topk + lane_id);
+                        int recv_expert_begin = responsible_rank * num_experts_per_rank,
+                            recv_expert_end   = (responsible_rank + 1) * num_experts_per_rank;
+                        auto idx_value        = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end)
                                         ? idx_value - recv_expert_begin
                                         : -1;
@@ -148,9 +149,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int *>(buffer_ptrs[rank]);
-        int  rank_offset = responsible_rank > 0
-                               ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank]
-                               : 0;
+        int  rank_offset        = responsible_rank > 0
+                                      ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank]
+                                      : 0;
 
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
@@ -246,6 +247,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                            shifted_buffer_x_int4, ld_nc_global, st_na_global);
                     }
                     dispatch_to_expert_map[mapped_idx] = dst_slot_idx;
+
+                    if (lane_id == 0 and recv_topk_idx_i64 >= 0) {
+                        // Release semantics: make the payload store above
+                        // visible to any persistent GroupedGEMM consumer that
+                        // polls `expert_tail_idx[recv_topk_idx_i64]`.
+                        __hip_atomic_fetch_add(expert_tail_idx + recv_topk_idx_i64, 1,
+                                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    }
                 }
             }
 
@@ -269,26 +278,27 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     }
 }
 
-void fused_dispatch_permute(void **buffer_ptrs, int64_t *recv_topk_idx, float *recv_topk_weights,
-                            int *dispatch_to_expert_map, void const *x, float const *x_scales,
-                            int64_t const *topk_idx, float const *topk_weights,
-                            bool const *is_token_in_rank, int const *channel_prefix_matrix,
-                            int const *num_recv_tokens_per_expert, void *recv_x, int num_tokens,
-                            int hidden_int4, int num_topk, int num_experts, int num_scales,
-                            int scale_token_stride, int scale_hidden_stride, int rank,
-                            int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens,
-                            int num_max_send_tokens) {
+void fused_dispatch_permute(void **buffer_ptrs, int *expert_tail_idx, int64_t *recv_topk_idx,
+                            float *recv_topk_weights, int *dispatch_to_expert_map, void const *x,
+                            float const *x_scales, int64_t const *topk_idx,
+                            float const *topk_weights, bool const *is_token_in_rank,
+                            int const *channel_prefix_matrix, int const *num_recv_tokens_per_expert,
+                            void *recv_x, int num_tokens, int hidden_int4, int num_topk,
+                            int num_experts, int num_scales, int scale_token_stride,
+                            int scale_hidden_stride, int rank, int num_ranks, cudaStream_t stream,
+                            int num_sms, int num_max_tokens, int num_max_send_tokens) {
     constexpr int kNumThreads = 1024;
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
         auto kernel = fused_dispatch_permute<ranks, kNumThreads>;                                  \
-        LAUNCH_KERNEL(&cfg, kernel, buffer_ptrs, recv_topk_idx, recv_topk_weights,                 \
-                      dispatch_to_expert_map, reinterpret_cast<int4 const *>(x), x_scales,         \
-                      topk_idx, topk_weights, is_token_in_rank, channel_prefix_matrix,             \
-                      num_recv_tokens_per_expert, reinterpret_cast<int4 *>(recv_x), num_tokens,    \
-                      hidden_int4, num_topk, num_experts, num_scales, scale_token_stride,          \
-                      scale_hidden_stride, rank, num_max_tokens, num_max_send_tokens);             \
+        LAUNCH_KERNEL(&cfg, kernel, buffer_ptrs, expert_tail_idx, recv_topk_idx,                   \
+                      recv_topk_weights, dispatch_to_expert_map,                                   \
+                      reinterpret_cast<int4 const *>(x), x_scales, topk_idx, topk_weights,         \
+                      is_token_in_rank, channel_prefix_matrix, num_recv_tokens_per_expert,         \
+                      reinterpret_cast<int4 *>(recv_x), num_tokens, hidden_int4, num_topk,         \
+                      num_experts, num_scales, scale_token_stride, scale_hidden_stride, rank,      \
+                      num_max_tokens, num_max_send_tokens);                                        \
     }                                                                                              \
     break
 
