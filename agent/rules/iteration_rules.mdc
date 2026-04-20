@@ -65,20 +65,34 @@ Every round MUST benchmark all shapes in the active validation set. No exception
 - Different shapes in the active validation set stress different bottlenecks. Skipping shapes hides regressions.
 - If a shape fails, record the failure explicitly.
 
+### Rule 2.1: Polling Cap — No Single Sleep/Wait > 15 Minutes
+
+When waiting on a backgrounded benchmark or test command:
+
+- A single `sleep` / `wait` / polling tool call MUST NOT exceed **15 minutes (900 seconds)**.
+- Long-running benchmarks (commonly 30-90 minutes on FP8 GEMM kernels) MUST be polled in repeated `sleep ≤ 900` windows.
+- Between windows, inspect progress via the terminal file and/or output artifact (e.g. grep `TestID:` in the benchmark log, `wc -l` the CSV, check terminal metadata for `exit_code`).
+- If two consecutive poll windows show no progress, treat the command as hung and investigate; do not keep sleeping blindly.
+
+Rationale: keeps the agent responsive to mid-run user corrections, bounds worst-case blocking on shell interrupts, and forces periodic progress verification instead of passive multi-hour waits.
+
 ## Rule 3: Accept or Rollback — No Ambiguity
 
-After benchmarking, apply this decision rule **mechanically**:
+After benchmarking, apply this decision rule **mechanically** using the campaign's **primary accept metric**:
+
+- For forward-only or otherwise single-objective campaigns, this is the primary performance metric directly.
+- For forward+backward GEMM campaigns, this should usually be a derived **combined-step** metric (for example, inverse step time or combined-step throughput), not independent forward/backward aggregates.
 
 ```
-IF   (avg TFLOPS improved) AND (no shape regressed ≥5%):
+IF   (primary aggregate score improved) AND (no core shape regressed ≥5% on the primary metric):
     ACCEPT → this round's code becomes the new baseline
     Record: "Round N: ACCEPTED — avg +X.X%, description"
 
-ELIF (some shapes improved, some regressed <5%):
+ELIF (primary aggregate score improved) AND (some shapes improved, some regressed <5%):
     ACCEPT WITH NOTE → document the trade-off
     Record: "Round N: ACCEPTED (trade-off) — avg +X.X%, shape Y regressed Z%"
 
-ELSE (avg TFLOPS did not improve) OR (any shape regressed ≥5%):
+ELSE (primary aggregate score did not improve) OR (any core shape regressed ≥5% on the primary metric):
     ROLLBACK → revert kernel code to previous round's snapshot
     Record: "Round N: ROLLED BACK — description did not help because ..."
     The NEXT round starts from the previous accepted code, not this failed attempt.
