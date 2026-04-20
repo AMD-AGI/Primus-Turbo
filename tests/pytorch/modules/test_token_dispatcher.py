@@ -32,7 +32,9 @@ def _get_backends():
     try:
         import deep_ep  # noqa: F401
 
-        return ["TURBO", "DEEP_EP"]
+        # TODO: add backend deepep, temporal disable it since rocm7.2 deepep bug.
+        # return ["TURBO", "DEEP_EP"]
+        return ["TURBO"]
     except ImportError:
         return ["TURBO"]
 
@@ -154,6 +156,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
     @parametrize("backend", _get_backends())
     def test_cuda_graph(self, backend):
+        from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
+
         self._bind_device()
         with patch.dict(
             os.environ,
@@ -164,6 +168,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         ):
             num_worst_tokens = NUM_TOKENS * 8
             permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
+
+            # clear buffer for reset
+            # a trick to reset the backend instance
+            moe_dispatch_combine_impl._backend_instances.clear()
 
             set_buffer_global_config(num_use_cu=32)
 
