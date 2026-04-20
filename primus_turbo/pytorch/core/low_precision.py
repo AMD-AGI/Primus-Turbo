@@ -135,7 +135,7 @@ class ScalingStrategy(Enum):
 
 
 @dataclass
-class MXScalingRecipe:
+class ScalingRecipe:
     """
     Supported MXFP8/MXFP4 scaling recipe.
 

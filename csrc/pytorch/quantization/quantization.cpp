@@ -310,10 +310,10 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
             colwise_scale.data_ptr<uint8_t>(), M, N, M_pad, N_pad, rowwise_scale_stride,
             colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
             colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
-            MXScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
-                            shuffle_rowwise_scale, shuffle_rowwise),
-            MXScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht,
-                            shuffle_colwise_scale, shuffle_colwise),
+            ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
+                          shuffle_rowwise_scale, shuffle_rowwise),
+            ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht,
+                          shuffle_colwise_scale, shuffle_colwise),
             stream);
     });
 
@@ -394,7 +394,7 @@ std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarT
             reinterpret_cast<dtype::float4x2_e2m1 *>(output.data_ptr()),
             scale_tensor.data_ptr<uint8_t>(), mode, M, N, M_pad, N_pad, scale_stride, scale_N,
             scale_M_pad, scale_N_pad,
-            MXScalingRecipe(use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out), stream);
+            ScalingRecipe(use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out), stream);
     });
 
     return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
@@ -488,10 +488,10 @@ quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
                 colwise_scale.data_ptr<uint8_t>(), M, N, M_pad, N_pad, rowwise_scale_stride,
                 colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
                 colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
-                MXScalingRecipe(rowwise_use_2d_block, false, false, shuffle_rowwise_scale,
-                                shuffle_rowwise),
-                MXScalingRecipe(colwise_use_2d_block, false, false, shuffle_colwise_scale,
-                                shuffle_colwise),
+                ScalingRecipe(rowwise_use_2d_block, false, false, shuffle_rowwise_scale,
+                              shuffle_rowwise),
+                ScalingRecipe(colwise_use_2d_block, false, false, shuffle_colwise_scale,
+                              shuffle_colwise),
                 stream);
         })});
 
@@ -572,7 +572,7 @@ std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarT
                 reinterpret_cast<IType *>(input.data_ptr()),
                 reinterpret_cast<OType *>(output.data_ptr()), scale_tensor.data_ptr<uint8_t>(),
                 mode, M, N, M_pad, N_pad, scale_stride, scale_N, scale_M_pad, scale_N_pad,
-                MXScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out), stream);
+                ScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out), stream);
         })});
 
     return {output.view(dest_dtype), scale_tensor.view(at::kFloat8_e8m0fnu)};
