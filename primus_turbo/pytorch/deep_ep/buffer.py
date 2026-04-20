@@ -52,7 +52,6 @@ class Buffer:
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
         explicitly_destroy: bool = False,
-        use_default_stream_as_comm_stream: bool = True,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -72,6 +71,12 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+
+        Note:
+            Whether dispatch/combine kernels run on the caller's current CUDA
+            stream or on a dedicated async communication stream is controlled
+            by the environment variable ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM``
+            (default ``1``: current-stream, CUDA-graph friendly).
         """
         check_nvlink_connections(group)
 
@@ -90,7 +95,6 @@ class Buffer:
             num_rdma_bytes,
             low_latency_mode,
             explicitly_destroy,
-            use_default_stream_as_comm_stream,
         )
 
         # Synchronize device IDs

@@ -75,5 +75,7 @@ def _is_distributed_test(item):
     if item.get_closest_marker("multigpu"):
         return True
     if hasattr(item, "cls") and item.cls is not None:
-        return any(cls.__name__ == "MultiProcessTestCase" for cls in item.cls.__mro__)
+        return any(
+            cls.__name__ in ["MultiProcessTestCase", "MultiProcContinuousTest"] for cls in item.cls.__mro__
+        )
     return False

@@ -18,6 +18,7 @@
 #include "primus_turbo/deep_ep/configs.h"
 
 #include "event.hpp"
+#include <c10/cuda/CUDAStream.h>
 namespace primus_turbo::pytorch::deep_ep {
 
 struct Buffer {
@@ -73,11 +74,28 @@ private:
     volatile int *moe_recv_rdma_counter        = nullptr;
     int          *moe_recv_rdma_counter_mapped = nullptr;
 
-    bool use_default_stream_as_comm_stream = false;
+    // When true (default, controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM``),
+    // all dispatch/combine kernels are launched on the caller's current CUDA
+    // stream instead of ``comm_stream``, so EP can be captured inside
+    // ``torch.cuda.graph``.  When false, the original async path is used and
+    // ``comm_stream`` fork/joins with the compute stream for overlap.
+    bool force_current_stream = true;
+
+    // Pick the launch stream for this dispatch/combine call.  Returns the
+    // caller's current stream when ``force_current_stream`` is set; otherwise
+    // makes ``comm_stream`` wait on ``previous_event`` (or ``compute_stream``)
+    // and returns ``comm_stream``.
+    c10::cuda::CUDAStream maybe_fork_stream(const c10::cuda::CUDAStream      &compute_stream,
+                                            const std::optional<EventHandle> &previous_event) const;
+
+    // Counterpart of ``maybe_fork_stream`` used in the synchronous path.  When
+    // ``force_current_stream`` is set this is a no-op; otherwise it makes
+    // ``compute_stream`` wait on ``comm_stream``.
+    void maybe_join_stream(const c10::cuda::CUDAStream &compute_stream) const;
 
 public:
     Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
-           bool low_latency_mode, bool explicitly_destroy, bool use_default_stream_as_comm_stream);
+           bool low_latency_mode, bool explicitly_destroy);
 
     ~Buffer() noexcept(false);
 
