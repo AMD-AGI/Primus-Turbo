@@ -34,14 +34,15 @@ make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at:
     params.c_type  = get_hipblaslt_dtype(c.scalar_type());
     params.c_shape = c.sizes().vec();
 
-    params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-    params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-    params.transA         = transA;
-    params.transB         = transB;
-    params.group_num      = group_lens.numel();
-    params.stream         = at::cuda::getCurrentCUDAStream();
-    params.workspace      = workspace.data_ptr();
-    params.handle         = at::cuda::getCurrentCUDABlasLtHandle();
+    params.group_lens_ptr     = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+    params.group_offs_ptr     = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+    params.group_lens_on_host = group_lens.is_cpu();
+    params.transA             = transA;
+    params.transB             = transB;
+    params.group_num          = group_lens.numel();
+    params.stream             = at::cuda::getCurrentCUDAStream();
+    params.workspace          = workspace.data_ptr();
+    params.handle             = at::cuda::getCurrentCUDABlasLtHandle();
     return params;
 }
 
@@ -65,13 +66,14 @@ inline HipblasltGroupedGemmParams make_hipblaslt_grouped_gemm_fp8_params(
     params.c_type  = get_hipblaslt_dtype(c.scalar_type());
     params.c_shape = c.sizes().vec();
 
-    params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-    params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-    params.transA         = transA;
-    params.transB         = transB;
-    params.group_num      = group_lens.numel();
-    params.stream         = at::cuda::getCurrentCUDAStream();
-    params.workspace      = workspace.data_ptr();
+    params.group_lens_ptr     = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+    params.group_offs_ptr     = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+    params.group_lens_on_host = group_lens.is_cpu();
+    params.transA             = transA;
+    params.transB             = transB;
+    params.group_num          = group_lens.numel();
+    params.stream             = at::cuda::getCurrentCUDAStream();
+    params.workspace          = workspace.data_ptr();
 
     params.use_low_precision = true;
 
@@ -106,7 +108,13 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
         c               = at::empty({m, n}, a.options());
     }
 
-    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    const int64_t single_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+    const int64_t grouped_workspace_size =
+        group_lens.numel() * single_workspace_size;
+    const int64_t workspace_size =
+        grouped_workspace_size > primus_turbo::get_hipblaslt_grouped_gemm_workspace_size()
+            ? grouped_workspace_size
+            : primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 
@@ -151,7 +159,13 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
         c               = at::empty({m, n}, a.options().dtype(out_dtype));
     }
 
-    const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
+    const int64_t single_workspace_size = primus_turbo::get_hipblaslt_workspace_size_in_byte();
+    const int64_t grouped_workspace_size =
+        group_lens.numel() * single_workspace_size;
+    const int64_t workspace_size =
+        grouped_workspace_size > primus_turbo::get_hipblaslt_grouped_gemm_workspace_size()
+            ? grouped_workspace_size
+            : primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
         at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(a.device()));
 
