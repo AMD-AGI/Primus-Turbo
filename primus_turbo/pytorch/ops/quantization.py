@@ -45,7 +45,7 @@ def quantize_fp8(
 
         For MXFP8 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.TENSORWISE:
@@ -93,7 +93,7 @@ def quantize_fp8_with_trans(
     NOTE:
         For MXFP8 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
@@ -165,7 +165,7 @@ def quantize_fp4(
     NOTE:
         For MXFP4 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
@@ -199,7 +199,7 @@ def quantize_fp4_with_trans(
     NOTE:
         For MXFP4 quantization:
             1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction. If not specified, the `with_trans` must be True.
+            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
