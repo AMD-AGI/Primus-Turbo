@@ -345,8 +345,7 @@ Buffer.set_num_sms(24)
 
 # You may call this function at the framework initialization
 def get_buffer(group: dist.ProcessGroup,
-               hidden_bytes: int,
-               use_comm_stream: bool = False) -> Buffer:
+               hidden_bytes: int) -> Buffer:
     global _buffer
 
     # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
@@ -355,12 +354,13 @@ def get_buffer(group: dist.ProcessGroup,
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
 
-    # Allocate a buffer if not existed or not enough buffer size
+    # Allocate a buffer if not existed or not enough buffer size.
+    # By default dispatch/combine kernels run on the caller's current CUDA stream so
+    # the buffer is safe to use inside ``torch.cuda.graph``.  To enable compute/comm
+    # overlap on a dedicated communication stream, set
+    # ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=0`` in the environment.
     if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
-        _buffer = Buffer(group,
-                         num_nvl_bytes,
-                         num_rdma_bytes,
-                         use_default_stream_as_comm_stream=not use_comm_stream)
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
 
 

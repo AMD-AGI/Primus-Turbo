@@ -20,14 +20,15 @@
 namespace primus_turbo::pytorch::deep_ep {
 
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
-               bool low_latency_mode, bool explicitly_destroy,
-               bool use_default_stream_as_comm_stream)
+               bool low_latency_mode, bool explicitly_destroy)
     : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes), rank(rank), num_ranks(num_ranks),
-      comm_stream(use_default_stream_as_comm_stream ? at::cuda::getCurrentCUDAStream()
-                                                    : at::cuda::getStreamFromPool(true)),
-      explicitly_destroy(explicitly_destroy),
-      use_default_stream_as_comm_stream(use_default_stream_as_comm_stream) {
+      // ``comm_stream`` is always a dedicated high-priority pool stream.  When
+      // ``force_current_stream`` is true (default) it is left idle and all
+      // kernels run on the caller's current stream; otherwise it hosts the
+      // async EP communication path that overlaps with compute.
+      comm_stream(at::cuda::getStreamFromPool(true)), explicitly_destroy(explicitly_destroy),
+      force_current_stream(is_ep_force_current_stream()) {
     // Metadata memory
     int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes         = NUM_MAX_NVL_PEERS * sizeof(void *);
@@ -177,6 +178,34 @@ torch::Stream Buffer::get_comm_stream() const {
     return comm_stream;
 }
 
+c10::cuda::CUDAStream
+Buffer::maybe_fork_stream(const c10::cuda::CUDAStream      &compute_stream,
+                          const std::optional<EventHandle> &previous_event) const {
+    // Synchronous path: run everything on the caller's stream.  Safe for
+    // ``torch.cuda.graph`` capture because no cross-stream dependency or
+    // ``setCurrentCUDAStream`` switch is introduced.
+    if (force_current_stream) {
+        return compute_stream;
+    }
+
+    // Async path: fork ``comm_stream`` from ``compute_stream`` (or the
+    // user-provided ``previous_event``) so communication overlaps with
+    // compute on a dedicated pool stream.
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
+    return comm_stream;
+}
+
+void Buffer::maybe_join_stream(const c10::cuda::CUDAStream &compute_stream) const {
+    if (force_current_stream) {
+        return;
+    }
+    stream_wait(compute_stream, comm_stream);
+}
+
 void Buffer::destroy() {
     PRIMUS_TURBO_CHECK(not destroyed);
 
@@ -296,21 +325,15 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
     PRIMUS_TURBO_CHECK(topk_idx.is_contiguous());
     PRIMUS_TURBO_CHECK(num_experts > 0);
 
-    // Allocate all tensors on comm stream if set
+    // Pick the actual kernel launch stream.  See ``maybe_fork_stream``.
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
+    auto       compute_stream = at::cuda::getCurrentCUDAStream();
+    auto       launch_stream  = maybe_fork_stream(compute_stream, previous_event);
+    const bool cross_stream_allocation =
+        allocate_on_comm_stream && launch_stream.id() != compute_stream.id();
+    if (cross_stream_allocation) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    if (not use_default_stream_as_comm_stream) {
-        // Wait previous tasks to be finished
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
+        at::cuda::setCurrentCUDAStream(launch_stream);
     }
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)),
@@ -331,30 +354,28 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts,
         num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>()
                                              : nullptr,
         num_tokens_per_expert.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(), num_tokens,
-        num_topk, num_ranks, num_experts, comm_stream);
+        num_topk, num_ranks, num_experts, launch_stream);
 
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
-        event = EventHandle(comm_stream);
+        event = EventHandle(launch_stream);
         for (auto &t : {topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
+            t.record_stream(launch_stream);
+            if (cross_stream_allocation)
                 t.record_stream(compute_stream);
         }
         for (auto &to : {num_tokens_per_rdma_rank}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
+            to.has_value() ? to->record_stream(launch_stream) : void();
+            if (cross_stream_allocation)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        if (not use_default_stream_as_comm_stream) {
-            stream_wait(compute_stream, comm_stream);
-        }
+        maybe_join_stream(compute_stream);
     }
 
     // Switch back compute stream
-    if (allocate_on_comm_stream)
+    if (cross_stream_allocation)
         at::cuda::setCurrentCUDAStream(compute_stream);
 
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
@@ -458,21 +479,15 @@ Buffer::intranode_dispatch(
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
-    // Allocate all tensors on comm stream if set
+    // Pick the actual kernel launch stream.  See ``maybe_fork_stream``.
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
+    auto       compute_stream = at::cuda::getCurrentCUDAStream();
+    auto       launch_stream  = maybe_fork_stream(compute_stream, previous_event);
+    const bool cross_stream_allocation =
+        allocate_on_comm_stream && launch_stream.id() != compute_stream.id();
+    if (cross_stream_allocation) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (not use_default_stream_as_comm_stream) {
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
+        at::cuda::setCurrentCUDAStream(launch_stream);
     }
 
     // Create handles (only return for non-cached mode)
@@ -491,7 +506,7 @@ Buffer::intranode_dispatch(
         // Copy rank prefix matrix and clean flags
         primus_turbo::deep_ep::intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu,
-            barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+            barrier_signal_ptrs_gpu, rank, num_ranks, launch_stream);
     } else {
         rank_prefix_matrix =
             torch::empty({num_ranks, num_ranks},
@@ -515,7 +530,7 @@ Buffer::intranode_dispatch(
             num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped, num_experts,
             num_tokens, is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, expert_alignment, buffer_ptrs_gpu,
-            barrier_signal_ptrs_gpu, rank, comm_stream, num_channels);
+            barrier_signal_ptrs_gpu, rank, launch_stream, num_channels);
 
         if (num_worst_tokens > 0) {
             // No CPU sync, just allocate the worst case
@@ -604,35 +619,33 @@ Buffer::intranode_dispatch(
         is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(), num_tokens,
         num_worst_tokens, static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)), num_topk,
         num_experts, num_scales, scale_token_stride, scale_hidden_stride, buffer_ptrs_gpu, rank,
-        num_ranks, comm_stream, config.num_sms, config.num_max_nvl_chunked_send_tokens,
+        num_ranks, launch_stream, config.num_sms, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
 
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
-        event = EventHandle(comm_stream);
+        event = EventHandle(launch_stream);
         for (auto &t : {x, is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix, recv_x,
                         recv_src_idx, recv_channel_prefix_matrix, send_head}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
+            t.record_stream(launch_stream);
+            if (cross_stream_allocation)
                 t.record_stream(compute_stream);
         }
         for (auto &to :
              {x_scales, topk_idx, topk_weights, num_tokens_per_rank, num_tokens_per_expert,
               cached_channel_prefix_matrix, cached_rank_prefix_matrix, recv_topk_idx,
               recv_topk_weights, recv_x_scales}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
+            to.has_value() ? to->record_stream(launch_stream) : void();
+            if (cross_stream_allocation)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        if (not use_default_stream_as_comm_stream) {
-            stream_wait(compute_stream, comm_stream);
-        }
+        maybe_join_stream(compute_stream);
     }
 
     // Switch back compute stream
-    if (allocate_on_comm_stream)
+    if (cross_stream_allocation)
         at::cuda::setCurrentCUDAStream(compute_stream);
 
     // Return values
@@ -685,21 +698,15 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
                        channel_prefix_matrix.size(1) == num_channels);
     PRIMUS_TURBO_CHECK((hidden * x.element_size()) % sizeof(int4) == 0);
 
-    // Allocate all tensors on comm stream if set
+    // Pick the actual kernel launch stream.  See ``maybe_fork_stream``.
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
+    auto       compute_stream = at::cuda::getCurrentCUDAStream();
+    auto       launch_stream  = maybe_fork_stream(compute_stream, previous_event);
+    const bool cross_stream_allocation =
+        allocate_on_comm_stream && launch_stream.id() != compute_stream.id();
+    if (cross_stream_allocation) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (not use_default_stream_as_comm_stream) {
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
+        at::cuda::setCurrentCUDAStream(launch_stream);
     }
 
     int    num_topk              = 0;
@@ -721,7 +728,7 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
                        num_nvl_bytes);
     primus_turbo::deep_ep::intranode::cached_notify_combine(
         buffer_ptrs_gpu, send_head.data_ptr<int>(), num_channels, num_recv_tokens,
-        num_channels * num_ranks * 2, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+        num_channels * num_ranks * 2, barrier_signal_ptrs_gpu, rank, num_ranks, launch_stream);
 
     // Assign bias pointers
     auto  bias_opts    = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -751,32 +758,30 @@ Buffer::intranode_combine(const torch::Tensor &x, const std::optional<torch::Ten
         recv_topk_weights_ptr, x.data_ptr(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
         src_idx.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(),
         channel_prefix_matrix.data_ptr<int>(), send_head.data_ptr<int>(), num_tokens,
-        num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu, rank, num_ranks, comm_stream,
+        num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu, rank, num_ranks, launch_stream,
         config.num_sms, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
 
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
-        event = EventHandle(comm_stream);
+        event = EventHandle(launch_stream);
         for (auto &t : {x, src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, recv_x}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
+            t.record_stream(launch_stream);
+            if (cross_stream_allocation)
                 t.record_stream(compute_stream);
         }
         for (auto &to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
+            to.has_value() ? to->record_stream(launch_stream) : void();
+            if (cross_stream_allocation)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        if (not use_default_stream_as_comm_stream) {
-            stream_wait(compute_stream, comm_stream);
-        }
+        maybe_join_stream(compute_stream);
     }
 
     // Switch back compute stream
-    if (allocate_on_comm_stream)
+    if (cross_stream_allocation)
         at::cuda::setCurrentCUDAStream(compute_stream);
 
     return {recv_x, recv_topk_weights, event};
@@ -906,22 +911,15 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
-    // Allocate all tensors on comm stream if set
+    // Pick the actual kernel launch stream.  See ``maybe_fork_stream``.
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
+    auto       compute_stream = at::cuda::getCurrentCUDAStream();
+    auto       launch_stream  = maybe_fork_stream(compute_stream, previous_event);
+    const bool cross_stream_allocation =
+        allocate_on_comm_stream && launch_stream.id() != compute_stream.id();
+    if (cross_stream_allocation) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (not use_default_stream_as_comm_stream) {
-        // Wait previous tasks to be finished
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
+        at::cuda::setCurrentCUDAStream(launch_stream);
     }
 
     // Create handles (only return for non-cached mode)
@@ -946,7 +944,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             hidden_int4, num_scales, num_topk, num_topk, num_ranks, num_channels, 0, nullptr,
             nullptr, nullptr, nullptr, rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
             buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
-            comm_stream, config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+            launch_stream, config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
             num_nvl_bytes, true, low_latency_mode);
     } else {
         rdma_channel_prefix_matrix =
@@ -973,7 +971,7 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
             rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
             gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
             rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-            config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, comm_stream,
+            config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, launch_stream,
             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
             low_latency_mode);
 
@@ -1076,18 +1074,18 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
         num_topk, num_experts, scale_token_stride, scale_hidden_stride, rdma_buffer_ptr,
         config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode, comm_stream,
+        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode, launch_stream,
         num_channels, low_latency_mode);
 
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
-        event = EventHandle(comm_stream);
+        event = EventHandle(launch_stream);
         for (auto &t :
              {x, is_token_in_rank, recv_x, rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,
               gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
+            t.record_stream(launch_stream);
+            if (cross_stream_allocation)
                 t.record_stream(compute_stream);
         }
         for (auto &to :
@@ -1097,18 +1095,16 @@ Buffer::internode_dispatch(const torch::Tensor &x, const std::optional<torch::Te
               cached_recv_gbl_rank_prefix_sum, recv_topk_idx, recv_topk_weights, recv_x_scales,
               recv_rdma_channel_prefix_matrix, recv_gbl_channel_prefix_matrix, send_rdma_head,
               send_nvl_head, recv_src_meta}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
+            to.has_value() ? to->record_stream(launch_stream) : void();
+            if (cross_stream_allocation)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        if (not use_default_stream_as_comm_stream) {
-            stream_wait(compute_stream, comm_stream);
-        }
+        maybe_join_stream(compute_stream);
     }
 
     // Switch back compute stream
-    if (allocate_on_comm_stream)
+    if (cross_stream_allocation)
         at::cuda::setCurrentCUDAStream(compute_stream);
 
     // Return values
@@ -1188,21 +1184,15 @@ Buffer::internode_combine(
     PRIMUS_TURBO_CHECK(combined_nvl_head.dim() == 2 and
                        combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
 
-    // Allocate all tensors on comm stream if set
+    // Pick the actual kernel launch stream.  See ``maybe_fork_stream``.
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
+    auto       compute_stream = at::cuda::getCurrentCUDAStream();
+    auto       launch_stream  = maybe_fork_stream(compute_stream, previous_event);
+    const bool cross_stream_allocation =
+        allocate_on_comm_stream && launch_stream.id() != compute_stream.id();
+    if (cross_stream_allocation) {
         PRIMUS_TURBO_CHECK(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (not use_default_stream_as_comm_stream) {
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
+        at::cuda::setCurrentCUDAStream(launch_stream);
     }
 
     // Top-k checks
@@ -1232,7 +1222,7 @@ Buffer::internode_combine(
         combined_rdma_head.data_ptr<int>(), rdma_channel_prefix_matrix.data_ptr<int>(),
         rdma_rank_prefix_sum.data_ptr<int>(), combined_nvl_head.data_ptr<int>(), rdma_buffer_ptr,
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, comm_stream,
+        config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank, launch_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes,
         false, low_latency_mode);
 
@@ -1263,33 +1253,31 @@ Buffer::internode_combine(
         num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,
         config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream, num_channels,
+        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, launch_stream, num_channels,
         low_latency_mode);
 
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
-        event = EventHandle(comm_stream);
+        event = EventHandle(launch_stream);
         for (auto &t : {x, src_meta, is_combined_token_in_rank, rdma_channel_prefix_matrix,
                         rdma_rank_prefix_sum, gbl_channel_prefix_matrix, combined_x,
                         combined_rdma_head, combined_nvl_head}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
+            t.record_stream(launch_stream);
+            if (cross_stream_allocation)
                 t.record_stream(compute_stream);
         }
         for (auto &to : {topk_weights, combined_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
+            to.has_value() ? to->record_stream(launch_stream) : void();
+            if (cross_stream_allocation)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
     } else {
-        if (not use_default_stream_as_comm_stream) {
-            stream_wait(compute_stream, comm_stream);
-        }
+        maybe_join_stream(compute_stream);
     }
 
     // Switch back compute stream
-    if (allocate_on_comm_stream)
+    if (cross_stream_allocation)
         at::cuda::setCurrentCUDAStream(compute_stream);
 
     // Return values
