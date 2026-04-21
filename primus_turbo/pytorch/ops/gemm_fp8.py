@@ -79,18 +79,18 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             )
 
         out = gemm_fp8_impl(
-            a_fp8.data,
-            a_fp8.scale_inv,
+            a_fp8._data,
+            a_fp8._scale_inv,
             trans_a,
-            b_fp8.data,
-            b_fp8.scale_inv,
+            b_fp8._data,
+            b_fp8._scale_inv,
             trans_b,
             out_dtype,
             False,
             granularity=config.granularity.value,
             default_backend=BackendType.HIPBLASLT.value,
         )
-        ctx.save_for_backward(a_fp8.data, a_fp8.scale_inv, b_fp8.data, b_fp8.scale_inv)
+        ctx.save_for_backward(a_fp8._data, a_fp8._scale_inv, b_fp8._data, b_fp8._scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -113,8 +113,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         )
 
         a_grad = gemm_fp8_impl(
-            grad_out_fp8.data,
-            grad_out_fp8.scale_inv,
+            grad_out_fp8._data,
+            grad_out_fp8._scale_inv,
             False,
             b_fp8,
             b_scale_inv,
@@ -129,8 +129,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             a_fp8,
             a_scale_inv,
             not ctx.trans_a,
-            grad_out_fp8.data,
-            grad_out_fp8.scale_inv,
+            grad_out_fp8._data,
+            grad_out_fp8._scale_inv,
             False,
             ctx.out_dtype,
             ctx.trans_b,
@@ -181,17 +181,17 @@ class FP8GemmRowFunction(torch.autograd.Function):
                 keep_trans_cache=True,
             )
 
-        # a_fp8.data = axis=1 (row-wise), a_fp8.t() = axis=0 (col-wise)
-        a_fp8_row, a_scale_inv_row = a_fp8.data, a_fp8.scale_inv
+        # a_fp8._data = axis=1 (row-wise), a_fp8.t() = axis=0 (col-wise)
+        a_fp8_row, a_scale_inv_row = a_fp8._data, a_fp8._scale_inv
         a_fp8_col, a_scale_inv_col = a_fp8.t()
 
         # For b: trans_b=True (NT) -> row is data; trans_b=False (NN) -> row is t
         if trans_b:
-            b_fp8_row, b_scale_inv_row = b_fp8.data, b_fp8.scale_inv
+            b_fp8_row, b_scale_inv_row = b_fp8._data, b_fp8._scale_inv
             b_fp8_col, b_scale_inv_col = b_fp8.t()
         else:
             b_fp8_row, b_scale_inv_row = b_fp8.t()
-            b_fp8_col, b_scale_inv_col = b_fp8.data, b_fp8.scale_inv
+            b_fp8_col, b_scale_inv_col = b_fp8._data, b_fp8._scale_inv
 
         out = gemm_fp8_impl(
             a_fp8_row,
@@ -229,7 +229,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             keep_trans_cache=True,
         )
-        grad_out_fp8_row, grad_out_scale_inv_row = grad_out_fp8.data, grad_out_fp8.scale_inv
+        grad_out_fp8_row, grad_out_scale_inv_row = grad_out_fp8._data, grad_out_fp8._scale_inv
         grad_out_fp8_col, grad_out_scale_inv_col = grad_out_fp8.t()
 
         # NT
@@ -308,22 +308,22 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 scaling_recipe=b_scaling_recipe,
             )
 
-        a_fp8_row, a_scale_inv_row = a_fp8.data, a_fp8.scale_inv
+        a_fp8_row, a_scale_inv_row = a_fp8._data, a_fp8._scale_inv
         a_fp8_col, a_scale_inv_col = a_fp8.t()
 
         out = gemm_fp8_impl(
             a_fp8_row,
             a_scale_inv_row,
             trans_a,
-            b_fp8.data,
-            b_fp8.scale_inv,
+            b_fp8._data,
+            b_fp8._scale_inv,
             trans_b,
             out_dtype,
             False,
             granularity=config.granularity.value,
             default_backend=BackendType.CK.value,
         )
-        ctx.save_for_backward(a_fp8_col, a_scale_inv_col, b_fp8.data, b_fp8.scale_inv)
+        ctx.save_for_backward(a_fp8_col, a_scale_inv_col, b_fp8._data, b_fp8._scale_inv)
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -346,7 +346,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             keep_trans_cache=True,
         )
-        grad_out_fp8_row, grad_out_scale_inv_row = grad_out_fp8.data, grad_out_fp8.scale_inv
+        grad_out_fp8_row, grad_out_scale_inv_row = grad_out_fp8._data, grad_out_fp8._scale_inv
         grad_out_fp8_col, grad_out_scale_inv_col = grad_out_fp8.t()
 
         a_grad = gemm_fp8_impl(
@@ -429,11 +429,11 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # NT layout
         out = gemm_fp8_impl(
-            a_fp8.data,
-            a_fp8.scale_inv,
+            a_fp8._data,
+            a_fp8._scale_inv,
             False,
-            b_fp8.data,
-            b_fp8.scale_inv,
+            b_fp8._data,
+            b_fp8._scale_inv,
             True,
             out_dtype,
             False,
@@ -475,8 +475,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
         grad_a = gemm_fp8_impl(
-            grad_out_fp8.data,
-            grad_out_fp8.scale_inv,
+            grad_out_fp8._data,
+            grad_out_fp8._scale_inv,
             False,
             b_t_fp8,
             b_t_scale_inv,

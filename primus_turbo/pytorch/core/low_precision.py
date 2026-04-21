@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -134,8 +134,7 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
-@dataclass
-class ScalingRecipe:
+class ScalingRecipe(NamedTuple):
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
@@ -144,6 +143,12 @@ class ScalingRecipe:
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.
     - shuffle_output: Whether to shuffle the output tensor. Available in MXFP4.
+
+    NOTE: this is a ``NamedTuple`` (not a ``@dataclass``) so that ``torch.compile``
+    / Dynamo can carry it through the FX graph as a tuple of bool constants.
+    A plain user-defined ``@dataclass`` cannot be turned into an FX proxy
+    (Dynamo raises ``Failed to convert args/kwargs to proxy``), which makes
+    ``QuantizedTensor`` constructors with ``scaling_recipe=...`` un-traceable.
     """
 
     use_2d_block: bool = False

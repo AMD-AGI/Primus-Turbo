@@ -111,11 +111,11 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         # NT layout
         out = gemm_fp4_impl(
-            a_fp4.data,
-            a_fp4.scale_inv,
+            a_fp4._data,
+            a_fp4._scale_inv,
             False,
-            b_fp4.data,
-            b_fp4.scale_inv,
+            b_fp4._data,
+            b_fp4._scale_inv,
             True,
             out_dtype,
             False,
@@ -169,8 +169,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
         grad_a = gemm_fp4_impl(
-            grad_out_fp4.data,
-            grad_out_fp4.scale_inv,
+            grad_out_fp4._data,
+            grad_out_fp4._scale_inv,
             False,
             b_t_fp4,
             b_t_scale_inv,

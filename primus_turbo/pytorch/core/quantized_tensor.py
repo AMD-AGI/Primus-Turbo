@@ -156,11 +156,12 @@ class QuantizedTensor(torch.Tensor):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if dest_dtype in [float8_e4m3, float8_e5m2]:
             if granularity == ScalingGranularity.MX_BLOCKWISE:
-                data_, scale_inv = quantize_fp8_with_trans(
+                data_, scale_inv = quantize_fp8(
                     data,
                     dest_dtype,
                     granularity,
                     block_size=block_size,
+                    axis=axis,
                     scaling_recipe=scaling_recipe,
                 )
             else:
@@ -241,13 +242,13 @@ class QuantizedTensor(torch.Tensor):
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
-    @property
-    def data(self) -> torch.Tensor:
-        return self._data
-
-    @property
-    def scale_inv(self) -> torch.Tensor:
-        return self._scale_inv
+    # NOTE: we intentionally do NOT expose ``data`` / ``scale_inv`` as
+    # ``@property``s on this Tensor subclass. ``torch.Tensor.data`` is a
+    # C++-level special attribute (implemented via ``_get_data_attr``) and
+    # Dynamo intercepts ``tensor.data`` access without going through any
+    # Python-side ``@property`` override, which breaks ``torch.compile`` on
+    # wrapper subclasses. Callers should use ``_data`` / ``_scale_inv``
+    # directly (or ``t()`` for the transposed variant).
 
     def t(self) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._data_t is None:

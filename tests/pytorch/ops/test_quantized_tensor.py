@@ -98,8 +98,8 @@ class TestQuantizedTensorBasic:
         assert qt.dtype == dtype
         assert qt.real_dtype == dest_dtype
         assert is_fp8_dtype(qt.real_dtype)
-        assert qt.data is not None
-        assert qt.scale_inv is not None
+        assert qt._data is not None
+        assert qt._scale_inv is not None
         assert qt.shape == torch.Size([M, N])
         assert qt.device.type == "cuda"
         assert qt.granularity == granularity
@@ -111,8 +111,8 @@ class TestQuantizedTensorBasic:
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
-        assert qt.data.dtype == dest_dtype
-        assert qt.data.shape == torch.Size([M, N])
+        assert qt._data.dtype == dest_dtype
+        assert qt._data.shape == torch.Size([M, N])
 
     @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
     @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
@@ -122,8 +122,8 @@ class TestQuantizedTensorBasic:
 
         expected = _expected_scale_shape(granularity, M, N, block_size, use_2d_block=False)
         assert (
-            tuple(qt.scale_inv.shape) == expected
-        ), f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+            tuple(qt._scale_inv.shape) == expected
+        ), f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt._scale_inv.shape)}"
 
     @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
     def test_blockwise_2d_weight(self, dest_dtype):
@@ -137,9 +137,9 @@ class TestQuantizedTensorBasic:
             use_2d_block=True,
         )
 
-        assert qt.data.dtype == dest_dtype
-        assert qt.data.shape == torch.Size([M, N])
-        assert tuple(qt.scale_inv.shape) == (M // BLOCK_SIZE_2D, N // BLOCK_SIZE_2D)
+        assert qt._data.dtype == dest_dtype
+        assert qt._data.shape == torch.Size([M, N])
+        assert tuple(qt._scale_inv.shape) == (M // BLOCK_SIZE_2D, N // BLOCK_SIZE_2D)
 
 
 # =====================================================================
