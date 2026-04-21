@@ -150,9 +150,62 @@ class TestTokenDispatcher(MultiProcContinuousTest):
             )
 
     # ------------------------------------------------------------------
-    # CUDA graph compatibility (requires num_worst_tokens > 0 and
-    # permute_max_token_num > 0 to avoid host syncs)
+    # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
     # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    def test_autotune(self, backend):
+        self._bind_device()
+        with patch.dict(
+            os.environ,
+            {
+                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
+                "PRIMUS_TURBO_AUTO_TUNE": "1",
+            },
+        ):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+            )
+
+
+# ----------------------------------------------------------------------
+# CUDA graph compatibility tests
+#
+# The C++ helper ``is_ep_force_current_stream()`` caches the value of
+# ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` in a ``static`` local on first
+# call, so toggling the env var inside a worker process after the first
+# ``Buffer`` has been constructed is a no-op.  Because
+# ``MultiProcContinuousTest`` reuses the same worker processes across every
+# test method in a class, we cannot rely on ``patch.dict(os.environ, ...)``
+# inside a test body to enable current-stream mode.
+#
+# Instead we put the CUDA-graph tests in a dedicated ``MultiProcContinuousTest``
+# subclass.  Each subclass spawns its own worker pool via
+# ``torch.multiprocessing.Process`` with the ``spawn`` start method, which
+# copies the parent's ``os.environ`` at ``process.start()`` time.  By setting
+# the env var in ``setUpClass`` and eagerly spawning the workers before
+# restoring ``os.environ``, the workers for this class inherit the flag and
+# their static cache is initialized to ``1`` on the very first Buffer
+# construction, while other test classes' worker pools remain unaffected.
+# ----------------------------------------------------------------------
+
+
+@instantiate_parametrized_tests
+class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
+    world_size = -2
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
+
+    def _bind_device(self) -> None:
+        torch.cuda.set_device(self.device)
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
+        super().setUpClass()
 
     @parametrize("backend", _get_backends())
     def test_cuda_graph(self, backend):
@@ -161,10 +214,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         self._bind_device()
         with patch.dict(
             os.environ,
-            {
-                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
-                "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": "1",
-            },
+            {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8
             permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
@@ -206,25 +256,6 @@ class TestTokenDispatcher(MultiProcContinuousTest):
             g.replay()
             torch.cuda.synchronize()
             assert restored is not None, "CUDA graph replay should produce output"
-
-    # ------------------------------------------------------------------
-    # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
-    # ------------------------------------------------------------------
-
-    @parametrize("backend", _get_backends())
-    def test_autotune(self, backend):
-        self._bind_device()
-        with patch.dict(
-            os.environ,
-            {
-                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
-                "PRIMUS_TURBO_AUTO_TUNE": "1",
-            },
-        ):
-            _run_dispatch_combine(
-                self.rank,
-                dist.group.WORLD,
-            )
 
 
 if __name__ == "__main__":
