@@ -204,8 +204,9 @@ Candidate step = 215.5 → improvement = (215.5 - 199.8) / 199.8 = +7.857% → a
 4. Compute baseline `score vector` and `aggregate score` per scoring specification
 5. Select 3-5 `representative_shapes` from PASS-only benchmark rows, covering small / medium / large behavior
 6. Update `quick_test_bench.py` with those `representative_shapes` and record `quick_command` in the manifest
-7. Copy the current kernel into `<campaign_dir>/rounds/round-1/kernel_snapshot/` to establish the rollback root
-8. Record backend configuration and key environment state
+7. Run `manifest.quick_command` once against the filled `representative_shapes` and save the combined stdout+stderr to `<campaign_dir>/rounds/round-1/artifacts/quick_baseline.log`. This file is the reference quick-validation output for every subsequent round; VALIDATE quick runs compare their own `quick_validation.log` against it when metrics look off
+8. Copy the current kernel into `<campaign_dir>/rounds/round-1/kernel_snapshot/` to establish the rollback root
+9. Record backend configuration and key environment state
 
 BASELINE always uses full validation to ensure the starting data is complete and reliable.
 
@@ -222,6 +223,7 @@ BASELINE always uses full validation to ensure the starting data is complete and
 - Aggregate score (geomean): 278.0
 - All Check: PASS
 - Detailed data: rounds/round-1/summary.md
+- Quick baseline log: rounds/round-1/artifacts/quick_baseline.log
 ```
 
 **Output**:
