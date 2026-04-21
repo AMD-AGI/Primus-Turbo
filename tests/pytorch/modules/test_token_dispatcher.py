@@ -168,6 +168,47 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 dist.group.WORLD,
             )
 
+    # ------------------------------------------------------------------
+    # Autotune without an explicit backend override: actually sweep configs
+    # and (when multiple backends exist) select the fastest backend.
+    # ------------------------------------------------------------------
+
+    def test_autotune_sweep(self):
+        """Exercise the real autotune path added to ``_DeepEPLikeBackend``.
+
+        With ``PRIMUS_TURBO_AUTO_TUNE=1`` and **no** backend pinned, the first
+        ``moe_dispatch`` for a given shape triggers a full (dispatch +
+        combine) ``nvl_chunk_size`` sweep, binds the result to the freshly
+        returned ``handle``, and the paired ``moe_combine`` simply looks the
+        result up by ``id(handle)``. A second run on the same shape hits the
+        shape cache without re-measuring.
+        """
+        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+            MoEDispatchCombineAutoTuner,
+        )
+
+        self._bind_device()
+        envs = {k: v for k, v in os.environ.items()}
+        envs.pop("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+        envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
+
+        with patch.dict(os.environ, envs, clear=True):
+            MoEDispatchCombineAutoTuner.clear()
+
+            # First run triggers autotune and registers the handle mapping.
+            _run_dispatch_combine(self.rank, dist.group.WORLD)
+            first = MoEDispatchCombineAutoTuner.current()
+            assert first is not None, "autotune should have populated a result"
+            assert (
+                len(MoEDispatchCombineAutoTuner._handle_cache) > 0
+            ), "moe_dispatch should have bound the tuned result to at least one handle"
+
+            # Second run hits the shape cache (no extra measurements) and
+            # yields the same backend selection.
+            _run_dispatch_combine(self.rank, dist.group.WORLD)
+            second = MoEDispatchCombineAutoTuner.current()
+            assert second is first or second.backend_name == first.backend_name
+
 
 # ----------------------------------------------------------------------
 # CUDA graph compatibility tests
