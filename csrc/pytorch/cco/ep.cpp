@@ -152,13 +152,106 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dis
     return std::make_tuple(recv_x, recv_topk_idx, recv_topk_weights, dispatch_to_expert_map);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Expert-grouped preprocessing: everything that `fused_dispatch_permute_preprocess`
+// produces, PLUS two extra tensors that describe the per-(dst_rank, channel)
+// group buckets consumed by `expert_grouped_dispatch_permute`:
+//
+//   group_offsets          [num_ranks, num_channels, kMaxExpertGroupsPerRank + 1] int32
+//   sorted_token_offsets   [num_ranks, num_channels, kMaxLocalTokensPerSlice]     int16
+//
+// Moving bucket construction out of the dispatch kernel is what lets the
+// sender begin shipping group 0 on the very first cycle after launch — on
+// the existing monolithic kernel it took ~3 scans of the channel's tokens
+// before the first group could be shipped, stealing ~1/(num_groups) of the
+// total dispatch time.
+// ─────────────────────────────────────────────────────────────────────────────
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+expert_grouped_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
+                                           const torch::Tensor &buffer_ptrs_dev,
+                                           const torch::Tensor &barrier_signal_ptrs_dev,
+                                           torch::Tensor        moe_recv_counter,
+                                           torch::Tensor moe_recv_expert_counter, int num_experts,
+                                           int expert_alignment, int num_worst_tokens, int rank,
+                                           int num_ranks, int num_sms, int num_experts_per_group) {
+    EP_HOST_ASSERT(num_sms % 2 == 0);
+    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(num_experts > 0);
+    EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    EP_HOST_ASSERT(num_experts_per_group > 0);
+
+    // Must stay in sync with the compile-time constants in dispatch.cu.
+    constexpr int kMaxExpertGroupsPerRank = 64;
+    constexpr int kMaxLocalTokensPerSlice = 1024;
+
+    auto num_experts_per_rank = num_experts / num_ranks;
+    auto num_channels         = num_sms / 2;
+
+    auto stream     = at::cuda::getCurrentCUDAStream();
+    auto int16_opts = torch::TensorOptions().dtype(torch::kInt16).device(topk_idx.device());
+    auto int32_opts = torch::TensorOptions().dtype(torch::kInt32).device(topk_idx.device());
+    auto bool_opts  = torch::TensorOptions().dtype(torch::kBool).device(topk_idx.device());
+
+    auto num_tokens            = static_cast<int>(topk_idx.size(0)),
+         num_topk              = static_cast<int>(topk_idx.size(1));
+    auto num_tokens_per_rank   = torch::empty({num_ranks}, int32_opts);
+    auto num_tokens_per_expert = torch::empty({num_experts}, int32_opts);
+    auto is_token_in_rank      = torch::empty({num_tokens, num_ranks}, bool_opts);
+
+    // 1. Layout
+    primus_turbo::deep_ep::layout::get_dispatch_layout(
+        topk_idx.data_ptr<int64_t>(), num_tokens_per_rank.data_ptr<int>(), nullptr,
+        num_tokens_per_expert.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(), num_tokens,
+        num_topk, num_ranks, num_experts, stream);
+
+    auto rank_prefix_matrix    = torch::empty({num_ranks, num_ranks}, int32_opts);
+    auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, int32_opts);
+    auto expert_prefix = torch::empty({num_ranks, num_ranks, num_experts_per_rank}, int32_opts);
+    auto channel_expert_prefix =
+        torch::empty({num_ranks, num_channels, num_experts_per_rank}, int32_opts);
+
+    int num_memset_int =
+        num_channels * num_ranks * 3 + num_experts_per_rank + num_worst_tokens * num_topk;
+
+    void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
+    int  **barrier_signal_ptrs_gpu =
+        reinterpret_cast<int **>(barrier_signal_ptrs_dev.data_ptr<int64_t>());
+
+    // 2. notify_dispatch (symm-mem barrier + rank/expert count exchange).
+    primus_turbo::deep_ep::intranode::notify_dispatch(
+        num_tokens_per_rank.data_ptr<int>(), moe_recv_counter.data_ptr<int>(), num_ranks,
+        num_tokens_per_expert.data_ptr<int>(), moe_recv_expert_counter.data_ptr<int>(), num_experts,
+        num_tokens, is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
+        rank_prefix_matrix.data_ptr<int>(), num_memset_int, expert_alignment, buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu, rank, stream, num_channels);
+
+    // 3. expert-group bucket builder. Allocates the two output tensors and
+    // runs a per-(dst_rank, channel) block that writes group-sorted token
+    // offsets to global memory.
+    auto group_offsets =
+        torch::empty({num_ranks, num_channels, kMaxExpertGroupsPerRank + 1}, int32_opts);
+    auto sorted_token_offsets =
+        torch::empty({num_ranks, num_channels, kMaxLocalTokensPerSlice}, int16_opts);
+
+    primus_turbo::cco::ep::intranode::expert_grouped_build_buckets(
+        topk_idx.data_ptr<int64_t>(), is_token_in_rank.data_ptr<bool>(), num_tokens, num_channels,
+        num_topk, num_experts, num_experts_per_group, num_ranks, group_offsets.data_ptr<int>(),
+        sorted_token_offsets.data_ptr<int16_t>(), stream);
+
+    return {num_tokens_per_rank,     num_tokens_per_expert, is_token_in_rank,      moe_recv_counter,
+            moe_recv_expert_counter, rank_prefix_matrix,    channel_prefix_matrix, expert_prefix,
+            channel_expert_prefix,   group_offsets,         sorted_token_offsets};
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 expert_grouped_dispatch_permute(
     const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
     const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
     const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
     const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
-    const torch::Tensor &expert_tail_idx, int num_worst_tokens, int num_permuted_tokens,
+    const torch::Tensor &expert_tail_idx, const torch::Tensor &group_offsets,
+    const torch::Tensor &sorted_token_offsets, int num_worst_tokens, int num_permuted_tokens,
     int num_experts, int num_experts_per_group, int rank, int num_ranks, int num_sms,
     int num_max_send_tokens, const std::optional<torch::Tensor> &recv_x_buffer) {
 
@@ -166,6 +259,8 @@ expert_grouped_dispatch_permute(
     EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
     EP_HOST_ASSERT(num_sms % 2 == 0);
     EP_HOST_ASSERT(num_experts_per_group > 0);
+    EP_HOST_ASSERT(group_offsets.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(sorted_token_offsets.scalar_type() == torch::kInt16);
 
     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
 
@@ -223,7 +318,8 @@ expert_grouped_dispatch_permute(
         recv_topk_weights.data_ptr<float>(), dispatch_to_expert_map.data_ptr<int>(), x.data_ptr(),
         x_scales_ptr, topk_idx.data_ptr<int64_t>(), topk_weights_ptr,
         is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
-        num_recv_tokens_per_expert.data_ptr<int>(), recv_x.data_ptr(), num_tokens,
+        num_recv_tokens_per_expert.data_ptr<int>(), group_offsets.data_ptr<int>(),
+        sorted_token_offsets.data_ptr<int16_t>(), recv_x.data_ptr(), num_tokens,
         static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)), num_topk, num_experts,
         num_scales, scale_token_stride, scale_hidden_stride, rank, num_ranks, stream, num_sms,
         num_worst_tokens, num_max_send_tokens, num_experts_per_group);

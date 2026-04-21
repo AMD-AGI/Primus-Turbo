@@ -56,6 +56,137 @@ __device__ __forceinline__ int compute_primary_local_expert(int64_t const *topk_
     return min_le;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 0 of the expert-grouped pipeline: build per-(dst_rank, channel)
+// group buckets so the main dispatch kernel's sender can start shipping
+// group 0 **immediately** on launch, without the 3-pass scan that used to
+// happen inside each sender SM.
+//
+// Launch: `num_ranks * num_channels` blocks, one warp each. Each block
+// classifies the tokens in ONE (dst_rank, channel) slice by primary local
+// expert → group, builds the per-group prefix sum, and writes two arrays to
+// global memory:
+//
+//   * group_offsets[dst_rank, channel, g]      int32, length
+//       `kMaxExpertGroupsPerRank + 1`. `group_offsets[..,g+1] - [..,g]` is
+//       the number of in-rank tokens in group `g`.
+//   * sorted_token_offsets[dst_rank, channel, i] int16, length
+//       `kMaxLocalTokensPerSlice`. Token slice offsets (relative to
+//       `token_start_idx`) sorted by group.
+//
+// These arrays replace the shared-memory scratch that the dispatch kernel
+// used to build on the hot path. Moving the work into a separate,
+// massively parallel kernel (#(dst_rank, channel) blocks ≈ 192 on MI300X
+// for R=8,C=24) cuts the per-(rank, channel) latency of the classification
+// from 3 passes × 170 tokens ≈ 500 cycles to the launch-gap of the kernel
+// preceding dispatch. On the dispatch side, every SM jumps straight to
+// phase 0.
+// ─────────────────────────────────────────────────────────────────────────────
+template <int kNumRanks>
+__global__ void __launch_bounds__(64, 1)
+    expert_grouped_build_buckets(int64_t const *topk_idx, bool const *is_token_in_rank,
+                                 int num_tokens, int num_channels, int num_topk, int num_experts,
+                                 int num_experts_per_group, int *group_offsets,
+                                 int16_t *sorted_token_offsets) {
+    int const block_id    = static_cast<int>(blockIdx.x);
+    int const dst_rank    = block_id / num_channels;
+    int const channel_id  = block_id % num_channels;
+    int const thread_id   = static_cast<int>(threadIdx.x);
+    int const num_threads = static_cast<int>(blockDim.x);
+
+    int const num_experts_per_rank = num_experts / kNumRanks;
+    int const num_groups =
+        (num_experts_per_rank + num_experts_per_group - 1) / num_experts_per_group;
+    EP_DEVICE_ASSERT(num_groups <= kMaxExpertGroupsPerRank);
+
+    int token_start_idx, token_end_idx;
+    get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+    int const slice_len = token_end_idx - token_start_idx;
+    EP_DEVICE_ASSERT(slice_len <= kMaxLocalTokensPerSlice);
+
+    __shared__ int s_count[kMaxExpertGroupsPerRank];
+    __shared__ int s_offset[kMaxExpertGroupsPerRank + 1];
+    __shared__ int s_fill[kMaxExpertGroupsPerRank];
+
+    for (int g = thread_id; g < num_groups; g += num_threads) {
+        s_count[g] = 0;
+        s_fill[g]  = 0;
+    }
+    __syncthreads();
+
+    // Pass 1: count per-group in-rank tokens for this (dst_rank, channel).
+    for (int t = thread_id; t < slice_len; t += num_threads) {
+        int64_t const token_idx = token_start_idx + t;
+        if (not is_token_in_rank[token_idx * kNumRanks + dst_rank])
+            continue;
+        int const le = compute_primary_local_expert(topk_idx, token_idx, num_topk, dst_rank,
+                                                    num_experts_per_rank);
+        int const g  = le / num_experts_per_group;
+        __hip_atomic_fetch_add(&s_count[g], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    }
+    __syncthreads();
+
+    // Pass 2: serial prefix-sum of the per-group counts into `s_offset`.
+    if (thread_id == 0) {
+        int prev = 0;
+#pragma unroll
+        for (int g = 0; g < kMaxExpertGroupsPerRank; ++g) {
+            if (g >= num_groups)
+                break;
+            s_offset[g] = prev;
+            prev += s_count[g];
+        }
+        s_offset[num_groups] = prev;
+    }
+    __syncthreads();
+
+    // Pass 3: scatter sorted token offsets directly to global memory.
+    int64_t const sorted_base =
+        (static_cast<int64_t>(dst_rank) * num_channels + channel_id) * kMaxLocalTokensPerSlice;
+    for (int t = thread_id; t < slice_len; t += num_threads) {
+        int64_t const token_idx = token_start_idx + t;
+        if (not is_token_in_rank[token_idx * kNumRanks + dst_rank])
+            continue;
+        int const le = compute_primary_local_expert(topk_idx, token_idx, num_topk, dst_rank,
+                                                    num_experts_per_rank);
+        int const g  = le / num_experts_per_group;
+        int const slot =
+            __hip_atomic_fetch_add(&s_fill[g], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        sorted_token_offsets[sorted_base + s_offset[g] + slot] = static_cast<int16_t>(t);
+    }
+
+    // Publish offsets to global memory. Only `num_groups + 1` entries per
+    // (dst_rank, channel) are meaningful; the rest of the padded slot is
+    // never read on the hot path.
+    int64_t const offs_base = (static_cast<int64_t>(dst_rank) * num_channels + channel_id) *
+                              (kMaxExpertGroupsPerRank + 1);
+    for (int g = thread_id; g <= num_groups; g += num_threads) {
+        group_offsets[offs_base + g] = s_offset[g];
+    }
+}
+
+void expert_grouped_build_buckets(int64_t const *topk_idx, bool const *is_token_in_rank,
+                                  int num_tokens, int num_channels, int num_topk, int num_experts,
+                                  int num_experts_per_group, int num_ranks, int *group_offsets,
+                                  int16_t *sorted_token_offsets, cudaStream_t stream) {
+    constexpr int kNumThreads = 64; // one AMD warp
+    EP_HOST_ASSERT(num_experts_per_group > 0);
+    EP_HOST_ASSERT(num_channels > 0);
+
+#define BUCKETS_LAUNCH_CASE(ranks)                                                                 \
+    {                                                                                              \
+        auto kernel = expert_grouped_build_buckets<ranks>;                                         \
+        LAUNCH_KERNEL(&cfg, kernel, topk_idx, is_token_in_rank, num_tokens, num_channels,          \
+                      num_topk, num_experts, num_experts_per_group, group_offsets,                 \
+                      sorted_token_offsets);                                                       \
+    }                                                                                              \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_ranks * num_channels, kNumThreads, stream);
+    SWITCH_RANKS(BUCKETS_LAUNCH_CASE);
+#undef BUCKETS_LAUNCH_CASE
+}
+
 // Pipelined expert-grouped dispatch + permute (optimized).
 //
 // Phase order is preserved on every (src_rank, dst_rank, channel) stream:
@@ -66,11 +197,14 @@ __device__ __forceinline__ int compute_primary_local_expert(int64_t const *topk_
 // completes — the rest of dispatch then overlaps with compute.
 //
 // Optimizations vs the naive multi-pass implementation:
-//   1.  Sender classifies tokens by primary local expert ONCE per channel
-//       and buckets them into shared memory. Phase loops then walk the
-//       bucket for the current group rather than re-scanning the whole
-//       token range and re-loading `topk_idx`/`is_token_in_rank` from
-//       global memory.
+//   1.  Token classification (which group each in-rank token belongs to)
+//       is moved **out** of this kernel entirely. A separate, per-
+//       (dst_rank, channel) kernel ``expert_grouped_build_buckets`` runs
+//       as part of ``notify_dispatch`` preprocessing, writing per-phase
+//       offsets and sorted token lists to global memory. Every sender SM
+//       here can therefore start shipping group 0 on the very first cycle
+//       after launch — no scan, no prefix-sum, no per-thread shared-mem
+//       scatter on the critical path.
 //   2.  Each phase ships its full bucket as a single batch — the inner
 //       `num_max_send_tokens` chunking and per-chunk barrier/tail-update
 //       are dropped. We pay exactly one workgroup barrier and one
@@ -87,7 +221,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
     void **buffer_ptrs, int *expert_tail_idx, int64_t *recv_topk_idx, float *recv_topk_weights,
     int *dispatch_to_expert_map, int4 const *x, float const *x_scales, int64_t const *topk_idx,
     float const *topk_weights, bool const *is_token_in_rank, int const *channel_prefix_matrix,
-    int const *num_recv_tokens_per_expert, int4 *recv_x, int num_tokens, int hidden_int4,
+    int const *num_recv_tokens_per_expert, int const *group_offsets_global,
+    int16_t const *sorted_token_offsets_global, int4 *recv_x, int num_tokens, int hidden_int4,
     int num_topk, int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
     int rank, int num_max_tokens, int num_max_send_tokens, int num_experts_per_group) {
 
@@ -136,13 +271,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
         amd::barrier_init(thread_id);
     __syncthreads();
 
-    // Per-rank classification scratch — used only by sender, but always
-    // allocated since `__shared__` is unconditional. Combined with the
-    // receiver-side phase-count scratch this stays well within the LDS budget.
-    __shared__ int     s_token_count_per_group[kNumRanks][kMaxExpertGroupsPerRank];
-    __shared__ int     s_group_offset[kNumRanks][kMaxExpertGroupsPerRank + 1];
-    __shared__ int     s_group_fill_counter[kNumRanks][kMaxExpertGroupsPerRank];
-    __shared__ int16_t s_sorted_token_offset[kNumRanks][kMaxLocalTokensPerSlice];
+    // Per-rank cached copy of the per-group base offsets that the
+    // preprocessing kernel wrote to global memory. Staging into LDS once
+    // keeps each phase's `begin`/`end` reads in-block and avoids uncached
+    // global loads inside the hot warp loop.
+    __shared__ int s_group_offset[kNumRanks][kMaxExpertGroupsPerRank + 1];
 
     if (is_sender) {
         constexpr int num_send_warps          = kNumThreads / WARP_SIZE;
@@ -176,62 +309,35 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
         if (num_tokens_to_recv <= 0)
             return;
 
-        int const slice_len = token_end_idx - token_start_idx;
-        EP_DEVICE_ASSERT(slice_len <= kMaxLocalTokensPerSlice);
+        // Precomputed base pointers into the bucket tensors. These arrays
+        // were built by ``expert_grouped_build_buckets`` as part of
+        // ``notify_dispatch`` preprocessing — they are ready in global
+        // memory before this kernel launches, so phase 0 can start on the
+        // very first cycle after the sender enters the phase loop.
+        int64_t const offs_base =
+            (static_cast<int64_t>(responsible_rank) * num_channels + responsible_channel) *
+            (kMaxExpertGroupsPerRank + 1);
+        int const *global_offs_ptr = group_offsets_global + offs_base;
 
-        // ── Init per-(rank, group) counters ─────────────────────────────────
-        if (thread_id_in_rank < num_expert_groups_per_rank) {
-            s_token_count_per_group[responsible_rank][thread_id_in_rank] = 0;
-            s_group_fill_counter[responsible_rank][thread_id_in_rank]    = 0;
-        }
-        sync_barrier(responsible_rank, num_threads_per_rank);
+        int64_t const sorted_base =
+            (static_cast<int64_t>(responsible_rank) * num_channels + responsible_channel) *
+            kMaxLocalTokensPerSlice;
+        int16_t const *global_sorted_ptr = sorted_token_offsets_global + sorted_base;
 
-        // ── Pass 1: count per-group in-rank tokens ──────────────────────────
-        for (int t = thread_id_in_rank; t < slice_len; t += num_threads_per_rank) {
-            int64_t token_idx = token_start_idx + t;
-            if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank])
-                continue;
-            int le = compute_primary_local_expert(topk_idx, token_idx, num_topk, responsible_rank,
-                                                  num_experts_per_rank);
-            int g  = le / num_experts_per_group;
-            __hip_atomic_fetch_add(&s_token_count_per_group[responsible_rank][g], 1,
-                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-        }
-        sync_barrier(responsible_rank, num_threads_per_rank);
-
-        // ── Pass 2: prefix-sum to produce per-group base offsets ────────────
-        if (thread_id_in_rank == 0) {
-            int prev = 0;
-#pragma unroll
-            for (int g = 0; g < kMaxExpertGroupsPerRank; ++g) {
-                if (g >= num_expert_groups_per_rank)
-                    break;
-                s_group_offset[responsible_rank][g] = prev;
-                prev += s_token_count_per_group[responsible_rank][g];
-            }
-            s_group_offset[responsible_rank][num_expert_groups_per_rank] = prev;
-        }
-        sync_barrier(responsible_rank, num_threads_per_rank);
-
-        // ── Pass 3: scatter tokens into group-major buckets ─────────────────
-        for (int t = thread_id_in_rank; t < slice_len; t += num_threads_per_rank) {
-            int64_t token_idx = token_start_idx + t;
-            if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank])
-                continue;
-            int le   = compute_primary_local_expert(topk_idx, token_idx, num_topk, responsible_rank,
-                                                    num_experts_per_rank);
-            int g    = le / num_experts_per_group;
-            int slot = __hip_atomic_fetch_add(&s_group_fill_counter[responsible_rank][g], 1,
-                                              __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-            s_sorted_token_offset[responsible_rank][s_group_offset[responsible_rank][g] + slot] =
-                static_cast<int16_t>(t);
+        // Cooperatively stage the per-group base offsets into LDS. Only
+        // `num_expert_groups_per_rank + 1` entries are meaningful.
+        for (int g = thread_id_in_rank; g <= num_expert_groups_per_rank;
+             g += num_threads_per_rank) {
+            s_group_offset[responsible_rank][g] = global_offs_ptr[g];
         }
         sync_barrier(responsible_rank, num_threads_per_rank);
 
         // ── Phase loop ──────────────────────────────────────────────────────
         // Each phase ships its full bucket. Warps in the rank's warp-group
         // share the work round-robin — each warp handles one token's hidden
-        // copy plus its topk metadata update.
+        // copy plus its topk metadata update. The sorted token-offset list
+        // is read directly from global memory (int16 loads, trivial next to
+        // the hidden copies and naturally cached).
         int cached_channel_tail_idx = 0;
         for (int group_id = 0; group_id < num_expert_groups_per_rank; ++group_id) {
             int begin = s_group_offset[responsible_rank][group_id];
@@ -239,7 +345,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
             int count = end - begin;
 
             for (int i = warp_id_in_rank; i < count; i += num_send_warps_per_rank) {
-                int local_t = static_cast<int>(s_sorted_token_offset[responsible_rank][begin + i]);
+                int     local_t      = static_cast<int>(__ldg(global_sorted_ptr + begin + i));
                 int64_t token_idx    = token_start_idx + local_t;
                 int     dst_slot_idx = total_offset + cached_channel_tail_idx + i;
 
@@ -440,7 +546,8 @@ void expert_grouped_dispatch_permute(
     void **buffer_ptrs, int *expert_tail_idx, int64_t *recv_topk_idx, float *recv_topk_weights,
     int *dispatch_to_expert_map, void const *x, float const *x_scales, int64_t const *topk_idx,
     float const *topk_weights, bool const *is_token_in_rank, int const *channel_prefix_matrix,
-    int const *num_recv_tokens_per_expert, void *recv_x, int num_tokens, int hidden_int4,
+    int const *num_recv_tokens_per_expert, int const *group_offsets_global,
+    int16_t const *sorted_token_offsets_global, void *recv_x, int num_tokens, int hidden_int4,
     int num_topk, int num_experts, int num_scales, int scale_token_stride, int scale_hidden_stride,
     int rank, int num_ranks, cudaStream_t stream, int num_sms, int num_max_tokens,
     int num_max_send_tokens, int num_experts_per_group) {
@@ -453,6 +560,7 @@ void expert_grouped_dispatch_permute(
                       recv_topk_weights, dispatch_to_expert_map,                                   \
                       reinterpret_cast<int4 const *>(x), x_scales, topk_idx, topk_weights,         \
                       is_token_in_rank, channel_prefix_matrix, num_recv_tokens_per_expert,         \
+                      group_offsets_global, sorted_token_offsets_global,                           \
                       reinterpret_cast<int4 *>(recv_x), num_tokens, hidden_int4, num_topk,         \
                       num_experts, num_scales, scale_token_stride, scale_hidden_stride, rank,      \
                       num_max_tokens, num_max_send_tokens, num_experts_per_group);                 \

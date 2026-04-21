@@ -186,6 +186,12 @@ def _expert_grouped_dispatch_permute(
     as phase 0 completes, overlapping the remaining dispatch phases with
     compute.
 
+    The per-(dst_rank, channel) group classification is now performed
+    alongside ``notify_dispatch`` in ``expert_grouped_dispatch_permute_preprocess``,
+    so the dispatch kernel's sender starts shipping group 0 on the very
+    first cycle after launch — no on-kernel scan of ``topk_idx`` /
+    ``is_token_in_rank`` on the hot path.
+
     ``num_experts_per_group`` controls the pipeline granularity. When it
     equals ``num_experts // num_ranks`` (single group) the kernel degenerates
     to a plain expert-major dispatch with identical timing to
@@ -230,6 +236,10 @@ def _expert_grouped_dispatch_permute(
             (num_experts_per_rank,), dtype=torch.int32, device=x.device
         )
 
+        # Preprocess: get_dispatch_layout + notify_dispatch + expert-group
+        # bucket builder. The extra ``group_offsets`` / ``sorted_token_offsets``
+        # tensors carry the per-(dst_rank, channel) token sort that the
+        # dispatch kernel used to compute on its own hot path.
         (
             num_tokens_per_rank,
             num_tokens_per_expert,
@@ -240,7 +250,9 @@ def _expert_grouped_dispatch_permute(
             channel_prefix_matrix,
             expert_offsets,
             moe_recv_expert_counter_padded,
-        ) = cpp_extensions.fused_dispatch_permute_preprocess(
+            group_offsets,
+            sorted_token_offsets,
+        ) = cpp_extensions.expert_grouped_dispatch_permute_preprocess(
             topk_idx,
             buffer_ptrs_dev,
             barrier_signal_ptrs_dev,
@@ -252,6 +264,7 @@ def _expert_grouped_dispatch_permute(
             rank,
             num_ranks,
             num_sms,
+            num_experts_per_group,
         )
 
         recv_x_buffer = _get_recv_x_buffer(x.device, x.dtype, num_worst_tokens * num_topk, hidden_size)
@@ -267,6 +280,8 @@ def _expert_grouped_dispatch_permute(
                 moe_recv_expert_counter,
                 buffer_ptrs_dev,
                 group_tail_idx,
+                group_offsets,
+                sorted_token_offsets,
                 num_worst_tokens,
                 num_worst_tokens * num_topk,
                 num_experts,

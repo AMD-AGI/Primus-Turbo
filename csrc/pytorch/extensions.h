@@ -207,13 +207,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dis
     int num_experts, int rank, int num_ranks, int num_sms, int num_max_send_tokens,
     const std::optional<torch::Tensor> &recv_x_buffer);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+expert_grouped_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
+                                           const torch::Tensor &buffer_ptrs_dev,
+                                           const torch::Tensor &barrier_signal_ptrs_dev,
+                                           torch::Tensor        moe_recv_counter,
+                                           torch::Tensor moe_recv_expert_counter, int num_experts,
+                                           int expert_alignment, int num_worst_tokens, int rank,
+                                           int num_ranks, int num_sms, int num_experts_per_group);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 expert_grouped_dispatch_permute(
     const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
     const torch::Tensor &topk_idx, const std::optional<torch::Tensor> &topk_weights,
     const torch::Tensor &is_token_in_rank, const torch::Tensor &channel_prefix_matrix,
     const torch::Tensor &num_recv_tokens_per_expert, const torch::Tensor &buffer_ptrs_dev,
-    const torch::Tensor &expert_tail_idx, int num_worst_tokens, int num_permuted_tokens,
+    const torch::Tensor &expert_tail_idx, const torch::Tensor &group_offsets,
+    const torch::Tensor &sorted_token_offsets, int num_worst_tokens, int num_permuted_tokens,
     int num_experts, int num_experts_per_group, int rank, int num_ranks, int num_sms,
     int num_max_send_tokens, const std::optional<torch::Tensor> &recv_x_buffer);
 

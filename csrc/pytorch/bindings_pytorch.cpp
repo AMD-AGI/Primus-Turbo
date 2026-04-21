@@ -192,6 +192,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ********* CCO *********
     m.def("fused_dispatch_permute_preprocess", cco::intranode::fused_dispatch_permute_preprocess);
     m.def("fused_dispatch_permute", cco::intranode::fused_dispatch_permute);
+    m.def("expert_grouped_dispatch_permute_preprocess",
+          cco::intranode::expert_grouped_dispatch_permute_preprocess);
     m.def("expert_grouped_dispatch_permute", cco::intranode::expert_grouped_dispatch_permute);
     // m.def("fused_unpermute_combine", cco::intranode::fused_unpermute_combine);
 }
