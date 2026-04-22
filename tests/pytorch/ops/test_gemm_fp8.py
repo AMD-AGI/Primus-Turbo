@@ -207,7 +207,7 @@ def _run_gemm_fp8_deterministic_test(
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
     if backend == BackendType.TRITON and format == Format.HYBRID:
         pytest.skip("TRITON backend does not support HYBRID format currently.")
@@ -232,7 +232,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
     _run_gemm_fp8_test(
         m=m,
@@ -255,7 +255,7 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
     _run_gemm_fp8_test(
         m=m,
@@ -278,7 +278,7 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tune):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "m, n and k must be multiples of 16"

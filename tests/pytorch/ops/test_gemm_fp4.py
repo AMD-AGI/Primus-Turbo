@@ -39,7 +39,7 @@ torch.manual_seed(42)
 )
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.AITER])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
     if backend == BackendType.AITER:
         if dtype != torch.bfloat16:
