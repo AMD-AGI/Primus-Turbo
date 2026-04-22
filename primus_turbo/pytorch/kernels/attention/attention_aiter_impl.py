@@ -200,8 +200,6 @@ class AttnBwdAiterBackend(KernelBackend):
         dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
     ) -> bool:
-        q.size(-1)
-
         if sink is not None and qkv_format == "sbhd":
             # sink attention is not supported for sbhd format
             return False
@@ -352,7 +350,7 @@ def attention_aiter_forward_impl(
     # TODO(ruibin): Add unified attention kernel dispatcher
     if not AttnFwdAiterBackend.can_handle(**kwargs):
         raise ValueError(
-            f"AttnBwdAiterBackend cannot handle the given inputs. "
+            f"AttnFwdAiterBackend cannot handle the given inputs. "
             f"Please check input constraints or choose a different backend."
         )
 
@@ -395,7 +393,6 @@ def attention_aiter_backward_impl(
         "dq": dq,
         "dk": dk,
         "dv": dv,
-        "dbias": dbias,
         "dropout_p": dropout_p,
         "softmax_scale": softmax_scale,
         "causal": causal,
