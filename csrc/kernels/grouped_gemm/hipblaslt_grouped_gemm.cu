@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 
 #include "primus_turbo/gemm.h"
@@ -28,6 +29,14 @@ public:
             PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
             PRIMUS_TURBO_CHECK_HIP(
                 hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
+            // Bind each handle to its dedicated compute stream. hipBLASLt's
+            // internal state (heuristic cache, workspace accounting) is
+            // per-handle and assumes a one-to-one handle<->stream association.
+            // Reusing a single handle concurrently across multiple streams can
+            // trigger intermittent serialisation/stalls. See ROCm TE and
+            // grouped-gemm-ck reference for the same pattern.
+            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasSetStream(
+                reinterpret_cast<hipblasHandle_t>(handles_[i]), compute_streams_[i]));
             PRIMUS_TURBO_CHECK_HIP(
                 hipEventCreateWithFlags(&hipblaslt_events_[i], hipEventDisableTiming));
         }
@@ -85,17 +94,26 @@ public:
         const size_t num_stream_used{std::min<size_t>(kMaxNumStreams, num_gemms)};
 
         if (num_gemms > 0) {
-            // wait for current stream to finish
-            PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
-
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
+            // Slot 0 runs on params.stream directly; only extra slots need
+            // fan-out from params.stream via sync_event_.
+            if (num_stream_used > 1) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
+                }
             }
 
             for (size_t idx = 0; idx < num_gemms; ++idx) {
                 const auto stream_idx = idx % kMaxNumStreams;
-                auto       stream     = compute_streams_[stream_idx];
-                auto       handle     = handles_[stream_idx];
+                // Slot 0 uses the caller's stream and hipBLASLt handle (the
+                // PyTorch current stream/handle, which is already bound
+                // one-to-one). Extra slots use our internal streams bound via
+                // hipblasSetStream above.
+                auto       stream     = (stream_idx == 0) ? params.stream
+                                                          : compute_streams_[stream_idx];
+                auto       handle     = (stream_idx == 0) ? params.handle
+                                                          : handles_[stream_idx];
                 auto       workspace  = workspaces_[stream_idx];
                 // clang-format off
                 hipblaslt_gemm_impl(
@@ -115,14 +133,17 @@ public:
                 // clang-format on
             }
 
-            // record events on compute streams
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
-            }
-
-            // wait for all compute streams to finish
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
+            if (num_stream_used > 1) {
+                // Slot 0 already runs on params.stream; fan extra slots back
+                // into params.stream.
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
+                }
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
+                }
             }
         }
     }
