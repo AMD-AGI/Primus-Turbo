@@ -29,6 +29,14 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+try:
+    HAVE_MORI = True
+    import mori  # fmt: skip
+    import mori.ops  # fmt: skip
+    import mori.shmem  # fmt: skip
+except ImportError:
+    HAVE_MORI = False
+
 
 __all__ = [
     "BackendEntry",
@@ -64,6 +72,7 @@ class BackendType(Enum):
     TRITON = auto()
     DEEP_EP = auto()
     TURBO = auto()
+    MORI = auto()
 
 
 class GlobalBackendManager:
@@ -231,6 +240,10 @@ class GlobalBackendManager:
                 assert (
                     HAVE_DEEP_EP
                 ), "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
+            if backend == BackendType.MORI:
+                assert (
+                    HAVE_MORI
+                ), "Mori is required for this module. Install from https://github.com/ROCm/mori"
             return backend
 
         return None
