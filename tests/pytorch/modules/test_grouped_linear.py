@@ -21,7 +21,7 @@ from tests.pytorch.test_utils import get_tolerances
 @pytest.mark.parametrize("N_K", [(1024, 2048), (512, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("auto_tune", [False, True, 2])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
 def test_grouped_linear(B, M, N_K, dtype, balance, auto_tune, enable_torch_compile):
     GlobalBackendManager.set_auto_tune(auto_tune)

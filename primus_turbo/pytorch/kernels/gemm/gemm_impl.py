@@ -50,7 +50,21 @@ class GEMMHipBLASLtBackend(KernelBackend):
         trans_c: bool,
         **kwargs,
     ) -> torch.Tensor:
-        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(a, b, out_dtype, trans_a, trans_b, trans_c)
+        algo_index = kwargs.get("algo_index", 0)
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm(
+            a, b, out_dtype, trans_a, trans_b, trans_c, algo_index
+        )
+
+    @staticmethod
+    def get_algo_count(**kwargs) -> int:
+        return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_algo_count(
+            kwargs["a"],
+            kwargs["b"],
+            kwargs["out_dtype"],
+            kwargs["trans_a"],
+            kwargs["trans_b"],
+            kwargs["trans_c"],
+        )
 
 
 class GEMMTritonBackend(KernelBackend):
