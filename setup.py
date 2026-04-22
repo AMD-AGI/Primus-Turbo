@@ -217,6 +217,7 @@ def get_common_flags():
         "-fvisibility=hidden",
         "-std=c++20",
         "-fgpu-rdc",
+        "-Wno-unknown-warning-option",
     ]
 
     nvcc_flags = [
@@ -239,6 +240,7 @@ def get_common_flags():
         # "-amdgpu-function-calls=false",
         "-std=c++20",
         "-fgpu-rdc",
+        "-Wno-unknown-warning-option",
     ]
 
     # Check and add optional compiler flags (for ROCm version compatibility)
