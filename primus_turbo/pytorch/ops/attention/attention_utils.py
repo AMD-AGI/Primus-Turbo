@@ -60,6 +60,9 @@ def _infer_qkv_format(
         # sbhd: sequence outermost → s1 > s0 > s2
         if s1 >= s0 >= s2:
             return "sbhd"
+        # bhsd: transposed bshd (e.g. bshd.transpose(1,2)) → s0 > s2 > s1
+        if s0 >= s2 >= s1:
+            return "bhsd"
 
         assert False, (
             f"Cannot infer qkv layout from shape {tuple(t.size())} " f"and strides {tuple(t.stride())}"

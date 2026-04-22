@@ -50,7 +50,7 @@ test_cases = [
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("enable_sink", [False, True])
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
-@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
 def test_attention_16bit(
     batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
@@ -76,8 +76,8 @@ def test_attention_16bit(
     if not enable_sink and window_size_left != -1:
         pytest.skip("window_size_left only applies when sink is enabled")
 
-    if enable_sink and qkv_format == "sbhd":
-        pytest.skip("Sink attention is not supported for sbhd format")
+    if enable_sink and qkv_format in ("sbhd", "bhsd"):
+        pytest.skip("Sink attention is not supported for sbhd/bhsd format")
 
     # Sink attention constraints / runtime control (skip early to avoid big allocations).
     if enable_sink:
@@ -101,6 +101,11 @@ def test_attention_16bit(
         k_layout = (seqlen_kv, batch, num_head_kv, head_dim_qk)
         v_layout = (seqlen_kv, batch, num_head_kv, head_dim_v)
         o_layout = (seqlen_q, batch, num_head_q, head_dim_v)
+    elif qkv_format == "bhsd":
+        q_layout = (batch, num_head_q, seqlen_q, head_dim_qk)
+        k_layout = (batch, num_head_kv, seqlen_kv, head_dim_qk)
+        v_layout = (batch, num_head_kv, seqlen_kv, head_dim_v)
+        o_layout = (batch, num_head_q, seqlen_q, head_dim_v)
     elif qkv_format == "bshd":
         q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
         k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
@@ -125,6 +130,11 @@ def test_attention_16bit(
         key = key.permute(1, 0, 2, 3)
         value = value.permute(1, 0, 2, 3)
         grad_out = grad_out.permute(1, 0, 2, 3)
+    elif qkv_format == "bhsd":
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        grad_out = grad_out.transpose(1, 2)
 
     sm_scale = head_dim_qk ** (-0.5)
 
@@ -169,6 +179,8 @@ def test_attention_16bit(
 
     if qkv_format == "sbhd":
         o_ref_cmp = o_ref.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        o_ref_cmp = o_ref.transpose(1, 2).contiguous()
     else:
         o_ref_cmp = o_ref
     out_snr = compute_snr(o_ref_cmp, o)

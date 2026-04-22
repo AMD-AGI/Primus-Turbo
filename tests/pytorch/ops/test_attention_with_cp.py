@@ -5,7 +5,11 @@
 ###############################################################################
 
 import itertools
+import os
 from typing import List
+
+# Must be set before importing common_distributed, which reads it at import time.
+os.environ.setdefault("DISTRIBUTED_TESTS_DEFAULT_TIMEOUT", "600")
 
 import torch
 import torch.distributed as dist
@@ -80,7 +84,7 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             "config": test_cases,
             "causal": [True, False],
             "fp8": [True, False],
-            "qkv_format": ["bshd", "sbhd"],
+            "qkv_format": ["bshd", "sbhd", "bhsd"],
             "ulysses_degree": [1, 2, 4, 8],
         }
 
@@ -127,17 +131,21 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             config.head_dim_qk,
             config.head_dim_v,
         )
-        if qkv_format == "bshd":
-            q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
-            k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
-            v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
-            seq_dim = 1
-        else:
-            assert qkv_format == "sbhd"
+        if qkv_format == "sbhd":
             q_layout = (seqlen_q, batch, num_head_q, head_dim_qk)
             k_layout = (seqlen_kv, batch, num_head_kv, head_dim_qk)
             v_layout = (seqlen_kv, batch, num_head_kv, head_dim_v)
             seq_dim = 0
+        elif qkv_format == "bhsd":
+            q_layout = (batch, num_head_q, seqlen_q, head_dim_qk)
+            k_layout = (batch, num_head_kv, seqlen_kv, head_dim_qk)
+            v_layout = (batch, num_head_kv, seqlen_kv, head_dim_v)
+            seq_dim = 2
+        else:
+            q_layout = (batch, seqlen_q, num_head_q, head_dim_qk)
+            k_layout = (batch, seqlen_kv, num_head_kv, head_dim_qk)
+            v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
+            seq_dim = 1
 
         query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
         key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
@@ -162,12 +170,15 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         )
 
         # flash_attn_usp_func expects shape [b, s, h, d] with format encoded
-        # in strides.  The ref tensors are actual [s, b, h, d]; transpose the
-        # sharded inputs so shape becomes [b, s_local, h, d] with sbhd strides.
+        # in strides.  Transpose sharded inputs to the expected view layout.
         if qkv_format == "sbhd":
             query_local_token = query_local_token.transpose(0, 1)
             key_local_token = key_local_token.transpose(0, 1)
             value_local_token = value_local_token.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            query_local_token = query_local_token.transpose(1, 2)
+            key_local_token = key_local_token.transpose(1, 2)
+            value_local_token = value_local_token.transpose(1, 2)
 
         kwargs = {}
         if func is pt.ops.flash_attn_usp_func:
@@ -193,10 +204,14 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
         grad = shard_cp_input([grad_ref], cp_group, seq_dim)[0]
         if qkv_format == "sbhd":
             grad = grad.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            grad = grad.transpose(1, 2)
         o.backward(grad)
 
         if qkv_format == "sbhd":
             o = o.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            o = o.transpose(1, 2)
         dq, dk, dv = shard_cp_input([query.grad, key.grad, value.grad], cp_group, seq_dim)
         out_snr = compute_snr(o_ref, o)
         query_grad_snr = compute_snr(dq_ref, dq)

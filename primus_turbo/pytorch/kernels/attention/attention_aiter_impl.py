@@ -42,27 +42,42 @@ def _normalize_sink_window(causal: bool, window_size_left: int, window_size_righ
 # =============================================================================
 
 
-_SUPPORTED_QKV_FORMATS = ["sbhd", "bshd"]
+_SUPPORTED_QKV_FORMATS = ["sbhd", "bshd", "bhsd"]
 
 
 class AttnFwdAiterBackend(KernelBackend):
 
     @staticmethod
-    def can_handle(**kwargs) -> bool:
-        q = kwargs["q"]
-        v = kwargs["v"]
-        head_dim_qk = q.shape[-1]
-        head_dim_v = v.shape[-1]
+    def can_handle(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        bias: Optional[torch.Tensor],
+        alibi_slopes: Optional[torch.Tensor],
+        return_lse: bool,
+        return_softmax: bool,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
+        sink: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = "bshd",
+    ) -> bool:
 
-        sink = kwargs.get("sink", None)
-        qkv_format = kwargs["qkv_format"]
+        if sink is not None:
+            if qkv_format in ("sbhd", "bhsd"):
+                # sink attention is not supported for sbhd and bhsd format
+                return False
 
-        if sink is not None and qkv_format == "sbhd":
-            # sink attention is not supported for sbhd format
-            return False
+            head_dim_qk = q.size(-1)
+            head_dim_v = v.size(-1)
+            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
+                return False
 
-        supported = kwargs["qkv_format"] in _SUPPORTED_QKV_FORMATS
-        supported &= head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
+        supported = qkv_format in _SUPPORTED_QKV_FORMATS
 
         return supported
 
@@ -83,7 +98,6 @@ class AttnFwdAiterBackend(KernelBackend):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         sink: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "sbhd",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
         batch_size, seq_len, num_heads_qk, head_dim_qk = q.size()
@@ -95,9 +109,11 @@ class AttnFwdAiterBackend(KernelBackend):
                 out = torch.empty(
                     (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
                 ).permute(1, 0, 2, 3)
+            elif qkv_format == "bhsd":
+                out = torch.empty(
+                    (batch_size, num_heads_qk, seq_len, head_dim_v), dtype=q.dtype, device=q.device
+                ).permute(0, 2, 1, 3)
             else:
-                # BSHD
-                assert qkv_format == "bshd"
                 out = torch.empty(
                     (batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
                 )
@@ -122,13 +138,6 @@ class AttnFwdAiterBackend(KernelBackend):
                 out=out,
             )
         else:
-            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
-
-            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
-                raise ValueError(
-                    "Triton sink attention requires head_dim_qk == head_dim_v and head_dim power-of-2"
-                )
-
             if max_seqlen_q is None:
                 max_seqlen_q = q.size(1)
             if max_seqlen_k is None:
@@ -166,27 +175,47 @@ class AttnFwdAiterBackend(KernelBackend):
 class AttnBwdAiterBackend(KernelBackend):
 
     @staticmethod
-    def can_handle(**kwargs) -> bool:
-        q = kwargs["q"]
-        v = kwargs["v"]
-        head_dim_qk = q.size(-1)
-        head_dim_v = v.size(-1)
+    def can_handle(
+        dout: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        softmax_lse: torch.Tensor,
+        dq: torch.Tensor,
+        dk: torch.Tensor,
+        dv: torch.Tensor,
+        dbias: Optional[torch.Tensor],
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        bias: Optional[torch.Tensor],
+        alibi_slopes: Optional[torch.Tensor],
+        deterministic: bool,
+        rng_state: Optional[torch.Tensor],
+        is_v3_atomic_fp32: bool,
+        how_v3_bf16_cvt: int,
+        sink: Optional[torch.Tensor] = None,
+        dsink: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = "bshd",
+    ) -> bool:
+        if sink is not None:
+            if qkv_format in ("sbhd", "bhsd"):
+                # sink attention is not supported for sbhd and bhsd format
+                return False
 
-        sink = kwargs.get("sink", None)
-        qkv_format = kwargs["qkv_format"]
-
-        if sink is not None and qkv_format == "sbhd":
-            # sink attention is not supported for sbhd format
-            return False
+            head_dim_qk = q.size(-1)
+            head_dim_v = v.size(-1)
+            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
+                return False
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
-        supported &= head_dim_qk == head_dim_v and _is_power_of_2(head_dim_qk)
-
-        is_v3_atomic_fp32 = kwargs["is_v3_atomic_fp32"]
 
         # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
         if get_device_compute_capability() == (9, 4):
-            supported &= not (qkv_format == "sbhd" and is_v3_atomic_fp32)
+            supported &= not (qkv_format == "sbhd" and not is_v3_atomic_fp32)
 
         return supported
 
@@ -242,8 +271,6 @@ class AttnBwdAiterBackend(KernelBackend):
                 how_v3_bf16_cvt,
             )
         else:
-            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
-
             assert (
                 isinstance(rng_state, torch.Tensor)
                 and rng_state.device.type == "cpu"
@@ -308,24 +335,32 @@ def attention_aiter_forward_impl(
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-    return AttnFwdAiterBackend.execute(
-        q=q,
-        k=k,
-        v=v,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        return_lse=return_lse,
-        return_softmax=return_softmax,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        sink=sink,
-        qkv_format=qkv_format,
-    )
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "dropout_p": dropout_p,
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+        "window_size_left": window_size_left,
+        "window_size_right": window_size_right,
+        "bias": bias,
+        "alibi_slopes": alibi_slopes,
+        "return_lse": return_lse,
+        "return_softmax": return_softmax,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+        "sink": sink,
+        "qkv_format": qkv_format,
+    }
+    # TODO(ruibin): Add unified attention kernel dispatcher
+    if not AttnFwdAiterBackend.can_handle(**kwargs):
+        raise ValueError(
+            f"AttnFwdAiterBackend cannot handle the given inputs. "
+            f"Please check input constraints or choose a different backend."
+        )
+
+    return AttnFwdAiterBackend.execute(**kwargs)
 
 
 def attention_aiter_backward_impl(
@@ -354,29 +389,38 @@ def attention_aiter_backward_impl(
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
 ):
-    return AttnBwdAiterBackend.execute(
-        dout=dout,
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        softmax_lse=softmax_lse,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        rng_state=rng_state,
-        is_v3_atomic_fp32=is_v3_atomic_fp32,
-        how_v3_bf16_cvt=how_v3_bf16_cvt,
-        dbias=dbias,
-        dsink=dsink,
-        sink=sink,
-        qkv_format=qkv_format,
-    )
+    kwargs = {
+        "dout": dout,
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "softmax_lse": softmax_lse,
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
+        "dropout_p": dropout_p,
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+        "window_size_left": window_size_left,
+        "window_size_right": window_size_right,
+        "bias": bias,
+        "alibi_slopes": alibi_slopes,
+        "deterministic": deterministic,
+        "rng_state": rng_state,
+        "is_v3_atomic_fp32": is_v3_atomic_fp32,
+        "how_v3_bf16_cvt": how_v3_bf16_cvt,
+        "dbias": dbias,
+        "dsink": dsink,
+        "sink": sink,
+        "qkv_format": qkv_format,
+    }
+
+    # TODO(ruibin): Add unified attention kernel dispatcher
+    if not AttnBwdAiterBackend.can_handle(**kwargs):
+        raise ValueError(
+            f"AttnBwdAiterBackend cannot handle the given inputs. "
+            f"Please check input constraints or choose a different backend."
+        )
+
+    return AttnBwdAiterBackend.execute(**kwargs)
