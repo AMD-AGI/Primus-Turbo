@@ -5,10 +5,14 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import dataclasses
 import inspect
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from enum import Enum
+from functools import lru_cache
 from typing import (
     Any,
     Dict,
@@ -24,6 +28,8 @@ from typing import (
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.core.backend import (
@@ -42,17 +48,150 @@ from primus_turbo.pytorch.kernels.moe.moe_utils import (
 # =========================================================================
 
 
+def _compute_expert_token_info_configs() -> List[triton.Config]:
+    """Autotune space for :func:`compute_expert_token_info_kernel`."""
+    configs: List[triton.Config] = []
+    for block_m in (64, 128, 256, 512, 1024):
+        for num_warps in (1, 2, 4, 8):
+            # Wave=64, cap threads/CTA to 1024 (HW limit on CDNA).
+            if num_warps * 64 > 1024:
+                continue
+            # Keep at least one element per thread in the M dimension.
+            if block_m < num_warps * 64:
+                continue
+            for num_stages in (1, 2):
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_SIZE_M": block_m},
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
+                )
+    return configs
+
+
+@triton.autotune(
+    configs=_compute_expert_token_info_configs(),
+    key=["num_tokens", "num_topk"],
+    reset_to_zero=["num_recv_tokens_per_expert_ptr"],
+)
+@triton.jit
+def compute_expert_token_info_kernel(
+    recv_topk_idx_ptr,
+    num_recv_tokens_per_expert_ptr,
+    num_tokens: tl.int32,
+    num_topk: tl.int32,
+    num_local_experts: tl.int32,
+    INVALID_VALUE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Count per-expert received tokens from a ``[num_tokens, num_topk]`` tile."""
+    pid = tl.program_id(0)
+    row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    col_offs = tl.arange(0, BLOCK_SIZE_K)
+    bin_offs = tl.arange(0, BLOCK_SIZE_N)
+
+    row_mask = row_offs < num_tokens
+    col_mask = col_offs < num_topk
+    load_mask = row_mask[:, None] & col_mask[None, :]
+
+    # Clamp OOB rows so the computed offset stays in-range; ``load_mask``
+    # guarantees these lanes don't contribute.
+    safe_row = tl.where(row_mask, row_offs, 0)
+    expert_offs = safe_row[:, None] * num_topk + col_offs[None, :]
+
+    topk_experts = tl.load(
+        recv_topk_idx_ptr + expert_offs,
+        mask=load_mask,
+        other=INVALID_VALUE,
+    )
+
+    valid = (
+        load_mask & (topk_experts != INVALID_VALUE) & (topk_experts >= 0) & (topk_experts < num_local_experts)
+    )
+    # Clamp the experts of invalid lanes so they land on a legal bin; the
+    # ``mask`` passed to ``tl.histogram`` makes sure they are not counted.
+    safe_experts = tl.where(valid, topk_experts, 0)
+
+    # ``tl.histogram`` requires a flat 1D input; reshape the 2D tile.
+    flat_experts = tl.reshape(safe_experts, [BLOCK_SIZE_M * BLOCK_SIZE_K])
+    flat_mask = tl.reshape(valid, [BLOCK_SIZE_M * BLOCK_SIZE_K])
+
+    # CTA-local 1D accumulator of size BLOCK_SIZE_N, initialised to 0 by
+    # ``tl.histogram``; bins ``[num_local_experts, BLOCK_SIZE_N)`` are the
+    # power-of-two padding and stay zero because ``safe_experts`` is clamped
+    # into ``[0, num_local_experts)`` for valid lanes.
+    local_counts = tl.histogram(flat_experts, BLOCK_SIZE_N, mask=flat_mask)
+
+    # Flush CTA-local accumulator to global memory with one atomic per bin.
+    bin_mask = (bin_offs < num_local_experts) & (local_counts > 0)
+    tl.atomic_add(
+        num_recv_tokens_per_expert_ptr + bin_offs,
+        local_counts,
+        sem="relaxed",
+        scope="gpu",
+        mask=bin_mask,
+    )
+
+
+def compute_expert_token_info(
+    recv_topk_idx: torch.Tensor,
+    num_local_experts: int,
+    invalid_value: int = -1,
+) -> torch.Tensor:
+    """Count per-expert received tokens from ``recv_topk_idx``.
+
+    Args:
+        recv_topk_idx: ``[num_tokens, num_topk]`` tensor of (local) expert
+            indices; entries equal to ``invalid_value`` (or outside
+            ``[0, num_local_experts)``) are treated as padding and excluded.
+        num_local_experts: Number of local expert bins.
+        invalid_value: Sentinel marking padded/invalid slots (default ``-1``).
+
+    Returns:
+        ``num_recv_tokens_per_expert`` of shape ``[num_local_experts]`` with
+        the same dtype as ``recv_topk_idx``; entry ``e`` holds the count of
+        valid ``(token, slot)`` pairs whose expert id equals ``e``.
+    """
+    assert recv_topk_idx.is_cuda, "recv_topk_idx must be a CUDA tensor"
+    assert recv_topk_idx.dim() == 2, "recv_topk_idx must be 2D [num_tokens, num_topk]"
+
+    device = recv_topk_idx.device
+    num_tokens, num_topk = recv_topk_idx.shape
+
+    num_recv_tokens_per_expert = torch.zeros(num_local_experts, dtype=recv_topk_idx.dtype, device=device)
+
+    if num_tokens == 0 or num_topk == 0 or num_local_experts == 0:
+        return num_recv_tokens_per_expert
+
+    # ``tl.histogram`` requires ``num_bins`` to be a power of 2 on AMD Triton.
+    block_size_n = triton.next_power_of_2(num_local_experts)
+
+    # ``BLOCK_SIZE_M`` is picked by the autotuner; the grid size depends on it.
+    grid = lambda META: (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
+    compute_expert_token_info_kernel[grid](
+        recv_topk_idx,
+        num_recv_tokens_per_expert,
+        num_tokens,
+        num_topk,
+        num_local_experts,
+        INVALID_VALUE=invalid_value,
+        BLOCK_SIZE_K=triton.next_power_of_2(num_topk),
+        BLOCK_SIZE_N=block_size_n,
+    )
+    return num_recv_tokens_per_expert
+
+
 @dataclass
 class EPBufferConfig:
     """Configuration for EP communication buffer initialization.
 
     Attributes:
-        num_sms: Number of SMs to use in high-throughput kernels.
-        dispatch_config: Optional user-provided dispatch config (from offline
-            benchmarking). When ``None``, the backend's default for the current
-            ``ep_size`` is used (``Buffer.get_dispatch_config(ep_size)``).
-        combine_config: Optional user-provided combine config.  Same fallback
-            behaviour as *dispatch_config*.
+        num_sms: Number of SMs used by high-throughput kernels.
+        dispatch_config: Dispatch config; ``None`` means use backend default.
+        combine_config: Combine config; ``None`` means use backend default.
     """
 
     num_sms: int = 32
@@ -60,36 +199,60 @@ class EPBufferConfig:
     combine_config: Any = None
 
 
-_DEFAULT_BUFFER_CONFIG = EPBufferConfig(
-    num_sms=32,
-    dispatch_config=None,
-    combine_config=None,
-)
+# Per-backend default buffer configuration. Keys must match the names used
+# in ``_BACKEND_REGISTRY`` so lookups can be done by backend name.
+_DEFAULT_BUFFER_CONFIG_PER_BACKEND: Dict[str, EPBufferConfig] = {
+    "TURBO": EPBufferConfig(
+        num_sms=64,
+        dispatch_config=None,
+        combine_config=None,
+    ),
+    "DEEP_EP": EPBufferConfig(
+        num_sms=64,
+        dispatch_config=None,
+        combine_config=None,
+    ),
+    "MORI": EPBufferConfig(num_sms=64, dispatch_config=None, combine_config=None),
+}
 
-_buffer_config: EPBufferConfig = _DEFAULT_BUFFER_CONFIG
+
+# Deep copy of the defaults so mutations via ``set_buffer_global_config``
+# don't leak into ``_DEFAULT_BUFFER_CONFIG_PER_BACKEND``.
+_buffer_config_per_backend: Dict[str, EPBufferConfig] = {
+    name: dataclasses.replace(cfg) for name, cfg in _DEFAULT_BUFFER_CONFIG_PER_BACKEND.items()
+}
+
+
+def _get_buffer_config(backend_name: str) -> EPBufferConfig:
+    """Return the runtime buffer config for ``backend_name``, or a default."""
+    cfg = _buffer_config_per_backend.get(backend_name)
+    if cfg is not None:
+        return cfg
+    default = _DEFAULT_BUFFER_CONFIG_PER_BACKEND.get(backend_name)
+    return dataclasses.replace(default) if default is not None else EPBufferConfig()
 
 
 def set_buffer_global_config(
     num_use_cu: int = 32,
     autotune_config: Optional[tuple] = None,
+    backend: Optional[str] = None,
 ) -> None:
-    """Store the SM count and optional per-operation configs.
-
-    This is typically called once by the token dispatcher during ``__init__``.
-
-    Args:
-        num_use_cu: Number of SMs (compute units) for high-throughput kernels.
-        autotune_config: Legacy parameter — a ``(dispatch_config, combine_config)``
-            tuple obtained from offline benchmarking.  ``None`` means use the
-            backend's built-in defaults for the current EP group size.
+    """Set the EP buffer config for a backend, or for all backends when
+    ``backend`` is ``None`` (backward-compat). Accepts SM count and an
+    optional ``(dispatch_config, combine_config)`` tuple.
     """
-    global _buffer_config
     dispatch_cfg, combine_cfg = autotune_config if autotune_config is not None else (None, None)
-    _buffer_config = EPBufferConfig(
+    new_cfg = EPBufferConfig(
         num_sms=num_use_cu,
         dispatch_config=dispatch_cfg,
         combine_config=combine_cfg,
     )
+    if backend is None:
+        targets = list(_buffer_config_per_backend.keys()) or list(_DEFAULT_BUFFER_CONFIG_PER_BACKEND.keys())
+        for name in targets:
+            _buffer_config_per_backend[name] = dataclasses.replace(new_cfg)
+    else:
+        _buffer_config_per_backend[backend] = new_cfg
 
 
 # =========================================================================
@@ -99,28 +262,39 @@ def set_buffer_global_config(
 
 @runtime_checkable
 class EPBackend(Protocol):
-    """Structural (``typing.Protocol``) interface for Expert-Parallel
-    communication backends.
-
-    Each backend encapsulates a specific EP library (e.g. in-tree Turbo DeepEP,
-    external ``deep_ep``, UCCL-EP, ...) and owns its own buffer lifecycle.
-    Adding a new backend is a single-class change plus one
-    ``register_ep_backend()`` call — any class that structurally conforms to
-    this Protocol is accepted; no explicit inheritance is required.
-    """
+    """Structural interface for Expert-Parallel communication backends."""
 
     @staticmethod
     def is_available() -> bool:
         """Return True if this backend's dependencies are importable."""
         ...
 
+    def is_initialized(self) -> bool:
+        """Return True if the backend is initialized."""
+        ...
+
     def init_buffer(
         self,
         group: dist.ProcessGroup,
-        hidden_bytes: int,
+        hidden_size: int,
+        num_experts: int,
+        num_topk: int,
+        seqlen: int,
+        fp8_dispatch: bool,
         config: EPBufferConfig,
     ) -> None:
-        """(Re-)create the communication buffer if needed."""
+        """(Re-)create the communication buffer if needed.
+
+        Args:
+            group: EP process group.
+            hidden_size: Per-token hidden dimension (element count).
+            num_experts: Total number of experts.
+            num_topk: Number of topk experts to dispatch.
+            seqlen: Per-rank maximum dispatch tokens.
+            fp8_dispatch: Whether the dispatch payload is FP8 (``x`` is a
+                ``(fp8_tensor, scales)`` tuple).
+            config: Backend-specific tuning config.
+        """
         ...
 
     def dispatch(
@@ -133,6 +307,7 @@ class EPBackend(Protocol):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
         num_worst_tokens: int = 0,
+        config: Optional[Any] = None,
     ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         Optional[torch.Tensor],
@@ -140,8 +315,21 @@ class EPBackend(Protocol):
         Optional[Union[List[int], torch.Tensor]],
         Optional[tuple],
     ]:
-        """Execute dispatch (layout + send) and return
-        ``(recv_x, recv_topk_idx, recv_topk_weights, tokens_per_expert, handle)``.
+        """Dispatch tokens to experts.
+
+        Args:
+            x: Input tensor, or ``(fp8_tensor, scales)`` tuple for FP8 path.
+            handle: Cached dispatch handle; ``None`` for a primary call.
+            topk_idx: ``[num_tokens, num_topk]`` expert indices (primary only).
+            token_weights: ``[num_tokens, num_topk]`` expert weights.
+            num_experts: Total number of experts (primary only).
+            async_finish: If True, return before the kernel finishes.
+            allocate_on_comm_stream: Allocate outputs on the comm stream.
+            num_worst_tokens: Worst-case receive token count (for padding).
+            config: Backend-specific dispatch config.
+
+        Returns:
+            ``(recv_x, recv_topk_idx, recv_topk_weights, tokens_per_expert, handle)``.
         """
         ...
 
@@ -152,8 +340,21 @@ class EPBackend(Protocol):
         topk_weights: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        config: Optional[Any] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Execute combine and return ``(combined_x, combined_topk_weights)``."""
+        """Combine expert outputs back to the original token order.
+
+        Args:
+            x: Expert-side tensor to be combined.
+            handle: Handle returned by the paired ``dispatch`` call.
+            topk_weights: Optional per-token expert weights.
+            async_finish: If True, return before the kernel finishes.
+            allocate_on_comm_stream: Allocate outputs on the comm stream.
+            config: Backend-specific combine config.
+
+        Returns:
+            ``(combined_x, combined_topk_weights)``.
+        """
         ...
 
     def release_buffer(self) -> None:
@@ -162,12 +363,7 @@ class EPBackend(Protocol):
 
 
 def _broadcast_from_rank0_int(values: Sequence[int], group: dist.ProcessGroup) -> List[int]:
-    """Return rank-0's ``values`` on every rank (via ``all_gather``).
-
-    Used to reach a globally consistent winning tune config: each rank picks
-    its own local optimum, and we arbitrarily adopt rank 0's pick on every
-    rank so the runtime config is identical across the group.
-    """
+    """Return rank-0's ``values`` on every rank (via ``all_gather``)."""
     t = torch.tensor(values, dtype=torch.int32, device="cuda")
     gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size(group))]
     dist.all_gather(gathered, t, group=group)
@@ -194,18 +390,7 @@ class _DeepEPLikeKernelName:
 
 
 class _DeepEPLikeBackend:
-    """Shared logic for all backends that follow the DeepEP Buffer protocol
-    (``get_dispatch_layout`` / ``dispatch`` / ``combine`` / ``set_num_sms`` /
-    ``get_dispatch_config`` / ``get_combine_config``).
-
-    This is a plain implementation base class — it does **not** inherit from
-    ``EPBackend``. Conformance to the ``EPBackend`` Protocol is checked
-    structurally by the type system.
-
-    Subclasses only need to override ``is_available``, ``_get_module``, and
-    optionally ``_make_buffer_kwargs`` to supply backend-specific constructor
-    arguments.
-    """
+    """Shared base class for backends that follow the DeepEP Buffer protocol."""
 
     intranode_kernel_names = _DeepEPLikeKernelName(
         dispatch=("intranode::dispatch", "notify_dispatch"), combine=("intranode::combine", "notify_combine")
@@ -221,20 +406,22 @@ class _DeepEPLikeBackend:
     # Subclass hooks
     # ------------------------------------------------------------------
 
+    def is_initialized(self) -> bool:
+        """Return True if the backend is initialized."""
+        return self._buffer is not None
+
     @staticmethod
     def is_available() -> bool:
-        """Return True if this backend's dependencies are importable."""
+        """Return True if backend dependencies are importable."""
         raise NotImplementedError
 
     @staticmethod
     def _get_module():
-        """Return the Python module that exposes ``Buffer``, ``Config``,
-        ``EventHandle``, ``EventOverlap`` (or a compatible ``utils`` sub-module).
-        """
+        """Return the backend Python module exposing ``Buffer``/``Config``/events."""
         raise NotImplementedError
 
     def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
-        """Extra keyword arguments forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
+        """Extra kwargs forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
         return {}
 
     # ------------------------------------------------------------------
@@ -244,16 +431,21 @@ class _DeepEPLikeBackend:
     def init_buffer(
         self,
         group: dist.ProcessGroup,
-        hidden_bytes: int,
+        hidden_size: int,
+        num_experts: int,  # noqa: ARG002 - DeepEP sizes by hidden_bytes only.
+        num_topk: int,  # noqa: ARG002 - DeepEP sizes by hidden_bytes only.
+        seqlen: int,  # noqa: ARG002 - DeepEP sizes by hidden_bytes only.
+        fp8_dispatch: bool,
         config: EPBufferConfig,
     ) -> None:
         mod = self._get_module()
         BufferClass = mod.Buffer
 
-        BufferClass.set_num_sms(config.num_sms)
-
         dispatch_config = config.dispatch_config or BufferClass.get_dispatch_config(group.size())
         combine_config = config.combine_config or BufferClass.get_combine_config(group.size())
+
+        element_size = 1 if fp8_dispatch else 2
+        hidden_bytes = hidden_size * max(element_size, 2)
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         for cfg in (dispatch_config, combine_config):
@@ -300,11 +492,11 @@ class _DeepEPLikeBackend:
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
         num_worst_tokens: int = 0,
+        config: Optional[Any] = None,
     ):
-        EventOverlapClass, EventHandleClass = self._get_event_classes()
-        buffer = self._buffer
-        assert buffer is not None, "init_buffer() must be called before dispatch()"
+        assert self.is_initialized(), "Backend is not initialized"
 
+        EventOverlapClass, EventHandleClass = self._get_event_classes()
         previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
 
         if handle is None:
@@ -316,7 +508,7 @@ class _DeepEPLikeBackend:
                 num_tokens_per_expert,
                 is_token_in_rank,
                 event,
-            ) = buffer.get_dispatch_layout(
+            ) = self._buffer.get_dispatch_layout(
                 topk_idx,
                 num_experts,
                 previous_event=previous_event,
@@ -331,7 +523,7 @@ class _DeepEPLikeBackend:
                 tokens_per_expert,
                 handle,
                 after_event,
-            ) = buffer.dispatch(
+            ) = self._buffer.dispatch(
                 x,
                 topk_idx=topk_idx,
                 topk_weights=token_weights,
@@ -343,15 +535,17 @@ class _DeepEPLikeBackend:
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
                 num_worst_tokens=num_worst_tokens,
+                config=config,
             )
         else:
             recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, after_event = (
-                buffer.dispatch(
+                self._buffer.dispatch(
                     x,
                     handle=handle,
                     previous_event=previous_event,
                     async_finish=async_finish,
                     allocate_on_comm_stream=allocate_on_comm_stream,
+                    config=config,
                 )
             )
 
@@ -367,20 +561,20 @@ class _DeepEPLikeBackend:
         topk_weights: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        config: Optional[Any] = None,
     ):
+        assert self.is_initialized(), "Backend is not initialized"
         EventOverlapClass, EventHandleClass = self._get_event_classes()
-        buffer = self._buffer
-        assert buffer is not None, "init_buffer() must be called before combine()"
-
         previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
 
-        combined_x, combined_topk_weights, after_event = buffer.combine(
+        combined_x, combined_topk_weights, after_event = self._buffer.combine(
             x,
             handle=handle,
             topk_weights=None if topk_weights is None else topk_weights.float(),
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
             previous_event=previous_event,
+            config=config,
         )
 
         if async_finish:
@@ -408,59 +602,45 @@ class _DeepEPLikeBackend:
         num_topk: Optional[int] = None,
         uniform_dispatch: bool = True,
     ) -> Tuple[Any, Any, float, float]:
-        """Tune dispatch / combine ``Config`` for this backend on the given case.
-
-        Follows the benchmark recipe in
-        ``benchmark/ops/deep_ep/test_intranode.py``: for each candidate
-        ``(nvl_chunk_size, rdma_chunk_size)``, build a ``Config`` and measure
-        cached dispatch / combine latency. Each rank picks its own local
-        optimum; to reach a globally consistent config we then adopt rank 0's
-        pick on every rank (see :func:`_broadcast_from_rank0_int`). The
-        returned latencies are rank 0's and are broadcast to every rank so
-        the values are identical across the group.
+        """Sweep ``(nvl_chunk_size, rdma_chunk_size)`` candidates and pick the
+        fastest dispatch / combine ``Config`` for this backend.
 
         Args:
             group: The EP process group.
             x: Dispatch input (Tensor or ``(fp8_tensor, scales)`` tuple).
-            topk_idx: ``[num_tokens, num_topk]`` expert indices. Required when
-                ``uniform_dispatch=False``. In uniform mode this argument is
-                only used to derive ``num_topk`` when ``num_topk`` is not
-                explicitly provided; its values are ignored and a fresh
-                near-uniform ``topk_idx`` is sampled internally.
-            topk_weights: ``[num_tokens, num_topk]`` expert weights. Required
-                when ``uniform_dispatch=False``; ignored (resampled) in
-                uniform mode.
             num_experts: Total number of experts.
-            num_sms: SM count to use for tuning (matches runtime setting).
-            num_tests: Timed iterations for each candidate.
-            num_topk: Number of experts per token. Only consulted in uniform
-                mode when ``topk_idx`` is not supplied.
-            uniform_dispatch: If ``True`` (default), generate a fresh
-                near-uniform ``topk_idx`` / ``topk_weights`` inside the
-                tuner — ``scores = |N(0,1)| + 1`` followed by ``topk`` over
-                experts, matching the recipe in
-                ``benchmark/ops/deep_ep/test_internode.py``. Tuning against
-                a uniform dispatch distribution produces a more robust
-                config than tuning against a specific, possibly skewed,
-                runtime workload.
+            topk_idx: ``[num_tokens, num_topk]`` expert indices. Required when
+                ``uniform_dispatch=False``; only used to derive ``num_topk``
+                in uniform mode.
+            topk_weights: ``[num_tokens, num_topk]`` expert weights. Required
+                when ``uniform_dispatch=False``; ignored in uniform mode.
+            num_sms: SM count to use for tuning.
+            num_tests: Timed iterations per candidate.
+            num_topk: Number of experts per token (uniform mode fallback
+                when ``topk_idx`` is not supplied).
+            uniform_dispatch: If True, resample a near-uniform ``topk_idx`` /
+                ``topk_weights`` internally for more robust tuning.
 
         Returns:
             ``(best_dispatch_config, best_combine_config, best_dispatch_s, best_combine_s)``
-            where the times are seconds and identical on all ranks (rank 0's
-            local optimum, broadcast).
+            with times identical on all ranks (rank 0's pick, broadcast).
         """
         mod = self._get_module()
+        BufferClass = mod.Buffer
+        BufferClass.set_num_sms(num_sms)
         ConfigClass = mod.Config
         ep_size = group.size()
         _, num_nodes = detect_group_topology(group)
 
         kernel_profile_names = self.internode_kernel_names if num_nodes > 1 else self.intranode_kernel_names
-        hidden_bytes = get_hidden_bytes(x)
+        x_tensor = x if isinstance(x, torch.Tensor) else x[0]
+        hidden_size = int(x_tensor.size(1))
+        seqlen = int(x_tensor.size(0))
+        fp8_dispatch = isinstance(x, tuple)
+        # Byte count used for RDMA bandwidth accounting.
+        hidden_bytes = hidden_size * max(1 if fp8_dispatch else 2, 2)
 
-        # --- Resolve (topk_idx, topk_weights) used for tuning ---------------
-        # In uniform mode we discard any real-workload values and resample a
-        # near-uniform distribution so the tuner does not overfit to a
-        # specific, possibly skewed, routing pattern.
+        # Resample (topk_idx, topk_weights) when uniform_dispatch is on.
         x_inp = x if isinstance(x, torch.Tensor) else x[0]
         if uniform_dispatch:
             if num_topk is None:
@@ -483,23 +663,19 @@ class _DeepEPLikeBackend:
                     "``topk_weights`` are both required."
                 )
 
-        # tune config from uccl-ep
+        # Buffer sizes (ported from uccl-ep).
         rdma_buffer_size, nvl_buffer_size = 512, (720 if ep_size in (144, 160) else 512)
         if ep_size == 24:
             nvl_buffer_size = 540
 
-        # Tune-candidate sweep ranges (shared by dispatch and combine).
-        # On intranode (single-node) groups RDMA is not involved, so the
-        # ``rdma_chunk_size`` value is inert: pin it to a single value to
-        # avoid running the whole NVL sweep N times for nothing.
+        # Sweep ranges; intranode pins rdma_chunk since RDMA is unused.
         nvl_chunk_range = range(1, 8, 1)
         if num_nodes <= 1:
             rdma_chunk_range = (16,)
         else:
             rdma_chunk_range = range(12 if num_nodes == 2 else 8, 33, 4)
 
-        # Allocate a buffer sized for the worst-case candidate so neither tune
-        # loop has to re-allocate (which would invalidate any live ``handle``).
+        # Size buffer for the worst-case candidate to avoid reallocation.
         worst_nvl_chunk = max(nvl_chunk_range)
         worst_rdma_chunk = max(rdma_chunk_range)
         worst_config = ConfigClass(
@@ -509,18 +685,21 @@ class _DeepEPLikeBackend:
             worst_rdma_chunk,
             rdma_buffer_size,
         )
-        # alloc worst-case buffer for tuning, it will be release after finish tuning
         self.init_buffer(
             group,
-            hidden_bytes,
-            EPBufferConfig(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            seqlen=seqlen,
+            fp8_dispatch=fp8_dispatch,
+            config=EPBufferConfig(
                 num_sms=num_sms,
                 dispatch_config=worst_config,
                 combine_config=worst_config,
             ),
         )
 
-        # Seed handle: one real dispatch so later runs can use the cached path.
+        # Seed one real dispatch so later tune runs can use the cached path.
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -540,11 +719,8 @@ class _DeepEPLikeBackend:
             "topk_weights": topk_weights_f,
         }
         recv_x, _, _, _, handle, _ = self._buffer.dispatch(**seed_args)
-        if isinstance(recv_x, tuple):
-            recv_x = recv_x[0]
 
-        # Bandwidth bookkeeping. On intranode (``num_nodes == 1``) RDMA does
-        # not participate, so we report N/A rather than a meaningless number.
+        # Bandwidth accounting; RDMA is N/A on intranode groups.
         is_intranode = num_nodes <= 1
         if is_intranode:
             rdma_send_bytes = 0
@@ -554,12 +730,9 @@ class _DeepEPLikeBackend:
             inplace_unique(rdma_idx, num_nodes)
             num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
             rdma_send_bytes = num_rdma_token_sent * hidden_bytes
-        # ``recv_x.numel() * element_size`` is the total NVL-received bytes;
-        # ``hidden_bytes`` already includes ``hidden`` so multiplying by
-        # ``numel`` would double-count it.
         nvl_recv_bytes = recv_x.numel() * max(recv_x.element_size(), 2)
 
-        # --- Tune dispatch configs -----------------------------------------
+        # Tune dispatch configs.
         best_time, best_results = 1e10, None
         for nvl_chunk_size in nvl_chunk_range:
             for rdma_chunk_size in rdma_chunk_range:
@@ -614,15 +787,8 @@ class _DeepEPLikeBackend:
             rdma_buffer_size,
         )
 
-        # Combine only accepts BF16 input. If the caller tuned with an FP8
-        # tuple, re-dispatch with a BF16 surrogate of the same shape so the
-        # combine sweep below can use ``recv_x`` directly.
-        if isinstance(x, tuple):
-            x_for_combine_tune = torch.empty(x[0].shape, dtype=torch.bfloat16, device=x[0].device)
-        else:
-            x_for_combine_tune = x
         dispatch_args = {
-            "x": x_for_combine_tune,
+            "x": x,
             "num_tokens_per_rank": num_tokens_per_rank,
             "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
             "is_token_in_rank": is_token_in_rank,
@@ -631,12 +797,11 @@ class _DeepEPLikeBackend:
         }
         recv_x, _, _, _, handle, _ = self._buffer.dispatch(**dispatch_args)
 
-        # Combine bandwidth accounting: combine sends out over NVL what
-        # dispatch received, and receives over RDMA what dispatch sent.
+        # Combine bandwidth mirrors dispatch (NVL-send / RDMA-recv).
         combine_nvl_send_bytes = recv_x.numel() * max(recv_x.element_size(), 2)
         combine_rdma_recv_bytes = rdma_send_bytes
 
-        # --- Tune combine configs ------------------------------------------
+        # Tune combine configs.
         best_time, best_results = 1e10, None
         for nvl_chunk_size in nvl_chunk_range:
             for rdma_chunk_size in rdma_chunk_range:
@@ -740,9 +905,373 @@ class DeepEPBackend(_DeepEPLikeBackend):
         except (TypeError, ValueError):
             param = None
         if param is not None and param.default is False:
-            # uccl-ep special handle
             return {"is_intranode": group.size() <= 8}
         return {}
+
+
+# ==========================================================================
+# Mori EP backend helpers
+# ==========================================================================
+
+_ENV_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = "PRIMUS_TURBO_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+_ENV_MORI_PREALLOC_MAX_RECV_TOKENS = "PRIMUS_TURBO_MORI_PREALLOC_MAX_RECV_TOKENS"
+_ENV_MORI_INTER_KERNEL_SWITCH_THRESHOLD = "PRIMUS_TURBO_MORI_INTER_KERNEL_SWITCH_THRESHOLD"
+_ENV_MORI_NUM_QP_PER_PE = "PRIMUS_TURBO_MORI_NUM_QP_PER_PE"
+
+
+class _MoriEpMode(Enum):
+    """Mori EP deployment mode (normal dispatch only)."""
+
+    INTRA_NODE = "intra_node"
+    INTER_NODE = "inter_node"
+
+
+@dataclass(frozen=True)
+class _MoriDispatchCfg:
+    """Mori kernel launch config for a given mode / token budget."""
+
+    kernel_type: Any  # mori.ops.EpDispatchCombineKernelType
+    warp_num_per_block: int
+    block_num: int
+    rdma_block_num: int
+
+
+def _get_mori_dispatch_configs(
+    num_max_dispatch_tokens_per_rank: int,
+) -> Dict[_MoriEpMode, _MoriDispatchCfg]:
+    """Return per-mode Mori kernel launch configs."""
+    import mori.ops
+
+    inter_kernel_threshold = int(os.environ.get(_ENV_MORI_INTER_KERNEL_SWITCH_THRESHOLD, "256"))
+    inter_kernel_type = (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+        if num_max_dispatch_tokens_per_rank <= inter_kernel_threshold
+        else mori.ops.EpDispatchCombineKernelType.InterNodeV1
+    )
+
+    return {
+        _MoriEpMode.INTRA_NODE: _MoriDispatchCfg(
+            kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+            warp_num_per_block=16,
+            block_num=80,
+            rdma_block_num=0,
+        ),
+        _MoriEpMode.INTER_NODE: _MoriDispatchCfg(
+            kernel_type=inter_kernel_type,
+            warp_num_per_block=8,
+            block_num=64,
+            rdma_block_num=32,
+        ),
+    }
+
+
+def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
+    """Register ``group`` with the Mori SHMEM runtime (idempotent)."""
+    import mori.shmem
+
+    assert dist.is_initialized(), "torch.distributed must be initialized before Mori SHMEM init."
+
+    cpu_group = getattr(group, "cpu_group", None) or group
+
+    group_name = "primus_turbo_mori_ep"
+    try:
+        torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
+    except Exception as e:  # noqa: BLE001 - mori raises various types here.
+        if "already registered" in str(e):
+            logger.info(
+                f"[MORI init] Process group already registered under "
+                f"'{group_name}'; reusing existing SHMEM binding.",
+                rank=0,
+            )
+            return
+        raise
+    mori.shmem.shmem_torch_process_group_init(group_name)
+
+
+def _resolve_mori_dispatch_cfg(
+    group: dist.ProcessGroup,
+    num_max_dispatch_tokens_per_rank: int,
+    config: Optional[EPBufferConfig] = None,
+) -> _MoriDispatchCfg:
+    """Resolve Mori kernel launch cfg: topology default, overridden by
+    ``config.num_sms`` (``block_num``) and ``config.dispatch_config`` (full).
+    """
+    _, num_nodes = detect_group_topology(group)
+    mode = _MoriEpMode.INTRA_NODE if num_nodes <= 1 else _MoriEpMode.INTER_NODE
+    base = _get_mori_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
+
+    kernel_type = base.kernel_type
+    warp_num_per_block = base.warp_num_per_block
+    block_num = base.block_num
+    rdma_block_num = base.rdma_block_num
+
+    num_sms_override = config.num_sms if config is not None else 0
+    full_override = (
+        config.dispatch_config
+        if config is not None and isinstance(config.dispatch_config, _MoriDispatchCfg)
+        else None
+    )
+
+    if num_sms_override > 0:
+        block_num = int(num_sms_override)
+
+    if full_override is not None:
+        kernel_type = full_override.kernel_type
+        warp_num_per_block = full_override.warp_num_per_block
+        block_num = full_override.block_num
+        rdma_block_num = full_override.rdma_block_num
+
+    return _MoriDispatchCfg(
+        kernel_type=kernel_type,
+        warp_num_per_block=warp_num_per_block,
+        block_num=block_num,
+        rdma_block_num=rdma_block_num,
+    )
+
+
+@lru_cache(maxsize=8)
+def _build_mori_op(
+    group: dist.ProcessGroup,
+    rank: int,
+    world_size: int,
+    hidden: int,
+    params_dtype: torch.dtype,
+    num_local_experts: int,
+    num_topk: int,
+    num_max_dispatch_tokens_per_rank: int,
+    kernel_type: Any,
+    warp_num_per_block: int,
+    block_num: int,
+    rdma_block_num: int,
+):
+    """Build and cache a :class:`mori.ops.EpDispatchCombineOp`.
+
+    Kernel launch params are explicit args so ``lru_cache`` keys them.
+    """
+    import mori.ops
+
+    max_total_recv_tokens = int(os.environ.get(_ENV_MORI_PREALLOC_MAX_RECV_TOKENS, "0"))
+    num_qp_per_pe = int(os.environ.get(_ENV_MORI_NUM_QP_PER_PE, "2"))
+
+    common_kwargs = dict(
+        data_type=params_dtype,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden,
+        scale_dim=0,
+        scale_type_size=0,
+        max_token_type_size=max(2, params_dtype.itemsize),
+        max_num_inp_token_per_rank=num_max_dispatch_tokens_per_rank,
+        num_experts_per_rank=num_local_experts,
+        num_experts_per_token=num_topk,
+        warp_num_per_block=warp_num_per_block,
+        block_num=block_num,
+        max_total_recv_tokens=max_total_recv_tokens,
+        use_external_inp_buf=True,
+        kernel_type=kernel_type,
+        gpu_per_node=torch.cuda.device_count(),
+        rdma_block_num=rdma_block_num,
+        num_qp_per_pe=num_qp_per_pe,
+        quant_type="none",
+    )
+
+    def _check_mori_compatibility(kwargs: dict) -> dict:
+        """Drop kwargs not accepted by the installed Mori config."""
+        valid = {f.name for f in dataclasses.fields(mori.ops.EpDispatchCombineConfig)}
+        cleaned = dict(kwargs)
+        for key in list(cleaned.keys()):
+            if key not in valid:
+                logger.warning(
+                    f"[MORI compat] Dropping incompatible EpDispatchCombineConfig " f"argument '{key}'.",
+                    once=True,
+                )
+                del cleaned[key]
+        return cleaned
+
+    common_kwargs = _check_mori_compatibility(common_kwargs)
+
+    logger.info(
+        f"[MORI init] world_size={world_size} rank={rank} hidden={hidden} "
+        f"dtype={params_dtype} max_inp_tokens={num_max_dispatch_tokens_per_rank} "
+        f"num_local_experts={num_local_experts} num_topk={num_topk} "
+        f"kernel={kernel_type} block_num={block_num} "
+        f"warp_num_per_block={warp_num_per_block} rdma_block_num={rdma_block_num}",
+        rank=0,
+    )
+
+    config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
+    return mori.ops.EpDispatchCombineOp(config)
+
+
+class MoriEPBackend:
+    """ROCm Mori EP backend for MoE dispatch/combine (normal mode)."""
+
+    def __init__(self) -> None:
+        self._group: Optional[dist.ProcessGroup] = None
+        # Fast-path reference; the op is owned by _build_mori_op's lru_cache.
+        self._op = None
+        self._hidden_size: int = 0
+        self._num_local_experts: int = 0
+        self._num_topk: int = 0
+        self._seqlen: int = 0
+        self._fp8_dispatch: bool = False
+        self._params_dtype: Optional[torch.dtype] = None
+        # Last resolved kernel cfg; used to detect cfg-only rebuilds.
+        self._kernel_cfg: Optional[_MoriDispatchCfg] = None
+
+    # ------------------------------------------------------------------
+    # EPBackend protocol
+    # ------------------------------------------------------------------
+
+    def is_initialized(self) -> bool:
+        """Return True if the backend is initialized."""
+        return self._op is not None
+
+    @staticmethod
+    def is_available() -> bool:
+        try:
+            import mori  # noqa: F401
+            import mori.ops  # noqa: F401
+            import mori.shmem  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _get_num_max_dispatch_tokens_per_rank(seqlen: int = 0) -> int:
+        """Return the per-rank max-tokens cap used to size Mori buffers."""
+        env_default = int(os.environ.get(_ENV_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, "4096"))
+        return max(env_default, int(seqlen))
+
+    @staticmethod
+    def _derive_params_dtype(fp8_dispatch: bool) -> torch.dtype:
+        """Pick the Mori ``data_type`` argument from ``fp8_dispatch``."""
+        assert not fp8_dispatch, "Not implemented"
+        return torch.bfloat16
+
+    def init_buffer(
+        self,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        num_experts: int,
+        num_topk: int,
+        seqlen: int,
+        fp8_dispatch: bool,
+        config: EPBufferConfig,
+    ) -> None:
+        """Register Mori SHMEM and build/rebuild the Mori op as needed.
+
+        Rebuilds when any shape signature field or kernel cfg changes. Reads
+        ``config.num_sms`` as a ``block_num`` override and
+        ``config.dispatch_config`` (if a :class:`_MoriDispatchCfg`) as a full
+        kernel cfg override; see :func:`_resolve_mori_dispatch_cfg`.
+        """
+        assert not fp8_dispatch, "not implemented"
+
+        if self._group is not group:
+            self._group = group
+            _register_and_init_mori_shmem(group)
+
+        num_local_experts = num_experts // group.size()
+        num_max_tokens = self._get_num_max_dispatch_tokens_per_rank(seqlen)
+        params_dtype = self._derive_params_dtype(fp8_dispatch)
+        kernel_cfg = _resolve_mori_dispatch_cfg(group, num_max_tokens, config)
+
+        # Rebuild on shape-signature or kernel-cfg change (_build_mori_op is cached).
+        needs_rebuild = (
+            self._op is None
+            or self._hidden_size != hidden_size
+            or self._num_local_experts != num_local_experts
+            or self._num_topk != num_topk
+            or self._seqlen != num_max_tokens
+            or self._fp8_dispatch != fp8_dispatch
+            or self._params_dtype != params_dtype
+            or self._kernel_cfg != kernel_cfg
+        )
+
+        self._hidden_size = hidden_size
+        self._num_local_experts = num_local_experts
+        self._num_topk = num_topk
+        self._seqlen = num_max_tokens
+        self._fp8_dispatch = fp8_dispatch
+        self._params_dtype = params_dtype
+        self._kernel_cfg = kernel_cfg
+
+        if needs_rebuild:
+            self._op = _build_mori_op(
+                group=group,
+                rank=group.rank(),
+                world_size=group.size(),
+                hidden=hidden_size,
+                params_dtype=params_dtype,
+                num_local_experts=num_local_experts,
+                num_topk=num_topk,
+                num_max_dispatch_tokens_per_rank=num_max_tokens,
+                kernel_type=kernel_cfg.kernel_type,
+                warp_num_per_block=kernel_cfg.warp_num_per_block,
+                block_num=kernel_cfg.block_num,
+                rdma_block_num=kernel_cfg.rdma_block_num,
+            )
+
+    def dispatch(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        handle: Optional[tuple] = None,
+        topk_idx: Optional[torch.Tensor] = None,
+        token_weights: Optional[torch.Tensor] = None,
+        num_experts: Optional[int] = None,
+        async_finish: bool = False,  # noqa: ARG002 - API compat only.
+        allocate_on_comm_stream: bool = False,  # noqa: ARG002 - API compat only.
+        num_worst_tokens: int = 0,  # noqa: ARG002 - API compat only.
+        config: Optional[Any] = None,  # noqa: ARG002 - API compat only.
+    ):
+        assert self.is_initialized(), "Backend is not initialized"
+        scale = None
+        non_blocking = num_worst_tokens > 0
+
+        if handle is None:
+            assert topk_idx is not None
+            recv_topk_idx_i32 = topk_idx.to(torch.int32)
+        else:
+            (recv_topk_idx_i32,) = handle
+
+        recv_x, recv_topk_weights, recv_x_scales, recv_topk_idx, _ = self._op.dispatch(
+            x,
+            token_weights,
+            scale,
+            recv_topk_idx_i32,
+        )
+        num_recv_tokens_per_expert = compute_expert_token_info(
+            recv_topk_idx, self._num_local_experts, invalid_value=self._num_local_experts
+        )
+        if not non_blocking:
+            num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
+        return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert, (recv_topk_idx_i32,)
+
+    def combine(
+        self,
+        x: torch.Tensor,
+        handle: tuple,
+        topk_weights: Optional[torch.Tensor] = None,
+        async_finish: bool = False,  # noqa: ARG002 - API compat only.
+        allocate_on_comm_stream: bool = False,  # noqa: ARG002 - API compat only.
+        config: Optional[Any] = None,  # noqa: ARG002 - API compat only.
+    ):
+        assert self.is_initialized(), "Backend is not initialized"
+
+        (topk_idx_i32,) = handle
+
+        combined_x, combined_topk_weights = self._op.combine(
+            x.contiguous(),
+            topk_weights,
+            topk_idx_i32,
+        )
+        return combined_x, combined_topk_weights
+
+    def release_buffer(self) -> None:
+        """Drop the fast-path op reference (stays alive in lru_cache)."""
+        self._op = None
 
 
 # =========================================================================
@@ -752,6 +1281,7 @@ class DeepEPBackend(_DeepEPLikeBackend):
 _BACKEND_REGISTRY: Dict[str, Type[EPBackend]] = {
     "TURBO": TurboEPBackend,
     "DEEP_EP": DeepEPBackend,
+    "MORI": MoriEPBackend,
 }
 
 _backend_instances: Dict[str, EPBackend] = {}
@@ -797,18 +1327,17 @@ class _EPAutoTuneKey:
 
 @dataclass
 class EPAutoTuneResult:
-    """Outcome of :class:`MoEDispatchCombineAutoTuner.tune`.
+    """Result of :class:`MoEDispatchCombineAutoTuner.tune`.
 
     Attributes:
-        backend_name: Registry name of the winning backend (e.g. ``"TURBO"``).
-        dispatch_config: Best dispatch ``Config`` for that backend.
-        combine_config: Best combine ``Config`` for that backend.
-        dispatch_time_us: Average dispatch latency of the winner (µs).
-        combine_time_us: Average combine latency of the winner (µs).
-        per_backend: Map ``backend_name -> (d_time_us, c_time_us)`` for every
-            candidate backend that completed tuning (for logging / debugging).
-        tune_duration_s: Wall-clock seconds spent sweeping all candidate
-            backends + configs to produce this result (rank 0 clock).
+        backend_name: Winning backend registry name.
+        dispatch_config: Best dispatch ``Config``.
+        combine_config: Best combine ``Config``.
+        dispatch_time_us: Dispatch latency of the winner (us).
+        combine_time_us: Combine latency of the winner (us).
+        per_backend: ``backend_name -> (d_time_us, c_time_us)`` of every
+            candidate that completed tuning.
+        tune_duration_s: Wall-clock seconds spent tuning (rank 0 clock).
     """
 
     backend_name: str
@@ -821,53 +1350,26 @@ class EPAutoTuneResult:
 
 
 class MoEDispatchCombineAutoTuner:
-    """Autotuner that selects the best *(backend, dispatch_config, combine_config)*
+    """Autotuner that picks the best *(backend, dispatch_config, combine_config)*
     for a given MoE dispatch / combine case.
 
-    Design
-    ------
-    Dispatch and combine come in pairs: a single ``dispatch()`` produces a
-    ``handle`` that is later consumed by the paired ``combine()`` (and, in
-    autograd, by a reverse-direction ``dispatch()`` during backward). The
-    combine input tensor has a different shape from the dispatch input, so
-    combine **cannot** reconstruct a shape-based cache key on its own.
+    Tuning is driven by ``moe_dispatch`` on a shape-based key; the resulting
+    :class:`EPAutoTuneResult` is bound to the returned ``handle`` so that the
+    paired ``moe_combine`` / cached-``moe_dispatch`` / autograd backward can
+    reuse it without any further lookup.
 
-    Therefore tuning is driven solely by ``moe_dispatch``:
-
-    1. ``moe_dispatch`` computes a shape-based key from ``(x, topk_idx,
-       num_experts, ep_size, dtype)`` and either reuses a cached
-       :class:`EPAutoTuneResult` or runs the full *(backend × dispatch ×
-       combine)* sweep once.
-    2. The chosen :class:`EPAutoTuneResult` is then *bound* to the freshly
-       returned ``handle`` via :meth:`register_handle`.
-    3. ``moe_combine`` / cached-``moe_dispatch`` / autograd backward use the
-       same ``handle`` and simply call :meth:`lookup_handle(handle)`` to pull
-       the already-tuned configs out of cache — no measurement, no shape
-       lookup on their own input tensors.
-
-    Explicit usage::
-
-        result = MoEDispatchCombineAutoTuner.get_or_tune(
-            group, x, topk_idx, topk_weights, num_experts,
-        )
-
-    Automatic (env var driven)::
-
-        export PRIMUS_TURBO_AUTO_TUNE=1
-        # first dispatch on a new shape triggers tuning, later calls reuse.
+    Enable via ``PRIMUS_TURBO_AUTO_TUNE=1`` or by calling
+    :meth:`get_or_tune` explicitly.
     """
 
-    # Shape-based cache: key -> EPAutoTuneResult (re-used across MoE layers
-    # that share the same input shape).
+    # Shape-based cache shared across layers with identical input shape.
     _cache: TuneCache = TuneCache(capacity=1024)
 
-    # Handle-based cache: id(handle) -> EPAutoTuneResult. LRU-bounded so that
-    # long-running jobs do not accumulate stale entries.
+    # id(handle) -> EPAutoTuneResult, LRU-bounded.
     _HANDLE_CACHE_MAX: int = 1024
     _handle_cache: "OrderedDict[int, EPAutoTuneResult]" = OrderedDict()
 
-    # Most-recent result: fallback for the (rare) cases where a call is made
-    # before any ``moe_dispatch`` has registered a handle mapping.
+    # Fallback for calls made before any handle mapping is registered.
     _current_result: Optional[EPAutoTuneResult] = None
 
     @staticmethod
@@ -902,15 +1404,11 @@ class MoEDispatchCombineAutoTuner:
 
     @classmethod
     def register_handle(cls, handle: Any, result: EPAutoTuneResult) -> None:
-        """Bind ``result`` to ``id(handle)`` so the matching ``combine`` /
-        cached-``dispatch`` call can recover the tuned configs without any
-        shape-based lookup.
+        """Bind ``result`` to ``id(handle)`` for paired-call reuse.
 
-        ``handle`` is the tuple returned by the backend's ``dispatch`` call;
-        we key by its Python ``id`` because the tuple itself is not hashable
-        as a cache key (it contains tensors) and is guaranteed to be unique
-        for as long as it is alive — which, under autograd, is exactly the
-        span during which combine / backward will need it.
+        Args:
+            handle: Handle returned by the backend's ``dispatch`` call.
+            result: Tune result to associate with the handle.
         """
         if handle is None:
             return
@@ -926,9 +1424,7 @@ class MoEDispatchCombineAutoTuner:
 
     @classmethod
     def lookup_handle(cls, handle: Any) -> Optional[EPAutoTuneResult]:
-        """Return the :class:`EPAutoTuneResult` previously bound to ``handle``
-        via :meth:`register_handle`, or ``None`` if the handle is unknown.
-        """
+        """Return the result bound to ``handle``, or ``None`` if unknown."""
         if handle is None:
             return None
         res = cls._handle_cache.get(id(handle))
@@ -963,26 +1459,29 @@ class MoEDispatchCombineAutoTuner:
         num_topk: Optional[int] = None,
         uniform_dispatch: bool = True,
     ) -> EPAutoTuneResult:
-        """Tune across candidate backends + configs, return the best result.
+        """Tune across candidate backends + configs and return the best.
 
-        Each candidate backend's :meth:`_DeepEPLikeBackend.tune_configs` is
-        called in turn and the one with the smallest *dispatch + combine*
-        latency wins. The resulting :class:`EPAutoTuneResult` is **not**
-        cached here; use :meth:`get_or_tune` for cached access.
+        Args:
+            group: EP process group.
+            x: Dispatch input (Tensor or ``(fp8_tensor, scales)`` tuple).
+            num_experts: Total number of experts.
+            topk_idx: ``[num_tokens, num_topk]`` expert indices (optional in
+                uniform mode).
+            topk_weights: ``[num_tokens, num_topk]`` expert weights (optional
+                in uniform mode).
+            num_sms: SM count to use for tuning.
+            candidate_backends: Optional explicit backend name list.
+            num_tests: Timed iterations per candidate.
+            num_topk: Number of experts per token (uniform-mode fallback).
+            uniform_dispatch: If True, resample topk internally for robustness.
 
-        ``uniform_dispatch`` is forwarded to each backend's ``tune_configs``
-        (default ``True``): tuning against a near-uniform topk distribution
-        generally yields a more robust config than fitting a specific runtime
-        routing pattern. See :meth:`_DeepEPLikeBackend.tune_configs` for
-        details.
+        Returns:
+            Best :class:`EPAutoTuneResult`. Not cached; use :meth:`get_or_tune`.
         """
         names = list(candidate_backends) if candidate_backends is not None else cls._candidate_backend_names()
         if not names:
             raise RuntimeError("MoE autotune: no EP backends are available.")
 
-        # Wall-clock timer for the whole sweep. Each backend's
-        # ``tune_configs`` runs real GPU kernels + host-side profiler setup,
-        # so this is the user-visible "time spent tuning" number.
         tune_start = time.perf_counter()
 
         best: Optional[EPAutoTuneResult] = None
@@ -1006,21 +1505,14 @@ class MoEDispatchCombineAutoTuner:
                     uniform_dispatch=uniform_dispatch,
                 )
             except Exception as exc:  # pragma: no cover - defensive
-                # Some exceptions (bare ``assert``, no-arg raises, certain
-                # pybind-backed C++ errors) have an empty ``str(exc)``; use
-                # ``repr`` + ``exc_info`` so the message and traceback are
-                # never silently blank.
+                # Use ``repr`` so pybind-backed errors aren't silently blank.
                 logger.warning(
                     f"MoE autotune: backend '{name}' failed: \n" f"{type(exc).__name__}: {exc!r}",
                     exc_info=True,
                 )
                 continue
             finally:
-                # ``tune_configs`` sizes its buffer for the worst-case
-                # candidate, and ``init_buffer`` only grows, never shrinks.
-                # Drop the buffer here so the next runtime ``init_buffer``
-                # (using the best config) reallocates at the right size
-                # instead of keeping the worst-case allocation around.
+                # Drop the worst-case buffer; next init_buffer sizes correctly.
                 backend.release_buffer()
 
             per_backend[name] = (round(d_t * 1e6, 3), round(c_t * 1e6, 3))
@@ -1061,16 +1553,17 @@ class MoEDispatchCombineAutoTuner:
     ) -> EPAutoTuneResult:
         """Return a cached tune result for this shape or run :meth:`tune` now.
 
-        Also updates the process-wide *current* result used by subsequent
-        dispatch / combine calls when full input tensors are unavailable
-        (e.g. cached-dispatch, combine, backward).
-
-        In uniform mode (default), ``topk_idx`` / ``topk_weights`` may be
-        ``None`` as long as ``num_topk`` is provided — the tuner will
-        synthesise a near-uniform distribution internally. ``num_topk`` is
-        also consulted when building the shape cache key, so the same
-        ``(num_tokens, hidden, num_topk, num_experts, ep_size, dtype)``
-        signature reuses the cached winner across calls.
+        Args:
+            group: EP process group.
+            x: Dispatch input (Tensor or ``(fp8_tensor, scales)`` tuple).
+            num_experts: Total number of experts.
+            topk_idx: Optional ``[num_tokens, num_topk]`` expert indices.
+            topk_weights: Optional ``[num_tokens, num_topk]`` expert weights.
+            num_sms: SM count to use for tuning.
+            num_topk: Number of experts per token. Also used in the shape
+                cache key, so the same signature reuses the cached winner.
+            uniform_dispatch: If True, resample topk internally for robustness.
+            **tune_kwargs: Forwarded to :meth:`tune`.
         """
         key = cls.make_key(x, topk_idx, num_experts, group.size(), num_topk=num_topk)
         cached = cls._cache.get(key)
@@ -1102,11 +1595,7 @@ class MoEDispatchCombineAutoTuner:
 
     @classmethod
     def current(cls) -> Optional[EPAutoTuneResult]:
-        """Return the most recent tune result, or ``None`` if never tuned.
-
-        Only used as a last-resort fallback when both handle-based and
-        shape-based lookup fail.
-        """
+        """Return the most recent tune result, or ``None`` if never tuned."""
         return cls._current_result
 
     @classmethod
@@ -1130,9 +1619,7 @@ _DEFAULT_BACKEND_NAME = "TURBO"
 
 
 def _get_backend_name() -> str:
-    """
-    User-selected backend name, or ``TURBO`` by default.
-    """
+    """Return the user-selected backend name, or ``TURBO`` by default."""
     bt = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
     return bt.name if bt is not None else _DEFAULT_BACKEND_NAME
 
@@ -1142,19 +1629,7 @@ def _get_backend_name() -> str:
 # =========================================================================
 
 
-def get_hidden_bytes(
-    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-) -> int:
-    """Calculate the number of hidden bytes for a tensor.
-
-    Uses at least 2 bytes (bf16 size) so buffers work for both fp8 and bf16
-    without reallocation.
-    """
-    inp = x if isinstance(x, torch.Tensor) else x[0]
-    return inp.size(1) * max(inp.element_size(), 2)
-
-
-def _get_runtime_config(
+def _maybe_tune_config(
     x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     group: dist.ProcessGroup,
     handle: Optional[tuple],
@@ -1162,59 +1637,29 @@ def _get_runtime_config(
     token_weights: Optional[torch.Tensor],
     num_experts: Optional[int],
 ) -> Tuple[str, EPBufferConfig, Optional[EPAutoTuneResult]]:
-    """Determine ``(backend_name, buffer_config, autotune_result)`` for the
-    current call.
+    """Resolve ``(backend_name, buffer_config, autotune_result)`` for a call.
 
-    Two-branch semantics:
-
-    * **Autotune disabled** — ``backend_name`` comes from the user override
-      (code-level :class:`GlobalBackendManager` setting or the
-      ``PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND`` env var), falling back
-      to the built-in default. ``buffer_config`` is the user-provided
-      :data:`_buffer_config` populated by :func:`set_buffer_global_config`.
-      No measurement is performed.
-
-    * **Autotune enabled** — the user's backend override is **ignored**;
-      every available EP backend is swept and the fastest *(backend,
-      dispatch_config, combine_config)* triple wins. Resolution is layered:
-
-        (a) Handle-keyed lookup: follow-up calls (``moe_combine``, cached
-            dispatch, autograd backward) share the same ``handle`` as the
-            paired primary ``moe_dispatch`` and retrieve the tuned result
-            directly from :meth:`MoEDispatchCombineAutoTuner.lookup_handle`.
-        (b) Shape-keyed tune / lookup: a primary ``moe_dispatch`` (no
-            handle yet + full inputs) triggers
-            :meth:`MoEDispatchCombineAutoTuner.get_or_tune` which either
-            reuses a cached :class:`EPAutoTuneResult` for that shape or
-            runs the full sweep once.
-        (c) Last-resort fallback: reuse
-            :meth:`MoEDispatchCombineAutoTuner.current` when neither (a)
-            nor (b) applies (e.g. autotune was flipped on mid-run).
-
-    The returned ``autotune_result`` is propagated back to
-    :func:`moe_dispatch_impl` so it can
-    :meth:`MoEDispatchCombineAutoTuner.register_handle` the freshly
-    produced handle; ``None`` means "no autotune was used for this call".
+    When autotune is disabled, returns the user-configured backend and buffer
+    config. When enabled, ignores the user's backend choice and selects the
+    fastest backend/config triple via the autotuner: first by handle lookup
+    (follow-up calls), then shape-keyed tune (primary dispatch), else the
+    last-run result as fallback.
     """
-    assert _buffer_config is not None
+    backend_name = _get_backend_name()
+    user_cfg = _get_buffer_config(backend_name)
 
-    # ---- (1) Autotune off: get the user's backend + configs. ----------
+    # Autotune off: use the user's backend + per-backend config.
     if not GlobalBackendManager.auto_tune_enabled():
-        return _get_backend_name(), _buffer_config, None
+        return backend_name, user_cfg, None
 
-    # ---- (2) Autotune on: the user's backend choice is ignored. ---------
+    # Autotune on: user's backend choice is ignored.
     result: Optional[EPAutoTuneResult] = None
 
-    # (a) Handle-keyed cache — the dispatch/combine pair shares the same
-    # ``handle``, so any non-primary call (combine, cached dispatch,
-    # backward) resolves the configs purely from it.
+    # (a) Handle-keyed cache for follow-up calls (combine / cached / backward).
     if handle is not None:
         result = MoEDispatchCombineAutoTuner.lookup_handle(handle)
 
-    # (b) Primary dispatch (no handle yet + full inputs): trigger / reuse
-    # the shape-keyed tune result. ``uniform_dispatch`` stays at its default
-    # (``True``) so the tuner ignores the runtime routing distribution and
-    # tunes against a near-uniform one for robustness.
+    # (b) Primary dispatch: shape-keyed tune/lookup.
     if (
         result is None
         and handle is None
@@ -1228,29 +1673,28 @@ def _get_runtime_config(
             num_experts=int(num_experts),
             topk_idx=topk_idx,
             topk_weights=token_weights,
-            num_sms=_buffer_config.num_sms,
+            num_sms=user_cfg.num_sms,
         )
 
-    # (c) Last-resort fallback: autotune was enabled without ever running a
-    # primary dispatch (e.g. toggled mid-flight); use the most recent result.
+    # (c) Fallback: reuse the most recent result if any.
     if result is None:
         result = MoEDispatchCombineAutoTuner.current()
 
     if result is not None:
+        winner_cfg = _get_buffer_config(result.backend_name)
         cfg = EPBufferConfig(
-            num_sms=_buffer_config.num_sms,
+            num_sms=winner_cfg.num_sms,
             dispatch_config=result.dispatch_config,
             combine_config=result.combine_config,
         )
         return result.backend_name, cfg, result
 
-    # Autotune enabled but nothing to go on yet — fall back to user/default.
-    # The next primary ``moe_dispatch`` will populate the cache.
-    return _get_backend_name(), _buffer_config, None
+    # Nothing cached yet - fall back to user/default.
+    return backend_name, user_cfg, None
 
 
 # =========================================================================
-# Public API — used by ``moe_dispatch_combine.py``
+# Public API - used by ``moe_dispatch_combine.py``
 # =========================================================================
 
 
@@ -1265,9 +1709,39 @@ def moe_dispatch_impl(
     allocate_on_comm_stream: bool = False,
     num_worst_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
-    name, cfg, result = _get_runtime_config(x, group, handle, topk_idx, token_weights, num_experts)
+    """Dispatch tokens to experts via the selected EP backend.
+
+    Args:
+        x: Input tensor, or ``(fp8_tensor, scales)`` tuple for FP8 path.
+        group: EP process group.
+        handle: Cached dispatch handle; ``None`` for a primary call.
+        topk_idx: ``[num_tokens, num_topk]`` expert indices (primary only).
+        token_weights: ``[num_tokens, num_topk]`` expert weights.
+        num_experts: Total number of experts (primary only).
+        async_finish: If True, return before the kernel finishes.
+        allocate_on_comm_stream: Allocate outputs on the comm stream.
+        num_worst_tokens: Worst-case receive token count (for padding).
+
+    Returns:
+        ``(recv_x, recv_topk_idx, recv_topk_weights, tokens_per_expert, handle)``.
+    """
+    name, cfg, result = _maybe_tune_config(x, group, handle, topk_idx, token_weights, num_experts)
     backend = _get_backend_instance(name)
-    backend.init_buffer(group, get_hidden_bytes(x), cfg)
+    if num_experts is None or topk_idx is None:
+        assert backend.is_initialized(), "Backend is not initialized"
+    else:
+        # Unpack FP8 ``(tensor, scales)`` tuple to get shape metadata.
+        fp8_dispatch = isinstance(x, tuple)
+        x_inp = x[0] if fp8_dispatch else x
+        backend.init_buffer(
+            group,
+            hidden_size=x_inp.size(1),
+            num_experts=num_experts,
+            num_topk=topk_idx.size(1),
+            seqlen=x_inp.size(0),
+            fp8_dispatch=fp8_dispatch,
+            config=cfg,
+        )
     outputs = backend.dispatch(
         x,
         handle=handle,
@@ -1277,11 +1751,10 @@ def moe_dispatch_impl(
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
         num_worst_tokens=num_worst_tokens,
+        config=cfg.dispatch_config,
     )
 
-    # Bind the autotune result to the newly returned ``handle`` so the paired
-    # combine (or a later cached-dispatch / backward with the same handle)
-    # can recover the configs without having to redo any lookup.
+    # Bind the autotune result to the new handle for paired-call reuse.
     if result is not None:
         new_handle = outputs[-1]
         MoEDispatchCombineAutoTuner.register_handle(new_handle, result)
@@ -1297,17 +1770,27 @@ def moe_combine_impl(
     async_finish: bool = False,
     allocate_on_comm_stream: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    # Combine never runs its own tune: it resolves the tuned config purely
-    # by ``handle`` (set by the paired :func:`moe_dispatch_impl`) because the
-    # combine input ``x`` has a different shape from the dispatch input and
-    # therefore cannot reconstruct a shape-based cache key on its own.
-    name, cfg, _ = _get_runtime_config(x, group, handle, None, None, None)
+    """Combine expert outputs back to original token order via the selected backend.
+
+    Args:
+        x: Expert-side tensor to be combined.
+        group: EP process group.
+        handle: Handle returned by the paired ``moe_dispatch_impl`` call.
+        topk_weights: Optional per-token expert weights.
+        async_finish: If True, return before the kernel finishes.
+        allocate_on_comm_stream: Allocate outputs on the comm stream.
+
+    Returns:
+        ``(combined_x, combined_topk_weights)``.
+    """
+    name, cfg, _ = _maybe_tune_config(x, group, handle, None, None, None)
     backend = _get_backend_instance(name)
-    backend.init_buffer(group, get_hidden_bytes(x), cfg)
+    assert backend.is_initialized(), "Backend is not initialized"
     return backend.combine(
         x,
         handle=handle,
         topk_weights=topk_weights,
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
+        config=cfg.combine_config,
     )

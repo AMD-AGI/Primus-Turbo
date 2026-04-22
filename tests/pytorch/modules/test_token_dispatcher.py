@@ -29,14 +29,23 @@ ROUTER_TOPK = 8
 
 def _get_backends():
     """Return available backend names."""
+    all_backends = ["TURBO"]
     try:
         import deep_ep  # noqa: F401
 
         # TODO: add backend deepep, temporal disable it since rocm7.2 deepep bug.
         # return ["TURBO", "DEEP_EP"]
-        return ["TURBO"]
+        # all_backends.append("DEEP_EP")
     except ImportError:
-        return ["TURBO"]
+        pass
+
+    try:
+        import mori  # noqa: F401
+
+        all_backends.append("MORI")
+    except ImportError:
+        pass
+    return all_backends
 
 
 def _run_dispatch_combine(
