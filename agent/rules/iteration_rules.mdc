@@ -65,20 +65,34 @@ Every round MUST benchmark all shapes in the active validation set. No exception
 - Different shapes in the active validation set stress different bottlenecks. Skipping shapes hides regressions.
 - If a shape fails, record the failure explicitly.
 
+### Rule 2.1: Polling Cap — No Single Sleep/Wait > 15 Minutes
+
+When waiting on a backgrounded benchmark or test command:
+
+- A single `sleep` / `wait` / polling tool call MUST NOT exceed **15 minutes (900 seconds)**.
+- Long-running benchmarks (commonly 30-90 minutes on FP8 GEMM kernels) MUST be polled in repeated `sleep ≤ 900` windows.
+- Between windows, inspect progress via the terminal file and/or output artifact (e.g. grep `TestID:` in the benchmark log, `wc -l` the CSV, check terminal metadata for `exit_code`).
+- If two consecutive poll windows show no progress, treat the command as hung and investigate; do not keep sleeping blindly.
+
+Rationale: keeps the agent responsive to mid-run user corrections, bounds worst-case blocking on shell interrupts, and forces periodic progress verification instead of passive multi-hour waits.
+
 ## Rule 3: Accept or Rollback — No Ambiguity
 
-After benchmarking, apply this decision rule **mechanically**:
+After benchmarking, apply this decision rule **mechanically** using the campaign's **primary accept metric**:
+
+- For forward-only or otherwise single-objective campaigns, this is the primary performance metric directly.
+- For forward+backward GEMM campaigns, this should usually be a derived **combined-step** metric (for example, inverse step time or combined-step throughput), not independent forward/backward aggregates.
 
 ```
-IF   (avg TFLOPS improved) AND (no shape regressed ≥5%):
+IF   (primary aggregate score improved) AND (no core shape regressed ≥5% on the primary metric):
     ACCEPT → this round's code becomes the new baseline
     Record: "Round N: ACCEPTED — avg +X.X%, description"
 
-ELIF (some shapes improved, some regressed <5%):
+ELIF (primary aggregate score improved) AND (some shapes improved, some regressed <5%):
     ACCEPT WITH NOTE → document the trade-off
     Record: "Round N: ACCEPTED (trade-off) — avg +X.X%, shape Y regressed Z%"
 
-ELSE (avg TFLOPS did not improve) OR (any shape regressed ≥5%):
+ELSE (primary aggregate score did not improve) OR (any core shape regressed ≥5% on the primary metric):
     ROLLBACK → revert kernel code to previous round's snapshot
     Record: "Round N: ROLLED BACK — description did not help because ..."
     The NEXT round starts from the previous accepted code, not this failed attempt.
@@ -169,18 +183,33 @@ When a round is rolled back:
 
 ## Rule 8: Update Performance Trend Every Round
 
-Maintain `<campaign_dir>/logs/performance_trend.md` as a running table:
+Maintain `<campaign_dir>/logs/performance_trend.md` as a running table. Each
+row records both Forward and Backward TFLOPS, plus a combined step geomean,
+so training-side kernels stay visible:
 
 ```markdown
-| Round | Status | Description | Avg TFLOPS | Peak TFLOPS | vs Baseline | Key Finding |
-|-------|--------|-------------|------------|-------------|-------------|-------------|
-| 1 | ACCEPTED | Baseline persistent kernel | 500.0 | 800.0 | — | Memory-bound |
-| 2 | ACCEPTED | Add EVEN_K optimization | 520.0 | 850.0 | +4.0% | K masking was costly |
-| 3 | ROLLBACK | Try 256x256 tiles | 480.0 | 780.0 | -4.0% | Register spill at 256 |
-| 4 | ACCEPTED | Add XOR swizzle (from R2 code) | 550.0 | 870.0 | +5.8% | Bank conflicts reduced |
+| Round | Status | Description | Fwd Avg TFLOPS | Fwd Peak TFLOPS | Bwd Avg TFLOPS | Bwd Peak TFLOPS | Step Geomean TFLOPS | vs Baseline | Key Finding |
+|-------|--------|-------------|----------------|-----------------|----------------|-----------------|---------------------|-------------|-------------|
+| 1 | BASELINE | Baseline persistent kernel | 500.000 | 800.000 | 250.000 | 420.000 | 353.553 | — | Memory-bound |
+| 2 | ACCEPTED | Add EVEN_K optimization | 520.000 | 850.000 | 258.000 | 430.000 | 366.411 | step +3.637%, fwd +4.000%, bwd +3.200% | K masking was costly |
+| 3 | ROLLBACK | Try 256x256 tiles | 480.000 | 780.000 | 240.000 | 405.000 | 339.411 | step -3.999%, fwd -4.000%, bwd -4.000% | Register spill at 256 |
+| 4 | ACCEPTED | Add XOR swizzle (from R2 code) | 550.000 | 870.000 | 272.000 | 445.000 | 386.695 | step +9.380%, fwd +10.000%, bwd +8.800% | Bank conflicts reduced |
 ```
 
-The "vs Baseline" column always compares against the **current best accepted** code, not the previous round (which may have been rolled back).
+Column notes:
+- `Fwd/Bwd Avg TFLOPS` is the geometric mean across all PASS shapes for the
+  forward or backward direction.
+- `Fwd/Bwd Peak TFLOPS` is the maximum per-shape TFLOPS in that direction.
+- `Step Geomean TFLOPS = sqrt(Fwd Avg × Bwd Avg)`. If the kernel only has a
+  forward path (inference-only), fill the Bwd columns with `-`, set
+  `Step Geomean = Fwd Avg`, and note it once in the first row's Key Finding.
+- `vs Baseline` reports three percentages separated by commas, each against
+  the **baseline** row (round-1), not the previous round:
+  - `step ±X%` — change in `Step Geomean TFLOPS`
+  - `fwd ±Y%` — change in `Fwd Avg TFLOPS`
+  - `bwd ±Z%` — change in `Bwd Avg TFLOPS` (or `bwd —` when no backward path)
+  Use 3-decimal precision (e.g. `+0.467%`). The baseline row itself renders
+  the entire cell as `—`.
 
 ### Append-Only Logging Rule
 
@@ -200,7 +229,7 @@ R1(accepted) → R2(accepted) → R3(rollback, back to R2) → R4(accepted, from
 
 The **working kernel** at any point is the code from the **last accepted round**. Never from a rolled-back round.
 
-To verify chain integrity, the `performance_trend.md` must show monotonically non-decreasing avg TFLOPS across ACCEPTED rounds (allowing ≤1% noise). If an accepted round is somehow worse than the previous accepted, something is wrong — investigate.
+To verify chain integrity, the `performance_trend.md` must show monotonically non-decreasing **Step Geomean TFLOPS** across ACCEPTED rounds (allowing ≤1% noise). If an accepted round has a lower Step Geomean than the previous accepted round, something is wrong — investigate. Individual Fwd/Bwd directions are informational: either one may regress inside a single accepted round (e.g. a bwd-focused change can drop fwd slightly) as long as the step geomean still improves and the regression is recorded in `Key Finding`.
 
 ## Rule 10: No Premature Termination
 
