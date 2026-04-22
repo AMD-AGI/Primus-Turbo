@@ -62,6 +62,56 @@ def quant_fp8_blockwise_kernel(
     )
 
 
+@triton.jit
+def quant_fp8_blockwise_dual_kernel(
+    x_ptr,
+    x_fp8_row_ptr,
+    x_scales_row_ptr,
+    x_fp8_col_ptr,
+    x_scales_col_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    x_ptrs = x_ptr + offs_m[:, None] * N + offs_n[None, :]
+    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x_tile_abs = tl.abs(x_tile)
+
+    x_fp8_row_tile, x_scales_row_tile = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX)
+    x_fp8_col_tile, x_scales_col_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
+
+    x_fp8_row_ptrs = x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=mask)
+
+    x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(x_fp8_col_ptrs, x_fp8_col_tile.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
+
+    row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+    row_scale_mask = offs_m < M
+    x_scales_row_tile_inv = tl.reshape(1.0 / x_scales_row_tile, BLOCK_SIZE)
+    tl.store(
+        x_scales_row_ptr + row_scale_offs,
+        x_scales_row_tile_inv,
+        mask=row_scale_mask,
+    )
+
+    col_scale_offs = pid_m * N + offs_n
+    col_scale_mask = offs_n < N
+    x_scales_col_tile_inv = tl.reshape(1.0 / x_scales_col_tile, BLOCK_SIZE)
+    tl.store(
+        x_scales_col_ptr + col_scale_offs,
+        x_scales_col_tile_inv,
+        mask=col_scale_mask,
+    )
+
+
 # Blockwise quantize with segment padding
 # Reads from original tensor, writes to padded tensor with segment alignment
 @triton.jit

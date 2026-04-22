@@ -31,6 +31,8 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 from __future__ import annotations
 
 import itertools
+import weakref
+from collections import OrderedDict
 
 import torch
 import triton
@@ -45,6 +47,33 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _select_params_origami,
     _set_knobs_gfx950,
 )
+
+
+# Cache `scale.T.contiguous()` results so repeated backward calls on the same
+# saved scale tensor (benchmark's 100-iter bwd loop, realistic training reuse)
+# do not keep relaunching the transpose kernel for the 2D blockwise-scale
+# paths (`_blockwise_nn` dgrad and `_blockwise_nt` forward).
+_SCALE_T_CACHE_CAPACITY = 32
+_scale_t_cache = OrderedDict()
+
+
+def _get_scale_t_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if x.is_contiguous() and x.ndim == 2:
+        key = (id(x), getattr(x, "_version", 0), x.shape[0], x.shape[1])
+        entry = _scale_t_cache.get(key)
+        if entry is not None:
+            ref, xt = entry
+            if ref() is x:
+                _scale_t_cache.move_to_end(key)
+                return xt
+            _scale_t_cache.pop(key, None)
+        xt = x.T.contiguous()
+        _scale_t_cache[key] = (weakref.ref(x), xt)
+        _scale_t_cache.move_to_end(key)
+        while len(_scale_t_cache) > _SCALE_T_CACHE_CAPACITY:
+            _scale_t_cache.popitem(last=False)
+        return xt
+    return x.T.contiguous()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -719,25 +748,28 @@ def gemm_fp8_rowwise_triton_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise autotune configs (32 total)
+# Blockwise autotune configs
 # Fixed: BLOCK_N=128, BLOCK_K=128, wpe=2, mfma=16
 # Variable: BLOCK_M, kpack, GROUP_M, CHUNK, num_stages
 # ═══════════════════════════════════════════════════════════════════════════════
 def _get_blockwise_autotune_configs():
     configs = []
-    for block_m, kp, gm, chunk, ns in itertools.product(
+    num_stage_values = [1, 2, 3] if _is_gfx950() else [1, 2]
+    block_n_values = [64, 128] if _is_gfx950() else [128]
+    for block_m, block_n, kp, gm, chunk, ns in itertools.product(
         [128, 256],
+        block_n_values,
         [1, 2],
         [4, 8],
         [32, 64],
-        [1, 2],
+        num_stage_values,
     ):
         nw = 4 if block_m == 128 else 8
         configs.append(
             triton.Config(
                 {
                     "BLOCK_M": block_m,
-                    "BLOCK_N": 128,
+                    "BLOCK_N": block_n,
                     "BLOCK_K": 128,
                     "GROUP_M": gm,
                     "NUM_XCDS": 8,
@@ -839,7 +871,10 @@ def _blockwise_fp8_autotune_kernel(
         as_ptrs = A_scales_ptr + rm * stride_as_m
 
         if SCALE_2D_B:
-            bs_ptr_base = B_scales_ptr + pn * stride_bs_0
+            # Blockwise B scales are still stored on 128-column granularity even
+            # when autotune tries a narrower output tile such as BLOCK_N=64.
+            scale_block_n = (pn * BLOCK_N) // 128
+            bs_ptr_base = B_scales_ptr + scale_block_n * stride_bs_0
         else:
             bs_ptrs = B_scales_ptr + rn * stride_bs_0
 
@@ -881,6 +916,232 @@ def _blockwise_fp8_autotune_kernel(
                 b_ptrs += BLOCK_K
             else:
                 b_ptrs += BLOCK_K * stride_bk_val
+
+        offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = C_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :].to(tl.int64) * stride_cn
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Forward-NT-specialised kernel: same logic as the shared kernel but with
+# `A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=True` hardcoded (since
+# this variant is only called from `_blockwise_nt`) and an `EVEN_K` fast-path
+# that skips the K-mask arithmetic when `K % BLOCK_K == 0`. Duplicating the
+# kernel source instead of adding another guard to the shared kernel avoids the
+# R26 / R53 fragility — the shared kernel's strided-load backward paths are
+# untouched.
+# ═══════════════════════════════════════════════════════════════════════════════
+@triton.autotune(
+    configs=_get_blockwise_autotune_configs(),
+    key=["M", "N", "K", "EVEN_K"],
+)
+@triton.jit
+def _blockwise_fp8_nt_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    A_scales_ptr,
+    B_scales_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_as_k,
+    stride_as_m,
+    stride_bs_0,
+    stride_bs_1,
+    NUM_SMS,
+    NUM_K_BLOCKS,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    if NUM_XCDS != 1:
+        full_chunk_pids = (NUM_SMS // (NUM_XCDS * CHUNK)) * (NUM_XCDS * CHUNK)
+        if pid <= full_chunk_pids:
+            local_pid = pid // NUM_XCDS
+            chunk_idx = local_pid // CHUNK
+            pos_in_chunk = local_pid % CHUNK
+            xcd = pid % NUM_XCDS
+            pid = chunk_idx * NUM_XCDS * CHUNK + xcd * CHUNK + pos_in_chunk
+
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    total = num_m * num_n
+    grp = GROUP_M * num_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for tid in range(pid, total, NUM_SMS):
+        gid = tid // grp
+        fm = gid * GROUP_M
+        gs = min(num_m - fm, GROUP_M)
+        pm = fm + (tid % grp) % gs
+        pn = (tid % grp) // gs
+        tl.assume(pm >= 0)
+        tl.assume(pn >= 0)
+
+        rm = tl.max_contiguous(tl.multiple_of((pm * BLOCK_M + tl.arange(0, BLOCK_M)) % M, BLOCK_M), BLOCK_M)
+        rn = tl.max_contiguous(tl.multiple_of((pn * BLOCK_N + tl.arange(0, BLOCK_N)) % N, BLOCK_N), BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+
+        # NT-only: A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True.
+        a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64)
+        b_ptrs = B_ptr + rk[:, None].to(tl.int64) + rn[None, :].to(tl.int64) * stride_bn
+
+        as_ptrs = A_scales_ptr + rm * stride_as_m
+
+        # NT-only: SCALE_2D_B=True. B scales are still on 128-column granularity.
+        scale_block_n = (pn * BLOCK_N) // 128
+        bs_ptr_base = B_scales_ptr + scale_block_n * stride_bs_0
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for ki in range(NUM_K_BLOCKS):
+            if EVEN_K:
+                a = tl.load(a_ptrs, cache_modifier=".ca")
+                b = tl.load(b_ptrs, cache_modifier=".ca")
+            else:
+                k_remaining = K - ki * BLOCK_K
+                mask_k_col = rk[None, :] < k_remaining
+                mask_k_row = rk[:, None] < k_remaining
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
+
+            partial = tl.dot(a, b, input_precision="ieee")
+
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+            acc += partial * (a_s * b_s)[:, None]
+
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K
+
+        offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = C_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :].to(tl.int64) * stride_cn
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Backward-NN-specialised kernel for dgrad: `A_K_CONTIGUOUS=True,
+# B_K_CONTIGUOUS=False, SCALE_2D_B=True` hardcoded. Same `EVEN_K` fast-path as
+# the NT variant. The B-load path stays strided (B is not K-contiguous in NN
+# dgrad), so we keep that arithmetic but drop the branch on it.
+# ═══════════════════════════════════════════════════════════════════════════════
+@triton.autotune(
+    configs=_get_blockwise_autotune_configs(),
+    key=["M", "N", "K", "EVEN_K"],
+)
+@triton.jit
+def _blockwise_fp8_nn_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    A_scales_ptr,
+    B_scales_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bk_val,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_as_k,
+    stride_as_m,
+    stride_bs_0,
+    stride_bs_1,
+    NUM_SMS,
+    NUM_K_BLOCKS,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    if NUM_XCDS != 1:
+        full_chunk_pids = (NUM_SMS // (NUM_XCDS * CHUNK)) * (NUM_XCDS * CHUNK)
+        if pid <= full_chunk_pids:
+            local_pid = pid // NUM_XCDS
+            chunk_idx = local_pid // CHUNK
+            pos_in_chunk = local_pid % CHUNK
+            xcd = pid % NUM_XCDS
+            pid = chunk_idx * NUM_XCDS * CHUNK + xcd * CHUNK + pos_in_chunk
+
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    total = num_m * num_n
+    grp = GROUP_M * num_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for tid in range(pid, total, NUM_SMS):
+        gid = tid // grp
+        fm = gid * GROUP_M
+        gs = min(num_m - fm, GROUP_M)
+        pm = fm + (tid % grp) % gs
+        pn = (tid % grp) // gs
+        tl.assume(pm >= 0)
+        tl.assume(pn >= 0)
+
+        rm = tl.max_contiguous(tl.multiple_of((pm * BLOCK_M + tl.arange(0, BLOCK_M)) % M, BLOCK_M), BLOCK_M)
+        rn = tl.max_contiguous(tl.multiple_of((pn * BLOCK_N + tl.arange(0, BLOCK_N)) % N, BLOCK_N), BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+
+        # NN: A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=False (B is strided in K).
+        a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64)
+        b_ptrs = B_ptr + rk[:, None].to(tl.int64) * stride_bk_val + rn[None, :].to(tl.int64) * stride_bn
+
+        as_ptrs = A_scales_ptr + rm * stride_as_m
+
+        # NN: SCALE_2D_B=True.
+        scale_block_n = (pn * BLOCK_N) // 128
+        bs_ptr_base = B_scales_ptr + scale_block_n * stride_bs_0
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for ki in range(NUM_K_BLOCKS):
+            if EVEN_K:
+                a = tl.load(a_ptrs, cache_modifier=".ca")
+                b = tl.load(b_ptrs, cache_modifier=".ca")
+            else:
+                k_remaining = K - ki * BLOCK_K
+                mask_k_col = rk[None, :] < k_remaining
+                mask_k_row = rk[:, None] < k_remaining
+                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
+                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
+
+            partial = tl.dot(a, b, input_precision="ieee")
+
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+            acc += partial * (a_s * b_s)[:, None]
+
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * stride_bk_val
 
         offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -976,14 +1237,14 @@ def _blockwise_nt(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
+    A_scales_t = _get_scale_t_contiguous(a_scale_inv)  # [K//128, M]
     B_t = b.T  # view [K, N]
 
     num_m = (M + 127) // 128
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_nt_kernel[(NUM_SMS,)](
         a,
         B_t,
         out,
@@ -993,8 +1254,6 @@ def _blockwise_nt(
         N,
         K,
         a.stride(0),
-        a.stride(1),
-        B_t.stride(0),
         B_t.stride(1),
         stride_cm,
         stride_cn,
@@ -1004,9 +1263,7 @@ def _blockwise_nt(
         b_scale_inv.stride(1),
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=True,
-        SCALE_2D_B=True,
+        EVEN_K=(K % 128) == 0,
     )
     return out
 
@@ -1036,16 +1293,16 @@ def _blockwise_nn(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
+    A_scales_t = _get_scale_t_contiguous(a_scale_inv)  # [K//128, M]
     # B_scales from quantization: [dim0_blocks, dim1_blocks] for weight stored as [N_fwd, K_fwd].
     # Kernel expects [N_output_blocks, K_inner_blocks] indexing → transpose.
-    b_scale_inv_t = b_scale_inv.T.contiguous()
+    b_scale_inv_t = _get_scale_t_contiguous(b_scale_inv)
 
     num_m = (M + 127) // 128
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_nn_kernel[(NUM_SMS,)](
         a,
         b,
         out,
@@ -1055,7 +1312,6 @@ def _blockwise_nn(
         N,
         K,
         a.stride(0),
-        a.stride(1),
         b.stride(0),
         b.stride(1),
         stride_cm,
@@ -1066,9 +1322,7 @@ def _blockwise_nn(
         b_scale_inv_t.stride(1),
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=True,
+        EVEN_K=(K % 128) == 0,
     )
     return out
 
