@@ -14,6 +14,12 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
+from primus_turbo.common.constants import (
+    ENV_AUTO_TUNE,
+    ENV_GEMM_BACKEND,
+    ENV_GROUPED_GEMM_BACKEND,
+    ENV_MOE_DISPATCH_COMBINE_BACKEND,
+)
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.gemm.gemm_kernel import clear_origami_caches
 
@@ -32,11 +38,6 @@ __all__ = [
     "TuneCache",
     "AutoKernelDispatcher",
 ]
-
-_ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
-_ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
-_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
-_ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
 
 
 class PrecisionType(Enum):
@@ -171,12 +172,12 @@ class GlobalBackendManager:
         """Get the GEMM backend configuration. Returns None if not set."""
         if cls._gemm_backend is not None:
             return cls._gemm_backend[precision]
-        env_value = os.environ.get(_ENV_GEMM_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_GEMM_BACKEND, None)
         if env_value is not None:
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
-                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
+                    f"Precision {precision.name} not found in the environment variable {ENV_GEMM_BACKEND}. "
                     f"Using default backend.",
                     once=True,
                 )
@@ -189,13 +190,13 @@ class GlobalBackendManager:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend[precision]
-        env_value = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_GROUPED_GEMM_BACKEND, None)
         if env_value is not None:
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
-                    f"{_ENV_GROUPED_GEMM_BACKEND_KEY}. Using default backend.",
+                    f"{ENV_GROUPED_GEMM_BACKEND}. Using default backend.",
                     once=True,
                 )
             return backend
@@ -212,7 +213,7 @@ class GlobalBackendManager:
         """
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend[precision]
-        env_value = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
         if env_value is not None:
             try:
                 backend = cls._extract_backend_from_env(env_value).get(precision, None)
@@ -222,7 +223,7 @@ class GlobalBackendManager:
             if backend is None:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
-                    f"{_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY}. Using default backend.",
+                    f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}. Using default backend.",
                     once=True,
                 )
 
@@ -239,7 +240,7 @@ class GlobalBackendManager:
         """Check if auto-tune is enabled."""
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get(_ENV_AUTO_TUNE_KEY, "0") == "1"
+        return os.environ.get(ENV_AUTO_TUNE, "0") == "1"
 
     @classmethod
     def reset(cls) -> None:

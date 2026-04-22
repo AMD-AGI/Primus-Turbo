@@ -23,6 +23,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 
+from primus_turbo.common.constants import ENV_MOE_DISPATCH_COMBINE_BACKEND
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -428,8 +429,6 @@ def _get_backend_instance(name: str) -> EPBackend:
 # Backend selection
 # =========================================================================
 
-_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
-
 _BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
     BackendType.TURBO: "TURBO",
     BackendType.DEEP_EP: "DEEP_EP",
@@ -448,7 +447,7 @@ def _resolve_backend_name() -> str:
     if user_backend is not None:
         return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
 
-    env_val = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY)
+    env_val = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND)
     if env_val is not None:
         return env_val.strip().upper()
 
