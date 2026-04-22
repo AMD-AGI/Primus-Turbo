@@ -130,7 +130,12 @@ def _fused_dispatch_permute(
             )
 
         total_permuted_tokens = num_worst_tokens * num_topk
-        metadata_ints = num_channels * num_ranks * 3 + num_experts_per_rank + total_permuted_tokens
+        # 4× num_channels * num_ranks accounts for the four per-(channel, rank)
+        # counters in the shared symmetric-memory layout:
+        # channel_start_offset, channel_end_offset, channel_tail_idx and
+        # channel_phase_idx. The last one is unused by the fused kernel but
+        # walked for layout parity with the expert-grouped variant.
+        metadata_ints = num_channels * num_ranks * 4 + num_experts_per_rank + total_permuted_tokens
         offset = rank_prefix_matrix.nbytes + metadata_ints * 4
         recv_x = symm_mem.get_buffer(
             rank, [num_worst_tokens, hidden_size], x.dtype, storage_offset=offset // x.element_size()
@@ -295,7 +300,10 @@ def _expert_grouped_dispatch_permute(
         )
 
         total_permuted_tokens = num_worst_tokens * num_topk
-        metadata_ints = num_channels * num_ranks * 3 + num_experts_per_rank + total_permuted_tokens
+        # 4× num_channels * num_ranks — matches the C++ Buffer walk in
+        # dispatch.cu (channel_start/end/tail/phase) and the zeroed range
+        # in ep.cpp's `num_memset_int`.
+        metadata_ints = num_channels * num_ranks * 4 + num_experts_per_rank + total_permuted_tokens
         offset = rank_prefix_matrix.nbytes + metadata_ints * 4
         recv_x = symm_mem.get_buffer(
             rank,

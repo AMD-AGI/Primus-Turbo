@@ -43,7 +43,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
     auto channel_end_offset   = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
     auto channel_tail_idx     = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto expert_slot_idx      = Buffer<int>(ptr, num_experts_per_rank);
+    // Unused by the monolithic (non-group) fused kernel, but walked here
+    // so the buffer layout stays bit-for-bit identical with the
+    // expert-grouped kernel's layout in dispatch.cu — which does use it
+    // for per-phase signalling. Keeping the two layouts aligned means
+    // the shared symmetric memory pool, the `num_memset_int` formula,
+    // and any downstream offset math (e.g. Python's `metadata_ints`)
+    // stay consistent regardless of which dispatch variant runs.
+    auto channel_phase_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto expert_slot_idx   = Buffer<int>(ptr, num_experts_per_rank);
+    (void) channel_phase_idx;
 
     auto num_tokens_total                = num_tokens * kNumRanks;
     auto dispatched_x_buffers            = Buffer<int4>(ptr, num_tokens_total * hidden_int4);

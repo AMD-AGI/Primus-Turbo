@@ -52,8 +52,13 @@ fused_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
     auto channel_expert_prefix =
         torch::empty({num_ranks, num_channels, num_experts_per_rank}, int32_opts);
 
+    // The 4 per-channel-rank counters are: channel_start_offset,
+    // channel_end_offset, channel_tail_idx, channel_phase_idx.
+    // The last one is walked by both the fused and the expert-grouped
+    // kernels (see dispatch.cu / intranode.cu) to keep the symmetric-
+    // memory buffer layout identical across the two variants.
     int num_memset_int =
-        num_channels * num_ranks * 3 + num_experts_per_rank + num_worst_tokens * num_topk;
+        num_channels * num_ranks * 4 + num_experts_per_rank + num_worst_tokens * num_topk;
 
     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
     int  **barrier_signal_ptrs_gpu =
@@ -211,8 +216,12 @@ expert_grouped_dispatch_permute_preprocess(const torch::Tensor &topk_idx,
     auto channel_expert_prefix =
         torch::empty({num_ranks, num_channels, num_experts_per_rank}, int32_opts);
 
+    // Same `num_memset_int` formula as the fused preprocess — the extra
+    // `num_channels * num_ranks` ints (4× instead of 3×) cover the
+    // shared `channel_phase_idx` slot that the expert-grouped receiver
+    // polls to advance through the G sender phases in lock-step.
     int num_memset_int =
-        num_channels * num_ranks * 3 + num_experts_per_rank + num_worst_tokens * num_topk;
+        num_channels * num_ranks * 4 + num_experts_per_rank + num_worst_tokens * num_topk;
 
     void **buffer_ptrs_gpu = reinterpret_cast<void **>(buffer_ptrs_dev.data_ptr<int64_t>());
     int  **barrier_signal_ptrs_gpu =

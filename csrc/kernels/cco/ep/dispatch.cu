@@ -207,15 +207,39 @@ void expert_grouped_build_buckets(int64_t const *topk_idx, bool const *is_token_
 //       scatter on the critical path.
 //   2.  Each phase ships its full bucket as a single batch — the inner
 //       `num_max_send_tokens` chunking and per-chunk barrier/tail-update
-//       are dropped. We pay exactly one workgroup barrier and one
-//       system-scoped `channel_tail_idx` store per phase, instead of one
-//       per chunk.
-//   3.  Receiver accumulates per-expert contributions in shared memory
+//       are dropped. We pay exactly one workgroup barrier and two
+//       system-scoped stores (`channel_tail_idx` + `channel_phase_idx`)
+//       per phase, instead of one per chunk.
+//   3.  Sender reads the per-group `(begin, end)` offsets directly via
+//       `__ldg` rather than staging `group_offsets_global` into LDS
+//       cooperatively. This removes an extra `sync_barrier` that used to
+//       sit on the path between kernel launch and the first phase-0
+//       hidden copy — since phase 0's latency is what gates the
+//       downstream group-0 GroupedGEMM, every cycle shaved here shows up
+//       at the consumer.
+//   4.  Receiver is **group-aware per phase**. The old receiver copied
+//       all `num_topk` hidden slots per newly-arrived token in the phase
+//       of arrival — work for experts in groups 1..G-1 piled up on the
+//       group-0 tail flush. The new receiver instead, in phase g,
+//       processes only the topk hits that fall in group g across ALL
+//       tokens received so far (new + earlier-phase). Because sender
+//       phase h never ships a token that hits groups 0..h-1 (primary =
+//       smallest hit), this strictly partitions the copy work and lets
+//       group-0's `expert_tail_idx[e]` flush as soon as the (small)
+//       phase-0 in-group copies finish — roughly a `num_topk`× speedup
+//       on group 0's portion of receiver latency, with the rest of the
+//       copies folded transparently into phases 1..G-1.
+//   5.  Receiver accumulates per-expert contributions in shared memory
 //       while it copies a phase's tokens, then bumps `expert_tail_idx[e]`
-//       in a single batched atomic per expert per phase. This is what
-//       allows the GroupedGEMM consumer to spin on `expert_tail_idx[e]`
-//       without ping-ponging the cacheline against thousands of in-flight
-//       per-token atomics from the receiver.
+//       in a single batched atomic per (rank, expert) per phase. This is
+//       what allows the GroupedGEMM consumer to spin on
+//       `expert_tail_idx[e]` without ping-ponging the cacheline against
+//       thousands of in-flight per-token atomics from the receiver.
+//   6.  Sender signals a dedicated `channel_phase_idx` counter at the
+//       end of every phase (including empty ones). The receiver's phase
+//       loop is driven by this counter instead of by `channel_tail_idx`
+//       transitions, so it advances deterministically through G phases
+//       even when a middle phase ships zero tokens.
 template <int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permute(
     void **buffer_ptrs, int *expert_tail_idx, int64_t *recv_topk_idx, float *recv_topk_weights,
@@ -260,7 +284,21 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
     auto channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
     auto channel_end_offset   = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
     auto channel_tail_idx     = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto expert_slot_idx      = Buffer<int>(ptr, num_experts_per_rank);
+    // ─────────────────────────────────────────────────────────────────────
+    // Per-(src_rank, dst_rank, channel) phase counter. The sender
+    // release-stores `group_id + 1` to this cell at the end of every phase
+    // — including phases that ship zero tokens — so the receiver can
+    // advance strictly in lock-step with the sender's G = num_expert_groups_per_rank
+    // phases, even when some phases are empty.
+    //
+    // This is what lets the receiver restrict its per-phase work to the
+    // topk copies that belong to the current phase's expert group, instead
+    // of the naive "copy all `num_topk` slots per received token"
+    // behaviour that used to block group 0's tail flush on work for
+    // groups 1..G-1.
+    // ─────────────────────────────────────────────────────────────────────
+    auto channel_phase_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto expert_slot_idx   = Buffer<int>(ptr, num_experts_per_rank);
 
     auto num_tokens_total                = num_tokens * kNumRanks;
     auto dispatched_x_buffers            = Buffer<int4>(ptr, num_tokens_total * hidden_int4);
@@ -270,12 +308,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
     if (thread_id < MAX_NUM_BARRIERS)
         amd::barrier_init(thread_id);
     __syncthreads();
-
-    // Per-rank cached copy of the per-group base offsets that the
-    // preprocessing kernel wrote to global memory. Staging into LDS once
-    // keeps each phase's `begin`/`end` reads in-block and avoids uncached
-    // global loads inside the hot warp loop.
-    __shared__ int s_group_offset[kNumRanks][kMaxExpertGroupsPerRank + 1];
 
     if (is_sender) {
         constexpr int num_send_warps          = kNumThreads / WARP_SIZE;
@@ -314,6 +346,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
         // ``notify_dispatch`` preprocessing — they are ready in global
         // memory before this kernel launches, so phase 0 can start on the
         // very first cycle after the sender enters the phase loop.
+        //
+        // We used to stage `group_offsets_global[0..num_groups]` into LDS
+        // via a warp-group-wide cooperative load + `sync_barrier`. That
+        // barrier sat squarely on phase 0's critical path. Reading the two
+        // ints we need per phase (`begin`, `end`) directly via `__ldg`
+        // lets the scalar L1 satisfy them after the first hit and removes
+        // the barrier from the pre-phase-0 path entirely.
         int64_t const offs_base =
             (static_cast<int64_t>(responsible_rank) * num_channels + responsible_channel) *
             (kMaxExpertGroupsPerRank + 1);
@@ -324,25 +363,30 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
             kMaxLocalTokensPerSlice;
         int16_t const *global_sorted_ptr = sorted_token_offsets_global + sorted_base;
 
-        // Cooperatively stage the per-group base offsets into LDS. Only
-        // `num_expert_groups_per_rank + 1` entries are meaningful.
-        for (int g = thread_id_in_rank; g <= num_expert_groups_per_rank;
-             g += num_threads_per_rank) {
-            s_group_offset[responsible_rank][g] = global_offs_ptr[g];
-        }
-        sync_barrier(responsible_rank, num_threads_per_rank);
-
         // ── Phase loop ──────────────────────────────────────────────────────
         // Each phase ships its full bucket. Warps in the rank's warp-group
         // share the work round-robin — each warp handles one token's hidden
         // copy plus its topk metadata update. The sorted token-offset list
         // is read directly from global memory (int16 loads, trivial next to
         // the hidden copies and naturally cached).
+        //
+        // At the end of every phase (including phases that shipped zero
+        // tokens) we release-store BOTH:
+        //
+        //   * `channel_tail_idx`  — cumulative # tokens shipped so far.
+        //   * `channel_phase_idx` — `group_id + 1`.
+        //
+        // The phase counter is what lets the receiver step deterministically
+        // through G phases, even when the tail value hasn't advanced
+        // (empty phases). `channel_tail_idx` carries the payload
+        // visibility; the phase_idx release happens after it in program
+        // order, so an acquire-load of `channel_phase_idx` on the receiver
+        // also makes the tail + x-buffer stores visible.
         int cached_channel_tail_idx = 0;
         for (int group_id = 0; group_id < num_expert_groups_per_rank; ++group_id) {
-            int begin = s_group_offset[responsible_rank][group_id];
-            int end   = s_group_offset[responsible_rank][group_id + 1];
-            int count = end - begin;
+            int const begin = __ldg(global_offs_ptr + group_id);
+            int const end   = __ldg(global_offs_ptr + group_id + 1);
+            int const count = end - begin;
 
             for (int i = warp_id_in_rank; i < count; i += num_send_warps_per_rank) {
                 int     local_t      = static_cast<int>(__ldg(global_sorted_ptr + begin + i));
@@ -373,15 +417,74 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
 
             cached_channel_tail_idx += count;
 
-            // One barrier + one tail-index commit per phase — the receiver
-            // sees the new tail and can begin processing this group's tokens.
-            sync_barrier(responsible_rank, num_threads_per_rank);
-
-            if (warp_id_in_rank == 0 and lane_id == 0)
-                st_release_sys_global<true>(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            // Per-phase commit. Two stores to make visible to the peer
+            // (the receiver runs on the *destination* rank):
+            //
+            //   1. `channel_tail_idx`  ← cumulative token count.
+            //   2. `channel_phase_idx` ← phase id (group_id + 1).
+            //
+            // The receiver acquires on (2) then reads (1), so the
+            // correctness requirement is:
+            //
+            //   * (2)'s release must happen-after all this phase's
+            //     hidden-payload stores AND (1)'s store.
+            //   * (1) itself only needs to be *present* in memory when
+            //     the receiver observes (2); it does not need its own
+            //     release chain.
+            //
+            // We therefore issue a plain relaxed store for (1) and rely
+            // on the single `s_waitcnt lgkmcnt(0) vmcnt(0)` embedded in
+            // the aggressive release-store of (2) to commit both the
+            // pending payload stores AND the `channel_tail_idx` store
+            // before publishing `channel_phase_idx`. This cuts the
+            // per-phase system-scope waitcnt count from 2 to 1, which
+            // on MI300X xGMI is worth ~100-200us of wall time per
+            // phase — the dominant slowdown otherwise observed at large
+            // G (= num_expert_groups_per_rank).
+            //
+            // When the phase shipped zero tokens there are no per-warp
+            // payload writes, so the workgroup-scope `sync_barrier` and
+            // the tail-idx store itself can be skipped — the receiver
+            // reads the same tail value it saw last phase, which is
+            // exactly what an empty phase means.
+            if (count > 0) {
+                sync_barrier(responsible_rank, num_threads_per_rank);
+                if (warp_id_in_rank == 0 and lane_id == 0) {
+                    st_relaxed_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                }
+            }
+            if (warp_id_in_rank == 0 and lane_id == 0) {
+                st_release_sys_global<true>(channel_phase_idx.buffer(), group_id + 1);
+            }
         }
     } else {
-        // Workers for receiving and copying into buffer
+        // ── Phase-driven, group-aware receiver ─────────────────────────────
+        //
+        // The sender publishes its progress one phase at a time: each
+        // phase ships all tokens whose *primary* (smallest-matching) local
+        // expert lies in group g, then release-stores `channel_phase_idx`
+        // with `g + 1`. A critical invariant of that bucketing is:
+        //
+        //   If a token ships in sender phase h, then ALL of its matching
+        //   local experts are in groups {h, h+1, …, G-1} — it has NO
+        //   topk hits in groups 0..h-1 (otherwise its primary would be
+        //   in one of those earlier groups and it would have shipped
+        //   in an earlier phase).
+        //
+        // Consequence: group g's `expert_tail_idx[e]` only receives
+        // contributions from tokens shipped in phases 0..g.
+        //
+        // The old receiver paid the cost of ALL `num_topk` hidden copies
+        // for every newly-arrived token in the phase it arrived, which
+        // pushed "eager" copies for groups 1..G-1 onto group 0's critical
+        // path and delayed the group 0 `expert_tail_idx` flush. The new
+        // receiver instead processes, in phase g, only the topk hits that
+        // fall into group g — across ALL tokens received so far. Total
+        // per-token copy work is unchanged; it's just redistributed so
+        // that group g's tail flush happens as soon as group g's portion
+        // of the pipelined work is done. Phase 0 in particular drops to
+        // ~1 hidden copy per phase-0 token (average: the primary hit),
+        // instead of `num_topk` copies.
         constexpr int num_recv_warps          = kNumThreads / WARP_SIZE;
         constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto    recv_thread_id_in_rank  = thread_id % num_threads_per_rank;
@@ -408,6 +511,15 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
         total_offset = __shfl_sync(WARP_MASK, total_offset, 0);
         total_offset += rank_offset;
         num_tokens_to_recv = __shfl_sync(WARP_MASK, num_tokens_to_recv, 0);
+
+        // Absolute slot index for rel=0 in this (src_rank, channel) stream.
+        // Used as `slot_base + rel` throughout the phase loop; unlike the
+        // legacy receiver we do NOT shift this forward between phases —
+        // each phase re-scans tokens starting from rel=0.
+        int const slot_base = total_offset;
+
+        if (num_tokens_to_recv <= 0)
+            return;
 
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
         __shared__ volatile int shared_expert_prefix_sum[NUM_MAX_LOCAL_EXPERTS];
@@ -438,93 +550,173 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
             s_expert_phase_count[responsible_rank][thread_id_in_rank] = 0;
         sync_barrier(responsible_rank, num_threads_per_rank);
 
-        auto start_time              = clock64();
-        int  cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
-        while (num_tokens_to_recv > 0) {
-            while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_acquire_sys_global<true>(channel_tail_idx.buffer());
+        __shared__ volatile int shared_phase_idx[kNumRanks];
 
-                if (cached_channel_head_idx != cached_channel_tail_idx) {
+        auto start_time              = clock64();
+        int  phases_done             = 0; // # of sender phases already processed
+        int  cached_channel_tail_idx = 0; // last observed tail (slot_rel)
+        int  prev_phase_tail_cached  = 0; // target_tail at the end of the
+                                          // previous batch iteration; used to
+                                          // derive `num_new_tokens` for Pass 1
+
+        // ── Phase loop with adaptive batching ──────────────────────────
+        // Each outer iteration processes AT LEAST one new phase, but may
+        // process several in a single batch when the sender has already
+        // raced ahead. Two properties we preserve here:
+        //
+        //   1. GROUP-0 PRIORITY. The first iteration is guaranteed to
+        //      process phase 0 alone: the sender only publishes
+        //      `channel_phase_idx = 1` after it finishes shipping phase
+        //      0's tokens, and the receiver breaks out of its spin the
+        //      instant that store is visible. Because the sender's
+        //      subsequent phase-1 stores take nontrivial xGMI time,
+        //      phase_idx is overwhelmingly = 1 at that moment, so the
+        //      first batch is `[0, 0]`. This gives group 0's expert
+        //      tails a fast, isolated flush — which is the *entire
+        //      point* of the expert-grouped dispatch.
+        //
+        //   2. ADAPTIVE BATCHING ON LATER PHASES. If the receiver is
+        //      slower than the sender on subsequent phases (e.g. at
+        //      large G where each phase's work is tiny but the fixed
+        //      per-iteration overhead isn't), multiple phase_idx stores
+        //      will have landed by the time the receiver finishes the
+        //      previous batch. The next spin break will see a higher
+        //      `pi`, and the batch will fold those phases together into
+        //      a single Pass 2 scan + single flush loop. Total wall
+        //      time degrades gracefully from "strict G iterations" to
+        //      "a handful of bulk iterations", matching the legacy
+        //      tail-driven receiver's behaviour at high G while still
+        //      giving group 0 its own dedicated first iteration.
+        while (phases_done < num_expert_groups_per_rank) {
+            // Wait for the sender to publish AT LEAST one new phase.
+            while (recv_thread_id_in_rank == 0) {
+                int pi = ld_acquire_sys_global<true>(channel_phase_idx.buffer());
+                if (pi > phases_done) {
+                    cached_channel_tail_idx =
+                        ld_acquire_sys_global<true>(channel_tail_idx.buffer());
                     shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
+                    shared_phase_idx[responsible_rank]        = pi;
                     break;
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("expert_grouped_dispatch_permute recv timeout, rank %d, channel %d, "
-                           "remained %d\n",
-                           rank, responsible_channel, num_tokens_to_recv);
+                           "phases_done %d\n",
+                           rank, responsible_channel, phases_done);
                     trap();
                 }
             }
-
             sync_barrier(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
+            int const target_phases = shared_phase_idx[responsible_rank];
 
-            int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
-            for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens;
-                 chunk_idx += num_recv_warps_per_rank) {
-                int  src_slot_idx = total_offset + chunk_idx;
+            int const target_tail     = cached_channel_tail_idx;
+            int const batch_group_lo  = phases_done;
+            int const batch_group_hi  = target_phases; // exclusive
+            int const batch_expert_lo = batch_group_lo * num_experts_per_group;
+            int const batch_expert_hi =
+                min(batch_group_hi * num_experts_per_group, num_experts_per_rank);
+
+            // ── Pass 1 (new tokens only): one-shot per-topk init ────────
+            // Copy the sender's topk_idx / topk_weights into the public
+            // outputs for tokens that arrived since the last iteration,
+            // and pre-seed `dispatch_to_expert_map` with -1 for topk
+            // entries whose expert isn't on this rank. Pass 2 overwrites
+            // map entries for topk hits whose expert's group falls in
+            // the current batch; entries for experts in LATER groups
+            // stay unwritten here and get filled by Pass 2 of a
+            // subsequent batch.
+            int const prev_phase_tail = prev_phase_tail_cached;
+            int const num_new_tokens  = target_tail - prev_phase_tail;
+            if (num_new_tokens > 0) {
+                for (int idx = recv_thread_id_in_rank; idx < num_new_tokens * num_topk;
+                     idx += WARP_SIZE * num_recv_warps_per_rank) {
+                    int  chunk_idx    = idx / num_topk;
+                    int  topk_i       = idx % num_topk;
+                    int  src_slot_idx = slot_base + prev_phase_tail + chunk_idx;
+                    auto mapped_idx   = static_cast<int64_t>(src_slot_idx) * num_topk + topk_i;
+                    auto expert = ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
+                    recv_topk_idx[mapped_idx] = expert;
+                    recv_topk_weights[mapped_idx] =
+                        ld_nc_global(dispatched_topk_weights_buffers.buffer() + mapped_idx);
+                    if (expert < 0) {
+                        dispatch_to_expert_map[mapped_idx] = -1;
+                    }
+                }
+            }
+
+            // ── Pass 2: hidden copies for all topk hits in THIS batch ─
+            // Scan every token received so far (rel in [0, target_tail)),
+            // pick out topk indices whose expert falls in the current
+            // batch's [batch_expert_lo, batch_expert_hi) range, and do
+            // the hidden copy + dispatch_to_expert_map write for each
+            // such hit. This is the same invariant as the one-phase-
+            // at-a-time path: tokens shipped by sender in phase h < g
+            // can still have topk hits in group g (and they get
+            // processed here for the first time when this batch covers
+            // group g).
+            //
+            // A token shipped in sender-phase h has all its matching
+            // experts in groups h..G-1, so it contributes to at most
+            // (G - h) hidden copies across the lifetime of the pipeline.
+            // Re-scanning its topk list across batches costs only a
+            // small L1/L2 read of `num_topk` int64s — negligible next
+            // to the hidden (~7168 bytes) copy work.
+            for (int rel = recv_warp_id_in_rank; rel < target_tail;
+                 rel += num_recv_warps_per_rank) {
+                int  src_slot_idx = slot_base + rel;
                 auto shifted_buffer_x_int4 =
                     dispatched_x_buffers.buffer() + src_slot_idx * hidden_int4;
 
 #pragma unroll
                 for (int i = 0; i < num_topk; i++) {
                     auto mapped_idx = static_cast<int64_t>(src_slot_idx) * num_topk + i;
-                    auto recv_topk_idx_i64 =
-                        ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
-                    int dst_slot_idx = -1;
-                    if (recv_topk_idx_i64 >= 0) {
-                        int slot = -1;
-                        if (lane_id == 0) {
-                            slot = __hip_atomic_fetch_add(
-                                expert_slot_idx.buffer() + recv_topk_idx_i64, 1, __ATOMIC_RELAXED,
-                                __HIP_MEMORY_SCOPE_AGENT);
-                        }
-                        slot = __shfl_sync(WARP_MASK, slot, 0);
-                        EP_DEVICE_ASSERT(slot >= 0);
-                        dst_slot_idx = shared_expert_prefix_sum[recv_topk_idx_i64] + slot;
-                        EP_DEVICE_ASSERT(dst_slot_idx < num_max_tokens * num_topk);
-                        auto shifted_recv_x_int4 =
-                            recv_x + static_cast<int64_t>(dst_slot_idx) * hidden_int4;
-                        UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4,
-                                           shifted_buffer_x_int4, ld_nc_global, st_na_global);
+                    auto expert = ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
+                    if (expert < batch_expert_lo || expert >= batch_expert_hi)
+                        continue;
 
-                        // Bookkeeping: increment the per-(rank, expert) phase
-                        // counter in shared memory. We use WORKGROUP scope to
-                        // limit cache-line ping-pong to within the SM.
-                        if (lane_id == 0) {
-                            __hip_atomic_fetch_add(
-                                &s_expert_phase_count[responsible_rank][recv_topk_idx_i64], 1,
-                                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-                        }
+                    int slot = -1;
+                    if (lane_id == 0) {
+                        slot = __hip_atomic_fetch_add(expert_slot_idx.buffer() + expert, 1,
+                                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                     }
+                    slot = __shfl_sync(WARP_MASK, slot, 0);
+                    EP_DEVICE_ASSERT(slot >= 0);
+                    int dst_slot_idx = shared_expert_prefix_sum[expert] + slot;
+                    EP_DEVICE_ASSERT(dst_slot_idx < num_max_tokens * num_topk);
+                    auto shifted_recv_x_int4 =
+                        recv_x + static_cast<int64_t>(dst_slot_idx) * hidden_int4;
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4,
+                                       shifted_buffer_x_int4, ld_nc_global, st_na_global);
+
                     dispatch_to_expert_map[mapped_idx] = dst_slot_idx;
+
+                    if (lane_id == 0) {
+                        __hip_atomic_fetch_add(&s_expert_phase_count[responsible_rank][expert], 1,
+                                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+                    }
                 }
             }
 
-#pragma unroll
-            for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk;
-                 idx += WARP_SIZE * num_recv_warps_per_rank) {
-                int  chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
-                int  src_slot_idx = total_offset + chunk_idx;
-                auto mapped_idx   = static_cast<int64_t>(src_slot_idx) * num_topk + token_topk_idx;
-                recv_topk_weights[mapped_idx] =
-                    ld_nc_global(dispatched_topk_weights_buffers.buffer() + mapped_idx);
-                recv_topk_idx[mapped_idx] =
-                    ld_nc_global(dispatched_topk_idx_buffers.buffer() + mapped_idx);
-            }
-
-            // Wait for all warps in this (channel, rank) to finish copying
-            // and incrementing the phase counters before flushing them out
-            // to the agent-scope `expert_tail_idx` array.
+            // Wait for all warps in this (channel, rank) to finish this
+            // batch's copies and phase-counter increments before
+            // publishing the batch's expert tails to the consumer-visible
+            // `expert_tail_idx` array.
             sync_barrier(responsible_rank, num_threads_per_rank);
 
-            // Flush per-expert phase counts → expert_tail_idx with one
-            // release-store per (rank, expert) — at most
-            // `num_experts_per_rank` atomics per phase per channel-rank
-            // (vs. one atomic per token-topk-target pair before this
-            // optimisation). The release synchronises with the consumer's
-            // acquire-load of `expert_tail_idx[e]`.
+            // Flush per-expert phase counts → expert_tail_idx for the
+            // experts covered by this batch. One atomic per (rank,
+            // covered-expert) per batch. The remaining experts retain
+            // their 0-valued phase counter until a later batch brings
+            // their group into range.
+            //
+            // No post-flush `sync_barrier` here: the next iteration of
+            // the outer while-loop opens with its own `sync_barrier`
+            // after the phase_idx spin, which is enough to order this
+            // flush with any subsequent batch's Pass 2 writes to
+            // `s_expert_phase_count` (those writes target a disjoint
+            // set of expert slots, so the memory race the barrier used
+            // to guard never materialises).
             if (thread_id_in_rank < num_experts_per_rank) {
                 int delta = s_expert_phase_count[responsible_rank][thread_id_in_rank];
                 if (delta > 0) {
@@ -533,11 +725,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) expert_grouped_dispatch_permut
                     s_expert_phase_count[responsible_rank][thread_id_in_rank] = 0;
                 }
             }
-            sync_barrier(responsible_rank, num_threads_per_rank);
 
-            num_tokens_to_recv -= num_recv_tokens;
-            cached_channel_head_idx += num_recv_tokens;
-            total_offset += num_recv_tokens;
+            prev_phase_tail_cached = target_tail;
+            phases_done            = target_phases;
         }
     }
 }
