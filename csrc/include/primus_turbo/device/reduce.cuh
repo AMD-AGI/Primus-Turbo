@@ -171,7 +171,7 @@ template <template <class> class Func, typename T> PRIMUS_TURBO_DEVICE T BlockRe
  * Reference: AMD CDNA4 ISA, ds_swizzle_b32 (page 480)
  */
 
-PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor1(float val) {
+PRIMUS_TURBO_DEVICE float ds_swizzle_xor1(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
                  "s_waitcnt lgkmcnt(0)"
@@ -180,7 +180,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor1(float val) {
     return result;
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor2(float val) {
+PRIMUS_TURBO_DEVICE float ds_swizzle_xor2(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
                  "s_waitcnt lgkmcnt(0)"
@@ -189,7 +189,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor2(float val) {
     return result;
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor8(float val) {
+PRIMUS_TURBO_DEVICE float ds_swizzle_xor8(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x201F\n\t"
                  "s_waitcnt lgkmcnt(0)"
@@ -198,7 +198,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor8(float val) {
     return result;
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor16(float val) {
+PRIMUS_TURBO_DEVICE float ds_swizzle_xor16(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x401F\n\t"
                  "s_waitcnt lgkmcnt(0)"
@@ -222,7 +222,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ float ds_swizzle_xor16(float val) {
  *   Step 2: XOR 2 - reduce 4 values to 2 (threads 0-1, 2-3)
  *   Step 3: XOR 1 - reduce 2 values to 1 (thread 0)
  */
-PRIMUS_TURBO_DEVICE __forceinline__ float warp_reduce_max_8_dpp(float val) {
+PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     uint32_t v = float_as_uint(val);
     uint32_t tmp;
 
@@ -246,7 +246,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ float warp_reduce_max_8_dpp(float val) {
     return val;
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ float warp_reduce_max_64_dpp(float val) {
+PRIMUS_TURBO_DEVICE float warp_reduce_max_64_dpp(float val) {
     val = warp_reduce_max_8_dpp(val);
     val = fmaxf(val, ds_swizzle_xor8(val));
     val = fmaxf(val, ds_swizzle_xor16(val));

@@ -31,8 +31,7 @@ using namespace primus_turbo::detail;
  *   i5 = col % 4
  *   index = i0*(scale_n_pad//8)*256 + i3*256 + i5*64 + i2*4 + i4*2 + i1
  */
-PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffle_scale_index(int row, int col,
-                                                                    int scale_n_pad) {
+PRIMUS_TURBO_DEVICE int compute_shuffle_scale_index(int row, int col, int scale_n_pad) {
     int i0 = row >> 5;       // row // 32
     int i1 = (row >> 4) & 1; // (row % 32) // 16
     int i2 = row & 15;       // row % 16
@@ -55,7 +54,7 @@ PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffle_scale_index(int row, int
  *   - Data is stored in (BN=16, BK=32) tiles
  */
 template <typename DType>
-PRIMUS_TURBO_DEVICE __forceinline__ int compute_shuffled_index(int row, int col, int K_packed) {
+PRIMUS_TURBO_DEVICE int compute_shuffled_index(int row, int col, int K_packed) {
     static_assert(std::is_same_v<DType, dtype::float4x2_e2m1> ||
                       std::is_same_v<DType, dtype::float8_e4m3> ||
                       std::is_same_v<DType, dtype::float8_e5m2>,
