@@ -39,11 +39,11 @@ __launch_bounds__(BLOCK_SIZE) __global__
         }
     } else {
         for (int mi = 0; mi < UNROLL_M; ++mi) {
-            const int64_t offset = mi * BLOCK_SIZE;
 #pragma unroll
             for (int ni = 0; ni < UNROLL_N; ++ni) {
-                const int64_t g = block_start + offset + ni * BLOCK_SIZE;
-                ld_regs[mi][ni] = (g < inner_len) ? input_ptr[offset + ni] : init_intype;
+                const int64_t idx = mi * tile_elems + tid * UNROLL_N + ni;
+                const int64_t g   = block_start + idx;
+                ld_regs[mi][ni]   = (g < inner_len) ? input_ptr[idx] : init_intype;
             }
         }
     }
