@@ -64,7 +64,6 @@ def _update_out_and_lse(
     lse: torch.Tensor,
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
-    is_sbhd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     block_out = block_out.to(torch.float32)
@@ -85,7 +84,6 @@ def update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
     slice_=None,
-    is_sbhd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         if slice_ is not None:
@@ -95,12 +93,10 @@ def update_out_and_lse(
         lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
-        slice_out, slice_lse = _update_out_and_lse(
-            slice_out, slice_lse, block_out, block_lse, is_sbhd=is_sbhd
-        )
+        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse)
         out[slice_], lse[slice_] = slice_out, slice_lse
     else:
-        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, is_sbhd=is_sbhd)
+        out, lse = _update_out_and_lse(out, lse, block_out, block_lse)
     return out, lse
 
 
@@ -117,9 +113,8 @@ def ring_attn_fwd(
 
     arg_causal = kwargs.pop("causal", False)
     qkv_format = kwargs.get("qkv_format", "bshd")
-    if qkv_format not in ("bshd", "sbhd"):
+    if qkv_format not in ("bshd", "sbhd", "bhsd"):
         raise ValueError(f"Unsupported qkv format: {qkv_format}")
-    is_sbhd = qkv_format == "sbhd"
     comm = RingComm(process_group)
 
     out = None
@@ -142,7 +137,7 @@ def ring_attn_fwd(
                 **kwargs,
             )
             output_dtype = block_out.dtype
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse, is_sbhd=is_sbhd)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
             comm.wait()
@@ -166,7 +161,7 @@ def ring_attn_bwd(
     **kwargs,
 ):
     qkv_format = kwargs.get("qkv_format", "bshd")
-    if qkv_format not in ("bshd", "sbhd"):
+    if qkv_format not in ("bshd", "sbhd", "bhsd"):
         raise ValueError(f"Unsupported qkv format: {qkv_format}")
 
     block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)

@@ -104,9 +104,14 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             qkv_format=qkv_format if not enable_sink else "bshd",
         )
 
-        if enable_sink and qkv_format == "sbhd":
-            # permute back to SBHD
-            out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
+        if enable_sink:
+            if qkv_format == "sbhd":
+                # permute back to SBHD
+                out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
+            elif qkv_format == "bhsd":
+                out_padded = out_padded.permute(0, 2, 1, 3).contiguous()
+            else:
+                assert qkv_format == "bshd"
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -144,7 +149,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         enable_sink = ctx.sink is not None
         qkv_format = ctx.qkv_format
 
-        if enable_sink and qkv_format == "sbhd":
+        if enable_sink and qkv_format in ("sbhd", "bhsd"):
             dout = dout.contiguous()
 
         dout_padded = dout
@@ -166,6 +171,16 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             dv_padded = torch.empty(
                 (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
+        elif bwd_qkv_format == "bhsd":
+            dq = torch.ones(
+                (batch_size, num_heads_q, seq_len, head_dim_qk), dtype=q.dtype, device=q.device
+            ).permute(0, 2, 1, 3)
+            dk = torch.empty(
+                (batch_size, num_heads_k, seq_len, head_dim_k), dtype=k.dtype, device=k.device
+            ).permute(0, 2, 1, 3)
+            dv_padded = torch.empty(
+                (batch_size, num_heads_v, seq_len, head_dim_v), dtype=v.dtype, device=v.device
+            ).permute(0, 2, 1, 3)
         else:
             dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
             dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
@@ -202,10 +217,17 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             qkv_format=bwd_qkv_format,
         )
 
-        if enable_sink and qkv_format == "sbhd":
-            dq = dq.permute(1, 0, 2, 3).contiguous()
-            dk = dk.permute(1, 0, 2, 3).contiguous()
-            dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
+        if enable_sink:
+            if qkv_format == "sbhd":
+                dq = dq.permute(1, 0, 2, 3).contiguous()
+                dk = dk.permute(1, 0, 2, 3).contiguous()
+                dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
+            elif qkv_format == "bhsd":
+                dq = dq.permute(0, 2, 1, 3).contiguous()
+                dk = dk.permute(0, 2, 1, 3).contiguous()
+                dv_padded = dv_padded.permute(0, 2, 1, 3).contiguous()
+            else:
+                assert qkv_format == "bshd"
 
         dq = dq[..., :head_size_q_og]
         dk = dk[..., :head_size_q_og]
@@ -351,7 +373,7 @@ def flash_attn_func(
 ):
     qkv_format = _infer_qkv_format(q, k, v)
 
-    return AiterFlashAttnFunc.apply(
+    result = AiterFlashAttnFunc.apply(
         q,
         k,
         v,
@@ -369,6 +391,8 @@ def flash_attn_func(
         sink,
         qkv_format,
     )
+
+    return result
 
 
 def flash_attn_fp8_func(
@@ -388,7 +412,11 @@ def flash_attn_fp8_func(
 ):
     qkv_format = _infer_qkv_format(q, k, v)
 
-    if qkv_format == "sbhd":
+    if qkv_format == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+    elif qkv_format == "sbhd":
         q = q.permute(1, 0, 2, 3).contiguous()
         k = k.permute(1, 0, 2, 3).contiguous()
         v = v.permute(1, 0, 2, 3).contiguous()
@@ -428,5 +456,7 @@ def flash_attn_fp8_func(
 
     if qkv_format == "sbhd":
         o = o.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        o = o.permute(0, 2, 1, 3).contiguous()
 
     return o
