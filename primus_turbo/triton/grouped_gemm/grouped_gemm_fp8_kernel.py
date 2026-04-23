@@ -647,7 +647,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         MAX_G_NEXT_POW2=max_g_next_pow2,
         num_warps=8,
         num_stages=num_stages_val,
-        waves_per_eu=0,
+        waves_per_eu=2,
         matrix_instr_nonkdim=16,
         kpack=1,
     )
