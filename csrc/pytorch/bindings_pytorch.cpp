@@ -5,6 +5,8 @@
 #include <torch/extension.h>
 
 #include "extensions.h"
+#include "primus_turbo/gemm.h"
+#include "primus_turbo/grouped_gemm.h"
 
 namespace primus_turbo::pytorch {
 
@@ -206,6 +208,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
     runtime_module.def("destroy_stream", &destroy_stream);
+    runtime_module.def("clear_hipblaslt_gemm_runtime_caches",
+                       &primus_turbo::clear_hipblaslt_gemm_runtime_caches);
+    runtime_module.def("clear_hipblaslt_grouped_gemm_runtime_state",
+                       &primus_turbo::clear_hipblaslt_grouped_gemm_runtime_state);
 }
 
 /********************************************/
