@@ -1268,6 +1268,22 @@ class MoriEPBackend:
             topk_idx_i32,
         )
         return combined_x, combined_topk_weights
+    
+    @torch.no_grad()
+    def tune_configs(
+        self,
+        group: dist.ProcessGroup,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        num_experts: int,
+        *,
+        topk_idx: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        num_sms: int = 32,
+        num_tests: int = 20,
+        num_topk: Optional[int] = None,
+        uniform_dispatch: bool = True,
+    ) -> Tuple[Any, Any, float, float]:
+        raise NotImplementedError("Tune configs is not implemented for MoriEPBackend")
 
     def release_buffer(self) -> None:
         """Drop the fast-path op reference (stays alive in lru_cache)."""
