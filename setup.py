@@ -306,7 +306,13 @@ if __name__ == "__main__":
     # Entry points and Install Requires
     entry_points = {}
     install_requires = [
-        "aiter @ git+https://github.com/ROCm/aiter.git@97007320d4b1d7b882d99af02cad02fbb9957559",
+        # Zixian: 01/29/2026: update to newer aiter to avoid pybind11 problem: 
+        # https://github.com/AMD-AGI/Primus-Turbo/commit/a97e986f01893fec5789243400c7046d18591ba9
+        # "aiter @ git+https://github.com/ROCm/aiter.git@97007320d4b1d7b882d99af02cad02fbb9957559",
+        # "aiter @ git+https://github.com/ROCm/aiter.git@a0b424d3848f461b2d94d9e3d1d329bd18f4d3b9",
+        # "aiter @ git+https://github.com/ROCm/aiter.git@9716b1b8", 
+        "aiter @ git+https://github.com/ROCm/aiter.git@a0b424d3848f461b2d94d9e3d1d329bd18f4d3b9",
+        # "amd-aiter @ git+https://github.com/ROCm/aiter.git@66fc02bfe54925d0b0488c2356656858064e8ace"
         "hip-python",
     ]
     if BUILD_JAX:
