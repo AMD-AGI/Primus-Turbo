@@ -31,6 +31,9 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
+from primus_turbo.triton.grouped_gemm.grouped_gemm_mxfp8_kernel import (
+    grouped_gemm_mxfp8_triton_kernel,
+)
 
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
@@ -313,13 +316,16 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
     Supports:
       - TENSORWISE: per-tensor scaling
       - ROWWISE: per-row/per-col vector scaling
-      - BLOCKWISE: block-wise scaling (2D B_scales per group)
+      - BLOCKWISE: 128-block FP32 scaling (post-MFMA apply)
+      - MX_BLOCKWISE: 32-block E8M0 scaling via ``tl.dot_scaled`` (native
+        ``v_mfma_scale_f32_32x32x64_f8f6f4`` on gfx950)
     """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
@@ -361,7 +367,17 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        if granularity == ScalingGranularity.BLOCKWISE:
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            return grouped_gemm_mxfp8_triton_kernel(
+                a,
+                b,
+                a_scales,
+                b_scales,
+                group_offs,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+            )
+        elif granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_triton_kernel(
                 a,
                 b,

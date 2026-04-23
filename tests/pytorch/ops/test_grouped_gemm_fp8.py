@@ -753,3 +753,103 @@ def test_grouped_gemm_fp8_blockwise_zero_group_lens():
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MX-FP8 (E8M0 @ K=32) forward-kernel tests
+#
+# The MX-FP8 Triton kernel uses ``tl.dot_scaled`` which emits native
+# ``v_mfma_scale_f32_32x32x64_f8f6f4`` on gfx950. Tests call the kernel
+# directly with pre-quantized inputs; the autograd Function / top-level
+# ``grouped_gemm_fp8`` op dispatch for MX_BLOCKWISE is tracked separately.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _quant_mxfp8_rowwise_reference(x: torch.Tensor, group_size: int = 32):
+    """Simple torch-side MX-FP8 (E4M3 + E8M0) rowwise quant reference for tests.
+
+    Used only to build the inputs the kernel expects — NOT a perf quant.
+    """
+    assert x.shape[-1] % group_size == 0
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1])
+    M, K = x_2d.shape
+    G = K // group_size
+    xr = x_2d.reshape(M, G, group_size).float()
+    amax = xr.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+    exp_f = torch.log2(amax / 448.0)
+    exp = torch.ceil(exp_f).clamp(-127, 127)
+    scale = torch.pow(2.0, exp)
+    xq = (xr / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    xq = xq.reshape(*orig_shape)
+    # e8m0 encoded as uint8 with bias 127
+    scale_u8 = (exp.to(torch.int32) + 127).clamp(0, 255).to(torch.uint8).squeeze(-1)
+    scale_u8 = scale_u8.reshape(*orig_shape[:-1], G)
+    return xq, scale_u8
+
+
+@pytest.mark.parametrize("B", [1, 4, 8, 32])
+@pytest.mark.parametrize("M", [256, 1024, 2048])
+@pytest.mark.parametrize("NK", [(2048, 2048), (5760, 2880)])
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("trans_b", [False, True])
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_mxfp8_triton_kernel(B, M, NK, ori_dtype, trans_b, balance):
+    """Forward correctness for the MX-FP8 Triton grouped GEMM kernel on gfx950."""
+    if get_device_compute_capability() != (9, 5):
+        pytest.skip("MX-FP8 grouped GEMM native MFMA requires gfx950 (MI355X)")
+
+    N, K = NK
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+    if K % 32 != 0:
+        pytest.skip(f"K={K} must be multiple of 32 for MX-FP8.")
+
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+        grouped_gemm_compute_offs,
+    )
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_mxfp8_kernel import (
+        grouped_gemm_mxfp8_triton_kernel,
+    )
+
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = "cuda:0"
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_offs = grouped_gemm_compute_offs(group_lens)
+
+    a = torch.randn((B * M, K), dtype=ori_dtype, device=device) * 0.3
+    # b layout depends on trans_b: False -> [B, K, N], True -> [B, N, K]
+    if trans_b:
+        b = torch.randn((B, N, K), dtype=ori_dtype, device=device) * 0.3
+    else:
+        b = torch.randn((B, K, N), dtype=ori_dtype, device=device) * 0.3
+
+    # Quantize a (rowwise along K) and each group of b (rowwise along K of B_view).
+    a_fp8, a_scale = _quant_mxfp8_rowwise_reference(a)  # [M,K] fp8, [M,K//32] uint8
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scale = torch.empty((B, N, K // 32), dtype=torch.uint8, device=device)
+    for g in range(B):
+        # Quant along the K axis (always the last dim of the [N, K] view).
+        b_view = b[g] if trans_b else b[g].transpose(0, 1).contiguous()  # [N, K]
+        bq, bs = _quant_mxfp8_rowwise_reference(b_view)  # [N, K] fp8, [N, K//32] uint8
+        if trans_b:
+            b_fp8[g].copy_(bq)
+        else:
+            b_fp8[g].copy_(bq.transpose(0, 1))
+        b_scale[g].copy_(bs)
+
+    out = grouped_gemm_mxfp8_triton_kernel(
+        a_fp8, b_fp8, a_scale, b_scale, group_offs,
+        trans_b=trans_b, out_dtype=ori_dtype,
+    )
+    out_ref = grouped_gemm_ref(a, b, group_lens, trans_b=trans_b)
+
+    assert out.shape == out_ref.shape
+    out_snr = compute_snr(out_ref, out)
+    print(f"[MX-FP8 triton] B={B} M={M} N={N} K={K} dtype={ori_dtype} "
+          f"trans_b={trans_b} balance={balance}  SNR={out_snr:.2f} dB")
+    assert out_snr > 20, f"MX-FP8 triton out SNR too low: {out_snr:.2f}"

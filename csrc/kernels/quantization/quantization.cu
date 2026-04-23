@@ -298,6 +298,89 @@ __launch_bounds__(BLOCK_SIZE) __global__
     }
 }
 
+// One-scan row-major rowwise quant — holds the full row in registers/LDS across
+// the block-reduce so each element is only read from HBM once. Contrast with
+// the two_scan kernel above, which reads the row twice (amax + quant).
+//
+// Per-thread register footprint: MAX_CHUNKS * UNROLL * sizeof(ComputeType).
+// For MAX_CHUNKS=4, UNROLL=8, CT=fp32 → 128 B/thread = 32 fp32 regs.
+// MI355X occupancy (256 VGPR/lane @ occ=2) leaves plenty of headroom.
+// Caller picks MAX_CHUNKS = cdiv(inner_len, BLOCK_SIZE * UNROLL).
+template <int BLOCK_SIZE, int UNROLL, int MAX_CHUNKS, bool PreComputeScale, typename FType,
+          typename QType, typename ComputeType = float>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void quantize_rowwise_row_major_one_scan_kernel(const FType *__restrict__ input_ptr,
+                                                    float *__restrict__ scale_ptr,
+                                                    float *__restrict__ scale_inv_ptr,
+                                                    QType *__restrict__ output_ptr,
+                                                    const int64_t inner_len) {
+    const int64_t bid     = blockIdx.x;
+    const int32_t tid     = threadIdx.x;
+
+    const ComputeType CLIP_MIN = static_cast<ComputeType>(std::numeric_limits<QType>::lowest());
+    const ComputeType CLIP_MAX = static_cast<ComputeType>(std::numeric_limits<QType>::max());
+    const ComputeType EPS      = 1e-12;
+
+    const int32_t start_offset = tid * UNROLL;
+
+    input_ptr += bid * inner_len;
+    output_ptr += bid * inner_len;
+
+    ComputeType values[MAX_CHUNKS][UNROLL];
+    ComputeType amax = AbsMaxOp<ComputeType>::init();
+
+    // Single-pass: load all chunks into register array + accumulate amax.
+    FType ld_regs[UNROLL];
+#pragma unroll
+    for (int32_t c = 0; c < MAX_CHUNKS; ++c) {
+        const int64_t offset = c * BLOCK_SIZE * UNROLL + start_offset;
+        if (offset < inner_len) {
+            load_data<FType, UNROLL>(input_ptr + offset, ld_regs);
+#pragma unroll
+            for (int32_t i = 0; i < UNROLL; ++i) {
+                values[c][i] = static_cast<ComputeType>(ld_regs[i]);
+                amax = AbsMaxOp<ComputeType>::op(amax, values[c][i]);
+            }
+        } else {
+#pragma unroll
+            for (int32_t i = 0; i < UNROLL; ++i) {
+                values[c][i] = static_cast<ComputeType>(0.0f);
+            }
+        }
+    }
+
+    ComputeType scale;
+    ComputeType scale_inv;
+    if (PreComputeScale == true) {
+        scale     = static_cast<ComputeType>(scale_ptr[bid]);
+        scale_inv = static_cast<ComputeType>(scale_inv_ptr[bid]);
+    } else {
+        amax = BlockReduce<AbsMaxOp, ComputeType>(amax);
+        scale     = compute_scale_from_amax_device_kernel<ComputeType>(amax, CLIP_MAX, EPS);
+        scale_inv = 1.0f / scale;
+    }
+
+    // Pass 2 (in-register): scale + cast + store. No HBM input re-read.
+    QType st_regs[UNROLL];
+#pragma unroll
+    for (int32_t c = 0; c < MAX_CHUNKS; ++c) {
+        const int64_t offset = c * BLOCK_SIZE * UNROLL + start_offset;
+        if (offset < inner_len) {
+#pragma unroll
+            for (int i = 0; i < UNROLL; ++i) {
+                st_regs[i] = static_cast<QType>(
+                    QuantOpBase<ComputeType>::quant(values[c][i], scale, CLIP_MIN, CLIP_MAX));
+            }
+            store_data<QType, UNROLL>(output_ptr + offset, st_regs);
+        }
+    }
+
+    if (PreComputeScale == false && tid == 0) {
+        scale_ptr[bid]     = static_cast<float>(scale);
+        scale_inv_ptr[bid] = static_cast<float>(scale_inv);
+    }
+}
+
 // Rowwise
 template <typename FType, typename QType, typename ComputeType, bool PreComputeScale>
 void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
@@ -308,6 +391,41 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
     const int32_t GRID_SIZE  = outer_len;
     int32_t       pack_size  = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
     pack_size                = get_quantize_rowwise_pack_size<FType>(pack_size, inner_len);
+
+    // Choose one-scan vs two-scan based on per-thread register budget.
+    // inner_len <= BLOCK_SIZE*UNROLL*MAX_CHUNKS (e.g. 512*8*4=16384 at pack=8).
+    // Additional guards:
+    //   - outer_len >= 4096: grid-launch overhead is amortized
+    //   - sizeof(FType)*UNROLL <= 16: load_data vector byte-width cap
+    const int32_t ONE_SCAN_UNROLL     = 8;
+    const int32_t ONE_SCAN_MAX_CHUNKS = 4;  // BLOCK_SIZE*UNROLL*4 = 16384
+    constexpr bool kFTypeFitsPack8    = (sizeof(FType) * ONE_SCAN_UNROLL) <= 16;
+    const bool use_one_scan = kFTypeFitsPack8 && (pack_size >= ONE_SCAN_UNROLL) &&
+                              (outer_len >= 4096) &&
+                              (inner_len <= BLOCK_SIZE * ONE_SCAN_UNROLL * ONE_SCAN_MAX_CHUNKS);
+
+    if constexpr (kFTypeFitsPack8) if (use_one_scan) {
+        // Pick the smallest MAX_CHUNKS that covers inner_len to reduce unused iters.
+        const int64_t coverage = BLOCK_SIZE * ONE_SCAN_UNROLL;
+        if (inner_len <= coverage) {
+            quantize_rowwise_row_major_one_scan_kernel<BLOCK_SIZE, ONE_SCAN_UNROLL, 1,
+                                                       PreComputeScale, FType, QType, ComputeType>
+                <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        } else if (inner_len <= 2 * coverage) {
+            quantize_rowwise_row_major_one_scan_kernel<BLOCK_SIZE, ONE_SCAN_UNROLL, 2,
+                                                       PreComputeScale, FType, QType, ComputeType>
+                <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        } else if (inner_len <= 3 * coverage) {
+            quantize_rowwise_row_major_one_scan_kernel<BLOCK_SIZE, ONE_SCAN_UNROLL, 3,
+                                                       PreComputeScale, FType, QType, ComputeType>
+                <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        } else {
+            quantize_rowwise_row_major_one_scan_kernel<BLOCK_SIZE, ONE_SCAN_UNROLL, 4,
+                                                       PreComputeScale, FType, QType, ComputeType>
+                <<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(x, scale, scale_inv, y, inner_len);
+        }
+        return;
+    }
 
     switch (pack_size) {
     case 8: {

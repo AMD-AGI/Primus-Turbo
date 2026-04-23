@@ -594,7 +594,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
@@ -673,7 +673,7 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
@@ -947,7 +947,7 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
@@ -1175,7 +1175,7 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
@@ -1616,9 +1616,9 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER=".ca",
         num_warps=8,
-        num_stages=1,  # 256×128×128 needs 48KB/stage; 2 stages=96KB > 64KB LDS
+        num_stages=2,  # MI355X has 160KB LDS; 48KB/stage × 2 = 96KB fits
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
@@ -1704,7 +1704,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         num_warps=4,
         num_stages=2,
         waves_per_eu=0,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
         kpack=1,
     )
     return out
