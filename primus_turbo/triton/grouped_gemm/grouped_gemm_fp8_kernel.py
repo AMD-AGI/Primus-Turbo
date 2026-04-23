@@ -496,7 +496,7 @@ def _grouped_fp8_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
 
@@ -514,7 +514,7 @@ def _grouped_fp8_persistent_gemm_kernel(
                 B_LAST = tl.multiple_of(B_LAST, (1, 16))
             a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
         # ── Apply per-tensor scale and store ──
         acc *= scale
