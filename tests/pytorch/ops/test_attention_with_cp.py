@@ -5,15 +5,12 @@
 ###############################################################################
 
 import itertools
-import os
 from typing import List
-
-# Must be set before importing common_distributed, which reads it at import time.
-os.environ.setdefault("DISTRIBUTED_TESTS_DEFAULT_TIMEOUT", "600")
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.testing._internal import common_distributed
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
@@ -26,6 +23,9 @@ from tests.pytorch.ref.attention_ref import (
     attention_vanilla_forward_pytorch_ref_impl,
 )
 from tests.pytorch.test_utils import compute_snr
+
+# loosen timeout for this test to avoid timeout failures
+common_distributed.TIMEOUT_DEFAULT = 600
 
 test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
