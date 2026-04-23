@@ -8,7 +8,6 @@ import os
 from unittest.mock import patch
 
 import torch
-import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcContinuousTest
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -107,6 +106,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # -2 tells MultiProcContinuousTest to use torch.cuda.device_count()
     world_size = -2
 
+    @classmethod
+    def backend_str(cls) -> str:
+        return "nccl"
+
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
@@ -136,7 +139,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
-                dist.group.WORLD,
+                self.pg,
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 expert_capacity_factor=expert_capacity_factor,
             )
@@ -152,7 +155,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
-                dist.group.WORLD,
+                self.pg,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 permute_max_token_num=permute_max_token_num,
@@ -174,7 +177,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         ):
             _run_dispatch_combine(
                 self.rank,
-                dist.group.WORLD,
+                self.pg,
             )
 
     # ------------------------------------------------------------------
@@ -205,7 +208,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
             MoEDispatchCombineAutoTuner.clear()
 
             # First run triggers autotune and registers the handle mapping.
-            _run_dispatch_combine(self.rank, dist.group.WORLD)
+            _run_dispatch_combine(self.rank, self.pg)
             first = MoEDispatchCombineAutoTuner.current()
             assert first is not None, "autotune should have populated a result"
             assert (
@@ -214,7 +217,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
             # Second run hits the shape cache (no extra measurements) and
             # yields the same backend selection.
-            _run_dispatch_combine(self.rank, dist.group.WORLD)
+            _run_dispatch_combine(self.rank, self.pg)
             second = MoEDispatchCombineAutoTuner.current()
             assert second is first or second.backend_name == first.backend_name
 
@@ -244,6 +247,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
     world_size = -2
+
+    @classmethod
+    def backend_str(cls) -> str:
+        return "nccl"
 
     @property
     def device(self) -> torch.device:
@@ -278,7 +285,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
             dispatcher = turbo.modules.DeepEPTokenDispatcher(
                 NUM_EXPERTS,
                 ROUTER_TOPK,
-                dist.group.WORLD,
+                self.pg,
                 permute_fusion=True,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=num_worst_tokens,
