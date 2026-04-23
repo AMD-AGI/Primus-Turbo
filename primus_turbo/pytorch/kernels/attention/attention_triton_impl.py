@@ -17,7 +17,6 @@ from torch._library import wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
 from primus_turbo.triton.attention.attention_kernel import (
-    DEBUG,
     FIXED_BLOCK_M,
     FIXED_BLOCK_N,
     USE_FP8E5M2_BWD,
@@ -85,25 +84,6 @@ def attention_triton_forward_impl(
     max_seqlens_k = k.shape[1]
     return_scores = return_softmax
     use_exp2 = True
-    if DEBUG:
-        print()
-        print("attention_forward_triton_impl")
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("softmax_scale:", softmax_scale)
-        print("alibi_slopes:", alibi_slopes)
-        print("causal:", causal)
-        print("bias:", bias)
-        print("dropout_p:", dropout_p)
-        print("layout:", layout)
-        print("cu_seqlens_q:", cu_seqlens_q)
-        print("cu_seqlens_k:", cu_seqlens_k)
-        print("max_seqlens_q:", max_seqlens_q)
-        print("max_seqlens_k:", max_seqlens_k)
-        print("return_scores:", return_scores)
-        print("use_exp2:", use_exp2)
-        print("use_fp8:", use_fp8)
 
     o_shape = list(q.shape)
     o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
@@ -349,29 +329,6 @@ def attention_triton_backward_impl(
     sequence_parallel = True
     do = do.contiguous()
 
-    if DEBUG:
-        print("####################################################")
-        print("attention_backward_triton_new_impl")
-        print("do:", do, do.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("o:", o, o.shape)
-        print("softmax_lse:", softmax_lse_delta, softmax_lse_delta.shape)
-        print("dq:", dq, dq.shape if dq is not None else None)
-        print("dk:", dk, dk.shape if dk is not None else None)
-        print("dv:", dv, dv.shape if dv is not None else None)
-        print("softmax_scale:", softmax_scale)
-        print("alibi_slopes:", alibi_slopes)
-        print("causal:", causal)
-        print("layout:", layout)
-        print("cu_seqlens_q:", cu_seqlens_q)
-        print("cu_seqlens_k:", cu_seqlens_k)
-        print("max_seqlen_q:", max_seqlen_q)
-        print("max_seqlen_k:", max_seqlen_k)
-        print("use_exp2:", use_exp2)
-        print("sequence_parallel:", sequence_parallel)
-
     # get strides and shape
     batch, nheads_q, nheads_k, head_size_qk, head_size_v, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
@@ -424,9 +381,6 @@ def attention_triton_backward_impl(
             dv_og = dv
             dv = dv.contiguous()
             copy_back["dv"] = True
-
-    if DEBUG:
-        print("copy_back:", copy_back)
 
     # assert contigious
     assert do.is_contiguous()
@@ -508,32 +462,6 @@ def attention_triton_backward_impl(
         F8_BWD_DTYPE=get_tl_f8_bwd_dtype(),
         F8_BWD_MAX=F8_BWD_MAX,
     )
-
-    if DEBUG:
-        print("####################################################")
-        print("_bwd_kernel inputs")
-        print("do:", do, do.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("softmax_scale", softmax_scale)
-        print("o:", o, o.shape)
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
-        print("L:", softmax_lse_delta, softmax_lse_delta.shape)
-        print("stride_qz, stride_qh, stride_qm, stride_qk:", stride_qz, stride_qh, stride_qm, stride_qk)
-        print("stride_kz, stride_kh, stride_kn, stride_kk:", stride_kz, stride_kh, stride_kn, stride_kk)
-        print("stride_vz, stride_vh, stride_vn, stride_vk:", stride_vz, stride_vh, stride_vn, stride_vk)
-        print("batch_q:", batch)
-        print("heads_q:", nheads_q)
-        print("max_seqlen_q:", max_seqlen_q)
-        print("max_seqlen_k:", max_seqlen_k)
-        print("BLOCK_DMODEL_QK:", padded_d_model_qk)
-        print("BLOCK_DMODEL_V:", padded_d_model_v)
-        print("SEQUENCE_PARALLEL:", sequence_parallel)
-        print("CAUSAL:", causal)
-        print("USE_EXP2:", use_exp2)
 
     log_p_scale = math.log(p_scale)
     num_block_m = triton.cdiv(max_seqlen_q, FIXED_BLOCK_M)
@@ -690,23 +618,6 @@ def attention_triton_backward_impl(
         log_p_scale=log_p_scale,
         F8_FWD_MAX=F8_FWD_MAX,
     )
-
-    if DEBUG:
-        print("####################################################")
-        print("_bwd_kernel outputs")
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
-        # print("delta:", delta, delta.shape)
-
-    if DEBUG:
-        print("####################################################")
-        print("attention_prefill_backward_triton_new_impl outputs")
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
-        # print("delta:", delta, delta.shape)
-        print("copy_back:", copy_back)
 
     if copy_back["dq"]:
         dq_og.copy_(dq)
