@@ -24,6 +24,8 @@ from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_ba
 from primus_turbo.pytorch.core.backend import KernelBackend
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
+_torch_custom_op_wrapper = torch.library.custom_op
+
 
 def _is_power_of_2(n: int) -> bool:
     """Check if n is a power of 2."""
@@ -317,6 +319,9 @@ class AttnBwdAiterBackend(KernelBackend):
         )
 
 
+@_torch_custom_op_wrapper(
+    "primus_turbo::attention_aiter_forward_impl", mutates_args=(), device_types="cuda"
+)
 def attention_aiter_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -334,7 +339,7 @@ def attention_aiter_forward_impl(
     max_seqlen_k: Optional[int] = None,
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     kwargs = {
         "q": q,
         "k": k,
@@ -363,6 +368,43 @@ def attention_aiter_forward_impl(
     return AttnFwdAiterBackend.execute(**kwargs)
 
 
+@attention_aiter_forward_impl.register_fake
+def _attention_aiter_forward_impl_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    return_lse: bool,
+    return_softmax: bool,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = "bshd",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seq_len_q, num_heads_q, _ = q.shape
+    _, _, _, head_dim_v = v.shape
+    out = torch.empty(
+        (batch_size, seq_len_q, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device
+    )
+    softmax_lse = torch.empty(
+        (batch_size, num_heads_q, seq_len_q), dtype=torch.float32, device=q.device
+    )
+    S_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    return out, softmax_lse, S_dmask, rng_state
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::attention_aiter_backward_impl",
+    mutates_args=("dq", "dk", "dv"),
+    device_types="cuda",
+)
 def attention_aiter_backward_impl(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -388,7 +430,7 @@ def attention_aiter_backward_impl(
     dsink: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
-):
+) -> None:
     kwargs = {
         "dout": dout,
         "q": q,
@@ -423,4 +465,34 @@ def attention_aiter_backward_impl(
             f"Please check input constraints or choose a different backend."
         )
 
-    return AttnBwdAiterBackend.execute(**kwargs)
+    AttnBwdAiterBackend.execute(**kwargs)
+
+
+@attention_aiter_backward_impl.register_fake
+def _attention_aiter_backward_impl_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor],
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dbias: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = "bshd",
+) -> None:
+    return None
