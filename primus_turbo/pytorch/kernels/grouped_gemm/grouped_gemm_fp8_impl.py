@@ -322,7 +322,10 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    # tl.dot is dtype-agnostic and handles mixed e4m3/e5m2 FP8 natively on
+    # gfx950 via v_mfma_f32_32x32x64_f8f6f4 with per-operand cbsz/blgp
+    # modifiers, matching the hipBLASLt backend's hybrid dtype support.
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
@@ -439,7 +442,9 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    # See ``GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES`` for the rationale
+    # behind including the hybrid e4m3/e5m2 pairs in the Triton backend.
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
