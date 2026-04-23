@@ -332,6 +332,41 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Tile-cumsum helper kernel (runs once per launch on the same CUDA stream so the
+# main kernel becomes free of the per-tile O(G) linear scan).
+#
+# tile_cumsum[g] = sum_{i<g} ceil(M_i / BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
+# tile_cumsum[0] = 0, tile_cumsum[G] = total_tiles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@triton.jit()
+def _compute_tile_cumsum_kernel(
+    group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (output)
+    G,  # runtime number of groups
+    num_pid_n,  # runtime int = cdiv(N, BLOCK_SIZE_N)
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """Single-program kernel; precomputes per-group cumulative tile counts."""
+    cumsum: tl.int32 = 0
+    tl.store(tile_cumsum_ptr, 0)
+    for g in range(G):
+        m_g = (tl.load(group_offs_ptr + g + 1) - tl.load(group_offs_ptr + g)).to(tl.int32)
+        tiles_g = tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+        cumsum += tiles_g
+        tl.store(tile_cumsum_ptr + g + 1, cumsum)
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power-of-two >= max(n, 1) (Triton tl.arange requires power-of-two)."""
+    p = 1
+    while p < max(n, 1):
+        p <<= 1
+    return p
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Tensorwise FP8 Forward Kernel (persistent, CPU-sync-free)
 #
 # Computes: out[offs[g]:offs[g+1], :] = A[offs[g]:offs[g+1], :] @ B_view[g] * a_scale * b_scale
@@ -347,6 +382,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     A_scale_ptr,  # per-tensor scale for A (scalar, fp32)
     B_scale_ptr,  # per-tensor scale for B (scalar, fp32)
     group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (precomputed cumulative tile counts)
     # Dimensions
     G,  # number of groups (runtime)
     N,
@@ -371,6 +407,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    MAX_G_NEXT_POW2: tl.constexpr,  # smallest pow2 >= G+1 (for tl.arange load)
 ):
     """Persistent grouped FP8 GEMM kernel (CPU-sync-free, per-tensor scaling)."""
     pid = tl.program_id(0)
@@ -379,11 +416,17 @@ def _grouped_fp8_persistent_gemm_kernel(
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # ── Compute total tiles across all groups ──
-    total_tiles: tl.int32 = 0
-    for _g in range(G):
-        m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-        total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+    # ── Load precomputed tile cumulative sums into registers (G is small) ──
+    g_idx_arr = tl.arange(0, MAX_G_NEXT_POW2)
+    g_valid_mask = g_idx_arr <= G  # valid range is [0..G]
+    # Out-of-range entries are loaded as MAX_INT so that subsequent "<= global_tile_id"
+    # comparisons never select them.
+    tile_cumsum_arr = tl.load(
+        tile_cumsum_ptr + g_idx_arr,
+        mask=g_valid_mask,
+        other=2147483647,
+    ).to(tl.int32)
+    total_tiles = tl.load(tile_cumsum_ptr + G).to(tl.int32)
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -400,18 +443,13 @@ def _grouped_fp8_persistent_gemm_kernel(
     acc_dtype = tl.float32
 
     for global_tile_id in range(pid, total_tiles, NUM_SMS):
-        # ── Find group via linear scan (O(G)) ──
-        group_idx: tl.int32 = 0
-        tile_start: tl.int32 = 0
-        cumsum: tl.int32 = 0
-        for _g in range(G):
-            m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
-            new_cumsum = cumsum + tiles_g
-            if global_tile_id >= new_cumsum:
-                group_idx = _g + 1
-                tile_start = new_cumsum
-            cumsum = new_cumsum
+        # ── Find group via register-resident lookup (was O(G) scan with 2*G loads) ──
+        # group_idx = number of g in [1..G] where tile_cumsum[g] <= global_tile_id;
+        # equivalently, the unique g such that tile_cumsum[g] <= global_tile_id < tile_cumsum[g+1].
+        le_mask = (tile_cumsum_arr <= global_tile_id) & (g_idx_arr >= 1) & (g_idx_arr <= G)
+        group_idx = tl.sum(le_mask.to(tl.int32))
+        # tile_start = tile_cumsum[group_idx]
+        tile_start = tl.sum(tl.where(g_idx_arr == group_idx, tile_cumsum_arr, 0))
 
         # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
         local_tile = global_tile_id - tile_start
@@ -564,6 +602,20 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     )
     even_k = K % blk_k == 0
 
+    # Precompute per-group tile cumulative sums on the device (single-program kernel,
+    # same CUDA stream → no host sync). The main kernel can then load this tiny
+    # array once into registers and skip the per-tile O(G) scan over group_offs.
+    num_pid_n_int = (N + blk_n - 1) // blk_n
+    tile_cumsum = torch.empty(G + 1, device=a.device, dtype=torch.int32)
+    _compute_tile_cumsum_kernel[(1,)](
+        group_offs,
+        tile_cumsum,
+        G,
+        num_pid_n_int,
+        BLOCK_SIZE_M=blk_m,
+    )
+    max_g_next_pow2 = _next_pow2(G + 1)
+
     _grouped_fp8_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -571,6 +623,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         a_scale,
         b_scale,
         group_offs,
+        tile_cumsum,
         G,
         N,
         K,
@@ -591,6 +644,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        MAX_G_NEXT_POW2=max_g_next_pow2,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
