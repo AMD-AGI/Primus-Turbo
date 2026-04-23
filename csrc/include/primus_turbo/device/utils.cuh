@@ -49,11 +49,11 @@ template <typename T, const int N> PRIMUS_TURBO_DEVICE void store_data(T *dst, c
     }
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ uint32_t float_as_uint(float f) {
+PRIMUS_TURBO_DEVICE uint32_t float_as_uint(float f) {
     return __float_as_uint(f);
 }
 
-PRIMUS_TURBO_DEVICE __forceinline__ float uint_as_float(uint32_t u) {
+PRIMUS_TURBO_DEVICE float uint_as_float(uint32_t u) {
     return __uint_as_float(u);
 }
 
@@ -63,8 +63,8 @@ PRIMUS_TURBO_DEVICE __forceinline__ float uint_as_float(uint32_t u) {
  * bfloat16 is FP32 with the lower 16 bits truncated, so we reconstruct
  * by shifting the 16-bit value left by 16 bits.
  */
-PRIMUS_TURBO_DEVICE __forceinline__ void bfloat16x4_to_floatx4(uint64_t packed, float &v0,
-                                                               float &v1, float &v2, float &v3) {
+PRIMUS_TURBO_DEVICE void bfloat16x4_to_floatx4(uint64_t packed, float &v0, float &v1, float &v2,
+                                               float &v3) {
     v0 = uint_as_float(((uint32_t) (packed & 0xFFFF)) << 16);
     v1 = uint_as_float(((uint32_t) ((packed >> 16) & 0xFFFF)) << 16);
     v2 = uint_as_float(((uint32_t) ((packed >> 32) & 0xFFFF)) << 16);
@@ -77,8 +77,8 @@ PRIMUS_TURBO_DEVICE __forceinline__ void bfloat16x4_to_floatx4(uint64_t packed, 
  * Convert 4 packed half values (in a uint64_t) to 4 floats using
  * the HIP __half intrinsic.
  */
-PRIMUS_TURBO_DEVICE __forceinline__ void halfx4_to_floatx4(uint64_t packed, float &v0, float &v1,
-                                                           float &v2, float &v3) {
+PRIMUS_TURBO_DEVICE void halfx4_to_floatx4(uint64_t packed, float &v0, float &v1, float &v2,
+                                           float &v3) {
     uint16_t h0 = (uint16_t) (packed & 0xFFFF);
     uint16_t h1 = (uint16_t) ((packed >> 16) & 0xFFFF);
     uint16_t h2 = (uint16_t) ((packed >> 32) & 0xFFFF);
@@ -93,8 +93,8 @@ PRIMUS_TURBO_DEVICE __forceinline__ void halfx4_to_floatx4(uint64_t packed, floa
  * Templated conversion helpers dispatching bfloat16 vs half at compile time.
  */
 template <bool IS_half>
-PRIMUS_TURBO_DEVICE __forceinline__ void
-packed_uint16x4_to_floatx4(uint64_t packed, float &v0, float &v1, float &v2, float &v3) {
+PRIMUS_TURBO_DEVICE void packed_uint16x4_to_floatx4(uint64_t packed, float &v0, float &v1,
+                                                    float &v2, float &v3) {
     if constexpr (IS_half) {
         halfx4_to_floatx4(packed, v0, v1, v2, v3);
     } else {
@@ -102,7 +102,7 @@ packed_uint16x4_to_floatx4(uint64_t packed, float &v0, float &v1, float &v2, flo
     }
 }
 
-template <bool IS_half> PRIMUS_TURBO_DEVICE __forceinline__ float uint16_to_float(uint16_t val) {
+template <bool IS_half> PRIMUS_TURBO_DEVICE float uint16_to_float(uint16_t val) {
     if constexpr (IS_half) {
         return __half2float(*reinterpret_cast<const half *>(&val));
     } else {

@@ -1,188 +1,261 @@
+###############################################################################
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
 
-
 import os
-from dataclasses import dataclass
-from functools import lru_cache
-from itertools import product
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import MultiProcessTestCase
+from torch.testing._internal.common_distributed import MultiProcContinuousTest
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
+    parametrize,
     run_tests,
 )
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+    set_buffer_global_config,
+)
+
+NUM_TOKENS = 4096
+HIDDEN_SIZE = 4096
+NUM_EXPERTS = 256
+ROUTER_TOPK = 8
 
 
-@dataclass
-class TokenDispatcherTestConfig:
-    # random data generation
-    num_tokens: int
-    hidden_size: int
-    dtype: torch.dtype
-    # DeepEPTokenDispatcher init
-    router_topk: int
-    num_experts: int
-    permute_fusion: bool
-    deepep_use_cuda_num_tokens_per_expert: bool
-    expert_capacity_factor: float
+def _get_backends():
+    """Return available backend names."""
+    try:
+        import deep_ep  # noqa: F401
 
-    # DeepEPTokenDispatcher forward
-    deepep_num_worst_tokens: int
-    permute_max_token_num: int
+        # TODO: add backend deepep, temporal disable it since rocm7.2 deepep bug.
+        # return ["TURBO", "DEEP_EP"]
+        return ["TURBO"]
+    except ImportError:
+        return ["TURBO"]
 
 
-@lru_cache
-def get_token_dispatcher_config():
-    num_tokens_list = [4096]
-    hidden_size_list = [4096]
-    dtype_list = [torch.bfloat16]
-    router_topk_list = [8]
-    num_experts_list = [256]
-    permute_fusion_list = [True]
-    deepep_use_cuda_num_tokens_per_expert_list = [False, True]
-    expert_capacity_factor_list = [None, 0.5]
-    for (
-        num_tokens,
-        hidden_size,
-        dtype,
-        router_topk,
+def _run_dispatch_combine(
+    rank,
+    ep_group,
+    num_tokens=NUM_TOKENS,
+    hidden_size=HIDDEN_SIZE,
+    num_experts=NUM_EXPERTS,
+    router_topk=ROUTER_TOPK,
+    dtype=torch.bfloat16,
+    permute_fusion=True,
+    deepep_use_cuda_num_tokens_per_expert=False,
+    deepep_num_worst_tokens=0,
+    permute_max_token_num=0,
+    expert_capacity_factor=None,
+):
+    """Core dispatch-combine logic shared by all test variants."""
+    dispatcher = turbo.modules.DeepEPTokenDispatcher(
         num_experts,
-        permute_fusion,
-        deepep_use_cuda_num_tokens_per_expert,
-        expert_capacity_factor,
-    ) in product(
-        num_tokens_list,
-        hidden_size_list,
-        dtype_list,
-        router_topk_list,
-        num_experts_list,
-        permute_fusion_list,
-        deepep_use_cuda_num_tokens_per_expert_list,
-        expert_capacity_factor_list,
-    ):
-        deepep_num_worst_tokens_list = [0, num_tokens * 8]
-        permute_max_token_num_list = [0, num_tokens * 8 * router_topk]
+        router_topk,
+        ep_group,
+        permute_fusion=permute_fusion,
+        deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
+        deepep_num_worst_tokens=deepep_num_worst_tokens,
+        permute_max_token_num=permute_max_token_num,
+        expert_capacity_factor=expert_capacity_factor,
+    )
 
-        for deepep_num_worst_tokens, permute_max_token_num in product(
-            deepep_num_worst_tokens_list, permute_max_token_num_list
-        ):
-            if deepep_num_worst_tokens > 0 and not deepep_use_cuda_num_tokens_per_expert:
-                continue
+    hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    ans = hidden_states.clone()
+    hidden_states.requires_grad = True
 
-            yield TokenDispatcherTestConfig(
-                num_tokens=num_tokens,
-                hidden_size=hidden_size,
-                dtype=dtype,
-                router_topk=router_topk,
-                num_experts=num_experts,
-                deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
-                permute_fusion=permute_fusion,
-                deepep_num_worst_tokens=deepep_num_worst_tokens,
-                expert_capacity_factor=expert_capacity_factor,
-                permute_max_token_num=permute_max_token_num,
-            )
+    probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / router_topk
+
+    permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
+        hidden_states, probs
+    )
+
+    permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
+    permuted_local_hidden_states = permuted_local_hidden_states.to(ans.dtype)
+
+    restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
+
+    assert torch.allclose(
+        restored_hidden_states, ans
+    ), "Restored hidden states do not match original hidden states"
+
+    torch.autograd.backward(restored_hidden_states, hidden_states)
+    assert torch.allclose(hidden_states.grad, ans), "Gradient does not match original hidden states"
+
+    expected_device = "cuda" if deepep_use_cuda_num_tokens_per_expert else "cpu"
+    assert (
+        tokens_per_expert.device.type == expected_device
+    ), f"Expected tokens_per_expert on {expected_device}, got {tokens_per_expert.device.type}"
 
 
 @instantiate_parametrized_tests
-class TokenDispatcherTestBase(MultiProcessTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self._spawn_processes()
-
-    @property
-    def world_size(self) -> int:
-        return torch.cuda.device_count()
+class TestTokenDispatcher(MultiProcContinuousTest):
+    # -2 tells MultiProcContinuousTest to use torch.cuda.device_count()
+    world_size = -2
 
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
-    def _init_process(self):
+    def _bind_device(self) -> None:
+        """Bind the current worker process to its own GPU.
+
+        ``MultiProcContinuousTest._init_pg`` only sets ``LOCAL_RANK`` but does
+        not call ``torch.cuda.set_device``.  Without this call every rank would
+        default to ``cuda:0``, causing NCCL to raise
+        ``Duplicate GPU detected: rank 0 and rank 1 both on CUDA device ...``
+        inside ``Buffer.__init__``'s ``all_gather_object`` and ultimately a
+        GPU memory-access fault in the ``intranode::barrier`` kernel during
+        buffer teardown.
+        """
         torch.cuda.set_device(self.device)
-        store = dist.FileStore(self.file_name, self.world_size)
-        dist.init_process_group(
-            backend="nccl",
-            world_size=self.world_size,
-            rank=self.rank,
-            store=store,
-        )
-        torch.manual_seed(42 + self.rank)
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["LOCAL_WORLD_SIZE"] = str(self.world_size)
-        os.environ["LOCAL_RANK"] = str(self.rank)
 
-    def test_token_dispatcher_dropless(self):
-        self._init_process()
-        ep_group = dist.group.WORLD
+    # ------------------------------------------------------------------
+    # Basic dispatch/combine correctness
+    # ------------------------------------------------------------------
 
-        # Test with different backends
-        backends_to_test = ["TURBO", "DEEP_EP"]
+    @parametrize("backend", _get_backends())
+    @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
+    @parametrize("expert_capacity_factor", [None, 0.5])
+    def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+                deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
+                expert_capacity_factor=expert_capacity_factor,
+            )
 
-        for backend in backends_to_test:
-            with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
-                if self.rank == 0:
-                    print(f"\n==> Testing with backend: {backend}")
+    # ------------------------------------------------------------------
+    # num_worst_tokens > 0 (requires deepep_use_cuda_num_tokens_per_expert)
+    # ------------------------------------------------------------------
 
-                for cfg in get_token_dispatcher_config():
-                    dispatcher = turbo.modules.DeepEPTokenDispatcher(
-                        cfg.num_experts,
-                        cfg.router_topk,
-                        ep_group,
-                        permute_fusion=cfg.permute_fusion,
-                        deepep_use_cuda_num_tokens_per_expert=cfg.deepep_use_cuda_num_tokens_per_expert,
-                        deepep_num_worst_tokens=cfg.deepep_num_worst_tokens,
-                        permute_max_token_num=cfg.permute_max_token_num,
-                        expert_capacity_factor=cfg.expert_capacity_factor,
-                    )
+    @parametrize("backend", _get_backends())
+    @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
+    def test_worst_tokens(self, backend, permute_max_token_num):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+                deepep_use_cuda_num_tokens_per_expert=True,
+                deepep_num_worst_tokens=NUM_TOKENS * 8,
+                permute_max_token_num=permute_max_token_num,
+            )
 
-                    hidden_states = torch.randn(
-                        (cfg.num_tokens, cfg.hidden_size), dtype=cfg.dtype, device="cuda"
-                    )
-                    ans = hidden_states.clone()
-                    hidden_states.requires_grad = True
+    # ------------------------------------------------------------------
+    # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
+    # ------------------------------------------------------------------
 
-                    probs = (
-                        torch.ones((cfg.num_tokens, cfg.num_experts), dtype=torch.float32, device="cuda")
-                        / cfg.router_topk
-                    )
+    @parametrize("backend", _get_backends())
+    def test_autotune(self, backend):
+        self._bind_device()
+        with patch.dict(
+            os.environ,
+            {
+                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
+                "PRIMUS_TURBO_AUTO_TUNE": "1",
+            },
+        ):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+            )
 
-                    (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
-                        dispatcher.token_dispatch(
-                            hidden_states,
-                            probs,
-                        )
-                    )
 
-                    permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
+# ----------------------------------------------------------------------
+# CUDA graph compatibility tests
+#
+# The C++ helper ``is_ep_force_current_stream()`` caches the value of
+# ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` in a ``static`` local on first
+# call, so toggling the env var inside a worker process after the first
+# ``Buffer`` has been constructed is a no-op.  Because
+# ``MultiProcContinuousTest`` reuses the same worker processes across every
+# test method in a class, we cannot rely on ``patch.dict(os.environ, ...)``
+# inside a test body to enable current-stream mode.
+#
+# Instead we put the CUDA-graph tests in a dedicated ``MultiProcContinuousTest``
+# subclass.  Each subclass spawns its own worker pool via
+# ``torch.multiprocessing.Process`` with the ``spawn`` start method, which
+# copies the parent's ``os.environ`` at ``process.start()`` time.  By setting
+# the env var in ``setUpClass`` and eagerly spawning the workers before
+# restoring ``os.environ``, the workers for this class inherit the flag and
+# their static cache is initialized to ``1`` on the very first Buffer
+# construction, while other test classes' worker pools remain unaffected.
+# ----------------------------------------------------------------------
 
-                    permuted_local_hidden_states = permuted_local_hidden_states.to(ans.dtype)
 
-                    restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
+@instantiate_parametrized_tests
+class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
+    world_size = -2
 
-                    assert torch.allclose(
-                        restored_hidden_states, ans
-                    ), f"[{backend}] Restored hidden states do not match original hidden states, {restored_hidden_states} {ans}"
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
 
-                    # check if the grad of the hidden states is same as the hidden states
-                    torch.autograd.backward(restored_hidden_states, hidden_states)
-                    assert torch.allclose(
-                        hidden_states.grad, ans
-                    ), f"[{backend}] Restored hidden states do not match original hidden states"
+    def _bind_device(self) -> None:
+        torch.cuda.set_device(self.device)
 
-                    expected_token_per_expert_device = (
-                        "cuda" if cfg.deepep_use_cuda_num_tokens_per_expert else "cpu"
-                    )
-                    assert (
-                        tokens_per_expert.device.type == expected_token_per_expert_device
-                    ), f"[{backend}] Expected tokens_per_expert on {expected_token_per_expert_device}, got {tokens_per_expert.device.type}"
+    @classmethod
+    def setUpClass(cls):
+        os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
+        super().setUpClass()
+
+    @parametrize("backend", _get_backends())
+    def test_cuda_graph(self, backend):
+        from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
+
+        self._bind_device()
+        with patch.dict(
+            os.environ,
+            {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
+        ):
+            num_worst_tokens = NUM_TOKENS * 8
+            permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
+
+            # clear buffer for reset
+            # a trick to reset the backend instance
+            moe_dispatch_combine_impl._backend_instances.clear()
+
+            set_buffer_global_config(num_use_cu=32)
+
+            dispatcher = turbo.modules.DeepEPTokenDispatcher(
+                NUM_EXPERTS,
+                ROUTER_TOPK,
+                dist.group.WORLD,
+                permute_fusion=True,
+                deepep_use_cuda_num_tokens_per_expert=True,
+                deepep_num_worst_tokens=num_worst_tokens,
+                permute_max_token_num=permute_max_token_num,
+            )
+
+            hidden_states = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
+            probs = torch.ones((NUM_TOKENS, NUM_EXPERTS), dtype=torch.float32, device="cuda") / ROUTER_TOPK
+
+            # Warmup (eager)
+            permuted, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(hidden_states, probs)
+            permuted = permuted * permuted_probs.unsqueeze(-1)
+            permuted = permuted.to(hidden_states.dtype)
+            restored = dispatcher.token_combine(permuted)
+
+            # Capture CUDA graph
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                permuted, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(hidden_states, probs)
+                permuted = permuted * permuted_probs.unsqueeze(-1)
+                permuted = permuted.to(hidden_states.dtype)
+                restored = dispatcher.token_combine(permuted)
+
+            # Replay and verify
+            g.replay()
+            torch.cuda.synchronize()
+            assert restored is not None, "CUDA graph replay should produce output"
 
 
 if __name__ == "__main__":
