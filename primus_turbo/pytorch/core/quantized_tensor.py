@@ -18,6 +18,8 @@ from primus_turbo.pytorch.core.low_precision import (
     float4_e2m1fn_x2,
     float8_e4m3,
     float8_e5m2,
+    is_fp4_dtype,
+    is_fp8_dtype,
 )
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp8,
@@ -30,6 +32,62 @@ from primus_turbo.pytorch.ops.quantization import (
 _SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 
 
+def _is_quantized_dtype(dtype: torch.dtype) -> bool:
+    return is_fp8_dtype(dtype) or is_fp4_dtype(dtype)
+
+
+def _validate_quantized_tensor_internals(
+    data: torch.Tensor,
+    scale_inv: torch.Tensor,
+    granularity: ScalingGranularity,
+    block_size: Optional[int],
+    data_t: Optional[torch.Tensor] = None,
+    scale_inv_t: Optional[torch.Tensor] = None,
+) -> None:
+    """Validate ``_data`` / ``_scale_inv`` dtype, shape, and device
+    consistency so that malformed tensors cannot reach native GEMM kernels
+    and cause out-of-bounds reads."""
+
+    # -- _data ---------------------------------------------------------------
+    if data.ndim != 2:
+        raise ValueError(f"QuantizedTensor._data must be 2D, got ndim={data.ndim}")
+    if not _is_quantized_dtype(data.dtype):
+        raise ValueError(
+            f"QuantizedTensor._data has unsupported dtype {data.dtype}; "
+            f"expected an FP8 or FP4 quantized type"
+        )
+
+    # -- _scale_inv ----------------------------------------------------------
+    if scale_inv.device != data.device:
+        raise ValueError(
+            f"QuantizedTensor._scale_inv device ({scale_inv.device}) does not "
+            f"match _data device ({data.device})"
+        )
+
+    # -- transposed data (optional) ------------------------------------------
+    if data_t is not None:
+        if data_t.ndim != 2:
+            raise ValueError(f"QuantizedTensor._data_t must be 2D, got ndim={data_t.ndim}")
+        if not _is_quantized_dtype(data_t.dtype):
+            raise ValueError(
+                f"QuantizedTensor._data_t has unsupported dtype {data_t.dtype}; "
+                f"expected an FP8 or FP4 quantized type"
+            )
+        if data_t.device != data.device:
+            raise ValueError(
+                f"QuantizedTensor._data_t device ({data_t.device}) does not "
+                f"match _data device ({data.device})"
+            )
+
+    # -- transposed scale (optional) -----------------------------------------
+    if scale_inv_t is not None:
+        if scale_inv_t.device != data.device:
+            raise ValueError(
+                f"QuantizedTensor._scale_inv_t device ({scale_inv_t.device}) does "
+                f"not match _data device ({data.device})"
+            )
+
+
 def check_quantized_tensor(
     quantized_tensor: "QuantizedTensor",
     config: Any,
@@ -37,7 +95,9 @@ def check_quantized_tensor(
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> None:
     """Assert a QuantizedTensor's granularity / block_size (and optionally
-    scaling recipes) match the given quant config.
+    scaling recipes) match the given quant config, **and** that the internal
+    ``_data`` / ``_scale_inv`` tensors have valid dtype, shape and device so
+    they can be safely passed to native GEMM kernels.
 
     ``config`` is duck-typed: any object exposing ``granularity`` and
     ``block_size`` attributes (e.g. ``Float8QuantConfig`` / ``Float4QuantConfig``)
@@ -141,6 +201,71 @@ class QuantizedTensor(torch.Tensor):
 
         self._data, self._scale_inv = data_, scale_inv
         self._data_t, self._scale_inv_t = data_t, scale_inv_t
+
+        return self
+
+    @classmethod
+    def from_tensor(
+        cls,
+        data: torch.Tensor,
+        scale_inv: torch.Tensor,
+        orig_size: torch.Size,
+        orig_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        block_size: Optional[int] = None,
+        scaling_recipe: Optional[ScalingRecipe] = None,
+    ) -> "QuantizedTensor":
+        """Create a :class:`QuantizedTensor` directly from pre-quantized
+        ``data`` and ``scale_inv``, skipping the quantization step.
+
+        This is useful when loading quantized weights from a checkpoint or
+        when the caller has already performed quantization externally.
+
+        Args:
+            data: Already-quantized 2D tensor (FP8 or FP4 dtype).
+            scale_inv: Inverse-scale tensor matching ``data``.
+            orig_dtype: The original high-precision dtype before quantization
+                (e.g. ``torch.bfloat16``).
+            granularity: The scaling granularity used during quantization.
+            orig_size: Logical shape of the original high-precision tensor
+                before quantization.  Must be provided when the physical
+                ``data`` shape differs from the logical shape (e.g. MX_BLOCKWISE
+                pads the inner-dim to a multiple of ``block_size``; FP4 packs
+                two values per element, halving the last dim).
+                Defaults to ``data.size()`` when *None*.
+            block_size: Block size (required for BLOCKWISE / MX_BLOCKWISE).
+            scaling_recipe: Scaling recipe (required for MX_BLOCKWISE).
+        """
+        _validate_quantized_tensor_internals(
+            data,
+            scale_inv,
+            granularity,
+            block_size,
+        )
+
+        dest_dtype = data.dtype
+        orig_stride = (orig_size[1], 1)
+
+        self = torch.Tensor._make_wrapper_subclass(
+            cls,
+            orig_size,
+            strides=orig_stride,
+            dtype=orig_dtype,
+            layout=data.layout,
+            requires_grad=False,
+            device=data.device,
+        )
+        self._orig_dtype = orig_dtype
+        self._dest_dtype = dest_dtype
+        self._keep_trans_cache = False
+        self._scaling_recipe = scaling_recipe
+        self._granularity = granularity
+        self._block_size = block_size
+        self._scaling_recipe_for_trans = None
+        self._data = data
+        self._scale_inv = scale_inv
+        self._data_t = None
+        self._scale_inv_t = None
 
         return self
 
@@ -336,6 +461,7 @@ class QuantizedTensor(torch.Tensor):
             tensors["_scale_inv_t"] = self._scale_inv_t
         metadata = {
             "_orig_dtype": self._orig_dtype,
+            "_dest_dtype": self._dest_dtype,
             "_granularity": self._granularity,
             "_block_size": self._block_size,
             "_keep_trans_cache": self._keep_trans_cache,
@@ -347,6 +473,21 @@ class QuantizedTensor(torch.Tensor):
     @staticmethod
     def __tensor_unflatten__(inner_tensors, metadata, outer_size, outer_stride):
         data = inner_tensors["_data"]
+        scale_inv = inner_tensors["_scale_inv"]
+        data_t = inner_tensors.get("_data_t")
+        scale_inv_t = inner_tensors.get("_scale_inv_t")
+        granularity = metadata["_granularity"]
+        block_size = metadata["_block_size"]
+
+        _validate_quantized_tensor_internals(
+            data,
+            scale_inv,
+            granularity,
+            block_size,
+            data_t=data_t,
+            scale_inv_t=scale_inv_t,
+        )
+
         self = torch.Tensor._make_wrapper_subclass(
             QuantizedTensor,
             outer_size,
@@ -355,15 +496,16 @@ class QuantizedTensor(torch.Tensor):
             device=data.device,
         )
         self._orig_dtype = metadata["_orig_dtype"]
-        self._granularity = metadata["_granularity"]
-        self._block_size = metadata["_block_size"]
+        self._dest_dtype = metadata["_dest_dtype"]
+        self._granularity = granularity
+        self._block_size = block_size
         self._keep_trans_cache = metadata["_keep_trans_cache"]
         self._scaling_recipe = metadata["_scaling_recipe"]
         self._scaling_recipe_for_trans = metadata["_scaling_recipe_for_trans"]
         self._data = data
-        self._scale_inv = inner_tensors["_scale_inv"]
-        self._data_t = inner_tensors.get("_data_t")
-        self._scale_inv_t = inner_tensors.get("_scale_inv_t")
+        self._scale_inv = scale_inv
+        self._data_t = data_t
+        self._scale_inv_t = scale_inv_t
         return self
 
     # ------------------------------------------------------------------

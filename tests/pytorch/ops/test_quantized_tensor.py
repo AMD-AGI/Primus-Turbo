@@ -308,3 +308,153 @@ class TestSerialization:
         qt2 = QuantizedTensor.__tensor_unflatten__(inner, metadata, qt.shape, qt.stride())
         assert torch.equal(qt2._data_t, qt._data_t)
         assert torch.equal(qt2._scale_inv_t, qt._scale_inv_t)
+
+
+# =====================================================================
+# from_tensor factory
+# =====================================================================
+class TestFromTensor:
+    """Tests for ``QuantizedTensor.from_tensor`` which wraps pre-quantized
+    data + scale_inv without re-running the quantization kernels."""
+
+    @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+    def test_basic_properties(self, granularity, block_size, dest_dtype, orig_dtype):
+        """from_tensor should produce correct dtype / real_dtype / shape /
+        device / granularity / block_size."""
+        x = torch.randn(M, N, dtype=orig_dtype, device=DEVICE)
+        qt_ref = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+        )
+
+        scaling_recipe = qt_ref._scaling_recipe
+        qt = QuantizedTensor.from_tensor(
+            data=qt_ref._data,
+            scale_inv=qt_ref._scale_inv,
+            orig_size=torch.Size([M, N]),
+            orig_dtype=orig_dtype,
+            granularity=granularity,
+            block_size=block_size,
+            scaling_recipe=scaling_recipe,
+        )
+
+        assert qt.dtype == orig_dtype
+        assert qt.real_dtype == dest_dtype
+        assert qt.shape == torch.Size([M, N])
+        assert qt.device.type == "cuda"
+        assert qt.granularity == granularity
+        assert qt.block_size == block_size
+        assert qt.scaling_recipe == scaling_recipe
+
+    @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_data_and_scale_preserved(self, granularity, block_size, dest_dtype):
+        """The internal _data / _scale_inv should be exactly the tensors we
+        passed in (no copy, no re-quantization)."""
+        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
+        qt_ref = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+        )
+
+        qt = QuantizedTensor.from_tensor(
+            data=qt_ref._data,
+            scale_inv=qt_ref._scale_inv,
+            orig_size=torch.Size([M, N]),
+            orig_dtype=torch.bfloat16,
+            granularity=granularity,
+            block_size=block_size,
+            scaling_recipe=qt_ref._scaling_recipe,
+        )
+
+        assert qt._data.data_ptr() == qt_ref._data.data_ptr()
+        assert qt._scale_inv.data_ptr() == qt_ref._scale_inv.data_ptr()
+
+    def test_orig_size_differs_from_data_size(self):
+        """When the physical data has been padded (e.g. MX_BLOCKWISE), the
+        wrapper shape should reflect orig_size, not data.size()."""
+        orig_m, orig_k = 100, 200
+        padded_k = 224  # ceil(200/32)*32 = 224
+        data = torch.zeros(orig_m, padded_k, dtype=float8_e4m3, device=DEVICE)
+        scale_inv = torch.ones(orig_m, padded_k // MXFP8_BLOCK_SIZE, dtype=torch.uint8, device=DEVICE)
+
+        qt = QuantizedTensor.from_tensor(
+            data=data,
+            scale_inv=scale_inv,
+            orig_size=torch.Size([orig_m, orig_k]),
+            orig_dtype=torch.bfloat16,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP8_BLOCK_SIZE,
+            scaling_recipe=ScalingRecipe(),
+        )
+
+        assert qt.shape == torch.Size([orig_m, orig_k])
+        assert qt._data.shape == torch.Size([orig_m, padded_k])
+
+    @pytest.mark.parametrize("granularity,block_size", _DEQUANT_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_dequantize_matches_normal_construction(self, granularity, block_size, dest_dtype):
+        """A from_tensor QuantizedTensor should dequantize identically to
+        one created via the normal __new__ path."""
+        torch.manual_seed(42)
+        x = torch.rand(M, N, dtype=torch.bfloat16, device=DEVICE)
+        qt_ref = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+        )
+
+        qt = QuantizedTensor.from_tensor(
+            data=qt_ref._data,
+            scale_inv=qt_ref._scale_inv,
+            orig_size=qt_ref.shape,
+            orig_dtype=torch.bfloat16,
+            granularity=granularity,
+            block_size=block_size,
+            scaling_recipe=qt_ref._scaling_recipe,
+        )
+
+        x_ref = qt_ref.dequantize()
+        x_ft = qt.dequantize()
+        torch.testing.assert_close(x_ft, x_ref, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("granularity,block_size", _GRAN_1D_CASES)
+    @pytest.mark.parametrize("dest_dtype", _FP8_DTYPES)
+    def test_flatten_unflatten_roundtrip(self, granularity, block_size, dest_dtype):
+        """from_tensor objects should survive flatten → unflatten."""
+        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
+        qt_ref = _make_quantized_tensor(
+            x,
+            granularity=granularity,
+            dest_dtype=dest_dtype,
+            block_size=block_size,
+        )
+
+        qt = QuantizedTensor.from_tensor(
+            data=qt_ref._data,
+            scale_inv=qt_ref._scale_inv,
+            orig_size=qt_ref.shape,
+            orig_dtype=torch.bfloat16,
+            granularity=granularity,
+            block_size=block_size,
+            scaling_recipe=qt_ref._scaling_recipe,
+        )
+
+        keys, metadata = qt.__tensor_flatten__()
+        inner = {"_data": qt._data, "_scale_inv": qt._scale_inv}
+        qt2 = QuantizedTensor.__tensor_unflatten__(inner, metadata, qt.shape, qt.stride())
+
+        assert qt2.shape == qt.shape
+        assert qt2.dtype == qt.dtype
+        assert qt2.real_dtype == qt.real_dtype
+        assert qt2.granularity == qt.granularity
+        assert qt2.block_size == qt.block_size
+        assert torch.equal(qt2._data, qt._data)
+        assert torch.equal(qt2._scale_inv, qt._scale_inv)
