@@ -74,9 +74,13 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     int                                           returnedAlgoCount = 0;
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulPreferenceCreate(&preference));
+    // Cap the workspace hint for low-precision (FP8/FP4) paths to steer
+    // hipBLASLt away from the Stream-K persistent kernel that intermittently
+    // stalls under multi-stream grouped GEMM (~500us -> 300ms..25s on MI355X).
+    int64_t pref_workspace_size = use_low_precision ? int64_t{8 * 1024 * 1024} : workspace_size;
     PRIMUS_TURBO_CHECK_HIPBLAS(
         hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                              &workspace_size, sizeof(workspace_size)));
+                                              &pref_workspace_size, sizeof(pref_workspace_size)));
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmulAlgoGetHeuristic(
         handle, operation_desc, A_desc, B_desc, D_desc, D_desc, preference, request_solutions,
