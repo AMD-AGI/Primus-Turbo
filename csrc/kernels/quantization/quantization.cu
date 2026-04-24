@@ -96,6 +96,18 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
 
     int32_t pack_size = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
     switch (pack_size) {
+    case 16: {
+        // Compile-time UNROLL: valid_pack returns either N (16) or 1; pick the smaller
+        // so dispatch covers (FType,QType) pairs whose byte-cap allows 16-pack.
+        constexpr int32_t UNROLL =
+            (valid_pack<FType, 16>() < valid_pack<QType, 16>())
+                ? static_cast<int32_t>(valid_pack<FType, 16>())
+                : static_cast<int32_t>(valid_pack<QType, 16>());
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
     case 8: {
         const int32_t       UNROLL = valid_pack<FType, 8>();
         PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
@@ -137,7 +149,11 @@ void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y
     };
 
     const int32_t BLOCK_SIZE = 512;
-    int32_t       pack_size  = std::min(get_pack_size<QType>(x), get_pack_size<FType>(y));
+    // Cap at 8 to preserve original switch coverage; only quantize_tensorwise path opts
+    // into the new case 16 lane.
+    int32_t pack_size =
+        static_cast<int32_t>(std::min(get_pack_size<QType>(x), get_pack_size<FType>(y)));
+    if (pack_size > 8) pack_size = 8;
     switch (pack_size) {
     case 8: {
         const int32_t       UNROLL = valid_pack<FType, 8>();
@@ -306,8 +322,12 @@ void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_
 
     const int32_t BLOCK_SIZE = 512;
     const int32_t GRID_SIZE  = outer_len;
-    int32_t       pack_size  = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
-    pack_size                = get_quantize_rowwise_pack_size<FType>(pack_size, inner_len);
+    // Cap at 8 to preserve original switch coverage; only quantize_tensorwise path opts
+    // into the new case 16 lane.
+    int32_t pack_size =
+        static_cast<int32_t>(std::min(get_pack_size<FType>(x), get_pack_size<QType>(y)));
+    if (pack_size > 8) pack_size = 8;
+    pack_size = get_quantize_rowwise_pack_size<FType>(pack_size, inner_len);
 
     switch (pack_size) {
     case 8: {
@@ -401,8 +421,12 @@ void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_
                                      hipStream_t stream) {
     const int32_t UNROLL_M = 32;
 
-    int32_t pack_size        = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
-    pack_size                = get_quantize_rowwise_pack_size<FType>(pack_size, n);
+    // Cap at 8 to preserve original switch coverage; only quantize_tensorwise path opts
+    // into the new case 16 lane.
+    int32_t pack_size =
+        static_cast<int32_t>(std::min(get_pack_size<FType>(x), get_pack_size<QType>(y)));
+    if (pack_size > 8) pack_size = 8;
+    pack_size = get_quantize_rowwise_pack_size<FType>(pack_size, n);
     const int32_t BLOCK_SIZE = 512;
 
     switch (pack_size) {
