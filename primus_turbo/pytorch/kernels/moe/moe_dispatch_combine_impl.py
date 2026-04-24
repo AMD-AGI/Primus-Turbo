@@ -920,9 +920,6 @@ class DeepEPBackend(_DeepEPLikeBackend):
 # ==========================================================================
 # Mori EP backend helpers
 # ==========================================================================
-
-_ENV_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = "PRIMUS_TURBO_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
-_ENV_MORI_PREALLOC_MAX_RECV_TOKENS = "PRIMUS_TURBO_MORI_PREALLOC_MAX_RECV_TOKENS"
 _ENV_MORI_NUM_QP_PER_PE = "PRIMUS_TURBO_MORI_NUM_QP_PER_PE"
 
 
