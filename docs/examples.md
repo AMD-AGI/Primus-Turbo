@@ -524,5 +524,5 @@ You can also control backend selection and AutoTune via environment variables:
 export PRIMUS_TURBO_AUTO_TUNE=1
 export PRIMUS_TURBO_GEMM_BACKEND=HIPBLASLT
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=CK
-export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=DEEP_EP
+export PRIMUS_TURBO_EP_BACKEND=DEEP_EP
 ```

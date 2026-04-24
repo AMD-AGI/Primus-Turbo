@@ -16,19 +16,12 @@ import torch
 
 from primus_turbo.common.constants import (
     ENV_AUTO_TUNE,
+    ENV_EP_BACKEND,
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
-    ENV_MOE_DISPATCH_COMBINE_BACKEND,
 )
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.gemm.gemm_kernel import clear_origami_caches
-
-try:
-    HAVE_DEEP_EP = True
-    import deep_ep  # fmt: skip
-except ImportError:
-    HAVE_DEEP_EP = False
-
 
 __all__ = [
     "BackendEntry",
@@ -64,6 +57,7 @@ class BackendType(Enum):
     TRITON = auto()
     DEEP_EP = auto()
     TURBO = auto()
+    MORI = auto()
 
 
 class GlobalBackendManager:
@@ -80,7 +74,7 @@ class GlobalBackendManager:
 
     _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
-    _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
+    _ep_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _auto_tune: Optional[bool] = None
 
     @classmethod
@@ -204,16 +198,16 @@ class GlobalBackendManager:
         return None
 
     @classmethod
-    def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
-        """Get the MoE dispatch combine backend configuration. Returns None if not set.
+    def get_ep_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+        """Get the EP backend configuration. Returns None if not set.
 
         If the environment variable contains a value that is not a valid ``BackendType``
         (e.g. a custom EP backend name like ``UCCL_EP``), this method returns ``None`` so
         the EP-specific backend registry in ``moe_dispatch_combine_impl`` can handle it.
         """
-        if cls._moe_dispatch_combine_backend is not None:
-            return cls._moe_dispatch_combine_backend[precision]
-        env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
+        if cls._ep_backend is not None:
+            return cls._ep_backend[precision]
+        env_value = os.environ.get(ENV_EP_BACKEND, None)
         if env_value is not None:
             try:
                 backend = cls._extract_backend_from_env(env_value).get(precision, None)
@@ -223,14 +217,9 @@ class GlobalBackendManager:
             if backend is None:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
-                    f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}. Using default backend.",
+                    f"{ENV_EP_BACKEND}. Using default backend.",
                     once=True,
                 )
-
-            if backend == BackendType.DEEP_EP:
-                assert (
-                    HAVE_DEEP_EP
-                ), "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
             return backend
 
         return None

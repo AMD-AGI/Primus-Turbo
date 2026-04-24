@@ -51,7 +51,8 @@ class MoEDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
 
-        tokens_per_expert = torch.tensor(tokens_per_expert)
+        if not isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = torch.tensor(tokens_per_expert)
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
