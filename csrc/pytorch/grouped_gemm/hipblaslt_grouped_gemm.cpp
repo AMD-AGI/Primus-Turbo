@@ -128,12 +128,19 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
                        "out_dtype must be kBFloat16 or kHalf");
-    PRIMUS_TURBO_CHECK(granularity == "TENSORWISE", "granularity must be 'TENSORWISE'");
+    PRIMUS_TURBO_CHECK(granularity == "TENSORWISE" || granularity == "MX_BLOCKWISE",
+                       "granularity must be 'TENSORWISE' or 'MX_BLOCKWISE'");
 
     // Scale mode
     hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_END;
     if (granularity == "TENSORWISE") {
         scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    } else if (granularity == "MX_BLOCKWISE") {
+        // Native MX-FP8 scale mode on gfx950 (HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0):
+        // hipBLASLt expects per-32-element e8m0 scales along the INNERMOST dim
+        // of each operand (same memory order as the operand). Caller is
+        // responsible for scale layout.
+        scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
     } else {
         PRIMUS_TURBO_ERROR("Invalid granularity.");
     }

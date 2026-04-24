@@ -1,0 +1,57 @@
+{
+  "schema": "phase0_pmc_summary_v1",
+  "kernel": "turbo_grouped_gemm_mxfp8_kernel<e4m3, e4m3, bf16>",
+  "shape": {
+    "M_total": 65536,
+    "K": 2880,
+    "N": 5760,
+    "G": 32,
+    "balanced_M_per_expert": 2048
+  },
+  "collector": {
+    "tool": "rocprofv3 1.0.0",
+    "gpu": "gfx950 (MI355X)",
+    "dispatches_captured": 25,
+    "measured_iterations": 20,
+    "warmup_iterations": 5
+  },
+  "counters_per_dispatch_mean": {
+    "SQ_INSTS_LDS": 26001408.0,
+    "SQ_INSTS_MFMA": 34668544.0,
+    "SQ_LDS_BANK_CONFLICT": 0.0,
+    "SQ_WAIT_ANY": 123664179.6,
+    "SQ_WAIT_INST_LDS": 2194381.64,
+    "SQ_WAVES": 23552.0,
+    "TCC_HIT_sum": 75139256.16,
+    "TCC_MISS_sum": 60165310.4
+  },
+  "counters_total_over_25_dispatches": {
+    "SQ_INSTS_LDS": 650035200.0,
+    "SQ_INSTS_MFMA": 866713600.0,
+    "SQ_LDS_BANK_CONFLICT": 0.0,
+    "SQ_WAIT_ANY": 3091604490.0,
+    "SQ_WAIT_INST_LDS": 54859541.0,
+    "SQ_WAVES": 588800.0,
+    "TCC_HIT_sum": 1878481404.0,
+    "TCC_MISS_sum": 1504132760.0
+  },
+  "derived_ratios": {
+    "wait_lds_over_mfma": 0.063296042660459,
+    "bank_conflict_rate_pct": 0.0,
+    "l2_hit_rate_pct": 55.53342216774328,
+    "wait_any_over_mfma": 3.567042780914018
+  },
+  "triton_baseline_reference": {
+    "source": "/tmp/phase0_pmc_out_counter_collection.csv",
+    "wait_lds_over_mfma": 3.54,
+    "bank_conflict_rate_pct": 57.5,
+    "SQ_WAIT_INST_LDS_total": 61434967,
+    "SQ_INSTS_MFMA_total": 17341481,
+    "SQ_LDS_BANK_CONFLICT_total": 34529116
+  },
+  "analysis": {
+    "wait_lds_reduction_vs_triton_x": 55.92766705795078,
+    "bank_conflict_elimination": "0 conflicts HIP vs 34.5M Triton (100% eliminated)",
+    "note": "ISA check: 0 s_waitcnt lgkmcnt(0) in HIP hot loop; Triton has 22 per 16-MFMA cluster. Bank conflicts eliminated via column-swizzle ds_read_b64 pattern."
+  }
+}

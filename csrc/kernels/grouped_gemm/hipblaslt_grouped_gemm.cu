@@ -148,6 +148,16 @@ private:
         const char *a_ptr = static_cast<const char *>(params.a_ptr);
         const char *b_ptr = static_cast<const char *>(params.b_ptr);
         char       *c_ptr = static_cast<char *>(params.c_ptr);
+        // Per-expert scale pointer advancement (VEC32_UE8M0 only). One uint8
+        // scale byte per 32-element block along the innermost dim of each
+        // operand. For TENSORWISE the scale is a single f32 — scales stay
+        // pinned to params.a_scale_ptr / params.b_scale_ptr.
+        const bool advance_scales =
+            params.use_low_precision &&
+            params.scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+        const char *a_scale_cur = static_cast<const char *>(params.a_scale_ptr);
+        const char *b_scale_cur = static_cast<const char *>(params.b_scale_ptr);
+        constexpr int64_t MX_GROUP = 32;
         gemm_ptrs_.resize(valid_group_num);
         ld_a_.resize(valid_group_num);
         ld_b_.resize(valid_group_num);
@@ -181,9 +191,8 @@ private:
             gemm_ptrs_[write_idx].b_ptr = b_ptr;
             gemm_ptrs_[write_idx].c_ptr = c_ptr;
             if (params.use_low_precision) {
-                // TODO(xiaobochen): support variable scale mode
-                gemm_ptrs_[write_idx].a_scale_ptr = params.a_scale_ptr;
-                gemm_ptrs_[write_idx].b_scale_ptr = params.b_scale_ptr;
+                gemm_ptrs_[write_idx].a_scale_ptr = a_scale_cur;
+                gemm_ptrs_[write_idx].b_scale_ptr = b_scale_cur;
             }
 
             // leading dimension
@@ -201,6 +210,15 @@ private:
             a_ptr += rows_a_[write_idx] * cols_a_[write_idx] * hipblaslt_dtype_bytes(params.a_type);
             b_ptr += rows_b_[write_idx] * cols_b_[write_idx] * hipblaslt_dtype_bytes(params.b_type);
             c_ptr += rows_c_[write_idx] * cols_c_[write_idx] * hipblaslt_dtype_bytes(params.c_type);
+            if (advance_scales) {
+                // One uint8 e8m0 byte per 32-element block along the innermost
+                // dim. Innermost dim of each operand is rows_a_/rows_b_ (the
+                // leading dim = stride 1 in our row-major-stored tensors).
+                a_scale_cur +=
+                    rows_a_[write_idx] / MX_GROUP * cols_a_[write_idx] * sizeof(uint8_t);
+                b_scale_cur +=
+                    rows_b_[write_idx] / MX_GROUP * cols_b_[write_idx] * sizeof(uint8_t);
+            }
             write_idx++;
         }
 

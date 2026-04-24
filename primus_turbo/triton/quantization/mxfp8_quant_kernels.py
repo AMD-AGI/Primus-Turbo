@@ -798,6 +798,163 @@ def quant_mxfp8_dual_jagged(
     return row_fp8, row_scale, col_fp8, col_scale, scale_offs
 
 
+# ── Dual-jagged with col output pre-permuted to [G, L, M_g] ────────────────
+# Attempted 2026-04-24 to eliminate the runtime fp8 permute for HIP wgrad.
+# Result: SLOWER than dual_jagged + post-permute at gpt_oss_20B shape (1301 vs
+# 1092 us), bit-exact correctness. Root cause: Triton's blocked layout for the
+# [GROUP=32, BLOCK_L=128] tile distributes threads along the OUTER axis, so
+# even with tl.trans(xq_c), stores to the permuted [G, L, M_g] layout (inner
+# = M_g) are not coalesced. The existing fp8_permute_M_to_GN post-pass hits
+# ~85% HBM peak and is cheaper than the layout penalty. Kept below for future
+# revisits (e.g., with explicit tl.BlockedEncoding tuned for inner-M_g stores).
+
+@triton.jit
+def _mxfp8_quant_dual_jagged_permuted_kernel(
+    X,
+    X_fp8_row, X_scale_row,
+    X_fp8_col_perm, X_scale_col_perm,
+    group_offs_ptr, scale_offs_ptr, block_to_expert_ptr,
+    L, M_g,
+    stride_xm, stride_xl,
+    stride_qm_row, stride_ql_row,
+    stride_sm_row, stride_sl_row,
+    # col_fp8_perm  [G, L, M_g]: stride_cg, stride_cl, stride_cm
+    stride_cg_perm, stride_cl_perm, stride_cm_perm,
+    # col_scale_perm [G, L, sc_g]: stride_ssg, stride_ssl, stride_sss
+    stride_ssg_perm, stride_ssl_perm, stride_sss_perm,
+    BLOCK_L: tl.constexpr,
+    GROUP: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Dual-jagged quant where col outputs are PRE-PERMUTED to [G, L, M_g]
+    contiguous (M_g uniform balanced MoE). Row outputs unchanged."""
+    pid_flat = tl.program_id(0)
+    pid_l = tl.program_id(1)
+
+    expert_g = tl.load(block_to_expert_ptr + pid_flat).to(tl.int32)
+    sc_base = tl.load(scale_offs_ptr + expert_g)
+    sg_within = pid_flat - sc_base
+
+    m_start = tl.load(group_offs_ptr + expert_g)
+    m_end = tl.load(group_offs_ptr + expert_g + 1)
+    M_g_runtime = (m_end - m_start).to(tl.int32)
+
+    rm_local = sg_within * GROUP + tl.arange(0, GROUP)
+    rm = m_start + rm_local
+    mask_m = rm_local < M_g_runtime
+
+    rl = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_l = rl < L
+    mask = mask_m[:, None] & mask_l[None, :]
+
+    # Single HBM read.
+    x = tl.load(X + rm[:, None] * stride_xm + rl[None, :] * stride_xl, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+
+    # Rowwise path (unchanged).
+    x_row = tl.reshape(x, (GROUP, BLOCK_L // GROUP, GROUP))
+    amax_r = tl.maximum(tl.max(tl.abs(x_row), axis=-1, keep_dims=True), 1e-8)
+    e_r = tl.clamp(tl.ceil(tl.log2(amax_r / FP8_MAX)), -127.0, 127.0)
+    sc_r = tl.exp2(e_r)
+    u8_r = (e_r.to(tl.int32) + 127).to(tl.uint8)
+    xq_r = tl.clamp(x_row / sc_r, -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    xq_row_out = tl.reshape(xq_r, (GROUP, BLOCK_L))
+    sc_row_out = tl.reshape(u8_r, (GROUP, BLOCK_L // GROUP))
+
+    # Colwise path.
+    amax_c = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-8)  # (BLOCK_L,)
+    e_c = tl.clamp(tl.ceil(tl.log2(amax_c / FP8_MAX)), -127.0, 127.0)
+    sc_c = tl.exp2(e_c)
+    u8_c = (e_c.to(tl.int32) + 127).to(tl.uint8)
+    xq_c = tl.clamp(x / sc_c[None, :], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+
+    # Row outputs (unchanged).
+    tl.store(X_fp8_row + rm[:, None] * stride_qm_row + rl[None, :] * stride_ql_row,
+             xq_row_out, mask=mask)
+    rls = pid_l * (BLOCK_L // GROUP) + tl.arange(0, BLOCK_L // GROUP)
+    mask_ls = rls < ((L + GROUP - 1) // GROUP)
+    tl.store(X_scale_row + rm[:, None] * stride_sm_row + rls[None, :] * stride_sl_row,
+             sc_row_out, mask=mask_m[:, None] & mask_ls[None, :])
+
+    # ── Col outputs: PERMUTED to [G, L, M_g] / [G, L, sc_g] ──────────────
+    # Target layout [G, L, M_g] has M_g as the innermost (contiguous) dim.
+    # To keep stores coalesced we transpose xq_c (shape [m_local, l]) into
+    # [l, m_local] and emit with m_local as the inner axis of the address
+    # expression. Adjacent lanes then write adjacent m_local bytes.
+    col_base = X_fp8_col_perm + expert_g.to(tl.int64) * stride_cg_perm
+    col_addr = col_base + rl[:, None] * stride_cl_perm + rm_local[None, :] * stride_cm_perm
+    tl.store(col_addr, tl.trans(xq_c), mask=mask_l[:, None] & mask_m[None, :])
+
+    # Scale: one scale byte per (l_idx, m_scale_group). sg_within is the
+    # current m-scale-group index within this expert.
+    scale_base = X_scale_col_perm + expert_g.to(tl.int64) * stride_ssg_perm
+    scale_addr = scale_base + rl * stride_ssl_perm + sg_within.to(tl.int64) * stride_sss_perm
+    tl.store(scale_addr, u8_c, mask=mask_l)
+
+
+def quant_mxfp8_dual_jagged_permuted(
+    x: torch.Tensor,
+    group_offs: torch.Tensor,
+    group_lens: torch.Tensor,
+):
+    """Fused rowwise + colwise MX-FP8 quant with PRE-PERMUTED col output.
+
+    Same as ``quant_mxfp8_dual_jagged`` except the col outputs are in the
+    ``[G, L, M_g]`` / ``[G, L, M_g//32]`` layout that HIP wgrad consumes,
+    eliminating the runtime fp8 permute (~240 µs per step).
+
+    **Requires balanced MoE (M_g uniform across all experts).** Caller must
+    verify. Returns 5-tuple matching the base function's shape:
+      - ``row_fp8``  : ``[M, L]``
+      - ``row_scale``: ``[M, L//32]``
+      - ``col_fp8``  : ``[G, L, M_g]``    ← pre-permuted
+      - ``col_scale``: ``[G, L, M_g//32]`` ← pre-permuted
+      - ``scale_offs``: ``[G+1]`` (same as base for API compatibility)
+    """
+    assert x.ndim == 2, f"x must be 2D, got {x.shape}"
+    M_total, L = x.shape
+    assert L % MX_GROUP_SIZE == 0, f"L={L} must be multiple of {MX_GROUP_SIZE}"
+    G = group_lens.shape[0]
+    GROUP = MX_GROUP_SIZE
+    assert M_total % G == 0, f"balanced MoE required: M_total={M_total} not div G={G}"
+    M_g = M_total // G
+    assert M_g % GROUP == 0, f"M_g={M_g} must be multiple of {GROUP} for balanced quant"
+
+    sg_per_group = (group_lens + GROUP - 1) // GROUP
+    scale_offs = torch.cat([
+        torch.zeros(1, dtype=group_offs.dtype, device=group_offs.device),
+        torch.cumsum(sg_per_group, dim=0),
+    ])
+    total_sc = int(scale_offs[-1].item())
+    block_to_expert = torch.repeat_interleave(
+        torch.arange(G, dtype=torch.int32, device=x.device),
+        sg_per_group.to(torch.int32),
+    )
+
+    sc_g = M_g // GROUP
+    row_fp8   = torch.zeros((M_total, L), dtype=torch.float8_e4m3fn, device=x.device)
+    row_scale = torch.empty((M_total, L // GROUP), dtype=torch.uint8, device=x.device)
+    col_fp8_perm   = torch.zeros((G, L, M_g), dtype=torch.float8_e4m3fn, device=x.device)
+    col_scale_perm = torch.empty((G, L, sc_g), dtype=torch.uint8, device=x.device)
+
+    BLOCK_L = 128
+    grid = (total_sc, triton.cdiv(L, BLOCK_L))
+    _mxfp8_quant_dual_jagged_permuted_kernel[grid](
+        x,
+        row_fp8, row_scale,
+        col_fp8_perm, col_scale_perm,
+        group_offs, scale_offs, block_to_expert,
+        L, M_g,
+        x.stride(0), x.stride(1),
+        row_fp8.stride(0), row_fp8.stride(1),
+        row_scale.stride(0), row_scale.stride(1),
+        col_fp8_perm.stride(0), col_fp8_perm.stride(1), col_fp8_perm.stride(2),
+        col_scale_perm.stride(0), col_scale_perm.stride(1), col_scale_perm.stride(2),
+        BLOCK_L=BLOCK_L, GROUP=GROUP, FP8_MAX=_FP8_MAX,
+    )
+    return row_fp8, row_scale, col_fp8_perm, col_scale_perm, scale_offs
+
+
 def quant_mxfp8_colwise_for_variable_k(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``[M, L]`` bf16 -> ``([M, L] fp8_e4m3, [L, M//32] uint8 e8m0)``.
 

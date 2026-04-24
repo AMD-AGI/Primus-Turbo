@@ -1,0 +1,14 @@
+# JIT build artifacts from torch.utils.cpp_extension.load
+build/
+build_128/
+*.o
+*.bc
+*.s
+*.hipi
+*.out
+*.out.resolution.txt
+*.hipfb
+
+# Profiling artifacts
+.rocprofv3/
+pmc_*.csv

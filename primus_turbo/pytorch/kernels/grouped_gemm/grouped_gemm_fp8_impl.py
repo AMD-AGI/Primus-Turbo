@@ -183,6 +183,12 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
 
 
 class GroupedGEMMFP8HipblasltBackend(KernelBackend):
+    # NOTE: MX_BLOCKWISE works correctness-wise via the patched C++ binding
+    # (hipblaslt_grouped_gemm.cpp accepts MX_BLOCKWISE → VEC32_UE8M0 scale
+    # mode). Disabled here because Primus-Turbo's grouped wrapper does
+    # per-expert hipblasLtMatmul calls with 4-stream pingpong → ~6× slower
+    # than Triton at gpt_oss_20B fwd (9.3 vs 1.5 ms). To re-enable, port the
+    # binding to use hipblaslt_ext::GroupedGemm (single-launch Tensile).
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
     }
@@ -242,6 +248,14 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
 
 
 class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
+    # NOTE: MX_BLOCKWISE for variable-K (wgrad) does not work via hipBLASLt's
+    # VEC32_UE8M0 scale mode. The MX spec needs scales along the reduction
+    # axis (M for wgrad), but VEC32_UE8M0 expects scales along the innermost
+    # dim of the operand. With opA=T (the only opA supported by MX-FP8 in
+    # hipBLASLt), the innermost dim of A equals the OUTPUT row dim, NOT the
+    # reduction. Verified empirically: routing MX wgrad through this backend
+    # produces 7.4 dB SNR (garbage). hipBLASLt would need to support a
+    # "scales along K" / "scales along reduction" mode for wgrad to work.
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
     }
@@ -440,6 +454,102 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
 
 
+class GroupedGEMMFP8VariableKHipBackend(KernelBackend):
+    """HIP-native variable-K grouped-GEMM backend (MX-FP8 only, v1).
+
+    Drop-in counterpart to ``GroupedGEMMFP8VariableKHipblasltBackend`` for the
+    ``MX_BLOCKWISE`` granularity that the C++ hipBLASLt binding does not yet
+    handle. Wraps the HIP fwd kernel (reused with operand role-swap) via a
+    single-launch stacked dispatch.
+
+    See ``primus_turbo/hip/grouped_gemm_mxfp8/__init__.py::grouped_gemm_mxfp8_hip_variable_k``
+    for implementation details and constraints (balanced MoE, M_g >= 384,
+    M_g % 128 == 0).
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    # MX-FP8 is e4m3 only in current Primus-Turbo pipeline.
+    SUPPORTED_DTYPES = {
+        (float8_e4m3, float8_e4m3, torch.float16),
+        (float8_e4m3, float8_e4m3, torch.bfloat16),
+    }
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8VariableKHipBackend.SUPPORTED_GRANULARITIES
+        supported &= trans_a and not trans_b
+        if not supported:
+            return False
+        # v1 only runs on gfx950 (MFMA scale instruction availability).
+        supported &= torch.cuda.is_available() and (
+            "gfx950" in torch.cuda.get_device_properties(a.device).gcnArchName
+        )
+        if not supported:
+            return False
+        # v1 requires balanced MoE with M_g multiple-of-128 and >= 384.
+        g = int(group_lens.numel())
+        M_total = int(a.size(0)) if not trans_a else int(a.size(0))  # M = reduction axis = a.size(0)
+        if M_total % g != 0:
+            return False
+        M_g = M_total // g
+        if M_g < 384 or M_g % 128 != 0:
+            return False
+        return True
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        maybe_pre_sync: bool = False,
+    ):
+        # Match the other VariableK backends' role-swap convention.
+        from primus_turbo.hip.grouped_gemm_mxfp8 import grouped_gemm_mxfp8_hip_variable_k
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+        # Our HIP entry point treats "lhs" as the operand whose cols become
+        # output rows; trans_c already handled above, so pass trans_c=False.
+        return grouped_gemm_mxfp8_hip_variable_k(
+            lhs, rhs, lhs_scales, rhs_scales,
+            group_offs,
+            out_dtype=out_dtype,
+            trans_c=False,
+        )
+
+
 class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward).
 
@@ -535,6 +645,7 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
     _backends = {
         BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
+        BackendType.TURBO: BackendEntry(GroupedGEMMFP8VariableKHipBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
     }
     _cache = TuneCache(1024)
