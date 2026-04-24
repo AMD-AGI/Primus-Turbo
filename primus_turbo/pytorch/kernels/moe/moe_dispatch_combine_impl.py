@@ -1647,7 +1647,7 @@ _DEFAULT_BACKEND_NAME = "TURBO"
 
 def _get_backend_name() -> str:
     """Return the user-selected backend name, or ``TURBO`` by default."""
-    bt = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
+    bt = GlobalBackendManager.get_ep_backend(PrecisionType.BF16_FP16_FP32)
     return bt.name if bt is not None else _DEFAULT_BACKEND_NAME
 
 

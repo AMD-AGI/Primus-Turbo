@@ -136,7 +136,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("expert_capacity_factor", [None, 0.5])
     def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 self.pg,
@@ -152,7 +152,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
     def test_worst_tokens(self, backend, permute_max_token_num):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 self.pg,
@@ -168,7 +168,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     def test_autotune(self):
         self._bind_device()
         envs = {k: v for k, v in os.environ.items()}
-        envs.pop("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+        envs.pop("PRIMUS_TURBO_EP_BACKEND", None)
         envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
         with patch.dict(os.environ, envs, clear=True):
             _run_dispatch_combine(
@@ -197,7 +197,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
         self._bind_device()
         envs = {k: v for k, v in os.environ.items()}
-        envs.pop("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+        envs.pop("PRIMUS_TURBO_EP_BACKEND", None)
         envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
 
         with patch.dict(os.environ, envs, clear=True):
@@ -220,23 +220,6 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
 # ----------------------------------------------------------------------
 # CUDA graph compatibility tests
-#
-# The C++ helper ``is_ep_force_current_stream()`` caches the value of
-# ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` in a ``static`` local on first
-# call, so toggling the env var inside a worker process after the first
-# ``Buffer`` has been constructed is a no-op.  Because
-# ``MultiProcContinuousTest`` reuses the same worker processes across every
-# test method in a class, we cannot rely on ``patch.dict(os.environ, ...)``
-# inside a test body to enable current-stream mode.
-#
-# Instead we put the CUDA-graph tests in a dedicated ``MultiProcContinuousTest``
-# subclass.  Each subclass spawns its own worker pool via
-# ``torch.multiprocessing.Process`` with the ``spawn`` start method, which
-# copies the parent's ``os.environ`` at ``process.start()`` time.  By setting
-# the env var in ``setUpClass`` and eagerly spawning the workers before
-# restoring ``os.environ``, the workers for this class inherit the flag and
-# their static cache is initialized to ``1`` on the very first Buffer
-# construction, while other test classes' worker pools remain unaffected.
 # ----------------------------------------------------------------------
 
 
@@ -267,7 +250,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
         self._bind_device()
         with patch.dict(
             os.environ,
-            {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
+            {"PRIMUS_TURBO_EP_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8
             permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK

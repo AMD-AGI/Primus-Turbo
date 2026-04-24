@@ -26,7 +26,7 @@ ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
 # MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
 # Default: TURBO
-ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
+ENV_EP_BACKEND = "PRIMUS_TURBO_EP_BACKEND"
 
 # Enable auto-tuning across registered kernel backends ("1" to enable).
 # Default: "0" (disabled)
