@@ -248,7 +248,7 @@ def set_buffer_global_config(
         combine_config=combine_cfg,
     )
     if backend is None:
-        targets = list(_buffer_config_per_backend.keys()) or list(_DEFAULT_BUFFER_CONFIG_PER_BACKEND.keys())
+        targets = set(_buffer_config_per_backend.keys()) | set(_BACKEND_REGISTRY.keys())
         for name in targets:
             _buffer_config_per_backend[name] = dataclasses.replace(new_cfg)
     else:
@@ -440,6 +440,8 @@ class _DeepEPLikeBackend:
     ) -> None:
         mod = self._get_module()
         BufferClass = mod.Buffer
+
+        BufferClass.set_num_sms(config.num_sms)
 
         dispatch_config = config.dispatch_config or BufferClass.get_dispatch_config(group.size())
         combine_config = config.combine_config or BufferClass.get_combine_config(group.size())
@@ -659,6 +661,11 @@ class _DeepEPLikeBackend:
                         "sample a uniform distribution."
                     )
                 num_topk = int(topk_idx.size(1))
+            if num_topk > num_experts:
+                raise ValueError(
+                    "tune_configs(uniform_dispatch=True): ``num_topk`` "
+                    f"({num_topk}) cannot exceed ``num_experts`` ({num_experts})."
+                )
             num_tokens = int(x_inp.size(0))
             device = x_inp.device
             scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device).abs() + 1
@@ -1374,9 +1381,8 @@ class MoEDispatchCombineAutoTuner:
     # Shape-based cache shared across layers with identical input shape.
     _cache: TuneCache = TuneCache(capacity=1024)
 
-    # id(handle) -> EPAutoTuneResult, LRU-bounded.
     _HANDLE_CACHE_MAX: int = 1024
-    _handle_cache: "OrderedDict[int, EPAutoTuneResult]" = OrderedDict()
+    _handle_cache: "OrderedDict[int, Tuple[Any, EPAutoTuneResult]]" = OrderedDict()
 
     # Fallback for calls made before any handle mapping is registered.
     _current_result: Optional[EPAutoTuneResult] = None
@@ -1413,7 +1419,7 @@ class MoEDispatchCombineAutoTuner:
 
     @classmethod
     def register_handle(cls, handle: Any, result: EPAutoTuneResult) -> None:
-        """Bind ``result`` to ``id(handle)`` for paired-call reuse.
+        """Bind ``result`` to ``handle`` for paired-call reuse.
 
         Args:
             handle: Handle returned by the backend's ``dispatch`` call.
@@ -1425,20 +1431,23 @@ class MoEDispatchCombineAutoTuner:
         cache = cls._handle_cache
         if hid in cache:
             cache.move_to_end(hid)
-            cache[hid] = result
-        else:
-            cache[hid] = result
-            if len(cache) > cls._HANDLE_CACHE_MAX:
-                cache.popitem(last=False)
+        cache[hid] = (handle, result)
+        if len(cache) > cls._HANDLE_CACHE_MAX:
+            cache.popitem(last=False)
 
     @classmethod
     def lookup_handle(cls, handle: Any) -> Optional[EPAutoTuneResult]:
         """Return the result bound to ``handle``, or ``None`` if unknown."""
         if handle is None:
             return None
-        res = cls._handle_cache.get(id(handle))
-        if res is not None:
-            cls._handle_cache.move_to_end(id(handle))
+        entry = cls._handle_cache.get(id(handle))
+        if entry is None:
+            return None
+        stored_handle, res = entry
+        if stored_handle is not handle:
+            cls._handle_cache.pop(id(handle), None)
+            return None
+        cls._handle_cache.move_to_end(id(handle))
         return res
 
     @classmethod
@@ -1655,14 +1664,7 @@ def _maybe_tune_config(
     token_weights: Optional[torch.Tensor],
     num_experts: Optional[int],
 ) -> Tuple[str, EPBufferConfig, Optional[EPAutoTuneResult]]:
-    """Resolve ``(backend_name, buffer_config, autotune_result)`` for a call.
-
-    When autotune is disabled, returns the user-configured backend and buffer
-    config. When enabled, ignores the user's backend choice and selects the
-    fastest backend/config triple via the autotuner: first by handle lookup
-    (follow-up calls), then shape-keyed tune (primary dispatch), else the
-    last-run result as fallback.
-    """
+    """Tune the config for the given shape or get default config."""
     backend_name = _get_backend_name()
     user_cfg = _get_buffer_config(backend_name)
 
@@ -1670,33 +1672,25 @@ def _maybe_tune_config(
     if not GlobalBackendManager.auto_tune_enabled():
         return backend_name, user_cfg, None
 
-    # Autotune on: user's backend choice is ignored.
+    # Autotune on: user's backend choice is ignored when we have a tuned
+    # result to fall back to.
     result: Optional[EPAutoTuneResult] = None
 
-    # (a) Handle-keyed cache for follow-up calls (combine / cached / backward).
     if handle is not None:
         result = MoEDispatchCombineAutoTuner.lookup_handle(handle)
+    else:
+        if topk_idx is not None and token_weights is not None and num_experts is not None:
+            result = MoEDispatchCombineAutoTuner.get_or_tune(
+                group=group,
+                x=x,
+                num_experts=int(num_experts),
+                topk_idx=topk_idx,
+                topk_weights=token_weights,
+                num_sms=user_cfg.num_sms,
+            )
 
-    # (b) Primary dispatch: shape-keyed tune/lookup.
-    if (
-        result is None
-        and handle is None
-        and topk_idx is not None
-        and token_weights is not None
-        and num_experts is not None
-    ):
-        result = MoEDispatchCombineAutoTuner.get_or_tune(
-            group=group,
-            x=x,
-            num_experts=int(num_experts),
-            topk_idx=topk_idx,
-            topk_weights=token_weights,
-            num_sms=user_cfg.num_sms,
-        )
-
-    # (c) Fallback: reuse the most recent result if any.
-    if result is None:
-        result = MoEDispatchCombineAutoTuner.current()
+        if result is None:
+            result = MoEDispatchCombineAutoTuner.current()
 
     if result is not None:
         winner_cfg = _get_buffer_config(result.backend_name)

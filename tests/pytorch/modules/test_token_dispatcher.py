@@ -32,7 +32,7 @@ def _get_backends():
     try:
         import deep_ep  # noqa: F401
 
-        # TODO: add backend deepep, temporal disable it since rocm7.2 deepep bug.
+        # TODO: add backend deepep, temporarily disable it since rocm7.2 deepep bug.
         # return ["TURBO", "DEEP_EP"]
         # all_backends.append("DEEP_EP")
     except ImportError:
@@ -165,16 +165,12 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
     # ------------------------------------------------------------------
 
-    @parametrize("backend", _get_backends())
-    def test_autotune(self, backend):
+    def test_autotune(self):
         self._bind_device()
-        with patch.dict(
-            os.environ,
-            {
-                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
-                "PRIMUS_TURBO_AUTO_TUNE": "1",
-            },
-        ):
+        envs = {k: v for k, v in os.environ.items()}
+        envs.pop("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", None)
+        envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
+        with patch.dict(os.environ, envs, clear=True):
             _run_dispatch_combine(
                 self.rank,
                 self.pg,
