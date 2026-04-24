@@ -471,6 +471,14 @@ class _DeepEPLikeBackend:
             or self._buffer.num_rdma_bytes < num_rdma_bytes
         ):
             self._buffer = BufferClass(group, num_nvl_bytes, num_rdma_bytes, **buf_kwargs)
+            logger.info(
+                f"[{self.__class__.__name__} init] world_size={group.size()} "
+                f"rank={group.rank()} hidden={hidden_size} "
+                f"fp8_dispatch={fp8_dispatch} num_nvl_bytes={num_nvl_bytes} "
+                f"num_rdma_bytes={num_rdma_bytes} "
+                f"dispatch_config={dispatch_config} combine_config={combine_config}",
+                rank=0,
+            )
 
     # ----- helpers ------------------------------------------------------
 
@@ -915,7 +923,6 @@ class DeepEPBackend(_DeepEPLikeBackend):
 
 _ENV_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = "PRIMUS_TURBO_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
 _ENV_MORI_PREALLOC_MAX_RECV_TOKENS = "PRIMUS_TURBO_MORI_PREALLOC_MAX_RECV_TOKENS"
-_ENV_MORI_INTER_KERNEL_SWITCH_THRESHOLD = "PRIMUS_TURBO_MORI_INTER_KERNEL_SWITCH_THRESHOLD"
 _ENV_MORI_NUM_QP_PER_PE = "PRIMUS_TURBO_MORI_NUM_QP_PER_PE"
 
 
@@ -942,13 +949,6 @@ def _get_mori_dispatch_configs(
     """Return per-mode Mori kernel launch configs."""
     import mori.ops
 
-    inter_kernel_threshold = int(os.environ.get(_ENV_MORI_INTER_KERNEL_SWITCH_THRESHOLD, "256"))
-    inter_kernel_type = (
-        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
-        if num_max_dispatch_tokens_per_rank <= inter_kernel_threshold
-        else mori.ops.EpDispatchCombineKernelType.InterNodeV1
-    )
-
     return {
         _MoriEpMode.INTRA_NODE: _MoriDispatchCfg(
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
@@ -957,7 +957,7 @@ def _get_mori_dispatch_configs(
             rdma_block_num=0,
         ),
         _MoriEpMode.INTER_NODE: _MoriDispatchCfg(
-            kernel_type=inter_kernel_type,
+            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
             warp_num_per_block=8,
             block_num=64,
             rdma_block_num=32,
@@ -965,27 +965,29 @@ def _get_mori_dispatch_configs(
     }
 
 
+_MORI_SHMEM_PG_NAME = "mori"
+
+
 def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
-    """Register ``group`` with the Mori SHMEM runtime (idempotent)."""
+    """Register ``group`` with the Mori SHMEM runtime."""
     import mori.shmem
 
     assert dist.is_initialized(), "torch.distributed must be initialized before Mori SHMEM init."
 
-    cpu_group = getattr(group, "cpu_group", None) or group
-
-    group_name = "primus_turbo_mori_ep"
     try:
-        torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
-    except Exception as e:  # noqa: BLE001 - mori raises various types here.
+        torch._C._distributed_c10d._register_process_group(_MORI_SHMEM_PG_NAME, group)
+    except Exception as e:  # noqa: BLE001 - mori binds raise a mix of exception types.
         if "already registered" in str(e):
             logger.info(
                 f"[MORI init] Process group already registered under "
-                f"'{group_name}'; reusing existing SHMEM binding.",
+                f"'{_MORI_SHMEM_PG_NAME}'; reusing existing SHMEM binding "
+                f"({e}).",
                 rank=0,
             )
-            return
-        raise
-    mori.shmem.shmem_torch_process_group_init(group_name)
+        else:
+            raise
+    else:
+        mori.shmem.shmem_torch_process_group_init(_MORI_SHMEM_PG_NAME)
 
 
 def _resolve_mori_dispatch_cfg(
@@ -1031,7 +1033,6 @@ def _resolve_mori_dispatch_cfg(
 
 @lru_cache(maxsize=8)
 def _build_mori_op(
-    group: dist.ProcessGroup,
     rank: int,
     world_size: int,
     hidden: int,
@@ -1044,13 +1045,9 @@ def _build_mori_op(
     block_num: int,
     rdma_block_num: int,
 ):
-    """Build and cache a :class:`mori.ops.EpDispatchCombineOp`.
-
-    Kernel launch params are explicit args so ``lru_cache`` keys them.
-    """
+    """Build and cache a :class:`mori.ops.EpDispatchCombineOp`."""
     import mori.ops
 
-    max_total_recv_tokens = int(os.environ.get(_ENV_MORI_PREALLOC_MAX_RECV_TOKENS, "0"))
     num_qp_per_pe = int(os.environ.get(_ENV_MORI_NUM_QP_PER_PE, "2"))
 
     common_kwargs = dict(
@@ -1066,7 +1063,7 @@ def _build_mori_op(
         num_experts_per_token=num_topk,
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
-        max_total_recv_tokens=max_total_recv_tokens,
+        max_total_recv_tokens=0,
         use_external_inp_buf=True,
         kernel_type=kernel_type,
         gpu_per_node=torch.cuda.device_count(),
@@ -1108,7 +1105,6 @@ class MoriEPBackend:
 
     def __init__(self) -> None:
         self._group: Optional[dist.ProcessGroup] = None
-        # Fast-path reference; the op is owned by _build_mori_op's lru_cache.
         self._op = None
         self._hidden_size: int = 0
         self._num_local_experts: int = 0
@@ -1139,12 +1135,6 @@ class MoriEPBackend:
             return False
 
     @staticmethod
-    def _get_num_max_dispatch_tokens_per_rank(seqlen: int = 0) -> int:
-        """Return the per-rank max-tokens cap used to size Mori buffers."""
-        env_default = int(os.environ.get(_ENV_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, "4096"))
-        return max(env_default, int(seqlen))
-
-    @staticmethod
     def _derive_params_dtype(fp8_dispatch: bool) -> torch.dtype:
         """Pick the Mori ``data_type`` argument from ``fp8_dispatch``."""
         assert not fp8_dispatch, "Not implemented"
@@ -1172,11 +1162,11 @@ class MoriEPBackend:
         if self._group is not group:
             self._group = group
             _register_and_init_mori_shmem(group)
+            logger.info("[MoriEPBackend init] Mori SHMEM initialized.", rank=0)
 
         num_local_experts = num_experts // group.size()
-        num_max_tokens = self._get_num_max_dispatch_tokens_per_rank(seqlen)
         params_dtype = self._derive_params_dtype(fp8_dispatch)
-        kernel_cfg = _resolve_mori_dispatch_cfg(group, num_max_tokens, config)
+        kernel_cfg = _resolve_mori_dispatch_cfg(group, seqlen, config)
 
         # Rebuild on shape-signature or kernel-cfg change (_build_mori_op is cached).
         needs_rebuild = (
@@ -1184,7 +1174,7 @@ class MoriEPBackend:
             or self._hidden_size != hidden_size
             or self._num_local_experts != num_local_experts
             or self._num_topk != num_topk
-            or self._seqlen != num_max_tokens
+            or self._seqlen != seqlen
             or self._fp8_dispatch != fp8_dispatch
             or self._params_dtype != params_dtype
             or self._kernel_cfg != kernel_cfg
@@ -1193,21 +1183,20 @@ class MoriEPBackend:
         self._hidden_size = hidden_size
         self._num_local_experts = num_local_experts
         self._num_topk = num_topk
-        self._seqlen = num_max_tokens
+        self._seqlen = seqlen
         self._fp8_dispatch = fp8_dispatch
         self._params_dtype = params_dtype
         self._kernel_cfg = kernel_cfg
 
         if needs_rebuild:
             self._op = _build_mori_op(
-                group=group,
                 rank=group.rank(),
                 world_size=group.size(),
                 hidden=hidden_size,
                 params_dtype=params_dtype,
                 num_local_experts=num_local_experts,
                 num_topk=num_topk,
-                num_max_dispatch_tokens_per_rank=num_max_tokens,
+                num_max_dispatch_tokens_per_rank=seqlen,
                 kernel_type=kernel_cfg.kernel_type,
                 warp_num_per_block=kernel_cfg.warp_num_per_block,
                 block_num=kernel_cfg.block_num,
@@ -1268,26 +1257,33 @@ class MoriEPBackend:
             topk_idx_i32,
         )
         return combined_x, combined_topk_weights
-    
+
     @torch.no_grad()
     def tune_configs(
         self,
-        group: dist.ProcessGroup,
-        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        num_experts: int,
+        group: dist.ProcessGroup,  # noqa: ARG002 - stub.
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],  # noqa: ARG002
+        num_experts: int,  # noqa: ARG002
         *,
-        topk_idx: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        num_sms: int = 32,
-        num_tests: int = 20,
-        num_topk: Optional[int] = None,
-        uniform_dispatch: bool = True,
+        topk_idx: Optional[torch.Tensor] = None,  # noqa: ARG002
+        topk_weights: Optional[torch.Tensor] = None,  # noqa: ARG002
+        num_sms: int = 32,  # noqa: ARG002
+        num_tests: int = 20,  # noqa: ARG002
+        num_topk: Optional[int] = None,  # noqa: ARG002
+        uniform_dispatch: bool = True,  # noqa: ARG002
     ) -> Tuple[Any, Any, float, float]:
-        raise NotImplementedError("Tune configs is not implemented for MoriEPBackend")
+        raise NotImplementedError("tune_configs is not implemented for MoriEPBackend")
 
     def release_buffer(self) -> None:
-        """Drop the fast-path op reference (stays alive in lru_cache)."""
+        """Drop the fast-path op reference and SHMEM binding state."""
         self._op = None
+        self._hidden_size = 0
+        self._num_local_experts = 0
+        self._num_topk = 0
+        self._seqlen = 0
+        self._fp8_dispatch = False
+        self._params_dtype = None
+        self._kernel_cfg = None
 
 
 # =========================================================================
@@ -1520,6 +1516,15 @@ class MoEDispatchCombineAutoTuner:
                     num_topk=num_topk,
                     uniform_dispatch=uniform_dispatch,
                 )
+            except NotImplementedError:
+                # Backend opts out of config tuning (e.g. Mori has no
+                # user-tunable Config sweep space). Skip quietly.
+                logger.info(
+                    f"MoE autotune: backend '{name}' does not support " f"tune_configs; skipping.",
+                    once=True,
+                    rank=0,
+                )
+                continue
             except Exception as exc:  # pragma: no cover - defensive
                 # Use ``repr`` so pybind-backed errors aren't silently blank.
                 logger.warning(
