@@ -1,8 +1,8 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Portions of this file (`empty_suppress`, `suppress_stdout_stderr`, `bench_kineto`)
-# are adapted from the DeepEP project:
-#   https://github.com/deepseek-ai/DeepEP/blob/main/tests/utils.py
-#
+# See LICENSE for license information.
+###############################################################################
 
 import json
 import os
