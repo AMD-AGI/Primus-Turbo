@@ -319,9 +319,7 @@ class AttnBwdAiterBackend(KernelBackend):
         )
 
 
-@_torch_custom_op_wrapper(
-    "primus_turbo::attention_aiter_forward_impl", mutates_args=(), device_types="cuda"
-)
+@_torch_custom_op_wrapper("primus_turbo::attention_aiter_forward_impl", mutates_args=(), device_types="cuda")
 def attention_aiter_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -389,12 +387,8 @@ def _attention_aiter_forward_impl_fake(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, seq_len_q, num_heads_q, _ = q.shape
     _, _, _, head_dim_v = v.shape
-    out = torch.empty(
-        (batch_size, seq_len_q, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device
-    )
-    softmax_lse = torch.empty(
-        (batch_size, num_heads_q, seq_len_q), dtype=torch.float32, device=q.device
-    )
+    out = torch.empty((batch_size, seq_len_q, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device)
+    softmax_lse = torch.empty((batch_size, num_heads_q, seq_len_q), dtype=torch.float32, device=q.device)
     S_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     return out, softmax_lse, S_dmask, rng_state
