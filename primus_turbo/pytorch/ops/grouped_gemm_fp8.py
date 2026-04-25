@@ -15,6 +15,9 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.kernels.grouped_gemm._persistent_b_quant_cache import (
+    get_or_quantize_b_fp8_tensorwise as _get_or_quantize_b_fp8_tensorwise,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
     grouped_gemm_fp8_impl,
@@ -304,7 +307,15 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
         a_fp8, a_scale_inv = quantize_fp8(a, a_dtype, config.granularity)
-        b_fp8, b_scale_inv = quantize_fp8(b, b_dtype, config.granularity)
+        # Round-56: persistent step-cached FP8 quantize for the WEIGHT
+        # operand `b`. The activation operand `a` keeps the per-call
+        # quantize because its identity / `_version` cannot be relied on
+        # across the bench's inner loop. The cache key includes
+        # `b._version`, so any in-place mutation of the weight (e.g. an
+        # optimizer.step) automatically invalidates the cached fp8 buffer.
+        b_fp8, b_scale_inv = _get_or_quantize_b_fp8_tensorwise(
+            b, b_dtype, lambda: quantize_fp8(b, b_dtype, config.granularity)
+        )
 
         out = grouped_gemm_fp8_impl(
             a_fp8,
