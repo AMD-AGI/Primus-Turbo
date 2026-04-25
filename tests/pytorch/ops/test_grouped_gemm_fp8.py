@@ -14,7 +14,6 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -194,15 +193,6 @@ def _run_grouped_gemm_fp8_deterministic_test(
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
-    # gfx942: hipBLASLt path can hang/flake when M <= 512 (known issue).
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and backend is BackendType.HIPBLASLT
-        and granularity == ScalingGranularity.TENSORWISE
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512 (deterministic)")
 
     # Deterministic suite: fixed backend / no autotune.
     GlobalBackendManager.set_grouped_gemm_backend(backend)
@@ -401,16 +391,6 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
 
     if backend == BackendType.TRITON and format == Format.HYBRID:
         pytest.skip("TRITON backend not support HYBRID format currently")
-
-    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
-    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
-    # Skip also when auto_tune=True because the tuner may select hipBLASLt.
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and (backend is BackendType.HIPBLASLT or auto_tune is True)
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
 
     N, K = NK
     _run_grouped_gemm_fp8_test(
