@@ -21,6 +21,9 @@ from primus_turbo.pytorch.kernels.grouped_gemm._persistent_act_quant_cache impor
 from primus_turbo.pytorch.kernels.grouped_gemm._persistent_b_quant_cache import (
     get_or_quantize_b_fp8_tensorwise as _get_or_quantize_b_fp8_tensorwise,
 )
+from primus_turbo.pytorch.kernels.grouped_gemm._persistent_grad_quant_cache import (
+    get_or_quantize_grad_out_fp8_tensorwise as _get_or_quantize_grad_out_fp8_tensorwise,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_compute_offs,
     grouped_gemm_fp8_impl,
@@ -361,13 +364,19 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
 
         # For grad_a
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        # Round-57: same persistent step-cached FP8 quantize applied to
-        # `grad_out`. Inside the bench harness's inner loop the same
-        # `grad_out` tensor identity feeds dgrad and wgrad in succession
-        # — caching its fp8 form removes the second unary+reduce_row
-        # cluster as well. Cache invalidation is identical to the
-        # forward path (data_ptr/shape/dtype/_version + weakref liveness).
-        grad_out_fp8, grad_out_scale_inv = _get_or_quantize_act_fp8_tensorwise(
+        # Round-77: route the `grad_out` -> dC_fp8 tensorwise quantize
+        # through a DEDICATED persistent cache (separate from the R57
+        # activation cache). This isolates the grad_out surface from
+        # the forward-`a` surface so that the LRU eviction policies do
+        # not compete for slots when the bench harness sweeps multiple
+        # shapes. Mechanism is identical to R56/R57: keyed on
+        # (data_ptr, shape, dtype, _version, device) with a weakref
+        # liveness guard against PyTorch caching-allocator data_ptr
+        # recycling. Within ONE backward call dgrad and wgrad receive
+        # the SAME `grad_out` Tensor (autograd materialises it once),
+        # so the second consumer is a true cache hit and the second
+        # amax+scale+cast HIP-launch chain is elided.
+        grad_out_fp8, grad_out_scale_inv = _get_or_quantize_grad_out_fp8_tensorwise(
             grad_out,
             grad_out_dtype,
             lambda: quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity),
