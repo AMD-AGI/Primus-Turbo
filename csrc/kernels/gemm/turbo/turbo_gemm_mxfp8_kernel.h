@@ -653,6 +653,13 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
                 base_scale_soff[3] + scale_off);
         }
 
+        // RACE FIX: full vmcnt drain + s_barrier between Phase 1 and Phase 2.
+        // The earlier "lite" vmcnt<4> attempt leaked ~0.007% race in single-GEMM
+        // (caught at 5000-iter stress with K=16384, missed by 200-iter sweeps).
+        // vmcnt<0> is empirically clean for single-GEMM at 15000+ runs.
+        wait_vmcnt<0>();
+        __builtin_amdgcn_s_barrier();
+
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {
             uint32_t dm0_0 = __builtin_amdgcn_readfirstlane(a_smem_tile[cur][2].u32_ptr()) + sts_wb;
@@ -711,6 +718,8 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
                 base_scale_soff[1] + next_scale_off);
         }
 
+        // End-of-loop barrier: original vmcnt<12>+s_barrier (race-fix sweep
+        // showed full drain here is redundant once Phase 1→2 is barriered).
         wait_vmcnt<12>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
@@ -764,7 +773,10 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        wait_vmcnt<6>();
+        // RACE FIX: drain Epi1 buffer_load_lds (B1+A1 prefetch) and pending
+        // ds_reads before flipping the double buffer.
+        wait_vmcnt<0>();
+        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
