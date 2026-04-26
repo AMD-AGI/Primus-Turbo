@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
@@ -90,10 +91,26 @@ def _run_grouped_gemm_fp8_test(
     device = "cuda:0"
 
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    # MX_BLOCKWISE forward/dgrad require per-group M_g % 16 == 0 (preshuffle
+    # row-block alignment).  The turbo wgrad kernel additionally requires
+    # M_g % 128 == 0 (preshuffled scale col-block alignment).  The default
+    # unbalanced generator does not enforce either, so round each group to
+    # 128 here and absorb the slack into the last group.
+    if granularity == ScalingGranularity.MX_BLOCKWISE and not balance:
+        lens = group_lens.tolist()
+        rounded = [(int(x) // 128) * 128 for x in lens]
+        if rounded[-1] <= 0:
+            rounded[-1] = 128
+        slack = sum(lens) - sum(rounded)
+        rounded[-1] += slack
+        if rounded[-1] <= 0:
+            pytest.skip("Cannot 128-align group_lens for MX_BLOCKWISE: degenerate distribution.")
+        group_lens = torch.tensor(rounded, dtype=group_lens.dtype, device=device)
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
         f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
-        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}"
+        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}, "
+        f"group_lens={group_lens.tolist() if granularity == ScalingGranularity.MX_BLOCKWISE else '...'}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
@@ -110,8 +127,15 @@ def _run_grouped_gemm_fp8_test(
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    # Turbo
-    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
+    # Turbo — MX_BLOCKWISE requires E8M0 scale_dtype (others default to FP32).
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        if block_size is None:
+            block_size = 32
+        config = Float8QuantConfig(
+            format=format, granularity=granularity, block_size=block_size, scale_dtype=ScaleDtype.E8M0
+        )
+    else:
+        config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
 
     if cuda_graph:
         # CUDA graph mode: warmup -> capture -> replay
@@ -481,6 +505,50 @@ def test_grouped_gemm_fp8_blockwise(
         block_size=block_size,
         backend=backend,
         auto_tune=auto_tune,
+    )
+
+
+# MX_BLOCKWISE only supports NT layout (trans_b=True), and it has stricter
+# shape constraints than other granularities.  Use a smaller, focused sweep.
+_MX_NK_VALUES = [
+    (512, 384),       # smallest valid (k>=384)
+    (2048, 2048),
+    (8192, 2048),     # representative MoE FFN-down
+    (4096, 7168),
+]
+_MX_M_VALUES = [256, 1024, 2048]
+_MX_B_VALUES = [1, 2, 4, 8]
+
+
+@pytest.mark.parametrize("B", _MX_B_VALUES)
+@pytest.mark.parametrize("M", _MX_M_VALUES)
+@pytest.mark.parametrize("NK", _MX_NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, balance):
+    """MXFP8 grouped GEMM forward + dgrad (turbo kernel) + wgrad (Phase-1 bf16 fallback).
+
+    Phase 2 will replace the wgrad fallback with a real turbo variable-K MXFP8
+    kernel; the test continues to apply the same SNR thresholds.
+    """
+    N, K = NK
+    # gfx950-only path; skip if compute capability mismatches
+    if get_device_compute_capability() != (9, 5):
+        pytest.skip("MXFP8 grouped GEMM requires gfx950 (MI350/MI355).")
+    # MX_BLOCKWISE turbo backend currently NT-only; trans_b is fixed True.
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=True,
+        balance=balance,
+        backend=BackendType.TURBO,
+        auto_tune=False,
     )
 
 
