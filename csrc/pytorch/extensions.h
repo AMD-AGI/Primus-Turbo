@@ -242,16 +242,17 @@ at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor 
                                        at::Tensor &group_offs, const bool transA, const bool transB,
                                        at::ScalarType out_dtype, const std::string &granularity);
 
-at::Tensor turbo_grouped_gemm_fp8_wgrad(at::Tensor &lhs, at::Tensor &lhs_scales, at::Tensor &rhs,
-                                        at::Tensor &rhs_scales, at::Tensor &group_lens,
-                                        at::Tensor &group_offs, at::ScalarType out_dtype,
-                                        const std::string &granularity);
-
-at::Tensor turbo_grouped_gemm_fp8_wgrad_meta(at::Tensor &lhs, at::Tensor &lhs_scales,
+at::Tensor turbo_grouped_gemm_variable_k_fp8(at::Tensor &lhs, at::Tensor &lhs_scales,
                                              at::Tensor &rhs, at::Tensor &rhs_scales,
                                              at::Tensor &group_lens, at::Tensor &group_offs,
                                              at::ScalarType out_dtype,
                                              const std::string &granularity);
+
+at::Tensor turbo_grouped_gemm_variable_k_fp8_meta(at::Tensor &lhs, at::Tensor &lhs_scales,
+                                                  at::Tensor &rhs, at::Tensor &rhs_scales,
+                                                  at::Tensor &group_lens, at::Tensor &group_offs,
+                                                  at::ScalarType out_dtype,
+                                                  const std::string &granularity);
 
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 

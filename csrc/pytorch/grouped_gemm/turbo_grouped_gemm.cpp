@@ -167,7 +167,7 @@ static at::Tensor launch_mxfp8_grouped_wgrad(at::Tensor &lhs, at::Tensor &lhs_sc
                 primus_turbo::turbo_grouped_gemm_mxfp8_wgrad_impl<AType, BType, CType>(params);
                 return db;)))
 
-    PRIMUS_TURBO_ERROR("Unsupported dtype combination for turbo_grouped_gemm_fp8_wgrad MX_BLOCKWISE.");
+    PRIMUS_TURBO_ERROR("Unsupported dtype combination for turbo_grouped_gemm_variable_k_fp8 MX_BLOCKWISE.");
     return db;
 }
 
@@ -205,10 +205,11 @@ at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor 
 
 // ── Wgrad top-level entry ──
 
-at::Tensor turbo_grouped_gemm_fp8_wgrad(at::Tensor &lhs, at::Tensor &lhs_scales, at::Tensor &rhs,
-                                        at::Tensor &rhs_scales, at::Tensor &group_lens,
-                                        at::Tensor &group_offs, at::ScalarType out_dtype,
-                                        const std::string &granularity) {
+at::Tensor turbo_grouped_gemm_variable_k_fp8(at::Tensor &lhs, at::Tensor &lhs_scales,
+                                             at::Tensor &rhs, at::Tensor &rhs_scales,
+                                             at::Tensor &group_lens, at::Tensor &group_offs,
+                                             at::ScalarType out_dtype,
+                                             const std::string &granularity) {
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(lhs.scalar_type()), "LHS must be FP8.");
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(rhs.scalar_type()), "RHS must be FP8.");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype), "out_dtype must be fp16 or bf16.");
@@ -221,16 +222,16 @@ at::Tensor turbo_grouped_gemm_fp8_wgrad(at::Tensor &lhs, at::Tensor &lhs_scales,
         return launch_mxfp8_grouped_wgrad(lhs, lhs_scales, rhs, rhs_scales, group_lens, group_offs,
                                           out_dtype);
     }
-    PRIMUS_TURBO_ERROR("turbo_grouped_gemm_fp8_wgrad: unsupported granularity '" + granularity +
-                       "'.");
+    PRIMUS_TURBO_ERROR("turbo_grouped_gemm_variable_k_fp8: unsupported granularity '" +
+                       granularity + "'.");
     return at::Tensor();
 }
 
-at::Tensor turbo_grouped_gemm_fp8_wgrad_meta(at::Tensor &lhs, at::Tensor &lhs_scales,
-                                             at::Tensor &rhs, at::Tensor &rhs_scales,
-                                             at::Tensor &group_lens, at::Tensor &group_offs,
-                                             at::ScalarType out_dtype,
-                                             const std::string &granularity) {
+at::Tensor turbo_grouped_gemm_variable_k_fp8_meta(at::Tensor &lhs, at::Tensor &lhs_scales,
+                                                  at::Tensor &rhs, at::Tensor &rhs_scales,
+                                                  at::Tensor &group_lens, at::Tensor &group_offs,
+                                                  at::ScalarType out_dtype,
+                                                  const std::string &granularity) {
     const int64_t n         = lhs.size(0);
     const int64_t k         = rhs.size(0);
     const int64_t group_num = group_lens.numel();
