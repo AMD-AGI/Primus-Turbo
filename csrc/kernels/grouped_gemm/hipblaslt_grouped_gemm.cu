@@ -105,7 +105,16 @@ public:
             }
 
             for (size_t idx = 0; idx < num_gemms; ++idx) {
-                const auto stream_idx = idx % kMaxNumStreams;
+                // Stream-K kernels deadlock when concurrent instances of the
+                // same kernel run on different streams (gfx942 FP8 small-M).
+                // Pin SK calls to params.stream so they serialize.
+                const bool is_streamk = hipblaslt_gemm_is_streamk(
+                    params.handle, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
+                    params.transB ? HIPBLAS_OP_T : HIPBLAS_OP_N, params.a_type, rows_a_[idx],
+                    cols_a_[idx], ld_a_[idx], params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                    params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
+                    params.use_low_precision, params.scale_mode);
+                const auto stream_idx = is_streamk ? size_t{0} : (idx % kMaxNumStreams);
                 // Slot 0 uses the caller's stream and hipBLASLt handle (the
                 // PyTorch current stream/handle, which is already bound
                 // one-to-one). Extra slots use our internal streams bound via
