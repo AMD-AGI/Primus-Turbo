@@ -20,7 +20,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.core.low_precision import MXScalingRecipe
+from primus_turbo.pytorch.core.low_precision import ScalingRecipe
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
@@ -390,7 +390,7 @@ def _grouped_wgrad_turbo_mxfp8(
     """Phase-2 wgrad: turbo variable-K MXFP8 kernel.
 
     Quantizes grad_out (col-quant transposed → grad_out^T fp8 of shape (N, total_M)),
-    then calls turbo_grouped_gemm_fp8_wgrad with saved a^T fp8 of shape (K, total_M).
+    then calls turbo_grouped_gemm_variable_k_fp8 with saved a^T fp8 of shape (K, total_M).
     Output dB shape (G, N, K).
     """
     # We only need the col-wise (transposed) quantization here.  quantize_fp8_with_trans
@@ -399,7 +399,7 @@ def _grouped_wgrad_turbo_mxfp8(
         grad_out, grad_out_dtype, ScalingGranularity.MX_BLOCKWISE, block_size=MX_BLOCK_SIZE
     )
     # grad_out_t_fp8 shape (N, total_M_pad); a_t_fp8 shape (K, total_M_pad)
-    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8_wgrad(
+    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
         grad_out_t_fp8, grad_out_t_scale_inv, a_t_fp8, a_t_scale_inv,
         group_lens, group_offs, out_dtype, "MX_BLOCKWISE",
     )
@@ -468,8 +468,8 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             b_dtype,
             config.granularity,
             block_size=MX_BLOCK_SIZE,
-            scaling_recipe=MXScalingRecipe(use_2d_block=True),
-            scaling_recipe_for_trans=MXScalingRecipe(use_2d_block=True),
+            scaling_recipe=ScalingRecipe(use_2d_block=True),
+            scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
         )
         # b_fp8_row_2d: (G*N, K) → reshape to (G, N, K) for forward.
         b_fp8_row = b_fp8_row_2d.reshape(G, N, K)

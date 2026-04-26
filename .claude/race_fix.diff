@@ -1,0 +1,86 @@
+diff --git a/csrc/kernels/gemm/turbo/turbo_gemm_mxfp8_kernel.h b/csrc/kernels/gemm/turbo/turbo_gemm_mxfp8_kernel.h
+index bfd6942..62c6846 100644
+--- a/csrc/kernels/gemm/turbo/turbo_gemm_mxfp8_kernel.h
++++ b/csrc/kernels/gemm/turbo/turbo_gemm_mxfp8_kernel.h
+@@ -649,6 +649,12 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
+                 base_scale_soff[3] + scale_off);
+         }
+
++        // RACE FIX: drain Phase 1 buffer_load_lds (vmcnt) and ds_reads (lgkmcnt)
++        // and cross-wave sync before Phase 2 begins.  See grouped MXFP8 kernel.
++        wait_vmcnt<0>();
++        wait_lgkmcnt<0>();
++        __builtin_amdgcn_s_barrier();
++
+         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
+         {
+             uint32_t dm0_0 = __builtin_amdgcn_readfirstlane(a_smem_tile[cur][2].u32_ptr()) + sts_wb;
+@@ -707,7 +713,9 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
+                 base_scale_soff[1] + next_scale_off);
+         }
+
+-        wait_vmcnt<12>();
++        // RACE FIX: drain all vmcnt + lgkmcnt before flipping double buffers
++        wait_vmcnt<0>();
++        wait_lgkmcnt<0>();
+         __builtin_amdgcn_s_barrier();
+         cur ^= 1;
+         next ^= 1;
+diff --git a/csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_kernel.h b/csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_kernel.h
+index 7b3d8fe..c37b0b1 100644
+--- a/csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_kernel.h
++++ b/csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_kernel.h
+@@ -23,7 +23,8 @@ __device__ __forceinline__ bool resolve_grouped_tile(const int64_t *group_lens_p
+     int32_t cum_tiles = 0;
+ #pragma unroll 1
+     for (int32_t g = 0; g < group_num; ++g) {
+-        const int32_t M_iter  = static_cast<int32_t>(group_lens_ptr[g]);
++        const int32_t M_iter =
++            __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[g]));
+         const int32_t tiles_g = (M_iter + 255) / 256;
+         if (pid_m_flat < cum_tiles + tiles_g) {
+             group_id    = g;
+@@ -60,8 +61,18 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
+     const uint32_t warp_m  = tile.warp_m;
+     const uint32_t warp_n  = tile.warp_n;
+
+-    const uint32_t scale_cols   = (k + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
+-    const int64_t  m_global     = group_offs_ptr[group_id] + (int64_t) pid_m;
++    const uint32_t scale_cols = (k + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
++    // Force scalar (SGPR) load of group_offs_ptr[group_id]: group_id is uniform
++    // across the block but compiler may emit a vector load (vmcnt-tracked) if
++    // it can't prove it.  readfirstlane forces the s_load path (lgkmcnt-tracked,
++    // matches the wait sequence below).
++    const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
++        static_cast<uint32_t>(group_offs_ptr[group_id] & 0xffffffffULL));
++    const uint32_t group_offset_hi = __builtin_amdgcn_readfirstlane(
++        static_cast<uint32_t>(static_cast<uint64_t>(group_offs_ptr[group_id]) >> 32));
++    const int64_t group_offset =
++        (static_cast<int64_t>(group_offset_hi) << 32) | static_cast<int64_t>(group_offset_lo);
++    const int64_t  m_global     = group_offset + (int64_t) pid_m;
+     const int64_t  b_group_off  = (int64_t) group_id * (int64_t) n * (int64_t) k;
+     const int64_t  bs_group_off = (int64_t) group_id * (int64_t) n * (int64_t) scale_cols;
+
+@@ -190,6 +201,11 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
+                 base_scale_soff[3] + scale_off);
+         }
+
++        // RACE FIX: full drain Phase1→Phase2
++        wait_vmcnt<0>();
++        wait_lgkmcnt<0>();
++        __builtin_amdgcn_s_barrier();
++
+         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
+         {
+             uint32_t dm0_0 = __builtin_amdgcn_readfirstlane(a_smem_tile[cur][2].u32_ptr()) + sts_wb;
+@@ -248,7 +264,9 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
+                 base_scale_soff[1] + next_scale_off);
+         }
+
+-        wait_vmcnt<12>();
++        // RACE FIX: drain all vmcnt + lgkmcnt before flipping double buffers
++        wait_vmcnt<0>();
++        wait_lgkmcnt<0>();
+         __builtin_amdgcn_s_barrier();
+         cur ^= 1;
+         next ^= 1;
