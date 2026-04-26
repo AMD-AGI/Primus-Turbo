@@ -392,8 +392,78 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFP8TurboBackend(KernelBackend):
+    """Hand-tuned MXFP8 grouped GEMM kernel for GFX950 (MI350/MI355).
+
+    Variable-M MoE FFN pattern. Supports MX_BLOCKWISE only.
+    Layout: NT (trans_a=False, trans_b=True). Tile 256x256x128.
+    Shape constraints: total_M % 16 == 0, N % 16 == 0, K % 128 == 0, K >= 384.
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8TurboBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a and trans_b
+        total_m = a.shape[0]
+        n = b.shape[-2] if trans_b else b.shape[-1]
+        k = a.shape[1]
+        supported &= total_m % 16 == 0 and n % 16 == 0 and k % 128 == 0 and k >= 384
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            out_dtype,
+            granularity.name,
+        )
+
+
 class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
+        BackendType.TURBO: BackendEntry(GroupedGEMMFP8TurboBackend),
         BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
