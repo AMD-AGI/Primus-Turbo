@@ -171,8 +171,24 @@ export HIP_VISIBLE_DEVICES="$DEVICES"
 
 cd "$REPO_ROOT"
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
-"${PYTEST_CMD[@]}" >"$TMP" 2>&1
+
+# Run pytest in its own process group so that if the auto_optimize watchdog
+# kills *us*, we can take the whole pytest tree (and any -n xdist workers)
+# down with us instead of leaving zombie GPU-holders. SIGTERM/SIGINT/SIGHUP
+# arrive at this script first; the trap cleanly kills the pgid before exit.
+cleanup() {
+    rm -f "$TMP"
+    if [[ -n "${PYTEST_PID:-}" ]] && kill -0 -- -"$PYTEST_PID" 2>/dev/null; then
+        kill -TERM -- -"$PYTEST_PID" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- -"$PYTEST_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+setsid "${PYTEST_CMD[@]}" >"$TMP" 2>&1 &
+PYTEST_PID=$!
+wait "$PYTEST_PID"
 RC=$?
 
 if [[ "$RAW" -eq 1 ]]; then

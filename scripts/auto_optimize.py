@@ -609,6 +609,9 @@ def run_dod_checkpoint(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     section(f"DoD checkpoint: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
 
+    import os as _os
+    import signal as _signal
+
     proc = subprocess.Popen(
         cmd,
         shell=True,
@@ -617,13 +620,15 @@ def run_dod_checkpoint(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,  # new pgrp so we can kill the whole tree
     )
+    pgid = _os.getpgid(proc.pid)
 
     captured_lines: list[str] = []
 
     def _pump() -> None:
         with log_path.open("w") as logf:
-            logf.write(f"# Command: {cmd}\n# Started at: {now_iso()}\n\n")
+            logf.write(f"# Command: {cmd}\n# Started at: {now_iso()}\n# pgid: {pgid}\n\n")
             logf.flush()
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -634,15 +639,30 @@ def run_dod_checkpoint(
     pump_thread = threading.Thread(target=_pump, daemon=True)
     pump_thread.start()
 
+    def _killtree() -> None:
+        try:
+            _os.killpg(pgid, _signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            _os.killpg(pgid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
     try:
         rc = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        print(f"[dod] TIMEOUT after {timeout}s, killing pytest", flush=True)
-        proc.kill()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            pass
+        print(f"[dod] TIMEOUT after {timeout}s, killing pytest tree (pgid={pgid})", flush=True)
+        _killtree()
         pump_thread.join(timeout=5)
         return None, 124
 
