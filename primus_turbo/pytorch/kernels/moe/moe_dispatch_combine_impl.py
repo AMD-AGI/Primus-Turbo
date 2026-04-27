@@ -405,6 +405,12 @@ _BACKEND_REGISTRY: Dict[str, Type[EPBackend]] = {
 _backend_instances: Dict[str, EPBackend] = {}
 
 
+def clear_backend_instances():
+    global _backend_instances
+
+    _backend_instances.clear()
+
+
 def register_ep_backend(name: str, cls: Type[EPBackend]) -> None:
     """Register a new EP backend class (e.g. ``UCCL_EP``)."""
     _BACKEND_REGISTRY[name] = cls

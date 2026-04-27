@@ -74,11 +74,9 @@ private:
     volatile int *moe_recv_rdma_counter        = nullptr;
     int          *moe_recv_rdma_counter_mapped = nullptr;
 
-    // When true (default, controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM``),
-    // all dispatch/combine kernels are launched on the caller's current CUDA
-    // stream instead of ``comm_stream``, so EP can be captured inside
-    // ``torch.cuda.graph``.  When false, the original async path is used and
-    // ``comm_stream`` fork/joins with the compute stream for overlap.
+    // Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
+    // When true, all dispatch/combine kernels run on the caller's current CUDA
+    // stream instead of ``comm_stream``.
     bool force_current_stream = true;
 
     // Pick the launch stream for this dispatch/combine call.  Returns the

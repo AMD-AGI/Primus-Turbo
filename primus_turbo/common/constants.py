@@ -35,3 +35,7 @@ ENV_AUTO_TUNE = "PRIMUS_TURBO_AUTO_TUNE"
 # Whether Attention V3 uses FP32 atomic accumulation ("1" to enable, "0" to disable).
 # Default: "1" (enabled)
 ENV_ATTN_V3_ATOMIC_FP32 = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
+
+# When set to "1", EP dispatch/combine kernels run on the caller's current CUDA stream.
+# Default: "0"
+ENV_EP_FORCE_CURRENT_STREAM = "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"

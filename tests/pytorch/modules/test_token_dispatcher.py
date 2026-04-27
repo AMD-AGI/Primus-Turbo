@@ -52,6 +52,7 @@ def _run_dispatch_combine(
     deepep_num_worst_tokens=0,
     permute_max_token_num=0,
     expert_capacity_factor=None,
+    deepep_use_comm_stream=False,
 ):
     """Core dispatch-combine logic shared by all test variants."""
     dispatcher = turbo.modules.DeepEPTokenDispatcher(
@@ -63,6 +64,7 @@ def _run_dispatch_combine(
         deepep_num_worst_tokens=deepep_num_worst_tokens,
         permute_max_token_num=permute_max_token_num,
         expert_capacity_factor=expert_capacity_factor,
+        deepep_use_comm_stream=deepep_use_comm_stream,
     )
 
     hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
