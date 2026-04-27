@@ -441,37 +441,21 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
         tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k, c_tmp,
                              c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
-    wait_vmcnt<0>();
-    wait_lgkmcnt<0>();
-    __builtin_amdgcn_s_barrier();
 }
 
-// ── Entry kernel — flat 3D grid (N/256, K/256, G) ──
 template <typename AType, typename BType, typename CType, typename AccType = float>
-__global__ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_kernel(
+__global__ __launch_bounds__(256, 1) void
+turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *lhs_ptr, const BType *rhs_ptr, const uint32_t *lhs_s_ptr,
     const uint32_t *rhs_s_ptr, CType *db_ptr, const int64_t *group_lens_ptr,
-    const int64_t *group_offs_ptr, const uint32_t total_m, const uint32_t n, const uint32_t k) {
+    const int64_t *group_offs_ptr, const int32_t group_num, const uint32_t total_m,
+    const uint32_t n, const uint32_t k, const int32_t grid_n, const int32_t grid_k) {
 #if !defined(__gfx950__)
-    assert(false && "turbo_grouped_gemm_mxfp8_wgrad kernel requires gfx950");
+    assert(false && "turbo_grouped_gemm_mxfp8_wgrad persistent kernel requires gfx950");
     return;
 #else
-    const int32_t group_id = (int32_t) blockIdx.z;
-    const int32_t M_g =
-        __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[group_id]));
-    if (M_g <= 0)
-        return;  // empty group
-
     using GemmTile =
         GEMM_Tile_MXFP8_NT_256x256x128_16x16x128_4_WAVE_GFX950<AType, BType, CType, AccType>;
-    // For wgrad: tile.m = N (output dim 0), tile.n = K (output dim 1).
-    // tile.k = `total_m` (the LHS/RHS row stride in gmem), NOT M_g.  The
-    // GemmTile load primitives use tile.k as the row stride for soff math
-    // `(i * 64 + warp_id * MFMA_SIZE_M) * k` — must be the actual stride of
-    // the (N, total_M) and (K, total_M) tensors, not the per-group reduction
-    // length.  The K-loop bound is computed separately from M_g.
-    GemmTile tile(threadIdx.x, n, k, total_m);
-    tile.reserve_pinned_regs();
 
     using ASmem                       = typename GemmTile::ASmemSubtile;
     using BSmem                       = typename GemmTile::BSmemSubtile;
@@ -486,10 +470,30 @@ __global__ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256
     auto            *b_s_smem_tile =
         reinterpret_cast<BSSmem(*)[4]>(smem_buf + SMEM_DATA_BYTES + sizeof(ASSmem) * 2 * 4);
 
-    turbo_grouped_gemm_mxfp8_wgrad_compute_tile<GemmTile, AType, BType, CType>(
-        tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, lhs_ptr, rhs_ptr, lhs_s_ptr,
-        rhs_s_ptr, db_ptr, group_offs_ptr, group_id, (int32_t) blockIdx.x, (int32_t) blockIdx.y,
-        M_g, n, k, total_m);
+    GemmTile reserve_tile(threadIdx.x, n, k, total_m);
+    reserve_tile.reserve_pinned_regs();
+
+    const int32_t tiles_per_group = grid_n * grid_k;
+    const int32_t total_tiles     = tiles_per_group * group_num;
+    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles; tile_id += (int32_t) gridDim.x) {
+        const int32_t group_id = tile_id / tiles_per_group;
+        const int32_t rem      = tile_id - group_id * tiles_per_group;
+        const int32_t pid_k    = rem / grid_n;
+        const int32_t pid_n    = rem - pid_k * grid_n;
+
+        const int32_t M_g =
+            __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[group_id]));
+        if (M_g <= 0) {
+            continue;
+        }
+
+        GemmTile tile(threadIdx.x, n, k, total_m);
+        turbo_grouped_gemm_mxfp8_wgrad_compute_tile<GemmTile, AType, BType, CType>(
+            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, lhs_ptr, rhs_ptr,
+            lhs_s_ptr, rhs_s_ptr, db_ptr, group_offs_ptr, group_id, pid_n, pid_k, M_g, n, k,
+            total_m);
+        __builtin_amdgcn_s_barrier();
+    }
 #endif
 }
 

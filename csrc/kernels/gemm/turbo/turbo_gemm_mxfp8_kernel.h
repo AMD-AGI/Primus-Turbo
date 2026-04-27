@@ -288,8 +288,11 @@ public:
                 for (int i = 0; i < 4; ++i) {
                     int32_t row = tr * MFMA_SIZE_M + lane_id / 16 * 4 + i;
                     int32_t col = tc * MFMA_SIZE_N + lane_id % 16;
-                    if (row < valid_rows && col < valid_cols)
-                        c_stg_ptr[c_stg_offsets[i]] = CType(c_frags[tr][tc][i]);
+                    if (row < valid_rows && col < valid_cols) {
+                        const CType    out_val = CType(c_frags[tr][tc][i]);
+                        const uint16_t raw     = __builtin_bit_cast(uint16_t, out_val);
+                        *reinterpret_cast<volatile uint16_t *>(c_stg_ptr + c_stg_offsets[i]) = raw;
+                    }
                 }
             }
         }
@@ -346,6 +349,10 @@ public:
     template <int PIN_A, int PIN_B, int PIN_ACC, int PIN_SA, int PIN_SB>
     __device__ __forceinline__ static void mfma_scale_pinned() {
         Mfma::template run_pinned_acc_agpr<PIN_A, PIN_B, PIN_ACC, PIN_SA, PIN_SB>();
+        clobber_agpr_one<PIN_ACC + 0>();
+        clobber_agpr_one<PIN_ACC + 1>();
+        clobber_agpr_one<PIN_ACC + 2>();
+        clobber_agpr_one<PIN_ACC + 3>();
     }
 
     // 16 MFMA + LDS prefetch (no GMEM prefetch). Used in epilogue phases.
@@ -387,6 +394,7 @@ public:
         mfma_scale_pinned<PIN_A + 24, PIN_B + 8, ACC + 52, PIN_SA + 3, PIN_SB + 1>();
         mfma_scale_pinned<PIN_A + 24, PIN_B + 16, ACC + 56, PIN_SA + 3, PIN_SB + 2>();
         mfma_scale_pinned<PIN_A + 24, PIN_B + 24, ACC + 60, PIN_SA + 3, PIN_SB + 3>();
+        wait_lgkmcnt<0>();
     }
 
     // 16 MFMA only (no memory ops). Used for the final epilogue phases.
@@ -447,7 +455,9 @@ public:
         ds_read_pinned<4, PIN_NEXT_S + 2, 512>(sbase);
         ds_read_pinned<4, PIN_NEXT_S + 3, 768>(sbase);
 
-        // WAR barrier
+        // WAR barrier: all LDS reads for the next pinned register set must
+        // retire before buffer_load_lds overwrites the same LDS region.
+        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         // MFMA #6-#15: GMEM->SMEM prefetch spread across MFMA gaps

@@ -57,6 +57,7 @@ constexpr int FP4_TARGET_MAX_POW2 = 2;
 
 constexpr int FP8E5M2_MANTISSA_BITS   = 2;
 constexpr int FP8E5M2_EXPONENT_BITS   = 5;
+constexpr float FP8E5M2_MAX           = 57344.0;
 constexpr int FP8E5M2_TARGET_MAX_POW2 = 15;
 
 constexpr int FP8E4M3_MANTISSA_BITS = 3;

@@ -52,16 +52,16 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
         <<<(group_num * n) / 16, 64, 0, params.stream>>>(b_scale_raw, b_scale_preshuf,
                                                          group_num * n, scale_cols);
 
-    // 3D grid: (max per-group m tiles, n tiles, group). Per-group padding tiles
-    // early-exit in the kernel, while group_id stays a direct blockIdx.z value.
-    const int32_t grid_x = params.grid_x;
-    const int32_t grid_y = (n + 255) / 256;
-    dim3          grid((unsigned) grid_x, (unsigned) grid_y, (unsigned) group_num);
+    const int32_t grid_m = params.grid_x;
+    const int32_t grid_n = (n + 255) / 256;
+    dim3          grid(256);
     dim3          block(256);
-    turbo::turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_kernel<AType, BType, CType>
+    turbo::turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel<AType, BType,
+                                                                                   CType>
         <<<grid, block, 0, params.stream>>>(
             params.a_ptr, params.b_ptr, a_scale_preshuf, b_scale_preshuf, params.c_ptr,
-            params.group_lens_ptr, params.group_offs_ptr, group_num, (uint32_t) n, (uint32_t) k);
+            params.group_lens_ptr, params.group_offs_ptr, group_num, (uint32_t) n, (uint32_t) k,
+            grid_m, grid_n);
 }
 
 // ── Explicit instantiations ──
@@ -119,17 +119,17 @@ void turbo_grouped_gemm_mxfp8_wgrad_impl(
     turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
         <<<k / 16, 64, 0, params.stream>>>(rhs_scale_raw, rhs_scale_preshuf, k, scale_cols);
 
-    // Grid: (N/256, K/256, G) — exact, no padding.
-    const int32_t grid_x = (n + 255) / 256;
-    const int32_t grid_y = (k + 255) / 256;
-    const int32_t grid_z = group_num;
-    dim3          grid((unsigned) grid_x, (unsigned) grid_y, (unsigned) grid_z);
+    const int32_t grid_n = (n + 255) / 256;
+    const int32_t grid_k = (k + 255) / 256;
+    dim3          grid(256);
     dim3          block(256);
-    turbo::turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_kernel<AType, BType, CType>
+    turbo::turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel<AType,
+                                                                                         BType,
+                                                                                         CType>
         <<<grid, block, 0, params.stream>>>(
             params.lhs_ptr, params.rhs_ptr, lhs_scale_preshuf, rhs_scale_preshuf, params.db_ptr,
-            params.group_lens_ptr, params.group_offs_ptr, (uint32_t) total_m, (uint32_t) n,
-            (uint32_t) k);
+            params.group_lens_ptr, params.group_offs_ptr, group_num, (uint32_t) total_m,
+            (uint32_t) n, (uint32_t) k, grid_n, grid_k);
 }
 
 #define INSTANTIATE_TURBO_GROUPED_GEMM_WGRAD(A, B, C)                                              \

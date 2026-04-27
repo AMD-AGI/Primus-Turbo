@@ -26,6 +26,7 @@ import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 
@@ -36,6 +37,12 @@ GRANULARITY_CONFIG_MAP = {
         format=Format.E4M3,
         granularity=ScalingGranularity.BLOCKWISE,
         block_size=128,
+    ),
+    "mxfp8": Float8QuantConfig(
+        format=Format.E4M3,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
     ),
 }
 
@@ -286,7 +293,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--granularity",
         type=str,
-        choices=["tensorwise", "rowwise", "blockwise"],
+        choices=["tensorwise", "rowwise", "blockwise", "mxfp8"],
         default="tensorwise",
         help="FP8 scaling granularity (only used when dtype=fp8, default: tensorwise)",
     )
