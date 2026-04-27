@@ -230,6 +230,64 @@ def _bf16_grouped_probe(name: str, b_groups: int, m: int, n: int, k: int,
 
 
 # ----------------------------------------------------------------------------
+# BF16 grouped GEMM variable-K (CRR / dB) probes — direct backend dispatch.
+#
+# We call GroupedGEMMVariableKHipKittenBackend.execute directly because some
+# CRR shapes in the allow-list don't have a matching RCR forward that would
+# exercise them through autograd (e.g. DeepSeek Down dB (7168, 2048, 4096)).
+#
+# Variable-K convention used in primus_turbo's autograd:
+#   a: [B*M, K], b: [B*M, N], trans_a=True, trans_b=False, trans_c=True
+#   -> per-group output = (b[g].T @ a[g])  shape [N, K]
+#   -> stacked output [B, N, K]
+# The HIPKITTEN allow-list keys this as _grouped_bf16_supported(N, K, M, "crr").
+# ----------------------------------------------------------------------------
+
+def _bf16_grouped_variable_k_probe(name: str, b_groups: int,
+                                    m: int, n: int, k: int) -> tuple[bool, str]:
+    try:
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+            GroupedGEMMVariableKHipKittenBackend,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{name} import failed: {exc!r}"
+    device = "cuda"
+    a = torch.randn((b_groups * m, k), dtype=torch.bfloat16, device=device)
+    b = torch.randn((b_groups * m, n), dtype=torch.bfloat16, device=device)
+    group_lens = torch.full((b_groups,), m, dtype=torch.int64, device=device)
+    group_offs = torch.zeros(b_groups + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+    if not GroupedGEMMVariableKHipKittenBackend.can_handle(
+        a, b, group_lens, group_offs,
+        trans_a=True, trans_b=False, trans_c=True, num_cu=None,
+    ):
+        return False, f"{name} variable_k can_handle=False"
+    try:
+        out = GroupedGEMMVariableKHipKittenBackend.execute(
+            a, b, group_lens, group_offs,
+            trans_a=True, trans_b=False, trans_c=True, num_cu=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{name} variable_k raised: {exc!r}"
+    if out.shape != (b_groups, n, k):
+        return False, f"{name} variable_k wrong shape {tuple(out.shape)} != {(b_groups, n, k)}"
+    if torch.isnan(out).any() or torch.isinf(out).any():
+        return False, f"{name} variable_k NaN/Inf in output"
+    biggest = max(b_groups * m * n, b_groups * m * k, b_groups * n * k)
+    if biggest > SNR_MAX_ELEMS:
+        return True, f"{name} ok (no-snr, big shape)"
+    out_ref = torch.empty_like(out)
+    for g in range(b_groups):
+        a_g = a[g * m:(g + 1) * m].float()
+        b_g = b[g * m:(g + 1) * m].float()
+        out_ref[g] = (b_g.T @ a_g).to(torch.bfloat16)
+    snr = compute_snr(out_ref, out)
+    if snr < SNR_BF16:
+        return False, f"{name} variable_k SNR={snr:.1f}"
+    return True, f"{name} ok (SNR={snr:.1f})"
+
+
+# ----------------------------------------------------------------------------
 # FP8 dense GEMM probes (optional, requires gemm_fp8 op + HIPKITTEN FP8 backend)
 # ----------------------------------------------------------------------------
 
@@ -339,6 +397,12 @@ def _bf16_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     # Mirror _grouped_bf16_supported; B=2 matches the existing pytest case.
     rcr_shapes = [(4096, 4096, 7168)]
     rrr_shapes = [(4096, 2048, 7168), (4096, 4096, 7168), (4096, 7168, 4096)]
+    # Variable-K CRR (dB-style) shapes — keys interpreted as
+    # _grouped_bf16_supported(N, K, M, "crr"), i.e. tuple = (n, k, m).
+    crr_shapes = [
+        (4096, 7168, 4096),  # DeepSeek GateUP dB (also reachable via RCR full)
+        (7168, 2048, 4096),  # DeepSeek Down dB (only reachable via direct probe)
+    ]
     out: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
     for (m, n, k) in rcr_shapes:
         n_, k_ = n, k
@@ -359,7 +423,73 @@ def _bf16_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
             lambda M=m, N=n, K=k:
                 _bf16_grouped_probe(f"GR_RRR_{M}x{N}x{K}_fwd", 2, M, N, K, False, False),
         ))
+    for (n, k, m) in crr_shapes:
+        out.append((
+            f"GR_CRR_n{n}_k{k}_m{m}",
+            lambda M=m, N=n, K=k:
+                _bf16_grouped_variable_k_probe(f"GR_CRR_n{N}_k{K}_m{M}", 2, M, N, K),
+        ))
     return out
+
+
+# ----------------------------------------------------------------------------
+# FP8 grouped GEMM probes — forward (RCR/RRR) and full RCR fwd+bwd which
+# exercises GroupedGEMMFP8VariableKHipKittenBackend (CRR dB).
+# ----------------------------------------------------------------------------
+
+def _fp8_grouped_probe(name: str, b_groups: int, m: int, n: int, k: int,
+                       trans_b: bool, check_backward: bool) -> tuple[bool, str]:
+    try:
+        from primus_turbo.pytorch.ops import grouped_gemm_fp8
+        from primus_turbo.pytorch.core.low_precision import (
+            Float8QuantConfig,
+            Format,
+            ScalingGranularity,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{name} fp8 import failed: {exc!r}"
+    device = "cuda"
+    a = torch.randn((b_groups * m, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    b_shape = (b_groups, n, k) if trans_b else (b_groups, k, n)
+    b = torch.randn(b_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+    group_lens = torch.full((b_groups,), m, dtype=torch.int64, device=device)
+    a_ref = a.detach().clone()
+    b_ref = b.detach().clone()
+    config = Float8QuantConfig(
+        format=Format.E4M3,
+        granularity=ScalingGranularity.TENSORWISE,
+        block_size=None,
+    )
+    with hipkitten_backend(grouped=True):
+        try:
+            out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{name} fp8 grouped fwd raised: {exc!r}"
+    out_ref = torch.empty_like(out)
+    offset = 0
+    for gi in range(b_groups):
+        a_g = a_ref[offset:offset + m].float()
+        b_g = b_ref[gi].T.float() if trans_b else b_ref[gi].float()
+        out_ref[offset:offset + m] = (a_g @ b_g).to(torch.bfloat16)
+        offset += m
+    if torch.isnan(out).any() or torch.isinf(out).any():
+        return False, f"{name} fp8 grouped NaN/Inf in output"
+    snr = compute_snr(out_ref, out)
+    if snr < SNR_FP8:
+        return False, f"{name} fp8 grouped SNR={snr:.1f}"
+    if check_backward:
+        grad = torch.randn_like(out)
+        with hipkitten_backend(grouped=True):
+            try:
+                out.backward(grad)
+            except Exception as exc:  # noqa: BLE001
+                return False, f"{name} fp8 grouped bwd raised: {exc!r}"
+        if a.grad is None or b.grad is None:
+            return False, f"{name} fp8 grouped bwd grads missing"
+        for nm, g in (("a", a.grad), ("b", b.grad)):
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                return False, f"{name} fp8 grouped bwd NaN/Inf in {nm}.grad"
+    return True, f"{name} ok (SNR={snr:.1f})"
 
 
 def _fp8_dense_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
@@ -381,11 +511,43 @@ def _fp8_dense_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     return out
 
 
+def _fp8_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
+    """FP8 grouped probes: RCR fwd + RCR full fwd+bwd (covers variable-K CRR).
+
+    The HIPKITTEN FP8 grouped backend has no shape allow-list (it pads and
+    loops per group), so any shape works. We pick the smallest shape from
+    the FP8 cache (4096, 4096, 4096) plus an RRR forward to keep the loop
+    fast — backward exercises the variable-K CRR path automatically.
+    """
+    if not FP8_CACHE.exists():
+        return []
+    fp8_shape = (4096, 4096, 4096)
+    out: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
+    m, n, k = fp8_shape
+    out.append((
+        f"GR_FP8_RCR_{m}x{n}x{k}_fwd",
+        lambda M=m, N=n, K=k:
+            _fp8_grouped_probe(f"GR_FP8_RCR_{M}x{N}x{K}_fwd", 2, M, N, K, True, False),
+    ))
+    out.append((
+        f"GR_FP8_RCR_{m}x{n}x{k}_full",
+        lambda M=m, N=n, K=k:
+            _fp8_grouped_probe(f"GR_FP8_RCR_{M}x{N}x{K}_full", 2, M, N, K, True, True),
+    ))
+    out.append((
+        f"GR_FP8_RRR_{m}x{n}x{k}_fwd",
+        lambda M=m, N=n, K=k:
+            _fp8_grouped_probe(f"GR_FP8_RRR_{M}x{N}x{K}_fwd", 2, M, N, K, False, False),
+    ))
+    return out
+
+
 def collect_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     probes: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
     probes.extend(_bf16_dense_probes())
     probes.extend(_bf16_grouped_probes())
     probes.extend(_fp8_dense_probes())
+    probes.extend(_fp8_grouped_probes())
     probes.append(("H1_reject_unsupported", _can_handle_reject_probe))
     return probes
 
