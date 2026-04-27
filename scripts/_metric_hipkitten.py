@@ -690,6 +690,14 @@ def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool,
     not represented in any cache entry today):
       - probe (4096, 4096, 14336) -> crr_4096_14336_4096  DeepSeek long-K dB
       - probe (8192, 8192, 4096)  -> crr_8192_4096_8192   gpt_oss MoE dB
+
+    Extra cache-hit shapes added in this round (each verified at SNR=28.5 dB
+    via standalone /tmp/verify_fp8_crr.py probe before adding):
+      - probe (14336, 4096, 4096) -> crr_4096_4096_14336  DeepSeek long-K dB (group_m=4)
+      - probe (4096, 4096, 22016) -> crr_4096_22016_4096  DeepSeek MLP up dB (group_m=8)
+      - probe (4096, 8192, 6144)  -> crr_8192_6144_4096   gpt_oss MoE small (group_m=8)
+      - probe (4096, 16384, 4096) -> crr_16384_4096_4096  gpt_oss MoE wide-N (group_m=8)
+      - probe (14336, 8192, 4096) -> crr_8192_4096_14336  DeepSeek long-K wide (group_m=4)
     """
     if not FP8_CACHE.exists():
         return []
@@ -703,6 +711,11 @@ def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool,
         (4096, 4096, 6144),
         (4096, 4096, 14336),
         (8192, 8192, 4096),
+        (14336, 4096, 4096),
+        (4096, 4096, 22016),
+        (4096, 8192, 6144),
+        (4096, 16384, 4096),
+        (14336, 8192, 4096),
     ]
     for (m, n, k) in shapes:
         out.append((
