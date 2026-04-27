@@ -433,6 +433,77 @@ def _bf16_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
 
 
 # ----------------------------------------------------------------------------
+# FP8 grouped GEMM variable-K (CRR / dB) probes — direct backend dispatch.
+#
+# The full RCR fwd+bwd probe in `_fp8_grouped_probes` covers
+# GroupedGEMMFP8VariableKHipKittenBackend at a single shape (4096,4096,4096)
+# via autograd. Direct probes at additional FP8 CRR cache shapes give us
+# isolation from the autograd plumbing and broaden cache coverage.
+#
+# Variable-K convention (matches BF16 probe):
+#   a: [B*M, K] fp8, b: [B*M, N] fp8, trans_a=True, trans_b=False, trans_c=True
+#   per-group output = (b[g].T @ a[g]) -> [N, K], stacked into [B, N, K].
+# Cache key in HipKittens kernel space: crr_<probe_n>_<probe_k>_<probe_m>.
+# ----------------------------------------------------------------------------
+
+def _fp8_grouped_variable_k_probe(name: str, b_groups: int,
+                                   m: int, n: int, k: int) -> tuple[bool, str]:
+    try:
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+            GroupedGEMMFP8VariableKHipKittenBackend,
+        )
+        from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+            quantize_fp8_tensorwise_impl,
+        )
+        from primus_turbo.pytorch.core.low_precision import (
+            ScalingGranularity,
+            float8_e4m3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{name} fp8 var_k import failed: {exc!r}"
+    device = "cuda"
+    a_bf = torch.randn((b_groups * m, k), dtype=torch.bfloat16, device=device)
+    b_bf = torch.randn((b_groups * m, n), dtype=torch.bfloat16, device=device)
+    group_lens = torch.full((b_groups,), m, dtype=torch.int64, device=device)
+    group_offs = torch.zeros(b_groups + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+    a_fp8, a_scale_inv = quantize_fp8_tensorwise_impl(a_bf, float8_e4m3)
+    b_fp8, b_scale_inv = quantize_fp8_tensorwise_impl(b_bf, float8_e4m3)
+    if not GroupedGEMMFP8VariableKHipKittenBackend.can_handle(
+        a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs,
+        trans_a=True, trans_b=False, trans_c=True,
+        out_dtype=torch.bfloat16, granularity=ScalingGranularity.TENSORWISE,
+        num_cu=None,
+    ):
+        return False, f"{name} fp8 var_k can_handle=False"
+    try:
+        out = GroupedGEMMFP8VariableKHipKittenBackend.execute(
+            a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs,
+            trans_a=True, trans_b=False, trans_c=True,
+            out_dtype=torch.bfloat16, granularity=ScalingGranularity.TENSORWISE,
+            num_cu=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{name} fp8 var_k raised: {exc!r}"
+    if out.shape != (b_groups, n, k):
+        return False, f"{name} fp8 var_k wrong shape {tuple(out.shape)} != {(b_groups, n, k)}"
+    if torch.isnan(out).any() or torch.isinf(out).any():
+        return False, f"{name} fp8 var_k NaN/Inf in output"
+    biggest = max(b_groups * m * n, b_groups * m * k, b_groups * n * k)
+    if biggest > SNR_MAX_ELEMS:
+        return True, f"{name} ok (no-snr, big shape)"
+    out_ref = torch.empty_like(out)
+    for g in range(b_groups):
+        a_g = a_bf[g * m:(g + 1) * m].float()
+        b_g = b_bf[g * m:(g + 1) * m].float()
+        out_ref[g] = (b_g.T @ a_g).to(torch.bfloat16)
+    snr = compute_snr(out_ref, out)
+    if snr < SNR_FP8:
+        return False, f"{name} fp8 var_k SNR={snr:.1f} dB < {SNR_FP8}"
+    return True, f"{name} ok (SNR={snr:.1f})"
+
+
+# ----------------------------------------------------------------------------
 # FP8 grouped GEMM probes — forward (RCR/RRR) and full RCR fwd+bwd which
 # exercises GroupedGEMMFP8VariableKHipKittenBackend (CRR dB).
 # ----------------------------------------------------------------------------
@@ -542,12 +613,41 @@ def _fp8_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     return out
 
 
+def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
+    """Direct probes for GroupedGEMMFP8VariableKHipKittenBackend (CRR / dB).
+
+    Three FP8 CRR cache shapes (kernel M_N_K → probe (M_p, N_p, K_p)):
+      - crr_4096_4096_4096   → probe (4096, 4096, 4096)   baseline / DeepSeek 4096^3
+      - crr_4096_12288_4096  → probe (4096, 4096, 12288)  DeepSeek MLP K-major
+      - crr_4096_8192_8192   → probe (8192, 4096, 8192)   GQA-ish, mid-size
+    All three cache shapes are present in the FP8 .autotune_cache.json so the
+    fast (no-pad) branch is exercised, with B=2 to mirror the existing pytest
+    case. Each ok adds 100 to the metric score.
+    """
+    if not FP8_CACHE.exists():
+        return []
+    out: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
+    shapes = [
+        (4096, 4096, 4096),
+        (4096, 4096, 12288),
+        (8192, 4096, 8192),
+    ]
+    for (m, n, k) in shapes:
+        out.append((
+            f"GR_FP8_CRR_n{n}_k{k}_m{m}",
+            lambda M=m, N=n, K=k:
+                _fp8_grouped_variable_k_probe(f"GR_FP8_CRR_n{N}_k{K}_m{M}", 2, M, N, K),
+        ))
+    return out
+
+
 def collect_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     probes: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
     probes.extend(_bf16_dense_probes())
     probes.extend(_bf16_grouped_probes())
     probes.extend(_fp8_dense_probes())
     probes.extend(_fp8_grouped_probes())
+    probes.extend(_fp8_grouped_variable_k_probes())
     probes.append(("H1_reject_unsupported", _can_handle_reject_probe))
     return probes
 
