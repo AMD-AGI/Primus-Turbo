@@ -85,6 +85,12 @@ DEFAULT_METRIC_CMD = "python3 scripts/_metric_hipkitten.py"
 # occasionally to confirm we haven't regressed the broader sweeps. Empty by
 # default so the loop doesn't measure it.
 DEFAULT_DETERMINISTIC_CMD = ""
+# DoD checkpoint: every N rounds we run the full 4-file pytest suite as a
+# regression guardrail. The fast metric (DEFAULT_METRIC_CMD) doesn't catch
+# every shape — e.g. the user-facing op layer assertions and the
+# non-HIPKITTEN backend regressions are only covered in pytest.
+DEFAULT_DOD_EVERY = 5
+DEFAULT_DOD_CMD = "bash scripts/run_dod_metric.sh --full"
 CLI_CONFIG_PATH = Path(os.path.expanduser("~/.cursor/cli-config.json"))
 
 
@@ -124,6 +130,9 @@ class TrajectoryState:
     best_metric: Optional[float] = None
     best_sha: Optional[str] = None
     rounds_without_improvement: int = 0
+    dod_checkpoints: list[dict] = field(default_factory=list)
+    last_dod_score: Optional[int] = None
+    last_dod_sha: Optional[str] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,6 +189,30 @@ def parse_args() -> argparse.Namespace:
             "Quoted into the agent prompt so it knows the second half of 'all pass'. "
             "Set to empty string to omit."
         ),
+    )
+    p.add_argument(
+        "--dod-every",
+        type=int,
+        default=DEFAULT_DOD_EVERY,
+        help=(
+            "Run the full-DoD pytest checkpoint every N rounds (0 disables). "
+            "Catches regressions the fast probe metric can't see."
+        ),
+    )
+    p.add_argument(
+        "--dod-cmd",
+        type=str,
+        default=DEFAULT_DOD_CMD,
+        help=(
+            "Shell command run on each DoD checkpoint. Should print a single "
+            "integer score where score >= 0 means all-pass."
+        ),
+    )
+    p.add_argument(
+        "--dod-timeout",
+        type=int,
+        default=60 * 30,
+        help="Seconds to allow each DoD checkpoint (default 30 min).",
     )
     p.add_argument(
         "--workspace",
@@ -333,6 +366,28 @@ def build_prompt(
         )
     history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
 
+    dod_block = ""
+    if args.dod_every > 0:
+        last_dod_line = (
+            f"上一次 DoD score = {state.last_dod_score}（SHA {(state.last_dod_sha or '')[:8]}）"
+            if state.last_dod_score is not None
+            else "尚未跑过 DoD checkpoint"
+        )
+        dod_block = (
+            f"\n【DoD 检查点（每 {args.dod_every} 轮自动跑一次，不需要你手动跑）】\n"
+            f"脚本会在第 {args.dod_every}, {2*args.dod_every}, ... 轮结束后自动执行：\n"
+            f"  {args.dod_cmd}\n"
+            f"它跑 4 文件全套 pytest（test_gemm{{,_fp8}}, test_grouped_gemm{{,_fp8}}），"
+            f"任何 failed > 0 都会让脚本立刻 EARLY-STOP。所以你 commit 的时候要小心：\n"
+            f"  - 如果你的改动只触及 HIPKITTEN 路径（grouped_gemm_impl.GroupedGEMMHipKittenBackend、"
+            f"gemm_fp8_impl.GEMMFP8HipKittenBackend、cache 文件读取等），快 metric 通常足够。\n"
+            f"  - 如果你触及任何**共用代码**（autograd 入口、dispatcher、quantize_fp8_*、"
+            f"grouped_gemm.py 顶层、torch.library custom_op 注册等），你**必须**怀疑会影响"
+            f"非 HIPKITTEN 后端，主动跑一次 `{args.dod_cmd}`（约 5-10 分钟）确认 0 failed 后再 commit；"
+            f"否则脚本下次 checkpoint 会因为你的改动 EARLY-STOP，整个 run 报废。\n"
+            f"  - {last_dod_line}\n"
+        )
+
     return f"""你是 Primus-Turbo 仓库的自动优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
 工作目录: {args.workspace}
 当前 git HEAD: {head_sha}
@@ -345,17 +400,13 @@ def build_prompt(
 【优化目标】
 {args.task}
 
-【本轮唯一验收命令 — 不要跑别的】
+【本轮的快速验收命令】
 本轮的 metric 命令（约 8 秒、单 GPU、自动选空闲卡）：
   {args.metric_cmd}
 含义：单进程跑 ~300 个 HipKittens probe（BF16/FP8 dense × RCR/RRR/CRR 全 cache shape + grouped + variable-K + reject）。
 Score = ok*100 - (fail+err)*1000，越大越好。任何回归会让分数瞬间掉 1100 以上。
-
-**绝对不要在每轮里跑 pytest**：
-- 不要跑 `python3 -m pytest tests/...`，无论是单文件还是 -n 8 全套。
-- 不要跑 `bash scripts/run_dod_metric.sh --full`，那是给用户做最终抽查的。
-- 全套 4 文件 DoD pytest 是用户偶尔抽查的事，不是你每轮的事。
-你只需要在 commit 之前跑一次 `{args.metric_cmd}`，确认它 ≥ 历史最佳即可。
+**这是你每轮**唯一**需要跑的命令** —— 改完一次、commit 前一次 即可。
+{dod_block}
 
 【度量指标】指标名: {args.metric_name}（数值越高越好）
 - 基线 (优化开始前) = {baseline_metric}
@@ -517,11 +568,55 @@ def run_cursor_round(
         return proc.returncode if proc.returncode is not None else 1
 
 
+def run_dod_checkpoint(
+    cmd: str,
+    cwd: str,
+    timeout: int,
+    log_path: Path,
+) -> tuple[Optional[int], int]:
+    """Run the full DoD pytest gate, log raw output, return (score, exit_code).
+
+    score is parsed from the last line of stdout (single integer, >= 0 = all
+    pass). Returns (None, rc) on timeout or unparseable output.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    section(f"DoD checkpoint: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
+    try:
+        with log_path.open("w") as logf:
+            logf.write(f"# Command: {cmd}\n# Started at: {now_iso()}\n\n")
+            logf.flush()
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+            logf.write(result.stdout or "")
+    except subprocess.TimeoutExpired:
+        print(f"[dod] TIMEOUT after {timeout}s", flush=True)
+        return None, 124
+    rc = result.returncode
+    out = (result.stdout or "").strip()
+    last = out.splitlines()[-1].strip() if out else ""
+    try:
+        score = int(last)
+    except ValueError:
+        print(f"[dod] could not parse {last!r} as int (rc={rc})", flush=True)
+        return None, rc
+    print(f"[dod] score={score} rc={rc}", flush=True)
+    return score, rc
+
+
 def write_summary(summary_path: Path, args: argparse.Namespace, state: TrajectoryState, baseline: Optional[float]) -> None:
     summary = {
         "started_at": getattr(write_summary, "_start", now_iso()),
         "metric_name": args.metric_name,
         "metric_cmd": args.metric_cmd,
+        "dod_cmd": args.dod_cmd if args.dod_every > 0 else None,
+        "dod_every": args.dod_every,
         "model": args.model,
         "max_mode": not args.no_max_mode,
         "rounds_planned": args.rounds,
@@ -532,6 +627,9 @@ def write_summary(summary_path: Path, args: argparse.Namespace, state: Trajector
         "best_sha": state.best_sha,
         "rounds_run": len(state.rounds),
         "rounds": [r.as_dict() for r in state.rounds],
+        "dod_checkpoints": state.dod_checkpoints,
+        "last_dod_score": state.last_dod_score,
+        "last_dod_sha": state.last_dod_sha,
     }
     summary_path.write_text(json.dumps(summary, indent=2))
 
@@ -635,6 +733,34 @@ def main() -> int:
                 f"duration={duration:.1f}s",
                 flush=True,
             )
+
+            # Periodic DoD checkpoint: every N rounds, run the slow 4-file
+            # pytest gate to catch regressions the fast probe can't see.
+            if args.dod_every > 0 and i % args.dod_every == 0:
+                banner(f"DoD CHECKPOINT after round {i}")
+                dod_log = round_dir / "dod.log"
+                dod_score, dod_rc = run_dod_checkpoint(
+                    args.dod_cmd, str(workspace), args.dod_timeout, dod_log
+                )
+                state.dod_checkpoints.append({
+                    "after_round": i,
+                    "sha": sha_after,
+                    "score": dod_score,
+                    "exit_code": dod_rc,
+                    "log_path": str(dod_log.relative_to(log_dir.parent)),
+                    "at": now_iso(),
+                })
+                if dod_score is not None and dod_score >= 0:
+                    state.last_dod_score = dod_score
+                    state.last_dod_sha = sha_after
+                write_summary(summary_path, args, state, baseline)
+                if dod_score is None or dod_score < 0:
+                    banner(
+                        f"EARLY-STOP: DoD checkpoint regressed (score={dod_score}, rc={dod_rc}) "
+                        f"after round {i}. Last green DoD SHA = {state.last_dod_sha or '(never green)'}. "
+                        f"Inspect {dod_log} for details."
+                    )
+                    return 0
 
             if state.rounds_without_improvement >= args.patience:
                 banner(
