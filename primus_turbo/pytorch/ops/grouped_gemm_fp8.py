@@ -32,6 +32,8 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 
+MXFP8_PADDING_ALIGN_SIZE = 128
+
 __all__ = [
     "grouped_gemm_fp8",
 ]
@@ -46,6 +48,51 @@ def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
         return float8_e4m3 if is_fwd_stage else float8_e5m2
     else:
         raise ValueError(f"Unsupported FP8 format: {format}")
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _regroup_b_colwise_for_dgrad(
+    b_fp8_col_2d: torch.Tensor,
+    b_scale_inv_col_2d: torch.Tensor,
+    group_num: int,
+    n: int,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert flattened B^T quantization to grouped B^T layout."""
+    assert b_fp8_col_2d.size(0) == k
+    assert b_fp8_col_2d.size(1) >= group_num * n
+    assert n % MX_BLOCK_SIZE == 0
+
+    n_padded = _ceil_div(n, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE
+    scale_cols = n // MX_BLOCK_SIZE
+    scale_cols_padded = n_padded // MX_BLOCK_SIZE
+    assert b_scale_inv_col_2d.size(0) == k
+    assert b_scale_inv_col_2d.size(1) >= group_num * scale_cols
+
+    b_fp8_col = (
+        b_fp8_col_2d[:, : group_num * n]
+        .reshape(k, group_num, n)
+        .transpose(0, 1)
+        .contiguous()
+    )
+    b_scale_inv_col = (
+        b_scale_inv_col_2d[:, : group_num * scale_cols]
+        .reshape(k, group_num, scale_cols)
+        .transpose(0, 1)
+        .contiguous()
+    )
+    if n_padded == n:
+        return b_fp8_col, b_scale_inv_col
+
+    b_fp8_col_padded = b_fp8_col.new_zeros((group_num, k, n_padded))
+    b_fp8_col_padded[:, :, :n].copy_(b_fp8_col)
+
+    b_scale_inv_col_padded = b_scale_inv_col.new_zeros((group_num, k, scale_cols_padded))
+    b_scale_inv_col_padded[:, :, :scale_cols].copy_(b_scale_inv_col)
+    return b_fp8_col_padded, b_scale_inv_col_padded
 
 
 def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
@@ -379,8 +426,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
 
 def _grouped_wgrad_turbo_mxfp8(
-    grad_out: torch.Tensor,
-    grad_out_dtype: torch.dtype,
+    grad_out_t_fp8: torch.Tensor,
+    grad_out_t_scale_inv: torch.Tensor,
     a_t_fp8: torch.Tensor,
     a_t_scale_inv: torch.Tensor,
     group_lens: torch.Tensor,
@@ -389,20 +436,16 @@ def _grouped_wgrad_turbo_mxfp8(
 ) -> torch.Tensor:
     """Phase-2 wgrad: turbo variable-K MXFP8 kernel.
 
-    Quantizes grad_out (col-quant transposed → grad_out^T fp8 of shape (N, total_M)),
-    then calls turbo_grouped_gemm_variable_k_fp8 with saved a^T fp8 of shape (K, total_M).
+    Calls turbo_grouped_gemm_variable_k_fp8 with grad_out^T fp8 of shape
+    (N, total_M) and saved a^T fp8 of shape (K, total_M).
     Output dB shape (G, N, K).
     """
-    # We only need the col-wise (transposed) quantization here.  quantize_fp8_with_trans
-    # does both row and col in one fused pass; ignore the row outputs.
-    _, _, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_with_trans(
-        grad_out, grad_out_dtype, ScalingGranularity.MX_BLOCKWISE, block_size=MX_BLOCK_SIZE
-    )
     # grad_out_t_fp8 shape (N, total_M_pad); a_t_fp8 shape (K, total_M_pad)
-    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
+    out = torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
         grad_out_t_fp8, grad_out_t_scale_inv, a_t_fp8, a_t_scale_inv,
         group_lens, group_offs, out_dtype, "MX_BLOCKWISE",
     )
+    return out
 
 
 class GroupedGemmFP8MXFunc(torch.autograd.Function):
@@ -452,8 +495,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
-        # ── A: (total_M, K) — row-wise quant for forward LHS, col-wise saved for wgrad
-        # Use with_trans=True to fuse both quantizations.
+        # ── A: (total_M, K) — row-wise for forward LHS, col-wise saved for wgrad.
         a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col = quantize_fp8_with_trans(
             a, a_dtype, config.granularity, block_size=MX_BLOCK_SIZE
         )
@@ -461,7 +503,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # ── B: (G, N, K)
         # Forward NT GEMM expects RHS shape (G, N, K), row-wise quant along K.
         # Dgrad NT GEMM expects RHS shape (G, K, N), row-wise quant along N (== col-wise of original B).
-        # quantize_fp8_with_trans requires 2D input — flatten and reshape back per group.
+        # Flatten and reshape back per group.
         b_2d = b.reshape(G * N, K)  # (G*N, K)
         b_fp8_row_2d, b_scale_inv_row_2d, b_fp8_col_2d, b_scale_inv_col_2d = quantize_fp8_with_trans(
             b_2d,
@@ -471,12 +513,15 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             scaling_recipe=ScalingRecipe(use_2d_block=True),
             scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
         )
-        # b_fp8_row_2d: (G*N, K) → reshape to (G, N, K) for forward.
-        b_fp8_row = b_fp8_row_2d.reshape(G, N, K)
-        b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, K // MX_BLOCK_SIZE)
-        # b_fp8_col_2d: (K, G*N) — view as (K, G, N) then permute to (G, K, N) for dgrad.
-        b_fp8_col = b_fp8_col_2d.reshape(K, G, N).permute(1, 0, 2).contiguous()
-        b_scale_inv_col = b_scale_inv_col_2d.reshape(K, G, N // MX_BLOCK_SIZE).permute(1, 0, 2).contiguous()
+        # Row-wise MXFP8 quantization pads K to the turbo tile alignment.
+        K_row_padded = b_fp8_row_2d.size(1)
+        assert a_fp8_row.size(1) == K_row_padded
+        b_fp8_row = b_fp8_row_2d.reshape(G, N, K_row_padded)
+        b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, b_scale_inv_row_2d.size(1))
+
+        b_fp8_col, b_scale_inv_col = _regroup_b_colwise_for_dgrad(
+            b_fp8_col_2d, b_scale_inv_col_2d, G, N, K
+        )
 
         # ── Forward: NT(A_row, B_row) — turbo MXFP8 grouped kernel
         out = grouped_gemm_fp8_impl(
@@ -525,13 +570,12 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # Quantize grad_out (total_M, N) — row-wise (axis=1) for dgrad LHS.
-        grad_out_fp8_row, grad_out_scale_inv_row = quantize_fp8(
+        # Quantize grad_out once, matching MX GEMM: row-wise for dgrad and transposed for wgrad.
+        grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=MX_BLOCK_SIZE,
-            axis=1,
         )
 
         # ── dgrad: dA = dC @ B = NT(dC, B^T)
@@ -554,12 +598,11 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # ── wgrad: dB = dC^T @ A = NT(dC^T, A^T) via turbo variable-K kernel
         if ctx.use_turbo_wgrad:
             grad_b = _grouped_wgrad_turbo_mxfp8(
-                grad_out, grad_out_dtype, a_fp8_col, a_scale_inv_col,
+                grad_out_t_fp8, grad_out_t_scale_inv, a_fp8_col, a_scale_inv_col,
                 group_lens, group_offs, ctx.out_dtype,
             )
         else:
             raise RuntimeError("MX_BLOCKWISE grouped GEMM requires the turbo wgrad path.")
-
         return grad_a, grad_b, None, None, None, None, None
 
 

@@ -11,37 +11,11 @@
 namespace primus_turbo {
 namespace turbo {
 
-// ── Per-block group lookup ──
-//
-// Walk the prefix sum of per-group tile counts (M_g + 255) / 256 to find which
-// group this tile belongs to and its row index within that group.  Returns
-// false if this is a padding tile (flat_tile_idx >= total active tiles).
-__device__ __forceinline__ bool resolve_grouped_tile(const int64_t *group_lens_ptr,
-                                                     const int32_t  group_num,
-                                                     const int32_t pid_m_flat, int32_t &group_id,
-                                                     int32_t &pid_m_local, int32_t &M_g) {
-    int32_t cum_tiles = 0;
-#pragma unroll 1
-    for (int32_t g = 0; g < group_num; ++g) {
-        const int32_t M_iter =
-            __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[g]));
-        const int32_t tiles_g = (M_iter + 255) / 256;
-        if (pid_m_flat < cum_tiles + tiles_g) {
-            group_id    = g;
-            pid_m_local = pid_m_flat - cum_tiles;
-            M_g         = M_iter;
-            return true;
-        }
-        cum_tiles += tiles_g;
-    }
-    return false; // padding tile
-}
-
-// ── Per-tile compute body (shared between flat and persistent kernels) ──
+// ── Per-tile compute body used by the persistent kernel ──
 //
 // Given a resolved tile (group_id, pid_m_local in tiles, pid_n_idx in tiles)
-// computes one 256x256 output tile.  Caller is responsible for all smem
-// allocation and resolution of group_id from the persistent loop.
+// computes one 256x256 output tile. Caller is responsible for shared-memory
+// allocation and persistent tile scheduling.
 template <typename GemmTile, typename AType, typename BType, typename CType>
 __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     GemmTile &tile, typename GemmTile::ASmemSubtile (*a_smem_tile)[4],
@@ -201,10 +175,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                 base_scale_soff[3] + scale_off);
         }
 
-        // RACE FIX (lite): partial vmcnt drain + s_barrier between Phase 1 and
-        // Phase 2. 5000-iter grouped stress still leaked at vmcnt<4>, so use
-        // the next tighter drain without changing the rest of the pipeline.
-        wait_vmcnt<3>();
+        wait_vmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
@@ -265,9 +236,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                 base_scale_soff[1] + next_scale_off);
         }
 
-        // End-of-loop barrier: original vmcnt<12>+s_barrier (race-fix sweep
-        // showed full drain here is redundant once Phase 1→2 is barriered).
-        wait_vmcnt<0>();
+        wait_vmcnt<12>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
@@ -344,7 +313,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
             a_s_smem_tile[cur][warp_m + 2].u32_ptr(), scale_lds_offset);
 
         wait_vmcnt<0>();
-        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         GemmTile::template phase_mfma_lds<GemmTile::PIN_A1, GemmTile::PIN_AS1, GemmTile::PIN_B0,
@@ -384,7 +352,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     }
 
     // ── Store C ──
-    asm volatile("s_nop 7\ns_nop 7\ns_nop 7\ns_nop 7" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
@@ -425,49 +392,21 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
                              c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
-    // End-of-tile drain.  Originally for persistent-kernel reuse of smem/VGPRs;
-    // persistent kernel was dropped (3ac1a42), but empirically removing this
-    // makes the flat-kernel race rate ~2x worse, so it is load-bearing for
-    // wave-retire ordering of in-flight stores.
-    wait_vmcnt<0>();
-    wait_lgkmcnt<0>();
-    __builtin_amdgcn_s_barrier();
 }
 
-// ── Grouped MXFP8 NT GEMM Kernel — flat grid (256x256x128, 4-warp, GFX950) ──
-//
-//   A: [total_M, K] FP8           (groups concatenated along M)
-//   B: [group_num, N, K] FP8      (per-group weight)
-//   C: [total_M, N] FP16/BF16
-//   group_lens: [group_num] int64 (M_g per group, sum = total_M)
-//   group_offs: [group_num+1] int64
-//
-// Grid: (max_g ceil(M_g/256), ceil(N/256), group_num).
-// Each block processes ONE 256x256 tile.  Per-group padding tiles early-exit.
 template <typename AType, typename BType, typename CType, typename AccType = float>
-__global__
-__launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_kernel(
+__global__ __launch_bounds__(256, 1) void
+turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *a_ptr, const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr,
     CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
-    const int32_t group_num, const uint32_t n, const uint32_t k) {
+    const int32_t group_num, const uint32_t n, const uint32_t k, const int32_t grid_m,
+    const int32_t grid_n) {
 #if !defined(__gfx950__)
-    assert(false && "turbo_grouped_gemm_mxfp8 kernel requires gfx950");
+    assert(false && "turbo_grouped_gemm_mxfp8 persistent kernel requires gfx950");
     return;
 #else
-    const int32_t group_id = (int32_t) blockIdx.z;
-    if (group_id >= group_num) {
-        return;
-    }
-    const int32_t M_g =
-        __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[group_id]));
-    const int32_t pid_m_local = (int32_t) blockIdx.x;
-    if (M_g <= 0 || pid_m_local * 256 >= M_g)
-        return;
-
     using GemmTile =
         GEMM_Tile_MXFP8_NT_256x256x128_16x16x128_4_WAVE_GFX950<AType, BType, CType, AccType>;
-    GemmTile tile(threadIdx.x, (uint32_t) M_g, n, k);
-    tile.reserve_pinned_regs();
 
     using ASmem                       = typename GemmTile::ASmemSubtile;
     using BSmem                       = typename GemmTile::BSmemSubtile;
@@ -482,9 +421,29 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4w
     auto            *b_s_smem_tile =
         reinterpret_cast<BSSmem(*)[4]>(smem_buf + SMEM_DATA_BYTES + sizeof(ASSmem) * 2 * 4);
 
-    turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
-        tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
-        b_s_ptr, c_ptr, group_offs_ptr, group_id, pid_m_local, (int32_t) blockIdx.y, M_g, n, k);
+    GemmTile reserve_tile(threadIdx.x, 0, n, k);
+    reserve_tile.reserve_pinned_regs();
+
+    const int32_t tiles_per_group = grid_m * grid_n;
+    const int32_t total_tiles     = tiles_per_group * group_num;
+    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles; tile_id += (int32_t) gridDim.x) {
+        const int32_t group_id = tile_id / tiles_per_group;
+        const int32_t rem      = tile_id - group_id * tiles_per_group;
+        const int32_t pid_n    = rem / grid_m;
+        const int32_t pid_m    = rem - pid_n * grid_m;
+
+        const int32_t M_g =
+            __builtin_amdgcn_readfirstlane(static_cast<int32_t>(group_lens_ptr[group_id]));
+        if (M_g <= 0 || pid_m * 256 >= M_g) {
+            continue;
+        }
+
+        GemmTile tile(threadIdx.x, (uint32_t) M_g, n, k);
+        turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
+            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
+            b_s_ptr, c_ptr, group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
+        __builtin_amdgcn_s_barrier();
+    }
 #endif
 }
 

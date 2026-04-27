@@ -59,18 +59,18 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Compute group metadata host-side for conservative per-group MXFP8 launches.
+    // The grouped kernel uses blockIdx.z as group_id, so grid.x is the maximum
+    // per-group tile count. Per-group padding tiles early-exit in the kernel.
     at::Tensor    lens_cpu  = group_lens.cpu();
     const int64_t *lens_data = lens_cpu.data_ptr<int64_t>();
-    at::Tensor    offs_cpu  = group_offs.cpu();
-    const int64_t *offs_data = offs_cpu.data_ptr<int64_t>();
-    int64_t        max_m     = 0;
+    int32_t        grid_x   = 0;
     for (int g = 0; g < group_num; ++g) {
-        max_m = std::max(max_m, lens_data[g]);
+        grid_x = std::max(grid_x, (int32_t) ((lens_data[g] + 255) / 256));
     }
-    const int64_t scale_cols = k / 32;
-    const size_t  ws_size = primus_turbo::turbo_gemm_mxfp8_workspace_size(max_m, n, k);
-    at::Tensor    workspace =
+
+    const size_t ws_size =
+        primus_turbo::turbo_grouped_gemm_mxfp8_workspace_size(total_m, group_num, n, k);
+    at::Tensor workspace =
         at::empty({(int64_t) ws_size}, torch::dtype(at::kByte).device(a.device()));
 
     TORCH_TYPE_SWITCH_FP8(
@@ -79,27 +79,26 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
             b.scalar_type(), BType,
             TORCH_TYPE_SWITCH_FP16_BF16(
                 out_dtype, CType,
-                auto *a_ptr = reinterpret_cast<const AType *>(a.data_ptr());
-                auto *b_ptr = reinterpret_cast<const BType *>(b.data_ptr());
-                auto *c_ptr = reinterpret_cast<CType *>(c.data_ptr());
-                auto *a_scale_ptr =
+                primus_turbo::TurboGroupedGemmMXFP8Params<AType, BType, CType> params;
+                params.a_ptr = reinterpret_cast<const AType *>(a.data_ptr());
+                params.b_ptr = reinterpret_cast<const BType *>(b.data_ptr());
+                params.c_ptr = reinterpret_cast<CType *>(c.data_ptr());
+                params.a_scale_ptr =
                     reinterpret_cast<const dtype::float8_e8m0 *>(a_scales.data_ptr());
-                auto *b_scale_ptr =
+                params.b_scale_ptr =
                     reinterpret_cast<const dtype::float8_e8m0 *>(b_scales.data_ptr());
-                for (int64_t g = 0; g < group_num; ++g) {
-                    const int64_t m_g = lens_data[g];
-                    if (m_g <= 0) {
-                        continue;
-                    }
-                    const int64_t off = offs_data[g];
-                    primus_turbo::turbo_gemm_mxfp8_impl<AType, BType, CType>(
-                        a_ptr + off * k,
-                        b_ptr + g * n * k,
-                        a_scale_ptr + off * scale_cols,
-                        b_scale_ptr + g * n * scale_cols,
-                        c_ptr + off * n,
-                        m_g, n, k, workspace.data_ptr(), ws_size, stream);
-                }
+                params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
+                params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+                params.group_num = (int32_t) group_num;
+                params.total_m   = (int32_t) total_m;
+                params.n         = (int32_t) n;
+                params.k         = (int32_t) k;
+                params.workspace = workspace.data_ptr();
+                params.workspace_size = ws_size;
+                params.grid_x         = grid_x;
+                params.stream         = stream;
+                primus_turbo::turbo_grouped_gemm_mxfp8_impl<AType, BType, CType>(params);
+                workspace.record_stream(stream);
                 return c;)))
 
     PRIMUS_TURBO_ERROR("Unsupported dtype combination for turbo_grouped_gemm_fp8 MX_BLOCKWISE.");
@@ -160,11 +159,15 @@ static at::Tensor launch_mxfp8_grouped_wgrad(at::Tensor &lhs, at::Tensor &lhs_sc
                     reinterpret_cast<const dtype::float8_e8m0 *>(rhs_scales.data_ptr());
                 params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
                 params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-                params.group_num = (int32_t) group_num; params.total_m = (int32_t) total_m;
-                params.n = (int32_t) n; params.k = (int32_t) k;
-                params.workspace = workspace.data_ptr(); params.workspace_size = ws_size;
-                params.stream    = stream;
+                params.group_num = (int32_t) group_num;
+                params.total_m   = (int32_t) total_m;
+                params.n         = (int32_t) n;
+                params.k         = (int32_t) k;
+                params.workspace = workspace.data_ptr();
+                params.workspace_size = ws_size;
+                params.stream         = stream;
                 primus_turbo::turbo_grouped_gemm_mxfp8_wgrad_impl<AType, BType, CType>(params);
+                workspace.record_stream(stream);
                 return db;)))
 
     PRIMUS_TURBO_ERROR("Unsupported dtype combination for turbo_grouped_gemm_variable_k_fp8 MX_BLOCKWISE.");
