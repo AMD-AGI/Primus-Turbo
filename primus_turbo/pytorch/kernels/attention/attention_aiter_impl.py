@@ -42,7 +42,7 @@ def _normalize_sink_window(causal: bool, window_size_left: int, window_size_righ
 # =============================================================================
 
 
-_SUPPORTED_QKV_FORMATS = ["sbhd", "bshd"]
+_SUPPORTED_QKV_FORMATS = ["sbhd", "bshd", "bhsd"]
 
 
 class AttnFwdAiterBackend(KernelBackend):
@@ -67,9 +67,15 @@ class AttnFwdAiterBackend(KernelBackend):
         qkv_format: Optional[str] = "bshd",
     ) -> bool:
 
-        if sink is not None and qkv_format == "sbhd":
-            # sink attention is not supported for sbhd format
-            return False
+        if sink is not None:
+            if qkv_format in ("sbhd", "bhsd"):
+                # sink attention is not supported for sbhd and bhsd format
+                return False
+
+            head_dim_qk = q.size(-1)
+            head_dim_v = v.size(-1)
+            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
+                return False
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
 
@@ -103,9 +109,11 @@ class AttnFwdAiterBackend(KernelBackend):
                 out = torch.empty(
                     (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
                 ).permute(1, 0, 2, 3)
+            elif qkv_format == "bhsd":
+                out = torch.empty(
+                    (batch_size, num_heads_qk, seq_len, head_dim_v), dtype=q.dtype, device=q.device
+                ).permute(0, 2, 1, 3)
             else:
-                # BSHD
-                assert qkv_format == "bshd"
                 out = torch.empty(
                     (batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
                 )
@@ -130,13 +138,6 @@ class AttnFwdAiterBackend(KernelBackend):
                 out=out,
             )
         else:
-            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
-
-            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
-                raise ValueError(
-                    "Triton sink attention requires head_dim_qk == head_dim_v and head_dim power-of-2"
-                )
-
             if max_seqlen_q is None:
                 max_seqlen_q = q.size(1)
             if max_seqlen_k is None:
@@ -200,11 +201,18 @@ class AttnBwdAiterBackend(KernelBackend):
         dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
     ) -> bool:
-        if sink is not None and qkv_format == "sbhd":
-            # sink attention is not supported for sbhd format
-            return False
+        if sink is not None:
+            if qkv_format in ("sbhd", "bhsd"):
+                # sink attention is not supported for sbhd and bhsd format
+                return False
+
+            head_dim_qk = q.size(-1)
+            head_dim_v = v.size(-1)
+            if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
+                return False
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
+
         # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
         if get_device_compute_capability() == (9, 4):
             supported &= not (qkv_format == "sbhd" and not is_v3_atomic_fp32)
@@ -263,8 +271,6 @@ class AttnBwdAiterBackend(KernelBackend):
                 how_v3_bf16_cvt,
             )
         else:
-            assert qkv_format == "bshd", "Sink attention is not supported for sbhd format"
-
             assert (
                 isinstance(rng_state, torch.Tensor)
                 and rng_state.device.type == "cpu"

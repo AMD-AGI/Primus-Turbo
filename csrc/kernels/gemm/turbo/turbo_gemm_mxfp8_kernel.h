@@ -446,6 +446,10 @@ public:
         mfma_scale_pinned<PIN_A + 8, PIN_B + 8, ACC + 20, PIN_SA + 1, PIN_SB + 1>();
         ds_read_pinned<4, PIN_NEXT_S + 2, 512>(sbase);
         ds_read_pinned<4, PIN_NEXT_S + 3, 768>(sbase);
+
+        // WAR barrier
+        __builtin_amdgcn_s_barrier();
+
         // MFMA #6-#15: GMEM->SMEM prefetch spread across MFMA gaps
         mfma_scale_pinned<PIN_A + 8, PIN_B + 16, ACC + 24, PIN_SA + 1, PIN_SB + 2>();
         load_gmem_to_smem_srd<16>(data_srd, ldg_offsets[0], data_m0_0, data_soff_0);
