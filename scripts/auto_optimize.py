@@ -211,8 +211,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dod-timeout",
         type=int,
-        default=60 * 30,
-        help="Seconds to allow each DoD checkpoint (default 30 min).",
+        default=60 * 60,
+        help=(
+            "Seconds to allow each DoD checkpoint (default 60 min). "
+            "Full 4-file pytest with -n=#idle-pool-GPUs can legitimately "
+            "take 40+ min on a busy box."
+        ),
     )
     p.add_argument(
         "--gpu-pool",
@@ -593,30 +597,58 @@ def run_dod_checkpoint(
 ) -> tuple[Optional[int], int]:
     """Run the full DoD pytest gate, log raw output, return (score, exit_code).
 
-    score is parsed from the last line of stdout (single integer, >= 0 = all
-    pass). Returns (None, rc) on timeout or unparseable output.
+    Streams stdout/stderr line-by-line to log_path so a `tail -f dod.log`
+    watcher sees real-time progress (subprocess.PIPE buffering meant we
+    only saw output after the run terminated, which made a 30-min timeout
+    appear as a stuck zero-output process).
+
+    score is parsed from the last line of captured stdout (single integer,
+    >= 0 = all pass). Returns (None, rc) on timeout or unparseable output.
     """
+    import threading
     log_path.parent.mkdir(parents=True, exist_ok=True)
     section(f"DoD checkpoint: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
-    try:
+
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    captured_lines: list[str] = []
+
+    def _pump() -> None:
         with log_path.open("w") as logf:
             logf.write(f"# Command: {cmd}\n# Started at: {now_iso()}\n\n")
             logf.flush()
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout,
-            )
-            logf.write(result.stdout or "")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                captured_lines.append(line)
+                logf.write(line)
+                logf.flush()
+
+    pump_thread = threading.Thread(target=_pump, daemon=True)
+    pump_thread.start()
+
+    try:
+        rc = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        print(f"[dod] TIMEOUT after {timeout}s", flush=True)
+        print(f"[dod] TIMEOUT after {timeout}s, killing pytest", flush=True)
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+        pump_thread.join(timeout=5)
         return None, 124
-    rc = result.returncode
-    out = (result.stdout or "").strip()
+
+    pump_thread.join(timeout=10)
+
+    out = "".join(captured_lines).strip()
     last = out.splitlines()[-1].strip() if out else ""
     try:
         score = int(last)
