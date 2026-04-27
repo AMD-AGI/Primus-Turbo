@@ -614,15 +614,27 @@ def _fp8_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     """FP8 grouped probes: RCR fwd + RCR full fwd+bwd (covers variable-K CRR).
 
     The HIPKITTEN FP8 grouped backend has no shape allow-list (it pads and
-    loops per group), so any shape works. We pick the smallest shape from
-    the FP8 cache (4096, 4096, 4096) plus an RRR forward to keep the loop
-    fast — backward exercises the variable-K CRR path automatically.
+    loops per group), so any shape works. We use the smallest shape from
+    the FP8 cache (4096, 4096, 4096) for the full RCR fwd+bwd to keep the
+    loop fast — backward exercises the variable-K CRR path automatically.
+
+    Forward-only probes (no float reference matmul beyond the 4096^3 case
+    that pays for the bwd path) cover additional MoE-realistic cache
+    shapes so the per-group cache lookup, padding short-circuit, and
+    TK_RCR_FORCE_KERNEL save/restore are exercised across distinct
+    `group_m` / `kernel` cache entries:
+      - (8192, 4096, 4096) — gpt_oss-style GateUP (M=8192)
+      - (4096, 4096, 11008) — DeepSeek-V3-style MLP K-major
     """
     if not FP8_CACHE.exists():
         return []
-    fp8_shape = (4096, 4096, 4096)
+    base_shape = (4096, 4096, 4096)
+    extra_shapes = [
+        (8192, 4096, 4096),
+        (4096, 4096, 11008),
+    ]
     out: list[tuple[str, Callable[[], tuple[bool, str]]]] = []
-    m, n, k = fp8_shape
+    m, n, k = base_shape
     out.append((
         f"GR_FP8_RCR_{m}x{n}x{k}_fwd",
         lambda M=m, N=n, K=k:
@@ -638,6 +650,17 @@ def _fp8_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
         lambda M=m, N=n, K=k:
             _fp8_grouped_probe(f"GR_FP8_RRR_{M}x{N}x{K}_fwd", 2, M, N, K, False, False),
     ))
+    for (em, en, ek) in extra_shapes:
+        out.append((
+            f"GR_FP8_RCR_{em}x{en}x{ek}_fwd",
+            lambda M=em, N=en, K=ek:
+                _fp8_grouped_probe(f"GR_FP8_RCR_{M}x{N}x{K}_fwd", 2, M, N, K, True, False),
+        ))
+        out.append((
+            f"GR_FP8_RRR_{em}x{en}x{ek}_fwd",
+            lambda M=em, N=en, K=ek:
+                _fp8_grouped_probe(f"GR_FP8_RRR_{M}x{N}x{K}_fwd", 2, M, N, K, False, False),
+        ))
     return out
 
 
