@@ -69,9 +69,9 @@ DEFAULT_TASK = (
     "持续优化 HipKittens 在 Primus-Turbo 中作为 BF16/FP8 GEMM 与 grouped GEMM "
     "后端的集成：扩大 _grouped_bf16_supported / FP8 cache 覆盖、修复回归、提升 "
     "benchmark TFLOPS、收紧 can_handle，使 HIPKITTEN 在 DeepSeek-V3 与 gpt_oss_20B "
-    "形状上又快又稳。**每轮快速验收**：tests/pytorch/ops/test_gemm.py 与 "
-    "tests/pytorch/ops/test_grouped_gemm.py 中 -k hipkitten 的所有用例必须 0 failed。"
-    "**最终验收 (DoD，由用户偶尔抽查)**：4 个 GEMM/grouped-GEMM bf16/fp8 测试文件全绿。"
+    "形状上又快又稳。**本轮唯一验收**：本仓库的 metric 命令 (python3 scripts/_metric_hipkitten.py) "
+    "在 commit 之后必须返回 >= 历史最佳分。**最终 DoD (由用户偶尔抽查，不是你每轮的事)**："
+    "4 个 GEMM/grouped-GEMM bf16/fp8 测试文件全绿。"
 )
 # Loop metric: a single-process probe that exercises EVERY HipKitten cache
 # entry — 144 BF16 dense (RCR/RRR/CRR × 48 shapes), 144 FP8 dense
@@ -333,12 +333,6 @@ def build_prompt(
         )
     history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
 
-    deterministic_block = (
-        f"\n【DoD 第二项 - 必须同时绿】\n  {args.deterministic_cmd}\n"
-        if args.deterministic_cmd
-        else ""
-    )
-
     return f"""你是 Primus-Turbo 仓库的自动优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
 工作目录: {args.workspace}
 当前 git HEAD: {head_sha}
@@ -346,23 +340,22 @@ def build_prompt(
 【强制第一步】
 请先用读文件工具完整读取这份本地 skill：
   {args.skill_path}
-里面有 HipKittens + Primus-Turbo 集成的所有上下文（路径、env、cache 结构、白名单、坑），并且开头就写了**硬性 DoD**（4 个测试文件全 pass）。读完再决定本轮该做什么。
+里面有 HipKittens + Primus-Turbo 集成的所有上下文（路径、env、cache 结构、白名单、坑）。读完再决定本轮该做什么。
 
 【优化目标】
 {args.task}
 
-【硬性 DoD - 任何一轮违反即视为失败】
-本仓库的验收门槛是：tests/pytorch/ops/ 下面这 4 个文件**默认模式与 --deterministic-only 模式都必须 0 failed**：
-  - tests/pytorch/ops/test_gemm.py
-  - tests/pytorch/ops/test_gemm_fp8.py
-  - tests/pytorch/ops/test_grouped_gemm.py
-  - tests/pytorch/ops/test_grouped_gemm_fp8.py
-
-本轮的 metric 命令 (越大越好) =
+【本轮唯一验收命令 — 不要跑别的】
+本轮的 metric 命令（约 8 秒、单 GPU、自动选空闲卡）：
   {args.metric_cmd}
-{deterministic_block}
-你必须确保：本轮结束时 metric 不下降；且如有改动，**在 commit 之前**自己运行上面的命令、确认 0 failed 后再 commit。
-绝不允许通过删测试 / 加 pytest.skip / 改 SNR 阈值这种方式骗过 DoD。
+含义：单进程跑 ~300 个 HipKittens probe（BF16/FP8 dense × RCR/RRR/CRR 全 cache shape + grouped + variable-K + reject）。
+Score = ok*100 - (fail+err)*1000，越大越好。任何回归会让分数瞬间掉 1100 以上。
+
+**绝对不要在每轮里跑 pytest**：
+- 不要跑 `python3 -m pytest tests/...`，无论是单文件还是 -n 8 全套。
+- 不要跑 `bash scripts/run_dod_metric.sh --full`，那是给用户做最终抽查的。
+- 全套 4 文件 DoD pytest 是用户偶尔抽查的事，不是你每轮的事。
+你只需要在 commit 之前跑一次 `{args.metric_cmd}`，确认它 ≥ 历史最佳即可。
 
 【度量指标】指标名: {args.metric_name}（数值越高越好）
 - 基线 (优化开始前) = {baseline_metric}
@@ -383,20 +376,18 @@ def build_prompt(
 1. 先读 skill，理解当前阶段卡在哪。
 2. 自己挑一个**具体且可验证**的小步骤去做（不要一次铺得太大）。可选方向举例：
    - 在 grouped_gemm_impl.py 的 `_grouped_bf16_supported` 中扩 allow-list（新加 shape 之前必须独立数值校验）。
-   - 调整 `_hipkitten_grouped_cfg` 的 fallback `(group_m, num_xcds)`，跑 benchmark 取真实最优。
-   - 用 HipKittens cache 中现有 shape 添加新的 HIPKITTEN 测试用例。
-   - 用 benchmark/ops/bench_grouped_gemm_turbo.py 做 perf 实验，把结果以 CSV 形式落到 benchmark/ops/。
+   - 调整 `_hipkitten_grouped_cfg` / `_hipkitten_fp8_group_m` 的 fallback，跑 benchmark 取真实最优。
+   - 在 scripts/_metric_hipkitten.py 中加 probe（覆盖新 cache shape、新 grouped 配置等）。
+   - 用 benchmark/ops/bench_grouped_gemm_turbo.py 做 perf 实验，把结果 CSV 落到 benchmark/ops/。
    - 修 FP8 路径中的小问题（尤其是 RCR `TK_RCR_FORCE_KERNEL` save/restore、padding）。
-3. 改完一定要跑相关 pytest 与 / 或 benchmark 验证（PRIMUS_TURBO_HIPKITTEN_PATH=/workspace/code/HipKittens；建议 -n 8 并行 8 GPU）。
-4. **commit 前**自己再跑一遍 metric 命令 + deterministic 命令，确认两边都 0 failed 且 metric 不降。
-5. 如果改动确实有进展（测试 0 failed 且 metric 提升），就 git commit；若没把握就 git restore 还原，**不要留下脏 working tree**。
+3. 改完只跑一次本轮 metric 命令验证。**绝对不要跑 pytest**。
+4. 如果改动有进展（metric 不降、最好提升）就 git commit；若没把握就 `git restore` / `git checkout -- .` 还原，**不要留下脏 working tree**。
 
 【硬性约束 - 不可违反】
-- **跑任何 pytest / probe / benchmark 前，必须先用 `rocm-smi --showuse --showpids` 选空闲 GPU**，不要抢占其他租户的作业。
-  - 单卡探针：`PICK=$(rocm-smi --showuse 2>/dev/null | awk '/^GPU\\[[0-9]+\\][[:space:]]+: GPU use \\(%\\)/{{gsub(/[^0-9]/,"",$1); if($NF+0==0){{print $1; exit}}}}')`，然后 `HIP_VISIBLE_DEVICES=$PICK ...`。
-  - 并行 pytest：先列空闲 GPU，把它们以逗号串接喂给 `HIP_VISIBLE_DEVICES`，并把 `-n` 调小到空闲卡的数量（不要盲目 `-n 8`，conftest 会把 worker 映射到 GPU 0..7，如果其中有忙的就会冲突）。
+- **跑 metric 命令前不需要手动选 GPU**，scripts/_metric_hipkitten.py 内部已经会用 rocm-smi 自动挑空闲 GPU。
+- 如果你确实需要跑别的脚本（benchmark / probe），先用 `rocm-smi --showuse --showpids` 选空闲 GPU，不要抢占其他租户的作业。
 - 绝不删除 tests/pytorch/ops/test_gemm_fp8.py 与 tests/pytorch/ops/test_grouped_gemm_fp8.py。
-- 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"测试。
+- 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"问题。
 - BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)`，绝不能让 autotune 默认选它。
 - 不要修改 ~/.cursor/cli-config.json 或全局 git config。
 - 不要 push 到 remote。
@@ -408,7 +399,7 @@ def build_prompt(
 本轮结束前，在你的最后一条文本里给出一段 markdown 小结，包含：
 - 本轮选择的目标
 - 实际改了哪些文件
-- 验证用的命令与简明结果（含 metric / deterministic 两个数）
+- metric 命令的结果数字（before / after）
 - 是否 commit、commit SHA / message
 - 下一轮你建议下游做什么
 
