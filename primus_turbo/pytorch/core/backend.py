@@ -315,7 +315,7 @@ class TuneCache:
         return key in self._cache
 
 
-def _format_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
+def _format_kwargs(kwargs: Dict[str, Any]) -> str:
 
     def _format_value(v):
         if isinstance(v, torch.Tensor):
@@ -324,7 +324,7 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
             return f"{type(v).__name__}.{v.name}"
         return repr(v)
 
-    return {k: _format_value(v) for k, v in kwargs.items()}
+    return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
 class AutoKernelDispatcher(ABC):
