@@ -45,23 +45,51 @@ BF16_CACHE = HIPKITTEN_ROOT / "analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final
 FP8_CACHE = HIPKITTEN_ROOT / "analysis/fp8_gemm/mi350x/.autotune_cache.json"
 
 
+def _gpu_pool() -> set[int] | None:
+    """Optional whitelist of allowed GPU ids (HIPKITTEN_GPU_POOL='0,1,2,3').
+
+    Returns None when unset, so the picker considers every GPU rocm-smi
+    reports.
+    """
+    raw = os.environ.get("HIPKITTEN_GPU_POOL", "").strip()
+    if not raw:
+        return None
+    pool: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            pool.add(int(tok))
+        except ValueError:
+            pass
+    return pool or None
+
+
 def _pick_idle_gpu() -> str | None:
     """Return the smallest idle GPU id (busy = any PID using >100MiB VRAM).
 
-    Falls back to None when rocm-smi is unavailable so the caller can let
-    the runtime choose the default device.
+    Honors HIPKITTEN_GPU_POOL ('0,1,2,3') as an allow-list intersected with
+    rocm-smi's view, so a shared host can keep half the GPUs reserved for
+    other tenants. Falls back to None when rocm-smi is unavailable so the
+    caller can let the runtime choose the default device.
     """
     import re
     import subprocess
     THR = 100 * 1024 * 1024
+    pool = _gpu_pool()
     try:
         out = subprocess.check_output(
             ["rocm-smi", "--showuse", "--showpids"],
             stderr=subprocess.DEVNULL, text=True, timeout=10,
         )
     except Exception:
+        if pool:
+            return str(min(pool))
         return None
     all_gpus = sorted({int(m) for m in re.findall(r"^GPU\[(\d+)\]", out, flags=re.M)})
+    if pool is not None:
+        all_gpus = [g for g in all_gpus if g in pool]
     busy: set[int] = set()
     in_kfd = False
     for line in out.splitlines():

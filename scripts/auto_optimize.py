@@ -215,6 +215,17 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to allow each DoD checkpoint (default 30 min).",
     )
     p.add_argument(
+        "--gpu-pool",
+        type=str,
+        default="0,1,2,3",
+        help=(
+            "Comma-separated list of GPU ids the loop is allowed to use. "
+            "Exported as HIPKITTEN_GPU_POOL, honored by scripts/_metric_hipkitten.py "
+            "and scripts/run_dod_metric.sh (idle picks intersect this pool). "
+            "Empty string disables (let scripts see all GPUs)."
+        ),
+    )
+    p.add_argument(
         "--workspace",
         type=str,
         default=str(Path(__file__).resolve().parent.parent),
@@ -366,6 +377,8 @@ def build_prompt(
         )
     history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
 
+    gpu_pool = args.gpu_pool or "(unrestricted)"
+
     dod_block = ""
     if args.dod_every > 0:
         last_dod_line = (
@@ -435,8 +448,12 @@ Score = ok*100 - (fail+err)*1000，越大越好。任何回归会让分数瞬间
 4. 如果改动有进展（metric 不降、最好提升）就 git commit；若没把握就 `git restore` / `git checkout -- .` 还原，**不要留下脏 working tree**。
 
 【硬性约束 - 不可违反】
-- **跑 metric 命令前不需要手动选 GPU**，scripts/_metric_hipkitten.py 内部已经会用 rocm-smi 自动挑空闲 GPU。
-- 如果你确实需要跑别的脚本（benchmark / probe），先用 `rocm-smi --showuse --showpids` 选空闲 GPU，不要抢占其他租户的作业。
+- **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量）。
+  metric 与 DoD checkpoint 会自动从这个池里挑空闲卡，你**不要手动 export HIP_VISIBLE_DEVICES=4..7**，
+  也不要往池外的卡跑 benchmark/probe；GPU 4-7 给别的租户用。
+  你跑任何额外脚本时也要先 `export HIP_VISIBLE_DEVICES=$(rocm-smi --showuse --showpids | ... 选池内空闲卡)` 或者直接复用 metric 脚本的逻辑。
+- **跑 metric 命令前不需要手动选 GPU**，scripts/_metric_hipkitten.py 内部已经会用 rocm-smi 自动从 HIPKITTEN_GPU_POOL 挑空闲卡。
+- 如果你确实需要跑别的脚本（benchmark / probe），先用 `rocm-smi --showuse --showpids` 选 HIPKITTEN_GPU_POOL 里的空闲 GPU，不要抢占其他租户的作业。
 - 绝不删除 tests/pytorch/ops/test_gemm_fp8.py 与 tests/pytorch/ops/test_grouped_gemm_fp8.py。
 - 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"问题。
 - BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)`，绝不能让 autotune 默认选它。
@@ -660,6 +677,10 @@ def main() -> int:
     write_summary._start = now_iso()  # type: ignore[attr-defined]
 
     cli_snapshot = None if args.no_max_mode else maybe_set_max_mode(True)
+
+    if args.gpu_pool:
+        os.environ["HIPKITTEN_GPU_POOL"] = args.gpu_pool
+        print(f"[gpu-pool] HIPKITTEN_GPU_POOL={args.gpu_pool}", flush=True)
 
     state = TrajectoryState()
     baseline = None
