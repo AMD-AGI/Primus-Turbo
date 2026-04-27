@@ -699,13 +699,21 @@ def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool,
       - probe (4096, 16384, 4096) -> crr_16384_4096_4096  gpt_oss MoE wide-N (group_m=8)
       - probe (14336, 8192, 4096) -> crr_8192_4096_14336  DeepSeek long-K wide (group_m=4)
 
-    Extra cache-hit shapes added in this round (each verified at SNR=28.5 dB
+    Extra cache-hit shapes added in earlier rounds (each verified at SNR=28.5 dB
     via standalone /tmp/verify_fp8_crr_round4.py probe before adding):
       - probe (8192, 8192, 8192)  -> crr_8192_8192_8192   DeepSeek large MoE square (group_m=4)
       - probe (4096, 4096, 28672) -> crr_4096_28672_4096  DeepSeek long-K MoE (group_m=4)
       - probe (4096, 8192, 12288) -> crr_8192_12288_4096  DeepSeek MLP wide-K (group_m=4)
       - probe (8192, 8192, 10240) -> crr_8192_10240_8192  GQA mid-size (group_m=4)
       - probe (3584, 16384, 3584) -> crr_16384_3584_3584  gpt_oss MoE wide-N small-MK (group_m=8)
+
+    Extra cache-hit shapes added in this round (each verified at SNR=28.5 dB
+    via standalone /tmp/verify_fp8_crr_round5.py probe before adding):
+      - probe (3584, 8192, 3584)   -> crr_8192_3584_3584   small-MK MoE base (group_m=8)
+      - probe (8192, 4096, 10240)  -> crr_4096_10240_8192  DeepSeek wide-K (group_m=4)
+      - probe (3584, 8192, 4608)   -> crr_8192_4608_3584   gpt_oss small-MoE (group_m=8)
+      - probe (11008, 8192, 4096)  -> crr_8192_4096_11008  DeepSeek MLP up dB N=8192 (group_m=4)
+      - probe (3584, 16384, 4608)  -> crr_16384_4608_3584  gpt_oss wide-N small-MoE (group_m=4)
     """
     if not FP8_CACHE.exists():
         return []
@@ -729,6 +737,11 @@ def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool,
         (4096, 8192, 12288),
         (8192, 8192, 10240),
         (3584, 16384, 3584),
+        (3584, 8192, 3584),
+        (8192, 4096, 10240),
+        (3584, 8192, 4608),
+        (11008, 8192, 4096),
+        (3584, 16384, 4608),
     ]
     for (m, n, k) in shapes:
         out.append((
