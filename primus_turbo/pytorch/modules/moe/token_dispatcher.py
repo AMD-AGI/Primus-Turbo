@@ -5,6 +5,7 @@
 ###############################################################################
 
 
+import os
 import warnings
 from abc import abstractmethod
 from typing import Optional, Tuple
@@ -115,6 +116,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         `expert_capacity_factor`: The capacity factor for each expert, None means no token will be dropped
         `permute_fusion`: use permuate fusion kernel when permute_fusion is True
         `permute_max_token_num`: use max_token_num can elimite host sync in permute when set deepep_use_cuda_num_tokens_per_expert=True
+        `deepep_use_comm_stream`: When True, force all EP dispatch/combine kernels onto a single stream by setting PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1.
         `deepep_num_use_cu`: number of cu deepep used
         `deepep_num_worst_tokens`: number of worst tokens for deepep, see DeepEP for more detail.
         `deepep_use_cuda_num_tokens_per_expert`: DeepEPTokenDispatcher will return num_tokens_per_expert by cuda tensor instead of cpu tensor, this may elimate groumlp cpu sync when use turbo's groupgemm.
@@ -134,6 +136,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         permute_max_token_num: int = 0,
         deepep_async_finish: bool = True,
         deepep_allocate_on_comm_stream: bool = True,
+        deepep_use_comm_stream: bool = False,
         deepep_num_use_cu: int = 32,
         deepep_num_worst_tokens: int = 0,
         deepep_use_cuda_num_tokens_per_expert: Optional[bool] = False,
@@ -145,6 +148,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             raise ValueError(
                 "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
             )
+
+        if not deepep_use_comm_stream:
+            os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
 
         self.capacity_factor = expert_capacity_factor
 
