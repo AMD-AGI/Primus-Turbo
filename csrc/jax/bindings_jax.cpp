@@ -54,8 +54,7 @@ PYBIND11_MODULE(_C, m) {
 
     // DeepEP Config
     pybind11::class_<primus_turbo::deep_ep::Config>(m, "Config")
-        .def(pybind11::init<int, int, int, int, int>(),
-             pybind11::arg("num_sms") = DEFAULT_NUM_CU,
+        .def(pybind11::init<int, int, int, int, int>(), pybind11::arg("num_sms") = DEFAULT_NUM_CU,
              pybind11::arg("num_max_nvl_chunked_send_tokens") =
                  DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
              pybind11::arg("num_max_nvl_chunked_recv_tokens") =
@@ -73,13 +72,11 @@ PYBIND11_MODULE(_C, m) {
                       &primus_turbo::deep_ep::Config::num_max_rdma_chunked_send_tokens)
         .def_readonly("num_max_rdma_chunked_recv_tokens",
                       &primus_turbo::deep_ep::Config::num_max_rdma_chunked_recv_tokens)
-        .def("get_nvl_buffer_size_hint",
-             &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint",
              &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);
 
-    m.def("get_low_latency_rdma_size_hint",
-          &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
+    m.def("get_low_latency_rdma_size_hint", &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
 
     // DType enum
     pybind11::enum_<DType>(m, "DType", pybind11::module_local())
