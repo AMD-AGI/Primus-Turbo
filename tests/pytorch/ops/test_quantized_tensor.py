@@ -11,6 +11,7 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
     ScalingGranularity,
     ScalingRecipe,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
     is_fp8_dtype,
@@ -42,6 +43,11 @@ def _make_quantized_tensor(
     - BLOCKWISE:  block_size required; `use_2d_block=True` for weight-style 2D blocks
     - MX_BLOCKWISE: block_size + ScalingRecipe required
     """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        mxfp8_supported, reason = check_mxfp8_support()
+        if not mxfp8_supported:
+            pytest.skip(reason)
+
     kwargs = dict(keep_trans_cache=keep_trans_cache)
 
     if granularity == ScalingGranularity.MX_BLOCKWISE:
