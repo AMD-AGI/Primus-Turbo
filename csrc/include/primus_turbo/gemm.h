@@ -53,6 +53,16 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
                          hipStream_t stream);
 
+// True if the algo hipblaslt_gemm_impl would pick is Stream-K. Cached per shape.
+bool hipblaslt_gemm_is_streamk(hipblasLtHandle_t handle, const hipDataType A_type,
+                               const int64_t rows_a, const int64_t cols_a, const int64_t lda,
+                               hipblasOperation_t transA, const hipDataType B_type,
+                               const int64_t rows_b, const int64_t cols_b, const int64_t ldb,
+                               hipblasOperation_t transB, const hipDataType D_type,
+                               const int64_t rows_d, const int64_t cols_d, const int64_t ldd,
+                               const bool                         use_low_precision,
+                               const hipblasLtMatmulMatrixScale_t scale_mode);
+
 //==================================================================
 //  CK GEMM
 //==================================================================
