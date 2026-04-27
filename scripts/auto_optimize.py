@@ -69,15 +69,22 @@ DEFAULT_TASK = (
     "持续优化 HipKittens 在 Primus-Turbo 中作为 BF16/FP8 GEMM 与 grouped GEMM "
     "后端的集成：扩大 _grouped_bf16_supported / FP8 cache 覆盖、修复回归、提升 "
     "benchmark TFLOPS、收紧 can_handle，使 HIPKITTEN 在 DeepSeek-V3 与 gpt_oss_20B "
-    "形状上又快又稳。"
+    "形状上又快又稳。**硬性验收门槛 (DoD)**：每轮结束时下面 4 个测试文件在默认模式 "
+    "和 --deterministic-only 模式下都必须 0 failed —— "
+    "tests/pytorch/ops/test_gemm.py, tests/pytorch/ops/test_gemm_fp8.py, "
+    "tests/pytorch/ops/test_grouped_gemm.py, tests/pytorch/ops/test_grouped_gemm_fp8.py。"
 )
-DEFAULT_METRIC_CMD = (
-    "HIP_VISIBLE_DEVICES=7 "
-    "PRIMUS_TURBO_HIPKITTEN_PATH=/workspace/code/HipKittens "
-    "python3 -m pytest tests/pytorch/ops/test_gemm.py "
-    "tests/pytorch/ops/test_grouped_gemm.py -k hipkitten --tb=no -q 2>&1 | "
-    "tail -1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+'"
-)
+# Default metric: pass count across all 4 GEMM/grouped-GEMM test files (BF16 +
+# FP8) under default (non-deterministic) mode. Run via scripts/run_dod_metric.sh
+# which auto-picks idle GPUs from `rocm-smi --showpids` so we never collide with
+# other tenants on this shared box. Higher is better; failures subtract heavily
+# (see SCORE inside the script) so any regression drops the metric.
+DEFAULT_METRIC_CMD = "bash scripts/run_dod_metric.sh"
+# The deterministic-only half of the DoD bar. Same idle-GPU picker, same files,
+# but with --deterministic-only. The agent is told to run this in every round;
+# the loop itself does not maximize it, but a round that leaves it red counts
+# as "did not improve".
+DEFAULT_DETERMINISTIC_CMD = "bash scripts/run_dod_metric.sh --deterministic"
 CLI_CONFIG_PATH = Path(os.path.expanduser("~/.cursor/cli-config.json"))
 
 
@@ -161,8 +168,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--metric-name",
         type=str,
-        default="hipkitten_pass_count",
+        default="gemm_grouped_bf16_fp8_pass_count",
         help="Human-readable metric label (used in logs only).",
+    )
+    p.add_argument(
+        "--deterministic-cmd",
+        type=str,
+        default=DEFAULT_DETERMINISTIC_CMD,
+        help=(
+            "Shell command for the deterministic-only suite that completes the DoD bar. "
+            "Quoted into the agent prompt so it knows the second half of 'all pass'. "
+            "Set to empty string to omit."
+        ),
     )
     p.add_argument(
         "--workspace",
@@ -316,6 +333,12 @@ def build_prompt(
         )
     history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
 
+    deterministic_block = (
+        f"\n【DoD 第二项 - 必须同时绿】\n  {args.deterministic_cmd}\n"
+        if args.deterministic_cmd
+        else ""
+    )
+
     return f"""你是 Primus-Turbo 仓库的自动优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
 工作目录: {args.workspace}
 当前 git HEAD: {head_sha}
@@ -323,10 +346,23 @@ def build_prompt(
 【强制第一步】
 请先用读文件工具完整读取这份本地 skill：
   {args.skill_path}
-里面有 HipKittens + Primus-Turbo 集成的所有上下文（路径、env、cache 结构、白名单、坑）。读完再决定本轮该做什么。
+里面有 HipKittens + Primus-Turbo 集成的所有上下文（路径、env、cache 结构、白名单、坑），并且开头就写了**硬性 DoD**（4 个测试文件全 pass）。读完再决定本轮该做什么。
 
 【优化目标】
 {args.task}
+
+【硬性 DoD - 任何一轮违反即视为失败】
+本仓库的验收门槛是：tests/pytorch/ops/ 下面这 4 个文件**默认模式与 --deterministic-only 模式都必须 0 failed**：
+  - tests/pytorch/ops/test_gemm.py
+  - tests/pytorch/ops/test_gemm_fp8.py
+  - tests/pytorch/ops/test_grouped_gemm.py
+  - tests/pytorch/ops/test_grouped_gemm_fp8.py
+
+本轮的 metric 命令 (越大越好) =
+  {args.metric_cmd}
+{deterministic_block}
+你必须确保：本轮结束时 metric 不下降；且如有改动，**在 commit 之前**自己运行上面的命令、确认 0 failed 后再 commit。
+绝不允许通过删测试 / 加 pytest.skip / 改 SNR 阈值这种方式骗过 DoD。
 
 【度量指标】指标名: {args.metric_name}（数值越高越好）
 - 基线 (优化开始前) = {baseline_metric}
@@ -351,11 +387,16 @@ def build_prompt(
    - 用 HipKittens cache 中现有 shape 添加新的 HIPKITTEN 测试用例。
    - 用 benchmark/ops/bench_grouped_gemm_turbo.py 做 perf 实验，把结果以 CSV 形式落到 benchmark/ops/。
    - 修 FP8 路径中的小问题（尤其是 RCR `TK_RCR_FORCE_KERNEL` save/restore、padding）。
-3. 改完一定要跑相关 pytest 与 / 或 benchmark 验证（HIP_VISIBLE_DEVICES=7，PRIMUS_TURBO_HIPKITTEN_PATH=/workspace/code/HipKittens）。
-4. 如果改动确实有进展（测试通过/数值正确/性能提升），就 git commit；若没把握就 git restore 还原，**不要留下脏 working tree**。
+3. 改完一定要跑相关 pytest 与 / 或 benchmark 验证（PRIMUS_TURBO_HIPKITTEN_PATH=/workspace/code/HipKittens；建议 -n 8 并行 8 GPU）。
+4. **commit 前**自己再跑一遍 metric 命令 + deterministic 命令，确认两边都 0 failed 且 metric 不降。
+5. 如果改动确实有进展（测试 0 failed 且 metric 提升），就 git commit；若没把握就 git restore 还原，**不要留下脏 working tree**。
 
 【硬性约束 - 不可违反】
+- **跑任何 pytest / probe / benchmark 前，必须先用 `rocm-smi --showuse --showpids` 选空闲 GPU**，不要抢占其他租户的作业。
+  - 单卡探针：`PICK=$(rocm-smi --showuse 2>/dev/null | awk '/^GPU\\[[0-9]+\\][[:space:]]+: GPU use \\(%\\)/{{gsub(/[^0-9]/,"",$1); if($NF+0==0){{print $1; exit}}}}')`，然后 `HIP_VISIBLE_DEVICES=$PICK ...`。
+  - 并行 pytest：先列空闲 GPU，把它们以逗号串接喂给 `HIP_VISIBLE_DEVICES`，并把 `-n` 调小到空闲卡的数量（不要盲目 `-n 8`，conftest 会把 worker 映射到 GPU 0..7，如果其中有忙的就会冲突）。
 - 绝不删除 tests/pytorch/ops/test_gemm_fp8.py 与 tests/pytorch/ops/test_grouped_gemm_fp8.py。
+- 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"测试。
 - BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)`，绝不能让 autotune 默认选它。
 - 不要修改 ~/.cursor/cli-config.json 或全局 git config。
 - 不要 push 到 remote。
@@ -367,7 +408,7 @@ def build_prompt(
 本轮结束前，在你的最后一条文本里给出一段 markdown 小结，包含：
 - 本轮选择的目标
 - 实际改了哪些文件
-- 验证用的命令与简明结果
+- 验证用的命令与简明结果（含 metric / deterministic 两个数）
 - 是否 commit、commit SHA / message
 - 下一轮你建议下游做什么
 
