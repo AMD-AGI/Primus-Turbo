@@ -315,6 +315,18 @@ class TuneCache:
         return key in self._cache
 
 
+def _format_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
+
+    def _format_value(v):
+        if isinstance(v, torch.Tensor):
+            return f"Tensor(shape={v.shape}, dtype={v.dtype})"
+        if isinstance(v, Enum):
+            return f"{type(v).__name__}.{v.name}"
+        return repr(v)
+
+    return {k: _format_value(v) for k, v in kwargs.items()}
+
+
 class AutoKernelDispatcher(ABC):
     """
     Base class for auto kernel dispatcher.
@@ -411,6 +423,7 @@ class AutoKernelDispatcher(ABC):
         cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
+
         if user_backend_enum is not None:
             if user_backend_enum not in cls._backends:
                 raise ValueError(
@@ -420,7 +433,7 @@ class AutoKernelDispatcher(ABC):
             entry = cls._backends[user_backend_enum]
             if not entry.impl.can_handle(**kwargs):
                 raise ValueError(
-                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs. "
+                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
             return entry.impl.execute(**kwargs)
@@ -441,9 +454,11 @@ class AutoKernelDispatcher(ABC):
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
                 logger.warning(
-                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!",
+                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
                     once=True,
                 )
                 return fallback_backend_entry.impl.execute(**kwargs)
 
-        raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
+        raise ValueError(
+            f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
+        )

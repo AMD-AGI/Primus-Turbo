@@ -21,7 +21,7 @@ from aiter.ops.triton.attention.mha import (
 )
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
-from primus_turbo.pytorch.core.backend import KernelBackend
+from primus_turbo.pytorch.core.backend import KernelBackend, _format_kwargs
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 
@@ -356,7 +356,7 @@ def attention_aiter_forward_impl(
     # TODO(ruibin): Add unified attention kernel dispatcher
     if not AttnFwdAiterBackend.can_handle(**kwargs):
         raise ValueError(
-            f"AttnFwdAiterBackend cannot handle the given inputs. "
+            f"AttnFwdAiterBackend cannot handle the given inputs: {_format_kwargs(kwargs)}. "
             f"Please check input constraints or choose a different backend."
         )
 
@@ -419,7 +419,7 @@ def attention_aiter_backward_impl(
     # TODO(ruibin): Add unified attention kernel dispatcher
     if not AttnBwdAiterBackend.can_handle(**kwargs):
         raise ValueError(
-            f"AttnBwdAiterBackend cannot handle the given inputs. "
+            f"AttnBwdAiterBackend cannot handle the given inputs: {_format_kwargs(kwargs)}. "
             f"Please check input constraints or choose a different backend."
         )
 
