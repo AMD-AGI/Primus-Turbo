@@ -185,7 +185,7 @@ class GEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 GEMM.
 
     Supports:
-      - TENSORWISE: per-tensor scaling (all layouts)
+      - TENSORWISE: per-tensor scaling (all layouts), including HYBRID format
       - ROWWISE: per-row/per-col vector scaling (all layouts)
       - BLOCKWISE: block-wise scaling with three layouts:
           NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
@@ -197,7 +197,7 @@ class GEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.BLOCKWISE,
     }
 
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
