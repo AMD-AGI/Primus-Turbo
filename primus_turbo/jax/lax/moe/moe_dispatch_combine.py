@@ -16,14 +16,19 @@ from primus_turbo.jax.primitive.moe.moe_dispatch import (
     moe_dispatch_p,
 )
 
-from .moe_utils import Config
+from primus_turbo.jax._C import Config
 
-__all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_combine"]
+__all__ = [
+    "Config",
+    "get_dispatch_config",
+    "get_combine_config",
+    "set_default_num_sms",
+    "moe_dispatch",
+    "moe_combine",
+]
 
 
 _default_num_sms = 64
-
-P = jax.sharding.PartitionSpec
 
 
 def set_default_num_sms(num_sms: int):
@@ -47,16 +52,16 @@ def get_dispatch_config() -> Config:
     num_ranks = jax.local_device_count()
     assert num_ranks <= 8, "not support internode"
     config_map = {
-        2: Config(_default_num_sms, 24, 256, 6, 128),
-        4: Config(_default_num_sms, 6, 256, 6, 128),
-        8: Config(_default_num_sms, 6, 256, 6, 128),
-        16: Config(_default_num_sms, 36, 288, 20, 128),
-        24: Config(_default_num_sms, 8, 288, 32, 128),
-        32: Config(_default_num_sms, 32, 288, 32, 128),
-        64: Config(_default_num_sms, 20, 288, 28, 128),
-        128: Config(_default_num_sms, 20, 560, 32, 128),
-        144: Config(_default_num_sms, 32, 720, 12, 128),
-        160: Config(_default_num_sms, 28, 720, 12, 128),
+        2: Config(_default_num_sms, 24, 512, 6, 512),
+        4: Config(_default_num_sms, 6, 512, 6, 512),
+        8: Config(_default_num_sms, 6, 512, 6, 512),
+        16: Config(_default_num_sms, 36, 512, 20, 512),
+        24: Config(_default_num_sms, 8, 512, 32, 512),
+        32: Config(_default_num_sms, 32, 512, 32, 512),
+        64: Config(_default_num_sms, 20, 512, 28, 512),
+        128: Config(_default_num_sms, 20, 560, 32, 512),
+        144: Config(_default_num_sms, 32, 720, 12, 512),
+        160: Config(_default_num_sms, 28, 720, 12, 512),
     }
     assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
     return config_map[num_ranks]
@@ -64,7 +69,7 @@ def get_dispatch_config() -> Config:
 
 def get_combine_config() -> Config:
     """
-    Get a recommended dispatch config.
+    Get a recommended combine config.
     Returns:
         config: the recommended config.
     """
@@ -72,16 +77,16 @@ def get_combine_config() -> Config:
     num_ranks = jax.local_device_count()
     assert num_ranks <= 8, "not support internode"
     config_map = {
-        2: Config(_default_num_sms, 10, 256, 6, 128),
-        4: Config(_default_num_sms, 9, 256, 6, 128),
-        8: Config(_default_num_sms, 4, 256, 6, 128),
-        16: Config(_default_num_sms, 4, 288, 12, 128),
-        24: Config(_default_num_sms, 1, 288, 8, 128),
-        32: Config(_default_num_sms, 1, 288, 8, 128),
-        64: Config(_default_num_sms, 1, 288, 20, 128),
-        128: Config(_default_num_sms, 1, 560, 12, 128),
-        144: Config(_default_num_sms, 2, 720, 8, 128),
-        160: Config(_default_num_sms, 2, 720, 8, 128),
+        2: Config(_default_num_sms, 10, 512, 6, 512),
+        4: Config(_default_num_sms, 9, 512, 6, 512),
+        8: Config(_default_num_sms, 4, 512, 6, 512),
+        16: Config(_default_num_sms, 4, 512, 12, 512),
+        24: Config(_default_num_sms, 1, 512, 8, 512),
+        32: Config(_default_num_sms, 1, 512, 8, 512),
+        64: Config(_default_num_sms, 1, 512, 20, 512),
+        128: Config(_default_num_sms, 1, 560, 12, 512),
+        144: Config(_default_num_sms, 2, 720, 8, 512),
+        160: Config(_default_num_sms, 2, 720, 8, 512),
     }
     assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
     return config_map[num_ranks]
