@@ -221,7 +221,7 @@ void Buffer::IntranodeDispatch(
 
     // Shape and contiguous checks
     PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
-    PRIMUS_TURBO_CHECK((x.dimensions()[1] * x.element_count()) % sizeof(int4) == 0);
+    PRIMUS_TURBO_CHECK((x.dimensions()[1] * ffi::ByteWidth(x.element_type())) % sizeof(int4) == 0);
     PRIMUS_TURBO_CHECK(is_token_in_rank.dimensions().size() == 2);
     PRIMUS_TURBO_CHECK(is_token_in_rank.dimensions()[0] == x.dimensions()[0] and
                        is_token_in_rank.dimensions()[1] == num_ranks_);
