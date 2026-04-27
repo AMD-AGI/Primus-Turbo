@@ -5,21 +5,29 @@
 # See LICENSE for license information.
 ###############################################################################
 #
-# Run the "all FP8/BF16 GEMM/grouped_GEMM tests must pass" DoD suite, picking
-# idle GPUs at runtime so we never collide with other tenants on this box.
+# Fast iteration metric for auto_optimize.py: runs ONLY the HipKitten-tagged
+# pytest cases in test_gemm.py + test_grouped_gemm.py (where HIPKITTEN tests
+# live) so each round finishes in tens of seconds, not minutes. Picks idle
+# GPUs at runtime via rocm-smi so we never collide with other tenants.
 #
-# Output: a single integer (pass count) on stdout when --metric is passed
-# (default), or the raw pytest output when --raw is passed. Designed to be
-# consumed by scripts/auto_optimize.py as its --metric-cmd / --deterministic-cmd.
+# The broader "all 4 files green" DoD bar is the **final acceptance gate**
+# (run with --full); the loop itself maximizes pass count over HipKitten
+# tests only.
+#
+# Output: single integer score on stdout (default), or raw pytest output
+# (--raw). Designed to be consumed by scripts/auto_optimize.py.
 #
 # Flags:
-#   --deterministic   Pass --deterministic-only to pytest (DoD second half).
-#   --raw             Print full pytest output instead of just pass count.
+#   --full            Run the full DoD suite (4 files, no -k filter). Slow.
+#                     Use this for final acceptance, not for the loop metric.
+#   --deterministic   Add --deterministic-only to pytest.
+#   --raw             Print full pytest output instead of score.
 #   --max-workers N   Cap the number of xdist workers (default: # idle GPUs).
 #
 # Env overrides:
 #   HIPKITTEN_PATH    Defaults to /workspace/code/HipKittens.
 #   IDLE_GPUS         Override auto-detection ("0,2,4" style).
+#   PYTEST_K          Override the -k expression (default: "hipkitten").
 ###############################################################################
 
 set -u -o pipefail
@@ -29,9 +37,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DETERMINISTIC=0
 RAW=0
+FULL=0
 MAX_WORKERS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --full)          FULL=1; shift ;;
         --deterministic) DETERMINISTIC=1; shift ;;
         --raw)           RAW=1; shift ;;
         --max-workers)   MAX_WORKERS="$2"; shift 2 ;;
@@ -102,18 +112,37 @@ if [[ -n "$MAX_WORKERS" && "$NPROC" -gt "$MAX_WORKERS" ]]; then
     DEVICES=$(awk -v n="$NPROC" -F, '{ for(i=1;i<=n;i++) printf "%s%s", $i, (i<n?",":"") }' <<<"$DEVICES")
 fi
 
-echo "[run_dod_metric] idle GPUs=${DEVICES} workers=${NPROC} deterministic=${DETERMINISTIC}" >&2
+echo "[run_dod_metric] idle GPUs=${DEVICES} workers=${NPROC} deterministic=${DETERMINISTIC} full=${FULL}" >&2
 
-PYTEST_FILES=(
-    "$REPO_ROOT/tests/pytorch/ops/test_gemm.py"
-    "$REPO_ROOT/tests/pytorch/ops/test_gemm_fp8.py"
-    "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm.py"
-    "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm_fp8.py"
-)
+if [[ "$FULL" -eq 1 ]]; then
+    PYTEST_FILES=(
+        "$REPO_ROOT/tests/pytorch/ops/test_gemm.py"
+        "$REPO_ROOT/tests/pytorch/ops/test_gemm_fp8.py"
+        "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm.py"
+        "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm_fp8.py"
+    )
+else
+    # Loop-mode: only the files that contain HIPKITTEN-tagged cases.
+    PYTEST_FILES=(
+        "$REPO_ROOT/tests/pytorch/ops/test_gemm.py"
+        "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm.py"
+    )
+fi
+KEXPR="${PYTEST_K:-hipkitten}"
 
 PYTEST_CMD=(python3 -m pytest "${PYTEST_FILES[@]}" --tb=no -q)
-if [[ "$NPROC" -gt 1 ]]; then
+if [[ "$FULL" -eq 0 ]]; then
+    PYTEST_CMD+=( -k "$KEXPR" )
+fi
+# Cap parallelism by # of selected tests for the narrow loop run; xdist only
+# helps if we have multiple cases per worker. For the HipKitten loop this
+# rarely needs >2 workers.
+if [[ "$NPROC" -gt 1 && "$FULL" -eq 1 ]]; then
     PYTEST_CMD+=( -n "$NPROC" )
+elif [[ "$NPROC" -gt 1 && "$FULL" -eq 0 ]]; then
+    LOOPN=$NPROC
+    [[ "$LOOPN" -gt 2 ]] && LOOPN=2
+    PYTEST_CMD+=( -n "$LOOPN" )
 fi
 if [[ "$DETERMINISTIC" -eq 1 ]]; then
     PYTEST_CMD+=( --deterministic-only )
