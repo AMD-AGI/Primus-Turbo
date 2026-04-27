@@ -9,6 +9,7 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import _load_hipkitten_module
 from tests.pytorch.test_utils import get_tolerances
 
 
@@ -146,6 +147,87 @@ def test_gemm_deterministic(m, n, k, layout, dtype, backend):
     torch.testing.assert_close(db0, b_ref.grad.detach(), **get_tolerances(dtype))
 
     GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("m, n, k", [(4096, 4096, 4096)])
+@pytest.mark.parametrize("layout", ["NN", "NT", "TN"])
+def test_gemm_bf16_hipkitten_backend(m, n, k, layout):
+    try:
+        _load_hipkitten_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    try:
+        GlobalBackendManager.set_gemm_backend(BackendType.HIPKITTEN)
+        GlobalBackendManager.set_auto_tune(False)
+
+        torch.manual_seed(42)
+        a_shape = (m, k) if not trans_a else (k, m)
+        b_shape = (k, n) if not trans_b else (n, k)
+        a = torch.randn(a_shape, dtype=dtype, device=device).requires_grad_()
+        b = torch.randn(b_shape, dtype=dtype, device=device).requires_grad_()
+        a_ref = a.detach().clone().requires_grad_()
+        b_ref = b.detach().clone().requires_grad_()
+
+        c = turbo.ops.gemm(a, b, trans_a, trans_b, dtype)
+        c_ref = (a_ref.T if trans_a else a_ref) @ (b_ref.T if trans_b else b_ref)
+        torch.testing.assert_close(c, c_ref, **get_tolerances(dtype))
+
+        grad_c = torch.randn_like(c)
+        c.backward(grad_c)
+        c_ref.backward(grad_c)
+        torch.testing.assert_close(a.grad, a_ref.grad, **get_tolerances(dtype))
+        torch.testing.assert_close(b.grad, b_ref.grad, **get_tolerances(dtype))
+    finally:
+        GlobalBackendManager.reset()
+
+
+def test_gemm_bf16_hipkitten_backend_rejects_unsupported_shape():
+    try:
+        _load_hipkitten_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    try:
+        GlobalBackendManager.set_gemm_backend(BackendType.HIPKITTEN)
+        GlobalBackendManager.set_auto_tune(False)
+        a = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda")
+        b = torch.randn((384, 256), dtype=torch.bfloat16, device="cuda")
+        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
+            turbo.ops.gemm(a, b, trans_b=True)
+    finally:
+        GlobalBackendManager.reset()
+
+
+def test_gemm_bf16_hipkitten_backend_rejects_uncached_backward_shape():
+    try:
+        _load_hipkitten_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    try:
+        GlobalBackendManager.set_gemm_backend(BackendType.HIPKITTEN)
+        GlobalBackendManager.set_auto_tune(False)
+        a = torch.randn((4096, 12288), dtype=torch.bfloat16, device="cuda")
+        b = torch.randn((12288, 4096), dtype=torch.bfloat16, device="cuda")
+        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
+            turbo.ops.gemm(a, b)
+    finally:
+        GlobalBackendManager.reset()
 
 
 @pytest.mark.parametrize(
