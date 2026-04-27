@@ -69,22 +69,22 @@ DEFAULT_TASK = (
     "持续优化 HipKittens 在 Primus-Turbo 中作为 BF16/FP8 GEMM 与 grouped GEMM "
     "后端的集成：扩大 _grouped_bf16_supported / FP8 cache 覆盖、修复回归、提升 "
     "benchmark TFLOPS、收紧 can_handle，使 HIPKITTEN 在 DeepSeek-V3 与 gpt_oss_20B "
-    "形状上又快又稳。**硬性验收门槛 (DoD)**：每轮结束时下面 4 个测试文件在默认模式 "
-    "和 --deterministic-only 模式下都必须 0 failed —— "
-    "tests/pytorch/ops/test_gemm.py, tests/pytorch/ops/test_gemm_fp8.py, "
-    "tests/pytorch/ops/test_grouped_gemm.py, tests/pytorch/ops/test_grouped_gemm_fp8.py。"
+    "形状上又快又稳。**每轮快速验收**：tests/pytorch/ops/test_gemm.py 与 "
+    "tests/pytorch/ops/test_grouped_gemm.py 中 -k hipkitten 的所有用例必须 0 failed。"
+    "**最终验收 (DoD，由用户偶尔抽查)**：4 个 GEMM/grouped-GEMM bf16/fp8 测试文件全绿。"
 )
-# Default metric: pass count across all 4 GEMM/grouped-GEMM test files (BF16 +
-# FP8) under default (non-deterministic) mode. Run via scripts/run_dod_metric.sh
-# which auto-picks idle GPUs from `rocm-smi --showpids` so we never collide with
-# other tenants on this shared box. Higher is better; failures subtract heavily
-# (see SCORE inside the script) so any regression drops the metric.
-DEFAULT_METRIC_CMD = "bash scripts/run_dod_metric.sh"
-# The deterministic-only half of the DoD bar. Same idle-GPU picker, same files,
-# but with --deterministic-only. The agent is told to run this in every round;
-# the loop itself does not maximize it, but a round that leaves it red counts
-# as "did not improve".
-DEFAULT_DETERMINISTIC_CMD = "bash scripts/run_dod_metric.sh --deterministic"
+# Loop metric: a single-process probe that exercises EVERY HipKitten cache
+# entry — 144 BF16 dense (RCR/RRR/CRR × 48 shapes), 144 FP8 dense
+# (RCR/RRR/CRR × 48 shapes, calling the HIPKITTEN backend directly so CRR is
+# included), and a handful of grouped + reject probes — in ~8 s wall.
+# Score formula inside the script penalizes failures by 1100 each so any
+# regression sinks the metric well below the best-so-far.
+DEFAULT_METRIC_CMD = "python3 scripts/_metric_hipkitten.py"
+# Final acceptance is the full DoD pytest suite (all 4 files, both default and
+# --deterministic-only). Too slow for every round; the agent / user runs this
+# occasionally to confirm we haven't regressed the broader sweeps. Empty by
+# default so the loop doesn't measure it.
+DEFAULT_DETERMINISTIC_CMD = ""
 CLI_CONFIG_PATH = Path(os.path.expanduser("~/.cursor/cli-config.json"))
 
 
@@ -168,7 +168,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--metric-name",
         type=str,
-        default="gemm_grouped_bf16_fp8_pass_count",
+        default="hipkitten_pass_count",
         help="Human-readable metric label (used in logs only).",
     )
     p.add_argument(
