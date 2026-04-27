@@ -408,6 +408,11 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                             warp_id / 2 * 64 * (int64_t) k + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_n + 256 > (int32_t) n) || (pid_k + 256 > (int32_t) k);
 
+    // Wgrad keeps the default volatile C-store path (see store_c_subtile in
+    // turbo_gemm_mxfp8_kernel.h): switching to non-volatile gives marginal
+    // perf here (the wgrad kernel processes many more tiles per CTA than FWD
+    // so C-store is already amortized) and measurably increases pre-existing
+    // dB stress-test races on small shapes.
     if (!is_boundary_tile) {
         float32x4 c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
