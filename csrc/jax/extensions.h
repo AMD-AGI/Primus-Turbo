@@ -49,5 +49,8 @@ int64_t GetQuantizeFP8RowwiseWorkspaceSize(const std::vector<int64_t> &shape, in
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoEDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECachedDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECombineHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(MoEDispatchPerProcessHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECachedDispatchPerProcessHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(MoECombinePerProcessHandler);
 
 } // namespace primus_turbo::jax

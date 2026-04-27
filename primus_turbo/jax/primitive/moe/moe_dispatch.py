@@ -12,6 +12,7 @@ from jax.core import ShapedArray
 from jax.extend.core import Primitive
 from jax.interpreters import xla
 
+from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE
 
 # ----------------------------------------
@@ -51,17 +52,22 @@ def _moe_dispatch_abstract_eval(
     num_experts: int,
     expert_alignment: int,
     num_worst_tokens: int,
+    ep_size: int,
+    launch_mode: int,
     num_sms: int,
     num_max_nvl_chunked_send_tokens: int,
     num_max_nvl_chunked_recv_tokens: int,
     num_max_rdma_chunked_send_tokens: int,
     num_max_rdma_chunked_recv_tokens: int,
 ):
+    del expert_alignment, launch_mode, num_max_nvl_chunked_send_tokens
+    del num_max_nvl_chunked_recv_tokens, num_max_rdma_chunked_send_tokens
+    del num_max_rdma_chunked_recv_tokens
 
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     assert topk_idx.ndim == 2, "topk_idx must be a 2D array, but got {}".format(topk_idx.ndim)
 
-    num_ranks = jax.local_device_count()
+    num_ranks = ep_size
     assert num_ranks <= 8, "not support internode"
 
     num_tokens, hidden_size = x.shape
@@ -105,17 +111,23 @@ def _moe_cached_dispatch_abstract_eval(
     num_recv_tokens: int,
     expert_alignment: int,
     num_worst_tokens: int,
+    ep_size: int,
+    launch_mode: int,
     num_sms: int,
     num_max_nvl_chunked_send_tokens: int,
     num_max_nvl_chunked_recv_tokens: int,
     num_max_rdma_chunked_send_tokens: int,
     num_max_rdma_chunked_recv_tokens: int,
 ):
+    del is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix, expert_alignment
+    del num_worst_tokens, launch_mode, num_max_nvl_chunked_send_tokens
+    del num_max_nvl_chunked_recv_tokens, num_max_rdma_chunked_send_tokens
+    del num_max_rdma_chunked_recv_tokens
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     num_tokens, hidden_size = x.shape
     num_channels = num_sms // 2
 
-    num_ranks = jax.local_device_count()
+    num_ranks = ep_size
     assert num_ranks <= 8, "not support internode"
 
     recv_x = ShapedArray((num_recv_tokens, hidden_size), x.dtype)
@@ -132,8 +144,20 @@ ABSTRACT_EVAL_TABLE[moe_cached_dispatch_p] = _moe_cached_dispatch_abstract_eval
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
-LOWERING_TABLE[moe_dispatch_p] = jax.ffi.ffi_lowering("moe_dispatch")
-LOWERING_TABLE[moe_cached_dispatch_p] = jax.ffi.ffi_lowering("moe_cached_dispatch")
+def _moe_dispatch_lowering(ctx, *args, **kwargs):
+    target = deep_ep_runtime.get_target_name("moe_dispatch", launch_mode=kwargs.get("launch_mode"))
+    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+
+
+def _moe_cached_dispatch_lowering(ctx, *args, **kwargs):
+    target = deep_ep_runtime.get_target_name(
+        "moe_cached_dispatch", launch_mode=kwargs.get("launch_mode")
+    )
+    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+
+
+LOWERING_TABLE[moe_dispatch_p] = _moe_dispatch_lowering
+LOWERING_TABLE[moe_cached_dispatch_p] = _moe_cached_dispatch_lowering
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------

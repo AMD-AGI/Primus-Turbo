@@ -11,6 +11,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
@@ -90,6 +91,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
             &buffer_ptrs_[nvl_rank_],
             num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes,
             hipDeviceMallocUncached));
+        PRIMUS_TURBO_CHECK_HIP(
+            hipIpcGetMemHandle(&ipc_handles_[nvl_rank_], buffer_ptrs_[nvl_rank_]));
 
         buffer_ptrs_gpu_ = reinterpret_cast<void **>(
             static_cast<uint8_t *>(buffer_ptrs_[nvl_rank_]) + num_nvl_bytes + barrier_signal_bytes);
@@ -149,12 +152,15 @@ Buffer::~Buffer() noexcept(false) {
 void Buffer::Destroy() {
     PRIMUS_TURBO_CHECK(not destroyed_);
 
-    // Synchronize
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
     if (num_nvl_bytes_ > 0) {
-        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
-        // Free local buffer and error flag
+        // Close remote IPC handles opened by SyncFromIPCHandles.
+        if (ipc_synced_ && is_available()) {
+            for (int i = 0; i < num_nvl_ranks_; ++i)
+                if (i != nvl_rank_)
+                    PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(buffer_ptrs_[i]));
+        }
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
     }
     destroyed_ = true;
@@ -499,6 +505,89 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
         send_head.typed_data(), num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs_gpu_,
         rank_, num_ranks_, stream, config.num_sms, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
+}
+
+pybind11::bytearray Buffer::get_local_ipc_handle() const {
+    PRIMUS_TURBO_CHECK(num_nvl_bytes_ > 0);
+    return {ipc_handles_[nvl_rank_].reserved, HIP_IPC_HANDLE_SIZE};
+}
+
+void Buffer::SyncFromIPCHandles(
+    const std::vector<std::optional<pybind11::bytearray>> &all_handles) {
+    PRIMUS_TURBO_CHECK(not is_available());
+    PRIMUS_TURBO_CHECK(not ipc_synced_);
+    PRIMUS_TURBO_CHECK(static_cast<int>(all_handles.size()) == num_ranks_);
+
+    if (num_nvl_bytes_ > 0) {
+        int offset = rdma_rank_ * num_nvl_ranks_;
+        for (int i = 0; i < num_nvl_ranks_; ++i) {
+            PRIMUS_TURBO_CHECK(all_handles[offset + i].has_value());
+            auto handle_str = std::string(all_handles[offset + i].value());
+            PRIMUS_TURBO_CHECK(handle_str.size() == HIP_IPC_HANDLE_SIZE);
+            if (offset + i != rank_) {
+                hipIpcMemHandle_t remote_handle;
+                std::memcpy(remote_handle.reserved, handle_str.c_str(), HIP_IPC_HANDLE_SIZE);
+                PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(
+                    &buffer_ptrs_[i], remote_handle, hipIpcMemLazyEnablePeerAccess));
+                barrier_signal_ptrs_[i] = reinterpret_cast<int *>(
+                    static_cast<uint8_t *>(buffer_ptrs_[i]) + num_nvl_bytes_);
+            } else {
+                PRIMUS_TURBO_CHECK(std::memcmp(ipc_handles_[i].reserved, handle_str.c_str(),
+                                               HIP_IPC_HANDLE_SIZE) == 0);
+            }
+        }
+
+        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
+                                         sizeof(void *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
+                                         sizeof(int *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+    }
+
+    ipc_synced_   = true;
+    is_available_ = true;
+}
+
+// ---------------------------------------------------------------------------
+//  Per-process buffer singleton
+// ---------------------------------------------------------------------------
+
+static std::unique_ptr<Buffer> g_per_process_buffer;
+
+Buffer *get_per_process_buffer() { return g_per_process_buffer.get(); }
+
+pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t num_nvl_bytes,
+                                              int64_t num_rdma_bytes) {
+    if (g_per_process_buffer != nullptr) {
+        g_per_process_buffer->Destroy();
+        g_per_process_buffer.reset();
+    }
+    g_per_process_buffer =
+        std::make_unique<Buffer>(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, true);
+    return g_per_process_buffer->get_local_ipc_handle();
+}
+
+void sync_per_process_buffer(
+    const std::vector<std::optional<pybind11::bytearray>> &all_handles) {
+    PRIMUS_TURBO_CHECK(g_per_process_buffer != nullptr);
+    g_per_process_buffer->SyncFromIPCHandles(all_handles);
+}
+
+void destroy_per_process_buffer() {
+    if (g_per_process_buffer != nullptr) {
+        g_per_process_buffer->Destroy();
+        g_per_process_buffer.reset();
+    }
+}
+
+bool is_per_process_buffer_ready() {
+    return g_per_process_buffer != nullptr && g_per_process_buffer->is_available();
+}
+
+int64_t per_process_buffer_nvl_bytes() {
+    if (g_per_process_buffer == nullptr)
+        return 0;
+    return g_per_process_buffer->num_nvl_bytes();
 }
 
 } // namespace primus_turbo::jax::deep_ep

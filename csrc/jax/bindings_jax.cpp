@@ -4,9 +4,13 @@
 
 #include "extensions.h"
 #include "ffi.h"
+#include "jax/deep_ep/deep_ep.h"
 #include "primus_turbo/arch.h"
+#include "primus_turbo/deep_ep/config.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+namespace py = pybind11;
 
 #define REGISTER_FFI_HANDLER(dict, name, fn) dict[#name] = ::primus_turbo::jax::EncapsulateFFI(fn);
 
@@ -27,9 +31,12 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, rmsnorm_bwd, RMSNormBwdHandler);
 
     // DeepEP
-    REGISTER_FFI_HANDLER(dict, moe_dispatch, MoEDispatchHandler);
-    REGISTER_FFI_HANDLER(dict, moe_cached_dispatch, MoECachedDispatchHandler);
-    REGISTER_FFI_HANDLER(dict, moe_combine, MoECombineHandler);
+    REGISTER_FFI_HANDLER(dict, moe_dispatch_inproc, MoEDispatchHandler);
+    REGISTER_FFI_HANDLER(dict, moe_cached_dispatch_inproc, MoECachedDispatchHandler);
+    REGISTER_FFI_HANDLER(dict, moe_combine_inproc, MoECombineHandler);
+    REGISTER_FFI_HANDLER(dict, moe_dispatch_per_process, MoEDispatchPerProcessHandler);
+    REGISTER_FFI_HANDLER(dict, moe_cached_dispatch_per_process, MoECachedDispatchPerProcessHandler);
+    REGISTER_FFI_HANDLER(dict, moe_combine_per_process, MoECombinePerProcessHandler);
 
     // Grouped GEMM
     REGISTER_FFI_HANDLER(dict, ck_grouped_gemm, CKGroupedGemmHandler);
@@ -83,6 +90,27 @@ PYBIND11_MODULE(_C, m) {
         return {prop.major, prop.minor};
     });
     m.def("is_gfx950", &primus_turbo::is_gfx950);
+
+    // DeepEP per-process buffer management
+    namespace dep = deep_ep;
+    auto dep_m = m.def_submodule("deep_ep");
+    dep_m.def("create_per_process_buffer", &dep::create_per_process_buffer,
+              py::arg("rank"), py::arg("num_ranks"), py::arg("num_nvl_bytes"),
+              py::arg("num_rdma_bytes") = 0);
+    dep_m.def("sync_per_process_buffer", &dep::sync_per_process_buffer);
+    dep_m.def("destroy_per_process_buffer", &dep::destroy_per_process_buffer);
+    dep_m.def("is_per_process_buffer_ready", &dep::is_per_process_buffer_ready);
+    dep_m.def("per_process_buffer_nvl_bytes", &dep::per_process_buffer_nvl_bytes);
+    dep_m.def("get_nvl_buffer_size_hint",
+              [](int64_t hidden_bytes, int num_ranks, int num_sms,
+                 int nvl_send, int nvl_recv, int rdma_send, int rdma_recv) -> int64_t {
+                  auto cfg = primus_turbo::deep_ep::Config(
+                      num_sms, nvl_send, nvl_recv, rdma_send, rdma_recv);
+                  return static_cast<int64_t>(
+                      cfg.get_nvl_buffer_size_hint(static_cast<size_t>(hidden_bytes), num_ranks));
+              },
+              py::arg("hidden_bytes"), py::arg("num_ranks"), py::arg("num_sms"),
+              py::arg("nvl_send"), py::arg("nvl_recv"), py::arg("rdma_send"), py::arg("rdma_recv"));
 }
 
 } // namespace primus_turbo::jax

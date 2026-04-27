@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 
+from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.primitive.moe.moe_combine import moe_combine_p
 from primus_turbo.jax.primitive.moe.moe_dispatch import (
     moe_cached_dispatch_p,
@@ -24,6 +25,10 @@ __all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_com
 _default_num_sms = 64
 
 P = jax.sharding.PartitionSpec
+
+
+def _get_hidden_bytes(x: jnp.ndarray) -> int:
+    return x.shape[1] * max(jnp.dtype(x.dtype).itemsize, 2)
 
 
 def set_default_num_sms(num_sms: int):
@@ -44,7 +49,7 @@ def get_dispatch_config() -> Config:
         config: the recommended config.
     """
     global _default_num_sms
-    num_ranks = jax.local_device_count()
+    num_ranks = deep_ep_runtime.get_ep_size()
     assert num_ranks <= 8, "not support internode"
     config_map = {
         2: Config(_default_num_sms, 24, 256, 6, 128),
@@ -69,7 +74,7 @@ def get_combine_config() -> Config:
         config: the recommended config.
     """
     global _default_num_sms
-    num_ranks = jax.local_device_count()
+    num_ranks = deep_ep_runtime.get_ep_size()
     assert num_ranks <= 8, "not support internode"
     config_map = {
         2: Config(_default_num_sms, 10, 256, 6, 128),
@@ -178,9 +183,12 @@ def _moe_dispatch_impl(
 
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     num_tokens, _ = x.shape
-    num_worst_tokens = num_tokens * jax.local_device_count()
     # default config
     config = get_dispatch_config() if config is None else config
+    deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
+    ep_size = deep_ep_runtime.get_ep_size(lock=True)
+    launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
+    num_worst_tokens = num_tokens * ep_size
 
     if handle is not None:
         assert topk_idx is None and topk_weights is None
@@ -202,6 +210,8 @@ def _moe_dispatch_impl(
             num_recv_tokens=num_recv_tokens,
             expert_alignment=expert_alignment,
             num_worst_tokens=num_worst_tokens,
+            ep_size=ep_size,
+            launch_mode=launch_mode,
             num_sms=config.num_sms,
             num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
             num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
@@ -235,6 +245,8 @@ def _moe_dispatch_impl(
             num_experts=num_experts,
             expert_alignment=expert_alignment,
             num_worst_tokens=num_worst_tokens,
+            ep_size=ep_size,
+            launch_mode=launch_mode,
             num_sms=config.num_sms,
             num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
             num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
@@ -348,9 +360,11 @@ def _moe_combine_impl(
     bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
 ) -> Tuple[jnp.ndarray]:
-
     # default config
     config = get_combine_config() if config is None else config
+    deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
+    ep_size = deep_ep_runtime.get_ep_size(lock=True)
+    launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
 
     # unpack bias
     bias_0, bias_1 = None, None
@@ -380,6 +394,8 @@ def _moe_combine_impl(
         rank_prefix_matrix,
         channel_prefix_matrix,
         send_head,
+        ep_size=ep_size,
+        launch_mode=launch_mode,
         num_sms=config.num_sms,
         num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
         num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,

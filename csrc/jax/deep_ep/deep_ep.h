@@ -12,6 +12,11 @@
 #include "primus_turbo/deep_ep/config.hpp"
 #include "primus_turbo/deep_ep/configs.h"
 #include <hip/hip_runtime.h>
+#include <optional>
+#include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
+#include <string>
+#include <vector>
 
 namespace primus_turbo::jax::deep_ep {
 class Buffer {
@@ -23,6 +28,13 @@ public:
     ~Buffer() noexcept(false);
 
     void Destroy();
+
+    // IPC handle access for cross-process synchronization.
+    pybind11::bytearray get_local_ipc_handle() const;
+
+    // Synchronize buffer pointers using IPC handles gathered from all ranks.
+    // Each element is the raw bytes of a hipIpcMemHandle_t (size HIP_IPC_HANDLE_SIZE).
+    void SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytearray>> &all_handles);
 
     int64_t num_nvl_bytes() const { return num_nvl_bytes_; }
     int64_t num_rdma_bytes() const { return num_rdma_bytes_; }
@@ -84,9 +96,11 @@ public:
 
 private:
     // NVLink Buffer
-    int64_t num_nvl_bytes_;
-    void   *buffer_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
-    void  **buffer_ptrs_gpu_                = nullptr;
+    int64_t            num_nvl_bytes_;
+    hipIpcMemHandle_t  ipc_handles_[NUM_MAX_NVL_PEERS] = {};
+    bool               ipc_synced_ = false;
+    void              *buffer_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
+    void             **buffer_ptrs_gpu_                = nullptr;
 
     // NVSHMEM Buffer
     int64_t num_rdma_bytes_;
@@ -126,7 +140,18 @@ private:
     int          *moe_recv_rdma_counter_mapped_ = nullptr;
 };
 
+// Inproc mode: per-device buffer pool with in-process barrier sync.
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::Config &config);
+
+// Per-process mode: single buffer per process, IPC-synced from Python.
+Buffer *get_per_process_buffer();
+pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t num_nvl_bytes,
+                                              int64_t num_rdma_bytes);
+void sync_per_process_buffer(
+    const std::vector<std::optional<pybind11::bytearray>> &all_handles);
+void destroy_per_process_buffer();
+bool is_per_process_buffer_ready();
+int64_t per_process_buffer_nvl_bytes();
 
 } // namespace primus_turbo::jax::deep_ep

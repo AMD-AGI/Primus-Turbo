@@ -12,6 +12,7 @@ from jax.core import ShapedArray
 from jax.extend.core import Primitive
 from jax.interpreters import xla
 
+from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE
 
 # ----------------------------------------
@@ -39,12 +40,18 @@ def _moe_combine_abstract_eval(
     rank_prefix_matrix: jnp.ndarray,
     channel_prefix_matrix: jnp.ndarray,
     send_head: jnp.ndarray,
+    ep_size: int,
+    launch_mode: int,
     num_sms: int,
     num_max_nvl_chunked_send_tokens: int,
     num_max_nvl_chunked_recv_tokens: int,
     num_max_rdma_chunked_send_tokens: int,
     num_max_rdma_chunked_recv_tokens: int,
 ):
+    del bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix
+    del ep_size, launch_mode, num_sms, num_max_nvl_chunked_send_tokens
+    del num_max_nvl_chunked_recv_tokens, num_max_rdma_chunked_send_tokens
+    del num_max_rdma_chunked_recv_tokens
 
     assert x.ndim == 2, f"x must be a 2D array, but got {x.ndim}"
     assert send_head.ndim == 2, f"send_head must be a 2D array, but got {send_head.ndim}"
@@ -62,7 +69,12 @@ ABSTRACT_EVAL_TABLE[moe_combine_p] = _moe_combine_abstract_eval
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
-LOWERING_TABLE[moe_combine_p] = jax.ffi.ffi_lowering("moe_combine")
+def _moe_combine_lowering(ctx, *args, **kwargs):
+    target = deep_ep_runtime.get_target_name("moe_combine", launch_mode=kwargs.get("launch_mode"))
+    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+
+
+LOWERING_TABLE[moe_combine_p] = _moe_combine_lowering
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------
