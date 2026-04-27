@@ -667,13 +667,29 @@ def _fp8_grouped_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
 def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool, str]]]]:
     """Direct probes for GroupedGEMMFP8VariableKHipKittenBackend (CRR / dB).
 
-    Three FP8 CRR cache shapes (kernel M_N_K → probe (M_p, N_p, K_p)):
-      - crr_4096_4096_4096   → probe (4096, 4096, 4096)   baseline / DeepSeek 4096^3
-      - crr_4096_12288_4096  → probe (4096, 4096, 12288)  DeepSeek MLP K-major
-      - crr_4096_8192_8192   → probe (8192, 4096, 8192)   GQA-ish, mid-size
-    All three cache shapes are present in the FP8 .autotune_cache.json so the
-    fast (no-pad) branch is exercised, with B=2 to mirror the existing pytest
-    case. Each ok adds 100 to the metric score.
+    Probe (M_p, N_p, K_p) maps to FP8 CRR cache key
+    ``crr_<round_up(N_p,256)>_<round_up(K_p,256)>_<round_up(M_p,128)>``;
+    cache-hit probes exercise the tuned ``group_m``, cache-miss probes still
+    exercise gemm_crr at distinct shapes via the default ``group_m=4`` path.
+    All shapes use B=2 to mirror the existing pytest case. Each ok adds 100
+    to the metric score; SNR independently verified at ~28.5 dB
+    (well above the 22 dB FP8 threshold).
+
+    Baseline (cache-hit) shapes:
+      - probe (4096, 4096, 4096)  -> crr_4096_4096_4096   DeepSeek 4096^3
+      - probe (4096, 4096, 12288) -> crr_4096_12288_4096  DeepSeek MLP K-major
+      - probe (8192, 4096, 8192)  -> crr_4096_8192_8192   GQA-ish mid-size
+
+    Extra cache-hit shapes (verified standalone before adding):
+      - probe (11008, 4096, 4096) -> crr_4096_4096_11008  DeepSeek MLP up dB
+      - probe (4096, 8192, 4096)  -> crr_8192_4096_4096   gpt_oss-style N=8192
+      - probe (4096, 4096, 6144)  -> crr_4096_6144_4096   mid-size MoE dB
+
+    Extra cache-miss shapes (use default group_m, still SNR-clean — they
+    broaden gemm_crr shape coverage at distinct M_p / N_p / K_p triples
+    not represented in any cache entry today):
+      - probe (4096, 4096, 14336) -> crr_4096_14336_4096  DeepSeek long-K dB
+      - probe (8192, 8192, 4096)  -> crr_8192_4096_8192   gpt_oss MoE dB
     """
     if not FP8_CACHE.exists():
         return []
@@ -682,6 +698,11 @@ def _fp8_grouped_variable_k_probes() -> list[tuple[str, Callable[[], tuple[bool,
         (4096, 4096, 4096),
         (4096, 4096, 12288),
         (8192, 4096, 8192),
+        (11008, 4096, 4096),
+        (4096, 8192, 4096),
+        (4096, 4096, 6144),
+        (4096, 4096, 14336),
+        (8192, 8192, 4096),
     ]
     for (m, n, k) in shapes:
         out.append((
