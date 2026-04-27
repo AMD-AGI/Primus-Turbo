@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
 from primus_turbo.pytorch.deep_ep import Config
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     clear_backend_instances,
@@ -150,9 +151,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
             )
 
-        if not deepep_use_comm_stream:
+        if not deepep_use_comm_stream and os.environ.get(ENV_EP_FORCE_CURRENT_STREAM) != "1":
             clear_backend_instances()
-            os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
+            os.environ[ENV_EP_FORCE_CURRENT_STREAM] = "1"
 
         self.capacity_factor = expert_capacity_factor
 
