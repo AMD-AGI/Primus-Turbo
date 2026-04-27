@@ -57,21 +57,39 @@ HIPKITTEN_PATH="${HIPKITTEN_PATH:-/workspace/code/HipKittens}"
 pick_idle_gpus() {
     # Returns comma-separated IDs of GPUs whose KFD process table shows
     # no PID using more than VRAM_BUSY_THRESHOLD bytes (default 100 MiB).
+    # Honors HIPKITTEN_GPU_POOL='0,1,2,3' (or via env) to restrict to a subset.
     # Falls back to "0" if rocm-smi is unavailable / parse fails.
     python3 - <<'PYEOF' 2>/dev/null || echo 0
 import os, re, subprocess, sys
 THR = int(os.environ.get("VRAM_BUSY_THRESHOLD", 100 * 1024 * 1024))
+pool_raw = os.environ.get("HIPKITTEN_GPU_POOL", "").strip()
+pool = None
+if pool_raw:
+    pool = set()
+    for tok in pool_raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            pool.add(int(tok))
+        except ValueError:
+            pass
+    if not pool:
+        pool = None
 try:
     out = subprocess.check_output(
         ["rocm-smi", "--showuse", "--showpids"],
         stderr=subprocess.DEVNULL, text=True, timeout=10,
     )
 except Exception:
-    print("0")
+    if pool:
+        print(",".join(str(g) for g in sorted(pool)))
+    else:
+        print("0")
     sys.exit(0)
-# All GPU IDs visible to rocm-smi.
 all_gpus = sorted({int(m) for m in re.findall(r"^GPU\[(\d+)\]", out, flags=re.M)})
-# Parse KFD process table to find busy GPUs (those with a PID using > THR VRAM).
+if pool is not None:
+    all_gpus = [g for g in all_gpus if g in pool]
 busy = set()
 in_kfd = False
 for line in out.splitlines():
@@ -95,8 +113,8 @@ for line in out.splitlines():
         busy.add(int(gid))
 idle = [g for g in all_gpus if g not in busy]
 if not idle:
-    # Pick the GPU with smallest VRAM usage among "all" as last resort.
-    idle = all_gpus[:1] or [0]
+    # Last resort: use the pool itself, else first known GPU.
+    idle = all_gpus[:1] or (sorted(pool)[:1] if pool else [0])
 print(",".join(str(g) for g in idle))
 PYEOF
 }
