@@ -10,3 +10,6 @@ test-reports/
 *_hip.cpp
 *_hip.hpp
 *_hip.cuh
+
+# auto_optimize.py per-run logs
+auto_optimize_logs/
