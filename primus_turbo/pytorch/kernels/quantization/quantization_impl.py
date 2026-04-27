@@ -29,24 +29,24 @@ def ceil_div(a, b):
 
 
 def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
 
 def quantize_fp8_rowwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Row-Wise
     """
     if not x.is_contiguous():
         x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, scale)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, None)
     return x_fp8, scale_inv
 
 

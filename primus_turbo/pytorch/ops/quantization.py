@@ -99,7 +99,6 @@ def quantize_fp8_with_trans(
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
-
         return quantize_mxfp8_impl(
             x,
             out_dtype,
@@ -170,7 +169,6 @@ def quantize_fp4(
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP8 quantization"
-
         return quantize_mxfp4_impl(
             x,
             out_dtype,
@@ -205,7 +203,6 @@ def quantize_fp4_with_trans(
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MX_BLOCK_SIZE, f"The block size must be {MX_BLOCK_SIZE} for MXFP4 quantization"
-
         return quantize_mxfp4_impl(
             x,
             out_dtype,
