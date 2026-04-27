@@ -9,7 +9,6 @@ import os
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -55,11 +54,6 @@ test_cases = [
 def test_attention_16bit(
     batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
 ):
-    # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
-    if get_device_compute_capability() == (9, 4):
-        if qkv_format == "sbhd" and not is_v3_atomic_fp32:
-            pytest.skip("gfx942 has numerical issue in fp16 atomic when layout is sbhd.")
-
     os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
 
     device = "cuda"

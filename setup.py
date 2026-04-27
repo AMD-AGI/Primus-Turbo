@@ -30,8 +30,8 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-# PR: feat: _flash_attn_forward add out args (#2648)
-AITER_COMMIT = "857f4d15775a29af153a2c68a2f8e8a8d696c986"
+# PR: fix other lse addr compute issue (#2833)
+AITER_COMMIT = "65d737fa2091a6f1ad9beabf46f43889891b583c"
 
 # -------------------------------------
 

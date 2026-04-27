@@ -22,7 +22,6 @@ from aiter.ops.triton.attention.mha import (
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import KernelBackend
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -214,10 +213,6 @@ class AttnBwdAiterBackend(KernelBackend):
                 return False
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
-
-        # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
-        if get_device_compute_capability() == (9, 4):
-            supported &= not (qkv_format == "sbhd" and not is_v3_atomic_fp32)
 
         return supported
 
