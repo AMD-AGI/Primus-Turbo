@@ -274,6 +274,18 @@ public:
         c_out[3][3]     = read_agpr<float32x4, B + 60>();
     }
 
+    // VolatileStore: when true, each 16-bit write is volatile, so the compiler
+    // emits a flat_store + s_waitcnt vmcnt(0) per element.  Use this for paths
+    // that have a separate pre-existing race surfaced by overlap of next-tile
+    // prefetch with a too-fast C epilogue (currently the variable-K wgrad).
+    //
+    // When false, the compiler coalesces stores and omits per-store vmcnt(0)
+    // drains, which dramatically improves the persistent FWD kernel (roughly
+    // 2x on M-large shapes).  The caller is responsible for emitting a single
+    // wait_vmcnt<0>() at the end of the C-store sequence so subsequent
+    // kernels (or the next persistent-loop iteration's prefetch) see fully
+    // committed C.
+    template <bool VolatileStore = true>
     __device__ __forceinline__ void store_c_subtile(CType *c_stg_base_ptr, const int32_t n,
                                                     float32x4 (&c_frags)[4][4],
                                                     uint32_t (&c_stg_offsets)[4],
@@ -291,7 +303,12 @@ public:
                     if (row < valid_rows && col < valid_cols) {
                         const CType    out_val = CType(c_frags[tr][tc][i]);
                         const uint16_t raw     = __builtin_bit_cast(uint16_t, out_val);
-                        *reinterpret_cast<volatile uint16_t *>(c_stg_ptr + c_stg_offsets[i]) = raw;
+                        if constexpr (VolatileStore) {
+                            *reinterpret_cast<volatile uint16_t *>(c_stg_ptr +
+                                                                   c_stg_offsets[i]) = raw;
+                        } else {
+                            *reinterpret_cast<uint16_t *>(c_stg_ptr + c_stg_offsets[i]) = raw;
+                        }
                     }
                 }
             }

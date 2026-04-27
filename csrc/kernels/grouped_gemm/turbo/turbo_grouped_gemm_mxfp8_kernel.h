@@ -359,20 +359,25 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         c_ptr + m_global * (int64_t) n + pid_n + warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_m + 256 > M_g) || (pid_n + 256 > (int32_t) n);
 
+    // Forward C-store: non-volatile so the compiler can coalesce stores and
+    // skip the per-element vmcnt(0) drains that volatile would emit.  Each
+    // output tile is written by exactly one CTA to a disjoint slice, so this
+    // is correctness-safe.  A single wait_vmcnt<0>() below drains the whole
+    // C epilogue before the next persistent-loop iteration or kernel exit.
     if (!is_boundary_tile) {
         float32x4 c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
-                             c_stg_offsets);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
+                                             c_tmp, c_stg_offsets);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
-                             c_stg_offsets);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
+                                             c_tmp, c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
-                             c_stg_offsets);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
+                                             c_tmp, c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
-                             c_stg_offsets);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
+                                             c_tmp, c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
@@ -380,18 +385,25 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         const int32_t tile_valid_n = min((int32_t) n - pid_n, 256) - warp_base_n;
         float32x4     c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
-                             c_stg_offsets, tile_valid_m, tile_valid_n);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
+                                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
-                             c_stg_offsets, tile_valid_m, tile_valid_n - 128);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
+                                             c_tmp, c_stg_offsets, tile_valid_m,
+                                             tile_valid_n - 128);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
-                             c_stg_offsets, tile_valid_m - 128, tile_valid_n);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
+                                             c_tmp, c_stg_offsets, tile_valid_m - 128,
+                                             tile_valid_n);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
-                             c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
+        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
+                                             c_tmp, c_stg_offsets, tile_valid_m - 128,
+                                             tile_valid_n - 128);
     }
+    // Drain pending C VMEM stores before the next iteration's prefetch (or
+    // kernel exit).  Effectively free here because the next iteration's
+    // prologue does its own wait_vmcnt<0>() anyway.
+    wait_vmcnt<0>();
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
