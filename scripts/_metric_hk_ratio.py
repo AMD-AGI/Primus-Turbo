@@ -29,12 +29,33 @@ For each shape:
 Score (single integer printed on the last line of stdout, consumed by
 auto_optimize.py):
 
-    score = int(geomean_over_sections * 1000)
+    score = int(weighted_geomean_of_progress * 1000)
 
-where ``geomean_over_sections`` is the geomean of the six section
-geomeans (each section weighs equally regardless of n_cases). This is
-just a ranking signal — *acceptance* is the 6-goal PASS/FAIL block
-printed to stderr, NOT the integer score.
+where for each section we compute *progress* = min(geomean / target, 1.0)
+— i.e. how close the section is to its goal, capped at 1.0 so that
+overshooting one easy section cannot mask underperformance elsewhere.
+The final score is the **weighted** geomean of those six progresses
+with the section weights below (sum = 14):
+
+    bf16_fwd  : 1   target 0.97  (vs HIPBLASLT)
+    bf16_bwd  : 1   target 0.97  (vs HIPBLASLT)
+    fp8_fwd   : 2   target 0.97  (vs HIPBLASLT)
+    fp8_bwd   : 2   target 1.20  (vs TRITON)
+    grp_bf16  : 4   target 1.20  (vs TRITON)
+    grp_fp8   : 4   target 1.20  (vs TRITON)
+
+The 1/2/4 split tells the optimizer: a 10% gain in grp_FP8 buys 4x
+more score than the same 10% gain in BF16_fwd, and overshooting BF16_fwd
+to 1.05x buys *zero* extra score (capped). This prevents the agent
+from grinding on already-passing sections instead of attacking the
+hard sections (grp_BF16 / grp_FP8 / FP8 dense).
+
+When all six sections reach their target, score = 1000. Section
+``score = 0`` (i.e. fully rejected) clips ratio to 0.01 — which lands
+its progress at ~0.008 / target and tanks the weighted geomean.
+
+This is just a ranking signal — *acceptance* is the 6-goal PASS/FAIL
+block printed to stderr, NOT the integer score.
 
 What this metric will NOT reward:
   * Adding shapes to the suite without making HIPKITTEN actually
@@ -642,29 +663,50 @@ def _run() -> int:
         ("(5) grp_BF16  vs triton    >= 1.20", g_grp_bf16, 1.20, n_grp_bf16),
         ("(6) grp_FP8   vs triton    >= 1.20", g_grp_fp8, 1.20, n_grp_fp8),
     ]
+    # Section weights — the 1/1/2/2/4/4 split (sum=14) deliberately
+    # over-weights grouped paths (where HipKittens has the most ground
+    # to make up vs TRITON's persistent grouped kernel) and FP8 dense
+    # (where C++ tile/swizzle work has higher ROI than BF16 dense,
+    # which is already saturating hipBLASLt). See module docstring.
+    SECTION_WEIGHTS: dict[str, float] = {
+        "bf16_fwd": 1.0,
+        "bf16_bwd": 1.0,
+        "fp8_fwd": 2.0,
+        "fp8_bwd": 2.0,
+        "grp_bf16": 4.0,
+        "grp_fp8": 4.0,
+    }
+    section_keys = ["bf16_fwd", "bf16_bwd", "fp8_fwd", "fp8_bwd", "grp_bf16", "grp_fp8"]
+
     n_pass = 0
-    for label, g, target, n in goals:
+    progresses: list[tuple[str, float, float]] = []  # (key, progress, weight)
+    for (label, g, target, n), key in zip(goals, section_keys):
         passed = (g >= target) if n else False
         if passed:
             n_pass += 1
+        # progress = how close this section is to its goal, capped at 1.0
+        # so that overshooting (e.g. BF16_fwd 1.05 vs target 0.97) does
+        # NOT bank extra score — agent must spend cycles on weaker sections.
+        progress = min(g / target, 1.0) if (n and target > 0) else 0.0
+        progress = max(progress, 0.001)  # clamp for log
+        weight = SECTION_WEIGHTS.get(key, 1.0)
+        progresses.append((key, progress, weight))
         print(
             f"[metric_hk_ratio]   {label}  : {g:.4f}  "
+            f"progress={progress:.3f}  w={weight:.0f}  "
             f"{'PASS' if passed else 'FAIL'}",
             file=sys.stderr,
         )
 
-    # Score is the geomean over all 6 section-geomeans, scaled to int
-    # (one per goal so each section weighs equally regardless of n).
-    # This is just an auto_optimize ranking signal — acceptance is the
-    # 6-goal PASS/FAIL above, not score.
-    section_geomeans = [g for _, g, _, n in goals if n]
-    if section_geomeans:
-        section_geo = math.exp(
-            sum(math.log(max(g, 0.01)) for g in section_geomeans) / len(section_geomeans)
-        )
+    # Weighted geomean of capped progresses. Score=1000 iff all 6 goals
+    # are AT LEAST met; PASSing all six with overshoot does not exceed 1000.
+    total_w = sum(w for _, _, w in progresses)
+    if total_w > 0:
+        weighted_log = sum(w * math.log(p) for _, p, w in progresses) / total_w
+        weighted_progress = math.exp(weighted_log)
     else:
-        section_geo = 0.0
-    score = int(round(section_geo * 1000))
+        weighted_progress = 0.0
+    score = int(round(weighted_progress * 1000))
 
     n_reject = sum(1 for _n, _, _, r, _ref, _s in rows if r == 0)
     n_below = sum(
@@ -676,9 +718,10 @@ def _run() -> int:
     )
 
     print(
-        f"[metric_hk_ratio] section_geomean={section_geo:.4f}  "
+        f"[metric_hk_ratio] weighted_progress={weighted_progress:.4f}  "
         f"reject={n_reject}/{len(rows)}  below_target={n_below}/{len(rows)}  "
-        f"goals={n_pass}/6  score={score}",
+        f"goals={n_pass}/6  score={score}  "
+        f"weights=BF16fwd/bwd:1/1 FP8fwd/bwd:2/2 grpBF16/FP8:4/4",
         file=sys.stderr,
     )
 

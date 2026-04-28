@@ -68,14 +68,24 @@ DEFAULT_SKILL = "/root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 DEFAULT_TASK = (
     "**最终目标**（6 段独立判定，每段都必须 PASS；看 metric stderr 的 "
     "`Goals:` 6 行 PASS/FAIL）：\n"
-    "  (1) **BF16_fwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM forward (8 shape)\n"
-    "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape)\n"
-    "  (3) **FP8_fwd  vs HIPBLASLT** ≥ 0.97 —— dense FP8 tensorwise GEMM forward (8 shape)\n"
-    "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape)\n"
-    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B)\n"
-    "  (6) **grp_FP8  vs TRITON**    ≥ 1.20 —— grouped FP8 tensorwise GEMM (同 16 shape)\n\n"
-    "6 段全 PASS 才算交付；metric score (= 6 段 geomean 的 geomean × 1000) 只"
-    "是 auto_optimize 的 ranking 信号，**不是验收标准**。\n\n"
+    "  (1) **BF16_fwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM forward (8 shape) [w=1]\n"
+    "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape) [w=1]\n"
+    "  (3) **FP8_fwd  vs HIPBLASLT** ≥ 0.97 —— dense FP8 tensorwise GEMM forward (8 shape) [w=2]\n"
+    "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape) [w=2]\n"
+    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B) [w=4]\n"
+    "  (6) **grp_FP8  vs TRITON**    ≥ 1.20 —— grouped FP8 tensorwise GEMM (同 16 shape) [w=4]\n\n"
+    "**Score = 1000 × weighted-geomean(min(progress_i / target_i, 1.0))**，权重\n"
+    "`BF16fwd:1 BF16bwd:1 FP8fwd:2 FP8bwd:2 grpBF16:4 grpFP8:4`（sum=14）。\n"
+    "解读：\n"
+    "  • 每段 progress 上限锁 1.0：把 BF16_fwd 从 0.97 推到 1.05 **不加分**；要花\n"
+    "    cycle 在还没 PASS 的段上才有 score 收益。\n"
+    "  • grp_BF16 / grp_FP8 权重 4 ——把 grouped 从 0.5 推到 1.0 比把 BF16_fwd 从 0.95 推到 1.0\n"
+    "    多 4× 分。FP8 dense 权重 2，BF16 dense 权重 1。这条权重表是 user 拍板的\n"
+    "    优先级体现 —— **挑分最大的方向打**，不要均匀分配 cycles。\n"
+    "  • 6 段全 PASS（每段 progress=1.0）= score 1000；任何段 progress<1 ⇒ score<1000。\n"
+    "  • Reject 把 ratio 钉到 0.01：grp_FP8 中 1/16 reject = 该段 geomean 大跌 → 段权重 4×\n"
+    "    放大冲击 ⇒ score 直接跌穿。所以**收紧 can_handle 在新打分里更亏**。\n"
+    "6 段全 PASS 才算交付；score 只是 ranking 信号，**不是验收标准**。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
     "**核心架构方向（必读，决定本轮所有判断）**\n"
     "═══════════════════════════════════════════════════════════════════════\n\n"
@@ -110,15 +120,21 @@ DEFAULT_TASK = (
     "     **开发者手动**把结论写回 `select_default_config` 的规则里，**结果不存盘**。\n"
     "     不是 runtime 路径 —— 第一刀做完后再考虑，可选。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
-    "**ROUND 1 起点 = 545** / 6 goals = 0 PASS（架构第一/二刀完成后的实测）：\n"
-    "  • BF16_fwd  (8)   geomean=0.937 vs HIPBLASLT  ← 离 0.97 一步之遥\n"
-    "  • BF16_bwd  (8)   geomean=0.739 vs HIPBLASLT  ← bwd 走 3 次 dispatch，还有 host overhead\n"
-    "  • FP8_fwd   (8)   geomean=0.918 vs HIPBLASLT  ← 离 0.97 一步之遥\n"
-    "  • FP8_bwd   (8)   geomean=0.775 vs TRITON     ← 距 1.20 远；HK FP8 CRR kernel 慢\n"
-    "  • grp_BF16 (16)   geomean=0.098 vs TRITON     ← gpt_oss_20B 的 8/16 因 N=K=2880 不对齐 256/128 被 reject\n"
-    "  • grp_FP8  (16)   geomean=?     vs TRITON     ← 还没测过；HK FP8 .so 没有 grouped binding，per-group launch 必慢\n"
+    "**起点（架构第一/二刀完成后的近期实测，权重表上线后会偏低）**：\n"
+    "  • BF16_fwd  (8)   geomean ≈ 0.94-1.05 vs HIPBLASLT  [w=1] ← 容易 PASS，progress 已 cap 1.0\n"
+    "  • BF16_bwd  (8)   geomean ≈ 0.74      vs HIPBLASLT  [w=1] ← bwd 走 3 次 dispatch，host overhead\n"
+    "  • FP8_fwd   (8)   geomean ≈ 0.93      vs HIPBLASLT  [w=2] ← 离 0.97 一步之遥\n"
+    "  • FP8_bwd   (8)   geomean ≈ 1.07      vs TRITON     [w=2] ← 距 1.20 还有 12% gap\n"
+    "  • grp_BF16 (16)   geomean ≈ 0.10-0.40 vs TRITON     [w=4] ← gpt_oss_20B (N=K=2880) 不对齐\n"
+    "  • grp_FP8  (16)   geomean ≈ 0.05-0.10 vs TRITON     [w=4] ← HK FP8 .so 缺 grouped binding\n"
+    "**权重 4× 决定攻坚顺序**：grp_FP8 / grp_BF16 是 score 大头。建议路径：\n"
+    "  ① 先把 grp_FP8 拉到 progress=1.0（HK 仓库写 grouped binding，详见第五刀）→ +28% score\n"
+    "  ② 再把 grp_BF16 拉到 progress=1.0（pad-and-copy 或新 tile 模板）→ 再 +28% score\n"
+    "  ③ FP8_fwd / FP8_bwd 凑零头 → +14%\n"
+    "  ④ BF16_bwd 最后做（dispatch overhead 可能 1 次重写解决多段）→ +7%\n"
     "新架构下 reject 全部源于**真硬约束**（dtype / layout / tile alignment），不再有 cache miss 类\n"
-    "假 reject。**收紧 can_handle 反而扣分**：reject → ratio clip 0.01 → 整段 geomean 塌掉。\n\n"
+    "假 reject。**收紧 can_handle 反而扣分**：reject → ratio clip 0.01 → 整段 geomean 塌掉，\n"
+    "在 grp_BF16/grp_FP8 (w=4) 段上一次 reject 就能让 score 掉 100+ 分。\n\n"
     "**严禁的『假优化』模式**（违反 = 本轮立即作废）：\n"
     "  ✗ **runtime 读任何 .json / .pkl / .autotune_cache.json**（开发期 bench 用、归纳完后\n"
     "    runtime 不再 import；任何 hipkitten 路径上看到 `json.load`/`pickle.load` 都是违规）\n"
@@ -215,6 +231,15 @@ class TrajectoryState:
     dod_checkpoints: list[dict] = field(default_factory=list)
     last_dod_score: Optional[int] = None
     last_dod_sha: Optional[str] = None
+    # Cross-round agent session reuse — see --reuse-chat-window-secs.
+    # ``chat_id`` is a dashed UUID (cursor-agent's session_id) we pass to
+    # ``--resume`` so the agent retains tool history / scratch reasoning
+    # / file reads across rounds. ``chat_started_at`` is monotonic time
+    # when the chat was originally opened; once that's older than the
+    # window we drop the chat_id and let the next round start fresh.
+    chat_id: Optional[str] = None
+    chat_started_at: Optional[float] = None
+    chat_round_count: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -331,6 +356,21 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to allow each cursor-agent invocation before killing it (default 30 min).",
     )
     p.add_argument(
+        "--reuse-chat-window-secs",
+        type=int,
+        default=60 * 90,
+        help=(
+            "Reuse the same cursor-agent chat session (via --resume <session_id>) "
+            "across rounds for this many seconds before starting a fresh chat. "
+            "Default 5400s = 1.5h. The agent keeps its tool history, scratch "
+            "reasoning, and file reads across rounds in the window — so a "
+            "multi-round task (write a HK .cpp kernel → compile → numerical "
+            "probe → metric → tweak → recompile) doesn't have to re-onboard "
+            "from SKILL.md / git log every round. After the window the chat "
+            "is dropped and the next round starts fresh (full prompt)."
+        ),
+    )
+    p.add_argument(
         "--metric-timeout",
         type=int,
         default=60 * 15,
@@ -432,7 +472,7 @@ def get_short_status(cwd: str) -> str:
         return ""
 
 
-def build_prompt(
+def _build_resume_prompt(
     args: argparse.Namespace,
     state: TrajectoryState,
     round_idx: int,
@@ -441,16 +481,105 @@ def build_prompt(
     recent_log: str,
     short_status: str,
 ) -> str:
+    """Lightweight follow-up prompt — same chat as previous round.
+
+    Assumes the agent already has the task body / skill / FROZEN list /
+    phased roadmap / commit policy in context. Only delivers the
+    per-round delta. Roughly 1/8 the length of the cold-start prompt.
+    """
+    last = state.rounds[-1] if state.rounds else None
+    last_metric = last.metric if last else baseline_metric
+    last_improved = "是" if (last and last.improved) else "否"
+
+    history_lines = []
+    for r in state.rounds[-3:]:  # 接续模式只回看最近 3 轮 — 完整历史 agent 自己记得
+        history_lines.append(
+            f"  - 第 {r.index} 轮: metric={r.metric}, best={r.best_so_far}, "
+            f"improved={r.improved}, sha {r.head_sha_before[:8]}->{r.head_sha_after[:8]}"
+        )
+    history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
+
+    chat_age_min = 0.0
+    if state.chat_started_at is not None:
+        chat_age_min = (time.monotonic() - state.chat_started_at) / 60.0
+
+    dod_line = ""
+    if args.dod_every > 0 and state.last_dod_score is not None:
+        dod_line = (
+            f"上次 DoD={state.last_dod_score} (sha {(state.last_dod_sha or '')[:8]}). "
+            f"提醒：每 {args.dod_every} 轮自动跑一次，failed > 0 立刻 EARLY-STOP。"
+        )
+
+    return f"""【第 {round_idx} / {args.rounds} 轮 — 接续上一轮 chat】
+本 chat session 已运行 {state.chat_round_count + 1} 轮 / {chat_age_min:.0f} 分钟（窗口上限
+{args.reuse_chat_window_secs / 60:.0f} 分钟，超过会换新 chat）。你已知道 task / 6 段目标 /
+FROZEN 列表 / phased 路线 / 严禁假优化清单 —— **不要重新读 SKILL.md，不要重 quote 上面这些**，
+直接干活。如果你忘了某条规则，自己回去翻本 chat 历史，不要再让用户复述。
+
+【本轮数据增量】
+- Primus-Turbo HEAD: {head_sha}
+- 历史最佳 metric = {state.best_metric}
+- 上一轮 metric = {last_metric}（improved={last_improved}）
+- 已连续 {state.rounds_without_improvement} 轮未提升（patience={args.patience}）
+- baseline (开始时) = {baseline_metric}
+{('- ' + dod_line) if dod_line else ''}
+
+【近 3 轮】
+{history_block}
+
+【近期 git log】
+{recent_log or "(空)"}
+
+【working tree 状态】
+{short_status or "(干净)"}
+
+【本轮指令】
+1. 第一步：跑 metric `{args.metric_cmd} 2>&1 | tee /tmp/metric_round_{round_idx}.log`，
+   看 stderr 表里 ratio 最低 + 权重最高的 shape (grp_FP8 / grp_BF16 weight=4，
+   FP8_fwd / FP8_bwd weight=2，BF16_fwd / BF16_bwd weight=1). 选 1 个攻坚目标。
+2. 你**记得**上一轮在做什么 —— 如果是跨轮长任务（写 HK .cpp kernel / 编译 / 数值 probe），
+   continue 那条主线，不要换方向。如果上一轮已 commit 完整工作，再选新目标。
+3. 改完跑 metric 验证，再 commit。每仓库最多 1 commit/轮。
+4. 末尾 markdown 小结：本轮目标 / 改了什么 / before-after metric / commit SHA / 下一轮建议。
+
+{args.prompt_extra}"""
+
+
+def build_prompt(
+    args: argparse.Namespace,
+    state: TrajectoryState,
+    round_idx: int,
+    baseline_metric: Optional[float],
+    head_sha: str,
+    recent_log: str,
+    short_status: str,
+    is_resume: bool = False,
+) -> str:
     """Build the per-round prompt fed to cursor-agent.
 
     The prompt is in Chinese to match the user's preferred working language.
-    It always:
-      * tells the agent to read the project skill first;
-      * gives it the metric and history;
-      * lets it decide what to optimize;
-      * reminds it of hard constraints (FP8 tests, autotune=False, etc.);
-      * asks it to commit any progress.
+
+    When ``is_resume=False`` (first round of a chat-window): includes the
+    full task body + skill-read instruction + FROZEN list + phased
+    roadmap + commit policy + output requirements. ~200 line cold-start
+    prompt.
+
+    When ``is_resume=True`` (subsequent rounds within the same chat
+    window): ships only the *delta* — round counter, current HEAD SHA,
+    last metric, best metric, working-tree status, recent git log.
+    Skips the task body / skill / roadmap / FROZEN list because the
+    agent has already seen all of them in the same chat session and
+    keeping ~10K-token boilerplate every round both burns context and
+    makes the user's actual delta hard for the model to find.
+
+    The boundary between the two modes is ``--reuse-chat-window-secs``;
+    once a chat exceeds that wall age the loop drops ``state.chat_id``
+    and the next round starts a fresh cold-start chat.
     """
+    if is_resume:
+        return _build_resume_prompt(
+            args, state, round_idx, baseline_metric, head_sha, recent_log, short_status,
+        )
     last = state.rounds[-1] if state.rounds else None
     last_metric = last.metric if last else baseline_metric
     last_improved = "是" if (last and last.improved) else "否"
@@ -591,6 +720,23 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
 - 如果两边都改了，本轮 git log 在 Primus-Turbo 显示的是 Primus 这边的 commit；
   在你的本轮小结里**列出 HipKittens commit SHA**，方便用户回溯。
 
+【**chat-window 跨轮接续**（agent 必读）】
+本 auto_optimize run 启用 `--reuse-chat-window-secs 5400`（默认 1.5 小时）。意思是：
+  • 第一轮 cold-start 一个新 cursor-agent chat session，记下 session_id；
+  • 后续轮如果**距 chat 起点 < 1.5 小时**，下一轮直接 `--resume <session_id>`
+    （**接续相同对话**，agent 保留所有 file reads / tool history / scratch 推理）；
+  • 一旦超过 1.5 小时窗口，丢掉 chat_id，下一轮 cold-start 新 chat。
+对你（agent）的影响：
+  ✓ 跨轮的**长任务**（写 HK .cpp → 编译 → 数值 probe → metric → 调 cfg → 重编 → ...）
+    可以**自然跨多轮**完成 —— 你**记得**自己上一轮试过什么、卡在哪一步。不要换方向。
+  ✓ resume 模式下 prompt 极短，**不再重复** task body / SKILL.md / FROZEN list / 路线 ——
+    这些你都已经在本 chat 里见过。**禁止再去读 SKILL.md** 或要求用户复述规则；忘了
+    自己回去翻本 chat history。
+  ✓ chat 滚动到第 ~10-15 轮时窗口会过期，那一轮你会看到完整 cold-start prompt ——
+    这是**新 chat**，之前的 file reads 都不再可见，你必须**从 commit log 推断**之前进展。
+  ✗ 不要在 resume 轮里"重做"已 commit 的工作 —— 看 git log 确认上一轮是否 commit；
+    如果是，**接着推进**，不是重做。
+
 【脚本机制硬约束 - 不可违反】
 - **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量；GPU 1
   当前被其他作业占用，绝不许动）。metric / DoD / 你自己的任何 benchmark/probe 都**只能从这个池
@@ -651,12 +797,51 @@ def restore_cli_config(snapshot: Optional[dict]) -> None:
         print(f"[max-mode] failed to restore cli-config.json: {exc}", flush=True)
 
 
+def _format_tool_call_summary(ev: dict) -> Optional[str]:
+    """Render a one-line summary of a stream-json tool_call event."""
+    sub = ev.get("subtype")
+    if sub != "started":
+        return None  # only show on start; completed lines are noisy
+    tc = ev.get("tool_call") or {}
+    # tool_call is a dict whose first key encodes the tool family.
+    tool_kind = next(iter(tc.keys()), "tool")
+    inner = tc.get(tool_kind) or {}
+    args_obj = inner.get("args") or {}
+    desc = inner.get("description") or args_obj.get("description") or ""
+    if tool_kind == "shellToolCall":
+        cmd = (args_obj.get("command") or "").splitlines()[0][:160]
+        return f"  [tool] shell: {cmd}{' — ' + desc if desc else ''}"
+    if tool_kind == "readToolCall":
+        return f"  [tool] read {args_obj.get('path', '?')[:160]}"
+    if tool_kind == "editToolCall":
+        return f"  [tool] edit {args_obj.get('path', '?')[:160]}"
+    if tool_kind == "writeToolCall":
+        return f"  [tool] write {args_obj.get('path', '?')[:160]}"
+    if tool_kind == "globToolCall":
+        return f"  [tool] glob {args_obj.get('globPattern', '?')[:160]}"
+    if tool_kind == "grepToolCall":
+        return f"  [tool] grep {args_obj.get('pattern', '?')[:160]}"
+    return f"  [tool] {tool_kind}{(' — ' + desc) if desc else ''}"
+
+
 def run_cursor_round(
     args: argparse.Namespace,
     prompt: str,
     log_dir: Path,
-) -> int:
-    """Run a single cursor-agent round, streaming output into log_dir/cursor.log."""
+    resume_chat_id: Optional[str] = None,
+) -> tuple[int, Optional[str]]:
+    """Run one cursor-agent round.
+
+    Returns ``(exit_code, session_id)`` where ``session_id`` is the
+    dashed UUID emitted on the very first ``system/init`` event. Caller
+    persists it across rounds so the next round can ``--resume`` instead
+    of cold-starting a brand-new chat.
+
+    Output is piped via ``--output-format stream-json`` so each line is
+    a JSON event (init / user / assistant / tool_call / result). The
+    raw event stream is logged to ``cursor.log``; the human-readable
+    text content is mirrored to stdout for live monitoring.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "prompt.md").write_text(prompt)
 
@@ -670,16 +855,29 @@ def run_cursor_round(
         "--workspace",
         args.workspace,
         "--output-format",
-        "text",
-        prompt,
+        "stream-json",
     ]
-    print(
-        f"[cursor] launching: cursor-agent --print --force --trust --model {args.model} ...",
-        flush=True,
-    )
+    if resume_chat_id:
+        cmd += ["--resume", resume_chat_id]
+    cmd.append(prompt)
+
+    pretty_cmd = " ".join(shlex.quote(c) for c in cmd[:-1])
+    if resume_chat_id:
+        print(
+            f"[cursor] resuming chat {resume_chat_id[:8]}…: {pretty_cmd} <prompt>",
+            flush=True,
+        )
+    else:
+        print(f"[cursor] new chat: {pretty_cmd} <prompt>", flush=True)
+
     log_path = log_dir / "cursor.log"
-    with log_path.open("w") as logf:
-        logf.write(f"# Command: {shlex.join(cmd[:-1])} <prompt>\n")
+    raw_path = log_dir / "cursor.jsonl"
+    captured_session_id: Optional[str] = None
+    last_assistant_text = ""
+
+    with log_path.open("w") as logf, raw_path.open("w") as rawf:
+        logf.write(f"# Command: {pretty_cmd} <prompt>\n")
+        logf.write(f"# Resume chat_id: {resume_chat_id or '(none — fresh chat)'}\n")
         logf.write(f"# Started at: {now_iso()}\n\n")
         logf.flush()
         try:
@@ -693,16 +891,64 @@ def run_cursor_round(
             )
         except FileNotFoundError:
             print("[cursor] cursor-agent not on PATH - aborting.", flush=True)
-            return 127
+            return 127, None
         try:
             assert proc.stdout is not None
             start = time.monotonic()
             for line in proc.stdout:
-                logf.write(line)
+                rawf.write(line)
+                rawf.flush()
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    ev = json.loads(stripped)
+                except json.JSONDecodeError:
+                    # Non-JSON line (e.g. cursor-agent error trace) — passthrough.
+                    logf.write(line)
+                    logf.flush()
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    continue
+                ev_type = ev.get("type")
+                if ev_type == "system" and ev.get("subtype") == "init":
+                    sid = ev.get("session_id")
+                    if sid and not captured_session_id:
+                        captured_session_id = sid
+                        msg = f"  [cursor] session_id={sid}"
+                        logf.write(msg + "\n")
+                        sys.stdout.write(msg + "\n")
+                        sys.stdout.flush()
+                elif ev_type == "assistant":
+                    for blk in ev.get("message", {}).get("content", []) or []:
+                        if blk.get("type") == "text":
+                            txt = blk.get("text", "")
+                            last_assistant_text = txt
+                            logf.write(txt + "\n")
+                            sys.stdout.write(txt + "\n")
+                            sys.stdout.flush()
+                elif ev_type == "thinking":
+                    # Thinking deltas only go to log (too noisy for stdout).
+                    delta = ev.get("text", "")
+                    if delta:
+                        logf.write(delta)
+                        logf.flush()
+                elif ev_type == "tool_call":
+                    summary = _format_tool_call_summary(ev)
+                    if summary:
+                        logf.write(summary + "\n")
+                        sys.stdout.write(summary + "\n")
+                        sys.stdout.flush()
+                elif ev_type == "result":
+                    sid = ev.get("session_id")
+                    if sid:
+                        captured_session_id = sid  # final overrides init for safety
+                    dur = ev.get("duration_ms", 0)
+                    msg = f"  [cursor] result: duration={dur}ms is_error={ev.get('is_error', False)}"
+                    logf.write(msg + "\n")
+                    sys.stdout.write(msg + "\n")
+                    sys.stdout.flush()
                 logf.flush()
-                # Mirror to console so the user can follow live progress.
-                sys.stdout.write(line)
-                sys.stdout.flush()
                 if time.monotonic() - start > args.round_timeout:
                     print(
                         f"\n[cursor] round timeout {args.round_timeout}s exceeded; "
@@ -714,7 +960,10 @@ def run_cursor_round(
                         proc.wait(timeout=15)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                    return proc.returncode if proc.returncode is not None else 124
+                    return (
+                        proc.returncode if proc.returncode is not None else 124,
+                        captured_session_id,
+                    )
             proc.wait()
         except KeyboardInterrupt:
             print("\n[cursor] interrupted by user; killing cursor-agent", flush=True)
@@ -724,7 +973,8 @@ def run_cursor_round(
             except subprocess.TimeoutExpired:
                 proc.kill()
             raise
-        return proc.returncode if proc.returncode is not None else 1
+        rc = proc.returncode if proc.returncode is not None else 1
+        return rc, captured_session_id
 
 
 def run_dod_checkpoint(
@@ -884,15 +1134,50 @@ def main() -> int:
         write_summary(summary_path, args, state, baseline)
 
         for i in range(1, args.rounds + 1):
+            # Decide whether to resume the previous chat or cold-start a new
+            # one. Cold-start when (a) no chat yet, (b) last cursor invocation
+            # didn't return a session_id (failure / signaled before init), or
+            # (c) the chat window has elapsed.
+            now = time.monotonic()
+            chat_age_secs = (
+                (now - state.chat_started_at)
+                if state.chat_started_at is not None
+                else None
+            )
+            cold_start = (
+                state.chat_id is None
+                or chat_age_secs is None
+                or chat_age_secs >= args.reuse_chat_window_secs
+            )
+            if cold_start and state.chat_id is not None:
+                age_min = (chat_age_secs or 0) / 60.0
+                print(
+                    f"[chat-window] previous chat {state.chat_id[:8]} aged "
+                    f"{age_min:.0f} min (>= {args.reuse_chat_window_secs/60:.0f} min "
+                    f"window) — starting fresh chat for round {i}.",
+                    flush=True,
+                )
+                state.chat_id = None
+                state.chat_started_at = None
+                state.chat_round_count = 0
+
+            chat_status = (
+                f"resume {state.chat_id[:8]} (age {(chat_age_secs or 0)/60:.0f}min, "
+                f"{state.chat_round_count} rounds in chat)"
+                if not cold_start
+                else "cold-start (new chat)"
+            )
             banner(
                 f"ROUND {i}/{args.rounds} | best={state.best_metric} "
-                f"| no_improve_streak={state.rounds_without_improvement}/{args.patience}"
+                f"| no_improve_streak={state.rounds_without_improvement}/{args.patience} "
+                f"| {chat_status}"
             )
             sha_before = get_head_sha(str(workspace))
             recent_log = get_recent_log(str(workspace))
             short_status = get_short_status(str(workspace))
             prompt = build_prompt(
-                args, state, i, baseline, sha_before, recent_log, short_status
+                args, state, i, baseline, sha_before, recent_log, short_status,
+                is_resume=(not cold_start),
             )
 
             round_dir = log_dir / f"round_{i:03d}"
@@ -903,8 +1188,30 @@ def main() -> int:
                 round_dir.mkdir(parents=True, exist_ok=True)
                 (round_dir / "prompt.md").write_text(prompt)
                 cursor_exit = 0
+                returned_session_id: Optional[str] = state.chat_id  # keep state
             else:
-                cursor_exit = run_cursor_round(args, prompt, round_dir)
+                cursor_exit, returned_session_id = run_cursor_round(
+                    args, prompt, round_dir,
+                    resume_chat_id=state.chat_id if not cold_start else None,
+                )
+
+            # Update chat-window state: cold start banks the new session_id;
+            # resume reuses the old one (returned_session_id should match).
+            if cold_start:
+                state.chat_id = returned_session_id  # may be None on failure
+                state.chat_started_at = t0 if returned_session_id else None
+                state.chat_round_count = 1 if returned_session_id else 0
+            else:
+                state.chat_round_count += 1
+                # Sanity-check resume preserved the chat_id.
+                if returned_session_id and returned_session_id != state.chat_id:
+                    print(
+                        f"[chat-window] WARNING resumed chat returned new "
+                        f"session_id {returned_session_id} (expected {state.chat_id}); "
+                        f"adopting new id.",
+                        flush=True,
+                    )
+                    state.chat_id = returned_session_id
             duration = time.monotonic() - t0
 
             sha_after = get_head_sha(str(workspace))
