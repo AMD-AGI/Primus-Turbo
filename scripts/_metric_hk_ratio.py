@@ -284,7 +284,7 @@ def _time_op(fn) -> float:
 
 
 def _bench_bf16(M: int, N: int, K: int, backend: Optional[BackendType]) -> float:
-    """Return TFLOPS, or 0.0 if backend rejects / NaNs out."""
+    """BF16 NT GEMM forward TFLOPS for the given backend, 0.0 on reject/NaN."""
     a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
     fn = lambda: turbo.ops.gemm(a, b, trans_b=True)  # noqa: E731
@@ -300,6 +300,50 @@ def _bench_bf16(M: int, N: int, K: int, backend: Optional[BackendType]) -> float
         except Exception:
             return 0.0
     return 2.0 * M * N * K / (ms * 1e9)
+
+
+def _bench_bf16_bwd(M: int, N: int, K: int, backend: Optional[BackendType]) -> float:
+    """BF16 NT GEMM **backward only** TFLOPS; same time-subtraction approach
+    as :func:`_bench_fp8_bwd`. Backward FLOPs = 2 * forward = 4 * M * N * K
+    (a_grad + b_grad GEMMs).
+
+    NOTE: ``out.sum().backward()`` would feed an expanded scalar gradient
+    (stride=0) into the backward GEMM, which hipBLASLt rejects with
+    ``A must be contiguous``. We construct a fresh contiguous ``dy``
+    once and pass it via ``out.backward(dy)`` instead.
+    """
+    a_ng = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    b_ng = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
+    a_g = torch.randn((M, K), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    b_g = torch.randn((N, K), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    dy = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    fwd_only = lambda: turbo.ops.gemm(a_ng, b_ng, trans_b=True)  # noqa: E731
+
+    def fwd_bwd():
+        a_g.grad = None
+        b_g.grad = None
+        out = turbo.ops.gemm(a_g, b_g, trans_b=True)
+        out.backward(dy)
+
+    with force_gemm_backend(backend, PrecisionType.BF16_FP16_FP32):
+        try:
+            out = fwd_only()
+            fwd_bwd()
+        except Exception:
+            return 0.0
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            return 0.0
+        if a_g.grad is None or b_g.grad is None:
+            return 0.0
+        if torch.isnan(a_g.grad).any() or torch.isnan(b_g.grad).any():
+            return 0.0
+        try:
+            t_fwd = _time_op(fwd_only)
+            t_total = _time_op(fwd_bwd)
+        except Exception:
+            return 0.0
+    t_bwd = max(t_total - t_fwd, 1e-3)
+    return 4.0 * M * N * K / (t_bwd * 1e9)
 
 
 def _bench_fp8(M: int, N: int, K: int, backend: Optional[BackendType]) -> float:
@@ -342,13 +386,16 @@ def _bench_fp8_bwd(M: int, N: int, K: int, backend: Optional[BackendType]) -> fl
     b_ng = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
     a_g = torch.randn((M, K), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     b_g = torch.randn((N, K), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    # Contiguous dy: ``out.sum().backward()`` would feed a stride-0 expanded
+    # scalar that hipBLASLt rejects.
+    dy = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
     fwd_only = lambda: turbo.ops.gemm_fp8(a_ng, b_ng, trans_b=True, config=cfg)  # noqa: E731
 
     def fwd_bwd():
         a_g.grad = None
         b_g.grad = None
         out = turbo.ops.gemm_fp8(a_g, b_g, trans_b=True, config=cfg)
-        out.sum().backward()
+        out.backward(dy)
 
     with force_gemm_backend(backend, PrecisionType.FP8):
         try:
@@ -411,36 +458,54 @@ def _run() -> int:
         print(0)
         return 1
 
-    rows: list[tuple[str, float, float, float]] = []
+    # Each row carries its own reference backend so different sections can
+    # compare against different baselines, per project policy:
+    #   - dense GEMM forward / backward (BF16 + FP8 fwd) compete with HIPBLASLT
+    #   - FP8 dense backward competes with TRITON (TRITON is the canonical
+    #     reference for FP8 backward since hipBLASLt's FP8 backward path
+    #     differs in quantization recipe)
+    #   - grouped BF16 competes with TRITON
+    rows: list[tuple[str, float, float, float, str, str]] = []
+    # row tuple: (name, hk_tflops, ref_tflops, ratio, ref_backend_name, section)
     t0 = time.monotonic()
+    HIPB = BackendType.HIPBLASLT
+    TRT = BackendType.TRITON
+    HK = BackendType.HIPKITTEN
 
-    # ── Dense BF16 (8 shapes) ──
+    # ── (1) Dense BF16 forward (vs HIPBLASLT) ──
     for (M, N, K) in BF16_SHAPES:
-        ref = _bench_bf16(M, N, K, backend=None)
-        hk = _bench_bf16(M, N, K, backend=BackendType.HIPKITTEN)
+        ref = _bench_bf16(M, N, K, backend=HIPB)
+        hk = _bench_bf16(M, N, K, backend=HK)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"dense_BF16_{M}x{N}x{K}", hk, ref, ratio))
+        rows.append((f"BF16fwd_{M}x{N}x{K}", hk, ref, ratio, "hipblaslt", "bf16_fwd"))
 
-    # ── Dense FP8 tensorwise forward (8 shapes) ──
+    # ── (2) Dense BF16 backward (vs HIPBLASLT) ──
+    for (M, N, K) in BF16_SHAPES:
+        ref = _bench_bf16_bwd(M, N, K, backend=HIPB)
+        hk = _bench_bf16_bwd(M, N, K, backend=HK)
+        ratio = (hk / ref) if ref > 0 else 0.0
+        rows.append((f"BF16bwd_{M}x{N}x{K}", hk, ref, ratio, "hipblaslt", "bf16_bwd"))
+
+    # ── (3) Dense FP8 tensorwise forward (vs HIPBLASLT) ──
     for (M, N, K) in FP8_SHAPES:
-        ref = _bench_fp8(M, N, K, backend=None)
-        hk = _bench_fp8(M, N, K, backend=BackendType.HIPKITTEN)
+        ref = _bench_fp8(M, N, K, backend=HIPB)
+        hk = _bench_fp8(M, N, K, backend=HK)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"dense_FP8fwd_{M}x{N}x{K}", hk, ref, ratio))
+        rows.append((f"FP8fwd_{M}x{N}x{K}", hk, ref, ratio, "hipblaslt", "fp8_fwd"))
 
-    # ── Dense FP8 tensorwise backward (8 shapes; same shapes as forward) ──
+    # ── (4) Dense FP8 tensorwise backward (vs TRITON) ──
     for (M, N, K) in FP8_SHAPES:
-        ref = _bench_fp8_bwd(M, N, K, backend=None)
-        hk = _bench_fp8_bwd(M, N, K, backend=BackendType.HIPKITTEN)
+        ref = _bench_fp8_bwd(M, N, K, backend=TRT)
+        hk = _bench_fp8_bwd(M, N, K, backend=HK)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"dense_FP8bwd_{M}x{N}x{K}", hk, ref, ratio))
+        rows.append((f"FP8bwd_{M}x{N}x{K}", hk, ref, ratio, "triton", "fp8_bwd"))
 
-    # ── Grouped BF16 (16 shapes, DeepSeek-V3 + gpt_oss_20B) ──
+    # ── (5) Grouped BF16 (vs TRITON) ──
     for (name, B, M, N, K) in GROUPED_BF16_SHAPES:
-        ref = _bench_grouped_bf16(B, M, N, K, backend=None)
-        hk = _bench_grouped_bf16(B, M, N, K, backend=BackendType.HIPKITTEN)
+        ref = _bench_grouped_bf16(B, M, N, K, backend=TRT)
+        hk = _bench_grouped_bf16(B, M, N, K, backend=HK)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"grp_BF16_{name}", hk, ref, ratio))
+        rows.append((f"grpBF16_{name}", hk, ref, ratio, "triton", "grp_bf16"))
 
     wall = time.monotonic() - t0
 
@@ -448,40 +513,40 @@ def _run() -> int:
     # without polluting stdout (which carries the score).
     print(f"\n[metric_hk_ratio] Shape suite ({len(rows)} cases, {wall:.1f}s wall):", file=sys.stderr)
     print(
-        f"  {'name':40s}  {'hk_tflops':>10s}  {'ref_tflops':>10s}  {'ratio':>6s}",
+        f"  {'name':40s}  {'hk_tflops':>10s}  {'ref_tflops':>10s}  {'vs':>9s}  {'ratio':>6s}",
         file=sys.stderr,
     )
-    for name, hk, ref, r in rows:
-        flag = "" if r >= 0.9 else ("  *reject" if r == 0 else "  <90%")
+    for name, hk, ref, r, ref_name, _section in rows:
+        if r == 0:
+            flag = "  *reject"
+        elif name.startswith("FP8bwd_") or name.startswith("grpBF16_"):
+            flag = "" if r >= 1.20 else ("  <120%")
+        else:
+            flag = "" if r >= 0.97 else ("  <97%")
         print(
-            f"  {name:40s}  {hk:>10.1f}  {ref:>10.1f}  {r:>6.3f}{flag}",
+            f"  {name:40s}  {hk:>10.1f}  {ref:>10.1f}  {ref_name:>9s}  {r:>6.3f}{flag}",
             file=sys.stderr,
         )
 
-    # Per-section geomean breakdown (helpful for the agent when picking
-    # what to attack).
-    def _section_geomean(predicate) -> tuple[float, int]:
-        sub = [max(r, 0.01) for n, _, _, r in rows if predicate(n)]
+    # Per-section geomean breakdown.
+    def _section_geomean(section: str) -> tuple[float, int]:
+        sub = [max(r, 0.01) for _n, _, _, r, _ref, s in rows if s == section]
         if not sub:
             return (float("nan"), 0)
         return (math.exp(sum(math.log(r) for r in sub) / len(sub)), len(sub))
 
-    g_bf16_dense, n_bf16_dense = _section_geomean(lambda n: n.startswith("dense_BF16"))
-    g_fp8_fwd, n_fp8_fwd = _section_geomean(lambda n: n.startswith("dense_FP8fwd"))
-    g_fp8_bwd, n_fp8_bwd = _section_geomean(lambda n: n.startswith("dense_FP8bwd"))
-    g_grp_bf16, n_grp_bf16 = _section_geomean(lambda n: n.startswith("grp_BF16"))
-    # BF16 overall = dense + grouped (per-shape, before geomean) so the BF16
-    # target covers the whole BF16 surface.
-    g_bf16_all, n_bf16_all = _section_geomean(
-        lambda n: n.startswith("dense_BF16") or n.startswith("grp_BF16")
-    )
+    g_bf16_fwd, n_bf16_fwd = _section_geomean("bf16_fwd")
+    g_bf16_bwd, n_bf16_bwd = _section_geomean("bf16_bwd")
+    g_fp8_fwd, n_fp8_fwd = _section_geomean("fp8_fwd")
+    g_fp8_bwd, n_fp8_bwd = _section_geomean("fp8_bwd")
+    g_grp_bf16, n_grp_bf16 = _section_geomean("grp_bf16")
 
     for label, g, n in [
-        ("dense_BF16    ", g_bf16_dense, n_bf16_dense),
-        ("dense_FP8_fwd ", g_fp8_fwd, n_fp8_fwd),
-        ("dense_FP8_bwd ", g_fp8_bwd, n_fp8_bwd),
-        ("grp_BF16      ", g_grp_bf16, n_grp_bf16),
-        ("BF16_overall  ", g_bf16_all, n_bf16_all),
+        ("BF16_fwd  vs hipblaslt", g_bf16_fwd, n_bf16_fwd),
+        ("BF16_bwd  vs hipblaslt", g_bf16_bwd, n_bf16_bwd),
+        ("FP8_fwd   vs hipblaslt", g_fp8_fwd, n_fp8_fwd),
+        ("FP8_bwd   vs triton   ", g_fp8_bwd, n_fp8_bwd),
+        ("grp_BF16  vs triton   ", g_grp_bf16, n_grp_bf16),
     ]:
         if n:
             print(
@@ -489,47 +554,54 @@ def _run() -> int:
                 file=sys.stderr,
             )
 
-    # Three-goal acceptance per project policy:
-    #   (1) BF16_overall          ratio >= 0.97
-    #   (2) FP8_forward           ratio >= 0.97
-    #   (3) FP8_backward          ratio >= FP8_forward * 0.97
+    # Five-goal acceptance per project policy:
+    #   (1) BF16_fwd  vs hipblaslt >= 0.97
+    #   (2) BF16_bwd  vs hipblaslt >= 0.97
+    #   (3) FP8_fwd   vs hipblaslt >= 0.97
+    #   (4) FP8_bwd   vs triton    >= 1.20
+    #   (5) grp_BF16  vs triton    >= 1.20
     print("[metric_hk_ratio] Goals:", file=sys.stderr)
-    pass_bf16 = g_bf16_all >= 0.97 if n_bf16_all else False
-    pass_fp8_fwd = g_fp8_fwd >= 0.97 if n_fp8_fwd else False
-    bwd_target = g_fp8_fwd * 0.97 if n_fp8_fwd else 0.97
-    pass_fp8_bwd = (g_fp8_bwd >= bwd_target) if n_fp8_bwd else False
-    print(
-        f"[metric_hk_ratio]   (1) BF16_overall  >= 0.97             : "
-        f"{g_bf16_all:.4f}  {'PASS' if pass_bf16 else 'FAIL'}",
-        file=sys.stderr,
-    )
-    print(
-        f"[metric_hk_ratio]   (2) FP8_forward   >= 0.97             : "
-        f"{g_fp8_fwd:.4f}  {'PASS' if pass_fp8_fwd else 'FAIL'}",
-        file=sys.stderr,
-    )
-    print(
-        f"[metric_hk_ratio]   (3) FP8_backward  >= FP8_fwd * 0.97   "
-        f"(target={bwd_target:.4f}): {g_fp8_bwd:.4f}  "
-        f"{'PASS' if pass_fp8_bwd else 'FAIL'}",
-        file=sys.stderr,
+    goals = [
+        ("(1) BF16_fwd  vs hipblaslt >= 0.97", g_bf16_fwd, 0.97, n_bf16_fwd),
+        ("(2) BF16_bwd  vs hipblaslt >= 0.97", g_bf16_bwd, 0.97, n_bf16_bwd),
+        ("(3) FP8_fwd   vs hipblaslt >= 0.97", g_fp8_fwd, 0.97, n_fp8_fwd),
+        ("(4) FP8_bwd   vs triton    >= 1.20", g_fp8_bwd, 1.20, n_fp8_bwd),
+        ("(5) grp_BF16  vs triton    >= 1.20", g_grp_bf16, 1.20, n_grp_bf16),
+    ]
+    n_pass = 0
+    for label, g, target, n in goals:
+        passed = (g >= target) if n else False
+        if passed:
+            n_pass += 1
+        print(
+            f"[metric_hk_ratio]   {label}  : {g:.4f}  "
+            f"{'PASS' if passed else 'FAIL'}",
+            file=sys.stderr,
+        )
+
+    # Score is the geomean over all 5 section-geomeans, scaled to int
+    # (one per goal so each section weighs equally regardless of n).
+    # This is just an auto_optimize ranking signal — acceptance is the
+    # 5-goal PASS/FAIL above, not score.
+    section_geomeans = [g for _, g, _, n in goals if n]
+    if section_geomeans:
+        section_geo = math.exp(
+            sum(math.log(max(g, 0.01)) for g in section_geomeans) / len(section_geomeans)
+        )
+    else:
+        section_geo = 0.0
+    score = int(round(section_geo * 1000))
+
+    n_reject = sum(1 for _n, _, _, r, _ref, _s in rows if r == 0)
+    n_below = sum(
+        1 for n, _, _, r, _ref, _s in rows
+        if 0 < r < (1.20 if (n.startswith("FP8bwd_") or n.startswith("grpBF16_")) else 0.97)
     )
 
-    # Geomean over clipped ratios. Clipping at 0.01 keeps the geomean defined
-    # but punishes rejection with a 100x drop on that entry.
-    ratios = [max(r, 0.01) for _, _, _, r in rows]
-    log_sum = sum(math.log(r) for r in ratios)
-    geomean = math.exp(log_sum / len(ratios))
-    score = int(round(geomean * 1000))
-
-    n_reject = sum(1 for _, _, _, r in rows if r == 0)
-    n_below_90 = sum(1 for _, _, _, r in rows if 0 < r < 0.9)
-
-    n_goals = sum([pass_bf16, pass_fp8_fwd, pass_fp8_bwd])
     print(
-        f"[metric_hk_ratio] geomean={geomean:.4f}  "
-        f"reject={n_reject}/{len(rows)}  below_90={n_below_90}/{len(rows)}  "
-        f"goals={n_goals}/3  score={score}",
+        f"[metric_hk_ratio] section_geomean={section_geo:.4f}  "
+        f"reject={n_reject}/{len(rows)}  below_target={n_below}/{len(rows)}  "
+        f"goals={n_pass}/5  score={score}",
         file=sys.stderr,
     )
 
