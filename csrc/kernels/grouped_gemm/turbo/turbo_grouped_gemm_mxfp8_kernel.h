@@ -306,6 +306,30 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                 base_scale_soff[1] + next_scale_off);
         }
 
+        // End-of-K-iter drain.  Phase 4 just issued 6 LDGs to next[0,1]
+        // (data + scale).  After the swap below, Phase 1 of the NEXT K-iter
+        // reads from cur[warp_n+2] (== formerly-next[2,3]) — a *different*
+        // SMEM sub-array than where Phase 3+4 wrote (formerly-next[0,1]) —
+        // so the immediate post-swap reader does not RAW-depend on Phase
+        // 3+4's tail LDGs.  However tightening this bound has been
+        // characterized empirically and `<12>` is the loosest safe value:
+        //   * `<12>`  : current — 0/100 stress on G=4 M=1024 N=2048 K=2048
+        //              E4M3 (5000-iter), and 0-2/100 on the metric stress
+        //              probe.  Holds on the post-squash kernel.
+        //   * `<16>`  : auto-opt loop round 20 (2026-04-28, log dir
+        //              `auto_optimize_logs/20260427_115238/round_020/`)
+        //              tried this and triggered a CATASTROPHIC race —
+        //              `stress_bad=100/100` with score collapse to ~5681.
+        //              The change was reverted.  Do not retry.
+        //   * `<13..15>` : not characterized but expected to race because
+        //              the 100/100 race at `<16>` indicates the LSU-WAR
+        //              window between this iter's tail LDG-LDS-writes and
+        //              the next iter's Phase 3 ds_reads is closer to
+        //              4 in-flight slots than to 0 — `<13>` would already
+        //              expose it on most shapes.
+        // If a future round wants to reach for a tighter bound, the right
+        // direction is `<10>`/`<8>` (more drain, slightly safer, slower)
+        // — NOT `<13+>` (looser, races).
         wait_vmcnt<12>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;

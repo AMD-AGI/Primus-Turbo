@@ -392,6 +392,14 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                 base_scale_soff[1] + next_scale_off);
         }
 
+        // End-of-K-iter drain.  Mirror of the FWD kernel's matching site
+        // (see turbo_grouped_gemm_mxfp8_kernel.h, end of main K-loop) —
+        // wgrad uses the IDENTICAL 4-phase LDS/LDG pipeline as the
+        // forward grouped kernel, so the same RAW analysis and the same
+        // empirically-safe `<12>` bound apply.  Loosening to `<16>` was
+        // characterized as RACY on FWD (stress 100/100 in auto-opt round
+        // 20, 2026-04-28) and the same race surface exists on wgrad —
+        // do not retry.  See FWD comment for the full race-bound table.
         wait_vmcnt<12>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
