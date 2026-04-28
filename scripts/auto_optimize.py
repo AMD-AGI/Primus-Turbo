@@ -127,9 +127,14 @@ DEFAULT_TASK = (
     "  • FP8_bwd   (8)   geomean ≈ 1.07      vs TRITON     [w=2] ← 距 1.20 还有 12% gap\n"
     "  • grp_BF16 (16)   geomean ≈ 0.10-0.40 vs TRITON     [w=4] ← gpt_oss_20B (N=K=2880) 不对齐\n"
     "  • grp_FP8  (16)   geomean ≈ 0.05-0.10 vs TRITON     [w=4] ← HK FP8 .so 缺 grouped binding\n"
-    "**权重 4× 决定攻坚顺序**：grp_FP8 / grp_BF16 是 score 大头。建议路径：\n"
-    "  ① 先把 grp_FP8 拉到 progress=1.0（HK 仓库写 grouped binding，详见第五刀）→ +28% score\n"
-    "  ② 再把 grp_BF16 拉到 progress=1.0（pad-and-copy 或新 tile 模板）→ 再 +28% score\n"
+    "**权重 4× 决定攻坚顺序**：grp_FP8 + grp_BF16 是 score 大头（合占 8/14 = 57%）。\n"
+    "**唯一允许的路径（user 拍板）**：HK 仓库新加 **persistent + CPU-sync-free** grouped\n"
+    "kernel（mirror Triton 的 `grouped_gemm_kernel.py`，详见第四+五刀），**不许** multi-stream\n"
+    "/ per-group launch / pad-and-copy 凑数。pad-and-copy 在非对齐 N/K 上能挤出局部分数但**永远**\n"
+    "无法跨过 1.20 vs TRITON 的目标 —— Triton 是 single-launch persistent，per-group launch\n"
+    "永远输给它。所以两段必须**一并**用 persistent kernel 解。建议路径：\n"
+    "  ① HK BF16 grouped binding 重写为 persistent + accept group_offs（轮 N）→ grp_BF16 +28%\n"
+    "  ② HK FP8 grouped binding 新加（同款 persistent，mirror BF16）（轮 N+1）→ grp_FP8 +28%\n"
     "  ③ FP8_fwd / FP8_bwd 凑零头 → +14%\n"
     "  ④ BF16_bwd 最后做（dispatch overhead 可能 1 次重写解决多段）→ +7%\n"
     "新架构下 reject 全部源于**真硬约束**（dtype / layout / tile alignment），不再有 cache miss 类\n"
@@ -157,6 +162,29 @@ DEFAULT_TASK = (
     "       的 HK 仓库 binding（FP8 grouped、新增 layout、新加变体）一律命名 `grouped_*`，\n"
     "       不准带 `_balanced` 后缀；任何**新加**的 Primus 端 grouped API 也不准带 `_balanced` 后缀。\n"
     "       这条规则覆盖 BF16 grouped、新加的 FP8 grouped、未来一切 grouped 入口。\n"
+    "  ✗ **grouped 路径严禁 multi-stream / per-group launch / cudaStream 池**（user 拍板）：\n"
+    "    1) **禁止**任何形式的 `for g in range(B): launch_dense_kernel(...)` 一组一发，\n"
+    "       哪怕是分摊到 `torch.cuda.Stream()` 池里『并行』也不准。这是当前 Primus 端\n"
+    "       `GroupedGEMMFP8HipKittenBackend.execute` 的 fallback 路径，必须**整体替换**\n"
+    "       为单次 launch 的 persistent kernel（见第五刀）。MI355X 有 256 个 CU + 8 个 XCD，\n"
+    "       一个 persistent kernel 单次 launch 用满 256 个 program 就能 saturate；切多 stream\n"
+    "       既增加 host overhead 又破坏 XCD chiplet 调度。\n"
+    "    2) **禁止**给 HK kernel binding 加 `stream` 参数 / `hipStream_t` 透传 / device-side\n"
+    "       stream pool —— 这是 multi-stream 的前置铺垫。HK 仓库 BF16/FP8 binding 只接受\n"
+    "       默认流（hipStream_t = 0）；如果 Primus 在非默认流上调用，是 Primus 端的责任在\n"
+    "       binding 调用前后做 stream sync（不是把 stream 塞进 binding 签名）。\n"
+    "  ✗ **grouped 路径严禁 CPU sync**（user 拍板）：\n"
+    "    1) **禁止**任何形式的 host-side 读 `group_lens` / `group_offs`：`.item()` /\n"
+    "       `.tolist()` / `.cpu()` / `int(t)` / `cudaMemcpyDeviceToHost` 全在禁单。哪怕是\n"
+    "       为了拿 `B = group_lens.shape[0]` 也不许（B 直接从 b.shape[0] 静态拿；其他元数据\n"
+    "       全在 device tensor 里）。\n"
+    "    2) **禁止** `group_offs.cumsum()` 跑在 CPU 上 —— prefix sum 必须 device tensor 输入\n"
+    "       device tensor 输出（`torch.cumsum(group_lens.cuda(), dim=0)`）。\n"
+    "    3) Persistent kernel 必须在 GPU 内自己消费 `group_offs_ptr` —— 用 `tl.load` /\n"
+    "       device pointer arithmetic 读 prefix sum，做 group-id 的 O(G) linear scan 或\n"
+    "       O(log G) binary search。**参考 `primus_turbo/triton/grouped_gemm/grouped_gemm_kernel.py`\n"
+    "       的 `_grouped_bf16_persistent_gemm_kernel` (line 182-330)** —— Triton 里同样的\n"
+    "       `_g in range(G): tl.load(group_offs_ptr + _g)` 模式，HK 仓库要 mirror。\n"
     "  ✗ 只改 metric/test/config.py 文件让数字变好\n"
     "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值\n\n"
     "**两仓库分工**：\n"
@@ -674,30 +702,59 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
       • BF16_bwd 走 fwd + dA + dB 三次 dispatch，host overhead 累积；
         可写专用 fused autograd 入口跳过中间 op-registration。
     依据：用 stderr 表锁定 ratio < 0.97 的具体 shape，再调规则。
-  ☐ 第四刀：grp_BF16 0.098 → 1.20。8/16 reject 全部是 gpt_oss_20B (N=2880 / K=2880 不对齐 256/128 tile)。
-    两条路：(a) Primus 端写通用 pad-and-copy 处理非对齐 grouped (会有 overhead，但能解 8 个 case)；
-    (b) 在 HipKittens 仓库出 256/128/?(non-256 N) 兼容 tile 模板 (更彻底)。先 (a) 验证可行性。
-    **再次提醒：can_handle 严禁判 balanced**（见上面"严禁的『假优化』模式"）。
-  ☐ 第五刀（**新加，重点**）：grp_FP8 vs TRITON >= 1.20。HipKittens FP8 .so 当前**没有**
-    原生 grouped binding，Primus 端 `GroupedGEMMFP8HipKittenBackend.execute` 是 per-group
-    `dense_run` 循环 fallback —— B=32 时 launch overhead 让它在 Triton 持久 kernel 面前
-    崩盘。**修法**（命名严格遵守『假优化』清单的禁 _balanced 规则）：
-      1. 在 `/workspace/code/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp` 末尾加 3 条
-         `m.def("grouped_<layout>", &grouped_<layout>, ...)` binding，layout ∈ {{rcr, rrr, crr}}。
-         **不要**带 `_balanced` 后缀（命名一律 `grouped_rcr` / `grouped_rrr` / `grouped_crr`）。
-         BF16 .so 暴露的 `grouped_*_balanced` 是历史遗留，新 binding 不传播这个污染 ——
-         Primus 端 loader 用 `_resolve_grouped_attr` 已经兼容两种命名，所以 BF16 老 .so 仍能
-         加载。binding 实现层面：MoE 真实流量 group_lens 不均匀，所以最好把 launcher 写成
-         接受 cumulative offsets 直接消费（而不是假设均匀 M-per-group）—— 这样 Primus 端
-         永远不需要 fast-path detection。
-      2. cd 到 mi350x，`source ../../../env.src && make -j`，重编 `tk_fp8_layouts.so`，确认
-         `python3 -c "import tk_fp8_layouts; print([x for x in dir(tk_fp8_layouts) if 'grouped' in x])"`
-         打印 `['grouped_crr', 'grouped_rcr', 'grouped_rrr']`（无 `_balanced` 后缀）。
-      3. Primus 端 `kernels/grouped_gemm/grouped_gemm_fp8_impl.py::GroupedGEMMFP8HipKittenBackend.execute`
-         去掉 per-group for 循环，改成一次 `hipkitten.grouped_run(hk, cfg, ...)` 调用。loader
-         自动通过 `_resolve_grouped_attr` 把新 `grouped_*` attribute 拿出来。
-      4. 跑 fp32 数值 probe（max_abs + SNR）确认 deepseek-v3 / gpt_oss_20B FP8 grouped
-         通过；跑 metric 验证 grp_FP8 ratio 提升；commit。
+  ☐ 第四刀 + 第五刀（user 拍板，**唯一允许的 grouped 实现路径**）：HK 仓库新加
+    **persistent + CPU-sync-free** grouped kernel binding（BF16 + FP8 各 3 个 layout）。
+    硬件参数：MI355X = **256 个 CU + 8 个 XCD**（per_xcd = 32 CU），grid_size = 256 个 program。
+    **样板**：完全照抄 `primus_turbo/triton/grouped_gemm/grouped_gemm_kernel.py::_grouped_bf16_persistent_gemm_kernel`
+    (line 182-330) 的设计 —— **本轮第一步先把这个文件读完**，理解 5 个核心点：
+      (i)  Grid = NUM_SMS（= 256 在 MI355X 上）；kernel 是 **persistent**：单次 launch、program 内
+           跨多 group × 多 tile 滚动 (`for global_tile_id in range(pid, total_tiles, NUM_SMS)`)。
+      (ii) `group_offs_ptr` 是 device int64 tensor (shape `[G+1]`，prefix sum of group_lens)。
+           Kernel 内**唯一**的 group 元数据来源是 `tl.load(group_offs_ptr + g)`。**没有任何 host
+           回读** —— host 只 launch 一次，剩下全在 device 上跑。
+      (iii) 每个 program 进 kernel 后做 O(G) linear scan 累加每组 tile 数得到 total_tiles +
+           映射 global_tile_id → (group_idx, local_tile)。G ≤ 32 时这个 scan 在 L1/L2 命中
+           后基本免费 (line 230-255)。
+      (iv) Group-local tile → (pid_m, pid_n) 用跟 dense GEMM 一样的 GROUP_SIZE_M swizzle
+           (line 263-268)；K-loop 跟 dense 完全一致。
+      (v)  Chiplet (XCD) 重排：`_chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS=8, CHUNK_SIZE)`
+           (line 152-165) 把 PID 重排让相邻 program 走相邻 XCD，提升 L2 reuse。MI355X
+           NUM_XCDS=8。
+    **实施分两轮**（必须按这个顺序，单 chat session 内连续推进）：
+    轮 N (HK BF16 grouped 重写)：
+      1. 在 `/workspace/code/HipKittens/analysis/bf16_gemm/mi350x/` 找到现有 BF16 grouped
+         launcher（mirror Triton 的 BF16 persistent 实现），把 binding 改成接受
+         `(a, b, c, group_offs)` —— 其中 group_offs 是 `[G+1] int64` device tensor，**绝不**
+         接受任何 group_lens / 假设 uniform-M / 把 group 信息从 host 传进来。binding 命名
+         `grouped_rcr` / `grouped_rrr` / `grouped_crr`（无 `_balanced` 后缀）。
+      2. Primus 端 `GroupedGEMMHipKittenBackend.execute`：删 `_uniform_group_m` fast-path、
+         删 padded uniform-M 分支、删 per-group `dense_run` fallback，**全部**走单次
+         `hipkitten.grouped_run(hk, cfg, a, b, out, group_offs)` 调用；group_offs 用
+         `torch.cumsum(group_lens, dim=0)` 算（device → device，无 sync）。
+      3. 数值 probe：fp32 reference vs 新 kernel，max_abs + SNR；commit。
+    轮 N+1 (HK FP8 grouped 新加)：
+      1. 在 `/workspace/code/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp` 末尾
+         新加 3 条 `m.def("grouped_<layout>", ...)` binding（rcr/rrr/crr），实现 mirror 上轮
+         BF16 grouped persistent launcher 的结构：grid=256, group_offs device 输入, single
+         launch 跑完所有 group × 所有 tile, FP8 quantize/dequantize 用现有 dense 路径的逻辑。
+         **绝对不准**给 binding 加 `stream` / `hipStream_t` 参数；**绝对不准**借机引入
+         multi-stream pool。如果上轮 commit 里看到任何 `stream` 参数 / multi-stream 准备工作，
+         **revert 之**。
+      2. `source ../../../env.src && make -j` 重编，确认 `dir(tk_fp8_layouts)` 有 `grouped_crr/rcr/rrr`。
+      3. Primus 端 `GroupedGEMMFP8HipKittenBackend.execute`：删 per-group `for` 循环 +
+         per-stream / per-CudaStream 调度，**全部**改成单次 `hipkitten.grouped_run(...)`。
+      4. 数值 probe + metric verify + commit。
+    **明确禁止**（违反 = 本轮立即作废，且整个 commit 必须 revert）：
+      ✗ multi-stream / `torch.cuda.Stream()` 池 / per-group hipStream_t / device-side stream
+      ✗ host-side 读 group_lens / group_offs（`.item()` / `.tolist()` / `.cpu()` / `int(...)`）
+      ✗ `for g in range(B): launch_dense_kernel(...)` 一组一发的 fallback（per-group launch）
+      ✗ 给 HK binding 加 `stream` / `hipStream_t` 参数（即便 default=0 也禁）
+      ✗ 假设 uniform M-per-group / can_handle 判 balanced
+      ✗ runtime 读任何 .json / .pkl / .autotune_cache.json
+      ✗ 加 dict/lru_cache/weakref/data_ptr cache 任何形式
+    Acceptance：grp_BF16 / grp_FP8 两段同时 PASS（>= 1.20 vs TRITON），且 `git grep` 在两个
+    仓库里**找不到** `cudaStream` / `hipStream_t` / `torch.cuda.Stream` / `.item()` 在
+    grouped 路径上的新增使用。
   ☐ HipKittens kernel 改写（任意时刻可做，不依赖前 5 刀）：改 .cpp 的 tile/wave/swizzle/
     MFMA 排布，进 analysis/{{bf16,fp8}}_gemm/mi350x `source ../../../env.src && make -j`，
     生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so。提速来源：bank conflict、
