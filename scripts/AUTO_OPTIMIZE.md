@@ -143,7 +143,7 @@ python3 scripts/auto_optimize.py --rounds 80 --patience 8
 # 单轮 cursor-agent 上限调到 60 min
 python3 scripts/auto_optimize.py --round-timeout 3600
 
-# 自定义 metric（必须打印 1 个浮点数到 stdout，越大越好）
+# 自定义 metric（stdout 最后一行非空行为一个数值，越大越好；默认脚本打印 1 个整数）
 python3 scripts/auto_optimize.py \
     --metric-cmd 'python3 scripts/_metric_mxfp8.py' \
     --metric-name mxfp8_score
@@ -215,16 +215,16 @@ jq '.rounds[] | select(.deep_check_ran) |
 
 每个 shape 跑：
 1. 一次 fwd+bwd 与 bf16 reference 对齐，算 SNR (`out` / `dA` / `dB`)，低于
-   `25 dB`（E5M2 是 `20 dB`）记 1 次 `snr_fail`。
-2. `MXFP8_PERF_WARMUP=10` 次预热后用 `torch.utils.benchmark.Timer.
-   blocked_autorange(min_run_time=MXFP8_PERF_MIN_RUN_TIME=0.3)` 自动选迭代
-   次数取中位数延迟，换算 TFLOPS。Timer 自带 outlier 过滤，比手写循环
-   稳定一档。
+   阈值（E4M3 默认 `MXFP8_SNR_E4M3=25`，E5M2 默认 `MXFP8_SNR_E5M2=20`，单位 dB）
+   记 1 次 `snr_fail`。
+2. 性能：`MXFP8_PERF_WARMUP`（默认 20）次预热后，在 `MXFP8_PERF_TRIALS`（默认 8）
+   批上做计时；每批跑 `MXFP8_PERF_BATCH_ITERS`（默认 30）次调用，用 CUDA event
+   测延迟，取各批平均延迟的 **最小值** 再换算 TFLOPS（对抗共享节点上的偶发抖动）。
 
-最后跑 1 段确定性 stress：(G=4, M=1024, N=2048, K=2048, E4M3)，30 次
-fwd+bwd，与 ref 对比 max-abs，超过 `1.0` 记一次 `stress_bad`。这是
-post-volatile-fix 后已知会爆 `out` race 的形状（约 3% 概率），用来给
-loop 一个对 race 敏感的信号。
+最后跑 1 段确定性 stress：`STRESS_SHAPE`（G=4, M=1024, N=2048, K=2048, E4M3），
+重复 `MXFP8_STRESS_ITERS`（默认 100）次 fwd+bwd，与首次运行对比 max-abs，超过
+`MXFP8_STRESS_THRESH`（默认 `1.0`）记一次 `stress_bad`。这是 post-volatile-fix
+后已知会爆 `out` race 的形状，用来给 loop 一个对 race 敏感的信号。
 
 最终：
 
@@ -238,11 +238,12 @@ score = int(round(sum_tflops * 10))
 环境变量可以调整：
 
 ```bash
-MXFP8_SNR_E4M3=25.0       # 默认值
+MXFP8_SNR_E4M3=25.0       # 默认值（可通过 env 覆盖）
 MXFP8_SNR_E5M2=20.0
-MXFP8_PERF_WARMUP=10
-MXFP8_PERF_MIN_RUN_TIME=0.3
-MXFP8_STRESS_ITERS=50
+MXFP8_PERF_WARMUP=20
+MXFP8_PERF_TRIALS=8
+MXFP8_PERF_BATCH_ITERS=30
+MXFP8_STRESS_ITERS=100
 MXFP8_STRESS_THRESH=1.0
 MXFP8_SNR_FAIL_PENALTY=1000
 MXFP8_STRESS_BAD_PENALTY=100

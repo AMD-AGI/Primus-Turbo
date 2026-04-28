@@ -12,8 +12,12 @@ forward + variable-K wgrad MXFP8 grouped-GEMM kernels through three
 representative shapes, measures TFLOPS, checks SNR vs the bf16 reference,
 and runs a short determinism stress on the worst-known shape.
 
-Score formula (printed as a single integer on stdout, consumed by
-auto_optimize.py):
+**Stdout contract:** on normal completion (including "no CUDA" fallback),
+exactly **one line** is printed to stdout: the integer ``score``.
+All diagnostics (pick banner, traceback, per-shape notes, summary line)
+go to stderr.
+
+Score formula:
 
     score = int(round(sum_tflops * 10)) \\
           - SNR_FAIL_PENALTY    * snr_fail_count \\
@@ -30,18 +34,19 @@ Higher is better.  Defaults are tuned so:
   * One stress BAD costs ~10 TFLOPS, so the loop rewards reducing
     determinism failure rate.
 
-The script picks an idle GPU via ``rocm-smi --showpids`` if HIP_VISIBLE_DEVICES
-is unset, mirroring the convention used by ``_metric_hipkitten.py``.
+If ``HIP_VISIBLE_DEVICES`` is unset, picks an idle GPU from ``MXFP8_GPU_POOL``
+via ``rocm-smi --showuse --showpids`` (KFD VRAM above the busy threshold).
 """
 
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 import time
 import traceback
 from contextlib import contextmanager
-from typing import Callable
 
 # Score weights -- tweak via env if you want a different penalty profile.
 SNR_FAIL_PENALTY   = int(os.environ.get("MXFP8_SNR_FAIL_PENALTY", "1000"))
@@ -74,6 +79,9 @@ PERF_BATCH_ITERS   = int(os.environ.get("MXFP8_PERF_BATCH_ITERS", "30"))
 STRESS_ITERS  = int(os.environ.get("MXFP8_STRESS_ITERS", "100"))
 STRESS_THRESH = float(os.environ.get("MXFP8_STRESS_THRESH", "1.0"))
 
+# rocm-smi KFD VRAM column: above this byte count, the GPU counts as busy.
+KFD_BUSY_VRAM_BYTES = 100 * 1024 * 1024
+
 
 # Allowed GPU pool.  We are sharing the host with another tenant on GPUs
 # 0-3, so this script (and anything it auto-picks for) is restricted to
@@ -84,12 +92,9 @@ GPU_POOL = sorted({
 
 
 def _pick_idle_gpu() -> str | None:
-    """Return the smallest idle GPU id from GPU_POOL (busy = any PID using
-    >100MiB VRAM).  Falls back to None when rocm-smi is unavailable.
+    """Smallest idle GPU id in ``GPU_POOL`` (busy if KFD lists a PID with
+    VRAM ``> KFD_BUSY_VRAM_BYTES``).  If rocm-smi fails, return the first pool id.
     """
-    import re
-    import subprocess
-    THR = 100 * 1024 * 1024
     try:
         out = subprocess.check_output(
             ["rocm-smi", "--showuse", "--showpids"],
@@ -114,7 +119,7 @@ def _pick_idle_gpu() -> str | None:
             vram = int(cols[3])
         except ValueError:
             continue
-        if vram <= THR:
+        if vram <= KFD_BUSY_VRAM_BYTES:
             continue
         for gid in re.findall(r"\d+", cols[2]):
             busy.add(int(gid))

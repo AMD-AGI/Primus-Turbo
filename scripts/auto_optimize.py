@@ -57,7 +57,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 DEFAULT_MODEL = "claude-opus-4-7-thinking-max"
 DEFAULT_SKILL = (
@@ -94,6 +93,30 @@ DEFAULT_DEEP_CHECK_CMD = (
 DEFAULT_DEEP_CHECK_EVERY = 5
 CLI_CONFIG_PATH = Path(os.path.expanduser("~/.cursor/cli-config.json"))
 
+# Preview / logging truncation (unchanged behavior).
+METRIC_CMD_PREVIEW_LEN = 120
+METRIC_IO_TAIL_CHARS = 300
+METRIC_STDERR_TAIL_LINES = 12
+DEEP_CHECK_TAIL_LINE_CAP = 200
+DEEP_CHECK_CONSOLE_TAIL_LINES = 12
+
+# Set once per process run for summary.json started_at (replaces setattr on write_summary).
+_SESSION_STARTED_AT: str | None = None
+
+
+def _preview_cmd(cmd: str, max_len: int = METRIC_CMD_PREVIEW_LEN) -> str:
+    """Shorten long shell commands for console section headers."""
+    if len(cmd) <= max_len:
+        return cmd
+    return cmd[:max_len] + "..."
+
+
+def _metric_stderr_tail(err: str, *, lines: int = METRIC_STDERR_TAIL_LINES) -> str:
+    """Last N lines of stderr for operator visibility."""
+    if not err:
+        return ""
+    return "\n".join(err.splitlines()[-lines:])
+
 
 @dataclass
 class RoundResult:
@@ -101,8 +124,8 @@ class RoundResult:
     started_at: str
     finished_at: str
     duration_s: float
-    metric: Optional[float]
-    best_so_far: Optional[float]
+    metric: float | None
+    best_so_far: float | None
     improved: bool
     head_sha_before: str
     head_sha_after: str
@@ -110,8 +133,8 @@ class RoundResult:
     log_dir: str
     # Deep-check fields are None when the round didn't run a deep check.
     deep_check_ran: bool = False
-    deep_check_passed: Optional[bool] = None
-    deep_check_exit_code: Optional[int] = None
+    deep_check_passed: bool | None = None
+    deep_check_exit_code: int | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -135,8 +158,8 @@ class RoundResult:
 @dataclass
 class TrajectoryState:
     rounds: list[RoundResult] = field(default_factory=list)
-    best_metric: Optional[float] = None
-    best_sha: Optional[str] = None
+    best_metric: float | None = None
+    best_sha: str | None = None
     rounds_without_improvement: int = 0
 
 
@@ -175,7 +198,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_METRIC_CMD,
         help=(
-            "Shell command that prints a single float metric to stdout (higher is better). "
+            "Shell command that prints one numeric metric on the last non-empty stdout line "
+            "(higher is better; default MXFP8 helper prints one integer). "
             "Run after every round and at startup for the baseline."
         ),
     )
@@ -304,8 +328,8 @@ def _env_with_pool(gpu_pool: str, restrict_visible: bool = False) -> dict:
     return env
 
 
-def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> Optional[float]:
-    section(f"measuring metric: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
+def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> float | None:
+    section(f"measuring metric: {_preview_cmd(cmd)}")
     try:
         result = subprocess.run(
             cmd,
@@ -324,11 +348,11 @@ def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> Optional[floa
     if result.returncode != 0:
         print(
             f"[metric] non-zero exit {result.returncode}; "
-            f"stdout={out[-300:]!r} stderr={err[-300:]!r}",
+            f"stdout={out[-METRIC_IO_TAIL_CHARS:]!r} stderr={err[-METRIC_IO_TAIL_CHARS:]!r}",
             flush=True,
         )
     if not out:
-        print(f"[metric] empty stdout; stderr={err[-300:]!r}", flush=True)
+        print(f"[metric] empty stdout; stderr={err[-METRIC_IO_TAIL_CHARS:]!r}", flush=True)
         return None
     last_line = out.splitlines()[-1].strip()
     try:
@@ -337,20 +361,18 @@ def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> Optional[floa
         print(f"[metric] could not parse {last_line!r} as float", flush=True)
         return None
     print(f"[metric] = {value}", flush=True)
-    # Print a short tail of stderr so the operator sees the per-shape breakdown
-    # (the metric script writes its OK/FAIL/STR notes to stderr).
     if err:
-        tail = "\n".join(err.splitlines()[-12:])
-        print(tail, flush=True)
+        print(_metric_stderr_tail(err), flush=True)
     return value
 
 
 def run_deep_check(cmd: str, cwd: str, timeout: int, log_path: Path,
                    gpu_pool: str) -> tuple[bool, int]:
-    """Run the deep-check command, stream its output to log_path, and return
-    (passed, exit_code).  passed=True iff exit_code == 0.
+    """Run the deep-check command, stream its output to log_path.
+
+    Returns ``(passed, exit_code)`` where ``passed`` is true iff exit_code == 0.
     """
-    section(f"deep-check: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
+    section(f"deep-check: {_preview_cmd(cmd)}")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w") as logf:
         logf.write(f"# Command: {cmd}\n# Started at: {now_iso()}\n\n")
@@ -365,16 +387,16 @@ def run_deep_check(cmd: str, cwd: str, timeout: int, log_path: Path,
         except FileNotFoundError as exc:
             print(f"[deep-check] failed to spawn: {exc}", flush=True)
             return False, 127
+        tail: list[str] = []
         try:
             assert proc.stdout is not None
             start = time.monotonic()
-            tail: list[str] = []
             for line in proc.stdout:
                 logf.write(line)
                 logf.flush()
                 tail.append(line.rstrip("\n"))
-                if len(tail) > 200:
-                    tail = tail[-200:]
+                if len(tail) > DEEP_CHECK_TAIL_LINE_CAP:
+                    tail = tail[-DEEP_CHECK_TAIL_LINE_CAP:]
                 if time.monotonic() - start > timeout:
                     print(
                         f"\n[deep-check] timeout {timeout}s exceeded; sending SIGTERM",
@@ -396,9 +418,8 @@ def run_deep_check(cmd: str, cwd: str, timeout: int, log_path: Path,
                 proc.kill()
             raise
         rc = proc.returncode if proc.returncode is not None else 1
-    # Echo the last few lines so the operator sees the verdict in console.
     if tail:
-        for line in tail[-12:]:
+        for line in tail[-DEEP_CHECK_CONSOLE_TAIL_LINES:]:
             print(f"[deep-check] {line}", flush=True)
     print(f"[deep-check] exit_code={rc} ({'PASS' if rc == 0 else 'FAIL'})", flush=True)
     return rc == 0, rc
@@ -436,7 +457,7 @@ def build_prompt(
     args: argparse.Namespace,
     state: TrajectoryState,
     round_idx: int,
-    baseline_metric: Optional[float],
+    baseline_metric: float | None,
     head_sha: str,
     recent_log: str,
     short_status: str,
@@ -553,7 +574,7 @@ def build_prompt(
 {args.prompt_extra}"""
 
 
-def maybe_set_max_mode(enabled: bool) -> Optional[dict]:
+def maybe_set_max_mode(enabled: bool) -> dict | None:
     """Toggle maxMode in cli-config.json. Returns the original snapshot, or None."""
     if not CLI_CONFIG_PATH.exists():
         print(f"[max-mode] {CLI_CONFIG_PATH} not found - skipping toggle.", flush=True)
@@ -576,7 +597,7 @@ def maybe_set_max_mode(enabled: bool) -> Optional[dict]:
     return snapshot
 
 
-def restore_cli_config(snapshot: Optional[dict]) -> None:
+def restore_cli_config(snapshot: dict | None) -> None:
     if snapshot is None:
         return
     try:
@@ -667,10 +688,10 @@ def write_summary(
     summary_path: Path,
     args: argparse.Namespace,
     state: TrajectoryState,
-    baseline: Optional[float],
+    baseline: float | None,
 ) -> None:
     summary = {
-        "started_at": getattr(write_summary, "_start", now_iso()),
+        "started_at": _SESSION_STARTED_AT or now_iso(),
         "metric_name": args.metric_name,
         "metric_cmd": args.metric_cmd,
         "model": args.model,
@@ -710,7 +731,8 @@ def main() -> int:
     )
     log_dir.mkdir(parents=True, exist_ok=True)
     summary_path = log_dir / "summary.json"
-    write_summary._start = now_iso()  # type: ignore[attr-defined]
+    global _SESSION_STARTED_AT
+    _SESSION_STARTED_AT = now_iso()
 
     cli_snapshot = None if args.no_max_mode else maybe_set_max_mode(True)
 
@@ -758,8 +780,8 @@ def main() -> int:
             # cancels any "improved" verdict and does NOT update best_metric,
             # regardless of how the cheap metric moved.
             deep_ran = False
-            deep_passed: Optional[bool] = None
-            deep_exit: Optional[int] = None
+            deep_passed: bool | None = None
+            deep_exit: int | None = None
             should_deep_check = (
                 args.deep_check_cmd
                 and args.deep_check_every > 0
