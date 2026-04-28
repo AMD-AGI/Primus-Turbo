@@ -94,6 +94,51 @@ public:
                           ffi::Result<ffi::AnyBuffer>                       recv_x,
                           std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights);
 
+    void InternodeDispatch(
+        hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> x_scales,
+        std::optional<ffi::Buffer<ffi::S32>> topk_idx,
+        std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
+        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
+        ffi::Buffer<ffi::PRED>               is_token_in_rank,
+        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert,
+        int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
+        std::optional<ffi::Buffer<ffi::S32>> cached_rdma_channel_prefix_matrix,
+        std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
+        std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
+        std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum,
+        int expert_alignment, int num_worst_tokens, primus_turbo::deep_ep::Config config,
+        ffi::Result<ffi::AnyBuffer>                      recv_x,
+        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
+        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
+        ffi::Result<ffi::Buffer<ffi::PRED>>               is_token_in_rank_out,
+        ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank_out,
+        ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert_out,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rdma_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_rank_prefix_sum,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> gbl_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_rank_prefix_sum,
+        std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>  recv_src_meta,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_rdma_head,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_nvl_head);
+
+    void InternodeCombine(
+        hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+        ffi::Buffer<ffi::U8>  src_meta,
+        ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
+        ffi::Buffer<ffi::S32> rdma_channel_prefix_matrix,
+        ffi::Buffer<ffi::S32> rdma_rank_prefix_sum,
+        ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
+        std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
+        ffi::Buffer<ffi::S32> combined_rdma_head,
+        ffi::Buffer<ffi::S32> combined_nvl_head,
+        primus_turbo::deep_ep::Config config,
+        ffi::Result<ffi::AnyBuffer>                       combined_x,
+        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights);
+
 private:
     // NVLink Buffer
     int64_t            num_nvl_bytes_;

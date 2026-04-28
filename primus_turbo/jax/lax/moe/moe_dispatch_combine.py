@@ -11,10 +11,15 @@ import jax
 import jax.numpy as jnp
 
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
-from primus_turbo.jax.primitive.moe.moe_combine import moe_combine_p
+from primus_turbo.jax.primitive.moe.moe_combine import (
+    moe_combine_p,
+    moe_internode_combine_p,
+)
 from primus_turbo.jax.primitive.moe.moe_dispatch import (
     moe_cached_dispatch_p,
     moe_dispatch_p,
+    moe_internode_cached_dispatch_p,
+    moe_internode_dispatch_p,
 )
 
 from .moe_utils import Config
@@ -50,7 +55,6 @@ def get_dispatch_config() -> Config:
     """
     global _default_num_sms
     num_ranks = deep_ep_runtime.get_ep_size()
-    assert num_ranks <= 8, "not support internode"
     config_map = {
         2: Config(_default_num_sms, 24, 256, 6, 128),
         4: Config(_default_num_sms, 6, 256, 6, 128),
@@ -69,13 +73,12 @@ def get_dispatch_config() -> Config:
 
 def get_combine_config() -> Config:
     """
-    Get a recommended dispatch config.
+    Get a recommended combine config.
     Returns:
         config: the recommended config.
     """
     global _default_num_sms
     num_ranks = deep_ep_runtime.get_ep_size()
-    assert num_ranks <= 8, "not support internode"
     config_map = {
         2: Config(_default_num_sms, 10, 256, 6, 128),
         4: Config(_default_num_sms, 9, 256, 6, 128),
@@ -90,6 +93,11 @@ def get_combine_config() -> Config:
     }
     assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
     return config_map[num_ranks]
+
+
+def _get_source_meta_bytes() -> int:
+    dep = deep_ep_runtime._get_c_deep_ep()
+    return dep.get_source_meta_bytes()
 
 
 def moe_dispatch(
@@ -183,12 +191,19 @@ def _moe_dispatch_impl(
 
     assert x.ndim == 2, "x must be a 2D array, but got {}".format(x.ndim)
     num_tokens, _ = x.shape
-    # default config
     config = get_dispatch_config() if config is None else config
     deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
     ep_size = deep_ep_runtime.get_ep_size(lock=True)
     launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
     num_worst_tokens = num_tokens * ep_size
+    internode = deep_ep_runtime.is_internode(lock=True)
+
+    if internode:
+        return _moe_dispatch_impl_internode(
+            x, x_scales, handle, topk_idx, topk_weights,
+            expert_alignment, num_experts, config,
+            ep_size, launch_mode, num_worst_tokens,
+        )
 
     if handle is not None:
         assert topk_idx is None and topk_weights is None
@@ -261,6 +276,109 @@ def _moe_dispatch_impl(
             recv_src_idx,
             is_token_in_rank,
             send_head,
+        )
+        return (
+            (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            handle,
+        )
+
+
+def _moe_dispatch_impl_internode(
+    x, x_scales, handle, topk_idx, topk_weights,
+    expert_alignment, num_experts, config,
+    ep_size, launch_mode, num_worst_tokens,
+):
+    """Internode dispatch path (ep_size > 8)."""
+    num_tokens = x.shape[0]
+    source_meta_bytes = _get_source_meta_bytes()
+
+    if handle is not None:
+        assert topk_idx is None and topk_weights is None
+        (
+            rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            recv_src_meta,
+            is_token_in_rank,
+            send_rdma_head,
+            send_nvl_head,
+        ) = handle
+        num_recv_tokens = recv_src_meta.shape[0]
+        num_rdma_recv_tokens = send_nvl_head.shape[0]
+        recv_x, recv_x_scales, _, _, _, _ = moe_internode_cached_dispatch_p.bind(
+            x,
+            x_scales,
+            is_token_in_rank,
+            rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            num_recv_tokens=num_recv_tokens,
+            num_rdma_recv_tokens=num_rdma_recv_tokens,
+            expert_alignment=expert_alignment,
+            num_worst_tokens=num_worst_tokens,
+            ep_size=ep_size,
+            launch_mode=launch_mode,
+            num_sms=config.num_sms,
+            num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
+            num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
+            num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
+            num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
+        )
+        recv = (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x
+        return recv, None, None, None
+    else:
+        assert topk_idx is not None and topk_weights is not None
+        assert num_experts is not None
+
+        (
+            recv_x,
+            recv_x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            is_token_in_rank,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            recv_src_meta,
+            recv_rdma_channel_prefix_matrix,
+            recv_gbl_channel_prefix_matrix,
+            send_rdma_head,
+            send_nvl_head,
+        ) = moe_internode_dispatch_p.bind(
+            x,
+            x_scales,
+            topk_idx,
+            topk_weights,
+            num_experts=num_experts,
+            expert_alignment=expert_alignment,
+            num_worst_tokens=num_worst_tokens,
+            ep_size=ep_size,
+            launch_mode=launch_mode,
+            num_sms=config.num_sms,
+            num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
+            num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
+            num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
+            num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
+            source_meta_bytes=source_meta_bytes,
+        )
+
+        handle = (
+            rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            recv_src_meta,
+            is_token_in_rank,
+            send_rdma_head,
+            send_nvl_head,
         )
         return (
             (recv_x, recv_x_scales) if x_scales.size > 0 else recv_x,
@@ -360,11 +478,16 @@ def _moe_combine_impl(
     bias: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]] = None,
     config: Optional[Config] = None,
 ) -> Tuple[jnp.ndarray]:
-    # default config
     config = get_combine_config() if config is None else config
     deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
     ep_size = deep_ep_runtime.get_ep_size(lock=True)
     launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
+    internode = deep_ep_runtime.is_internode(lock=True)
+
+    if internode:
+        return _moe_combine_impl_internode(
+            x, handle, topk_weights, config, ep_size, launch_mode,
+        )
 
     # unpack bias
     bias_0, bias_1 = None, None
@@ -394,6 +517,46 @@ def _moe_combine_impl(
         rank_prefix_matrix,
         channel_prefix_matrix,
         send_head,
+        ep_size=ep_size,
+        launch_mode=launch_mode,
+        num_sms=config.num_sms,
+        num_max_nvl_chunked_send_tokens=config.num_max_nvl_chunked_send_tokens,
+        num_max_nvl_chunked_recv_tokens=config.num_max_nvl_chunked_recv_tokens,
+        num_max_rdma_chunked_send_tokens=config.num_max_rdma_chunked_send_tokens,
+        num_max_rdma_chunked_recv_tokens=config.num_max_rdma_chunked_recv_tokens,
+    )
+    return combined_x, combined_topk_weights
+
+
+def _moe_combine_impl_internode(
+    x, handle, topk_weights, config, ep_size, launch_mode,
+):
+    """Internode combine path (ep_size > 8)."""
+    (
+        rdma_channel_prefix_matrix,
+        recv_rdma_rank_prefix_sum,
+        gbl_channel_prefix_matrix,
+        recv_gbl_rank_prefix_sum,
+        recv_src_meta,
+        is_token_in_rank,
+        send_rdma_head,
+        send_nvl_head,
+    ) = handle
+
+    if topk_weights is None:
+        topk_weights = jnp.array([], dtype=jnp.float32)
+
+    combined_x, combined_topk_weights = moe_internode_combine_p.bind(
+        x,
+        topk_weights,
+        recv_src_meta,
+        is_token_in_rank,
+        rdma_channel_prefix_matrix,
+        recv_rdma_rank_prefix_sum,
+        gbl_channel_prefix_matrix,
+        recv_gbl_rank_prefix_sum,
+        send_rdma_head,
+        send_nvl_head,
         ep_size=ep_size,
         launch_mode=launch_mode,
         num_sms=config.num_sms,

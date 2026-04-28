@@ -37,6 +37,12 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, moe_dispatch_per_process, MoEDispatchPerProcessHandler);
     REGISTER_FFI_HANDLER(dict, moe_cached_dispatch_per_process, MoECachedDispatchPerProcessHandler);
     REGISTER_FFI_HANDLER(dict, moe_combine_per_process, MoECombinePerProcessHandler);
+    REGISTER_FFI_HANDLER(dict, moe_internode_dispatch_per_process,
+                         MoEInternodeDispatchPerProcessHandler);
+    REGISTER_FFI_HANDLER(dict, moe_internode_cached_dispatch_per_process,
+                         MoEInternodeCachedDispatchPerProcessHandler);
+    REGISTER_FFI_HANDLER(dict, moe_internode_combine_per_process,
+                         MoEInternodeCombinePerProcessHandler);
 
     // Grouped GEMM
     REGISTER_FFI_HANDLER(dict, ck_grouped_gemm, CKGroupedGemmHandler);
@@ -101,6 +107,39 @@ PYBIND11_MODULE(_C, m) {
     dep_m.def("destroy_per_process_buffer", &dep::destroy_per_process_buffer);
     dep_m.def("is_per_process_buffer_ready", &dep::is_per_process_buffer_ready);
     dep_m.def("per_process_buffer_nvl_bytes", &dep::per_process_buffer_nvl_bytes);
+#ifndef DISABLE_ROCSHMEM
+    dep_m.def("get_unique_id",
+              []() -> pybind11::bytes {
+                  auto uid = primus_turbo::deep_ep::internode::get_unique_id();
+                  return {reinterpret_cast<const char *>(uid.data()),
+                          uid.size()};
+              });
+    dep_m.def("init_rocshmem",
+              [](const pybind11::bytes &root_uid, int rank, int num_ranks) -> int {
+                  auto uid_str = std::string(root_uid);
+                  std::vector<uint8_t> uid_vec(uid_str.begin(), uid_str.end());
+                  return primus_turbo::deep_ep::internode::init(uid_vec, rank, num_ranks, false);
+              },
+              py::arg("root_unique_id"), py::arg("rank"), py::arg("num_ranks"));
+    dep_m.def("barrier_rocshmem", &primus_turbo::deep_ep::internode::barrier);
+    dep_m.def("finalize_rocshmem", &primus_turbo::deep_ep::internode::finalize);
+    dep_m.def("get_rdma_buffer_size_hint",
+              [](int64_t hidden_bytes, int num_ranks, int num_sms,
+                 int nvl_send, int nvl_recv, int rdma_send, int rdma_recv) -> int64_t {
+                  auto cfg = primus_turbo::deep_ep::Config(
+                      num_sms, nvl_send, nvl_recv, rdma_send, rdma_recv);
+                  return static_cast<int64_t>(
+                      cfg.get_rdma_buffer_size_hint(static_cast<int64_t>(hidden_bytes), num_ranks));
+              },
+              py::arg("hidden_bytes"), py::arg("num_ranks"), py::arg("num_sms"),
+              py::arg("nvl_send"), py::arg("nvl_recv"), py::arg("rdma_send"), py::arg("rdma_recv"));
+    dep_m.def("get_source_meta_bytes",
+              &primus_turbo::deep_ep::internode::get_source_meta_bytes);
+    dep_m.def("has_rocshmem", []() { return true; });
+#else
+    dep_m.def("has_rocshmem", []() { return false; });
+#endif
+
     dep_m.def("get_nvl_buffer_size_hint",
               [](int64_t hidden_bytes, int num_ranks, int num_sms,
                  int nvl_send, int nvl_recv, int rdma_send, int rdma_recv) -> int64_t {

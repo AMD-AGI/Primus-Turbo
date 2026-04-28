@@ -163,12 +163,22 @@ void Buffer::Destroy() {
         }
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
     }
+
+#ifndef DISABLE_ROCSHMEM
+    if (is_available_ && num_rdma_bytes_ > 0 && rdma_buffer_ptr_ != nullptr) {
+        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+        primus_turbo::deep_ep::internode::barrier();
+        primus_turbo::deep_ep::internode::free(rdma_buffer_ptr_);
+        primus_turbo::deep_ep::internode::finalize();
+        rdma_buffer_ptr_ = nullptr;
+    }
+#endif
+
     destroyed_ = true;
 }
 
 bool Buffer::is_internode_available() const {
-    PRIMUS_TURBO_CHECK(false and "not implemented");
-    return false; // TODO: implement this
+    return is_available_ && num_rdma_bytes_ > 0 && rdma_buffer_ptr_ != nullptr;
 }
 
 void Buffer::DispatchLayout(
@@ -507,6 +517,252 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
         config.num_max_nvl_chunked_recv_tokens);
 }
 
+void Buffer::InternodeDispatch(
+    hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> x_scales,
+    std::optional<ffi::Buffer<ffi::S32>> topk_idx,
+    std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+    std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
+    std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
+    ffi::Buffer<ffi::PRED>               is_token_in_rank,
+    std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert,
+    int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
+    std::optional<ffi::Buffer<ffi::S32>> cached_rdma_channel_prefix_matrix,
+    std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
+    std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
+    std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum,
+    int expert_alignment, int num_worst_tokens, primus_turbo::deep_ep::Config config,
+    ffi::Result<ffi::AnyBuffer>                      recv_x,
+    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
+    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
+    ffi::Result<ffi::Buffer<ffi::PRED>>               is_token_in_rank_out,
+    ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_rank_out,
+    ffi::Result<ffi::Buffer<ffi::S32>>                num_tokens_per_expert_out,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rdma_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_rank_prefix_sum,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> gbl_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_rank_prefix_sum,
+    std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>  recv_src_meta,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_rdma_head,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_nvl_head) {
+
+#ifndef DISABLE_ROCSHMEM
+    bool cached_mode = cached_rdma_channel_prefix_matrix.has_value();
+
+    const int num_channels = config.num_sms / 2;
+    PRIMUS_TURBO_CHECK(config.num_sms % 2 == 0);
+    PRIMUS_TURBO_CHECK(0 < num_rdma_ranks_ && num_rdma_ranks_ <= NUM_MAX_RDMA_PEERS);
+
+    PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
+    PRIMUS_TURBO_CHECK((x.dimensions()[1] * x.element_count()) % sizeof(int4) == 0);
+
+    auto num_tokens = static_cast<int>(x.dimensions()[0]),
+         hidden     = static_cast<int>(x.dimensions()[1]);
+    auto hidden_int4 = static_cast<int>(hidden * ffi::ByteWidth(x.element_type()) / sizeof(int4));
+    auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->dimensions()[0]),
+         num_local_experts = num_experts / num_ranks_;
+
+    // Top-k checks
+    int      num_topk         = 0;
+    int32_t *topk_idx_ptr     = nullptr;
+    float   *topk_weights_ptr = nullptr;
+    PRIMUS_TURBO_CHECK(topk_idx.has_value() == topk_weights.has_value());
+    if (topk_idx.has_value()) {
+        num_topk = static_cast<int>(topk_idx->dimensions()[1]);
+        topk_idx_ptr     = topk_idx->typed_data();
+        topk_weights_ptr = topk_weights->typed_data();
+    }
+
+    // FP8 scales checks
+    float *x_scales_ptr = nullptr;
+    int    num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (x_scales.has_value()) {
+        PRIMUS_TURBO_CHECK(x_scales->dimensions().size() == 2);
+        num_scales =
+            x_scales->dimensions()[1] == 1 ? 1 : static_cast<int>(x_scales->dimensions()[1]);
+        x_scales_ptr        = x_scales->typed_data();
+        scale_token_stride  = static_cast<int>(x_scales->dimensions()[1]);
+        scale_hidden_stride = 1;
+    }
+
+    int num_recv_tokens = -1, num_rdma_recv_tokens = -1;
+
+    if (cached_mode) {
+        num_recv_tokens      = cached_num_recv_tokens;
+        num_rdma_recv_tokens = cached_num_rdma_recv_tokens;
+
+        primus_turbo::deep_ep::internode::cached_notify(
+            hidden_int4, num_scales, num_topk, num_topk, num_ranks_, num_channels, 0, nullptr,
+            nullptr, nullptr, nullptr, rdma_buffer_ptr_, config.num_max_rdma_chunked_recv_tokens,
+            buffer_ptrs_gpu_, config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu_,
+            rank_, stream,
+            config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks_),
+            num_nvl_bytes_, true, false);
+    } else {
+        *moe_recv_counter_ = -1;
+        *moe_recv_rdma_counter_ = -1;
+        for (int i = 0; i < num_local_experts; ++i)
+            moe_recv_expert_counter_[i] = -1;
+
+        PRIMUS_TURBO_CHECK(rdma_channel_prefix_matrix.has_value());
+        PRIMUS_TURBO_CHECK(recv_rdma_rank_prefix_sum.has_value());
+        PRIMUS_TURBO_CHECK(gbl_channel_prefix_matrix.has_value());
+        PRIMUS_TURBO_CHECK(recv_gbl_rank_prefix_sum.has_value());
+
+        primus_turbo::deep_ep::internode::notify_dispatch(
+            num_tokens_per_rank->typed_data(), moe_recv_counter_mapped_, num_ranks_,
+            num_tokens_per_rdma_rank->typed_data(), moe_recv_rdma_counter_mapped_,
+            num_tokens_per_expert->typed_data(), moe_recv_expert_counter_mapped_, num_experts,
+            is_token_in_rank.typed_data(), num_tokens, num_worst_tokens, num_channels, hidden_int4,
+            num_scales, num_topk, expert_alignment,
+            rdma_channel_prefix_matrix.value()->typed_data(),
+            recv_rdma_rank_prefix_sum.value()->typed_data(),
+            gbl_channel_prefix_matrix.value()->typed_data(),
+            recv_gbl_rank_prefix_sum.value()->typed_data(), rdma_buffer_ptr_,
+            config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu_,
+            config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu_, rank_, stream,
+            config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks_),
+            num_nvl_bytes_, false);
+
+        if (num_worst_tokens > 0) {
+            num_recv_tokens      = num_worst_tokens;
+            num_rdma_recv_tokens = num_worst_tokens;
+            PRIMUS_TURBO_CHECK(topk_idx.has_value());
+            PRIMUS_TURBO_CHECK(topk_weights.has_value());
+        } else {
+            auto start_time = std::chrono::high_resolution_clock::now();
+            while (true) {
+                num_recv_tokens      = static_cast<int>(*moe_recv_counter_);
+                num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter_);
+
+                bool ready = (num_recv_tokens >= 0) && (num_rdma_recv_tokens >= 0);
+                for (int i = 0; i < num_local_experts && ready; ++i)
+                    ready &= moe_recv_expert_counter_[i] >= 0;
+
+                if (ready)
+                    break;
+
+                if (std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::high_resolution_clock::now() - start_time)
+                        .count() > get_num_cpu_timeout_secs())
+                    throw std::runtime_error("DeepEP error: timeout (internode dispatch CPU)");
+            }
+        }
+    }
+
+    // Assign output pointers
+    int32_t *recv_topk_idx_ptr     = nullptr;
+    float   *recv_topk_weights_ptr = nullptr;
+    float   *recv_x_scales_ptr     = nullptr;
+
+    if (topk_idx.has_value()) {
+        recv_topk_idx_ptr     = recv_topk_idx.value()->typed_data();
+        recv_topk_weights_ptr = recv_topk_weights.value()->typed_data();
+    }
+    if (x_scales.has_value()) {
+        recv_x_scales_ptr = recv_x_scales.value()->typed_data();
+    }
+
+    primus_turbo::deep_ep::internode::dispatch(
+        recv_x->untyped_data(), recv_x_scales_ptr, recv_topk_idx_ptr, recv_topk_weights_ptr,
+        cached_mode ? nullptr
+                    : static_cast<void *>(recv_src_meta.value()->typed_data()),
+        x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
+        cached_mode ? nullptr : send_rdma_head.value()->typed_data(),
+        cached_mode ? nullptr : send_nvl_head.value()->typed_data(),
+        cached_mode ? nullptr : recv_rdma_channel_prefix_matrix.value()->typed_data(),
+        cached_mode ? nullptr : recv_gbl_channel_prefix_matrix.value()->typed_data(),
+        cached_mode ? cached_rdma_channel_prefix_matrix->typed_data()
+                    : rdma_channel_prefix_matrix.value()->typed_data(),
+        cached_mode ? cached_recv_rdma_rank_prefix_sum->typed_data()
+                    : recv_rdma_rank_prefix_sum.value()->typed_data(),
+        cached_mode ? cached_gbl_channel_prefix_matrix->typed_data()
+                    : gbl_channel_prefix_matrix.value()->typed_data(),
+        cached_mode ? cached_recv_gbl_rank_prefix_sum->typed_data()
+                    : recv_gbl_rank_prefix_sum.value()->typed_data(),
+        is_token_in_rank.typed_data(), num_tokens, num_worst_tokens, hidden_int4, num_scales,
+        num_topk, num_experts, scale_token_stride, scale_hidden_stride, rdma_buffer_ptr_,
+        config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu_, config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens, rank_, num_ranks_, cached_mode, stream,
+        num_channels, false);
+
+#else
+    PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled; internode unavailable");
+#endif
+}
+
+void Buffer::InternodeCombine(
+    hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> topk_weights,
+    ffi::Buffer<ffi::U8>  src_meta,
+    ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
+    ffi::Buffer<ffi::S32> rdma_channel_prefix_matrix,
+    ffi::Buffer<ffi::S32> rdma_rank_prefix_sum,
+    ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
+    std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
+    ffi::Buffer<ffi::S32> combined_rdma_head,
+    ffi::Buffer<ffi::S32> combined_nvl_head,
+    primus_turbo::deep_ep::Config config,
+    ffi::Result<ffi::AnyBuffer>                       combined_x,
+    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights) {
+
+#ifndef DISABLE_ROCSHMEM
+    const int num_channels = config.num_sms / 2;
+    PRIMUS_TURBO_CHECK(config.num_sms % 2 == 0);
+
+    PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
+    auto num_tokens = static_cast<int>(x.dimensions()[0]),
+         hidden     = static_cast<int>(x.dimensions()[1]);
+    auto hidden_int4 = static_cast<int>(hidden * ffi::ByteWidth(x.element_type()) / sizeof(int4));
+    auto num_combined_tokens = static_cast<int>(is_combined_token_in_rank.dimensions()[0]);
+
+    int    num_topk                  = 0;
+    float *topk_weights_ptr          = nullptr;
+    float *combined_topk_weights_ptr = nullptr;
+    if (topk_weights.has_value()) {
+        PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
+        num_topk         = static_cast<int>(topk_weights->dimensions()[1]);
+        topk_weights_ptr = topk_weights->typed_data();
+        combined_topk_weights_ptr = combined_topk_weights.value()->typed_data();
+    }
+
+    PRIMUS_TURBO_CHECK(config.num_max_nvl_chunked_recv_tokens % num_rdma_ranks_ == 0);
+    PRIMUS_TURBO_CHECK(config.num_max_nvl_chunked_send_tokens <=
+                       config.num_max_nvl_chunked_recv_tokens / num_rdma_ranks_);
+
+    primus_turbo::deep_ep::internode::cached_notify(
+        hidden_int4, 0, 0, num_topk, num_ranks_, num_channels, num_combined_tokens,
+        combined_rdma_head.typed_data(), rdma_channel_prefix_matrix.typed_data(),
+        rdma_rank_prefix_sum.typed_data(), combined_nvl_head.typed_data(), rdma_buffer_ptr_,
+        config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu_,
+        config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu_, rank_, stream,
+        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks_), num_nvl_bytes_,
+        false, false);
+
+    const int *gbl_rank_prefix_sum_ptr =
+        gbl_rank_prefix_sum.has_value() ? gbl_rank_prefix_sum->typed_data() : nullptr;
+
+    primus_turbo::deep_ep::internode::combine(
+        primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()),
+        combined_x->untyped_data(), combined_topk_weights_ptr,
+        is_combined_token_in_rank.typed_data(), x.untyped_data(), topk_weights_ptr,
+        nullptr, nullptr,
+        combined_rdma_head.typed_data(), combined_nvl_head.typed_data(),
+        src_meta.untyped_data(), rdma_channel_prefix_matrix.typed_data(),
+        rdma_rank_prefix_sum.typed_data(), gbl_channel_prefix_matrix.typed_data(),
+        gbl_rank_prefix_sum_ptr, num_tokens, num_combined_tokens, hidden, num_topk,
+        rdma_buffer_ptr_, config.num_max_rdma_chunked_send_tokens,
+        config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu_,
+        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens, rank_,
+        num_ranks_, stream, num_channels, false);
+
+#else
+    PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled; internode unavailable");
+#endif
+}
+
 pybind11::bytearray Buffer::get_local_ipc_handle() const {
     PRIMUS_TURBO_CHECK(num_nvl_bytes_ > 0);
     return {ipc_handles_[nvl_rank_].reserved, HIP_IPC_HANDLE_SIZE};
@@ -544,7 +800,18 @@ void Buffer::SyncFromIPCHandles(
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
     }
 
-    ipc_synced_   = true;
+    ipc_synced_ = true;
+
+#ifndef DISABLE_ROCSHMEM
+    if (num_rdma_bytes_ > 0) {
+        rdma_buffer_ptr_ =
+            primus_turbo::deep_ep::internode::alloc(num_rdma_bytes_, NUM_BUFFER_ALIGNMENT_BYTES);
+        PRIMUS_TURBO_CHECK_HIP(hipMemset(rdma_buffer_ptr_, 0, num_rdma_bytes_));
+        primus_turbo::deep_ep::internode::barrier();
+        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+    }
+#endif
+
     is_available_ = true;
 }
 
