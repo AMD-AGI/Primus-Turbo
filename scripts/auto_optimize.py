@@ -380,8 +380,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--round-timeout",
         type=int,
-        default=60 * 30,
-        help="Seconds to allow each cursor-agent invocation before killing it (default 30 min).",
+        default=60 * 60,
+        help="Seconds to allow each cursor-agent invocation before killing it (default 60 min).",
     )
     p.add_argument(
         "--reuse-chat-window-secs",
