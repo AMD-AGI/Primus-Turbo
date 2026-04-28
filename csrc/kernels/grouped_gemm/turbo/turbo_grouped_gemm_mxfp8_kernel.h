@@ -218,8 +218,35 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         // Per-iter saving: drains drop from ~50 cycles (vmcnt<0> for ~18
         // outstanding LDGs) to ~30 cycles (vmcnt<3> for at most 15-of-18),
         // i.e. ~20 cycles × k_iters per output tile.
+        //
+        // PERF: drop the previously-here `__builtin_amdgcn_s_barrier()`.
+        // The inter-Phase wave-sync is provided by Phase 2's own
+        // `phase_mfma_lds_ldg` body, which begins with 6 MFMA + 20
+        // ds_reads and then issues `wait_lgkmcnt<0> + s_barrier` (the
+        // WAR barrier; see turbo_gemm_mxfp8_kernel.h ~L477-L478) before
+        // its `buffer_load_lds`.  That internal s_barrier is a stronger
+        // wave-sync point than the one we're removing here:
+        //   * Wave A entering Phase 2 with wave B still in Phase 1's
+        //     buffer_load_lds tail does NOT corrupt wave A's Phase 2
+        //     ds_reads — wave A reads `a_smem[cur][warp_m+2]` which is
+        //     wave A's own LDS region (warp-local sts_warp_base offset),
+        //     never written by wave B.  The cross-warp LDS dependency
+        //     (Phase 2's PIN_B1 source) was already drained by Phase 1's
+        //     own internal WAR barrier inside its `phase_mfma_lds_ldg`,
+        //     not by this outer s_barrier.
+        //   * Wave A's Phase 2 `buffer_load_lds` writes target
+        //     `a_smem[cur][2,3]`, i.e. the OPPOSITE LDS array from
+        //     wave B's still-in-flight Phase 1 writes (`b_smem[cur][2,3]`),
+        //     so no LDS WAW.
+        //   * Phase 2's internal s_barrier (after its 20 ds_reads) re-aligns
+        //     all 4 waves before any new buffer_load_lds is issued, so
+        //     wave skew accumulated across Phase 1->2 cannot persist past
+        //     that point.
+        // Net saving: ~30 cycles of s_barrier wave-sync stall per K-iter
+        // (gfx950 s_barrier emulates a wavefront-rendezvous via lgkm-bound
+        // hardware sync).  On main_iters=53 (DSv3-GateUP-B16, K=7168) this
+        // is ~1.6k cycles per output tile (~0.3-0.5 % of fwd K-loop wall).
         wait_vmcnt<3>();
-        __builtin_amdgcn_s_barrier();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {

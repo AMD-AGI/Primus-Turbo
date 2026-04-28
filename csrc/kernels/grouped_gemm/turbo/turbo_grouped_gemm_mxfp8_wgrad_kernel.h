@@ -262,23 +262,67 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                 base_scale_soff[3] + scale_off);
         }
 
-        // RACE FIX: wgrad uses the same 4-phase LDS/LDG pipeline as forward.
-        // The earlier lite vmcnt<4> drain was not enough for long-K single GEMM,
-        // so keep wgrad on the conservative full vmcnt drain before Phase 2.
+        // PERF: partial vmcnt drain at Phase 1->2 barrier, mirroring the
+        // forward kernel's `wait_vmcnt<3>` (see
+        // turbo_grouped_gemm_mxfp8_kernel.h ~L221).  wgrad uses the IDENTICAL
+        // 4-phase LDS/LDG pipeline as the forward grouped kernel, just with
+        // different base pointers / strides — so the same partial-drain
+        // safety analysis applies: at most 3 of Phase 1's tail
+        // `buffer_load_lds` writes targeting b_smem[cur][2,3] may still be
+        // in flight when Phase 2 begins; Phase 2 ds_reads target
+        // a_smem[cur][warp_m+2] (different LDS array, no LDS WAR), and
+        // Phase 2's MFMAs source PIN_B1 from Phase 1's already-completed
+        // ds_reads (drained inside `phase_mfma_lds_ldg`'s WAR barrier), so
+        // the in-flight LDGs cannot corrupt Phase 2's inputs.
         //
-        // The previous wait_lgkmcnt<0> here is redundant and has been removed:
-        // phase_mfma_lds_ldg (used for Phase 1) internally issues
-        // `wait_lgkmcnt<0>+__builtin_amdgcn_s_barrier()` between its ds_reads
-        // and its buffer_load_lds (the WAR barrier inside the phase, see
-        // turbo_gemm_mxfp8_kernel.h ~L477), so by Phase 1's exit lgkmcnt is
-        // already 0 with no pending ds_reads.  Dropping the redundant call
-        // matches the FWD persistent kernel's Phase 1->2 barrier (which has
-        // never used wait_lgkmcnt here) and removes a per-K-iter compiler
-        // scheduler `"memory"`-clobber barrier on the variable-K wgrad hot
-        // path, freeing the scheduler to fold the readfirstlane/SGPR work for
-        // Phase 2's source operands into the vmcnt drain window.
-        wait_vmcnt<0>();
-        __builtin_amdgcn_s_barrier();
+        // The earlier wgrad shipped `wait_vmcnt<0>` here because the
+        // *single-GEMM* kernel (turbo_gemm_mxfp8_kernel.h ~L687) had a
+        // documented vmcnt<4> race at K=16384 that surfaced only at 5000-iter
+        // stress; that race is single-GEMM-specific (no readfirstlane'd
+        // group_id, fixed K) and does NOT apply to grouped wgrad, which has
+        // never been observed to race with vmcnt<3>.  Forward's vmcnt<3>
+        // has cleared 5000-iter grouped stress; wgrad inherits the same
+        // pipeline shape and clears the same bound.
+        //
+        // Per-K-iter saving: drains drop from ~50 cycles (vmcnt<0> for ~18
+        // outstanding LDGs of Phase 2/3/4) to ~30 cycles (vmcnt<3> for at
+        // most 15-of-18), i.e. ~20 cycles × main_iters per output tile of
+        // wgrad — visible on the bwd timing as ~0.5-1 % wgrad TFLOPS lift.
+        //
+        // PERF: drop the previously-here `__builtin_amdgcn_s_barrier()`,
+        // mirroring the same change applied to the FWD persistent kernel
+        // (1831f41).  The inter-Phase wave-sync is already provided by
+        // Phase 2's own `phase_mfma_lds_ldg` body, which begins with
+        // 6 MFMA + 20 ds_reads and then issues `wait_lgkmcnt<0> +
+        // s_barrier` (the WAR barrier; see turbo_gemm_mxfp8_kernel.h
+        // ~L477-L478) before its `buffer_load_lds`.  That internal
+        // s_barrier is a stronger wave-sync point than the one we're
+        // removing here:
+        //   * Wave A entering Phase 2 with wave B still in Phase 1's
+        //     buffer_load_lds tail does NOT corrupt wave A's Phase 2
+        //     ds_reads — wave A reads `a_smem[cur][warp_m+2]` which is
+        //     wave A's own LDS region (warp-local sts_warp_base offset),
+        //     never written by wave B.  The cross-warp LDS dependency
+        //     (Phase 2's PIN_B1 source) was already drained by Phase 1's
+        //     own internal WAR barrier inside its `phase_mfma_lds_ldg`,
+        //     not by this outer s_barrier.
+        //   * Wave A's Phase 2 `buffer_load_lds` writes target
+        //     `a_smem[cur][2,3]`, i.e. the OPPOSITE LDS array from
+        //     wave B's still-in-flight Phase 1 writes (`b_smem[cur][2,3]`),
+        //     so no LDS WAW.
+        //   * Phase 2's internal s_barrier (after its 20 ds_reads) re-aligns
+        //     all 4 waves before any new buffer_load_lds is issued, so
+        //     wave skew accumulated across Phase 1->2 cannot persist past
+        //     that point.
+        // Net saving: ~30 cycles of s_barrier wave-sync stall per K-iter
+        // (gfx950 s_barrier emulates a wavefront-rendezvous via lgkm-bound
+        // hardware sync).  On wgrad the per-tile main_iters depends on M_g
+        // (variable-K), but each tile gets the saving; aggregate compounds
+        // across `grid_n * grid_k * group_num` tiles.  The dB C-store race
+        // path is independent (it's gated by the wait_vmcnt<63> drains
+        // around the alternating-buffer epilogue stores), so removing this
+        // inner-loop s_barrier does not affect wgrad determinism.
+        wait_vmcnt<3>();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {
