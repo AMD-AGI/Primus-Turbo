@@ -99,6 +99,24 @@ the round-7 commit message):
         for fwd ``(4096, 4096, 11008)`` — bench 1350.5 vs default
         1322.6 = +2.1pp. Same config as the cube rule, just relaxes
         the tiles_m == tiles_n constraint.
+  * Round 5 — last gap in BF16 backward dispatch coverage. The shape
+    ``(8192, 28672, 4096)`` BF16_bwd was at ratio 0.939 (worst in the
+    section) because two of its three dispatches were sub-optimal:
+      - dA RRR ``(8192, 4096, 28672)`` had no RRR rule with
+        ``tiles_n == 16`` so it fell through to the binding default
+        ``(4, 8)``. New rule: ``rrr and tiles_m == 32 and
+        tiles_n == 16 and k >= 22016`` -> ``(8, 2)``. Tight-bench
+        (200 iters × 3 repeats) gives p20 1499.8 TF vs 1482.7 TF
+        (+1.15pp). K bound is 22016 because the 11008-22016 tier
+        shows (2, 32) and (8, 2) tied within 0.4pp (no clear winner
+        to anchor a rule on).
+      - dB CRR ``(28672, 4096, 8192)`` matched the existing
+        ``crr tiles_m >= 64 tiles_n == 16 k > 4096`` rule but the
+        original (2, 32) pick was only +0.2pp over default. Tight
+        re-bench shows (gm=4, xcd=32) wins at p20 1450.1 TF vs
+        (gm=2, xcd=32) 1442.3 TF (+0.54pp); bit-identical output.
+        Existing rule's k <= 4096 branch (``(24, 2)``) is unchanged
+        — only the deeper-K branch flips.
   * FP8 (analysis/fp8_gemm/mi350x/.autotune_cache.json, 48 shapes x 3
     layouts): much tighter distribution -- ``group_m`` is 4 in 60% of RCR
     entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries.
@@ -254,6 +272,22 @@ def select_default_config(
             # 1411.7, (2, 16) 1395.3, (24, 4) << default), so the bound
             # is exact (==32) rather than the round-1 inclusive (<=32).
             return HipKittenConfig(layout=layout, group_m=24, num_xcds=4, kernel=None)
+        if layout == "rrr" and tiles_m == 32 and tiles_n == 16 and k >= 22016:
+            # Round-5 rule. Skinny-N very-deep-K RRR. Canonical: dA RRR
+            # (8192, 4096, 28672) for fwd (8192, 28672, 4096) — the
+            # bwd's middle dispatch was previously falling through to
+            # the binding default (4, 8) because no RRR rule covered
+            # tiles_n == 16. Tight-bench on (8192, 4096, 28672)
+            # (200 iters × 3 repeats, p20): (gm=8, xcd=2) = 1499.8 TF
+            # beats default (4, 8) = 1482.7 TF by +1.15pp; bit-identical
+            # output (cross max_abs = 0, SNR = 47.85 dB unchanged; see
+            # /tmp/probe_bf16_round5.log archived in commit message).
+            # K bound is 22016 (not 11008) on purpose: the 11008-22016
+            # tier showed (2, 32) and (8, 2) within 0.4pp of each other
+            # (sweep_bf16_bwd_round5_nearby.log) so adding a rule there
+            # is not anchored well; only K >= 22016 has a clear (8, 2)
+            # winner with a +1.4-1.8pp margin.
+            return HipKittenConfig(layout=layout, group_m=8, num_xcds=2, kernel=None)
         if layout == "crr" and tiles_m >= 64 and tiles_n == 16:
             # Long-N backward dB-after-swap (CRR sees logical (N_fwd,
             # K_fwd, M_fwd) post-swap). Canonical Llama-2-7B
@@ -261,13 +295,15 @@ def select_default_config(
             #   fwd 4096x22016x4096 -> dB CRR (22016,4096,4096) = (86,16,4096)
             # and Llama-3.1-8B
             #   fwd 8192x28672x4096 -> dB CRR (28672,4096,8192) = (112,16,8192)
-            # Bench: shallow K (=4096) prefers (gm=24, xcd=2) by +1.4pp;
-            # deeper K (=8192) prefers (gm=2, xcd=32) by +0.2pp. The K
-            # split mirrors the cache row family for these long-N CRR
-            # shapes.
+            # Round-7: shallow K (=4096) prefers (gm=24, xcd=2) by +1.4pp.
+            # Round-5: deeper K (>4096) tight-bench refines the previous
+            # (gm=2, xcd=32) pick to (gm=4, xcd=32) — on (28672, 4096, 8192)
+            # the p20 reads (gm=4, xcd=32) = 1450.1 TF vs (gm=2, xcd=32)
+            # = 1442.3 TF (+0.54pp), bit-identical output (cross max_abs
+            # = 0, SNR = 47.86 dB unchanged; see /tmp/probe_bf16_round5.log).
             if k <= 4096:
                 return HipKittenConfig(layout=layout, group_m=24, num_xcds=2, kernel=None)
-            return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+            return HipKittenConfig(layout=layout, group_m=4, num_xcds=32, kernel=None)
         if layout == "crr" and 32 <= tiles_m < 64 and tiles_n == 16 and k <= 4096:
             # Mid-tiles_m CRR with tiles_n==16, K shallow. Canonical
             # Llama-2-7B attn_qkv backward dB:
