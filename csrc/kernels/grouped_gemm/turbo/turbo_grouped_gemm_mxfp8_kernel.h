@@ -493,22 +493,22 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     // kernel is at vgpr_count=512 with launch_bounds(256,1), so this is
     // well within budget — no spill).
     //
-    // RACE FIX (2a1943c left ~2/100 residual): even with alternating
-    // buffers, pair-2's `v_accvgpr_read_b32` into c_tmp_a can fire
-    // before pair-0's 64 `flat_store_short` have read their source
-    // VGPRs in their entirety — only ~80 cycles of pair-1 (16 reads + 64
-    // stores) sit between pair-0's issue and pair-2's overwrite, which
-    // is short of the LSU's source-read window for ~few percent of waves.
-    // Insert `wait_vmcnt<63>` immediately before each c_tmp reuse so the
-    // older pair's stores are FORCED to commit (and thus retire their
-    // source-VGPR reads) before the new pair's accvgpr_read overwrites
-    // them.  After pair-1's 64 stores issue, vmcnt<=128; wait_vmcnt<63>()
-    // blocks until vmcnt≤63, i.e., pair-0's 64 stores plus 1 of pair-1's
-    // have committed — pair-0 fully drained, c_tmp_a safe to overwrite.
-    // 63 is the gfx950 max for the s_waitcnt vmcnt field; 64 is rejected
-    // by the assembler ("too large value for vmcnt").  The wait is
-    // empirically near-zero cost because pair-1's read+store sequence
-    // (~80 cycles) already overlaps most of pair-0's commit latency.
+    // RACE FIX (2a1943c left ~2/100 residual; this round tightens further):
+    // even with alternating buffers, pair-2's `v_accvgpr_read_b32` into
+    // c_tmp_a can fire before pair-0's 64 `flat_store_short` have read
+    // their source VGPRs in their entirety — only ~80 cycles of pair-1
+    // (16 reads + 64 stores) sit between pair-0's issue and pair-2's
+    // overwrite, which is short of the LSU's source-read window for
+    // ~few percent of waves.  Round 2 of the auto-opt loop (2026-04-28)
+    // observed that the previously-shipped `wait_vmcnt<63>` left a
+    // 2-6/100 residual on G=4 M=1024 N=2048 K=2048 E4M3 stress: <63>
+    // only guarantees 65 of 128 in-flight stores have retired, and on
+    // gfx950 the retirement order across pairs is not strictly FIFO
+    // under cache pressure, so pair-0's tail can still have pending
+    // source-VGPR reads when pair-2 overwrites c_tmp_a.  Tightening
+    // to `wait_vmcnt<0>` makes the c_tmp_a register slot provably idle
+    // (no LSU pending reads from it) before the next accvgpr_read writes
+    // to it — see the in-body note for the cost analysis.
     if (!is_boundary_tile) {
         float32x4 c_tmp_a[4][4];
         float32x4 c_tmp_b[4][4];
@@ -520,12 +520,28 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
+        // RACE FIX (FWD `out` race, residual after 2a1943c's wait_vmcnt<63>):
+        // tightening to wait_vmcnt<0> here forces pair-0's 64 flat_store_short
+        // PLUS pair-1's 64 stores to fully retire before pair-2 starts
+        // overwriting c_tmp_a.  The previous <63> bound only guaranteed 65 of
+        // 128 in-flight stores had retired, which on gfx950 is ambiguous when
+        // store retirement order across pairs isn't strictly FIFO under cache
+        // pressure — pair-0's source-VGPR reads could still be pending while
+        // pair-2's `v_accvgpr_read_b32` overwrote the same VGPRs, leaking
+        // 2-6/100 BAD on G=4 M=1024 N=2048 K=2048 E4M3 stress.  With <0> the
+        // c_tmp_a register slot is provably idle (no LSU pending reads from
+        // it) before the next accvgpr_read writes to it.
+        //
+        // Cost: ~50-100 extra cycles per output tile (the tail of pair-1's
+        // 64 stores that <63> didn't drain).  Net per-call hit is bounded
+        // by 2 × this × tiles_per_call; the determinism win is worth more
+        // than the perf hit at the metric's 100×stress_bad weighting.
+        wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
                                              c_tmp_a, c_stg_offsets);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
+        wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets);
@@ -545,13 +561,18 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                                              c_tmp_b, c_stg_offsets, tile_valid_m,
                                              tile_valid_n - 128);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
+        // RACE FIX: see matching note in the !is_boundary_tile branch above.
+        // Boundary tiles emit fewer stores (some `if (row<valid_rows..)` checks
+        // skip), so vmcnt at this point may be <128, but we still want pair-0
+        // fully drained before c_tmp_a is overwritten — the safest formal
+        // bound is wait_vmcnt<0>.
+        wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
                                              c_tmp_a, c_stg_offsets, tile_valid_m - 128,
                                              tile_valid_n);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
+        wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets, tile_valid_m - 128,
