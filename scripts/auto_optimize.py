@@ -66,20 +66,27 @@ from typing import Optional
 DEFAULT_MODEL = "claude-opus-4-7-thinking-max"
 DEFAULT_SKILL = "/root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 DEFAULT_TASK = (
-    "持续优化 HipKittens 在 Primus-Turbo 中作为 BF16/FP8 GEMM 与 grouped GEMM "
-    "后端的集成：扩大 _grouped_bf16_supported / FP8 cache 覆盖、修复回归、提升 "
-    "benchmark TFLOPS、收紧 can_handle，使 HIPKITTEN 在 DeepSeek-V3 与 gpt_oss_20B "
-    "形状上又快又稳。**本轮唯一验收**：本仓库的 metric 命令 (python3 scripts/_metric_hipkitten.py) "
-    "在 commit 之后必须返回 >= 历史最佳分。**最终 DoD (由用户偶尔抽查，不是你每轮的事)**："
-    "4 个 GEMM/grouped-GEMM bf16/fp8 测试文件全绿。"
+    "**最终目标**：让 HIPKITTEN backend 在 LLM 典型 dense GEMM shape 上达到 "
+    "Primus 默认 dispatch（BF16→HIPBLASLT, FP8 tensorwise→HIPBLASLT）TFLOPS 的 "
+    "≥ 90% (geomean across 16-shape suite) —— 即新 metric `_metric_hk_ratio.py` "
+    "score ≥ 900。Baseline = 904（BF16 已基本 parity，FP8 tensorwise 8/8 shape "
+    "全在 0.79~0.87，是核心瓶颈）。\n\n"
+    "**分工**：\n"
+    "  - HipKittens 仓库 (/workspace/code/HipKittens) 提供底层 kernel 优化：\n"
+    "    改 kernel cpp（tile/wave layout/swizzle/MFMA 排布等）、扩 autotune "
+    "    cache、调 group_m/xcd 搜索空间。改完用 Makefile 重编 .so。\n"
+    "  - Primus-Turbo 仓库提供\"规则式\"参数调度：\n"
+    "    GEMMHipKittenBackend.can_handle 用形状级规则（M%256==0 等）放宽限制；\n"
+    "    GEMMFP8HipKittenBackend / dispatch 用通用启发式选 group_m/kernel 变体。\n\n"
+    "**严禁**：case-by-case 调优 —— 不允许在任何 .py 里塞 `if (M,N,K)==(...): "
+    "return cfg` 这种形状→配置的硬编码表（autotune cache 是数据，不算）。"
 )
-# Loop metric: a single-process probe that exercises EVERY HipKitten cache
-# entry — 144 BF16 dense (RCR/RRR/CRR × 48 shapes), 144 FP8 dense
-# (RCR/RRR/CRR × 48 shapes, calling the HIPKITTEN backend directly so CRR is
-# included), and a handful of grouped + reject probes — in ~8 s wall.
-# Score formula inside the script penalizes failures by 1100 each so any
-# regression sinks the metric well below the best-so-far.
-DEFAULT_METRIC_CMD = "python3 scripts/_metric_hipkitten.py"
+# Loop metric: real benchmark of HIPKITTEN vs default-backend TFLOPS on a
+# fixed 16-shape LLM-typical suite (BF16 + FP8 tensorwise dense). Score is
+# int(geomean(hk_tflops / ref_tflops) * 1000); target >= 900 (= 90%).
+# HIPKITTEN reject -> ratio clipped to 0.01 -> ~100x geomean penalty so the
+# agent can't game the score by narrowing can_handle. ~10s wall.
+DEFAULT_METRIC_CMD = "python3 scripts/_metric_hk_ratio.py"
 # Final acceptance is the full DoD pytest suite (all 4 files, both default and
 # --deterministic-only). Too slow for every round; the agent / user runs this
 # occasionally to confirm we haven't regressed the broader sweeps. Empty by
@@ -177,7 +184,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--metric-name",
         type=str,
-        default="hipkitten_pass_count",
+        default="hk_ratio_score",
         help="Human-readable metric label (used in logs only).",
     )
     p.add_argument(
@@ -405,9 +412,11 @@ def build_prompt(
             f"  - {last_dod_line}\n"
         )
 
-    return f"""你是 Primus-Turbo 仓库的自动优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
-工作目录: {args.workspace}
-当前 git HEAD: {head_sha}
+    return f"""你是 HipKittens × Primus-Turbo 联合优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
+你**同时拥有两个仓库的写权限**：
+  • Primus-Turbo: {args.workspace} (本轮工作目录、metric 在这里跑)
+  • HipKittens : /workspace/code/HipKittens  (kernel 源码、autotune cache 在这里)
+当前 Primus-Turbo git HEAD: {head_sha}
 
 【强制第一步】
 请先用读文件工具完整读取这份本地 skill：
@@ -418,62 +427,101 @@ def build_prompt(
 {args.task}
 
 【本轮的快速验收命令】
-本轮的 metric 命令（约 8 秒、单 GPU、自动选空闲卡）：
+metric 命令（约 10 秒、单 GPU、自动选空闲卡）：
   {args.metric_cmd}
-含义：单进程跑 ~300 个 HipKittens probe（BF16/FP8 dense × RCR/RRR/CRR 全 cache shape + grouped + variable-K + reject）。
-Score = ok*100 - (fail+err)*1000，越大越好。任何回归会让分数瞬间掉 1100 以上。
-**这是你每轮**唯一**需要跑的命令** —— 改完一次、commit 前一次 即可。
+含义：在 16 个 LLM 典型 dense shape 上跑 HIPKITTEN vs Primus 默认 dispatch 的 TFLOPS 实测，
+score = int(geomean(hk_tflops / ref_tflops) * 1000)。target ≥ 900 (= 90%)。
+HIPKITTEN reject 一个 shape → 该 shape ratio 被 clip 到 0.01 → geomean 大幅下跌，
+所以**收紧 can_handle 反而会扣分**，必须靠真功夫扩覆盖 + 提速。
+**改完一次、commit 前一次** —— 不要每改一行都跑。
 {dod_block}
 
-【度量指标】指标名: {args.metric_name}（数值越高越好）
+【度量指标】指标名: {args.metric_name}（数值越高越好；900 = 90% 是 DoD）
 - 基线 (优化开始前) = {baseline_metric}
 - 历史最佳 = {state.best_metric}
 - 上一轮 = {last_metric}（improved={last_improved}）
 - 已连续 {state.rounds_without_improvement} 轮未提升（patience={args.patience}）
 
-【近期 git log】
+【近期 Primus-Turbo git log】
 {recent_log or "(空)"}
 
-【当前 working tree 状态】
+【当前 Primus-Turbo working tree 状态】
 {short_status or "(干净)"}
 
 【近 5 轮记录】
 {history_block}
 
-【你需要自主决策的事】
-1. 先读 skill，理解当前阶段卡在哪。
-2. 自己挑一个**具体且可验证**的小步骤去做（不要一次铺得太大）。可选方向举例：
-   - 在 grouped_gemm_impl.py 的 `_grouped_bf16_supported` 中扩 allow-list（新加 shape 之前必须独立数值校验）。
-   - 调整 `_hipkitten_grouped_cfg` / `_hipkitten_fp8_group_m` 的 fallback，跑 benchmark 取真实最优。
-   - 在 scripts/_metric_hipkitten.py 中加 probe（覆盖新 cache shape、新 grouped 配置等）。
-   - 用 benchmark/ops/bench_grouped_gemm_turbo.py 做 perf 实验，把结果 CSV 落到 benchmark/ops/。
-   - 修 FP8 路径中的小问题（尤其是 RCR `TK_RCR_FORCE_KERNEL` save/restore、padding）。
-3. 改完只跑一次本轮 metric 命令验证。**绝对不要跑 pytest**。
-4. 如果改动有进展（metric 不降、最好提升）就 git commit；若没把握就 `git restore` / `git checkout -- .` 还原，**不要留下脏 working tree**。
+【你必须**改 kernel 或 cache 或规则式 dispatch**，不能只改测试/probe 脚本】
+**禁止**的"假优化"模式（auto_optimize 会通过 commit 内容检测、违者立即作废本轮）：
+  ✗ 只动 scripts/_metric_*.py 让指标数字变好。
+  ✗ 用 if (M,N,K)==(X,Y,Z) 这种 case-by-case 形状→配置硬编码表"修"某 shape。
+  ✗ 在 can_handle 里加新形状黑名单"绕"过难 shape（geomean 会立刻塌）。
+  ✗ 改 SNR 阈值、删 pytest 用例、注掉 parametrize 这类回避问题的手段。
+
+**真**优化方向（任选一个具体小目标）：
+  ✓ HipKittens kernel 改写：例如 /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/
+    kernel_fp8_layouts.cpp 的 K-step / wave grid / swizzle / MFMA 排布。
+    改完进 analysis/{{bf16,fp8}}_gemm/mi350x 跑 `source ../../../env.src && make`，
+    会在原地生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so，无需 rebuild Primus。
+    最常见的提速来源：fix bank conflict、提升 ds_read 吞吐、调 K_STEP 更好覆盖 K=128/256 倍数。
+  ✓ HipKittens autotune 扩 cache：跑 bench_bf16_vs_torch.py / autotune.py 把缺的 (M,N,K)
+    填进 bench_*.json / .autotune_cache.json（数据不是分支，允许）。注意只跑 LLM 典型 shape，
+    别把 cache 撑爆。
+  ✓ HipKittens kernel 接受更宽的 K：当前 FP8 kernel 模板化 K，导致 K=4096/8192/14336 走得通、
+    K=11008/53248 走不通。改 launcher 让 launcher 在运行时切换 K-block，能直接增加 can_handle 命中。
+  ✓ Primus 规则式 can_handle/dispatch：例如把 "_can_use_hipkitten_kernel" 的 K%TILE_K 限制改为
+    K%128==0（如果 kernel 支持），或对未在 cache 中的 shape 用 default group_m=4, xcd=8 兜底
+    （**通用规则**，不是查表）。
+  ✓ Primus 改 _hipkitten_fp8_group_m / _hipkitten_grouped_cfg 的 fallback 启发式（用形状特征
+    例如 N>=K 走 group_m=2, otherwise group_m=4 之类**规则**，不是 if shape==X return 2）。
+
+【典型流程示例（FP8 提速）】
+1. 跑 metric 看哪 8 个 FP8 shape ratio < 0.9（stderr 表里有）
+2. 选其中 1 个 shape (例如 4096x4096x4096) 进 HipKittens 仓库直接 bench 那个 kernel：
+   ```bash
+   cd /workspace/code/HipKittens/analysis/fp8_gemm/mi350x
+   source ../../../env.src
+   python3 bench_vs_hipblaslt.py  # 看 group_m 是不是没扫到 32
+   ```
+3. 想清楚瓶颈（例如 4-wave kernel 在 N<8192 时 wave fan-out 不够），动 cpp:
+   ```bash
+   $EDITOR kernel_fp8_layouts.cpp
+   make -j  # 重编 tk_fp8_layouts.so
+   ```
+4. 回 Primus 跑 metric。提升了就 commit 在 HipKittens 仓库（feat/perf:），同时也 commit
+   在 Primus-Turbo 仓库（哪怕只是空 commit "perf(hk): trigger HK fp8 kernel rebench"，
+   方便 auto_optimize 跟踪历史）。
+
+【两个仓库的 commit】
+- 改了 HipKittens：进 /workspace/code/HipKittens 用 git add/commit；不要 push。
+- 改了 Primus-Turbo：进 {args.workspace} commit；不要 push。
+- 如果两边都改了，本轮 git log 在 Primus-Turbo 显示的是 Primus 这边的 commit；
+  在你的本轮小结里**列出 HipKittens commit SHA**，方便用户回溯。
 
 【硬性约束 - 不可违反】
 - **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量）。
-  metric 与 DoD checkpoint 会自动从这个池里挑空闲卡，你**不要手动 export HIP_VISIBLE_DEVICES=4..7**，
-  也不要往池外的卡跑 benchmark/probe；GPU 4-7 给别的租户用。
-  你跑任何额外脚本时也要先 `export HIP_VISIBLE_DEVICES=$(rocm-smi --showuse --showpids | ... 选池内空闲卡)` 或者直接复用 metric 脚本的逻辑。
-- **跑 metric 命令前不需要手动选 GPU**，scripts/_metric_hipkitten.py 内部已经会用 rocm-smi 自动从 HIPKITTEN_GPU_POOL 挑空闲卡。
-- 如果你确实需要跑别的脚本（benchmark / probe），先用 `rocm-smi --showuse --showpids` 选 HIPKITTEN_GPU_POOL 里的空闲 GPU，不要抢占其他租户的作业。
-- 绝不删除 tests/pytorch/ops/test_gemm_fp8.py 与 tests/pytorch/ops/test_grouped_gemm_fp8.py。
+  metric 与 DoD checkpoint 会自动从这个池里挑空闲卡，你**不要手动 export HIP_VISIBLE_DEVICES=4..7**。
+  跑任何 benchmark/probe 前先 `rocm-smi --showuse --showpids` 选池内空闲卡。
+- 绝不删除 tests/pytorch/ops/test_gemm_fp8.py / test_grouped_gemm_fp8.py 等测试文件。
 - 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"问题。
 - BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)`，绝不能让 autotune 默认选它。
+- **绝不在 .py 里塞 case-by-case 形状→配置表**（autotune cache .json 是数据，允许）。
+- **绝不只改 scripts/_metric_*.py 来让分数升高** —— 那是作弊，本轮直接作废。
 - 不要修改 ~/.cursor/cli-config.json 或全局 git config。
-- 不要 push 到 remote。
+- 不要 push 到任何 remote。
 - 不要用 `git rebase -i / git add -i` 这类交互命令。
-- 任何对 _grouped_bf16_supported 的扩展都必须在脚本之外用一个小 python probe 跑过 max_abs/相对误差，并把数值写进 commit message。
-- 小步前进：**每轮只 commit 1 个 focused commit**，commit message 用 `feat:` / `fix:` / `perf:` / `test:` / `refactor:` 风格。
+- 任何对 dispatch / can_handle 规则的修改都要在脚本之外做一个小 python 数值 probe（max_abs / SNR），
+  把数值写进 commit message，证明数值正确。
+- 小步前进：**每轮在每个仓库最多 1 个 focused commit**，message 用 `feat:` / `fix:` / `perf:` /
+  `refactor:` 风格。
 
 【输出要求】
-本轮结束前，在你的最后一条文本里给出一段 markdown 小结，包含：
-- 本轮选择的目标
-- 实际改了哪些文件
+本轮结束前给一段 markdown 小结，包含：
+- 本轮选择的目标 + 选了哪个方向（kernel / cache / 规则 dispatch）
+- HipKittens 与 Primus-Turbo 各自改了哪些文件
 - metric 命令的结果数字（before / after）
-- 是否 commit、commit SHA / message
-- 下一轮你建议下游做什么
+- 两个仓库各自的 commit SHA / message（如果都改了）
+- 下一轮建议下游做什么
 
 完成后退出（headless 模式会自动结束）。
 
