@@ -15,7 +15,7 @@ share the same plumbing:
   3. Pick a per-call config via :func:`select_default_config` (pure if/else
      rules, no IO).
   4. Launch the kernel via ``dispatch.dense_run`` /
-     ``dispatch.grouped_run_balanced``.
+     ``dispatch.grouped_run``.
 
 This subpackage centralizes that plumbing so the per-precision backend
 implementations are thin wrappers around ``hipkitten.dispatch`` calls.
@@ -28,7 +28,7 @@ from primus_turbo.pytorch.kernels.hipkitten.dispatch import (
     dense_run,
     force_rcr_kernel,
     fp8_has_dscale,
-    grouped_run_balanced,
+    grouped_run,
 )
 from primus_turbo.pytorch.kernels.hipkitten.layout import (
     aligned_for,
@@ -51,7 +51,7 @@ __all__ = [
     "dense_run",
     "force_rcr_kernel",
     "fp8_has_dscale",
-    "grouped_run_balanced",
+    "grouped_run",
     "has_bf16",
     "has_fp8",
     "layout_of",

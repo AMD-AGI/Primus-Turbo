@@ -9,18 +9,27 @@ The binding signatures differ slightly between precisions:
 
   * BF16 (``tk_bf16_layouts``):
       ``gemm_{rcr,rrr,crr}(a, b, c, group_m, num_xcds)``
-      ``grouped_{rcr,rrr,crr}_balanced(a, b, c, group_m, num_xcds)``
+      ``grouped_{rcr,rrr,crr}(a, b, c, group_m, num_xcds)``
 
   * FP8 (``tk_fp8_layouts``):
       ``gemm_{rcr,rrr,crr}(a, b, c, scale_a, scale_b, group_m)``
-      (no grouped entrypoints; FP8 grouped is implemented in Python by
-      looping over the dense entry per group)
+      (no grouped entrypoint yet; the FP8 grouped backend either falls
+      back to a per-group dense_run loop, or — once the HK FP8 .cpp
+      grows ``grouped_{rcr,rrr,crr}`` bindings — uses :func:`grouped_run`
+      directly via the same path as BF16.)
 
 This module hides the difference behind :func:`dense_run` and
-:func:`grouped_run_balanced`, plus a thread-safe context manager for the
+:func:`grouped_run`, plus a thread-safe context manager for the
 ``TK_RCR_FORCE_KERNEL`` env-var hack the FP8 binding uses to select among
 RCR kernel templates (the binding will eventually take ``kernel`` as a
 parameter; once it does we can drop the env-var path entirely).
+
+Note: the BF16 ``.so`` historically exposes its grouped entries as
+``grouped_*_balanced`` (legacy naming). The Primus side does *not*
+propagate that suffix — :class:`HipKittenModule` aliases them to
+``grouped_*``. Any new HK grouped binding (FP8 or otherwise) MUST be
+shipped without the ``_balanced`` suffix; balanced / unbalanced is a
+property of the workload, not the entrypoint.
 
 NOTE: per the project policy, this module MUST NOT keep any per-call /
 per-shape cache (no dict / weakref / data_ptr / _version / lru_cache /
@@ -141,26 +150,26 @@ def dense_run(
         hk.gemm(cfg.layout)(a, b, c, scale_a, scale_b, cfg.group_m)
 
 
-def grouped_run_balanced(
+def grouped_run(
     hk: HipKittenModule,
     cfg: HipKittenConfig,
     a: torch.Tensor,
     b: torch.Tensor,
     c: torch.Tensor,
 ) -> None:
-    """Dispatch ``module.grouped_{layout}_balanced(...)`` (BF16 only).
+    """Dispatch the precision's native grouped launcher for ``cfg.layout``.
 
-    FP8 has no native grouped entrypoint, so the FP8 grouped backend
-    implements grouped GEMM by looping :func:`dense_run` over the groups
-    in Python instead. The grouped launchers are pre-resolved at
-    module-load time and exposed via :meth:`HipKittenModule.grouped_balanced`.
+    The grouped launcher is pre-resolved at module-load time and exposed
+    via :meth:`HipKittenModule.grouped`. Returns immediately if the
+    binding does not expose a grouped entrypoint for the precision —
+    callers should check :meth:`HipKittenModule.has_grouped` (or fall
+    back to a per-group :func:`dense_run` loop) before dispatching here.
     """
-    if hk.dtype != "bf16":
-        raise ValueError("HipKittens grouped_run_balanced is BF16-only")
-    fn = hk.grouped_balanced(cfg.layout)
+    fn = hk.grouped(cfg.layout)
     if fn is None:
         raise AttributeError(
-            f"HipKittens BF16 binding does not expose grouped_{cfg.layout}_balanced; "
-            "rebuild tk_bf16_layouts.so or use the per-group dense_run fallback."
+            f"HipKittens {hk.dtype} binding does not expose grouped_{cfg.layout}. "
+            "Rebuild tk_*_layouts.so with the grouped binding, or use the "
+            "per-group dense_run fallback."
         )
     fn(a, b, c, cfg.group_m, cfg.num_xcds)

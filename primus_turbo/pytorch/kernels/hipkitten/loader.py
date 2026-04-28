@@ -19,10 +19,10 @@ This module's only state is the per-precision singleton stored in
 ``_BF16_SINGLETON`` / ``_FP8_SINGLETON``: a frozen :class:`HipKittenModule`
 that bundles the imported ``.so`` with pre-resolved layout-keyed callables
 (``gemm_rcr`` / ``gemm_rrr`` / ``gemm_crr`` and the optional FP8 ``_dscale``
-variants and BF16 ``grouped_*_balanced`` group launchers). The first
-:func:`load_bf16` / :func:`load_fp8` call constructs the singleton; every
-subsequent call returns it as a single attribute load. This avoids two
-sources of per-dispatch host overhead:
+variants and the optional grouped ``grouped_{rcr,rrr,crr}`` launchers).
+The first :func:`load_bf16` / :func:`load_fp8` call constructs the
+singleton; every subsequent call returns it as a single attribute load.
+This avoids two sources of per-dispatch host overhead:
 
   1. Reconstructing the :class:`HipKittenModule` dataclass per call
      (~3-5 us in observed measurement on MI355X).
@@ -69,15 +69,24 @@ class HipKittenModule:
     alignment in ``can_handle``; we cache the values on the dataclass so
     ``can_handle`` does not re-issue ``getattr`` per dispatch.
 
-    The ``gemm_*`` and ``grouped_*_balanced`` attributes hold direct refs to
-    the binding's pybind11 callables, looked up once at import time. The
-    dispatcher would otherwise pay ~0.5-1 us per call for ``getattr`` on the
-    binding; for the BF16 4096x4096x4096 forward (kernel ≈ 100 us) that is
-    a measurable fraction of host overhead, especially in the BF16 backward
-    path which issues 3 dispatches per autograd step.
+    The ``gemm_*`` and ``grouped_*`` attributes hold direct refs to the
+    binding's pybind11 callables, looked up once at import time. The
+    dispatcher would otherwise pay ~0.5-1 us per call for ``getattr`` on
+    the binding; for the BF16 4096x4096x4096 forward (kernel ≈ 100 us)
+    that is a measurable fraction of host overhead, especially in the
+    BF16 backward path which issues 3 dispatches per autograd step.
 
-    None of these attributes depend on input shape / dtype / data: they are
-    process-wide constants, computed once. They are NOT a per-shape cache.
+    None of these attributes depend on input shape / dtype / data: they
+    are process-wide constants, computed once. They are NOT a per-shape
+    cache.
+
+    The grouped slots are aliased — see :func:`_resolve_grouped_attr` —
+    so this dataclass exposes ``grouped_{rcr,rrr,crr}`` regardless of
+    whether the underlying ``.so`` ships them as ``grouped_*`` (FP8,
+    new HK builds) or with the legacy ``_balanced`` suffix (the BF16
+    ``.so`` shipped today). New HK bindings MUST drop the
+    ``_balanced`` suffix; balanced / unbalanced is a workload property,
+    not an entrypoint property.
     """
 
     module: Any
@@ -92,10 +101,10 @@ class HipKittenModule:
     gemm_rcr_dscale: Any
     gemm_rrr_dscale: Any
     gemm_crr_dscale: Any
-    # BF16-only grouped launchers. None on FP8 (no native grouped binding).
-    grouped_rcr_balanced: Any
-    grouped_rrr_balanced: Any
-    grouped_crr_balanced: Any
+    # Grouped launchers (None when the binding does not expose them).
+    grouped_rcr: Any
+    grouped_rrr: Any
+    grouped_crr: Any
 
     def gemm(self, layout: str) -> Any:
         """Return the dense kernel callable for ``layout``."""
@@ -113,13 +122,33 @@ class HipKittenModule:
             return self.gemm_rrr_dscale
         return self.gemm_crr_dscale
 
-    def grouped_balanced(self, layout: str) -> Any:
-        """Return the grouped (balanced) launcher for ``layout``."""
+    def grouped(self, layout: str) -> Any:
+        """Return the grouped launcher for ``layout`` or None.
+
+        ``None`` means the underlying ``.so`` does not ship a grouped
+        entrypoint for the precision; callers must fall back to a
+        per-group :func:`...dispatch.dense_run` loop.
+        """
         if layout == "rcr":
-            return self.grouped_rcr_balanced
+            return self.grouped_rcr
         if layout == "rrr":
-            return self.grouped_rrr_balanced
-        return self.grouped_crr_balanced
+            return self.grouped_rrr
+        return self.grouped_crr
+
+    def has_grouped(self) -> bool:
+        return self.grouped_rcr is not None
+
+
+def _resolve_grouped_attr(module: Any, layout: str) -> Any:
+    """Pull the grouped launcher off ``module`` for ``layout``.
+
+    Tries the new (preferred) name ``grouped_<layout>`` first, then falls
+    back to the legacy ``grouped_<layout>_balanced`` for the BF16 ``.so``
+    shipped today. Returns ``None`` if neither attribute exists.
+    """
+    return getattr(module, f"grouped_{layout}", None) or getattr(
+        module, f"grouped_{layout}_balanced", None
+    )
 
 
 def _build_module(module: Any, dtype: Literal["bf16", "fp8"], default_bs: int, default_kb: int) -> "HipKittenModule":
@@ -134,9 +163,9 @@ def _build_module(module: Any, dtype: Literal["bf16", "fp8"], default_bs: int, d
         gemm_rcr_dscale=getattr(module, "gemm_rcr_dscale", None),
         gemm_rrr_dscale=getattr(module, "gemm_rrr_dscale", None),
         gemm_crr_dscale=getattr(module, "gemm_crr_dscale", None),
-        grouped_rcr_balanced=getattr(module, "grouped_rcr_balanced", None),
-        grouped_rrr_balanced=getattr(module, "grouped_rrr_balanced", None),
-        grouped_crr_balanced=getattr(module, "grouped_crr_balanced", None),
+        grouped_rcr=_resolve_grouped_attr(module, "rcr"),
+        grouped_rrr=_resolve_grouped_attr(module, "rrr"),
+        grouped_crr=_resolve_grouped_attr(module, "crr"),
     )
 
 

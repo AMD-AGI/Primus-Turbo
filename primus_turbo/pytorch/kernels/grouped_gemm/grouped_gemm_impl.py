@@ -40,20 +40,22 @@ def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
     return [int(x) for x in group_offs.detach().cpu().tolist()]
 
 
-def _detect_balanced_m(a_total_rows: int, group_lens: torch.Tensor) -> int | None:
-    """Return per-group M iff ``group_lens`` is uniform; else None.
+def _uniform_group_m(a_total_rows: int, group_lens: torch.Tensor) -> int | None:
+    """Return per-group M iff every entry of ``group_lens`` is equal; else None.
 
     Uses ``(group_lens == m_avg).all().item()`` — one tiny GPU reduction
     plus one GPU→CPU sync (≈ tens of microseconds for typical B≤32).
-    Forwarded by the HipKittens grouped backends to choose between a
-    single ``grouped_*_balanced`` launch (fast path) and a per-group
-    ``dense_run`` loop.
+    Forwarded by the HipKittens grouped backends as a *fast-path*
+    detector: the native HK grouped launcher today consumes a single
+    per-group M (the kernel iterates ``B`` groups of identical size),
+    so when this returns ``None`` we route to the per-group
+    :func:`...dispatch.dense_run` loop instead — never reject.
 
-    Per project policy this is **not** a ``can_handle`` resume / reject
-    helper: HipKittens ``can_handle`` accepts arbitrary ``group_lens``
-    and the *execute* path uses this to dispatch to the right
-    implementation (the ``grouped_*_balanced`` binding only handles
-    equal-M groups). See ``GroupedGEMMHipKittenBackend.execute``.
+    Per project policy this is NOT a ``can_handle`` resume / reject
+    helper: HipKittens ``can_handle`` accepts arbitrary ``group_lens``,
+    and the *execute* path uses this to pick an implementation. New HK
+    grouped bindings should accept cumulative-offsets directly so this
+    fast-path detector becomes redundant.
     """
     bs = group_lens.numel()
     if bs <= 0 or a_total_rows % bs != 0:
@@ -239,9 +241,9 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # Hard constraints only — dtype, dim, device, B-divisibility.
         #
         # We deliberately do NOT reject on:
-        #   * unbalanced ``group_lens`` (project rule: real MoE traffic is
-        #     never balanced; ``execute`` falls back to a per-group
-        #     ``dense_run`` loop when needed).
+        #   * non-uniform ``group_lens`` (project rule: real MoE traffic
+        #     never has equal-sized groups; ``execute`` falls back to a
+        #     per-group ``dense_run`` loop when uniform-M is not detected).
         #   * misaligned (M, N, K) (project rule: ``aligned_for`` is a
         #     launcher-internal constraint, not a resume / reject. The
         #     ``execute`` path pads the missing dims and dispatches a
@@ -274,12 +276,12 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
         layout = "rcr" if trans_b else "rrr"
 
-        m = _detect_balanced_m(a.shape[0], group_lens)
+        m = _uniform_group_m(a.shape[0], group_lens)
         if m is not None:
             m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "bf16")
             cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "bf16")
             if (m_pad, n_pad, k_pad) == (m, n, k):
-                hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
+                hipkitten.grouped_run(hk, cfg, a.contiguous(), b.contiguous(), out)
                 return out
             if m_pad == m:
                 # M is aligned, but N and / or K need padding (the gpt_oss_20B
@@ -306,21 +308,21 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
                         b_in = torch.zeros((bs, k_pad, n_pad), dtype=b.dtype, device=b.device)
                         b_in[:, :k, :n].copy_(b)
                 c_pad = torch.zeros((bs * m, n_pad), dtype=a.dtype, device=a.device)
-                hipkitten.grouped_run_balanced(hk, cfg, a_in, b_in, c_pad)
+                hipkitten.grouped_run(hk, cfg, a_in, b_in, c_pad)
                 out.copy_(c_pad[:, :n])
                 return out
             # M is misaligned: fall through to the per-group dense_run
-            # loop. M-pad of a balanced grouped layout would require
+            # loop. M-pad of a uniform-M grouped layout would require
             # interleaving zeros between groups, which is only marginally
             # faster than per-group padding at large B and adds enough
             # complexity that we keep the fallback simple here. The
             # metric never hits this branch (DeepSeek / gpt_oss / Llama
             # all have M ∈ {2048, 4096, 8192}).
 
-        # Per-group dense_run fallback. Slower than ``grouped_*_balanced``
-        # but correct for unbalanced ``group_lens`` and for shapes where
-        # M and / or K need padding. Mirrors the FP8 grouped fallback in
-        # ``grouped_gemm_fp8_impl.py``.
+        # Per-group dense_run fallback. Slower than the native ``grouped_*``
+        # launcher but correct for non-uniform ``group_lens`` and for
+        # shapes where M and / or K need padding. Mirrors the FP8 grouped
+        # fallback in ``grouped_gemm_fp8_impl.py``.
         offs = _group_offsets_cpu(group_offs)
         for group_idx in range(bs):
             start, end = offs[group_idx], offs[group_idx + 1]
@@ -366,9 +368,9 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         # Hard constraints only — dtype, dim, device, layout, B-divisibility.
-        # We do NOT reject on ``_is_balanced_group_lens``: ``execute``
-        # below dispatches the unbalanced case to a per-group ``dense_run``
-        # loop with crr ordering. Alignment of (n, k, m_avg) is checked
+        # We do NOT reject on group-size uniformity: ``execute`` below
+        # dispatches non-uniform-M to a per-group ``dense_run`` loop with
+        # crr ordering. Alignment of (n, k, m_avg) is checked
         # because the per-group fallback also pads internally — accepting
         # any (n, k, m) here means execute can always run; rejecting only
         # M_avg-misaligned shapes would be cleaner but no metric / DoD
@@ -406,13 +408,13 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         k = a.shape[1]
         out = torch.zeros((bs, n, k), dtype=a.dtype, device=a.device)
 
-        m = _detect_balanced_m(a.shape[0], group_lens)
+        m = _uniform_group_m(a.shape[0], group_lens)
         if m is not None:
             cfg = hipkitten.select_default_config(n, k, m, "crr", "bf16")
-            hipkitten.grouped_run_balanced(hk, cfg, b.contiguous(), a.contiguous(), out)
+            hipkitten.grouped_run(hk, cfg, b.contiguous(), a.contiguous(), out)
             return out
 
-        # Unbalanced fallback: per-group dense_run via gemm_crr, with
+        # Non-uniform-M fallback: per-group dense_run via gemm_crr, with
         # per-group padding for any individual group whose K_logical
         # (= per-group M) breaks the crr alignment that ``can_handle``
         # checked using the *average* M.

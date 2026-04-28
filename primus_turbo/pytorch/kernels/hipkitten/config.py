@@ -57,7 +57,7 @@ Rule derivation summary (cross-referenced offline at round 1 / round 3):
 
 The functions in this module return ``HipKittenConfig`` objects directly;
 backends pass them to :mod:`primus_turbo.pytorch.kernels.hipkitten.dispatch`
-``dense_run`` / ``grouped_run_balanced`` for the actual kernel launch.
+``dense_run`` / ``grouped_run`` for the actual kernel launch.
 """
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def select_default_config(
     Returns a :class:`HipKittenConfig` whose fields match the binding
     signature of the layout-specific entry point; pass directly to
     :func:`primus_turbo.pytorch.kernels.hipkitten.dispatch.dense_run` or
-    :func:`...dispatch.grouped_run_balanced`.
+    :func:`...dispatch.grouped_run`.
     """
     if dtype == "bf16":
         # BF16 tile-geometry rules (round 3, derived from

@@ -127,14 +127,20 @@ DEFAULT_TASK = (
     "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（**通用规则**才允许，\n"
     "    例如 `if K>=4096`、`if min(tiles)<16`、`if N>=K`）\n"
     "  ✗ 收紧 can_handle 把难 shape 排除掉（geomean clip 0.01，分数立刻塌）\n"
-    "  ✗ **grouped 路径严禁判 balanced**：HK 的 `grouped_{rcr,rrr,crr}_balanced` binding 命名上叫\n"
-    "    'balanced' 是 launcher 的实现细节，不是 can_handle 的资格条件。**严禁**在\n"
-    "    `GroupedGEMM*HipKittenBackend.can_handle` / Primus dispatch 路径里加任何形如\n"
-    "    `_is_balanced_group_lens(group_lens)` / `all(g==g[0] for g in group_lens)` 的检查\n"
-    "    去 reject 不平衡的输入 —— 真实 MoE 训练里 group_lens 永远是稀疏不平衡的。\n"
-    "    HK kernel 必须能跑任意 group_lens；如果当前 launcher 假设 balanced，要么改 launcher\n"
-    "    支持 unbalanced（用 cumulative offsets 显式传），要么在 Primus 端用 per-group dense_run\n"
-    "    fallback —— 但 **can_handle 不准 reject**。这条规则同时覆盖 BF16 grouped 与新加的 FP8 grouped。\n"
+    "  ✗ **grouped 路径严禁任何形式的 balanced 假设**（命名 + 资格判定都不准）：\n"
+    "    1) `can_handle` / dispatch 路径**禁止**加任何形如 `_is_balanced_group_lens` /\n"
+    "       `all(g==g[0] for g in group_lens)` 的检查去 reject 非均匀 `group_lens` —— 真实\n"
+    "       MoE 训练里 group_lens 永远是稀疏不均匀的，reject 一个 shape → ratio clip 0.01\n"
+    "       → 整段 geomean 塌掉。HK kernel 必须能跑任意 group_lens；当前 HK BF16 grouped\n"
+    "       launcher 只接受均匀 M-per-group，是 launcher 实现细节，所以 `execute` 用\n"
+    "       `_uniform_group_m` 做 *fast-path detection*（detect 不到 → per-group `dense_run`\n"
+    "       fallback），**不是 reject**。\n"
+    "    2) **命名同样禁止传播 balanced 污染**：HK 仓库 BF16 .so 当前暴露的 `grouped_*_balanced`\n"
+    "       是历史遗留命名，Primus 内部已经统一别名为 `grouped_*`（loader 通过\n"
+    "       `_resolve_grouped_attr` 兼容老 .so，新代码不暴露 `_balanced` 后缀）。任何**新加**\n"
+    "       的 HK 仓库 binding（FP8 grouped、新增 layout、新加变体）一律命名 `grouped_*`，\n"
+    "       不准带 `_balanced` 后缀；任何**新加**的 Primus 端 grouped API 也不准带 `_balanced` 后缀。\n"
+    "       这条规则覆盖 BF16 grouped、新加的 FP8 grouped、未来一切 grouped 入口。\n"
     "  ✗ 只改 metric/test/config.py 文件让数字变好\n"
     "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值\n\n"
     "**两仓库分工**：\n"
@@ -544,23 +550,25 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
     (b) 在 HipKittens 仓库出 256/128/?(non-256 N) 兼容 tile 模板 (更彻底)。先 (a) 验证可行性。
     **再次提醒：can_handle 严禁判 balanced**（见上面"严禁的『假优化』模式"）。
   ☐ 第五刀（**新加，重点**）：grp_FP8 vs TRITON >= 1.20。HipKittens FP8 .so 当前**没有**
-    `grouped_*_balanced` binding，Primus 端 `GroupedGEMMFP8HipKittenBackend.execute` 是
-    per-group `dense_run` 循环 fallback —— B=32 时 launch overhead 会让它在 Triton 持久 kernel
-    面前直接崩盘。**修法**：
+    原生 grouped binding，Primus 端 `GroupedGEMMFP8HipKittenBackend.execute` 是 per-group
+    `dense_run` 循环 fallback —— B=32 时 launch overhead 让它在 Triton 持久 kernel 面前
+    崩盘。**修法**（命名严格遵守『假优化』清单的禁 _balanced 规则）：
       1. 在 `/workspace/code/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp` 末尾加 3 条
-         `m.def("grouped_{{rcr,rrr,crr}}_balanced", &grouped_..., ...)` binding —— 镜像 BF16 .so 暴露的
-         `grouped_{{rcr,rrr,crr}}_balanced` (你可以 `python -c "import tk_bf16_layouts; print(dir(tk_bf16_layouts))"`
-         确认 BF16 .so 有这些条目)。从命名一致性看，BF16 grouped launcher 是 'fixed M-per-group'
-         实现 —— 你的 FP8 grouped binding 不需要重复 BF16 那种假设，实现成支持任意
-         cumulative-offsets 的 grouped launcher 即可（这样 can_handle 永远不需要判 balanced）。
-      2. cd 到 mi350x，`source ../../../env.src && make -j`，重编 `tk_fp8_layouts.so`。
-      3. 在 Primus 端 `kernels/hipkitten/dispatch.py` 把 `grouped_run_balanced` 的 BF16-only assert 去掉，
-         FP8 grouped 走同一条原生 launcher。
-      4. 在 Primus 端 `kernels/grouped_gemm/grouped_gemm_fp8_impl.py::GroupedGEMMFP8HipKittenBackend.execute`
-         去掉 per-group for 循环，改成一次 `grouped_run_balanced` 调用。
-      5. **同步**把 `kernels/grouped_gemm/grouped_gemm_impl.py::GroupedGEMMHipKittenBackend.can_handle`
-         里的 `_is_balanced_group_lens(group_lens)` reject **删掉**（line 235 / 321 的两处），
-         以及 grouped_gemm_fp8_impl.py 那边对应的检查 —— 见"严禁的『假优化』模式"清单。
+         `m.def("grouped_<layout>", &grouped_<layout>, ...)` binding，layout ∈ {{rcr, rrr, crr}}。
+         **不要**带 `_balanced` 后缀（命名一律 `grouped_rcr` / `grouped_rrr` / `grouped_crr`）。
+         BF16 .so 暴露的 `grouped_*_balanced` 是历史遗留，新 binding 不传播这个污染 ——
+         Primus 端 loader 用 `_resolve_grouped_attr` 已经兼容两种命名，所以 BF16 老 .so 仍能
+         加载。binding 实现层面：MoE 真实流量 group_lens 不均匀，所以最好把 launcher 写成
+         接受 cumulative offsets 直接消费（而不是假设均匀 M-per-group）—— 这样 Primus 端
+         永远不需要 fast-path detection。
+      2. cd 到 mi350x，`source ../../../env.src && make -j`，重编 `tk_fp8_layouts.so`，确认
+         `python3 -c "import tk_fp8_layouts; print([x for x in dir(tk_fp8_layouts) if 'grouped' in x])"`
+         打印 `['grouped_crr', 'grouped_rcr', 'grouped_rrr']`（无 `_balanced` 后缀）。
+      3. Primus 端 `kernels/grouped_gemm/grouped_gemm_fp8_impl.py::GroupedGEMMFP8HipKittenBackend.execute`
+         去掉 per-group for 循环，改成一次 `hipkitten.grouped_run(hk, cfg, ...)` 调用。loader
+         自动通过 `_resolve_grouped_attr` 把新 `grouped_*` attribute 拿出来。
+      4. 跑 fp32 数值 probe（max_abs + SNR）确认 deepseek-v3 / gpt_oss_20B FP8 grouped
+         通过；跑 metric 验证 grp_FP8 ratio 提升；commit。
   ☐ HipKittens kernel 改写（任意时刻可做，不依赖前 5 刀）：改 .cpp 的 tile/wave/swizzle/
     MFMA 排布，进 analysis/{{bf16,fp8}}_gemm/mi350x `source ../../../env.src && make -j`，
     生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so。提速来源：bank conflict、
