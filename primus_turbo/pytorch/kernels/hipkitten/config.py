@@ -23,7 +23,11 @@ down to general rules. We do the same here, distilling the offline
 HipKittens autotune cache files into rules that are general over (M, N, K)
 rather than a per-shape lookup.
 
-Rule derivation summary (cross-referenced offline at round 1 / round 3):
+Rule derivation summary (cross-referenced offline at round 1 / round 3,
+extended at round 5 from a direct microbench sweep over the 5 BF16_bwd
+metric shapes that fell <0.97 in round 4 — see /tmp/bench_bf16_bwd_round2.log
+archived in the round-5 commit message: 30 (group_m, num_xcds) candidates
+swept on each of 14 (layout, m, n, k) tuples, picking empirical max):
   * BF16 (analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json, 48 shapes
     x 3 layouts = 144 cache entries): the autotune-winning ``(group_m,
     num_xcds)`` pair is wide across shapes -- {1..24} for ``group_m`` and
@@ -34,6 +38,8 @@ Rule derivation summary (cross-referenced offline at round 1 / round 3):
        - 4096x4096x4096:    cache (gm=2, xcd=32) -> 1.071 vs torch
                             (gm=4, xcd=8) ~ 0.90 vs torch (-17pp)
        - 4096x4096x11008:   cache (gm=2, xcd=32) -> 1.007
+       - 4096x4096x12288:   bench round-2 (gm=2, xcd=32) -> 1555.2 TF
+                            (default 1542.9, +0.8pp). Round-5 extension.
        - 8192x4096x4096:    cache (gm=2, xcd=16) -> 1.003
                             (rrr/crr cousins both prefer (2, 32))
        - 16384x4096x4096:   cache (gm=2, xcd=32) -> 0.986
@@ -46,6 +52,22 @@ Rule derivation summary (cross-referenced offline at round 1 / round 3):
         (gm=2, xcd=*) (verified by enumeration of the 48 cache rows);
       - cover all 6 BF16 metric shapes that currently fall below the
         0.97 acceptance bar.
+  * BF16 backward (round 5): ``RRR tiles_m == 32 + tiles_n >= 32`` shapes
+    show (gm=24, xcd=4) winning over the round-1 (gm=2, xcd=16) — sweep
+    on dA (8192, 14336, 4096) gives 1467.5 / 1443.5 = +1.7pp. The same
+    rule subset narrowed away from the small-tiles_m ``(rrr tiles_m=16,
+    tiles_n>=32, k<=8192)`` family because the sweep there shows the
+    default ``(4, 8)`` already wins (1411.7 TF; round-1 (2, 16) was
+    1395.3 TF / -1.2pp).
+  * BF16 backward (round 5) CRR additions for shapes that were falling
+    to the binding default:
+      - ``32 <= tiles_m < 64`` and ``tiles_n == 16`` and ``k <= 4096``:
+        (2, 32). Anchor: dB-after-swap (12288, 4096, 4096) — bench
+        1414.7 vs default 1393.9 = +1.5pp.
+      - ``tiles_m <= 16`` and ``tiles_n >= 32`` and ``k > 4096``:
+        (2, 32). Anchor: dB-after-swap (4096, 14336, 8192) — bench
+        1330.2 vs default 1313.2 = +1.3pp. The rule is intentionally
+        ``crr``-scoped to avoid colliding with ``rrr``-only patterns.
   * FP8 (analysis/fp8_gemm/mi350x/.autotune_cache.json, 48 shapes x 3
     layouts): much tighter distribution -- ``group_m`` is 4 in 60% of RCR
     entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries
@@ -114,19 +136,24 @@ def select_default_config(
     if dtype == "bf16":
         # BF16 tile-geometry rules. Forward (RCR) rules derived from
         # analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json (round
-        # 3). Backward (RRR/CRR) rules added in round 4 from a direct
-        # microbench sweep over the 5 BF16_bwd Llama-2-7B / Llama-3.1-8B
-        # shapes that fell <0.97 in metric round 1 (see
-        # /tmp/bench_bf16_bwd_cfg.log archived in the round-4 commit
-        # message): for each (dA RRR, dB CRR-after-swap) shape we tested
-        # 10 (group_m, num_xcds) candidates and picked the empirical max.
+        # 3). Backward (RRR/CRR) rules added in round 4 from an initial
+        # 10-candidate microbench, then refined in round 5 with a wider
+        # 30-candidate sweep on the 5 BF16_bwd Llama shapes that still
+        # fell <0.97 (see /tmp/bench_bf16_bwd_round2.log archived in
+        # the round-5 commit message).
         tiles_m = m // 256
         tiles_n = n // 256
-        if tiles_m <= 16 and tiles_m == tiles_n and k <= 11008:
-            # Cube-ish small (16x16 grid): canonical attn_out shape
-            # 4096x4096x{4096, 11008}. Cache rcr/rrr/crr all win on
-            # (gm=2, xcd=32) for these rows. +17pp uplift on RCR fwd at
-            # 4096^3.
+        if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
+            # Cube-ish small (16x16 grid). Round 1: 4096^3 fwd RCR and
+            # 4096x4096x11008 win on (gm=2, xcd=32). Round 5 extends the
+            # K bound from 11008 to 12288 to capture dA RRR
+            # (4096, 4096, 12288) (= round-2 sweep best 1555.2 TF, +0.8pp
+            # over default). 22016-cube falls through (sweep shows
+            # default still wins by 0.6pp there) and any LLM K above
+            # 12288 is non-cube in the metric suite, so the wider bound
+            # has no collateral. Also catches the dB-after-swap RCR-fwd
+            # cube cousins (e.g. 8192x4096x4096 -> dB (4096,4096,8192))
+            # that already passed in round 4.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
         if tiles_n == 16 and tiles_m == 2 * tiles_n and k <= 4096:
             # Skinny tall (32x16 grid, K shallow): canonical attn_out
@@ -134,21 +161,18 @@ def select_default_config(
             # we pick (2, 32) because it is within ~1pp of (2, 16) on
             # rcr and matches the rrr/crr backward-pass winners exactly.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
-        if layout == "rrr" and tiles_m <= 32 and tiles_n >= 32 and k <= 8192:
-            # Asymmetric "tall-N" RRR (canonical dA shape from
-            # turbo.ops.gemm autograd backward):
-            #   fwd 8192x4096x14336 -> dA RRR (8192,14336,4096) = (32,56,4096)
-            #   fwd 4096x4096x11008 -> dA RRR (4096,11008,4096) = (16,43,4096)
-            # Bench (round 1, /tmp/bench_bf16_bwd_cfg.log):
-            #   (gm=2, xcd=16) wins on shape 5 dA by +1.8pp, on shape 3
-            #   dA by +0.4pp. xcd=16 is the discriminator -- (2,32) loses
-            #   on shape 5 dA by -4pp. CRR-side (dB-after-swap) is
-            #   intentionally NOT covered here: bench shows the same
-            #   (gm=2, xcd=16) is within 0.1pp of CRR's best on those
-            #   two shapes but in metric the run-to-run noise dominates,
-            #   so we leave CRR at the default (4, 8) for the (tiles_m
-            #   <= 32, tiles_n >= 32) bucket pending more evidence.
-            return HipKittenConfig(layout=layout, group_m=2, num_xcds=16, kernel=None)
+        if layout == "rrr" and tiles_m == 32 and tiles_n >= 32 and k <= 8192:
+            # Tall-N RRR with tiles_m EXACTLY 32. Canonical: dA shape
+            # from turbo.ops.gemm autograd backward of fwd
+            # 8192xN_largex4096 (RRR (8192, N_large, 4096)).
+            # Round-2 30-candidate sweep on (8192, 14336, 4096) gives
+            # (24, 4) = 1467.5 TF, beating round-1 winner (2, 16) by
+            # +1.7pp and default (4, 8) by +3.3pp. Distinguish from
+            # tiles_m==16 RRR (which the same sweep shows prefers the
+            # default (4, 8) — e.g. dA RRR (4096, 11008, 4096): default
+            # 1411.7, (2, 16) 1395.3, (24, 4) << default), so the bound
+            # is exact (==32) rather than the round-1 inclusive (<=32).
+            return HipKittenConfig(layout=layout, group_m=24, num_xcds=4, kernel=None)
         if layout == "crr" and tiles_m >= 64 and tiles_n == 16:
             # Long-N backward dB-after-swap (CRR sees logical (N_fwd,
             # K_fwd, M_fwd) post-swap). Canonical Llama-2-7B
@@ -162,6 +186,24 @@ def select_default_config(
             # shapes.
             if k <= 4096:
                 return HipKittenConfig(layout=layout, group_m=24, num_xcds=2, kernel=None)
+            return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "crr" and 32 <= tiles_m < 64 and tiles_n == 16 and k <= 4096:
+            # Mid-tiles_m CRR with tiles_n==16, K shallow. Canonical
+            # Llama-2-7B attn_qkv backward dB:
+            #   fwd 4096x12288x4096 -> dB CRR (12288, 4096, 4096) = (48, 16, 4096)
+            # Round-2 sweep: (2, 32) = 1414.7 TF beats default (4, 8) by
+            # +1.5pp. (24, 2) — the tiles_m>=64 winner — only reaches
+            # 1393.5 here, so the rule is rightfully tile-bucketed
+            # rather than just adding shape 48 to the long-N rule.
+            return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "crr" and tiles_m <= 16 and tiles_n >= 32 and k > 4096:
+            # Asymmetric tall-N CRR with deep K. Canonical: dB-after-swap
+            # for fwd 8192x4096x14336 -> CRR (4096, 14336, 8192) =
+            # (16, 56, 8192). Round-2 sweep: (2, 32) = 1330.2 TF, +1.3pp
+            # over default (4, 8) and within 0.04pp of the empirical max
+            # (6, 8) = 1330.2 (chose (2, 32) because it is the same
+            # config the long-N CRR rule above picks for the deep-K
+            # tier, keeping the rule family coherent).
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
         return HipKittenConfig(
             layout=layout,
