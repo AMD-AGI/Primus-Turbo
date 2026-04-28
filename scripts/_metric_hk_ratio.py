@@ -6,36 +6,48 @@
 ###############################################################################
 """HipKittens / default-backend TFLOPS ratio metric for auto_optimize.
 
-For each shape in a fixed LLM-typical suite (BF16 dense + FP8 tensorwise dense,
-forward-only), this script:
+Six independent sections (64 cases total) each measured against its
+canonical baseline:
 
+    (1) BF16_fwd  vs HIPBLASLT  —  8 dense LLama-2-7B / Llama-3.1-8B shapes
+    (2) BF16_bwd  vs HIPBLASLT  —  same 8 shapes, backward-only
+    (3) FP8_fwd   vs HIPBLASLT  —  same 8 shapes, FP8 tensorwise forward
+    (4) FP8_bwd   vs TRITON     —  same 8 shapes, FP8 tensorwise backward
+    (5) grp_BF16  vs TRITON     —  16 MoE shapes (DeepSeek-V3 + gpt_oss_20B)
+    (6) grp_FP8   vs TRITON     —  same 16 MoE shapes, FP8 tensorwise
+
+For each shape:
   1. Times the op with HIPKITTEN forced as the GEMM backend.
-  2. Times the op with no override (Primus's default dispatch — HIPBLASLT for
-     BF16 / FP8-tensorwise, which is "Turbo's current best" on these shapes).
-  3. Computes ratio = hk_tflops / default_tflops.
-  4. If HIPKITTEN.can_handle rejects the shape (raises ValueError) or produces
-     NaN/Inf, the ratio is clipped to 0.01 — which sinks geomean and forces the
+  2. Times the op with the canonical reference backend (HIPBLASLT for dense
+     fwd / bwd; TRITON for FP8 backward and both grouped sections).
+  3. Computes ratio = hk_tflops / ref_tflops.
+  4. If HIPKITTEN.can_handle rejects the shape or produces NaN/Inf, the
+     ratio is clipped to 0.01 — which sinks geomean and forces the
      optimizer to actually extend HipKittens coverage instead of routing
      around hard cases.
 
 Score (single integer printed on the last line of stdout, consumed by
 auto_optimize.py):
 
-    score = int(geomean(ratios) * 1000)
+    score = int(geomean_over_sections * 1000)
 
-A score of 900 means HIPKITTEN is at 90% of the default backend across the
-suite — which is the explicit DoD set by the user. 1000 means parity, >1000
-means HIPKITTEN is faster on average.
+where ``geomean_over_sections`` is the geomean of the six section
+geomeans (each section weighs equally regardless of n_cases). This is
+just a ranking signal — *acceptance* is the 6-goal PASS/FAIL block
+printed to stderr, NOT the integer score.
 
 What this metric will NOT reward:
-  * Adding shapes to the suite without making HIPKITTEN actually competitive
-    on them — geomean of 14 ratios is robust to cherry-picking.
+  * Adding shapes to the suite without making HIPKITTEN actually
+    competitive on them — geomean of 64 ratios is robust to cherry-picking.
   * "Fixing" rejection by skipping the shape — every entry in SUITE is
     counted, no exceptions.
-  * Editing this script — auto_optimize.py forbids commits that only touch
-    scripts/_metric_*.py.
+  * Narrowing ``can_handle`` (e.g. ``balanced groups only``,
+    ``layout RCR only``) to dodge hard shapes — those rejects clip to
+    0.01 and tank the section.
+  * Editing this script — auto_optimize.py forbids commits that only
+    touch scripts/_metric_*.py.
 
-Wall: ~10-15 seconds on an idle MI350. Auto-picks an idle GPU from
+Wall: ~30-45 seconds on an idle MI350. Auto-picks an idle GPU from
 HIPKITTEN_GPU_POOL.
 """
 
@@ -447,6 +459,44 @@ def _bench_grouped_bf16(
     return 2.0 * (B * M) * N * K / (ms * 1e9)
 
 
+def _bench_grouped_fp8(
+    B: int, M: int, N: int, K: int, backend: Optional[BackendType]
+) -> float:
+    """Return TFLOPS for FP8 tensorwise grouped GEMM (NT, balanced), or 0.0 on failure.
+
+    Layout matches turbo.ops.grouped_gemm_fp8 with trans_b=True:
+        a: [B*M, K]   bf16 (quantized inside the op)
+        b: [B, N, K]  bf16 (quantized inside the op)
+        out: [B*M, N] bf16
+    Total FLOPs = 2 * (B*M) * N * K.
+
+    NOTE: HipKittens FP8 .so exposes only dense ``gemm_*`` entries — there
+    is currently no native ``grouped_*_balanced`` FP8 kernel. The current
+    HIPKITTEN backend therefore loops :func:`dense_run` per-group, which
+    bleeds launch overhead at large B vs the persistent Triton kernel. The
+    intended fix is to add a native ``grouped_{rcr,rrr,crr}_balanced``
+    binding to ``analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp`` (mirror
+    the BF16 grouped binding shape) so this section can clear the goal.
+    """
+    cfg = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device="cuda")
+    group_lens = torch.full((B,), M, dtype=torch.int64, device="cuda")
+    fn = lambda: turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=cfg)  # noqa: E731
+    with force_grouped_gemm_backend(backend, PrecisionType.FP8):
+        try:
+            out = fn()
+        except Exception:
+            return 0.0
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            return 0.0
+        try:
+            ms = _time_op(fn)
+        except Exception:
+            return 0.0
+    return 2.0 * (B * M) * N * K / (ms * 1e9)
+
+
 # ----------------------------------------------------------------------------
 # Suite runner
 # ----------------------------------------------------------------------------
@@ -465,6 +515,13 @@ def _run() -> int:
     #     reference for FP8 backward since hipBLASLt's FP8 backward path
     #     differs in quantization recipe)
     #   - grouped BF16 competes with TRITON
+    #   - grouped FP8 (tensorwise) competes with TRITON; baseline ratio
+    #     will be very low because HipKittens FP8 .so has no native
+    #     ``grouped_*_balanced`` binding yet — the HIPKITTEN backend
+    #     loops the dense kernel per-group, which loses to Triton's
+    #     persistent grouped kernel at large B. Adding a native FP8
+    #     grouped kernel to HipKittens (mirroring the BF16 grouped
+    #     binding) is the canonical fix for this section.
     rows: list[tuple[str, float, float, float, str, str]] = []
     # row tuple: (name, hk_tflops, ref_tflops, ratio, ref_backend_name, section)
     t0 = time.monotonic()
@@ -507,6 +564,18 @@ def _run() -> int:
         ratio = (hk / ref) if ref > 0 else 0.0
         rows.append((f"grpBF16_{name}", hk, ref, ratio, "triton", "grp_bf16"))
 
+    # ── (6) Grouped FP8 tensorwise (vs TRITON) ──
+    # Same 16 MoE shapes as BF16 grouped (DeepSeek-V3 + gpt_oss_20B). The
+    # baseline here is intentionally honest: HK FP8 lacks a native
+    # ``grouped_*_balanced`` entry, so HIPKITTEN currently per-group
+    # launches dense — slow at large B. PASS requires the agent to add
+    # the native HK FP8 grouped binding.
+    for (name, B, M, N, K) in GROUPED_BF16_SHAPES:
+        ref = _bench_grouped_fp8(B, M, N, K, backend=TRT)
+        hk = _bench_grouped_fp8(B, M, N, K, backend=HK)
+        ratio = (hk / ref) if ref > 0 else 0.0
+        rows.append((f"grpFP8_{name}", hk, ref, ratio, "triton", "grp_fp8"))
+
     wall = time.monotonic() - t0
 
     # Print per-shape table to stderr so the auto_optimize log captures it
@@ -519,7 +588,7 @@ def _run() -> int:
     for name, hk, ref, r, ref_name, _section in rows:
         if r == 0:
             flag = "  *reject"
-        elif name.startswith("FP8bwd_") or name.startswith("grpBF16_"):
+        elif name.startswith("FP8bwd_") or name.startswith("grpBF16_") or name.startswith("grpFP8_"):
             flag = "" if r >= 1.20 else ("  <120%")
         else:
             flag = "" if r >= 0.97 else ("  <97%")
@@ -540,6 +609,7 @@ def _run() -> int:
     g_fp8_fwd, n_fp8_fwd = _section_geomean("fp8_fwd")
     g_fp8_bwd, n_fp8_bwd = _section_geomean("fp8_bwd")
     g_grp_bf16, n_grp_bf16 = _section_geomean("grp_bf16")
+    g_grp_fp8, n_grp_fp8 = _section_geomean("grp_fp8")
 
     for label, g, n in [
         ("BF16_fwd  vs hipblaslt", g_bf16_fwd, n_bf16_fwd),
@@ -547,6 +617,7 @@ def _run() -> int:
         ("FP8_fwd   vs hipblaslt", g_fp8_fwd, n_fp8_fwd),
         ("FP8_bwd   vs triton   ", g_fp8_bwd, n_fp8_bwd),
         ("grp_BF16  vs triton   ", g_grp_bf16, n_grp_bf16),
+        ("grp_FP8   vs triton   ", g_grp_fp8, n_grp_fp8),
     ]:
         if n:
             print(
@@ -554,12 +625,14 @@ def _run() -> int:
                 file=sys.stderr,
             )
 
-    # Five-goal acceptance per project policy:
+    # Six-goal acceptance per project policy:
     #   (1) BF16_fwd  vs hipblaslt >= 0.97
     #   (2) BF16_bwd  vs hipblaslt >= 0.97
     #   (3) FP8_fwd   vs hipblaslt >= 0.97
     #   (4) FP8_bwd   vs triton    >= 1.20
     #   (5) grp_BF16  vs triton    >= 1.20
+    #   (6) grp_FP8   vs triton    >= 1.20  (requires native HK FP8
+    #       grouped kernel — see _bench_grouped_fp8 docstring)
     print("[metric_hk_ratio] Goals:", file=sys.stderr)
     goals = [
         ("(1) BF16_fwd  vs hipblaslt >= 0.97", g_bf16_fwd, 0.97, n_bf16_fwd),
@@ -567,6 +640,7 @@ def _run() -> int:
         ("(3) FP8_fwd   vs hipblaslt >= 0.97", g_fp8_fwd, 0.97, n_fp8_fwd),
         ("(4) FP8_bwd   vs triton    >= 1.20", g_fp8_bwd, 1.20, n_fp8_bwd),
         ("(5) grp_BF16  vs triton    >= 1.20", g_grp_bf16, 1.20, n_grp_bf16),
+        ("(6) grp_FP8   vs triton    >= 1.20", g_grp_fp8, 1.20, n_grp_fp8),
     ]
     n_pass = 0
     for label, g, target, n in goals:
@@ -579,10 +653,10 @@ def _run() -> int:
             file=sys.stderr,
         )
 
-    # Score is the geomean over all 5 section-geomeans, scaled to int
+    # Score is the geomean over all 6 section-geomeans, scaled to int
     # (one per goal so each section weighs equally regardless of n).
     # This is just an auto_optimize ranking signal — acceptance is the
-    # 5-goal PASS/FAIL above, not score.
+    # 6-goal PASS/FAIL above, not score.
     section_geomeans = [g for _, g, _, n in goals if n]
     if section_geomeans:
         section_geo = math.exp(
@@ -595,13 +669,16 @@ def _run() -> int:
     n_reject = sum(1 for _n, _, _, r, _ref, _s in rows if r == 0)
     n_below = sum(
         1 for n, _, _, r, _ref, _s in rows
-        if 0 < r < (1.20 if (n.startswith("FP8bwd_") or n.startswith("grpBF16_")) else 0.97)
+        if 0 < r < (
+            1.20 if (n.startswith("FP8bwd_") or n.startswith("grpBF16_") or n.startswith("grpFP8_"))
+            else 0.97
+        )
     )
 
     print(
         f"[metric_hk_ratio] section_geomean={section_geo:.4f}  "
         f"reject={n_reject}/{len(rows)}  below_target={n_below}/{len(rows)}  "
-        f"goals={n_pass}/5  score={score}",
+        f"goals={n_pass}/6  score={score}",
         file=sys.stderr,
     )
 

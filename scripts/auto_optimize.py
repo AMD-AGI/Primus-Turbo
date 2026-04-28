@@ -66,14 +66,15 @@ from typing import Optional
 DEFAULT_MODEL = "claude-opus-4-7-thinking-max"
 DEFAULT_SKILL = "/root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 DEFAULT_TASK = (
-    "**最终目标**（5 段独立判定，每段都必须 PASS；看 metric stderr 的 "
-    "`Goals:` 5 行 PASS/FAIL）：\n"
+    "**最终目标**（6 段独立判定，每段都必须 PASS；看 metric stderr 的 "
+    "`Goals:` 6 行 PASS/FAIL）：\n"
     "  (1) **BF16_fwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM forward (8 shape)\n"
     "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape)\n"
     "  (3) **FP8_fwd  vs HIPBLASLT** ≥ 0.97 —— dense FP8 tensorwise GEMM forward (8 shape)\n"
     "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape)\n"
-    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B)\n\n"
-    "5 段全 PASS 才算交付；metric score (= 5 段 geomean 的 geomean × 1000) 只"
+    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B)\n"
+    "  (6) **grp_FP8  vs TRITON**    ≥ 1.20 —— grouped FP8 tensorwise GEMM (同 16 shape)\n\n"
+    "6 段全 PASS 才算交付；metric score (= 6 段 geomean 的 geomean × 1000) 只"
     "是 auto_optimize 的 ranking 信号，**不是验收标准**。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
     "**核心架构方向（必读，决定本轮所有判断）**\n"
@@ -109,15 +110,15 @@ DEFAULT_TASK = (
     "     **开发者手动**把结论写回 `select_default_config` 的规则里，**结果不存盘**。\n"
     "     不是 runtime 路径 —— 第一刀做完后再考虑，可选。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
-    "**Baseline = 53** / 5 goals = 0 PASS（2026-04-28 reset 后的诚实起点）：\n"
-    "  • BF16_fwd  (8)  geomean=0.319 vs HIPBLASLT  ← dispatch overhead 把小 GEMM 拖死\n"
-    "  • BF16_bwd  (8)  geomean=0.014 vs HIPBLASLT  ← 7/8 reject\n"
-    "  • FP8_fwd   (8)  geomean=0.366 vs HIPBLASLT  ← 同 overhead 问题\n"
-    "  • FP8_bwd   (8)  geomean=0.014 vs TRITON     ← 7/8 reject\n"
-    "  • grp_BF16 (16)  geomean=0.018 vs TRITON     ← 14/16 reject\n"
-    "现在 reject 全部源于 'backend 通过 lookup .json 找 entry 来兜底，cache miss → reject' —— \n"
-    "**新架构下这种 reject 应该消失**：select_default_config 永远返回一个 cfg，kernel 永远能跑。\n"
-    "dispatch overhead 也消失：当前 ~0.6 ms 是 reparse json，新架构下是 ~us 的 if/else。\n\n"
+    "**ROUND 1 起点 = 545** / 6 goals = 0 PASS（架构第一/二刀完成后的实测）：\n"
+    "  • BF16_fwd  (8)   geomean=0.937 vs HIPBLASLT  ← 离 0.97 一步之遥\n"
+    "  • BF16_bwd  (8)   geomean=0.739 vs HIPBLASLT  ← bwd 走 3 次 dispatch，还有 host overhead\n"
+    "  • FP8_fwd   (8)   geomean=0.918 vs HIPBLASLT  ← 离 0.97 一步之遥\n"
+    "  • FP8_bwd   (8)   geomean=0.775 vs TRITON     ← 距 1.20 远；HK FP8 CRR kernel 慢\n"
+    "  • grp_BF16 (16)   geomean=0.098 vs TRITON     ← gpt_oss_20B 的 8/16 因 N=K=2880 不对齐 256/128 被 reject\n"
+    "  • grp_FP8  (16)   geomean=?     vs TRITON     ← 还没测过；HK FP8 .so 没有 grouped binding，per-group launch 必慢\n"
+    "新架构下 reject 全部源于**真硬约束**（dtype / layout / tile alignment），不再有 cache miss 类\n"
+    "假 reject。**收紧 can_handle 反而扣分**：reject → ratio clip 0.01 → 整段 geomean 塌掉。\n\n"
     "**严禁的『假优化』模式**（违反 = 本轮立即作废）：\n"
     "  ✗ **runtime 读任何 .json / .pkl / .autotune_cache.json**（开发期 bench 用、归纳完后\n"
     "    runtime 不再 import；任何 hipkitten 路径上看到 `json.load`/`pickle.load` 都是违规）\n"
@@ -126,6 +127,14 @@ DEFAULT_TASK = (
     "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（**通用规则**才允许，\n"
     "    例如 `if K>=4096`、`if min(tiles)<16`、`if N>=K`）\n"
     "  ✗ 收紧 can_handle 把难 shape 排除掉（geomean clip 0.01，分数立刻塌）\n"
+    "  ✗ **grouped 路径严禁判 balanced**：HK 的 `grouped_{rcr,rrr,crr}_balanced` binding 命名上叫\n"
+    "    'balanced' 是 launcher 的实现细节，不是 can_handle 的资格条件。**严禁**在\n"
+    "    `GroupedGEMM*HipKittenBackend.can_handle` / Primus dispatch 路径里加任何形如\n"
+    "    `_is_balanced_group_lens(group_lens)` / `all(g==g[0] for g in group_lens)` 的检查\n"
+    "    去 reject 不平衡的输入 —— 真实 MoE 训练里 group_lens 永远是稀疏不平衡的。\n"
+    "    HK kernel 必须能跑任意 group_lens；如果当前 launcher 假设 balanced，要么改 launcher\n"
+    "    支持 unbalanced（用 cumulative offsets 显式传），要么在 Primus 端用 per-group dense_run\n"
+    "    fallback —— 但 **can_handle 不准 reject**。这条规则同时覆盖 BF16 grouped 与新加的 FP8 grouped。\n"
     "  ✗ 只改 metric/test/config.py 文件让数字变好\n"
     "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值\n\n"
     "**两仓库分工**：\n"
@@ -520,28 +529,43 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
 【近 5 轮记录】
 {history_block}
 
-【优化方向 — phased 路线，第一刀必做】（"严禁假优化"清单已在【优化目标】里给出，请重读）
-  ✓ **第一刀（关键，缺它后面全做不动）**：在 `primus_turbo/pytorch/kernels/hipkitten/`
-    下新建 `config.py`，写纯函数：
-       `def select_default_config(M, N, K, layout, dtype) -> Config`
-    Config 含 group_m / num_xcds / kernel variant。**依据**：
-       /workspace/code/HipKittens/analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json (~58 行)
-       /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/.autotune_cache.json    (~177 行)
-    一次性 dump 出来线下看，归纳 (M,N,K,layout) → cfg 的分布成几条 **if/else 通用规则**
-    （不是 233 行查表）。参考 `primus_turbo/triton/gemm/gemm_kernel.py::offline_select_bf16`
-    （186 entry → 几条 if/else）的归纳风格。
-  ✓ 第二刀：改 `loader.py` + `dispatch.py` + `gemm_impl.py` / `gemm_fp8_impl.py`，
-    **删除所有 json.load / pickle.load 路径**。loader 只做：import .so → 暴露 kernel binding。
-    backend 用 `select_default_config` 拿 cfg 直接 launch。
-    `can_handle` 只查 dtype / layout / alignment 这种**硬约束**，不再查"是否命中 cache"。
-  ✓ 第三刀：扩 backward layout 覆盖 —— 在 select_default_config 里加 RRR / CRR 层的规则；
-    对应在 HipKittens 那边补齐 backward layout 的 kernel binding（如果还没有的话）。
-  ✓ 第四刀：扩 grouped 覆盖 —— grouped 路径同样用 select_default_config 风格的规则。
-  ✓ HipKittens kernel 改写（任意时刻可做，不依赖前 4 刀）：改 .cpp 的 tile/wave/swizzle/
+【优化方向 — phased 路线】（"严禁假优化"清单已在【优化目标】里给出，请重读）
+  ✓ 第一刀 / 第二刀 已完成（commit `1970d91`）：rule-based dispatch + 删 runtime JSON cache lookups。
+    `select_default_config` 在 `primus_turbo/pytorch/kernels/hipkitten/config.py`，runtime 不再 parse
+    任何 JSON/pickle。后面所有的提速都建立在这个基础上 —— **不要回退它**。
+  ☐ 第三刀（接下来 1-2 轮）：BF16/FP8 fwd 0.94 → 0.97，BF16_bwd 0.74 → 0.97。
+    这两段都是 dispatch host overhead 残余 + select_default_config 规则不够细的问题：
+      • BF16/FP8 fwd 4096x4096x4096 仅 0.888 —— 看是 (a) host overhead vs (b) tile cfg 不优；
+      • BF16_bwd 走 fwd + dA + dB 三次 dispatch，host overhead 累积；
+        可写专用 fused autograd 入口跳过中间 op-registration。
+    依据：用 stderr 表锁定 ratio < 0.97 的具体 shape，再调规则。
+  ☐ 第四刀：grp_BF16 0.098 → 1.20。8/16 reject 全部是 gpt_oss_20B (N=2880 / K=2880 不对齐 256/128 tile)。
+    两条路：(a) Primus 端写通用 pad-and-copy 处理非对齐 grouped (会有 overhead，但能解 8 个 case)；
+    (b) 在 HipKittens 仓库出 256/128/?(non-256 N) 兼容 tile 模板 (更彻底)。先 (a) 验证可行性。
+    **再次提醒：can_handle 严禁判 balanced**（见上面"严禁的『假优化』模式"）。
+  ☐ 第五刀（**新加，重点**）：grp_FP8 vs TRITON >= 1.20。HipKittens FP8 .so 当前**没有**
+    `grouped_*_balanced` binding，Primus 端 `GroupedGEMMFP8HipKittenBackend.execute` 是
+    per-group `dense_run` 循环 fallback —— B=32 时 launch overhead 会让它在 Triton 持久 kernel
+    面前直接崩盘。**修法**：
+      1. 在 `/workspace/code/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp` 末尾加 3 条
+         `m.def("grouped_{{rcr,rrr,crr}}_balanced", &grouped_..., ...)` binding —— 镜像 BF16 .so 暴露的
+         `grouped_{{rcr,rrr,crr}}_balanced` (你可以 `python -c "import tk_bf16_layouts; print(dir(tk_bf16_layouts))"`
+         确认 BF16 .so 有这些条目)。从命名一致性看，BF16 grouped launcher 是 'fixed M-per-group'
+         实现 —— 你的 FP8 grouped binding 不需要重复 BF16 那种假设，实现成支持任意
+         cumulative-offsets 的 grouped launcher 即可（这样 can_handle 永远不需要判 balanced）。
+      2. cd 到 mi350x，`source ../../../env.src && make -j`，重编 `tk_fp8_layouts.so`。
+      3. 在 Primus 端 `kernels/hipkitten/dispatch.py` 把 `grouped_run_balanced` 的 BF16-only assert 去掉，
+         FP8 grouped 走同一条原生 launcher。
+      4. 在 Primus 端 `kernels/grouped_gemm/grouped_gemm_fp8_impl.py::GroupedGEMMFP8HipKittenBackend.execute`
+         去掉 per-group for 循环，改成一次 `grouped_run_balanced` 调用。
+      5. **同步**把 `kernels/grouped_gemm/grouped_gemm_impl.py::GroupedGEMMHipKittenBackend.can_handle`
+         里的 `_is_balanced_group_lens(group_lens)` reject **删掉**（line 235 / 321 的两处），
+         以及 grouped_gemm_fp8_impl.py 那边对应的检查 —— 见"严禁的『假优化』模式"清单。
+  ☐ HipKittens kernel 改写（任意时刻可做，不依赖前 5 刀）：改 .cpp 的 tile/wave/swizzle/
     MFMA 排布，进 analysis/{{bf16,fp8}}_gemm/mi350x `source ../../../env.src && make -j`，
     生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so。提速来源：bank conflict、
     ds_read 吞吐、K_STEP 覆盖 K=128/256 倍数。
-  ✓ 可选第五刀：写 opt-in autotune 工具（开发期 sweep，结果只 print 不存盘 —— 开发者手动
+  ☐ 可选第六刀：写 opt-in autotune 工具（开发期 sweep，结果只 print 不存盘 —— 开发者手动
     把 winning config 写回 select_default_config 规则）。
 
 【典型流程示例（按新架构）】
