@@ -51,10 +51,11 @@ def fp8_has_dscale(hk: HipKittenModule, layout: str) -> bool:
     """Return True if ``hk.module`` exposes a ``gemm_<layout>_dscale`` entry.
 
     Used by :class:`GEMMFP8HipKittenBackend.execute` to decide whether to
-    take the device-pointer scale path. Resolved with a fresh ``hasattr``
-    on every call — no memoization.
+    take the device-pointer scale path. The pre-resolved
+    ``hk.gemm_*_dscale`` attributes are populated at module-load time
+    (loader.py), so the runtime check is a single attribute load.
     """
-    return hasattr(hk.module, f"gemm_{layout}_dscale")
+    return hk.gemm_dscale(layout) is not None
 
 
 @contextlib.contextmanager
@@ -104,20 +105,40 @@ def dense_run(
     The device-tensor path uses the binding's ``gemm_<layout>_dscale``
     entry which reads the scales in-kernel and skips the ``.item()`` stream
     sync that the host-scalar path otherwise pays per dispatch.
+
+    The kernel callables (``hk.gemm_{rcr,rrr,crr}{_dscale}``) are
+    pre-resolved at module-load time (loader.py), so this dispatcher
+    issues no ``getattr`` per call.
     """
+    if hk.dtype == "bf16":
+        # Fast path: BF16 has no kernel-template knob, so we can skip
+        # the env-var context manager entirely. Pre-resolved attribute
+        # load via the dataclass.
+        hk.gemm(cfg.layout)(a, b, c, cfg.group_m, cfg.num_xcds)
+        return
+    # FP8 path. Apply the kernel-template env hack only when we have a
+    # non-None ``cfg.kernel`` to set (None on RRR/CRR, and on RCR rules
+    # that pick the binding default).
     rcr_kernel = cfg.kernel if cfg.layout == "rcr" else None
-    with force_rcr_kernel(rcr_kernel):
-        if hk.dtype == "bf16":
-            getattr(hk.module, f"gemm_{cfg.layout}")(a, b, c, cfg.group_m, cfg.num_xcds)
-            return
+    if rcr_kernel is None:
         if scale_a_dev is not None and scale_b_dev is not None:
-            fn_dscale = getattr(hk.module, f"gemm_{cfg.layout}_dscale", None)
+            fn_dscale = hk.gemm_dscale(cfg.layout)
             if fn_dscale is not None:
                 fn_dscale(a, b, c, scale_a_dev, scale_b_dev, cfg.group_m)
                 return
         if scale_a is None or scale_b is None:
             raise ValueError("HipKittens FP8 dense_run requires scale_a/scale_b or scale_*_dev")
-        getattr(hk.module, f"gemm_{cfg.layout}")(a, b, c, scale_a, scale_b, cfg.group_m)
+        hk.gemm(cfg.layout)(a, b, c, scale_a, scale_b, cfg.group_m)
+        return
+    with force_rcr_kernel(rcr_kernel):
+        if scale_a_dev is not None and scale_b_dev is not None:
+            fn_dscale = hk.gemm_dscale(cfg.layout)
+            if fn_dscale is not None:
+                fn_dscale(a, b, c, scale_a_dev, scale_b_dev, cfg.group_m)
+                return
+        if scale_a is None or scale_b is None:
+            raise ValueError("HipKittens FP8 dense_run requires scale_a/scale_b or scale_*_dev")
+        hk.gemm(cfg.layout)(a, b, c, scale_a, scale_b, cfg.group_m)
 
 
 def grouped_run_balanced(
@@ -131,9 +152,15 @@ def grouped_run_balanced(
 
     FP8 has no native grouped entrypoint, so the FP8 grouped backend
     implements grouped GEMM by looping :func:`dense_run` over the groups
-    in Python instead.
+    in Python instead. The grouped launchers are pre-resolved at
+    module-load time and exposed via :meth:`HipKittenModule.grouped_balanced`.
     """
     if hk.dtype != "bf16":
         raise ValueError("HipKittens grouped_run_balanced is BF16-only")
-    fn = getattr(hk.module, f"grouped_{cfg.layout}_balanced")
+    fn = hk.grouped_balanced(cfg.layout)
+    if fn is None:
+        raise AttributeError(
+            f"HipKittens BF16 binding does not expose grouped_{cfg.layout}_balanced; "
+            "rebuild tk_bf16_layouts.so or use the per-group dense_run fallback."
+        )
     fn(a, b, c, cfg.group_m, cfg.num_xcds)
