@@ -22,6 +22,7 @@ from primus_turbo.pytorch.kernels.hipkitten.config import (
 from primus_turbo.pytorch.kernels.hipkitten.dispatch import (
     dense_run,
     force_rcr_kernel,
+    fp8_has_dscale,
     grouped_run_balanced,
 )
 from primus_turbo.pytorch.kernels.hipkitten.layout import (
@@ -44,6 +45,7 @@ __all__ = [
     "aligned_for",
     "dense_run",
     "force_rcr_kernel",
+    "fp8_has_dscale",
     "grouped_run_balanced",
     "has_bf16",
     "has_fp8",
