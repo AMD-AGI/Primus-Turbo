@@ -5,7 +5,6 @@
 ###############################################################################
 
 import torch
-import os
 
 from primus_turbo.pytorch.core.backend import (
     BackendEntry,
@@ -20,10 +19,8 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
-    _load_hipkitten_fp8,
-    _scale_to_float,
-)
+from primus_turbo.pytorch.kernels import hipkitten
+from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import _scale_to_float
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -56,43 +53,12 @@ def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
     return [int(x) for x in group_offs.detach().cpu().tolist()]
 
 
-def _aligned_for_hipkitten(m: int, n: int, k: int) -> bool:
-    return m % 256 == 0 and n % 256 == 0 and k % 128 == 0
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _round_up(a: int, b: int) -> int:
-    return _ceil_div(a, b) * b
-
-
-def _hipkitten_fp8_padded_shape(m: int, n: int, k: int) -> tuple[int, int, int]:
-    return _round_up(m, 256), _round_up(n, 256), _round_up(k, 128)
-
-
 def _pad_2d(x: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     if x.shape[0] == rows and x.shape[1] == cols:
         return x
     out = torch.zeros((rows, cols), dtype=x.dtype, device=x.device)
     out[: x.shape[0], : x.shape[1]] = x
     return out
-
-
-def _hipkitten_fp8_cache_has(m: int, n: int, k: int, layout: str) -> bool:
-    _, cache = _load_hipkitten_fp8()
-    return f"{layout}_{m}_{n}_{k}" in cache
-
-
-def _hipkitten_fp8_entry(m: int, n: int, k: int, layout: str) -> dict:
-    _, cache = _load_hipkitten_fp8()
-    return cache.get(f"{layout}_{m}_{n}_{k}", {})
-
-
-def _hipkitten_fp8_group_m(module, m: int, n: int, k: int, layout: str) -> int:
-    entry = _hipkitten_fp8_entry(m, n, k, layout)
-    return int(entry.get("group_m", getattr(module, "DEFAULT_GROUP_M", 4)))
 
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
@@ -335,57 +301,46 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        module, _ = _load_hipkitten_fp8()
+        hk = hipkitten.load_fp8()
         offs = _group_offsets_cpu(group_offs)
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
         out = torch.zeros((a.shape[0], n), dtype=out_dtype, device=a.device)
         scale_a = _scale_to_float(a_scales)
         scale_b = _scale_to_float(b_scales)
+        layout = "rcr" if trans_b else "rrr"
         for group_idx in range(b.shape[0]):
             start, end = offs[group_idx], offs[group_idx + 1]
             m = end - start
-            m_pad, n_pad, k_pad = _hipkitten_fp8_padded_shape(m, n, k)
-            if trans_b:
-                entry = _hipkitten_fp8_entry(m_pad, n_pad, k_pad, "rcr")
-                group_m = int(entry.get("group_m", getattr(module, "DEFAULT_GROUP_M", 4)))
-                kernel = str(entry.get("kernel", "8"))
-                prev = os.environ.get("TK_RCR_FORCE_KERNEL")
-                os.environ["TK_RCR_FORCE_KERNEL"] = kernel
-                try:
-                    if (m_pad, n_pad, k_pad) == (m, n, k):
-                        module.gemm_rcr(a[start:end].contiguous(), b[group_idx].contiguous(), out[start:end], scale_a, scale_b, group_m)
-                    else:
-                        out_pad = torch.zeros((m_pad, n_pad), dtype=out_dtype, device=a.device)
-                        module.gemm_rcr(
-                            _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
-                            _pad_2d(b[group_idx].contiguous(), n_pad, k_pad),
-                            out_pad,
-                            scale_a,
-                            scale_b,
-                            group_m,
-                        )
-                        out[start:end].copy_(out_pad[:m, :n])
-                finally:
-                    if prev is None:
-                        os.environ.pop("TK_RCR_FORCE_KERNEL", None)
-                    else:
-                        os.environ["TK_RCR_FORCE_KERNEL"] = prev
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "fp8")
+            cfg = hipkitten.lookup(hk, layout, m_pad, n_pad, k_pad)
+            if (m_pad, n_pad, k_pad) == (m, n, k):
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    a[start:end].contiguous(),
+                    b[group_idx].contiguous(),
+                    out[start:end],
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                )
             else:
-                group_m = _hipkitten_fp8_group_m(module, m_pad, n_pad, k_pad, "rrr")
-                if (m_pad, n_pad, k_pad) == (m, n, k):
-                    module.gemm_rrr(a[start:end].contiguous(), b[group_idx].contiguous(), out[start:end], scale_a, scale_b, group_m)
-                else:
-                    out_pad = torch.zeros((m_pad, n_pad), dtype=out_dtype, device=a.device)
-                    module.gemm_rrr(
-                        _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
-                        _pad_2d(b[group_idx].contiguous(), k_pad, n_pad),
-                        out_pad,
-                        scale_a,
-                        scale_b,
-                        group_m,
-                    )
-                    out[start:end].copy_(out_pad[:m, :n])
+                # Pad-and-slice once per group: HipKittens kernels need M/N
+                # multiples of 256 and K of 128, but the per-group payload is
+                # rarely already aligned (especially the trailing remainder).
+                b_pad_rows = n_pad if trans_b else k_pad
+                b_pad_cols = k_pad if trans_b else n_pad
+                out_pad = torch.zeros((m_pad, n_pad), dtype=out_dtype, device=a.device)
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
+                    _pad_2d(b[group_idx].contiguous(), b_pad_rows, b_pad_cols),
+                    out_pad,
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                )
+                out[start:end].copy_(out_pad[:m, :n])
         return out
 
 
@@ -506,7 +461,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        module, _ = _load_hipkitten_fp8()
+        hk = hipkitten.load_fp8()
         offs = _group_offsets_cpu(group_offs)
         group_num = group_lens.numel()
         n = b.shape[1]
@@ -518,19 +473,28 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         for group_idx in range(group_num):
             start, end = offs[group_idx], offs[group_idx + 1]
             m = end - start
-            m_pad, n_pad, k_pad = _hipkitten_fp8_padded_shape(n, k, m)
-            group_m = _hipkitten_fp8_group_m(module, m_pad, n_pad, k_pad, "crr")
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(n, k, m, "crr", "fp8")
+            cfg = hipkitten.lookup(hk, "crr", m_pad, n_pad, k_pad)
             if (m_pad, n_pad, k_pad) == (n, k, m):
-                module.gemm_crr(b[start:end].contiguous(), a[start:end].contiguous(), out[group_idx], scale_grad, scale_a, group_m)
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    b[start:end].contiguous(),
+                    a[start:end].contiguous(),
+                    out[group_idx],
+                    scale_a=scale_grad,
+                    scale_b=scale_a,
+                )
             else:
                 out_pad = torch.zeros((m_pad, n_pad), dtype=out_dtype, device=a.device)
-                module.gemm_crr(
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
                     _pad_2d(b[start:end].contiguous(), k_pad, m_pad),
                     _pad_2d(a[start:end].contiguous(), k_pad, n_pad),
                     out_pad,
-                    scale_grad,
-                    scale_a,
-                    group_m,
+                    scale_a=scale_grad,
+                    scale_b=scale_a,
                 )
                 out[group_idx].copy_(out_pad[:n, :k])
         return out

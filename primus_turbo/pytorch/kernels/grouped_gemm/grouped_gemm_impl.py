@@ -14,7 +14,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_impl import _load_hipkitten_module
+from primus_turbo.pytorch.kernels import hipkitten
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -28,17 +28,8 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _HIPKITTEN_SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
-def _hipkitten_grouped_cfg(m: int, n: int, k: int, layout: str) -> tuple[int, int]:
-    _, cache = _load_hipkitten_module()
-    return cache.get((m, n, k), {}).get(layout, (1, 2))
-
-
-def _aligned_for_hipkitten(m: int, n: int, k: int) -> bool:
-    return m % 256 == 0 and n % 256 == 0 and k % 64 == 0
-
-
 def _grouped_bf16_supported(m: int, n: int, k: int, layout: str) -> bool:
-    if not _aligned_for_hipkitten(m, n, k):
+    if not hipkitten.aligned_for(m, n, k, "bf16"):
         return False
     # Validated under benchmark strict allclose gate.
     if layout == "rcr":
@@ -63,25 +54,6 @@ def _grouped_bf16_supported_with_groups(group_count: int, m: int, n: int, k: int
     if group_count >= 32 and m < 4096:
         return False
     return _grouped_bf16_supported(m, n, k, layout)
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _round_up(a: int, b: int) -> int:
-    return _ceil_div(a, b) * b
-
-
-def _hipkitten_bf16_padded_shape(m: int, n: int, k: int, layout: str) -> tuple[int, int, int]:
-    m_pad = _round_up(m, 256)
-    n_pad = _round_up(n, 256)
-    k_pad = _round_up(k, 64)
-    if layout == "rrr":
-        n_pad = max(n_pad, 4096)
-    if layout == "crr":
-        k_pad = max(k_pad, 4096)
-    return m_pad, n_pad, k_pad
 
 
 def _pad_2d(x: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -302,7 +274,7 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> torch.Tensor:
-        hipkitten, _ = _load_hipkitten_module()
+        hk = hipkitten.load_bf16()
         n = b.shape[-2] if trans_b else b.shape[-1]
         out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
         m = int(group_lens[0].item())
@@ -311,34 +283,34 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         if not _grouped_bf16_supported_with_groups(b.shape[0], m, n, k, layout):
             raise ValueError(f"HipKitten grouped GEMM unsupported shape M={m}, N={n}, K={k}")
         if trans_b:
-            group_m, num_xcds = _hipkitten_grouped_cfg(m, n, k, "rcr")
-            hipkitten.grouped_rcr_balanced(a.contiguous(), b.contiguous(), out, group_m, num_xcds)
+            cfg = hipkitten.lookup(hk, "rcr", m, n, k)
+            hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
         else:
-            m_pad, n_pad, k_pad = _hipkitten_bf16_padded_shape(m, n, k, "rrr")
-            group_m, num_xcds = _hipkitten_grouped_cfg(m_pad, n_pad, k_pad, "rrr")
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, "rrr", "bf16")
+            cfg = hipkitten.lookup(hk, "rrr", m_pad, n_pad, k_pad)
             if (m_pad, n_pad, k_pad) == (m, n, k):
-                hipkitten.grouped_rrr_balanced(a.contiguous(), b.contiguous(), out, group_m, num_xcds)
+                hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
             else:
                 # HipKittens BF16 kernels can have a one-time per-shape setup miss on the first call.
                 # Warm up on scratch so the first real group is not the cold launch.
                 warmup_out = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
-                hipkitten.gemm_rrr(
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
                     _pad_2d(a[:m].contiguous(), m_pad, k_pad),
                     _pad_2d(b[0].contiguous(), k_pad, n_pad),
                     warmup_out,
-                    group_m,
-                    num_xcds,
                 )
                 offs = _group_offsets_cpu(group_offs)
                 for group_idx in range(b.shape[0]):
                     start, end = offs[group_idx], offs[group_idx + 1]
                     out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
-                    hipkitten.gemm_rrr(
+                    hipkitten.dense_run(
+                        hk,
+                        cfg,
                         _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
                         _pad_2d(b[group_idx].contiguous(), k_pad, n_pad),
                         out_pad,
-                        group_m,
-                        num_xcds,
                     )
                     out[start:end].copy_(out_pad[:m, :n])
         return out
@@ -386,7 +358,7 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> torch.Tensor:
-        hipkitten, _ = _load_hipkitten_module()
+        hk = hipkitten.load_bf16()
         group_num = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
@@ -394,8 +366,8 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         m = int(group_lens[0].item())
         if not _grouped_bf16_supported(n, k, m, "crr"):
             raise ValueError(f"HipKitten grouped GEMM dB unsupported shape M={m}, N={n}, K={k}")
-        group_m, num_xcds = _hipkitten_grouped_cfg(n, k, m, "crr")
-        hipkitten.grouped_crr_balanced(b.contiguous(), a.contiguous(), out, group_m, num_xcds)
+        cfg = hipkitten.lookup(hk, "crr", n, k, m)
+        hipkitten.grouped_run_balanced(hk, cfg, b.contiguous(), a.contiguous(), out)
         return out
 
 
