@@ -234,6 +234,70 @@ def _worker_dispatch_combine_bwd_bf16(rank, world_size):
     assert bwd_diff < 5e-6, f"Rank {rank}: backward diff={bwd_diff}"
 
 
+def _worker_eval_shape(rank, world_size):
+    """Verify jax.eval_shape traces dispatch/combine without crashing.
+
+    Reproduces the TracerArrayConversionError that occurred when
+    jax.eval_shape traced through moe_dispatch -> ensure_deepep_runtime
+    -> process_allgather -> np.asarray(tracer).
+
+    The fix requires:
+      1. warmup() before tracing (eagerly bootstraps IPC buffers), and
+      2. Tracer guard inside _moe_dispatch_impl (skips bootstrap during tracing).
+    """
+    jax_mod, jnp, np = _init_per_process()
+    from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, warmup
+
+    num_experts = _EXPERTS_PER_RANK * world_size
+
+    hidden_bytes = _HIDDEN * jnp.dtype(jnp.bfloat16).itemsize
+    warmup(hidden_bytes)
+
+    def model_fn(x, topk_idx, topk_weights):
+        recv_x, _, _, handle = moe_dispatch(
+            x, topk_idx, topk_weights, num_experts
+        )
+        combined_x = moe_combine(recv_x, handle)
+        return combined_x
+
+    x_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _HIDDEN), jnp.bfloat16)
+    idx_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.int32)
+    weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
+
+    out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
+    assert out_shape.shape[1] == _HIDDEN, (
+        f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
+    )
+
+
+def _worker_eval_shape_no_warmup(rank, world_size):
+    """Verify that eval_shape WITHOUT warmup also does not crash.
+
+    The tracer guard alone should prevent the TracerArrayConversionError.
+    IPC buffers won't be ready, but eval_shape only needs shapes, not data.
+    """
+    jax_mod, jnp, np = _init_per_process()
+    from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
+
+    num_experts = _EXPERTS_PER_RANK * world_size
+
+    def model_fn(x, topk_idx, topk_weights):
+        recv_x, _, _, handle = moe_dispatch(
+            x, topk_idx, topk_weights, num_experts
+        )
+        combined_x = moe_combine(recv_x, handle)
+        return combined_x
+
+    x_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _HIDDEN), jnp.bfloat16)
+    idx_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.int32)
+    weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
+
+    out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
+    assert out_shape.shape[1] == _HIDDEN, (
+        f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test class
 # ---------------------------------------------------------------------------
@@ -265,3 +329,15 @@ class TestPerProcessDispatchCombine(JaxMultiProcessTestCase):
         """BF16 backward: jax.vjp round-trip gradient check."""
         self._skip_if_insufficient_gpus()
         self.run_multiprocess(_worker_dispatch_combine_bwd_bf16)
+
+    @pytest.mark.multigpu
+    def test_eval_shape_with_warmup(self):
+        """jax.eval_shape after warmup(): shape inference without TracerArrayConversionError."""
+        self._skip_if_insufficient_gpus()
+        self.run_multiprocess(_worker_eval_shape)
+
+    @pytest.mark.multigpu
+    def test_eval_shape_no_warmup(self):
+        """jax.eval_shape without warmup(): tracer guard alone prevents crash."""
+        self._skip_if_insufficient_gpus()
+        self.run_multiprocess(_worker_eval_shape_no_warmup)

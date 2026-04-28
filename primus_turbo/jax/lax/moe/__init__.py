@@ -9,4 +9,5 @@ from .moe_dispatch_combine import (
     get_dispatch_config,
     moe_combine,
     moe_dispatch,
+    warmup,
 )
