@@ -101,12 +101,28 @@ the round-7 commit message):
         the tiles_m == tiles_n constraint.
   * FP8 (analysis/fp8_gemm/mi350x/.autotune_cache.json, 48 shapes x 3
     layouts): much tighter distribution -- ``group_m`` is 4 in 60% of RCR
-    entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries
-    (the two outliers are for tn>=86 with K==4096, where "4" wins). Rules:
+    entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries.
+    Rules:
       - default ``(group_m=4, kernel="8")``
-      - ``kernel="4"`` when ``layout=="rcr"`` AND ``N//256 >= 86`` AND
-        ``K <= 4096`` (covers the M=4096,N=22016,K=4096 and
-        M=8192,N=28672,K=4096 outliers).
+    Round 4 update (2026-04-28): the round-1 ``kernel="4"`` outlier rule
+    keyed on ``layout=="rcr" and tiles_n>=86 and K<=4096`` (covering
+    ``(4096,22016,4096)`` and ``(8192,28672,4096)``) is REMOVED — it
+    was based on the offline cache's ``ms`` numbers, which were taken
+    against an older HipKittens FP8 ``.so``. Re-bench on the current
+    .so (HK SHA bf6b0cf9 "switch large-N RCR autotune cache to 4-wave
+    kernel for two LLM shapes" — note the cache was bumped, not the
+    kernel template selector code) shows ``kernel="8"`` wins on both
+    metric shapes by a clear margin:
+      - ``(4096, 22016, 4096)``: (gm=4, k="8") = 2551.0 TF vs
+        (gm=4, k="4") = 2475.4 TF (+3.05pp; see /tmp/sweep_fp8_fwd_round4_v3.log)
+      - ``(8192, 28672, 4096)``: (gm=4, k="8") = 2579.6 TF vs
+        (gm=4, k="4") = 2533.6 TF (+1.81pp)
+    Numerically, switching kernel="4"->"8" is bit-identical on these
+    two shapes (cross max_abs = 0.0000, SNR = 49.61 dB unchanged; see
+    /tmp/probe_fp8_round4.log) — the kernel template only affects the
+    schedule, not the precision. With the rule gone every aligned RCR
+    FP8 call falls through to the binding default, which the rest of
+    the cache (46/48 entries) already endorses.
 
 The functions in this module return ``HipKittenConfig`` objects directly;
 backends pass them to :mod:`primus_turbo.pytorch.kernels.hipkitten.dispatch`
@@ -278,17 +294,12 @@ def select_default_config(
         )
 
     # FP8: kernel template ID matters only for RCR (the binding ignores it
-    # for RRR / CRR), and the offline cache shows kernel="8" wins on 46/48
-    # RCR entries. The two outliers are long-skinny shapes with shallow K
-    # (tiles_n>=86 and K<=4096), where "4" wins. Encode that as a single
-    # rule keyed on (N // 256, K) tile-count buckets — generic over shapes,
-    # not a per-shape lookup.
-    kernel: str | None = None
-    if layout == "rcr":
-        kernel = _FP8_DEFAULT_KERNEL
-        tiles_n = n // 256
-        if tiles_n >= 86 and k <= 4096:
-            kernel = "4"
+    # for RRR / CRR). The offline cache shows kernel="8" wins on 46/48
+    # RCR entries; round 4 confirmed by direct re-bench that the two
+    # historical "4"-winning entries (long-N + shallow K) flipped to
+    # "8" on the current HK .so, so RCR uniformly picks the binding
+    # default and there is no FP8-specific exception rule.
+    kernel = _FP8_DEFAULT_KERNEL if layout == "rcr" else None
 
     return HipKittenConfig(
         layout=layout,
