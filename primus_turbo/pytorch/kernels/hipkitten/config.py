@@ -27,7 +27,11 @@ Rule derivation summary (cross-referenced offline at round 1 / round 3,
 extended at round 5 from a direct microbench sweep over the 5 BF16_bwd
 metric shapes that fell <0.97 in round 4 — see /tmp/bench_bf16_bwd_round2.log
 archived in the round-5 commit message: 30 (group_m, num_xcds) candidates
-swept on each of 14 (layout, m, n, k) tuples, picking empirical max):
+swept on each of 14 (layout, m, n, k) tuples, picking empirical max;
+extended again at round 7 with a 30-config sweep over the BF16_bwd /
+BF16_fwd shapes that still fell <0.97 / <0.97 — see
+/tmp/bench_bwd_sweep.log + /tmp/bench_rule_validation.log archived in
+the round-7 commit message):
   * BF16 (analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json, 48 shapes
     x 3 layouts = 144 cache entries): the autotune-winning ``(group_m,
     num_xcds)`` pair is wide across shapes -- {1..24} for ``group_m`` and
@@ -68,6 +72,33 @@ swept on each of 14 (layout, m, n, k) tuples, picking empirical max):
         (2, 32). Anchor: dB-after-swap (4096, 14336, 8192) — bench
         1330.2 vs default 1313.2 = +1.3pp. The rule is intentionally
         ``crr``-scoped to avoid colliding with ``rrr``-only patterns.
+  * Round 7 — BF16 forward RCR rules covering the 4 "long-N" /
+    "deep-K skinny" forward shapes that still fell ``<0.97`` after
+    round 5 (cube + skinny-tall covered only the 2 small-tile cases):
+      - ``rcr`` and ``tiles_n >= 86`` and ``k <= 4096``: (24, 2). Covers
+        ``(4096,22016,4096)``, ``(4096,28672,4096)``, ``(8192,22016,4096)``,
+        ``(8192,28672,4096)``. 30-config sweep on all 4 shapes shows
+        ``(24, 2)`` ties or wins for each (gains: +1.6pp / +1.2pp /
+        +2.6pp / +1.0pp over default ``(4, 8)``). Cache configs vary
+        across these four shapes — (24,2) / (4,16) / (2,32) / (16,4) —
+        but the empirical sweep collapses them to a single winner.
+      - ``rcr`` and ``tiles_m == 32`` and ``tiles_n == 16`` and
+        ``k >= 11008``: (2, 32). Covers ``(8192,4096,11008)`` and
+        ``(8192,4096,14336)``. Same config the existing skinny-tall
+        rule picks at ``k <= 4096`` — keeps the rcr ``(32,16,*)``
+        family coherent. Bench: +1.7pp on k=11008, +1.9pp on k=14336.
+  * Round 7 — BF16 backward RRR additions for the dA shapes that fall
+    through to default in BF16_bwd:
+      - ``rrr`` and ``tiles_m <= 16`` and ``tiles_m == tiles_n`` and
+        ``12288 < k <= 32768``: (24, 2). Anchor: dA RRR
+        ``(4096, 4096, 22016)`` for fwd ``(4096, 22016, 4096)`` —
+        bench 1450.2 vs default 1433.8 = +1.1pp. Extends the cube
+        rule's K bound for the deeper-K tier of square cubes.
+      - ``rrr`` and ``tiles_m <= 16`` and ``32 <= tiles_n < 64`` and
+        ``k <= 4096``: (2, 32). Anchor: dA RRR ``(4096, 11008, 4096)``
+        for fwd ``(4096, 4096, 11008)`` — bench 1350.5 vs default
+        1322.6 = +2.1pp. Same config as the cube rule, just relaxes
+        the tiles_m == tiles_n constraint.
   * FP8 (analysis/fp8_gemm/mi350x/.autotune_cache.json, 48 shapes x 3
     layouts): much tighter distribution -- ``group_m`` is 4 in 60% of RCR
     entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries
@@ -140,7 +171,10 @@ def select_default_config(
         # 10-candidate microbench, then refined in round 5 with a wider
         # 30-candidate sweep on the 5 BF16_bwd Llama shapes that still
         # fell <0.97 (see /tmp/bench_bf16_bwd_round2.log archived in
-        # the round-5 commit message).
+        # the round-5 commit message). Round 7 added 4 more rules
+        # (rcr long-N, rcr deep-K skinny, rrr cube deep-K, rrr small-M
+        # medium-N) to push BF16_bwd above 0.97 — see
+        # /tmp/bench_rule_validation.log.
         tiles_m = m // 256
         tiles_n = n // 256
         if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
@@ -160,6 +194,37 @@ def select_default_config(
             # shape 8192x4096x4096. Cache rcr (2, 16); rrr/crr (2, 32);
             # we pick (2, 32) because it is within ~1pp of (2, 16) on
             # rcr and matches the rrr/crr backward-pass winners exactly.
+            return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "rcr" and tiles_n >= 86 and k <= 4096:
+            # Round-7 rule. Long-N RCR with shallow K — covers
+            # Llama-2-7B mlp_gate_up (4096x22016x4096) and gpt_oss /
+            # Llama-3 mlp variants (4096x28672x4096, 8192x22016x4096,
+            # 8192x28672x4096). 30-config sweep on all 4 shapes shows
+            # (24, 2) ties or wins each (gains +1.6 to +2.6pp over the
+            # binding default). The cache picks differ shape-by-shape
+            # (24,2 / 4,16 / 2,32 / 16,4) but the empirical sweep
+            # collapses them to a single robust winner.
+            return HipKittenConfig(layout=layout, group_m=24, num_xcds=2, kernel=None)
+        if layout == "rcr" and tiles_m == 32 and tiles_n == 16 and k >= 11008:
+            # Round-7 rule. Deep-K skinny RCR (32x16 grid). Covers
+            # Llama mlp_down forward shapes (8192x4096x11008,
+            # 8192x4096x14336). Same config as the skinny-tall rule
+            # at shallow K — keeps the (32,16,*) family coherent.
+            # Bench: +1.7pp on k=11008, +1.9pp on k=14336 over default.
+            return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "rrr" and tiles_m <= 16 and tiles_m == tiles_n and 12288 < k <= 32768:
+            # Round-7 rule. Deep-K cube RRR. Anchor: dA RRR
+            # (4096, 4096, 22016) for fwd (4096, 22016, 4096) —
+            # +1.1pp over default. Extends the cube rule (which
+            # caps at k<=12288) into the deeper-K tier without
+            # overlap.
+            return HipKittenConfig(layout=layout, group_m=24, num_xcds=2, kernel=None)
+        if layout == "rrr" and tiles_m <= 16 and 32 <= tiles_n < 64 and k <= 4096:
+            # Round-7 rule. Small-M medium-N shallow-K RRR. Anchor:
+            # dA RRR (4096, 11008, 4096) for fwd (4096, 4096, 11008)
+            # — +2.1pp over default. Same config as the cube rule;
+            # the tiles_n band intentionally excludes the >=64 family
+            # which the cache shows benefits from a different config.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
         if layout == "rrr" and tiles_m == 32 and tiles_n >= 32 and k <= 8192:
             # Tall-N RRR with tiles_m EXACTLY 32. Canonical: dA shape
