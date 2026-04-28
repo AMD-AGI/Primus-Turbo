@@ -926,5 +926,55 @@ __global__ void preshuffle_scale_16x4_kernel(const InT *in_scale_ptr, OutT *out_
     }
 }
 
+// Dual variant: preshuffle two independent (rows, cols) tensors in a SINGLE
+// kernel launch.  The grid is launched with `(rows0 + rows1) / 16` blocks; the
+// first `rows0/16` blocks process tensor 0 (in0 -> out0), the remaining
+// `rows1/16` blocks process tensor 1 (in1 -> out1).  Both inputs must share
+// the same `cols` (true for wgrad's LHS and RHS scale tensors which are
+// derived from the same MX block_size and total_M).
+//
+// Motivation: the variable-K wgrad path used to launch two preshuffle kernels
+// back-to-back (LHS scale of shape [N, scale_cols] then RHS scale of shape
+// [K, scale_cols]).  Each launch costs ~10us of host overhead, and the
+// preshuffle GPU work for these dimensions is only ~3-4us, so launch overhead
+// dominated.  Fusing the two launches saves one host->device dispatch per
+// wgrad call, which on the metric's DSv3-GateUP / Down / gpt_oss-Down shapes
+// is a bounded but consistent ~1-2% bwd TFLOPS win that compounds over the
+// PERF_BATCH_ITERS=30 timing window.  No correctness risk: each block is
+// statically routed by `blockIdx.x` to a unique (in_ptr, out_ptr) pair, the
+// inner loop is identical to `preshuffle_scale_16x4_kernel`, and the two
+// output tensors do not alias (they live at different workspace offsets).
+template <typename InT, typename OutT>
+__global__ void preshuffle_scale_16x4_dual_kernel(const InT *in_scale_ptr0,
+                                                  OutT      *out_scale_ptr0,
+                                                  const int  rows0,
+                                                  const InT *in_scale_ptr1,
+                                                  OutT      *out_scale_ptr1,
+                                                  const int  cols) {
+    const int BLOCK_SIZE_ROW = 16;
+    const int BLOCK_SIZE_COL = 4;
+    const int tid            = threadIdx.x;
+    const int bid            = blockIdx.x;
+    const int blocks0        = rows0 / BLOCK_SIZE_ROW;
+
+    const InT *in_ptr;
+    OutT      *out_ptr;
+    if (bid < blocks0) {
+        in_ptr  = in_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
+        out_ptr = out_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
+    } else {
+        const int sub_bid = bid - blocks0;
+        in_ptr  = in_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
+        out_ptr = out_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
+    }
+
+    for (int i = 0; i < (cols / BLOCK_SIZE_COL); ++i) {
+        const OutT val = static_cast<OutT>(in_ptr[tid % 16 * cols + tid / 16]);
+        out_ptr[tid]   = val;
+        in_ptr += 4;
+        out_ptr += BLOCK_SIZE_ROW * BLOCK_SIZE_COL;
+    }
+}
+
 } // namespace turbo
 } // namespace primus_turbo

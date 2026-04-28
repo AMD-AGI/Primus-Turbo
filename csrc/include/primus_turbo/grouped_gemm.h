@@ -128,16 +128,47 @@ template <typename AType, typename BType, typename CType> struct TurboGroupedGem
     // Computed host-side from group_lens by the wrapper.
     int32_t grid_x = 0;
 
+    // When true, the caller has already preshuffled `b_scale_ptr` into the
+    // 16x4 layout that `turbo_grouped_gemm_mxfp8_*_persistent_kernel` expects
+    // (via a previous `turbo_preshuffle_mxfp8_scale_16x4` call).  The launch
+    // skips the per-call B-scale preshuffle kernel and the workspace's
+    // `b_scale_preshuf` slot is unused.  Used by the Python wrapper to cache
+    // the preshuffle output across forward+dgrad calls when B is a weight.
+    bool b_scale_preshuffled = false;
+
     void       *workspace      = nullptr;
     size_t      workspace_size = 0;
     hipStream_t stream         = nullptr;
 };
 
+// When `b_scale_preshuffled` is true the caller has already preshuffled B's
+// E8M0 scales into the 16x4 uint32 layout the kernel expects (cached across
+// fwd+dgrad on the Python side because B is a weight tensor) and the kernel
+// will source `params.b_scale_ptr` directly, leaving the workspace's
+// `b_scale_preshuf` slot unused.  Skip allocating that slot — for the
+// DSv3-GateUP shape (G=16, N=4096, K=7168) this drops `~58.7 MB` of unused
+// workspace per call, halving the cudaMalloc/caching-allocator footprint and
+// the `at::empty(...)` cost on cache misses.  Default keeps backward-compat:
+// callers that don't yet pass the preshuffled flag still allocate the union.
 size_t turbo_grouped_gemm_mxfp8_workspace_size(int32_t total_m, int32_t group_num, int32_t n,
-                                               int32_t k);
+                                               int32_t k, bool b_scale_preshuffled = false);
 
 template <typename AType, typename BType, typename CType>
 void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BType, CType> &params);
+
+// Standalone launcher for the 16x4 column-major preshuffle that converts an
+// E8M0 scale tensor into the layout the persistent grouped GEMM kernel
+// consumes via `reinterpret_cast<const uint32_t *>` (see
+// `preshuffle_scale_16x4_kernel` in `turbo_gemm_mxfp8_kernel.h`).  Wrapped
+// here so callers (e.g. the PyTorch op `turbo_preshuffle_mxfp8_scale_16x4`)
+// do not need to include the kernel header from a `.cpp` translation unit.
+//
+// Layout:
+//   - `in_ptr`  : E8M0 scale buffer, length rows * cols bytes
+//   - `out_ptr` : preshuffled output buffer, same byte length
+// Grid: rows/16 workgroups of 64 threads.
+void turbo_preshuffle_mxfp8_scale_16x4_launch(const uint8_t *in_ptr, uint32_t *out_ptr,
+                                              int rows, int cols, hipStream_t stream);
 
 //==================================================================
 //  Turbo Grouped GEMM (MXFP8) — variable-K wgrad path

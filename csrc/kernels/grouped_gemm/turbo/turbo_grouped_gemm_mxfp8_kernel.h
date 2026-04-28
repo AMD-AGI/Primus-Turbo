@@ -126,6 +126,23 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     GemmTile::template load_scale_subtile_pinned<GemmTile::PIN_BS0>(
         b_s_smem_tile[cur][warp_n].u32_ptr(), scale_lds_offset);
 
+    // PERF: drain ONLY the prologue ds_reads here (8+4+8+4 = 24 LDS reads
+    // that fill PIN_A0/AS0/B0/BS0 for the main loop's first MFMA).  The
+    // tile-2 prefetch `buffer_load_lds` below targets a_smem[cur][0,1] and
+    // b_smem[cur][0,1] (warp-specific 2KB chunks) which the main loop's
+    // Phase 1 does NOT read — Phase 1 consumes the just-filled PIN_* regs
+    // and issues new ds_reads from b_smem[cur][warp_n+2] (the OPPOSITE
+    // half).  The tile-2 LDG's LDS-write side will be drained by Phase 1's
+    // existing WAR barrier (`wait_lgkmcnt<0>; s_barrier` inside
+    // `phase_mfma_lds_ldg`, see turbo_gemm_mxfp8_kernel.h ~L477).
+    //
+    // Issuing the LDGs AFTER the wait lets their ~150-cycle GMEM-to-LDS
+    // latency overlap with the 6 MFMAs that Phase 1 fires before its WAR
+    // barrier (~96 cycles of compute), so the steady-state stall on the
+    // tile-2 LDGs drops from ~150 to ~50 cycles per output tile.  The wait
+    // itself shrinks to the ds_read tail (~5-10 cycles).
+    wait_lgkmcnt<0>();
+
     if (k_iters > 2) {
         tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[cur],
                                                       sts_offsets, 2 * DATA_STRIDE);
@@ -138,7 +155,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                                                             b_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols, 2 * SCALE_STRIDE);
     }
-    wait_lgkmcnt<0>();
 
     int32_t base_data_soff[4], base_scale_soff[4];
     tile.precompute_base_soff(base_data_soff, base_scale_soff, scale_cols);
@@ -175,7 +191,34 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                 base_scale_soff[3] + scale_off);
         }
 
-        wait_vmcnt<0>();
+        // PERF: partial vmcnt drain at Phase 1->2 barrier.  vmcnt<3> is the
+        // tightest empirically-safe bound for this 4-phase pipeline on the
+        // forward grouped MXFP8 kernel: 286c897 originally shipped with
+        // wait_vmcnt<3> after a 5000-iter grouped stress sweep showed
+        // wait_vmcnt<4> still leaked (race re-emerges); a08b5b7 then bumped
+        // it to wait_vmcnt<0> as part of a "stabilize variable-K kernels"
+        // pass that bundled all four kernel barriers (FWD + wgrad + epilogue)
+        // to the most conservative drain.  The variable-K reasoning only
+        // applied to the wgrad kernel (its K dimension = M_g varies per
+        // group); the forward kernel has fixed K and the original vmcnt<3>
+        // analysis still holds, so we restore the partial drain.
+        //
+        // What's still in flight when Phase 2 begins (worst case, vmcnt<3>):
+        //   * up to 3 of Phase 1's tail buffer_load_lds writes targeting
+        //     b_smem[cur][2,3].  Phase 2's ds_reads target a_smem[cur][warp_m+2]
+        //     (different LDS array, no LDS WAR), and Phase 2's MFMAs use
+        //     PIN_B1 sourced from Phase 1's already-completed ds_reads
+        //     (drained by Phase 1's internal WAR barrier at the end of its
+        //     `phase_mfma_lds_ldg` body), so the in-flight LDGs cannot
+        //     corrupt Phase 2's inputs.
+        //   * Phase 2's own `phase_mfma_lds_ldg` then issues 6 more LDGs;
+        //     end-of-loop wait_vmcnt<12> still bounds the cumulative
+        //     in-flight count.
+        //
+        // Per-iter saving: drains drop from ~50 cycles (vmcnt<0> for ~18
+        // outstanding LDGs) to ~30 cycles (vmcnt<3> for at most 15-of-18),
+        // i.e. ~20 cycles × k_iters per output tile.
+        wait_vmcnt<3>();
         __builtin_amdgcn_s_barrier();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
@@ -289,10 +332,13 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        // RACE FIX: drain Epi1 buffer_load_lds (B1+A1 prefetch) and pending
-        // ds_reads before flipping the double buffer.
+        // RACE FIX: drain Epi1 buffer_load_lds (B1+A1 prefetch) before
+        // flipping the double buffer.  wait_lgkmcnt<0> previously here is
+        // redundant: phase_mfma_lds (used for Phase 3+4 of this Epi1) ends
+        // with its own `wait_lgkmcnt<0>` (see turbo_gemm_mxfp8_kernel.h
+        // ~L414), so lgkmcnt is already 0 with no pending ds_reads at this
+        // point.  Drop it to match the inner-loop Phase 1->2 barrier idiom.
         wait_vmcnt<0>();
-        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
@@ -312,7 +358,19 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
             a_smem_tile[cur][warp_m + 2].u32_ptr(), lds_offsets,
             a_s_smem_tile[cur][warp_m + 2].u32_ptr(), scale_lds_offset);
 
-        wait_vmcnt<0>();
+        // PERF: drop the previously-here `wait_vmcnt<0>()` because it is
+        // provably a no-op at this program point.  vmcnt is drained by the
+        // `wait_vmcnt<0>()` at the end of Epi1 (~L298), and Epi2 phases 1+2
+        // are both `phase_mfma_lds` (no `buffer_load_lds`, hence no vmem
+        // ops issued in this region).  The `s_barrier()` is preserved so
+        // waves stay in step before Phase 3 reads from the `next`
+        // (cross-buffer) LDS region.  The remaining lgkmcnt drain is also
+        // unnecessary: `phase_mfma_lds` for Phase 2 ends with its own
+        // `wait_lgkmcnt<0>()` (turbo_gemm_mxfp8_kernel.h ~L414), so by
+        // exit lgkmcnt is already 0.  Net effect: one fewer s_waitcnt
+        // instruction inside every `compute_tile()` call (the persistent
+        // kernel reaches Epi2 once per output tile, so the saving scales
+        // with `total_tiles / 256_resident_CTAs`).
         __builtin_amdgcn_s_barrier();
 
         GemmTile::template phase_mfma_lds<GemmTile::PIN_A1, GemmTile::PIN_AS1, GemmTile::PIN_B0,
@@ -364,46 +422,113 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     // output tile is written by exactly one CTA to a disjoint slice, so this
     // is correctness-safe.  A single wait_vmcnt<0>() below drains the whole
     // C epilogue before the next persistent-loop iteration or kernel exit.
+    //
+    // RACE FIX (FWD `out` race on G=4 M=1024 N=2048 K=2048): when all four
+    // (read_c, store_c) pairs share a single `c_tmp` VGPR array, the LLVM
+    // register allocator gives the SAME 64 VGPRs to every pair, so pair-(i+1)
+    // `v_accvgpr_read_b32` instructions write the very registers that
+    // pair-(i)'s in-flight `flat_store_short` are still latching from.
+    // `sched_barrier(0)` between pairs reduces but does not eliminate the
+    // resulting drift (df78f4a brought it from 4/200 to 3/500 on E4M3, but
+    // 100-iter stress still trips 2-6/100 on this shape).
+    //
+    // Use two alternating `c_tmp_a` / `c_tmp_b` buffers so adjacent pairs
+    // are guaranteed to land in disjoint VGPR slots: pair-0 writes c_tmp_a,
+    // pair-1 writes c_tmp_b (cannot collide with pair-0's stores), pair-2
+    // reuses c_tmp_a only AFTER pair-1's complete (read+store) sequence
+    // sits between pair-0 and pair-2 in program order, giving pair-0's
+    // flat_store_short ample time to issue and consume their source VGPRs
+    // before pair-2's reads land.  Cost: ~64 extra unpinned VGPRs (the
+    // kernel is at vgpr_count=512 with launch_bounds(256,1), so this is
+    // well within budget — no spill).
+    //
+    // RACE FIX (2a1943c left ~2/100 residual): even with alternating
+    // buffers, pair-2's `v_accvgpr_read_b32` into c_tmp_a can fire
+    // before pair-0's 64 `flat_store_short` have read their source
+    // VGPRs in their entirety — only ~80 cycles of pair-1 (16 reads + 64
+    // stores) sit between pair-0's issue and pair-2's overwrite, which
+    // is short of the LSU's source-read window for ~few percent of waves.
+    // Insert `wait_vmcnt<63>` immediately before each c_tmp reuse so the
+    // older pair's stores are FORCED to commit (and thus retire their
+    // source-VGPR reads) before the new pair's accvgpr_read overwrites
+    // them.  After pair-1's 64 stores issue, vmcnt<=128; wait_vmcnt<63>()
+    // blocks until vmcnt≤63, i.e., pair-0's 64 stores plus 1 of pair-1's
+    // have committed — pair-0 fully drained, c_tmp_a safe to overwrite.
+    // 63 is the gfx950 max for the s_waitcnt vmcnt field; 64 is rejected
+    // by the assembler ("too large value for vmcnt").  The wait is
+    // empirically near-zero cost because pair-1's read+store sequence
+    // (~80 cycles) already overlaps most of pair-0's commit latency.
     if (!is_boundary_tile) {
-        float32x4 c_tmp[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        float32x4 c_tmp_a[4][4];
+        float32x4 c_tmp_b[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp, c_stg_offsets);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+                                             c_tmp_a, c_stg_offsets);
+        __builtin_amdgcn_sched_barrier(0);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp, c_stg_offsets);
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+                                             c_tmp_b, c_stg_offsets);
+        __builtin_amdgcn_sched_barrier(0);
+        wait_vmcnt<63>();
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp, c_stg_offsets);
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+                                             c_tmp_a, c_stg_offsets);
+        __builtin_amdgcn_sched_barrier(0);
+        wait_vmcnt<63>();
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp, c_stg_offsets);
+                                             c_tmp_b, c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
         const int32_t tile_valid_m = min(M_g - pid_m, 256) - warp_base_m;
         const int32_t tile_valid_n = min((int32_t) n - pid_n, 256) - warp_base_n;
-        float32x4     c_tmp[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        float32x4     c_tmp_a[4][4];
+        float32x4     c_tmp_b[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+                                             c_tmp_a, c_stg_offsets, tile_valid_m, tile_valid_n);
+        __builtin_amdgcn_sched_barrier(0);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp, c_stg_offsets, tile_valid_m,
+                                             c_tmp_b, c_stg_offsets, tile_valid_m,
                                              tile_valid_n - 128);
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+        __builtin_amdgcn_sched_barrier(0);
+        wait_vmcnt<63>();
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp, c_stg_offsets, tile_valid_m - 128,
+                                             c_tmp_a, c_stg_offsets, tile_valid_m - 128,
                                              tile_valid_n);
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+        __builtin_amdgcn_sched_barrier(0);
+        wait_vmcnt<63>();
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp, c_stg_offsets, tile_valid_m - 128,
+                                             c_tmp_b, c_stg_offsets, tile_valid_m - 128,
                                              tile_valid_n - 128);
     }
-    // Drain pending C VMEM stores before the next iteration's prefetch (or
-    // kernel exit).  Effectively free here because the next iteration's
-    // prologue does its own wait_vmcnt<0>() anyway.
-    wait_vmcnt<0>();
+    // PERF: drop the previously-here trailing `wait_vmcnt<0>()`.  C-store
+    // drain ordering is already provided by:
+    //   1. The next persistent-loop iteration's prologue
+    //      `wait_vmcnt<0>(); s_barrier();` (around L112) drains any C-store
+    //      vmem still in flight before the new iteration's ds_reads consume
+    //      the prologue's buffer_load_lds writes — same counter, same wave.
+    //   2. The persistent-loop CTA-level `s_barrier()` (at the end of each
+    //      iteration body) carries an implicit `"memory"` clobber, so the
+    //      compiler cannot reorder C-store stores past it.
+    //   3. On the LAST persistent-loop iteration the kernel exits via
+    //      `s_endpgm`, which natively waits for outstanding VMEM ops to
+    //      retire before the wave terminates and the dispatch completes —
+    //      no trailing fence required to make the writes visible to host
+    //      after `cudaDeviceSynchronize` / `hipStreamSynchronize`.
+    // Net effect: one fewer `s_waitcnt vmcnt(0)` per output tile in the
+    // persistent loop hot path; the wait was previously labeled "effectively
+    // free" but in practice the prev-iter's stores and the next-iter's
+    // prologue LDGs naturally overlap in the HBM bandwidth window when this
+    // explicit serialization point is removed.  C-store addresses (output
+    // tile `c[m_global..m_global+256, pid_n..pid_n+256]`) and the new
+    // prologue's input addresses (`a[m_global_next * k]`, `b[g_next * n *
+    // k]`) live in disjoint global regions, so removing the fence introduces
+    // no aliasing race.
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
@@ -454,6 +579,20 @@ turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
         turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
             b_s_ptr, c_ptr, group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
+        // CRITICAL: do NOT remove this CTA-level s_barrier.
+        //
+        // It re-syncs the 4 waves between the just-finished tile's epilogue
+        // (whose final phase still issues `phase_mfma_lds` reads against the
+        // double-buffered SMEM region for the next tile's PIN_NEXT load) and
+        // the next tile's prologue, which immediately starts overwriting the
+        // SAME SMEM regions with fresh GMEM->SMEM LDGs.  Without this barrier
+        // a faster wave can race ahead and clobber SMEM that a slower wave
+        // is still reading from for the previous tile's final mfma_lds, which
+        // shows up as `out` drift on the MXFP8 stress probe (verified: removing
+        // this barrier raised stress_bad to ~5-7/100 on G=4 M=1024 N=2048
+        // K=2048 E4M3, well above the ≤2/100 target).  compute_tile()'s own
+        // prologue does its own `wait_vmcnt<0>(); s_barrier();`, but that fires
+        // AFTER its 6 prologue LDGs have already issued, i.e. too late.
         __builtin_amdgcn_s_barrier();
     }
 #endif

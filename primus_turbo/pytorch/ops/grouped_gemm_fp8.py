@@ -425,6 +425,39 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None
 
 
+def _grouped_fwd_turbo_mxfp8(
+    a_fp8: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_fp8: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    out_dtype: torch.dtype,
+    grid_x_hint: int,
+) -> torch.Tensor:
+    """Forward / dgrad: call the turbo MXFP8 grouped GEMM kernel directly.
+
+    Bypasses the dispatcher-level ``grouped_gemm_fp8_impl`` because for
+    MX_BLOCKWISE only the TURBO backend is supported, so there is nothing
+    to autotune between.  ``grid_x_hint`` (the persistent kernel's per-group
+    tile-M upper bound) is precomputed in Python from a single .cpu()
+    readback of ``group_lens`` and passed in to skip the C++ entry's own
+    D2H sync.
+
+    Layout: NT (trans_a=False, trans_b=True), MX_BLOCKWISE granularity.
+    """
+    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
+        a_fp8, b_fp8, a_scales, b_scales,
+        group_lens, group_offs,
+        False,  # trans_a
+        True,   # trans_b
+        out_dtype,
+        "MX_BLOCKWISE",
+        int(grid_x_hint),
+        False,  # b_scale_preshuffled — wrapper does not preshuffle; C++ entry will.
+    )
+
+
 def _grouped_wgrad_turbo_mxfp8(
     grad_out_t_fp8: torch.Tensor,
     grad_out_t_scale_inv: torch.Tensor,
@@ -479,8 +512,13 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # Additionally, the turbo wgrad kernel requires per-group M_g % 128 ==
         # 0 (preshuffled scale col-block alignment).
         use_turbo_wgrad = True
+        # When not compiling, validate group_lens alignment and compute the
+        # persistent kernel's per-group tile-M upper bound (`grid_x_hint`) so
+        # the C++ entry can skip its own .cpu() sync.  Under torch.compile we
+        # leave grid_x_hint=0 and let the C++ entry fall back to the sync path.
         if not torch.compiler.is_compiling():
             lens_cpu = group_lens.cpu().tolist()
+            grid_x_hint = 0
             for g, mg in enumerate(lens_cpu):
                 if mg % 16 != 0:
                     raise ValueError(
@@ -492,6 +530,12 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
                         "MX_BLOCKWISE grouped GEMM wgrad requires each group's M_g to be "
                         f"a multiple of 128; got group {g} M_g={mg}."
                     )
+                tiles = (mg + 255) // 256
+                if tiles > grid_x_hint:
+                    grid_x_hint = tiles
+            grid_x_hint = max(grid_x_hint, 1)
+        else:
+            grid_x_hint = 0
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
@@ -503,8 +547,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # ── B: (G, N, K)
         # Forward NT GEMM expects RHS shape (G, N, K), row-wise quant along K.
         # Dgrad NT GEMM expects RHS shape (G, K, N), row-wise quant along N (== col-wise of original B).
-        # Flatten and reshape back per group.
-        b_2d = b.reshape(G * N, K)  # (G*N, K)
+        b_2d = b.reshape(G * N, K)
         b_fp8_row_2d, b_scale_inv_row_2d, b_fp8_col_2d, b_scale_inv_col_2d = quantize_fp8_with_trans(
             b_2d,
             b_dtype,
@@ -513,30 +556,27 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             scaling_recipe=ScalingRecipe(use_2d_block=True),
             scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
         )
-        # Row-wise MXFP8 quantization pads K to the turbo tile alignment.
         K_row_padded = b_fp8_row_2d.size(1)
-        assert a_fp8_row.size(1) == K_row_padded
         b_fp8_row = b_fp8_row_2d.reshape(G, N, K_row_padded)
         b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, b_scale_inv_row_2d.size(1))
-
         b_fp8_col, b_scale_inv_col = _regroup_b_colwise_for_dgrad(
             b_fp8_col_2d, b_scale_inv_col_2d, G, N, K
         )
+        # Row-wise MXFP8 quantization pads K to the turbo tile alignment.
+        assert a_fp8_row.size(1) == b_fp8_row.size(2)
 
         # ── Forward: NT(A_row, B_row) — turbo MXFP8 grouped kernel
-        out = grouped_gemm_fp8_impl(
+        # Bypass the FP8 dispatcher because MX_BLOCKWISE only has the TURBO
+        # backend; nothing to autotune between.
+        out = _grouped_fwd_turbo_mxfp8(
             a_fp8_row,
-            b_fp8_row,
             a_scale_inv_row,
+            b_fp8_row,
             b_scale_inv_row,
             group_lens,
             group_offs,
-            trans_a=False,
-            trans_b=True,
-            out_dtype=out_dtype,
-            granularity=config.granularity.value,
-            num_cu=num_cu,
-            default_backend=BackendType.TURBO.value,
+            out_dtype,
+            grid_x_hint,
         )
 
         # Save tensors required by turbo dgrad and wgrad.
@@ -554,6 +594,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.b_shape = (G, N, K)
         ctx.trans_b = trans_b
         ctx.use_turbo_wgrad = use_turbo_wgrad
+        ctx.grid_x_hint = grid_x_hint
         return out
 
     @staticmethod
@@ -580,19 +621,17 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
 
         # ── dgrad: dA = dC @ B = NT(dC, B^T)
         # b_fp8_col already has shape (G, K, N), serving as B^T for the NT kernel.
-        grad_a = grouped_gemm_fp8_impl(
+        # Reuse grid_x_hint from forward — group_lens is unchanged across the
+        # fwd/bwd pair (autograd holds the same tensor).
+        grad_a = _grouped_fwd_turbo_mxfp8(
             grad_out_fp8_row,
-            b_fp8_col,
             grad_out_scale_inv_row,
+            b_fp8_col,
             b_scale_inv_col,
             group_lens,
             group_offs,
-            trans_a=False,
-            trans_b=True,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TURBO.value,
+            ctx.out_dtype,
+            ctx.grid_x_hint,
         )
 
         # ── wgrad: dB = dC^T @ A = NT(dC^T, A^T) via turbo variable-K kernel

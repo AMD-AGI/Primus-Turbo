@@ -25,9 +25,19 @@ namespace primus_turbo::pytorch {
 static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::Tensor &b,
                                        at::Tensor &b_scales, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const at::ScalarType out_dtype,
-                                       bool transA, bool transB) {
+                                       bool transA, bool transB, int64_t grid_x_hint,
+                                       bool b_scale_preshuffled) {
     PRIMUS_TURBO_CHECK(a_scales.scalar_type() == at::kFloat8_e8m0fnu, "Scale A must be E8M0.");
-    PRIMUS_TURBO_CHECK(b_scales.scalar_type() == at::kFloat8_e8m0fnu, "Scale B must be E8M0.");
+    if (b_scale_preshuffled) {
+        // Preshuffled B-scale is the kernel's MFMA-input layout: each E8M0
+        // byte zero-extended into a uint32 word, so dtype widens to int32
+        // (numel preserved).  Shape is still (group_num, N, K/32) for the
+        // wrapper to reason about.
+        PRIMUS_TURBO_CHECK(b_scales.scalar_type() == at::kInt,
+                           "Scale B must be int32 when b_scale_preshuffled=true.");
+    } else {
+        PRIMUS_TURBO_CHECK(b_scales.scalar_type() == at::kFloat8_e8m0fnu, "Scale B must be E8M0.");
+    }
     PRIMUS_TURBO_CHECK(a_scales.dim() == 2, "Scale A must be 2D [total_M, K/32].");
     PRIMUS_TURBO_CHECK(b_scales.dim() == 3, "Scale B must be 3D [group_num, N, K/32].");
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong, "group_lens must be int64.");
@@ -59,17 +69,44 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // The grouped kernel uses blockIdx.z as group_id, so grid.x is the maximum
-    // per-group tile count. Per-group padding tiles early-exit in the kernel.
-    at::Tensor    lens_cpu  = group_lens.cpu();
-    const int64_t *lens_data = lens_cpu.data_ptr<int64_t>();
-    int32_t        grid_x   = 0;
-    for (int g = 0; g < group_num; ++g) {
-        grid_x = std::max(grid_x, (int32_t) ((lens_data[g] + 255) / 256));
+    // ── grid_x = persistent per-group tile-M upper bound ──
+    //
+    // The persistent kernel iterates `tile_id ∈ [0, grid_m * grid_n *
+    // group_num)` and resolves each one to (group_id, pid_m, pid_n).  Tiles
+    // whose `pid_m * 256 >= M_g` early-exit uniformly in-block (via
+    // readfirstlane'd M_g + uniform pid_m), but each early-exit iteration
+    // still costs ~2 sdiv + 1 scalar load(group_lens) + branch ≈ tens of
+    // cycles per TB.  Empirically a loose bound like `(total_m + 255) / 256`
+    // (G× larger for uniform groups) inflates kernel time by 2-10× on the
+    // MoE shapes, so we want a TIGHT bound = `max_g((M_g + 255) / 256)`.
+    //
+    // Computing that tight bound from device-side `group_lens` requires
+    // either a `.cpu()` D2H sync (stalls host launch loop ~5-10us per call)
+    // or a tiny pre-kernel + readback.  In hot loops where the same
+    // `group_lens` tensor is reused (MoE training, the metric benchmark
+    // loop), the Python wrapper computes the max once via the validation
+    // cache and passes it as `grid_x_hint`; we trust that and skip the
+    // sync.  When `grid_x_hint == 0` (default for callers that haven't
+    // opted in, or first calls before the cache warms) we fall back to the
+    // synchronous .cpu() path so behavior is unchanged for them.
+    int32_t grid_x = 0;
+    if (grid_x_hint > 0) {
+        grid_x = (int32_t) grid_x_hint;
+    } else {
+        at::Tensor     lens_cpu  = group_lens.cpu();
+        const int64_t *lens_data = lens_cpu.data_ptr<int64_t>();
+        for (int g = 0; g < group_num; ++g) {
+            grid_x = std::max(grid_x, (int32_t) ((lens_data[g] + 255) / 256));
+        }
     }
 
-    const size_t ws_size =
-        primus_turbo::turbo_grouped_gemm_mxfp8_workspace_size(total_m, group_num, n, k);
+    // Skip the workspace's `b_scale_preshuf` slot when the caller already
+    // preshuffled B (Python-side cache, b_scale_preshuffled=True) — that slot
+    // would just sit unused since `turbo_grouped_gemm_mxfp8_impl` reads B's
+    // preshuffled scale straight from `params.b_scale_ptr` in that case.
+    // For the DSv3-GateUP shape this drops ~58.7 MB of unused alloc per call.
+    const size_t ws_size = primus_turbo::turbo_grouped_gemm_mxfp8_workspace_size(
+        total_m, group_num, n, k, b_scale_preshuffled);
     at::Tensor workspace =
         at::empty({(int64_t) ws_size}, torch::dtype(at::kByte).device(a.device()));
 
@@ -94,9 +131,10 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
                 params.n         = (int32_t) n;
                 params.k         = (int32_t) k;
                 params.workspace = workspace.data_ptr();
-                params.workspace_size = ws_size;
-                params.grid_x         = grid_x;
-                params.stream         = stream;
+                params.workspace_size      = ws_size;
+                params.grid_x              = grid_x;
+                params.b_scale_preshuffled = b_scale_preshuffled;
+                params.stream              = stream;
                 primus_turbo::turbo_grouped_gemm_mxfp8_impl<AType, BType, CType>(params);
                 workspace.record_stream(stream);
                 return c;)))
@@ -179,7 +217,8 @@ static at::Tensor launch_mxfp8_grouped_wgrad(at::Tensor &lhs, at::Tensor &lhs_sc
 at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                   at::Tensor &b_scales, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB,
-                                  at::ScalarType out_dtype, const std::string &granularity) {
+                                  at::ScalarType out_dtype, const std::string &granularity,
+                                  const int64_t grid_x_hint, const bool b_scale_preshuffled) {
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()), "A must be FP8.");
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()), "B must be FP8.");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype), "out_dtype must be fp16 or bf16.");
@@ -190,7 +229,7 @@ at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
 
     if (granularity == "MX_BLOCKWISE") {
         return launch_mxfp8_grouped(a, a_scales, b, b_scales, group_lens, group_offs, out_dtype,
-                                    transA, transB);
+                                    transA, transB, grid_x_hint, b_scale_preshuffled);
     }
 
     PRIMUS_TURBO_ERROR("turbo_grouped_gemm_fp8: unsupported granularity '" + granularity + "'.");
@@ -200,7 +239,11 @@ at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
 at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                        at::Tensor &b_scales, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA, const bool transB,
-                                       at::ScalarType out_dtype, const std::string &granularity) {
+                                       at::ScalarType out_dtype, const std::string &granularity,
+                                       const int64_t grid_x_hint,
+                                       const bool b_scale_preshuffled) {
+    (void) grid_x_hint;
+    (void) b_scale_preshuffled;
     const int64_t total_m = a.size(0);
     const int64_t n       = transB ? b.size(1) : b.size(2);
     return at::empty({total_m, n}, at::dtype(out_dtype).device(at::kMeta));
@@ -239,6 +282,55 @@ at::Tensor turbo_grouped_gemm_variable_k_fp8_meta(at::Tensor &lhs, at::Tensor &l
     const int64_t k         = rhs.size(0);
     const int64_t group_num = group_lens.numel();
     return at::empty({group_num, n, k}, at::dtype(out_dtype).device(at::kMeta));
+}
+
+// ── Standalone E8M0 → 16x4 preshuffle entry point ──
+//
+// Wraps the same `preshuffle_scale_16x4_kernel` that the grouped GEMM forward
+// launches before the main MFMA loop, exposed to Python so the wrapper can
+// cache the preshuffled B-scale alongside the cached B FP8 quantization (B is
+// a weight tensor; its scale is identical across iterations between optimizer
+// steps).  Cached output is then passed back into `turbo_grouped_gemm_fp8`
+// with `b_scale_preshuffled=True` so the per-call preshuffle launch is
+// skipped on every forward and dgrad.
+//
+// The kernel zero-extends each E8M0 byte into a 4-byte uint32 word in the
+// MFMA scale-input layout, so the output buffer is 4x larger (in bytes) than
+// the input — element count preserved, dtype widens uint8 → int32.
+//
+// Input  layout: arbitrary leading dims followed by (rows, cols) where
+// numel/cols %% 16 == 0 (preshuffle row block) and cols %% 4 == 0 (col
+// block).  Element type must be E8M0.
+// Output layout: same shape, dtype int32; bytes are reordered into the 16x4
+// column-major MFMA-scale layout that the persistent kernel consumes via
+// `reinterpret_cast<const uint32_t *>`.
+at::Tensor turbo_preshuffle_mxfp8_scale_16x4(const at::Tensor scale) {
+    PRIMUS_TURBO_CHECK(scale.scalar_type() == at::kFloat8_e8m0fnu,
+                       "turbo_preshuffle_mxfp8_scale_16x4: scale must be E8M0.");
+    PRIMUS_TURBO_CHECK(scale.is_contiguous(),
+                       "turbo_preshuffle_mxfp8_scale_16x4: scale must be contiguous.");
+    PRIMUS_TURBO_CHECK(scale.dim() >= 2,
+                       "turbo_preshuffle_mxfp8_scale_16x4: scale must have ndim >= 2.");
+    const int64_t cols = scale.size(scale.dim() - 1);
+    const int64_t rows = scale.numel() / cols;
+    PRIMUS_TURBO_CHECK(rows % 16 == 0,
+                       "turbo_preshuffle_mxfp8_scale_16x4: total rows (numel/cols) must be a "
+                       "multiple of 16 (preshuffle row-block alignment).");
+    PRIMUS_TURBO_CHECK(cols % 4 == 0,
+                       "turbo_preshuffle_mxfp8_scale_16x4: cols must be a multiple of 4 "
+                       "(preshuffle col-block alignment).");
+
+    at::Tensor out    = at::empty(scale.sizes(), scale.options().dtype(at::kInt));
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    auto      *in_ptr = reinterpret_cast<const uint8_t *>(scale.data_ptr());
+    auto      *out_ptr = reinterpret_cast<uint32_t *>(out.data_ptr());
+    primus_turbo::turbo_preshuffle_mxfp8_scale_16x4_launch(in_ptr, out_ptr, (int) rows, (int) cols,
+                                                           stream);
+    return out;
+}
+
+at::Tensor turbo_preshuffle_mxfp8_scale_16x4_meta(const at::Tensor scale) {
+    return at::empty(scale.sizes(), scale.options().dtype(at::kInt));
 }
 
 } // namespace primus_turbo::pytorch

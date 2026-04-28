@@ -14,15 +14,30 @@ namespace primus_turbo {
 //
 // Layout:
 //   [ A_scale_preshuf : total_M * scale_cols * uint32 ]
-//   [ B_scale_preshuf : group_num * N * scale_cols * uint32 ]
-
+//   [ B_scale_preshuf : group_num * N * scale_cols * uint32 ]   (only when
+//                                                                B is NOT
+//                                                                pre-shuffled)
+//
+// When the caller has already preshuffled B's scale (cached on the Python
+// side across fwd+dgrad — B is a weight tensor) we source `b_scale_preshuf`
+// directly from `params.b_scale_ptr` in `turbo_grouped_gemm_mxfp8_impl` and
+// leave the workspace slot unused, so we can simply not allocate it.
 size_t turbo_grouped_gemm_mxfp8_workspace_size(int32_t total_m, int32_t group_num, int32_t n,
-                                               int32_t k) {
+                                               int32_t k, bool b_scale_preshuffled) {
     constexpr int32_t MX_BLOCK_SIZE = 32;
     const int32_t     scale_cols    = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
     const size_t      a_scale_bytes = (size_t) total_m * scale_cols * sizeof(uint32_t);
+    if (b_scale_preshuffled) {
+        return a_scale_bytes;
+    }
     const size_t b_scale_bytes = (size_t) group_num * (size_t) n * scale_cols * sizeof(uint32_t);
     return a_scale_bytes + b_scale_bytes;
+}
+
+void turbo_preshuffle_mxfp8_scale_16x4_launch(const uint8_t *in_ptr, uint32_t *out_ptr,
+                                              int rows, int cols, hipStream_t stream) {
+    turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
+        <<<(uint32_t) (rows / 16), 64, 0, stream>>>(in_ptr, out_ptr, rows, cols);
 }
 
 // ── Public API ──
@@ -38,19 +53,30 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
     const size_t      a_scale_bytes = (size_t) total_m * scale_cols * sizeof(uint32_t);
 
     auto *a_scale_preshuf = reinterpret_cast<uint32_t *>(params.workspace);
-    auto *b_scale_preshuf =
-        reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(params.workspace) + a_scale_bytes);
+    // When `b_scale_preshuffled` is set the caller has already preshuffled B's
+    // scale (cached across forward+dgrad calls because B is a weight).  Skip
+    // the per-call preshuffle kernel and source the persistent kernel's
+    // `b_scale_preshuf` directly from `params.b_scale_ptr`.  Otherwise we
+    // preshuffle into the workspace's b_scale slot.
+    const uint32_t *b_scale_preshuf;
+    if (params.b_scale_preshuffled) {
+        b_scale_preshuf = reinterpret_cast<const uint32_t *>(params.b_scale_ptr);
+    } else {
+        auto *b_scale_preshuf_workspace = reinterpret_cast<uint32_t *>(
+            reinterpret_cast<uint8_t *>(params.workspace) + a_scale_bytes);
+        auto *b_scale_raw = reinterpret_cast<const uint8_t *>(params.b_scale_ptr);
+        // Preshuffle B scales over [group_num*N, scale_cols].
+        turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
+            <<<(group_num * n) / 16, 64, 0, params.stream>>>(
+                b_scale_raw, b_scale_preshuf_workspace, group_num * n, scale_cols);
+        b_scale_preshuf = b_scale_preshuf_workspace;
+    }
 
     // Preshuffle A scales over [total_M, scale_cols] (groups concatenated along M;
     // 16-row preshuffle blocks are stateless across groups).
     auto *a_scale_raw = reinterpret_cast<const uint8_t *>(params.a_scale_ptr);
-    auto *b_scale_raw = reinterpret_cast<const uint8_t *>(params.b_scale_ptr);
     turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
         <<<total_m / 16, 64, 0, params.stream>>>(a_scale_raw, a_scale_preshuf, total_m, scale_cols);
-    // Preshuffle B scales over [group_num*N, scale_cols].
-    turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
-        <<<(group_num * n) / 16, 64, 0, params.stream>>>(b_scale_raw, b_scale_preshuf,
-                                                         group_num * n, scale_cols);
 
     const int32_t grid_m = params.grid_x;
     const int32_t grid_n = (n + 255) / 256;
@@ -111,13 +137,19 @@ void turbo_grouped_gemm_mxfp8_wgrad_impl(
     auto *rhs_scale_preshuf = reinterpret_cast<uint32_t *>(
         reinterpret_cast<uint8_t *>(params.workspace) + lhs_scale_bytes);
 
-    // Preshuffle LHS scales over (N, scale_cols) — N rows, blocks of 16.
+    // Preshuffle LHS over (N, scale_cols) and RHS over (K, scale_cols) in a
+    // SINGLE fused kernel launch.  Both tensors share the same `scale_cols`
+    // (= ceil(total_m / MX_BLOCK_SIZE)), and the dual variant routes blocks
+    // 0..(n/16)-1 to LHS and blocks (n/16)..(n+k)/16-1 to RHS based on
+    // `blockIdx.x`.  This saves one host->device kernel dispatch per wgrad
+    // call (~10us each, vs ~3-4us of GPU work per preshuffle) which
+    // compounds over PERF_BATCH_ITERS=30 in `_metric_mxfp8.py` / training
+    // backward steps.
     auto *lhs_scale_raw = reinterpret_cast<const uint8_t *>(params.lhs_scale_ptr);
     auto *rhs_scale_raw = reinterpret_cast<const uint8_t *>(params.rhs_scale_ptr);
-    turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
-        <<<n / 16, 64, 0, params.stream>>>(lhs_scale_raw, lhs_scale_preshuf, n, scale_cols);
-    turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
-        <<<k / 16, 64, 0, params.stream>>>(rhs_scale_raw, rhs_scale_preshuf, k, scale_cols);
+    turbo::preshuffle_scale_16x4_dual_kernel<uint8_t, uint32_t>
+        <<<(n + k) / 16, 64, 0, params.stream>>>(lhs_scale_raw, lhs_scale_preshuf, n,
+                                                  rhs_scale_raw, rhs_scale_preshuf, scale_cols);
 
     const int32_t grid_n = (n + 255) / 256;
     const int32_t grid_k = (k + 255) / 256;
