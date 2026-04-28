@@ -158,9 +158,27 @@ class GEMMHipKittenBackend(KernelBackend):
         layout = hipkitten.layout_of(trans_a, trans_b)
         if layout is None:
             raise ValueError("HipKitten BF16 backend supports RCR, RRR, and CRR layouts only.")
+
+        # CRR + trans_c shortcut. The HK ``gemm_crr`` kernel computes
+        # ``c[m, n] = first^T @ second``; the algebraic identity
+        # ``(A^T @ B)^T == B^T @ A`` lets us produce the trans_c-transposed
+        # output [n, m] directly by swapping (a, b). This avoids the
+        # post-GEMM ``out.t().contiguous()`` copy — for the canonical
+        # 4096x4096x4096 BF16 backward dB the saved copy is 32 MB / ~21 us
+        # at 3 TB/s HBM, which is ~12 % of the kernel time. The CRR path
+        # is the dominant trans_c=True hit on this branch (autograd dW
+        # always lands on it for trans_b=True forwards).
+        a_in = a if a.is_contiguous() else a.contiguous()
+        b_in = b if b.is_contiguous() else b.contiguous()
+        if trans_c and layout == "crr":
+            out = torch.empty((n, m), dtype=out_dtype, device=a.device)
+            cfg = hipkitten.select_default_config(n, m, k, layout, "bf16")
+            hipkitten.dense_run(hk, cfg, b_in, a_in, out)
+            return out
+
         out = torch.empty((m, n), dtype=out_dtype, device=a.device)
         cfg = hipkitten.select_default_config(m, n, k, layout, "bf16")
-        hipkitten.dense_run(hk, cfg, a.contiguous(), b.contiguous(), out)
+        hipkitten.dense_run(hk, cfg, a_in, b_in, out)
         return out.t().contiguous() if trans_c else out
 
 

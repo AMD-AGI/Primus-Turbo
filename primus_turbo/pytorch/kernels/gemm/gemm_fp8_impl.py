@@ -230,15 +230,37 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         layout = hipkitten.layout_of(trans_a, trans_b)
         if layout is None:
             raise ValueError("HipKitten FP8 backend supports RCR, RRR, and CRR layouts only.")
-        c = torch.empty((m, n), dtype=out_dtype, device=a.device)
         has_dscale = hipkitten.fp8_has_dscale(hk, layout)
         sa, sb, sa_dev, sb_dev = _resolve_fp8_scales(a_scale_inv, b_scale_inv, has_dscale)
-        cfg = hipkitten.select_default_config(m, n, k, layout, "fp8")
         # Skip the contiguous() call when the tensor already is — torch.Tensor.contiguous
         # still walks strides + bumps refcount even on the no-op path, ~1us per dispatch
         # which is non-trivial for FP8 RCR (kernel is ~700us, so we want zero host fat).
         a_in = a if a.is_contiguous() else a.contiguous()
         b_in = b if b.is_contiguous() else b.contiguous()
+
+        # CRR + trans_c shortcut. ``gemm_crr`` computes
+        # ``c[m, n] = first^T @ second * sa * sb``; multiplication is
+        # commutative so swapping (a, b) and (sa, sb) yields the
+        # trans_c-transposed output [n, m] directly (verified bit-equal
+        # in /tmp/probe_trans_c_swap.py: max_abs(classic, swap) = 0.0
+        # across {4096^3, 4096x22016x4096, 8192x4096x14336, 4096x12288x4096};
+        # SNR vs fp32 ref = 47-49 dB matching classic). Saves the
+        # post-GEMM transpose+contiguous copy that hit the FP8 BWD dB
+        # path (the FP8 b-grad goes via TN/CRR + trans_c=True for any
+        # trans_b=True forward — the metric's whole 8-shape FP8_bwd
+        # section is on this path).
+        if trans_c and layout == "crr":
+            c = torch.empty((n, m), dtype=out_dtype, device=a.device)
+            cfg = hipkitten.select_default_config(n, m, k, layout, "fp8")
+            hipkitten.dense_run(
+                hk, cfg, b_in, a_in, c,
+                scale_a=sb, scale_b=sa,
+                scale_a_dev=sb_dev, scale_b_dev=sa_dev,
+            )
+            return c
+
+        c = torch.empty((m, n), dtype=out_dtype, device=a.device)
+        cfg = hipkitten.select_default_config(m, n, k, layout, "fp8")
         hipkitten.dense_run(
             hk, cfg, a_in, b_in, c,
             scale_a=sa, scale_b=sb,
