@@ -31,24 +31,23 @@ Layout: NT (`trans_a=False, trans_b=True`). Tile 256×256×128. Constraints `tot
 
 ---
 
-## 2. **HARD RULE — you may only edit kernel files**
+## 2. Modification scope (HARD RULE)
 
-Every round, you may only modify files under:
+### Allowed
 
-- `csrc/kernels/grouped_gemm/turbo/*.h`
-- `csrc/kernels/gemm/turbo/*.h`
-- `csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu` (launcher internals only — do **not** change its top-level signature or arguments)
-- `csrc/kernels/gemm/turbo_gemm.cu` (same: launcher internals only)
+1. **Kernel headers** — `csrc/kernels/grouped_gemm/turbo/*.h`, `csrc/kernels/gemm/turbo/*.h`. Edit freely.
+2. **Launchers (internals only)** — `csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu`, `csrc/kernels/gemm/turbo_gemm.cu`. Do **not** change the top-level entry-point signatures the C++ extension exposes; only edit the launch / workspace logic inside.
+3. **Wrapper, equivalent micro-tweaks only** — `primus_turbo/pytorch/ops/grouped_gemm_fp8.py`. You may rearrange call order, fold reshapes, drop redundant `.contiguous()`, narrow `.cpu()` syncs, simplify the `ctx.save_for_backward` list, etc. The forward / backward outputs must remain **bitwise** equivalent on the metric shapes, and the file's public function signatures must stay unchanged.
 
-**Forbidden** (will be reverted):
+### Forbidden — **any** of these is auto-reverted
 
-- `primus_turbo/pytorch/**` — Python wrapper / autograd / dispatcher.
-- `csrc/include/primus_turbo/**`, `csrc/pytorch/extensions.h`, `csrc/pytorch/bindings_pytorch.cpp` — C++ entry signatures and torchlib registration.
-- `csrc/pytorch/grouped_gemm/turbo_grouped_gemm.cpp` — top-level entry; only edit the `.cu` launcher it calls.
+- **Host-side caches in any form.** No `dict` / `weakref` / `data_ptr` / `_version` / LRU / TTL / "lazy compute" caching of: `quantize_*` outputs, scale preshuffle, `group_offs`, `grid_x_hint`, B's column-quant tensors, `autograd` intermediate products, etc. This is a **design decision**, not a performance trade-off. The previous wrapper-level caches were intentionally removed in `86371b3 / 7525339` to keep the cross-granularity comparison honest; do not reintroduce them, even with a different name (e.g. "memo", "stash", "reuse buffer", "registry"). If a host computation looks "wasteful to repeat", the right fix is either (a) fuse it into the kernel, or (b) accept the repetition. Never attempt to share state across calls.
+- Dispatcher / backend class changes — `primus_turbo/pytorch/kernels/grouped_gemm/grouped_gemm_fp8_impl.py` (the `GroupedGEMMFP8*Backend` classes, `_backends` dict, and `grouped_gemm_fp8_impl` / `grouped_gemm_fp8_variable_k_impl` signatures stay untouched).
+- C++ entry signatures — `csrc/include/primus_turbo/**`, `csrc/pytorch/extensions.h`, `csrc/pytorch/bindings_pytorch.cpp`, `csrc/pytorch/grouped_gemm/turbo_grouped_gemm.cpp`, `csrc/pytorch/gemm/turbo_gemm.cpp`.
 - `benchmark/**`, `tests/**`, `scripts/**`, `.claude/**`, `3rdparty/**`.
-- The metric script and the SNR thresholds inside it.
+- The metric script (`scripts/_metric_mxfp8.py`), `STRESS_*` / `SNR_*` thresholds, and `~/.cursor/cli-config.json`.
 
-If your idea requires a wrapper / dispatcher / interface change, write it down in the round summary as a "future suggestion" and do **not** commit it. The wrapper-level optimizations (host caches, fused quantize, scale preshuffle pulled into Python) were intentionally removed in commit `86371b3` to keep the cross-granularity comparison honest, and must not be re-introduced from inside this loop.
+If an idea genuinely requires moving outside this list, write it down in the round summary as a "future suggestion" and do **not** commit. Do not be clever with the rules.
 
 ---
 

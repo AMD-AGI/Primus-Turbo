@@ -79,9 +79,13 @@ DEFAULT_TASK = (
     "test_grouped_gemm_fp8_mx_blockwise 全 pass，且 "
     "benchmark/ops/bench_grouped_gemm_turbo.py --dtype fp8 --granularity mxfp8 "
     "16/16 PASS。"
-    "**修改范围严格限制：只允许动 csrc/kernels/ 下的 turbo MXFP8 GEMM kernel 文件 "
-    "(以及为它们服务的 csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu launcher)。"
-    "primus_turbo/pytorch/、benchmark/、tests/、scripts/、.claude/、3rdparty/ 一律不准改。**"
+    "**修改范围**：(a) csrc/kernels/ 下的 turbo MXFP8 kernel header 和它们的 .cu launcher，"
+    "(b) primus_turbo/pytorch/ops/grouped_gemm_fp8.py 内部的等价微调 (调用顺序、合并 reshape、"
+    "去除冗余 contiguous() 等)。"
+    "**绝对禁止：任何形式的 host-side cache** (dict / weakref / data_ptr / _version / LRU / TTL "
+    "缓存 quantize 结果、preshuffle、group_offs、grid_x_hint、scale 张量、autograd 中间产物)。"
+    "**也不准动**：dispatcher / backend 类、C++ 入口签名、benchmark/、tests/、scripts/、.claude/、"
+    "3rdparty/、SNR 阈值、metric 脚本本身。"
 )
 DEFAULT_METRIC_CMD = "python3 scripts/_metric_mxfp8.py"
 # Deep-check acceptance: full mxfp8 pytest sweep.  Run every N rounds (not
@@ -520,10 +524,23 @@ def build_prompt(
 本轮的 metric 命令 (越大越好) =
   {args.metric_cmd}
 {deep_check_block}
-你必须确保：本轮结束时 metric 不下降；改完 kernel 后 commit 之前自己再跑一次 metric 命令确认 score >= 当前 best。
+你必须确保：本轮结束时 metric 不下降；改完后 commit 之前自己再跑一次 metric 命令确认 score >= 当前 best。
 **绝不允许通过删测试 / 加 pytest.skip / 改 SNR 阈值这种方式骗过 DoD。**
-**修改范围 (hard rule)**：只能动 csrc/kernels/grouped_gemm/turbo/*.h、csrc/kernels/gemm/turbo/*.h 这些 turbo MXFP8 kernel header，以及它们的 .cu launcher (csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu)。
-**不允许**改 primus_turbo/pytorch/、benchmark/、tests/、scripts/、.claude/、3rdparty/、csrc/include/、csrc/pytorch/extensions.h、csrc/pytorch/bindings_pytorch.cpp、Python wrapper、C++ 入口签名、dispatcher 任何位置——它们是上一阶段已经定型的接口，本阶段只动 kernel 本体。如果你觉得必须改 wrapper / 接口才能继续优化，请把改动写进本轮总结的"建议"段落，但**不要 commit**，让人工接手。
+
+【修改范围（hard rule）】
+
+允许：
+  1. csrc/kernels/grouped_gemm/turbo/*.h、csrc/kernels/gemm/turbo/*.h —— turbo MXFP8 kernel header。
+  2. csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu、csrc/kernels/gemm/turbo_gemm.cu —— launcher 内部 (不动顶层 entry 函数签名)。
+  3. primus_turbo/pytorch/ops/grouped_gemm_fp8.py —— **等价小幅微调**，例子：调整 quantize / reshape / preshuffle 调用顺序，合并冗余的 reshape / contiguous()，缩小 .cpu() sync 的范围，简化 ctx.save_for_backward 列表。改动必须保持 forward / backward 的输出与现状 bitwise 等价。
+
+绝对禁止 (任何形式都会被立刻回滚)：
+  - **任何形式的 host-side cache**：用 dict / weakref / data_ptr / _version / LRU / TTL 任何手段，把 wrapper 一次 call 算出来的中间量 (quantize 结果、preshuffle scale、group_offs、grid_x_hint、scale 张量、autograd 中间产物等) 缓存给后续 call 复用。这条是项目设计取舍，不是性能取舍。如果一个 host 计算看起来"重复执行可惜了"，正确做法是 kernel 端融合或接受重复执行，**不允许跨 call 攒状态**。
+  - 改 dispatcher / backend 类：primus_turbo/pytorch/kernels/grouped_gemm/grouped_gemm_fp8_impl.py 里的 GroupedGEMMFP8*Backend 类、_backends 字典、grouped_gemm_fp8_impl / grouped_gemm_fp8_variable_k_impl 函数签名都不动。
+  - 改 C++ 入口签名：csrc/include/primus_turbo/**、csrc/pytorch/extensions.h、csrc/pytorch/bindings_pytorch.cpp、csrc/pytorch/grouped_gemm/turbo_grouped_gemm.cpp、csrc/pytorch/gemm/turbo_gemm.cpp。
+  - 改 benchmark/、tests/、scripts/、.claude/、3rdparty/、SNR 阈值、metric 脚本、cli-config。
+
+如果某个 idea 必须越过上述允许范围才能落地，请写进本轮总结的"建议"段，**不要 commit**，让人工接手。
 
 【度量指标】指标名: {args.metric_name}（数值越高越好）
 - 基线 (优化开始前) = {baseline_metric}
@@ -542,11 +559,12 @@ def build_prompt(
 
 【你需要自主决策的事】
 1. 先读 skill，理解当前阶段卡在哪、哪些方向被允许、哪些被明确禁止。
-2. 自己挑一个**具体且可验证**的小步骤去做（不要一次铺得太大）。skill 里列出的"Recommended Next Experiments"是优先方向；下面是当前文件结构里几个真实可改的点（注意：本阶段**只动 kernel**，下面列出的全是 csrc/kernels/ 下的 kernel 源码）：
+2. 自己挑一个**具体且可验证**的小步骤去做（不要一次铺得太大）。skill 里列出的"Recommended Next Experiments"是优先方向；下面是当前文件结构里几个真实可改的点：
    - csrc/kernels/gemm/turbo/turbo_gemm_mxfp8_kernel.h - GemmTile / phase_mfma_lds_ldg / store_c_subtile，inner-loop 调度 (主回路 wait_vmcnt<0> 是已知最大 stall)。
    - csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_kernel.h - persistent forward kernel (compute_tile + 外层 tile_id 循环)。
    - csrc/kernels/grouped_gemm/turbo/turbo_grouped_gemm_mxfp8_wgrad_kernel.h - persistent variable-K wgrad kernel；目前保留 volatile C-store 是因为 dB 有 pre-existing race，谁能吃下这条 race 谁就再拿一段 perf。
    - csrc/kernels/grouped_gemm/turbo_grouped_gemm.cu - workspace 与 preshuffle launch (有融合空间)；只改 launcher 内部，不动 C++ 入口签名。
+   - primus_turbo/pytorch/ops/grouped_gemm_fp8.py - GroupedGemmFP8MXFunc wrapper：**仅限等价微调**（调用顺序、合并 reshape、去冗余 contiguous() 等），**严禁加 cache** (任何形式都不行，见下方硬约束)。
 3. 改完一定要：
    - 重编译：`rm -f build/temp/csrc/kernels/grouped_gemm/turbo_grouped_gemm.o; touch <你改的 .h>; HIP_VISIBLE_DEVICES=$IDLE pip install --no-build-isolation -e .` (skill 里有完整命令)。
    - 跑 metric：`HIP_VISIBLE_DEVICES=$IDLE python3 scripts/_metric_mxfp8.py --verbose 2>&1 | tail -20` 看 score 是否上升。
@@ -555,7 +573,8 @@ def build_prompt(
 4. 如果改动确实有进展（metric 不降且测试 0 fail），就 git commit；若没把握就 git restore 还原，**不要留下脏 working tree**。
 
 【硬性约束 - 不可违反】
-- **修改范围 = csrc/kernels/ 下的 turbo MXFP8 kernel 文件**（gemm/turbo/*.h、grouped_gemm/turbo/*.h、grouped_gemm/turbo_grouped_gemm.cu）。**任何**对 primus_turbo/pytorch/、benchmark/、tests/、scripts/、.claude/、3rdparty/、csrc/include/、csrc/pytorch/extensions.h、csrc/pytorch/bindings_pytorch.cpp 的修改都是**违规**，会被立即回滚。这意味着：不要碰 Python wrapper、不要改 dispatcher / backend 类、不要动 C++ 入口签名、不要改 benchmark 脚本、不要改测试用例、不要改 metric 脚本本身。优化只来自 kernel 本体。
+- **绝对禁止任何形式的 host-side cache**：dict / weakref / data_ptr / _version / LRU / TTL 任何手段把 wrapper 一次 call 的中间量缓存给后续 call 复用 (quantize 结果、preshuffle scale、group_offs、grid_x_hint、scale 张量、autograd 中间产物 都不行)。这条是项目设计取舍，不是性能取舍——重复 host 工作要么 kernel 端融合解决，要么接受重复执行，不允许跨 call 攒状态。
+- **修改范围**：(a) csrc/kernels/ 下的 turbo MXFP8 kernel 文件 (gemm/turbo/*.h、grouped_gemm/turbo/*.h、grouped_gemm/turbo_grouped_gemm.cu、gemm/turbo_gemm.cu)；(b) primus_turbo/pytorch/ops/grouped_gemm_fp8.py 内部的等价小幅微调 (调用顺序、合并 reshape、去冗余 contiguous() 等，输出必须 bitwise 等价)。**禁止改**：dispatcher / backend 类、C++ 入口签名 (csrc/include/、csrc/pytorch/extensions.h、bindings_pytorch.cpp、grouped_gemm/turbo_grouped_gemm.cpp、gemm/turbo_gemm.cpp)、benchmark/、tests/、scripts/、.claude/、3rdparty/、SNR 阈值、metric 脚本本身。任何越界修改会被回滚。
 - **本节点和别的租户共用，被允许使用的 GPU 池 = `{args.gpu_pool}`** (env: MXFP8_GPU_POOL)。绝对不要碰这个池外的卡。`scripts/_metric_mxfp8.py` 会从这个池里 auto-pick 一张空闲卡 (`rocm-smi --showuse --showpids` 看 KFD VRAM > 100 MiB 视为 busy)；直接跑 pytest / .claude/probes/* 时也务必从池里挑一张：例如 `HIP_VISIBLE_DEVICES=$(MXFP8_GPU_POOL={args.gpu_pool} python3 -c "from scripts._metric_mxfp8 import _pick_idle_gpu; print(_pick_idle_gpu())")`。
 - skill 里的"Not allowed as final solutions"清单严禁触碰：不允许恢复 flat 内核、不允许 uniform-group fast path、不允许 host/device sync 当作 race fix、不允许 cache flush/invalidate 当 workaround、不允许 s_nop / 计时 padding、不允许 majority voting / 重复执行。
 - 绝不删除 tests/pytorch/ops/test_grouped_gemm_fp8.py，不要给 mx_blockwise 加 pytest.skip。
