@@ -28,34 +28,6 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _HIPKITTEN_SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
-def _grouped_bf16_supported(m: int, n: int, k: int, layout: str) -> bool:
-    if not hipkitten.aligned_for(m, n, k, "bf16"):
-        return False
-    # Validated under benchmark strict allclose gate.
-    if layout == "rcr":
-        return (m, n, k) in {
-            (4096, 4096, 7168),  # DeepSeek GateUP
-        }
-    if layout == "rrr":
-        return (m, n, k) in {
-            (4096, 2048, 7168),  # DeepSeek Down dA
-            (4096, 4096, 7168),  # DeepSeek dA (RRR forward variant)
-            (4096, 7168, 4096),  # DeepSeek GateUP dA
-        }
-    if layout == "crr":
-        return (m, n, k) in {
-            (4096, 7168, 4096),  # DeepSeek GateUP dB
-            (7168, 2048, 4096),  # DeepSeek Down dB
-        }
-    return False
-
-
-def _grouped_bf16_supported_with_groups(group_count: int, m: int, n: int, k: int, layout: str) -> bool:
-    if group_count >= 32 and m < 4096:
-        return False
-    return _grouped_bf16_supported(m, n, k, layout)
-
-
 def _pad_2d(x: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     if x.shape[0] == rows and x.shape[1] == cols:
         return x
@@ -247,6 +219,11 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> bool:
+        # Hard constraints only — dtype, dim, balanced groups, alignment.
+        # No shape allow-list. Per-group (M, N, K) just needs to be
+        # alignable; we route to ``grouped_*_balanced`` when the unpadded
+        # shape is already aligned, and fall back to a per-group pad-and-
+        # copy loop otherwise (in ``execute``).
         if a.dim() != 2 or b.dim() != 3 or trans_a:
             return False
         if a.dtype not in _HIPKITTEN_SUPPORTED_DTYPES or b.dtype not in _HIPKITTEN_SUPPORTED_DTYPES:
@@ -260,8 +237,7 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         m = a.shape[0] // b.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
-        layout = "rcr" if trans_b else "rrr"
-        return _grouped_bf16_supported_with_groups(b.shape[0], m, n, k, layout)
+        return hipkitten.aligned_for(m, n, k, "bf16")
 
     @staticmethod
     def execute(
@@ -280,14 +256,12 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         m = int(group_lens[0].item())
         k = a.shape[1]
         layout = "rcr" if trans_b else "rrr"
-        if not _grouped_bf16_supported_with_groups(b.shape[0], m, n, k, layout):
-            raise ValueError(f"HipKitten grouped GEMM unsupported shape M={m}, N={n}, K={k}")
         if trans_b:
-            cfg = hipkitten.lookup(hk, "rcr", m, n, k)
+            cfg = hipkitten.select_default_config(m, n, k, "rcr", "bf16")
             hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
         else:
             m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, "rrr", "bf16")
-            cfg = hipkitten.lookup(hk, "rrr", m_pad, n_pad, k_pad)
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, "rrr", "bf16")
             if (m_pad, n_pad, k_pad) == (m, n, k):
                 hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
             else:
@@ -329,6 +303,11 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> bool:
+        # Hard constraints only — dtype, dim, balanced groups, alignment of
+        # the CRR (n, k, m) view that the kernel actually consumes. The
+        # variable-K dB backend re-uses dense ``grouped_*_balanced`` with
+        # CRR ordering, so the alignment rules of the dense kernel apply
+        # to ``(n, k, m)``.
         if a.dim() != 2 or b.dim() != 2:
             return False
         if a.dtype not in _HIPKITTEN_SUPPORTED_DTYPES or b.dtype not in _HIPKITTEN_SUPPORTED_DTYPES:
@@ -344,7 +323,7 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         m = a.shape[0] // group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
-        return _grouped_bf16_supported(n, k, m, "crr")
+        return hipkitten.aligned_for(n, k, m, "bf16")
 
     @staticmethod
     def execute(
@@ -364,9 +343,7 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         k = a.shape[1]
         out = torch.zeros((group_num, n, k), dtype=a.dtype, device=a.device)
         m = int(group_lens[0].item())
-        if not _grouped_bf16_supported(n, k, m, "crr"):
-            raise ValueError(f"HipKitten grouped GEMM dB unsupported shape M={m}, N={n}, K={k}")
-        cfg = hipkitten.lookup(hk, "crr", n, k, m)
+        cfg = hipkitten.select_default_config(n, k, m, "crr", "bf16")
         hipkitten.grouped_run_balanced(hk, cfg, b.contiguous(), a.contiguous(), out)
         return out
 

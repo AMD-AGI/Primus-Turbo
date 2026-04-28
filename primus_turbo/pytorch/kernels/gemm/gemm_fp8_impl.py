@@ -192,6 +192,11 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
+        # Hard constraints only — granularity, dtype, alignment, layout,
+        # device. No shape-table or autotune-cache lookup. Any aligned
+        # tensorwise FP8 GEMM is dispatched to the kernel via
+        # ``hipkitten.select_default_config``; the kernel templates handle
+        # the variation across (M, N, K) without per-shape pre-validation.
         if granularity not in GEMMFP8HipKittenBackend.SUPPORTED_GRANULARITIES:
             return False
         if (a.dtype, b.dtype, out_dtype) not in GEMMFP8HipKittenBackend.SUPPORTED_DTYPES:
@@ -206,10 +211,7 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         if not hipkitten.has_fp8():
             return False
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        if not hipkitten.aligned_for(m, n, k, "fp8"):
-            return False
-        hk = hipkitten.load_fp8()
-        return hipkitten.has_in_cache(hk, layout, m, n, k)
+        return hipkitten.aligned_for(m, n, k, "fp8")
 
     @staticmethod
     def execute(
@@ -231,7 +233,7 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         c = torch.empty((m, n), dtype=out_dtype, device=a.device)
         has_dscale = hipkitten.fp8_has_dscale(hk, layout)
         sa, sb, sa_dev, sb_dev = _resolve_fp8_scales(a_scale_inv, b_scale_inv, has_dscale)
-        cfg = hipkitten.lookup(hk, layout, m, n, k)
+        cfg = hipkitten.select_default_config(m, n, k, layout, "fp8")
         # Skip the contiguous() call when the tensor already is — torch.Tensor.contiguous
         # still walks strides + bumps refcount even on the no-op path, ~1us per dispatch
         # which is non-trivial for FP8 RCR (kernel is ~700us, so we want zero host fat).

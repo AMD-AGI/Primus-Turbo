@@ -6,18 +6,23 @@
 """Shared HipKittens integration layer for Primus-Turbo backends.
 
 The four HIPKITTEN-typed kernel backends (dense / grouped, BF16 / FP8) all
-share the same plumbing: discover and import the prebuilt ``tk_*_layouts``
-module, parse its autotune cache, decide which (layout, M, N, K) shapes are
-supported, and finally call the ``gemm_{rcr,rrr,crr}`` / ``grouped_*_balanced``
-entrypoints with the right ``group_m`` / ``num_xcds`` / ``kernel`` config.
+share the same plumbing:
+
+  1. Discover and import the prebuilt ``tk_*_layouts`` extension via
+     :func:`load_bf16` / :func:`load_fp8`.
+  2. Decide whether ``(layout, M, N, K, dtype)`` is supportable in
+     ``can_handle`` (alignment + dtype + layout — no shape lookup).
+  3. Pick a per-call config via :func:`select_default_config` (pure if/else
+     rules, no IO).
+  4. Launch the kernel via ``dispatch.dense_run`` /
+     ``dispatch.grouped_run_balanced``.
 
 This subpackage centralizes that plumbing so the per-precision backend
 implementations are thin wrappers around ``hipkitten.dispatch`` calls.
 """
 from primus_turbo.pytorch.kernels.hipkitten.config import (
     HipKittenConfig,
-    has_in_cache,
-    lookup,
+    select_default_config,
 )
 from primus_turbo.pytorch.kernels.hipkitten.dispatch import (
     dense_run,
@@ -49,11 +54,10 @@ __all__ = [
     "grouped_run_balanced",
     "has_bf16",
     "has_fp8",
-    "has_in_cache",
     "layout_of",
     "load_bf16",
     "load_fp8",
-    "lookup",
     "padded_shape",
     "round_up",
+    "select_default_config",
 ]

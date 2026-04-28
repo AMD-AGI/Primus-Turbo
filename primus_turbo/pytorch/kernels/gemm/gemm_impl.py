@@ -109,6 +109,10 @@ class GEMMHipKittenBackend(KernelBackend):
         trans_c: bool,
         **kwargs,
     ) -> bool:
+        # Hard constraints only — alignment, dtype, layout, device. No
+        # shape-table or autotune-cache lookup. Aligned shapes always run;
+        # the kernel handles them via the binding defaults (group_m=4,
+        # num_xcds=8) selected by ``hipkitten.select_default_config``.
         if a.ndim != 2 or b.ndim != 2:
             return False
         if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
@@ -121,10 +125,9 @@ class GEMMHipKittenBackend(KernelBackend):
         if layout is None:
             return False
         m, n, k_a, k_b = GEMMHipKittenBackend._logical_shape(a, trans_a, b, trans_b)
-        if k_a != k_b or not hipkitten.aligned_for(m, n, k_a, "bf16"):
+        if k_a != k_b:
             return False
-        hk = hipkitten.load_bf16()
-        return hipkitten.has_in_cache(hk, layout, m, n, k_a)
+        return hipkitten.aligned_for(m, n, k_a, "bf16")
 
     @staticmethod
     def execute(
@@ -142,7 +145,7 @@ class GEMMHipKittenBackend(KernelBackend):
         if layout is None:
             raise ValueError("HipKitten BF16 backend supports RCR, RRR, and CRR layouts only.")
         out = torch.empty((m, n), dtype=out_dtype, device=a.device)
-        cfg = hipkitten.lookup(hk, layout, m, n, k)
+        cfg = hipkitten.select_default_config(m, n, k, layout, "bf16")
         hipkitten.dense_run(hk, cfg, a.contiguous(), b.contiguous(), out)
         return out.t().contiguous() if trans_c else out
 

@@ -210,26 +210,6 @@ def test_gemm_bf16_hipkitten_backend_rejects_unsupported_shape():
         GlobalBackendManager.reset()
 
 
-def test_gemm_bf16_hipkitten_backend_rejects_uncached_backward_shape():
-    try:
-        _load_hipkitten_module()
-    except ImportError as exc:
-        pytest.skip(str(exc))
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    try:
-        GlobalBackendManager.set_gemm_backend(BackendType.HIPKITTEN)
-        GlobalBackendManager.set_auto_tune(False)
-        a = torch.randn((4096, 12288), dtype=torch.bfloat16, device="cuda")
-        b = torch.randn((12288, 4096), dtype=torch.bfloat16, device="cuda")
-        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
-            turbo.ops.gemm(a, b)
-    finally:
-        GlobalBackendManager.reset()
-
-
 @pytest.mark.parametrize(
     "m, n, k, layout",
     [

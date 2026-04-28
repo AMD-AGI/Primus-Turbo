@@ -137,21 +137,6 @@ def test_grouped_gemm_bf16_hipkitten_backend():
         GlobalBackendManager.reset()
 
 
-def test_grouped_gemm_bf16_hipkitten_rejects_small_m():
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.HIPKITTEN)
-    GlobalBackendManager.set_auto_tune(False)
-    try:
-        B, M, N, K = 2, 512, 4096, 7168
-        device = "cuda"
-        group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
-        a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
-        b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
-        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
-            grouped_gemm(a, b, group_lens, trans_b=True)
-    finally:
-        GlobalBackendManager.reset()
-
-
 @pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("M", [2048, 4096])
 @pytest.mark.parametrize("N_K", [(2048, 1536), (4096, 7168)])

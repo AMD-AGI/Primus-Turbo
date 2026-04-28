@@ -313,7 +313,7 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             start, end = offs[group_idx], offs[group_idx + 1]
             m = end - start
             m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "fp8")
-            cfg = hipkitten.lookup(hk, layout, m_pad, n_pad, k_pad)
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "fp8")
             if (m_pad, n_pad, k_pad) == (m, n, k):
                 hipkitten.dense_run(
                     hk,
@@ -474,7 +474,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             start, end = offs[group_idx], offs[group_idx + 1]
             m = end - start
             m_pad, n_pad, k_pad = hipkitten.padded_shape(n, k, m, "crr", "fp8")
-            cfg = hipkitten.lookup(hk, "crr", m_pad, n_pad, k_pad)
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, "crr", "fp8")
             if (m_pad, n_pad, k_pad) == (n, k, m):
                 hipkitten.dense_run(
                     hk,

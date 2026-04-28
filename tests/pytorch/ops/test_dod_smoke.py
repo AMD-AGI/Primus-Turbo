@@ -657,20 +657,6 @@ def test_smoke_gemm_hipkitten_rejects_unsupported_shape():
         GlobalBackendManager.reset()
 
 
-def test_smoke_gemm_hipkitten_rejects_uncached_backward_shape():
-    """Forward shape is in cache but the implied backward shape is not."""
-    _skip_if_no_hipkitten()
-    GlobalBackendManager.set_gemm_backend(BackendType.HIPKITTEN)
-    GlobalBackendManager.set_auto_tune(False)
-    try:
-        a = torch.randn((4096, 12288), dtype=torch.bfloat16, device="cuda")
-        b = torch.randn((12288, 4096), dtype=torch.bfloat16, device="cuda")
-        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
-            turbo.ops.gemm(a, b)
-    finally:
-        GlobalBackendManager.reset()
-
-
 # (12) HIPKITTEN fp8 reject path (rowwise) — 1
 def test_smoke_gemm_hipkitten_fp8_rejects_rowwise():
     """HIPKITTEN FP8 only supports TENSORWISE; ROWWISE must be rejected."""
@@ -1071,25 +1057,6 @@ def test_smoke_grouped_gemm_fp8_blockwise_zero_group_triton():
         assert compute_snr(out_ref, out) > snr_threshold, "out_snr too low"
         assert compute_snr(a_ref.grad, a.grad) > snr_threshold, "a_grad_snr too low"
         assert compute_snr(b_ref.grad, b.grad) > snr_threshold, "b_grad_snr too low"
-    finally:
-        GlobalBackendManager.reset()
-
-
-# (25) HIPKITTEN BF16 grouped reject — 1
-def test_smoke_grouped_gemm_hipkitten_rejects_unsupported_shape():
-    """HIPKITTEN grouped only accepts the small BF16 whitelist; everything else
-    must surface as 'HIPKITTEN cannot handle'."""
-    _skip_if_no_hipkitten()
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.HIPKITTEN)
-    GlobalBackendManager.set_auto_tune(False)
-    try:
-        B, M, N, K = 2, 512, 4096, 7168
-        device = "cuda"
-        group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
-        a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
-        b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
-        with pytest.raises(ValueError, match="HIPKITTEN cannot handle"):
-            grouped_gemm(a, b, group_lens, trans_b=True)
     finally:
         GlobalBackendManager.reset()
 
