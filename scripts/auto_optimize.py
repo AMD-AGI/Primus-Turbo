@@ -231,7 +231,7 @@ def parse_args() -> argparse.Namespace:
         default="0,1,2,3",
         help=(
             "Comma-separated list of GPU ids the loop is allowed to use. "
-            "Exported as HIPKITTEN_GPU_POOL, honored by scripts/_metric_hipkitten.py "
+            "Exported as HIPKITTEN_GPU_POOL, honored by scripts/_metric_hk_ratio.py "
             "and scripts/run_dod_metric.sh (idle picks intersect this pool). "
             "Empty string disables (let scripts see all GPUs)."
         ),
