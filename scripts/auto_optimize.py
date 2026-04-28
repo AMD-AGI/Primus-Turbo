@@ -27,6 +27,18 @@ historical best, and either updates ``best_sha`` / resets the patience counter
 or warns and increments.  When patience runs out the script prints a clear
 ``EARLY-STOP`` banner and exits.
 
+Metric noise mitigation
+-----------------------
+
+The metric command is invoked ``--metric-trials`` times per round (default
+``3``) and reduced via ``--metric-aggregator`` (default ``median``).  Multi-
+trial smooths over the cross-run noise typical of a shared-host MI355
+benchmark (~300-400 score on the MXFP8 helper) so the early-stop heuristic
+doesn't latch onto a single lucky outlier from round 1.  Pass
+``--metric-trials 1`` to fall back to the legacy single-shot behavior.  Per-
+trial values are also persisted on each ``RoundResult`` (``metric_trials``)
+so noise can be inspected post-hoc from ``summary.json``.
+
 The framework is forked from the auto_optimize.py shipped on
 ``dev/kyle_hipkitten_bf16``; the changes here are the project-specific
 defaults (skill path, task description, metric command, prompt body) and the
@@ -88,6 +100,15 @@ DEFAULT_TASK = (
     "3rdparty/、SNR 阈值、metric 脚本本身。"
 )
 DEFAULT_METRIC_CMD = "python3 scripts/_metric_mxfp8.py"
+# Multi-trial metric reduction: each round invokes the metric command
+# DEFAULT_METRIC_TRIALS times and reduces the per-trial scores via
+# DEFAULT_METRIC_AGGREGATOR.  median is the default because the dominant
+# round-to-round noise on shared MI355 hosts (~300-400 score from one-off
+# scheduler / GPU contention spikes) shows up as 1-of-N outliers that median
+# rejects but mean / max would amplify.
+DEFAULT_METRIC_TRIALS = 3
+DEFAULT_METRIC_AGGREGATOR = "median"
+ALLOWED_METRIC_AGGREGATORS = ("median", "max", "min", "mean")
 # Deep-check acceptance: full mxfp8 pytest sweep.  Run every N rounds (not
 # every round) because it's slow.  A failure forces improved=False and does
 # NOT update best_metric/best_sha, even if the cheap metric went up — it
@@ -125,6 +146,39 @@ def _metric_stderr_tail(err: str, *, lines: int = METRIC_STDERR_TAIL_LINES) -> s
     return "\n".join(err.splitlines()[-lines:])
 
 
+def _aggregate_metric(values: list[float | None], how: str) -> float | None:
+    """Reduce per-trial scores into a single round score.
+
+    ``None`` entries (timeout / non-zero exit / unparseable output) are
+    dropped.  Returns ``None`` only if every trial failed.  ``how`` must be
+    one of ``ALLOWED_METRIC_AGGREGATORS``.
+
+    median is the recommended default for shared-host MI355 perf metrics:
+    typical noise shows up as 1-of-N upward spikes (better-than-average
+    quiet moments on the SOC) or downward spikes (one-off contention from
+    other tenants on the same node), and median is the cheapest reduction
+    that rejects both without throwing away data.
+    """
+    finite = [v for v in values if v is not None]
+    if not finite:
+        return None
+    if how == "median":
+        finite.sort()
+        n = len(finite)
+        if n % 2 == 1:
+            return finite[n // 2]
+        return 0.5 * (finite[n // 2 - 1] + finite[n // 2])
+    if how == "max":
+        return max(finite)
+    if how == "min":
+        return min(finite)
+    if how == "mean":
+        return sum(finite) / len(finite)
+    raise ValueError(
+        f"unknown aggregator {how!r}; allowed: {ALLOWED_METRIC_AGGREGATORS}"
+    )
+
+
 @dataclass
 class RoundResult:
     index: int
@@ -138,6 +192,9 @@ class RoundResult:
     head_sha_after: str
     cursor_exit_code: int
     log_dir: str
+    # Per-trial metric values for this round (length == --metric-trials).
+    # ``metric`` above is the aggregator applied to the non-None entries here.
+    metric_trials: list[float | None] = field(default_factory=list)
     # Deep-check fields are None when the round didn't run a deep check.
     deep_check_ran: bool = False
     deep_check_passed: bool | None = None
@@ -150,6 +207,7 @@ class RoundResult:
             "finished_at": self.finished_at,
             "duration_s": round(self.duration_s, 2),
             "metric": self.metric,
+            "metric_trials": self.metric_trials,
             "best_so_far": self.best_so_far,
             "improved": self.improved,
             "head_sha_before": self.head_sha_before,
@@ -208,6 +266,29 @@ def parse_args() -> argparse.Namespace:
             "Shell command that prints one numeric metric on the last non-empty stdout line "
             "(higher is better; default MXFP8 helper prints one integer). "
             "Run after every round and at startup for the baseline."
+        ),
+    )
+    p.add_argument(
+        "--metric-trials",
+        type=int,
+        default=DEFAULT_METRIC_TRIALS,
+        help=(
+            "Run the metric command this many times per round and reduce via "
+            "--metric-aggregator (default %(default)s).  Smooths over the "
+            "~300-400 score shared-host noise on MI355 mxfp8 so a single "
+            "lucky outlier doesn't dominate the early-stop heuristic.  "
+            "Set to 1 to reproduce the legacy single-shot behavior."
+        ),
+    )
+    p.add_argument(
+        "--metric-aggregator",
+        choices=ALLOWED_METRIC_AGGREGATORS,
+        default=DEFAULT_METRIC_AGGREGATOR,
+        help=(
+            "Reduction over per-trial metric values to produce one round "
+            "score (default %(default)s).  median rejects 1-of-N spikes "
+            "(quiet-moment bonuses or contention dips) without dropping "
+            "data; max is optimistic, min pessimistic, mean averages."
         ),
     )
     p.add_argument(
@@ -297,7 +378,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Skip cursor-agent invocations, just measure the metric N times. Useful for testing.",
+        help=(
+            "Skip cursor-agent invocations and just measure the metric every "
+            "round (with --metric-trials trials each).  Useful for sanity-"
+            "checking the metric / aggregator config end-to-end without "
+            "burning agent time."
+        ),
     )
     return p.parse_args()
 
@@ -335,8 +421,13 @@ def _env_with_pool(gpu_pool: str, restrict_visible: bool = False) -> dict:
     return env
 
 
-def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> float | None:
-    section(f"measuring metric: {_preview_cmd(cmd)}")
+def _run_metric_once(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> float | None:
+    """Run the metric command once and parse the last stdout line as float.
+
+    Returns ``None`` on timeout / non-zero exit / unparseable output.  Each
+    call is logged to console with the same wording the legacy single-shot
+    ``run_metric`` used, so existing log-greps still work.
+    """
     try:
         result = subprocess.run(
             cmd,
@@ -371,6 +462,47 @@ def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str) -> float | None:
     if err:
         print(_metric_stderr_tail(err), flush=True)
     return value
+
+
+def run_metric(
+    cmd: str,
+    cwd: str,
+    timeout: int,
+    gpu_pool: str,
+    *,
+    trials: int = DEFAULT_METRIC_TRIALS,
+    aggregator: str = DEFAULT_METRIC_AGGREGATOR,
+) -> tuple[float | None, list[float | None]]:
+    """Run ``cmd`` ``trials`` times and reduce via ``aggregator``.
+
+    Returns ``(score, per_trial_values)`` where ``per_trial_values`` always
+    has length ``max(trials, 1)``.  Failed trials are recorded as ``None``
+    and dropped before aggregation; if every trial fails, ``score`` is also
+    ``None``.
+
+    Multi-trial smooths over the ~300-400 score shared-host noise typical of
+    MI355 / MXFP8: a single round-1 outlier no longer becomes the all-time
+    best that subsequent legitimate-but-smaller wins can't dethrone.
+    Setting ``trials=1`` reproduces the legacy single-shot behavior.
+    """
+    trials = max(1, trials)
+    section(
+        f"measuring metric ({trials} trial{'s' if trials != 1 else ''}, "
+        f"{aggregator}): {_preview_cmd(cmd)}"
+    )
+    if trials == 1:
+        v = _run_metric_once(cmd, cwd, timeout, gpu_pool)
+        return v, [v]
+    samples: list[float | None] = []
+    for k in range(1, trials + 1):
+        print(f"[metric] trial {k}/{trials}", flush=True)
+        samples.append(_run_metric_once(cmd, cwd, timeout, gpu_pool))
+    agg = _aggregate_metric(samples, aggregator)
+    print(
+        f"[metric] {aggregator}={agg} over trials={samples}",
+        flush=True,
+    )
+    return agg, samples
 
 
 def run_deep_check(cmd: str, cwd: str, timeout: int, log_path: Path,
@@ -485,8 +617,9 @@ def build_prompt(
 
     history_lines = []
     for r in state.rounds[-5:]:
+        trials_repr = f" trials={r.metric_trials}" if r.metric_trials else ""
         history_lines.append(
-            f"  - 第 {r.index} 轮: metric={r.metric}, "
+            f"  - 第 {r.index} 轮: metric={r.metric}{trials_repr}, "
             f"best={r.best_so_far}, improved={r.improved}, "
             f"sha {r.head_sha_before[:8]}->{r.head_sha_after[:8]}"
         )
@@ -523,6 +656,7 @@ def build_prompt(
 
 本轮的 metric 命令 (越大越好) =
   {args.metric_cmd}
+脚本会跑这条命令 {args.metric_trials} 次并取 {args.metric_aggregator}（缓解 shared-host noise，单次跑可能 ±300/400 抖）。你自己 commit 前自检时也建议至少跑 2-3 次，确认 score >= 当前 best 不是单次撞大运。
 {deep_check_block}
 你必须确保：本轮结束时 metric 不下降；改完后 commit 之前自己再跑一次 metric 命令确认 score >= 当前 best。
 **绝不允许通过删测试 / 加 pytest.skip / 改 SNR 阈值这种方式骗过 DoD。**
@@ -767,8 +901,14 @@ def main() -> int:
         banner(
             f"AUTO-OPTIMIZE start | rounds={args.rounds} | patience={args.patience} | log_dir={log_dir}"
         )
-        section(f"baseline metric (gpu_pool={args.gpu_pool})")
-        baseline = run_metric(args.metric_cmd, str(workspace), args.metric_timeout, args.gpu_pool)
+        section(
+            f"baseline metric (gpu_pool={args.gpu_pool}, "
+            f"trials={args.metric_trials}, agg={args.metric_aggregator})"
+        )
+        baseline, _baseline_trials = run_metric(
+            args.metric_cmd, str(workspace), args.metric_timeout, args.gpu_pool,
+            trials=args.metric_trials, aggregator=args.metric_aggregator,
+        )
         state.best_metric = baseline
         state.best_sha = get_head_sha(str(workspace))
         write_summary(summary_path, args, state, baseline)
@@ -798,7 +938,10 @@ def main() -> int:
             duration = time.monotonic() - t0
 
             sha_after = get_head_sha(str(workspace))
-            metric = run_metric(args.metric_cmd, str(workspace), args.metric_timeout, args.gpu_pool)
+            metric, metric_trials = run_metric(
+                args.metric_cmd, str(workspace), args.metric_timeout, args.gpu_pool,
+                trials=args.metric_trials, aggregator=args.metric_aggregator,
+            )
 
             # Deep check (slow pytest sweep) every N rounds.  A failure here
             # cancels any "improved" verdict and does NOT update best_metric,
@@ -845,6 +988,7 @@ def main() -> int:
                 finished_at=now_iso(),
                 duration_s=duration,
                 metric=metric,
+                metric_trials=metric_trials,
                 best_so_far=state.best_metric,
                 improved=improved,
                 head_sha_before=sha_before,
@@ -865,7 +1009,8 @@ def main() -> int:
                     f"(exit={deep_exit})"
                 )
             print(
-                f"[round {i}] metric={metric} best={state.best_metric} improved={improved}"
+                f"[round {i}] metric={metric} trials={metric_trials} "
+                f"best={state.best_metric} improved={improved}"
                 f"{deep_str} streak={state.rounds_without_improvement}/{args.patience} "
                 f"duration={duration:.1f}s",
                 flush=True,
