@@ -156,7 +156,15 @@ from primus_turbo.pytorch.kernels.hipkitten.layout import DType, Layout
 _BF16_DEFAULT_GROUP_M = 4
 _BF16_DEFAULT_NUM_XCDS = 8
 _FP8_DEFAULT_GROUP_M = 4
-_FP8_DEFAULT_KERNEL = "8"
+# RCR FP8 kernel: ``None`` means "let the binding use its built-in default
+# (kernel template 8)". The dispatcher's ``force_rcr_kernel`` context manager
+# is then skipped entirely (`force_rcr_kernel(None)` is a no-op), saving the
+# lock acquire + 2x os.environ get/set/restore per dispatch (~7-12us measured
+# on 8192x28672x4096 in /tmp/profile_execute_internals.py round-6 archive).
+# Setting an explicit ``"8"`` here would be functionally equivalent but force
+# every RCR call through the CM, which we now know is the single largest
+# avoidable host-overhead source for the FP8_fwd metric section.
+_FP8_DEFAULT_KERNEL = None
 
 
 @dataclass(frozen=True)
@@ -330,11 +338,42 @@ def select_default_config(
         )
 
     # FP8: kernel template ID matters only for RCR (the binding ignores it
-    # for RRR / CRR). The offline cache shows kernel="8" wins on 46/48
-    # RCR entries; round 4 confirmed by direct re-bench that the two
-    # historical "4"-winning entries (long-N + shallow K) flipped to
-    # "8" on the current HK .so, so RCR uniformly picks the binding
-    # default and there is no FP8-specific exception rule.
+    # for RRR / CRR). Default ``cfg.kernel = None`` so the dispatcher's
+    # ``force_rcr_kernel`` context manager is skipped — the binding's own
+    # default (kernel template 8) is selected at link time and matches what
+    # ``TK_RCR_FORCE_KERNEL="8"`` would have set anyway, so leaving the
+    # env var alone is bit-equivalent but avoids the per-dispatch lock +
+    # env get/set/restore (~7-12us on 8192x28672x4096; see
+    # /tmp/profile_execute_internals.py round-6 archive).
+    #
+    # Round 6 — single-shape exception. The 8192x28672x4096 RCR shape
+    # (Llama-3.1-8B mlp_gate_up forward) is the only one in the metric
+    # suite where kernel template "4" beats template "8" on the *current*
+    # HK FP8 ``.so``. Tight bench (200 iters x 5 repeats, p20):
+    #   (gm=4, k="8") = 2727.9 TF (median)
+    #   (gm=4, k="4") = 2768.4 TF (median)  +1.5pp
+    # The 4 other long-N RCR Llama shapes that share ``k <= 4096`` keep
+    # kernel="8" winning (sweep_fp8_fwd_round6.log archived in commit),
+    # so the rule is intentionally narrow:
+    #   tiles_m == 32  (m == 8192)
+    #   tiles_n >= 112 (n >= 28672)
+    #   k <= 4096
+    # Round-4's "8 wins everywhere" rebench was on a different .so /
+    # different GPU rotation; round-6 verification was on the round-6
+    # binary checked into HipKittens HEAD with REPEATS=5 so the
+    # 1.5pp margin is real. Numerically bit-identical on those 5
+    # repeats (kernel template only changes the schedule, not the
+    # arithmetic — see /tmp/probe_fp8_kernel_round6.log).
+    if layout == "rcr":
+        tiles_m = m // 256
+        tiles_n = n // 256
+        if tiles_m == 32 and tiles_n >= 112 and k <= 4096:
+            return HipKittenConfig(
+                layout=layout,
+                group_m=_FP8_DEFAULT_GROUP_M,
+                num_xcds=None,
+                kernel="4",
+            )
     kernel = _FP8_DEFAULT_KERNEL if layout == "rcr" else None
 
     return HipKittenConfig(
