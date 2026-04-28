@@ -125,6 +125,13 @@ if "HIP_VISIBLE_DEVICES" not in os.environ:
         print(f"[metric_hk_ratio] auto-picked HIP_VISIBLE_DEVICES={pick}", file=sys.stderr)
 
 
+# Make benchmark/ops/config.py importable so we share the canonical MoE shape
+# table with the rest of the repo (DeepSeek-V3 / gpt_oss_20B grouped GEMM
+# suite is generated there, NOT duplicated here).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import torch  # noqa: E402
 
 import primus_turbo.pytorch as turbo  # noqa: E402
@@ -137,6 +144,10 @@ from primus_turbo.pytorch.core.low_precision import (  # noqa: E402
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+)
+from benchmark.ops.config import (  # noqa: E402
+    GROUPED_GEMM_M_SIZE_LIST,
+    MoEModelConfigs,
 )
 
 
@@ -170,6 +181,46 @@ BF16_SHAPES: list[tuple[int, int, int]] = _LLAMA2_7B + _LLAMA31_8B
 FP8_SHAPES: list[tuple[int, int, int]] = _LLAMA2_7B + _LLAMA31_8B
 
 
+def _grouped_suite() -> list[tuple[str, int, int, int, int]]:
+    """Return [(name, B, M_per_group, N, K)] for DeepSeek-V3 + gpt_oss_20B.
+
+    Mirrors benchmark/ops/config.py::gen_grouped_gemm_test_cases():
+      * batch_sizes per model (DeepSeek-V3=[16,32], gpt_oss_20B=[4,32])
+      * M_per_group ∈ GROUPED_GEMM_M_SIZE_LIST = [2048, 4096]
+      * layer ∈ {GateUP=(2*moe_int, hidden), Down=(hidden, moe_int)}
+      * skip when n_routed_experts %% B != 0
+
+    DeepSeek-V3 (n_routed=256, moe_int=2048, hidden=7168):
+      * 2 batch × 2 M × 2 layer = 8 cases
+    gpt_oss_20B (n_routed=32, moe_int=2880, hidden=2880):
+      * 2 batch × 2 M × 2 layer = 8 cases
+    Total: 16 cases.
+    """
+    rows: list[tuple[str, int, int, int, int]] = []
+    for model_name, cfg in MoEModelConfigs.items():
+        if "moe_intermediate_size" not in cfg or "hidden_size" not in cfg:
+            continue
+        n_routed = cfg["n_routed_experts"]
+        moe_int = cfg["moe_intermediate_size"]
+        hidden = cfg["hidden_size"]
+        batch_sizes = cfg.get("grouped_gemm_batch_sizes", [4, 16, 32])
+        layers = {
+            "GateUP": (2 * moe_int, hidden),
+            "Down": (hidden, moe_int),
+        }
+        for B in batch_sizes:
+            if n_routed % B != 0:
+                continue
+            for M in GROUPED_GEMM_M_SIZE_LIST:
+                for layer, (N, K) in layers.items():
+                    name = f"{model_name}-{layer}-B{B}-M{M}"
+                    rows.append((name, B, M, N, K))
+    return rows
+
+
+GROUPED_BF16_SHAPES: list[tuple[str, int, int, int, int]] = _grouped_suite()
+
+
 # ----------------------------------------------------------------------------
 # Backend forcing helpers
 # ----------------------------------------------------------------------------
@@ -187,6 +238,21 @@ def force_gemm_backend(backend: Optional[BackendType], precision: PrecisionType)
         GlobalBackendManager.reset()
         if snapshot is not None:
             GlobalBackendManager._gemm_backend = snapshot  # type: ignore[attr-defined]
+
+
+@contextmanager
+def force_grouped_gemm_backend(backend: Optional[BackendType], precision: PrecisionType):
+    """Temporarily pin the grouped-GEMM backend for one precision."""
+    snapshot = GlobalBackendManager._grouped_gemm_backend  # type: ignore[attr-defined]
+    GlobalBackendManager.reset()
+    if backend is not None:
+        GlobalBackendManager.set_grouped_gemm_backend(backend, precision)
+    try:
+        yield
+    finally:
+        GlobalBackendManager.reset()
+        if snapshot is not None:
+            GlobalBackendManager._grouped_gemm_backend = snapshot  # type: ignore[attr-defined]
 
 
 # ----------------------------------------------------------------------------
@@ -256,6 +322,35 @@ def _bench_fp8(M: int, N: int, K: int, backend: Optional[BackendType]) -> float:
     return 2.0 * M * N * K / (ms * 1e9)
 
 
+def _bench_grouped_bf16(
+    B: int, M: int, N: int, K: int, backend: Optional[BackendType]
+) -> float:
+    """Return TFLOPS for BF16 grouped GEMM (NT, balanced groups), or 0.0 on failure.
+
+    Layout matches turbo.ops.grouped_gemm with trans_b=True:
+        a: [B*M, K]   bf16
+        b: [B, N, K]  bf16
+        out: [B*M, N] bf16
+    Total FLOPs = 2 * (B*M) * N * K.
+    """
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device="cuda")
+    group_lens = torch.full((B,), M, dtype=torch.int64, device="cuda")
+    fn = lambda: turbo.ops.grouped_gemm(a, b, group_lens, trans_b=True)  # noqa: E731
+    with force_grouped_gemm_backend(backend, PrecisionType.BF16_FP16_FP32):
+        try:
+            out = fn()
+        except Exception:
+            return 0.0
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            return 0.0
+        try:
+            ms = _time_op(fn)
+        except Exception:
+            return 0.0
+    return 2.0 * (B * M) * N * K / (ms * 1e9)
+
+
 # ----------------------------------------------------------------------------
 # Suite runner
 # ----------------------------------------------------------------------------
@@ -270,17 +365,26 @@ def _run() -> int:
     rows: list[tuple[str, float, float, float]] = []
     t0 = time.monotonic()
 
+    # ── Dense BF16 (8 shapes) ──
     for (M, N, K) in BF16_SHAPES:
         ref = _bench_bf16(M, N, K, backend=None)
         hk = _bench_bf16(M, N, K, backend=BackendType.HIPKITTEN)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"BF16_{M}x{N}x{K}", hk, ref, ratio))
+        rows.append((f"dense_BF16_{M}x{N}x{K}", hk, ref, ratio))
 
+    # ── Dense FP8 tensorwise (8 shapes) ──
     for (M, N, K) in FP8_SHAPES:
         ref = _bench_fp8(M, N, K, backend=None)
         hk = _bench_fp8(M, N, K, backend=BackendType.HIPKITTEN)
         ratio = (hk / ref) if ref > 0 else 0.0
-        rows.append((f"FP8_{M}x{N}x{K}", hk, ref, ratio))
+        rows.append((f"dense_FP8_{M}x{N}x{K}", hk, ref, ratio))
+
+    # ── Grouped BF16 (16 shapes, DeepSeek-V3 + gpt_oss_20B) ──
+    for (name, B, M, N, K) in GROUPED_BF16_SHAPES:
+        ref = _bench_grouped_bf16(B, M, N, K, backend=None)
+        hk = _bench_grouped_bf16(B, M, N, K, backend=BackendType.HIPKITTEN)
+        ratio = (hk / ref) if ref > 0 else 0.0
+        rows.append((f"grp_BF16_{name}", hk, ref, ratio))
 
     wall = time.monotonic() - t0
 
@@ -288,15 +392,35 @@ def _run() -> int:
     # without polluting stdout (which carries the score).
     print(f"\n[metric_hk_ratio] Shape suite ({len(rows)} cases, {wall:.1f}s wall):", file=sys.stderr)
     print(
-        f"  {'name':28s}  {'hk_tflops':>10s}  {'ref_tflops':>10s}  {'ratio':>6s}",
+        f"  {'name':40s}  {'hk_tflops':>10s}  {'ref_tflops':>10s}  {'ratio':>6s}",
         file=sys.stderr,
     )
     for name, hk, ref, r in rows:
         flag = "" if r >= 0.9 else ("  *reject" if r == 0 else "  <90%")
         print(
-            f"  {name:28s}  {hk:>10.1f}  {ref:>10.1f}  {r:>6.3f}{flag}",
+            f"  {name:40s}  {hk:>10.1f}  {ref:>10.1f}  {r:>6.3f}{flag}",
             file=sys.stderr,
         )
+
+    # Per-section geomean breakdown (helpful for the agent when picking
+    # what to attack — dense vs grouped, BF16 vs FP8).
+    def _section_geomean(prefix: str) -> tuple[float, int]:
+        sub = [max(r, 0.01) for n, _, _, r in rows if n.startswith(prefix)]
+        if not sub:
+            return (float("nan"), 0)
+        return (math.exp(sum(math.log(r) for r in sub) / len(sub)), len(sub))
+
+    for label, prefix in [
+        ("dense_BF16", "dense_BF16"),
+        ("dense_FP8 ", "dense_FP8"),
+        ("grp_BF16  ", "grp_BF16"),
+    ]:
+        g, n = _section_geomean(prefix)
+        if n:
+            print(
+                f"[metric_hk_ratio]   {label} geomean={g:.4f} (n={n})",
+                file=sys.stderr,
+            )
 
     # Geomean over clipped ratios. Clipping at 0.01 keeps the geomean defined
     # but punishes rejection with a 100x drop on that entry.

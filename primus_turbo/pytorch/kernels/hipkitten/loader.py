@@ -15,6 +15,13 @@ together with the autotune cache that records the per-shape ``group_m`` /
 ``num_xcds`` / ``kernel`` choices made during offline autotune. This module
 finds, imports, and parses both into a uniform :class:`HipKittenModule`
 shape that the rest of the integration layer consumes.
+
+NOTE: per the project policy, this module MUST NOT keep any cache (no
+dict / weakref / data_ptr / _version / lru_cache / TTL of any kind). Each
+``load_bf16()`` / ``load_fp8()`` call re-reads the on-disk autotune cache
+file from scratch. ``importlib.import_module`` itself goes through Python's
+own ``sys.modules`` mapping which we do not control; that is part of the
+language runtime, not a cache we introduced.
 """
 from __future__ import annotations
 
@@ -23,7 +30,6 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -142,9 +148,14 @@ def _parse_fp8_cache(search_paths: list[Path]) -> dict[tuple[str, int, int, int]
     return {}
 
 
-@lru_cache(maxsize=1)
 def load_bf16() -> HipKittenModule:
-    """Import ``tk_bf16_layouts`` and parse the BF16 autotune cache."""
+    """Import ``tk_bf16_layouts`` and parse the BF16 autotune cache.
+
+    Re-runs both the ``importlib.import_module`` call and the JSON parse on
+    every invocation; no memoization. The ``importlib`` step is cheap once
+    Python has the module in ``sys.modules``, but the ``json.load`` of the
+    autotune cache file is a fresh disk read every time.
+    """
     module_name = os.environ.get(_HIPKITTEN_MODULE_ENV, _BF16_DEFAULT_MODULE)
     search_paths = _bf16_search_paths()
     module = _import_with_fallback(module_name, search_paths)
@@ -160,9 +171,11 @@ def load_bf16() -> HipKittenModule:
     )
 
 
-@lru_cache(maxsize=1)
 def load_fp8() -> HipKittenModule:
-    """Import ``tk_fp8_layouts`` and parse the FP8 autotune cache."""
+    """Import ``tk_fp8_layouts`` and parse the FP8 autotune cache.
+
+    Same no-cache semantics as :func:`load_bf16`.
+    """
     search_paths = _fp8_search_paths()
     module = _import_with_fallback(_FP8_MODULE, search_paths)
     cache = _parse_fp8_cache(search_paths)
