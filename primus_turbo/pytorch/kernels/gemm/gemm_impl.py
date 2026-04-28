@@ -24,6 +24,20 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _HIPBLASLT_SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
+def _load_hipkitten_module():
+    """Backward-compat shim for tests/pytorch/ops/test_gemm.py.
+
+    The historical API (pre-refactor) lived at this module path and
+    returned the loaded BF16 extension. The rule-based dispatcher
+    refactor in commit 1970d91 moved the actual loader to
+    :func:`primus_turbo.pytorch.kernels.hipkitten.load_bf16`, but the
+    test file (which is FROZEN per project policy) still imports from
+    here. We forward to the new loader so the import — and the tests'
+    "skip on missing extension" guard — keep working.
+    """
+    return hipkitten.load_bf16().module
+
+
 class GEMMHipBLASLtBackend(KernelBackend):
 
     @staticmethod

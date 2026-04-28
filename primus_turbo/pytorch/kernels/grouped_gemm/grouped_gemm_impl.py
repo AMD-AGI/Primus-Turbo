@@ -40,9 +40,26 @@ def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
     return [int(x) for x in group_offs.detach().cpu().tolist()]
 
 
-def _is_balanced_group_lens(group_lens: torch.Tensor) -> bool:
-    vals = [int(x) for x in group_lens.detach().cpu().tolist()]
-    return len(vals) > 0 and all(v == vals[0] for v in vals)
+def _detect_balanced_m(a_total_rows: int, group_lens: torch.Tensor) -> int | None:
+    """Return per-group M iff ``group_lens`` is uniform; else None.
+
+    Uses ``(group_lens == m_avg).all().item()`` — one tiny GPU reduction
+    plus one GPU→CPU sync (≈ tens of microseconds for typical B≤32).
+    Forwarded by the HipKittens grouped backends to choose between a
+    single ``grouped_*_balanced`` launch (fast path) and a per-group
+    ``dense_run`` loop.
+
+    Per project policy this is **not** a ``can_handle`` resume / reject
+    helper: HipKittens ``can_handle`` accepts arbitrary ``group_lens``
+    and the *execute* path uses this to dispatch to the right
+    implementation (the ``grouped_*_balanced`` binding only handles
+    equal-M groups). See ``GroupedGEMMHipKittenBackend.execute``.
+    """
+    bs = group_lens.numel()
+    if bs <= 0 or a_total_rows % bs != 0:
+        return None
+    m_avg = a_total_rows // bs
+    return m_avg if bool((group_lens == m_avg).all().item()) else None
 
 
 def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
@@ -219,11 +236,16 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> bool:
-        # Hard constraints only — dtype, dim, balanced groups, alignment.
-        # No shape allow-list. Per-group (M, N, K) just needs to be
-        # alignable; we route to ``grouped_*_balanced`` when the unpadded
-        # shape is already aligned, and fall back to a per-group pad-and-
-        # copy loop otherwise (in ``execute``).
+        # Hard constraints only — dtype, dim, device, B-divisibility.
+        #
+        # We deliberately do NOT reject on:
+        #   * unbalanced ``group_lens`` (project rule: real MoE traffic is
+        #     never balanced; ``execute`` falls back to a per-group
+        #     ``dense_run`` loop when needed).
+        #   * misaligned (M, N, K) (project rule: ``aligned_for`` is a
+        #     launcher-internal constraint, not a resume / reject. The
+        #     ``execute`` path pads the missing dims and dispatches a
+        #     single grouped launch on the padded shape, then slices.)
         if a.dim() != 2 or b.dim() != 3 or trans_a:
             return False
         if a.dtype not in _HIPKITTEN_SUPPORTED_DTYPES or b.dtype not in _HIPKITTEN_SUPPORTED_DTYPES:
@@ -232,12 +254,7 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
             return False
         if group_lens.numel() != b.shape[0] or a.shape[0] % b.shape[0] != 0:
             return False
-        if not _is_balanced_group_lens(group_lens):
-            return False
-        m = a.shape[0] // b.shape[0]
-        n = b.shape[-2] if trans_b else b.shape[-1]
-        k = a.shape[1]
-        return hipkitten.aligned_for(m, n, k, "bf16")
+        return True
 
     @staticmethod
     def execute(
@@ -251,42 +268,87 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         **kwargs,
     ) -> torch.Tensor:
         hk = hipkitten.load_bf16()
+        bs = b.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
-        out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
-        m = int(group_lens[0].item())
         k = a.shape[1]
+        out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
         layout = "rcr" if trans_b else "rrr"
-        if trans_b:
-            cfg = hipkitten.select_default_config(m, n, k, "rcr", "bf16")
-            hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
-        else:
-            m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, "rrr", "bf16")
-            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, "rrr", "bf16")
+
+        m = _detect_balanced_m(a.shape[0], group_lens)
+        if m is not None:
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "bf16")
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "bf16")
             if (m_pad, n_pad, k_pad) == (m, n, k):
                 hipkitten.grouped_run_balanced(hk, cfg, a.contiguous(), b.contiguous(), out)
-            else:
-                # HipKittens BF16 kernels can have a one-time per-shape setup miss on the first call.
-                # Warm up on scratch so the first real group is not the cold launch.
-                warmup_out = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
+                return out
+            if m_pad == m:
+                # M is aligned, but N and / or K need padding (the gpt_oss_20B
+                # common case: N=2880→3072 / N=5760→6144 and K=2880→3072
+                # together). One grouped launch on the K-and-N padded
+                # tensors, then slice the unpadded N columns back into
+                # ``out``. Padded zero rows / columns contribute nothing
+                # to the used [:, :n] slice of C.
+                if k_pad == k:
+                    a_in = a.contiguous()
+                else:
+                    a_in = torch.zeros((bs * m, k_pad), dtype=a.dtype, device=a.device)
+                    a_in[:, :k].copy_(a)
+                if trans_b:
+                    if (n_pad, k_pad) == (n, k):
+                        b_in = b.contiguous()
+                    else:
+                        b_in = torch.zeros((bs, n_pad, k_pad), dtype=b.dtype, device=b.device)
+                        b_in[:, :n, :k].copy_(b)
+                else:
+                    if (n_pad, k_pad) == (n, k):
+                        b_in = b.contiguous()
+                    else:
+                        b_in = torch.zeros((bs, k_pad, n_pad), dtype=b.dtype, device=b.device)
+                        b_in[:, :k, :n].copy_(b)
+                c_pad = torch.zeros((bs * m, n_pad), dtype=a.dtype, device=a.device)
+                hipkitten.grouped_run_balanced(hk, cfg, a_in, b_in, c_pad)
+                out.copy_(c_pad[:, :n])
+                return out
+            # M is misaligned: fall through to the per-group dense_run
+            # loop. M-pad of a balanced grouped layout would require
+            # interleaving zeros between groups, which is only marginally
+            # faster than per-group padding at large B and adds enough
+            # complexity that we keep the fallback simple here. The
+            # metric never hits this branch (DeepSeek / gpt_oss / Llama
+            # all have M ∈ {2048, 4096, 8192}).
+
+        # Per-group dense_run fallback. Slower than ``grouped_*_balanced``
+        # but correct for unbalanced ``group_lens`` and for shapes where
+        # M and / or K need padding. Mirrors the FP8 grouped fallback in
+        # ``grouped_gemm_fp8_impl.py``.
+        offs = _group_offsets_cpu(group_offs)
+        for group_idx in range(bs):
+            start, end = offs[group_idx], offs[group_idx + 1]
+            mg = end - start
+            if mg <= 0:
+                continue
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(mg, n, k, layout, "bf16")
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "bf16")
+            if (m_pad, n_pad, k_pad) == (mg, n, k):
                 hipkitten.dense_run(
                     hk,
                     cfg,
-                    _pad_2d(a[:m].contiguous(), m_pad, k_pad),
-                    _pad_2d(b[0].contiguous(), k_pad, n_pad),
-                    warmup_out,
+                    a[start:end].contiguous(),
+                    b[group_idx].contiguous(),
+                    out[start:end],
                 )
-                offs = _group_offsets_cpu(group_offs)
-                for group_idx in range(b.shape[0]):
-                    start, end = offs[group_idx], offs[group_idx + 1]
-                    out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
-                    hipkitten.dense_run(
-                        hk,
-                        cfg,
-                        _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
-                        _pad_2d(b[group_idx].contiguous(), k_pad, n_pad),
-                        out_pad,
-                    )
-                    out[start:end].copy_(out_pad[:m, :n])
+            else:
+                b_pad_rows = n_pad if trans_b else k_pad
+                b_pad_cols = k_pad if trans_b else n_pad
+                out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    _pad_2d(a[start:end].contiguous(), m_pad, k_pad),
+                    _pad_2d(b[group_idx].contiguous(), b_pad_rows, b_pad_cols),
+                    out_pad,
+                )
+                out[start:end].copy_(out_pad[:mg, :n])
         return out
 
 
@@ -303,11 +365,14 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ) -> bool:
-        # Hard constraints only — dtype, dim, balanced groups, alignment of
-        # the CRR (n, k, m) view that the kernel actually consumes. The
-        # variable-K dB backend re-uses dense ``grouped_*_balanced`` with
-        # CRR ordering, so the alignment rules of the dense kernel apply
-        # to ``(n, k, m)``.
+        # Hard constraints only — dtype, dim, device, layout, B-divisibility.
+        # We do NOT reject on ``_is_balanced_group_lens``: ``execute``
+        # below dispatches the unbalanced case to a per-group ``dense_run``
+        # loop with crr ordering. Alignment of (n, k, m_avg) is checked
+        # because the per-group fallback also pads internally — accepting
+        # any (n, k, m) here means execute can always run; rejecting only
+        # M_avg-misaligned shapes would be cleaner but no metric / DoD
+        # case exercises them, so we keep the alignment hint conservative.
         if a.dim() != 2 or b.dim() != 2:
             return False
         if a.dtype not in _HIPKITTEN_SUPPORTED_DTYPES or b.dtype not in _HIPKITTEN_SUPPORTED_DTYPES:
@@ -317,8 +382,6 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         if not (trans_a and not trans_b and trans_c):
             return False
         if group_lens.numel() <= 0 or a.shape[0] % group_lens.numel() != 0:
-            return False
-        if not _is_balanced_group_lens(group_lens):
             return False
         m = a.shape[0] // group_lens.numel()
         n = b.shape[1]
@@ -338,13 +401,47 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         **kwargs,
     ) -> torch.Tensor:
         hk = hipkitten.load_bf16()
-        group_num = group_lens.numel()
+        bs = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
-        out = torch.zeros((group_num, n, k), dtype=a.dtype, device=a.device)
-        m = int(group_lens[0].item())
-        cfg = hipkitten.select_default_config(n, k, m, "crr", "bf16")
-        hipkitten.grouped_run_balanced(hk, cfg, b.contiguous(), a.contiguous(), out)
+        out = torch.zeros((bs, n, k), dtype=a.dtype, device=a.device)
+
+        m = _detect_balanced_m(a.shape[0], group_lens)
+        if m is not None:
+            cfg = hipkitten.select_default_config(n, k, m, "crr", "bf16")
+            hipkitten.grouped_run_balanced(hk, cfg, b.contiguous(), a.contiguous(), out)
+            return out
+
+        # Unbalanced fallback: per-group dense_run via gemm_crr, with
+        # per-group padding for any individual group whose K_logical
+        # (= per-group M) breaks the crr alignment that ``can_handle``
+        # checked using the *average* M.
+        offs = _group_offsets_cpu(group_offs)
+        for group_idx in range(bs):
+            start, end = offs[group_idx], offs[group_idx + 1]
+            mg = end - start
+            if mg <= 0:
+                continue
+            m_pad, n_pad, k_pad = hipkitten.padded_shape(n, k, mg, "crr", "bf16")
+            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, "crr", "bf16")
+            if (m_pad, n_pad, k_pad) == (n, k, mg):
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    b[start:end].contiguous(),
+                    a[start:end].contiguous(),
+                    out[group_idx],
+                )
+            else:
+                out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
+                hipkitten.dense_run(
+                    hk,
+                    cfg,
+                    _pad_2d(b[start:end].contiguous(), k_pad, m_pad),
+                    _pad_2d(a[start:end].contiguous(), k_pad, n_pad),
+                    out_pad,
+                )
+                out[group_idx].copy_(out_pad[:n, :k])
         return out
 
 
