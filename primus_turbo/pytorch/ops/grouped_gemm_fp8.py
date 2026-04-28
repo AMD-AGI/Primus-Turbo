@@ -425,66 +425,12 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None
 
 
-def _grouped_fwd_turbo_mxfp8(
-    a_fp8: torch.Tensor,
-    a_scales: torch.Tensor,
-    b_fp8: torch.Tensor,
-    b_scales: torch.Tensor,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    out_dtype: torch.dtype,
-    grid_x_hint: int,
-) -> torch.Tensor:
-    """Forward / dgrad: call the turbo MXFP8 grouped GEMM kernel directly.
-
-    Bypasses the dispatcher-level ``grouped_gemm_fp8_impl`` because for
-    MX_BLOCKWISE only the TURBO backend is supported, so there is nothing
-    to autotune between.  ``grid_x_hint`` (the persistent kernel's per-group
-    tile-M upper bound) is precomputed in Python from a single .cpu()
-    readback of ``group_lens`` and passed in to skip the C++ entry's own
-    D2H sync.
-
-    Layout: NT (trans_a=False, trans_b=True), MX_BLOCKWISE granularity.
-    """
-    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
-        a_fp8, b_fp8, a_scales, b_scales,
-        group_lens, group_offs,
-        False,  # trans_a
-        True,   # trans_b
-        out_dtype,
-        "MX_BLOCKWISE",
-        int(grid_x_hint),
-        False,  # b_scale_preshuffled — wrapper does not preshuffle; C++ entry will.
-    )
-
-
-def _grouped_wgrad_turbo_mxfp8(
-    grad_out_t_fp8: torch.Tensor,
-    grad_out_t_scale_inv: torch.Tensor,
-    a_t_fp8: torch.Tensor,
-    a_t_scale_inv: torch.Tensor,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Phase-2 wgrad: turbo variable-K MXFP8 kernel.
-
-    Calls turbo_grouped_gemm_variable_k_fp8 with grad_out^T fp8 of shape
-    (N, total_M) and saved a^T fp8 of shape (K, total_M).
-    Output dB shape (G, N, K).
-    """
-    # grad_out_t_fp8 shape (N, total_M_pad); a_t_fp8 shape (K, total_M_pad)
-    out = torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
-        grad_out_t_fp8, grad_out_t_scale_inv, a_t_fp8, a_t_scale_inv,
-        group_lens, group_offs, out_dtype, "MX_BLOCKWISE",
-    )
-    return out
-
-
 class GroupedGemmFP8MXFunc(torch.autograd.Function):
     """MXFP8 grouped GEMM autograd Function (NT layout, MX_BLOCKWISE granularity).
 
-    Forward, dgrad, and wgrad use the turbo MXFP8 kernels.
+    Forward, dgrad, and wgrad all dispatch through the FP8 dispatcher and
+    land on the turbo MXFP8 backends (``GroupedGEMMFP8TurboBackend`` and
+    ``GroupedGEMMFP8VariableKTurboBackend``).
     """
 
     @staticmethod
@@ -508,17 +454,11 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         G, N, K = b.shape
         # MXFP8 preshuffle (preshuffle_scale_16x4_kernel) uses 16-row blocks per
         # group; misalignment makes the kernel read scales across group bound-
-        # aries and corrupts the output for downstream groups.  Enforce here.
-        # Additionally, the turbo wgrad kernel requires per-group M_g % 128 ==
-        # 0 (preshuffled scale col-block alignment).
-        use_turbo_wgrad = True
-        # When not compiling, validate group_lens alignment and compute the
-        # persistent kernel's per-group tile-M upper bound (`grid_x_hint`) so
-        # the C++ entry can skip its own .cpu() sync.  Under torch.compile we
-        # leave grid_x_hint=0 and let the C++ entry fall back to the sync path.
+        # aries and corrupts the output for downstream groups.  Additionally,
+        # the turbo wgrad kernel requires per-group M_g % 128 == 0 (preshuffled
+        # scale col-block alignment).
         if not torch.compiler.is_compiling():
             lens_cpu = group_lens.cpu().tolist()
-            grid_x_hint = 0
             for g, mg in enumerate(lens_cpu):
                 if mg % 16 != 0:
                     raise ValueError(
@@ -530,12 +470,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
                         "MX_BLOCKWISE grouped GEMM wgrad requires each group's M_g to be "
                         f"a multiple of 128; got group {g} M_g={mg}."
                     )
-                tiles = (mg + 255) // 256
-                if tiles > grid_x_hint:
-                    grid_x_hint = tiles
-            grid_x_hint = max(grid_x_hint, 1)
-        else:
-            grid_x_hint = 0
+
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
@@ -566,20 +501,21 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         assert a_fp8_row.size(1) == b_fp8_row.size(2)
 
         # ── Forward: NT(A_row, B_row) — turbo MXFP8 grouped kernel
-        # Bypass the FP8 dispatcher because MX_BLOCKWISE only has the TURBO
-        # backend; nothing to autotune between.
-        out = _grouped_fwd_turbo_mxfp8(
+        out = grouped_gemm_fp8_impl(
             a_fp8_row,
-            a_scale_inv_row,
             b_fp8_row,
+            a_scale_inv_row,
             b_scale_inv_row,
             group_lens,
             group_offs,
-            out_dtype,
-            grid_x_hint,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            granularity=config.granularity.value,
+            num_cu=num_cu,
+            default_backend=BackendType.TURBO.value,
         )
 
-        # Save tensors required by turbo dgrad and wgrad.
         ctx.save_for_backward(
             a_fp8_col,
             a_scale_inv_col,
@@ -593,8 +529,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.num_cu = num_cu
         ctx.b_shape = (G, N, K)
         ctx.trans_b = trans_b
-        ctx.use_turbo_wgrad = use_turbo_wgrad
-        ctx.grid_x_hint = grid_x_hint
         return out
 
     @staticmethod
@@ -611,7 +545,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # Quantize grad_out once, matching MX GEMM: row-wise for dgrad and transposed for wgrad.
+        # Quantize grad_out once: row-wise for dgrad, col-wise (transposed) for wgrad.
         grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
@@ -621,27 +555,40 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
 
         # ── dgrad: dA = dC @ B = NT(dC, B^T)
         # b_fp8_col already has shape (G, K, N), serving as B^T for the NT kernel.
-        # Reuse grid_x_hint from forward — group_lens is unchanged across the
-        # fwd/bwd pair (autograd holds the same tensor).
-        grad_a = _grouped_fwd_turbo_mxfp8(
+        grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8_row,
-            grad_out_scale_inv_row,
             b_fp8_col,
+            grad_out_scale_inv_row,
             b_scale_inv_col,
             group_lens,
             group_offs,
-            ctx.out_dtype,
-            ctx.grid_x_hint,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TURBO.value,
         )
 
-        # ── wgrad: dB = dC^T @ A = NT(dC^T, A^T) via turbo variable-K kernel
-        if ctx.use_turbo_wgrad:
-            grad_b = _grouped_wgrad_turbo_mxfp8(
-                grad_out_t_fp8, grad_out_t_scale_inv, a_fp8_col, a_scale_inv_col,
-                group_lens, group_offs, ctx.out_dtype,
-            )
-        else:
-            raise RuntimeError("MX_BLOCKWISE grouped GEMM requires the turbo wgrad path.")
+        # ── wgrad: dB = dC^T @ A via the turbo variable-K kernel; the kernel
+        # is fixed NT, so feed in the already-transposed col-quant tensors and
+        # leave trans_a/trans_b/trans_c at False.
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            grad_out_t_fp8,
+            a_fp8_col,
+            grad_out_t_scale_inv,
+            a_scale_inv_col,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TURBO.value,
+        )
+
         return grad_a, grad_b, None, None, None, None, None
 
 
