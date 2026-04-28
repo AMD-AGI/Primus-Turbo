@@ -81,6 +81,21 @@ def _check_locked_mode(mode: LaunchMode) -> None:
         )
 
 
+def auto_detect_mode() -> None:
+    """Set PRIMUS_TURBO_JAX_DEEPEP_MODE if not already set.
+
+    When each JAX process owns exactly one GPU (ONE_GPU_PER_PROCESS),
+    DeepEP must use inter-process IPC buffers instead of intra-process
+    shared memory.  Call this before the first ``get_mode(lock=True)``
+    so that the env var is in place before the mode is locked.
+    """
+    if os.environ.get(_MODE_ENV_VAR) is not None:
+        return
+    if jax.local_device_count() == 1 and jax.process_count() > 1:
+        os.environ[_MODE_ENV_VAR] = "per_process"
+        log.info("Auto-detected per_process mode (1 GPU per process, %d processes)", jax.process_count())
+
+
 def get_mode(*, lock: bool = False) -> LaunchMode:
     global _locked_mode
 
@@ -181,6 +196,7 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
 
 
 def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) -> None:
+    auto_detect_mode()
     mode = get_mode(lock=True)
     if mode is MODE_INPROC:
         return

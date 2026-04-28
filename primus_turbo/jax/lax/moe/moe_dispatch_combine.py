@@ -8,6 +8,7 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import jax
+import jax.core
 import jax.numpy as jnp
 
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
@@ -19,12 +20,30 @@ from primus_turbo.jax.primitive.moe.moe_dispatch import (
 
 from .moe_utils import Config
 
-__all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_combine"]
+__all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_combine", "warmup"]
 
 
 _default_num_sms = 64
 
 P = jax.sharding.PartitionSpec
+
+
+def warmup(hidden_bytes: int, *, config: Optional[Config] = None) -> None:
+    """Eagerly bootstrap DeepEP runtime outside any JAX tracing context.
+
+    Must be called **collectively by all processes** before the first
+    ``jax.eval_shape`` / ``jax.jit`` that touches DeepEP dispatch or
+    combine ops.  Safe to call multiple times (subsequent calls are
+    no-ops when the buffer is already large enough).
+
+    Args:
+        hidden_bytes: ``emb_dim * max(dtype_itemsize, 2)``.
+        config: DeepEP dispatch ``Config``.  When *None* the default
+            dispatch config for the current EP size is used.
+    """
+    deep_ep_runtime.auto_detect_mode()
+    config = get_dispatch_config() if config is None else config
+    deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=hidden_bytes, config=config)
 
 
 def _get_hidden_bytes(x: jnp.ndarray) -> int:
@@ -185,7 +204,8 @@ def _moe_dispatch_impl(
     num_tokens, _ = x.shape
     # default config
     config = get_dispatch_config() if config is None else config
-    deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
+    if not isinstance(x, jax.core.Tracer):
+        deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
     ep_size = deep_ep_runtime.get_ep_size(lock=True)
     launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
     num_worst_tokens = num_tokens * ep_size
@@ -362,7 +382,8 @@ def _moe_combine_impl(
 ) -> Tuple[jnp.ndarray]:
     # default config
     config = get_combine_config() if config is None else config
-    deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
+    if not isinstance(x, jax.core.Tracer):
+        deep_ep_runtime.ensure_deepep_runtime(hidden_bytes=_get_hidden_bytes(x), config=config)
     ep_size = deep_ep_runtime.get_ep_size(lock=True)
     launch_mode = deep_ep_runtime.get_launch_mode(lock=True)
 
