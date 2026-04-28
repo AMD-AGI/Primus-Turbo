@@ -68,18 +68,25 @@ DEFAULT_SKILL = "/root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 DEFAULT_TASK = (
     "**最终目标**：让 HIPKITTEN backend 在 LLM 典型 dense GEMM shape 上达到 "
     "Primus 默认 dispatch（BF16→HIPBLASLT, FP8 tensorwise→HIPBLASLT）TFLOPS 的 "
-    "≥ 90% (geomean across 16-shape suite) —— 即新 metric `_metric_hk_ratio.py` "
+    "≥ 90% (geomean across 16-shape suite) —— 即 metric `_metric_hk_ratio.py` "
     "score ≥ 900。Baseline = 904（BF16 已基本 parity，FP8 tensorwise 8/8 shape "
     "全在 0.79~0.87，是核心瓶颈）。\n\n"
-    "**分工**：\n"
-    "  - HipKittens 仓库 (/workspace/code/HipKittens) 提供底层 kernel 优化：\n"
-    "    改 kernel cpp（tile/wave layout/swizzle/MFMA 排布等）、扩 autotune "
-    "    cache、调 group_m/xcd 搜索空间。改完用 Makefile 重编 .so。\n"
-    "  - Primus-Turbo 仓库提供\"规则式\"参数调度：\n"
-    "    GEMMHipKittenBackend.can_handle 用形状级规则（M%256==0 等）放宽限制；\n"
-    "    GEMMFP8HipKittenBackend / dispatch 用通用启发式选 group_m/kernel 变体。\n\n"
-    "**严禁**：case-by-case 调优 —— 不允许在任何 .py 里塞 `if (M,N,K)==(...): "
-    "return cfg` 这种形状→配置的硬编码表（autotune cache 是数据，不算）。"
+    "**两仓库分工**：\n"
+    "  - /workspace/code/HipKittens —— 底层 kernel 仓：tile/wave layout/swizzle/MFMA、"
+    "autotune cache、kernel launcher。改 .cpp 后进 analysis/{bf16,fp8}_gemm/mi350x/ "
+    "跑 `source ../../../env.src && make -j` 重编 tk_*_layouts.so（Primus 自动 reload）。\n"
+    "  - /workspace/code/Primus-Turbo —— dispatch 框架仓：写**通用规则**(`if K%128==0`、"
+    "`if N>=K`)，不写形状表。扩 can_handle 覆盖、改 group_m / kernel 变体的启发式。\n\n"
+    "**FROZEN（不可修改）文件清单**：\n"
+    "  - scripts/_metric_hk_ratio.py —— metric 评分脚本，改它就是作弊\n"
+    "  - scripts/auto_optimize.py / scripts/run_dod_metric.sh —— 调度器本身\n"
+    "  - tests/pytorch/ops/test_*.py —— 不能加 skip / 删 parametrize / 调 SNR 阈值\n"
+    "  - /root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md —— 上下文文档\n\n"
+    "**严禁的『假优化』模式**（违反 = 本轮立即作废）：\n"
+    "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（autotune .json 是数据，允许）\n"
+    "  ✗ 收紧 can_handle 把难 shape 排除掉（geomean clip 0.01，分数立刻塌）\n"
+    "  ✗ 只改 metric/test 文件让数字变好\n"
+    "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值"
 )
 # Loop metric: real benchmark of HIPKITTEN vs default-backend TFLOPS on a
 # fixed 16-shape LLM-typical suite (BF16 + FP8 tensorwise dense). Score is
@@ -228,9 +235,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--gpu-pool",
         type=str,
-        default="0,1,2,3",
+        default="0,2,3",
         help=(
             "Comma-separated list of GPU ids the loop is allowed to use. "
+            "Default 0,2,3 (GPU 1 is currently reserved for other workloads). "
             "Exported as HIPKITTEN_GPU_POOL, honored by scripts/_metric_hk_ratio.py "
             "and scripts/run_dod_metric.sh (idle picks intersect this pool). "
             "Empty string disables (let scripts see all GPUs)."
@@ -433,6 +441,12 @@ metric 命令（约 10 秒、单 GPU、自动选空闲卡）：
 score = int(geomean(hk_tflops / ref_tflops) * 1000)。target ≥ 900 (= 90%)。
 HIPKITTEN reject 一个 shape → 该 shape ratio 被 clip 到 0.01 → geomean 大幅下跌，
 所以**收紧 can_handle 反而会扣分**，必须靠真功夫扩覆盖 + 提速。
+
+【**首要数据源** — metric 的 stderr 表】
+metric 命令的 stderr 会打印一张逐 shape 表，列出 dtype / (M,N,K) / hk_tflops / ref_tflops /
+ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 ratio < 0.9 的 shape，
+按 ratio 升序选 1 个作为本轮攻坚目标。**不许凭印象选 shape**，必须用上一轮 metric 数据。
+跑命令：`{args.metric_cmd} 2>&1 | tee /tmp/metric_round_{round_idx}.log`。
 **改完一次、commit 前一次** —— 不要每改一行都跑。
 {dod_block}
 
@@ -451,14 +465,7 @@ HIPKITTEN reject 一个 shape → 该 shape ratio 被 clip 到 0.01 → geomean 
 【近 5 轮记录】
 {history_block}
 
-【你必须**改 kernel 或 cache 或规则式 dispatch**，不能只改测试/probe 脚本】
-**禁止**的"假优化"模式（auto_optimize 会通过 commit 内容检测、违者立即作废本轮）：
-  ✗ 只动 scripts/_metric_*.py 让指标数字变好。
-  ✗ 用 if (M,N,K)==(X,Y,Z) 这种 case-by-case 形状→配置硬编码表"修"某 shape。
-  ✗ 在 can_handle 里加新形状黑名单"绕"过难 shape（geomean 会立刻塌）。
-  ✗ 改 SNR 阈值、删 pytest 用例、注掉 parametrize 这类回避问题的手段。
-
-**真**优化方向（任选一个具体小目标）：
+【真优化方向 — 任选一个具体小目标】（"严禁假优化"清单已在【优化目标】里给出，请重读）
   ✓ HipKittens kernel 改写：例如 /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/
     kernel_fp8_layouts.cpp 的 K-step / wave grid / swizzle / MFMA 排布。
     改完进 analysis/{{bf16,fp8}}_gemm/mi350x 跑 `source ../../../env.src && make`，
@@ -498,22 +505,19 @@ HIPKITTEN reject 一个 shape → 该 shape ratio 被 clip 到 0.01 → geomean 
 - 如果两边都改了，本轮 git log 在 Primus-Turbo 显示的是 Primus 这边的 commit；
   在你的本轮小结里**列出 HipKittens commit SHA**，方便用户回溯。
 
-【硬性约束 - 不可违反】
-- **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量）。
-  metric 与 DoD checkpoint 会自动从这个池里挑空闲卡，你**不要手动 export HIP_VISIBLE_DEVICES=4..7**。
-  跑任何 benchmark/probe 前先 `rocm-smi --showuse --showpids` 选池内空闲卡。
-- 绝不删除 tests/pytorch/ops/test_gemm_fp8.py / test_grouped_gemm_fp8.py 等测试文件。
-- 绝不通过添加 pytest.skip / 删 parametrize / 改 SNR 阈值的方式来"修复"问题。
-- BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)`，绝不能让 autotune 默认选它。
-- **绝不在 .py 里塞 case-by-case 形状→配置表**（autotune cache .json 是数据，允许）。
-- **绝不只改 scripts/_metric_*.py 来让分数升高** —— 那是作弊，本轮直接作废。
+【脚本机制硬约束 - 不可违反】
+- **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量；GPU 1
+  当前被其他作业占用，绝不许动）。metric / DoD / 你自己的任何 benchmark/probe 都**只能从这个池
+  里挑卡**，跑前先 `rocm-smi --showuse --showpids` 看哪张空闲。**绝不许手动 export
+  HIP_VISIBLE_DEVICES** 去用池外的卡。
+- BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)` —— 它是手动 backend，
+  不能进 autotune 池。
+- 任何动 dispatch / can_handle / group_m 规则的修改都必须配一个小 python 数值 probe
+  （比 fp32 reference 算 max_abs + SNR），把两个数值贴进 commit message。
+- **每轮在每个仓库最多 1 个 focused commit**；message 用 `feat:` / `fix:` / `perf:` /
+  `refactor:` 风格；commit 后**绝不 push**任何 remote。
 - 不要修改 ~/.cursor/cli-config.json 或全局 git config。
-- 不要 push 到任何 remote。
 - 不要用 `git rebase -i / git add -i` 这类交互命令。
-- 任何对 dispatch / can_handle 规则的修改都要在脚本之外做一个小 python 数值 probe（max_abs / SNR），
-  把数值写进 commit message，证明数值正确。
-- 小步前进：**每轮在每个仓库最多 1 个 focused commit**，message 用 `feat:` / `fix:` / `perf:` /
-  `refactor:` 风格。
 
 【输出要求】
 本轮结束前给一段 markdown 小结，包含：
