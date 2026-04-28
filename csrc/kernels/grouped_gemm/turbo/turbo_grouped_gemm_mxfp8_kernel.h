@@ -541,7 +541,18 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
                                              c_tmp_a, c_stg_offsets);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<0>();
+        // PERF: drop the previously-here second `wait_vmcnt<0>()`.  pair-3
+        // about to read into c_tmp_b — it must wait for pair-1's stores
+        // (the previous c_tmp_b writer) to have read their source VGPRs.
+        // That guarantee is ALREADY provided transitively by the first
+        // `wait_vmcnt<0>` above (~539): when that drain returned, vmcnt==0
+        // → pair-0 (c_tmp_a) AND pair-1 (c_tmp_b) had both fully retired.
+        // pair-2 between then and here only writes c_tmp_a — it does not
+        // touch c_tmp_b.  So at this program point c_tmp_b's register slot
+        // is provably already safe for pair-3's `v_accvgpr_read_b32` to
+        // overwrite, with no pending LSU source-VGPR reads from any prior
+        // pair.  The drop saves a full vmcnt(0) drain (~50-100 cycles
+        // depending on pair-2's L1 commit latency) per output tile.
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets);
@@ -572,7 +583,12 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                                              c_tmp_a, c_stg_offsets, tile_valid_m - 128,
                                              tile_valid_n);
         __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<0>();
+        // PERF: drop the previously-here second `wait_vmcnt<0>()` (mirror of
+        // the !is_boundary_tile branch above).  pair-1 (the previous c_tmp_b
+        // writer) was already fully drained by the first `wait_vmcnt<0>`
+        // above; pair-2 between then and here only writes c_tmp_a, never
+        // c_tmp_b.  So c_tmp_b's register slot is provably free for
+        // pair-3's accvgpr reads at this point — no extra drain needed.
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets, tile_valid_m - 128,
