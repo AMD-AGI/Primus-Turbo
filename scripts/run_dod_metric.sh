@@ -10,16 +10,24 @@
 # live) so each round finishes in tens of seconds, not minutes. Picks idle
 # GPUs at runtime via rocm-smi so we never collide with other tenants.
 #
-# The broader "all 4 files green" DoD bar is the **final acceptance gate**
-# (run with --full); the loop itself maximizes pass count over HipKitten
-# tests only.
+# The broader regression guardrail is the curated DoD smoke set
+# (tests/pytorch/ops/test_dod_smoke.py) — selected via --full — which
+# exercises every backend / granularity / layout combination with small
+# shapes plus the dedicated bug-fix regressions. It finishes in ~5-10 min
+# on 3-4 idle GPUs, vs. ~hours for the four canonical test files.
 #
 # Output: single integer score on stdout (default), or raw pytest output
 # (--raw). Designed to be consumed by scripts/auto_optimize.py.
 #
 # Flags:
-#   --full            Run the full DoD suite (4 files, no -k filter). Slow.
-#                     Use this for final acceptance, not for the loop metric.
+#   --full            Run the curated DoD smoke regression set
+#                     (tests/pytorch/ops/test_dod_smoke.py). ~610 cases
+#                     (~309 dense + ~301 grouped), ~5-15 min on 3 workers.
+#                     This is the periodic DoD checkpoint gate driven by
+#                     scripts/auto_optimize.py.
+#   --exhaustive      Run the four canonical test files with no -k filter.
+#                     ~200 K parametrized cases — only suitable as a
+#                     manual end-of-run / release acceptance check.
 #   --deterministic   Add --deterministic-only to pytest.
 #   --raw             Print full pytest output instead of score.
 #   --max-workers N   Cap the number of xdist workers (default: # idle GPUs).
@@ -38,10 +46,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DETERMINISTIC=0
 RAW=0
 FULL=0
+EXHAUSTIVE=0
 MAX_WORKERS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --full)          FULL=1; shift ;;
+        --exhaustive)    EXHAUSTIVE=1; shift ;;
         --deterministic) DETERMINISTIC=1; shift ;;
         --raw)           RAW=1; shift ;;
         --max-workers)   MAX_WORKERS="$2"; shift 2 ;;
@@ -51,6 +61,11 @@ while [[ $# -gt 0 ]]; do
             echo "[run_dod_metric] unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+if [[ "$FULL" -eq 1 && "$EXHAUSTIVE" -eq 1 ]]; then
+    echo "[run_dod_metric] --full and --exhaustive are mutually exclusive" >&2
+    exit 2
+fi
 
 HIPKITTEN_PATH="${HIPKITTEN_PATH:-/workspace/code/HipKittens}"
 
@@ -130,15 +145,18 @@ if [[ -n "$MAX_WORKERS" && "$NPROC" -gt "$MAX_WORKERS" ]]; then
     DEVICES=$(awk -v n="$NPROC" -F, '{ for(i=1;i<=n;i++) printf "%s%s", $i, (i<n?",":"") }' <<<"$DEVICES")
 fi
 
-echo "[run_dod_metric] idle GPUs=${DEVICES} workers=${NPROC} deterministic=${DETERMINISTIC} full=${FULL}" >&2
+echo "[run_dod_metric] idle GPUs=${DEVICES} workers=${NPROC} deterministic=${DETERMINISTIC} full=${FULL} exhaustive=${EXHAUSTIVE}" >&2
 
-if [[ "$FULL" -eq 1 ]]; then
+if [[ "$EXHAUSTIVE" -eq 1 ]]; then
     PYTEST_FILES=(
         "$REPO_ROOT/tests/pytorch/ops/test_gemm.py"
         "$REPO_ROOT/tests/pytorch/ops/test_gemm_fp8.py"
         "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm.py"
         "$REPO_ROOT/tests/pytorch/ops/test_grouped_gemm_fp8.py"
     )
+elif [[ "$FULL" -eq 1 ]]; then
+    # Curated DoD smoke regression set; finishes in ~5-10 min on 3 workers.
+    PYTEST_FILES=( "$REPO_ROOT/tests/pytorch/ops/test_dod_smoke.py" )
 else
     # Loop-mode: only the files that contain HIPKITTEN-tagged cases.
     PYTEST_FILES=(
@@ -148,16 +166,21 @@ else
 fi
 KEXPR="${PYTEST_K:-hipkitten}"
 
-PYTEST_CMD=(python3 -m pytest "${PYTEST_FILES[@]}" --tb=no -q)
-if [[ "$FULL" -eq 0 ]]; then
+# Verbose tracebacks for the regression gates; terse for the fast loop.
+if [[ "$FULL" -eq 1 || "$EXHAUSTIVE" -eq 1 ]]; then
+    PYTEST_CMD=(python3 -m pytest "${PYTEST_FILES[@]}" --tb=short -q)
+else
+    PYTEST_CMD=(python3 -m pytest "${PYTEST_FILES[@]}" --tb=no -q)
+fi
+if [[ "$FULL" -eq 0 && "$EXHAUSTIVE" -eq 0 ]]; then
     PYTEST_CMD+=( -k "$KEXPR" )
 fi
 # Cap parallelism by # of selected tests for the narrow loop run; xdist only
 # helps if we have multiple cases per worker. For the HipKitten loop this
 # rarely needs >2 workers.
-if [[ "$NPROC" -gt 1 && "$FULL" -eq 1 ]]; then
+if [[ "$NPROC" -gt 1 && ( "$FULL" -eq 1 || "$EXHAUSTIVE" -eq 1 ) ]]; then
     PYTEST_CMD+=( -n "$NPROC" )
-elif [[ "$NPROC" -gt 1 && "$FULL" -eq 0 ]]; then
+elif [[ "$NPROC" -gt 1 ]]; then
     LOOPN=$NPROC
     [[ "$LOOPN" -gt 2 ]] && LOOPN=2
     PYTEST_CMD+=( -n "$LOOPN" )
@@ -175,16 +198,25 @@ TMP=$(mktemp)
 # Run pytest in its own process group so that if the auto_optimize watchdog
 # kills *us*, we can take the whole pytest tree (and any -n xdist workers)
 # down with us instead of leaving zombie GPU-holders. SIGTERM/SIGINT/SIGHUP
-# arrive at this script first; the trap cleanly kills the pgid before exit.
-cleanup() {
-    rm -f "$TMP"
+# arrive at this script first; the trap kills the pgid but PRESERVES $TMP
+# so that on a timeout the partial pytest output survives long enough for
+# the score-parse / diagnostic tail below to emit it. The on-EXIT trap is
+# what actually unlinks $TMP.
+cleanup_pytest() {
     if [[ -n "${PYTEST_PID:-}" ]] && kill -0 -- -"$PYTEST_PID" 2>/dev/null; then
         kill -TERM -- -"$PYTEST_PID" 2>/dev/null || true
         sleep 2
         kill -KILL -- -"$PYTEST_PID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM HUP
+cleanup_all() {
+    cleanup_pytest
+    if [[ -n "${TMP:-}" && -f "$TMP" ]]; then
+        rm -f "$TMP"
+    fi
+}
+trap cleanup_pytest INT TERM HUP
+trap cleanup_all EXIT
 
 setsid "${PYTEST_CMD[@]}" >"$TMP" 2>&1 &
 PYTEST_PID=$!
@@ -198,12 +230,20 @@ fi
 
 # Extract "<N> passed" from the last summary line; if not found print 0 so
 # the metric stays comparable.
-PASS=$(grep -oE '[0-9]+ passed' "$TMP" | tail -1 | grep -oE '[0-9]+' || true)
-FAIL=$(grep -oE '[0-9]+ failed' "$TMP" | tail -1 | grep -oE '[0-9]+' || true)
-ERR=$(grep -oE '[0-9]+ errors?' "$TMP" | tail -1 | grep -oE '[0-9]+' || true)
+PASS=$(grep -oE '[0-9]+ passed' "$TMP" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)
+FAIL=$(grep -oE '[0-9]+ failed' "$TMP" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)
+ERR=$(grep -oE '[0-9]+ errors?' "$TMP" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)
 PASS=${PASS:-0}
 FAIL=${FAIL:-0}
 ERR=${ERR:-0}
+
+# When pytest got killed before producing a summary line, stash the tail of
+# its captured output to stderr so the dod.log keeps a hint of what was
+# running. Loop-mode (no flag) skips this to keep the metric stdout clean.
+if [[ ( "$FULL" -eq 1 || "$EXHAUSTIVE" -eq 1 ) && "$PASS" -eq 0 && "$FAIL" -eq 0 && "$ERR" -eq 0 ]]; then
+    echo "[run_dod_metric] no pytest summary found; tail of captured output:" >&2
+    tail -n 40 "$TMP" >&2 || true
+fi
 
 echo "[run_dod_metric] passed=${PASS} failed=${FAIL} errors=${ERR} pytest_rc=${RC}" >&2
 
