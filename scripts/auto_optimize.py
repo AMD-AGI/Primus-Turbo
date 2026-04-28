@@ -69,58 +69,77 @@ DEFAULT_TASK = (
     "**最终目标**（5 段独立判定，每段都必须 PASS；看 metric stderr 的 "
     "`Goals:` 5 行 PASS/FAIL）：\n"
     "  (1) **BF16_fwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM forward (8 shape)\n"
-    "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape，"
-    "a_grad + b_grad 两次 GEMM 的隔离时间)\n"
+    "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape)\n"
     "  (3) **FP8_fwd  vs HIPBLASLT** ≥ 0.97 —— dense FP8 tensorwise GEMM forward (8 shape)\n"
-    "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape)。"
-    "FP8 backward 不跟 HIPBLASLT 比 (HIPBLASLT 的 FP8 backward 走的 quant 路径不同)，"
-    "跟 TRITON 比，要求 HK 比 Triton 快至少 20%。\n"
-    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape，"
-    "DeepSeek-V3 + gpt_oss_20B)。grouped 不跟 AITER 比 (AITER 是高度优化的"
-    "上游)，跟 TRITON 比，要求 HK 比 Triton 快至少 20%。\n\n"
+    "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape)\n"
+    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B)\n\n"
     "5 段全 PASS 才算交付；metric score (= 5 段 geomean 的 geomean × 1000) 只"
     "是 auto_optimize 的 ranking 信号，**不是验收标准**。\n\n"
-    "**Baseline = 53** / 5 goals = 0 PASS（2026-04-28，cache-free dispatch + "
-    "48-shape suite, 5 sections）。这是把 hipkitten 模块所有 lru_cache / "
-    "dict / weakref 全部清光后的诚实起点 —— 每次 forward 重 import + reparse "
-    "autotune JSON 多吃 ~0.6 ms dispatch overhead，会盖过小 GEMM 的 kernel "
-    "时间。这是规则的物理代价，不能用 cache 绕。\n"
-    "现状 per-section breakdown:\n"
+    "═══════════════════════════════════════════════════════════════════════\n"
+    "**核心架构方向（必读，决定本轮所有判断）**\n"
+    "═══════════════════════════════════════════════════════════════════════\n\n"
+    "参考 turbo 自己的 triton GEMM：\n"
+    "  `primus_turbo/triton/gemm/gemm_kernel.py::offline_select_bf16` (line 239-281)\n"
+    "  + `gemm_triton_kernel` 主入口 (line 626-823)\n"
+    "它**完全没有 cache / JSON / pickle / dict lookup**，全是 if/else 规则：\n"
+    "  ```\n"
+    "  BM, BN, BK = 256, 256, 64                           # 90% shape 默认 tile\n"
+    "  group_m = 8 if min(tiles_m, tiles_n) < 16 else 4    # ← 规则，不查表\n"
+    "  use_bk64 = is_tn and (K > 3584 or min(M,N) > 4608)  # ← 规则\n"
+    "  ```\n"
+    "kernel 永远能跑 —— 永远有一组规则给出 default config。triton 的 `offline_select_bf16` "
+    "docstring 写得很清楚：186 个 bench entry 是**线下分析时**用的，归纳成 if/else 规则后，"
+    "**runtime 不再需要那张表**。这就是 user 想要的 'autotune 是 turbo 这边可设的，"
+    "一般不开，有一组根据 mnk 的默认配置'。\n\n"
+    "**HipKittens backend 必须改成同样的模式**：\n"
+    "  1. 在 `primus_turbo/pytorch/kernels/hipkitten/` 下新建 `config.py`，写一个纯函数：\n"
+    "       `select_default_config(M, N, K, layout, dtype) -> Config`\n"
+    "     （Config 含 group_m / num_xcds / kernel variant id）。**依据**：把\n"
+    "     `/workspace/code/HipKittens/analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json` (~58 行)\n"
+    "     `/workspace/code/HipKittens/analysis/fp8_gemm/mi350x/.autotune_cache.json` (~177 行)\n"
+    "     一次性 dump 出来线下看，归纳 (M,N,K,layout) → cfg 的分布成几条 if/else。\n"
+    "     这些 .json 是**离线 bench 笔记**，runtime **不再 import / parse**。\n"
+    "  2. `can_handle` 只查硬约束：dtype 支持、layout (NT/NN/TN/TT)、alignment\n"
+    "     （HK kernel 对 M/N/K 的 tile 对齐要求）。**不再查 cache 是否命中**。\n"
+    "     永远命中 default 规则 → 永远不 reject。\n"
+    "  3. dispatch 路径 = `select_default_config(...)` + `kernel(args, group_m=g, num_xcds=x)`，\n"
+    "     **零 IO、零 cache、零 dict、零 pickle、零 JSON parse**。\n"
+    "  4. autotune 是 turbo 这边的**可选机制**（像 `@triton.autotune`）。\n"
+    "     **默认关闭**。开了之后是开发者工具：跑 sweep → 看 winning config →\n"
+    "     **开发者手动**把结论写回 `select_default_config` 的规则里，**结果不存盘**。\n"
+    "     不是 runtime 路径 —— 第一刀做完后再考虑，可选。\n\n"
+    "═══════════════════════════════════════════════════════════════════════\n"
+    "**Baseline = 53** / 5 goals = 0 PASS（2026-04-28 reset 后的诚实起点）：\n"
     "  • BF16_fwd  (8)  geomean=0.319 vs HIPBLASLT  ← dispatch overhead 把小 GEMM 拖死\n"
-    "  • BF16_bwd  (8)  geomean=0.014 vs HIPBLASLT  ← **7/8 reject** + 1 个 ratio=0.134\n"
-    "  • FP8_fwd   (8)  geomean=0.366 vs HIPBLASLT  ← 同 dispatch overhead 问题\n"
-    "  • FP8_bwd   (8)  geomean=0.014 vs TRITON     ← **7/8 reject** + 1 个 ratio=0.186\n"
-    "  • grp_BF16 (16)  geomean=0.018 vs TRITON     ← **14/16 reject**, 跑通 2 个 ratio=1.05/1.11 (差 0.20→1.20 还有距离)\n"
-    "唯二跑通的 grouped case 是 DeepSeek-V3-GateUP-{B16,B32}-M4096（vs TRITON "
-    "ratio=1.05~1.11，离 1.20 目标差 ~10%）。BF16 / FP8 backward 全部 reject 是因为 "
-    "backward 走的 grad_a (NN/RRR layout) + grad_b (TN/CRR layout) HK backend "
-    "当前 can_handle 不覆盖。\n"
-    "Attack vectors:\n"
-    "  - dense fwd：在 kernel 侧/launch 侧把 dispatch 路径变短，让 HK kernel 单 launch 自己做更多事\n"
-    "  - bf16/fp8 bwd：扩 HK BF16/FP8 binding 的 layout 覆盖（添加 RRR / CRR entry，含 grouped）\n"
-    "  - grouped：扩 HipKittens grouped autotune cache 到缺失的 K/M/N，放宽 can_handle 同时保 numeric\n"
-    "（绝对禁止靠任何 host-side cache 做。）\n\n"
-    "**两仓库分工**：\n"
-    "  - /workspace/code/HipKittens —— 底层 kernel 仓：tile/wave layout/swizzle/MFMA、"
-    "autotune cache、kernel launcher。改 .cpp 后进 analysis/{bf16,fp8}_gemm/mi350x/ "
-    "或对应 grouped 目录跑 `source ../../../env.src && make -j` 重编 "
-    "tk_*_layouts.so（Primus 自动 reload）。\n"
-    "  - /workspace/code/Primus-Turbo —— dispatch 框架仓：写**通用规则**(`if K%128==0`、"
-    "`if N>=K`)，不写形状表。扩 can_handle 覆盖、改 group_m / kernel 变体的启发式。\n\n"
-    "**FROZEN（不可修改）文件清单**：\n"
-    "  - scripts/_metric_hk_ratio.py —— metric 评分脚本，改它就是作弊\n"
-    "  - scripts/auto_optimize.py / scripts/run_dod_metric.sh —— 调度器本身\n"
-    "  - tests/pytorch/ops/test_*.py —— 不能加 skip / 删 parametrize / 调 SNR 阈值\n"
-    "  - benchmark/ops/config.py —— shape 表的 ground truth\n"
-    "  - /root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md —— 上下文文档\n\n"
+    "  • BF16_bwd  (8)  geomean=0.014 vs HIPBLASLT  ← 7/8 reject\n"
+    "  • FP8_fwd   (8)  geomean=0.366 vs HIPBLASLT  ← 同 overhead 问题\n"
+    "  • FP8_bwd   (8)  geomean=0.014 vs TRITON     ← 7/8 reject\n"
+    "  • grp_BF16 (16)  geomean=0.018 vs TRITON     ← 14/16 reject\n"
+    "现在 reject 全部源于 'backend 通过 lookup .json 找 entry 来兜底，cache miss → reject' —— \n"
+    "**新架构下这种 reject 应该消失**：select_default_config 永远返回一个 cfg，kernel 永远能跑。\n"
+    "dispatch overhead 也消失：当前 ~0.6 ms 是 reparse json，新架构下是 ~us 的 if/else。\n\n"
     "**严禁的『假优化』模式**（违反 = 本轮立即作废）：\n"
-    "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（autotune .json 是数据，允许）\n"
+    "  ✗ **runtime 读任何 .json / .pkl / .autotune_cache.json**（开发期 bench 用、归纳完后\n"
+    "    runtime 不再 import；任何 hipkitten 路径上看到 `json.load`/`pickle.load` 都是违规）\n"
+    "  ✗ **任何形式 cache：dict / weakref / data_ptr / _version / LRU / TTL** —— quant 输出 /\n"
+    "    preshuffle / group_offs / grid_x_hint / scale / autograd 中间产物全在禁单里\n"
+    "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（**通用规则**才允许，\n"
+    "    例如 `if K>=4096`、`if min(tiles)<16`、`if N>=K`）\n"
     "  ✗ 收紧 can_handle 把难 shape 排除掉（geomean clip 0.01，分数立刻塌）\n"
-    "  ✗ 只改 metric/test 文件让数字变好\n"
-    "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值\n"
-    "  ✗ **永远禁止 cache：dict / weakref / data_ptr / _version / LRU / TTL "
-    "任何形式都不行（quant 输出 / preshuffle / group_offs / grid_x_hint / "
-    "scale / autograd 中间产物 全在禁单里）**"
+    "  ✗ 只改 metric/test/config.py 文件让数字变好\n"
+    "  ✗ 加 pytest.skip / 删 parametrize / 提高 SNR 阈值\n\n"
+    "**两仓库分工**：\n"
+    "  - /workspace/code/HipKittens —— kernel/launcher 仓：tile/wave layout/swizzle/MFMA。\n"
+    "    改 .cpp 后进 analysis/{bf16,fp8}_gemm/mi350x/ 跑 `source ../../../env.src && make -j` 重编\n"
+    "    tk_*_layouts.so（Primus 自动 reload）。**.json 文件保留作为离线 bench 笔记，\n"
+    "    runtime 不读**。\n"
+    "  - /workspace/code/Primus-Turbo —— dispatch 仓：写 `select_default_config` 的通用规则\n"
+    "    + can_handle 硬约束检查；不写形状表。\n\n"
+    "**FROZEN（不可修改）**：\n"
+    "  - scripts/_metric_hk_ratio.py / scripts/auto_optimize.py / scripts/run_dod_metric.sh\n"
+    "  - tests/pytorch/ops/test_*.py（不能加 skip / 删 parametrize / 调 SNR 阈值）\n"
+    "  - benchmark/ops/config.py（shape ground truth）\n"
+    "  - /root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 )
 # Loop metric: real benchmark of HIPKITTEN vs default-backend TFLOPS on a
 # fixed 16-shape LLM-typical suite (BF16 + FP8 tensorwise dense). Score is
@@ -446,7 +465,7 @@ def build_prompt(
             f"它跑 4 文件全套 pytest（test_gemm{{,_fp8}}, test_grouped_gemm{{,_fp8}}），"
             f"任何 failed > 0 都会让脚本立刻 EARLY-STOP。所以你 commit 的时候要小心：\n"
             f"  - 如果你的改动只触及 HIPKITTEN 路径（grouped_gemm_impl.GroupedGEMMHipKittenBackend、"
-            f"gemm_fp8_impl.GEMMFP8HipKittenBackend、cache 文件读取等），快 metric 通常足够。\n"
+            f"gemm_fp8_impl.GEMMFP8HipKittenBackend、kernels/hipkitten/* 等），快 metric 通常足够。\n"
             f"  - 如果你触及任何**共用代码**（autograd 入口、dispatcher、quantize_fp8_*、"
             f"grouped_gemm.py 顶层、torch.library custom_op 注册等），你**必须**怀疑会影响"
             f"非 HIPKITTEN 后端，主动跑一次 `{args.dod_cmd}`（约 5-10 分钟）确认 0 failed 后再 commit；"
@@ -457,7 +476,7 @@ def build_prompt(
     return f"""你是 HipKittens × Primus-Turbo 联合优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
 你**同时拥有两个仓库的写权限**：
   • Primus-Turbo: {args.workspace} (本轮工作目录、metric 在这里跑)
-  • HipKittens : /workspace/code/HipKittens  (kernel 源码、autotune cache 在这里)
+  • HipKittens : /workspace/code/HipKittens  (kernel 源码 + 离线 bench 笔记 .json，runtime 不读)
 当前 Primus-Turbo git HEAD: {head_sha}
 
 【强制第一步】
@@ -469,12 +488,14 @@ def build_prompt(
 {args.task}
 
 【本轮的快速验收命令】
-metric 命令（约 10 秒、单 GPU、自动选空闲卡）：
+metric 命令（约 10-30 秒、单 GPU、自动选空闲卡）：
   {args.metric_cmd}
-含义：在 16 个 LLM 典型 dense shape 上跑 HIPKITTEN vs Primus 默认 dispatch 的 TFLOPS 实测，
-score = int(geomean(hk_tflops / ref_tflops) * 1000)。target ≥ 900 (= 90%)。
-HIPKITTEN reject 一个 shape → 该 shape ratio 被 clip 到 0.01 → geomean 大幅下跌，
-所以**收紧 can_handle 反而会扣分**，必须靠真功夫扩覆盖 + 提速。
+含义：在 48 个 LLM 典型 shape（BF16/FP8 dense fwd+bwd 各 8 + BF16 grouped 16）上跑
+HIPKITTEN vs reference 的 TFLOPS 实测。score = int(geomean²(hk/ref) × 1000)。
+**新架构下 HIPKITTEN 不应该 reject 任何 shape** —— select_default_config 永远返回 cfg，
+kernel 永远能跑。reject 一个 shape → ratio clip 0.01 → geomean 大幅下跌，所以收紧
+can_handle 反而扣分。新架构下，本轮的真实压力来自 (a) dispatch overhead 是否清掉、
+(b) HK kernel 跟 reference 的相对速度。
 
 【**首要数据源** — metric 的 stderr 表】
 metric 命令的 stderr 会打印一张逐 shape 表，列出 dtype / (M,N,K) / hk_tflops / ref_tflops /
@@ -499,39 +520,38 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
 【近 5 轮记录】
 {history_block}
 
-【真优化方向 — 任选一个具体小目标】（"严禁假优化"清单已在【优化目标】里给出，请重读）
-  ✓ HipKittens kernel 改写：例如 /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/
-    kernel_fp8_layouts.cpp 的 K-step / wave grid / swizzle / MFMA 排布。
-    改完进 analysis/{{bf16,fp8}}_gemm/mi350x 跑 `source ../../../env.src && make`，
-    会在原地生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so，无需 rebuild Primus。
-    最常见的提速来源：fix bank conflict、提升 ds_read 吞吐、调 K_STEP 更好覆盖 K=128/256 倍数。
-  ✓ HipKittens autotune 扩 cache：跑 bench_bf16_vs_torch.py / autotune.py 把缺的 (M,N,K)
-    填进 bench_*.json / .autotune_cache.json（数据不是分支，允许）。注意只跑 LLM 典型 shape，
-    别把 cache 撑爆。
-  ✓ HipKittens kernel 接受更宽的 K：当前 FP8 kernel 模板化 K，导致 K=4096/8192/14336 走得通、
-    K=11008/53248 走不通。改 launcher 让 launcher 在运行时切换 K-block，能直接增加 can_handle 命中。
-  ✓ Primus 规则式 can_handle/dispatch：例如把 "_can_use_hipkitten_kernel" 的 K%TILE_K 限制改为
-    K%128==0（如果 kernel 支持），或对未在 cache 中的 shape 用 default group_m=4, xcd=8 兜底
-    （**通用规则**，不是查表）。
-  ✓ Primus 改 _hipkitten_fp8_group_m / _hipkitten_grouped_cfg 的 fallback 启发式（用形状特征
-    例如 N>=K 走 group_m=2, otherwise group_m=4 之类**规则**，不是 if shape==X return 2）。
+【优化方向 — phased 路线，第一刀必做】（"严禁假优化"清单已在【优化目标】里给出，请重读）
+  ✓ **第一刀（关键，缺它后面全做不动）**：在 `primus_turbo/pytorch/kernels/hipkitten/`
+    下新建 `config.py`，写纯函数：
+       `def select_default_config(M, N, K, layout, dtype) -> Config`
+    Config 含 group_m / num_xcds / kernel variant。**依据**：
+       /workspace/code/HipKittens/analysis/bf16_gemm/mi350x/bench_bf16_no_jit_final.json (~58 行)
+       /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/.autotune_cache.json    (~177 行)
+    一次性 dump 出来线下看，归纳 (M,N,K,layout) → cfg 的分布成几条 **if/else 通用规则**
+    （不是 233 行查表）。参考 `primus_turbo/triton/gemm/gemm_kernel.py::offline_select_bf16`
+    （186 entry → 几条 if/else）的归纳风格。
+  ✓ 第二刀：改 `loader.py` + `dispatch.py` + `gemm_impl.py` / `gemm_fp8_impl.py`，
+    **删除所有 json.load / pickle.load 路径**。loader 只做：import .so → 暴露 kernel binding。
+    backend 用 `select_default_config` 拿 cfg 直接 launch。
+    `can_handle` 只查 dtype / layout / alignment 这种**硬约束**，不再查"是否命中 cache"。
+  ✓ 第三刀：扩 backward layout 覆盖 —— 在 select_default_config 里加 RRR / CRR 层的规则；
+    对应在 HipKittens 那边补齐 backward layout 的 kernel binding（如果还没有的话）。
+  ✓ 第四刀：扩 grouped 覆盖 —— grouped 路径同样用 select_default_config 风格的规则。
+  ✓ HipKittens kernel 改写（任意时刻可做，不依赖前 4 刀）：改 .cpp 的 tile/wave/swizzle/
+    MFMA 排布，进 analysis/{{bf16,fp8}}_gemm/mi350x `source ../../../env.src && make -j`，
+    生成 tk_{{bf16,fp8}}_layouts.so —— Primus 自动加载新 .so。提速来源：bank conflict、
+    ds_read 吞吐、K_STEP 覆盖 K=128/256 倍数。
+  ✓ 可选第五刀：写 opt-in autotune 工具（开发期 sweep，结果只 print 不存盘 —— 开发者手动
+    把 winning config 写回 select_default_config 规则）。
 
-【典型流程示例（FP8 提速）】
-1. 跑 metric 看哪 8 个 FP8 shape ratio < 0.9（stderr 表里有）
-2. 选其中 1 个 shape (例如 4096x4096x4096) 进 HipKittens 仓库直接 bench 那个 kernel：
-   ```bash
-   cd /workspace/code/HipKittens/analysis/fp8_gemm/mi350x
-   source ../../../env.src
-   python3 bench_vs_hipblaslt.py  # 看 group_m 是不是没扫到 32
-   ```
-3. 想清楚瓶颈（例如 4-wave kernel 在 N<8192 时 wave fan-out 不够），动 cpp:
-   ```bash
-   $EDITOR kernel_fp8_layouts.cpp
-   make -j  # 重编 tk_fp8_layouts.so
-   ```
-4. 回 Primus 跑 metric。提升了就 commit 在 HipKittens 仓库（feat/perf:），同时也 commit
-   在 Primus-Turbo 仓库（哪怕只是空 commit "perf(hk): trigger HK fp8 kernel rebench"，
-   方便 auto_optimize 跟踪历史）。
+【典型流程示例（按新架构）】
+1. 跑 metric 看哪些 shape ratio < 0.9（stderr 表里有 dtype/(M,N,K)/layout/ratio/status）
+2. 在 select_default_config 里加 / 调一条规则覆盖这族 shape（**规则**，不是 if shape==X return Y）。
+   依据：HK 仓库的 .json 数据（开发期看，归纳完后 runtime 不 import）。
+3. 跑 fp32 数值 probe（max_abs + SNR）确认改动数值正确。
+4. 跑 metric 验证 ratio 提升。
+5. commit 在 Primus-Turbo（如果同时也改了 HK kernel cpp，分别 commit 在两个仓库）。
+   commit message 要贴 (a) 改了哪条规则 (b) before/after ratio (c) SNR 数字。
 
 【两个仓库的 commit】
 - 改了 HipKittens：进 /workspace/code/HipKittens 用 git add/commit；不要 push。
