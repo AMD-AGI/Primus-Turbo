@@ -856,7 +856,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = wall_clock64();
-                while (__any(channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
+                while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and
+                                                     expected_head >= 0)) {
                     // Timeout check
                     if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel "
@@ -871,7 +872,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++i) {
-                    auto expected_head_i = __shfl(expected_head, i);
+                    auto expected_head_i = __shfl_sync(kFullWarpMask, expected_head, i);
                     if (expected_head_i >= 0) {
                         slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
                         topk_ranks[num_topk_ranks++] = i;
