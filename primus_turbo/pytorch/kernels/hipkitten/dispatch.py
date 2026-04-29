@@ -161,6 +161,7 @@ def grouped_run(
     b: torch.Tensor,
     c: torch.Tensor,
     group_offs: torch.Tensor,
+    m_per_group: int = 0,
 ) -> None:
     """Dispatch the precision's native grouped launcher for ``cfg.layout``.
 
@@ -176,9 +177,24 @@ def grouped_run(
     :meth:`HipKittenModule.has_grouped` (or fall back to a per-group
     :func:`dense_run` loop) before dispatching here.
 
-    Binding signature (BF16 ``tk_bf16_layouts.so`` post round-1 rebuild):
+    Binding signature (BF16 ``tk_bf16_layouts.so`` post round-9 rebuild):
 
-        grouped_{rcr,rrr,crr}(a, b, c, group_offs, group_m=4, num_xcds=8)
+        grouped_{rcr,rrr,crr}(a, b, c, group_offs, group_m=4, num_xcds=8,
+                              m_per_group=0)
+
+    The ``m_per_group`` argument is a HINT consumed by the LDS-staged
+    K-tail kernel: when ``m_per_group >= TAIL_BLOCK_M`` and
+    ``m_per_group % TAIL_BLOCK_M == 0``, the kernel enables LDS-staged
+    interior K-tail correction (~10× speedup over the scalar fp32 tail
+    on K-misaligned shapes such as gpt_oss K=2880). The kernel
+    additionally performs a per-block ``row_block_base + TBM <=
+    s_offs[group_idx + 1]`` runtime check to guarantee correctness when
+    the host hint happens to be a multiple of TBM but the real per-group
+    M values are not (non-uniform group_lens), so passing ``avg_m =
+    a_total // bs`` is always safe — the kernel falls back to the
+    scalar tail for any cross-group block that the hint mis-classified.
+    Default ``0`` keeps the legacy "always-scalar-tail" behavior for
+    callers that haven't been updated.
 
     NOTE: this helper is BF16-only. The FP8 grouped binding has a
     different signature (extra ``scale_a`` / ``scale_b`` args, no
@@ -193,4 +209,4 @@ def grouped_run(
             "Rebuild tk_*_layouts.so with the grouped binding, or use the "
             "per-group dense_run fallback."
         )
-    fn(a, b, c, group_offs, cfg.group_m, cfg.num_xcds)
+    fn(a, b, c, group_offs, cfg.group_m, cfg.num_xcds, m_per_group)

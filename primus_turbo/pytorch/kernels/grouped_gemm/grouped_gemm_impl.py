@@ -247,14 +247,22 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # (M, N, K) — including misaligned N/K — via column-masked C
         # store + LDS K-tail + per-group SRD on the device side.
         # Host端禁止 uniform 判断，禁止 per-group fallback。
+        avg_m = _avg_group_m(a.shape[0], bs)
         cfg = hipkitten.select_default_config(
-            _avg_group_m(a.shape[0], bs), n, k, layout, "bf16",
+            avg_m, n, k, layout, "bf16",
             m_total=a.shape[0],
         )
         out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
         a_in = a if a.is_contiguous() else a.contiguous()
         b_in = b if b.is_contiguous() else b.contiguous()
-        hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
+        # ``avg_m`` is a HINT to the HK kernel for LDS-staged K-tail
+        # eligibility (m_per_group >= TBM && % TBM == 0). The kernel
+        # ALSO performs a per-block ``row_block_base + TBM <=
+        # s_offs[group_idx + 1]`` runtime check on the device so non-
+        # uniform group_lens whose ``avg_m`` happens to satisfy the
+        # alignment predicate fall back to the scalar tail block-by-
+        # block (no host uniform check / branch on group_lens).
+        hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs, m_per_group=avg_m)
         return out
 
 
