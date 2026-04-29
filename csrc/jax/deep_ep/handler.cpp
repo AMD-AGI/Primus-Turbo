@@ -102,7 +102,8 @@ ffi::Error MoECombineFFI(
     ffi::Buffer<ffi::S32> channel_prefix_matrix, ffi::Buffer<ffi::S32> send_head, int64_t num_sms,
     int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
     int64_t num_max_rdma_chunked_send_tokens, int64_t num_max_rdma_chunked_recv_tokens,
-    ffi::Result<ffi::AnyBuffer> recv_x, ffi::Result<ffi::Buffer<ffi::F32>> recv_topk_weights) {
+    ffi::Result<ffi::AnyBuffer> recv_x, ffi::Result<ffi::Buffer<ffi::F32>> recv_topk_weights,
+    ffi::Result<ffi::Buffer<ffi::S32>> send_head_work) {
     int num_ranks = -1;
     int rank      = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&rank));
@@ -119,12 +120,18 @@ ffi::Error MoECombineFFI(
     bool has_bias0   = bias_0.element_count() > 0;
     bool has_bias1   = bias_1.element_count() > 0;
 
-    buffer->IntranodeCombine(stream, x,
-                             has_weights ? std::make_optional(topk_weights) : std::nullopt,
-                             has_bias0 ? std::make_optional(bias_0) : std::nullopt,
-                             has_bias1 ? std::make_optional(bias_1) : std::nullopt, src_idx,
-                             rank_prefix_matrix, channel_prefix_matrix, send_head, cfg, recv_x,
-                             has_weights ? std::make_optional(recv_topk_weights) : std::nullopt);
+    // Copy send_head into a scratch buffer so the kernel can modify it
+    // without corrupting the JAX-owned immutable input buffer.
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpyAsync(send_head_work->typed_data(), send_head.typed_data(),
+                                          send_head.element_count() * sizeof(int32_t),
+                                          hipMemcpyDeviceToDevice, stream));
+
+    buffer->IntranodeCombine(
+        stream, x, has_weights ? std::make_optional(topk_weights) : std::nullopt,
+        has_bias0 ? std::make_optional(bias_0) : std::nullopt,
+        has_bias1 ? std::make_optional(bias_1) : std::nullopt, src_idx, rank_prefix_matrix,
+        channel_prefix_matrix, *send_head_work, cfg, recv_x,
+        has_weights ? std::make_optional(recv_topk_weights) : std::nullopt);
 
     return ffi::Error::Success();
 }
@@ -202,6 +209,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("num_max_rdma_chunked_recv_tokens") // num_max_rdma_chunked_recv_tokens
         .Ret<ffi::AnyBuffer>()                             // recv_x
         .Ret<ffi::Buffer<ffi::F32>>()                      // recv_topk_weights
+        .Ret<ffi::Buffer<ffi::S32>>()                      // send_head_work (scratch)
 );
 
 } // namespace primus_turbo::jax::deep_ep
