@@ -22,7 +22,6 @@ from aiter.ops.triton.attention.mha import (
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import KernelBackend
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 
 def _is_power_of_2(n: int) -> bool:
@@ -68,10 +67,6 @@ class AttnFwdAiterBackend(KernelBackend):
     ) -> bool:
 
         if sink is not None:
-            if qkv_format in ("sbhd", "bhsd"):
-                # sink attention is not supported for sbhd and bhsd format
-                return False
-
             head_dim_qk = q.size(-1)
             head_dim_v = v.size(-1)
             if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
@@ -100,24 +95,21 @@ class AttnFwdAiterBackend(KernelBackend):
         sink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "sbhd",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-        batch_size, seq_len, num_heads_qk, head_dim_qk = q.size()
+        batch_size, seq_len, num_heads_qk, _ = q.size()
         _, _, _, head_dim_v = v.size()
 
-        out = None
-        if sink is None:
-            if qkv_format == "sbhd":
-                out = torch.empty(
-                    (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
-                ).permute(1, 0, 2, 3)
-            elif qkv_format == "bhsd":
-                out = torch.empty(
-                    (batch_size, num_heads_qk, seq_len, head_dim_v), dtype=q.dtype, device=q.device
-                ).permute(0, 2, 1, 3)
-            else:
-                out = torch.empty(
-                    (batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
-                )
+        if qkv_format == "sbhd":
+            out = torch.empty(
+                (seq_len, batch_size, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device
+            ).permute(1, 0, 2, 3)
+        elif qkv_format == "bhsd":
+            out = torch.empty(
+                (batch_size, num_heads_qk, seq_len, head_dim_v), dtype=q.dtype, device=q.device
+            ).permute(0, 2, 1, 3)
+        else:
+            out = torch.empty((batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device)
 
+        if sink is None:
             _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
                 q,
                 k,
@@ -142,9 +134,11 @@ class AttnFwdAiterBackend(KernelBackend):
                 max_seqlen_q = q.size(1)
             if max_seqlen_k is None:
                 max_seqlen_k = k.size(1)
+
             window_size_left, window_size_right = _normalize_sink_window(
                 causal, window_size_left, window_size_right
             )
+
             out, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
                 q,
                 k,
@@ -165,11 +159,6 @@ class AttnFwdAiterBackend(KernelBackend):
             rng_state = torch.tensor([philox_seed, philox_offset], dtype=torch.int64, device="cpu")
 
         return out, softmax_lse, S_dmask, rng_state
-
-
-# =============================================================================
-# Backward Backends
-# =============================================================================
 
 
 class AttnBwdAiterBackend(KernelBackend):
@@ -202,20 +191,12 @@ class AttnBwdAiterBackend(KernelBackend):
         qkv_format: Optional[str] = "bshd",
     ) -> bool:
         if sink is not None:
-            if qkv_format in ("sbhd", "bhsd"):
-                # sink attention is not supported for sbhd and bhsd format
-                return False
-
             head_dim_qk = q.size(-1)
             head_dim_v = v.size(-1)
             if head_dim_qk != head_dim_v or not _is_power_of_2(head_dim_qk):
                 return False
 
         supported = qkv_format in _SUPPORTED_QKV_FORMATS
-
-        # NOTE: gfx942 has numerical issue in fp16 atomic when layout is sbhd.
-        if get_device_compute_capability() == (9, 4):
-            supported &= not (qkv_format == "sbhd" and not is_v3_atomic_fp32)
 
         return supported
 

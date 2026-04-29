@@ -86,6 +86,10 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
         q = q.permute(1, 0, 2, 3).contiguous()
         k = k.permute(1, 0, 2, 3).contiguous()
         v = v.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
     elif qkv_format != "bshd":
         raise ValueError(f"Unknown qkv format {qkv_format}")
 
@@ -126,6 +130,9 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
     output = output.to(dtype=dtype_og)
     if qkv_format == "sbhd":
         output = output.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        output = output.transpose(1, 2).contiguous()
+
     return output
 
 

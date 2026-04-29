@@ -30,8 +30,8 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-# PR: feat: _flash_attn_forward add out args (#2648)
-AITER_COMMIT = "857f4d15775a29af153a2c68a2f8e8a8d696c986"
+# PR: fix(mha_bwd): pass independent strides for do in _bwd_preprocess (#2808)
+AITER_COMMIT = "059c778739fa1a85b7d8469bcd3df9fb07e3ba5b"
 
 # -------------------------------------
 
