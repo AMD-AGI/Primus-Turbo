@@ -220,60 +220,60 @@ def select_default_config(
         # /tmp/bench_rule_validation.log.
         tiles_m = m // 256
         tiles_n = n // 256
-        # Round-26 rule. K-padded gpt_oss-style grouped BF16 RCR: the
-        # per-launch tile geometry (m_pad ∈ {2048, 4096}, n_pad ∈
-        # {3072, 5888}, k_pad = 2944) is what the persistent grouped
-        # launcher computes per group, but the launcher's grid spans
-        # ``B`` groups so the *total* tile count flips the optimal
-        # ``(group_m, num_xcds)`` choice between B=4 and B=32 of the
-        # same (m_per_group, n, k). Without an ``m_total`` discriminator
-        # one rule cannot cover the family — falling back to the binding
-        # default (gm=4, xcd=8) leaves 1-2pp on the table for the
-        # 6 / 8 gpt_oss shapes with m_total >= 16384.
+        # Round-45 rule. Unpadded gpt_oss-style grouped BF16 RCR: the
+        # per-launch tile geometry (m_per_group ∈ {2048, 4096}, n ∈
+        # {2880, 5760}, k = 2880) goes straight to the persistent grouped
+        # launcher (no host-side K/N pad as of round-44), so the
+        # scheduling key is now (m_per_group, n, k) = the *raw* gpt_oss
+        # dims. The launcher's grid still spans ``B`` groups, so the
+        # total tile count flips the optimal ``(group_m, num_xcds)``
+        # between B=4 and B=32 of the same per-group shape; we still
+        # gate on ``m_total >= 16384`` to keep the 2 B=4 M=2048 shapes
+        # (m_total=8192) on the binding default where the sweep showed
+        # they're already at top1.
         #
-        # 24-config sweep (gm × xcd from /tmp/sweep_bf16_gptoss_grouped.py)
-        # confirmed by /tmp/verify_bf16_gptoss.py (80 iters × 5 repeats):
+        # 36-config sweep (gm ∈ {1,2,4,8,16,24} × xcd ∈ {1,2,4,8,16,32},
+        # 80 iters / shape) — see /tmp/probe_gptoss_bf16_grouped.py
+        # archived alongside this commit:
         #
-        #   tiles_n=23 (GateUP, n_pad=5888) — winners by m_total:
-        #     m_total=8192   default(4,8) wins (skip rule, fall through)
-        #     m_total=16384  (8,4) +0.41pp over default
-        #     m_total=65536  (8,4) +1.62pp over default
-        #     m_total=131072 (8,4) +1.95pp over default
+        #   tiles_n=22 (GateUP, n=5760) — winners by m_total:
+        #     m_total=8192   (2,2)=574 vs default(4,8)=569 (+0.85pp, skip)
+        #     m_total=16384  (1,4)≈540 vs default=538 (~tie, accept)
+        #     m_total=65536  (1,4)=459 vs default=450 (+2.0pp)
+        #     m_total=131072 (1,4)=475 vs default=459 (+3.5pp)
+        #     -> (1,4) is the consistent winner once m_total>=16384.
         #
-        #   tiles_n=12 (Down, n_pad=3072) — winners by m_total:
-        #     m_total=8192   default(4,8) wins (skip rule, fall through)
-        #     m_total=16384  (24,4) +0.60pp / (8,4) +0.41pp
-        #     m_total=65536  (24,4) +1.73pp / (8,4) +0.98pp
-        #     m_total=131072 (24,4) +0.16pp / (8,4) +0.44pp
-        #     -> (24,4) is the more consistent winner, keep it for tiles_n=12.
+        #   tiles_n=11 (Down, n=2880) — winners by m_total:
+        #     m_total=8192   (2,2)=504 vs default=501 (+0.5pp, skip)
+        #     m_total=16384  (8,4)=574 vs default=567 (+1.2pp, top1)
+        #     m_total=65536  (8,4)=471 vs default=461 (+2.2pp)
+        #     m_total=131072 (8,4)=462 vs default=459 (+0.7pp)
+        #     -> (8,4) is the consistent winner once m_total>=16384.
         #
-        # The ``m_total >= 16384`` gate excludes the 2 B=4 M=2048 shapes
-        # (m_total=8192) where (8,4) actually regresses by -8.18pp on
-        # tiles_n=12 — gating on m_total instead of bs is essential
-        # because (m, n, k) alone cannot tell B=4 M=2048 apart from
-        # B=32 M=2048. Bit-identical output (group_m / num_xcds only
-        # change tile scheduling order, not arithmetic).
+        # Bit-identical output (group_m / num_xcds only change tile
+        # scheduling order, not arithmetic). The previous round-26 rule
+        # targeted the K-padded values (k=2944, tiles_n ∈ {12, 23}),
+        # which no longer fire after the round-44 host-pad cleanup.
         #
-        # Rule scope check: ``k == 2944`` is only hit by gpt_oss
-        # padded shapes (K=2880 → K_pad=2944). Dense BF16 has K ∈
-        # {4096, 11008, 14336, ...}; grouped DSV3 has K_pad ∈
-        # {2048, 7168}. ``tiles_m ∈ {8, 16}`` covers M_per_group
-        # ∈ {2048, 4096}; ``tiles_n ∈ {12, 23}`` covers Down n_pad=3072
-        # / GateUP n_pad=5888.
+        # Rule scope check: ``k == 2880`` is only hit by gpt_oss in the
+        # metric (DSV3 grouped K ∈ {2048, 7168}; dense BF16 K ∈
+        # {4096, 11008, 14336, ...}). ``tiles_m ∈ {8, 16}`` covers
+        # M_per_group ∈ {2048, 4096}; ``tiles_n ∈ {11, 22}`` covers
+        # Down (n=2880) / GateUP (n=5760) raw N.
         if (
             layout == "rcr"
-            and k == 2944
+            and k == 2880
             and tiles_m in (8, 16)
             and m_total is not None
             and m_total >= 16384
         ):
-            if tiles_n == 23:
+            if tiles_n == 22:  # GateUP N=5760
+                return HipKittenConfig(
+                    layout=layout, group_m=1, num_xcds=4, kernel=None
+                )
+            if tiles_n == 11:  # Down N=2880
                 return HipKittenConfig(
                     layout=layout, group_m=8, num_xcds=4, kernel=None
-                )
-            if tiles_n == 12:
-                return HipKittenConfig(
-                    layout=layout, group_m=24, num_xcds=4, kernel=None
                 )
         if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
             # Cube-ish small (16x16 grid). Round 1: 4096^3 fwd RCR and
