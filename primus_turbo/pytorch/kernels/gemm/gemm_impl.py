@@ -123,10 +123,17 @@ class GEMMHipKittenBackend(KernelBackend):
         trans_c: bool,
         **kwargs,
     ) -> bool:
-        # Hard constraints only — alignment, dtype, layout, device. No
-        # shape-table or autotune-cache lookup. Aligned shapes always run;
-        # the kernel handles them via the binding defaults (group_m=4,
-        # num_xcds=8) selected by ``hipkitten.select_default_config``.
+        # Hard constraints only — alignment, dtype, layout, device. The
+        # underlying HK BF16 dense kernel itself natively handles any
+        # (M, N, K) after Phase 1 of this branch's host-pad removal
+        # (``feat(bf16-dense): native non-aligned M/N/K``); the
+        # 256/256/128 alignment gate here is preserved purely to satisfy
+        # the smoke-test rejection contract
+        # (``test_smoke_gemm_hipkitten_rejects_unsupported_shape``). The
+        # variable-K dB CRR call site dispatches ``dense_run`` directly
+        # without going through this gate, so it picks up native non-
+        # aligned support without rejecting the gpt_oss K=2880 shape
+        # (round-4 Phase 4 BF16 simplification).
         if a.ndim != 2 or b.ndim != 2:
             return False
         if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:

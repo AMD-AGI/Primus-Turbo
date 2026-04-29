@@ -192,11 +192,11 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
-        # Hard constraints only — granularity, dtype, alignment, layout,
-        # device. No shape-table or autotune-cache lookup. Any aligned
-        # tensorwise FP8 GEMM is dispatched to the kernel via
-        # ``hipkitten.select_default_config``; the kernel templates handle
-        # the variation across (M, N, K) without per-shape pre-validation.
+        # Hard constraints only — granularity, dtype, layout, device.
+        # Phase 4 of the host-pad removal: alignment is no longer a gate.
+        # The HK FP8 dense kernel natively handles any (M, N, K) via the
+        # ``fast_m / fast_n / fast_k`` + ``gemm_tail_kernel`` splitter in
+        # ``kernel_fp8_layouts.cpp::dispatch<L>``.
         if granularity not in GEMMFP8HipKittenBackend.SUPPORTED_GRANULARITIES:
             return False
         if (a.dtype, b.dtype, out_dtype) not in GEMMFP8HipKittenBackend.SUPPORTED_DTYPES:
@@ -208,10 +208,7 @@ class GEMMFP8HipKittenBackend(KernelBackend):
         layout = hipkitten.layout_of(trans_a, trans_b)
         if layout is None:
             return False
-        if not hipkitten.has_fp8():
-            return False
-        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return hipkitten.aligned_for(m, n, k, "fp8")
+        return hipkitten.has_fp8()
 
     @staticmethod
     def execute(
