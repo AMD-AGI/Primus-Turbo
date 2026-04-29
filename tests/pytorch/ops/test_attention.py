@@ -66,21 +66,6 @@ def test_attention_16bit(
         config.head_dim_v,
     )
 
-    # FIXME(ruibzhan): config7 has numerical issue when enable_sink is True
-    if (
-        config
-        == AttnConfig(
-            seqlen_q=4096 + 64,
-            seqlen_kv=4096 + 64,
-            num_head_q=2,
-            num_head_kv=1,
-            head_dim_qk=32,
-            head_dim_v=32,
-        )
-        and enable_sink
-    ):
-        pytest.skip("config7 has numerical issue when enable_sink is True")
-
     # Sliding window coverage only applies when sink attention is enabled.
     if not enable_sink and window_size_left != -1:
         pytest.skip("window_size_left only applies when sink is enabled")
@@ -204,7 +189,15 @@ def test_attention_16bit(
     assert query_grad_snr > 40, f"query_grad_snr too low: {query_grad_snr}"
     assert key_grad_snr > 40, f"key_grad_snr too low: {key_grad_snr}"
     assert value_grad_snr > 40, f"value_grad_snr too low: {value_grad_snr}"
-    assert (sink_grad_snr is None) or (sink_grad_snr > 40), f"sink_grad_snr too low: {sink_grad_snr}"
+    # SNR threshold for sink grad is 5e-2, reference from aiter: https://github.com/ROCm/aiter/blob/c71075ceda2788004f1a6e02608e114137dee856/op_tests/triton_tests/attention/test_mha_with_sink.py#L151-L157
+    if sink_grad_snr is not None:
+        torch.testing.assert_close(
+            sink.grad,
+            sink_ref.grad,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda msg: f"sink_grad mismatch (snr={sink_grad_snr:.2f})\n\n{msg}\n",
+        )
 
 
 @pytest.mark.parametrize("batch", [1, 2, 3, 4])
