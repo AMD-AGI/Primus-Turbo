@@ -355,10 +355,8 @@ def get_buffer(group: dist.ProcessGroup,
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
 
     # Allocate a buffer if not existed or not enough buffer size.
-    # By default dispatch/combine kernels run on the caller's current CUDA stream so
-    # the buffer is safe to use inside ``torch.cuda.graph``.  To enable compute/comm
-    # overlap on a dedicated communication stream, set
-    # ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=0`` in the environment.
+    # Set ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1`` to force dispatch/combine kernels
+    # onto the caller's current CUDA stream (default ``0``).
     if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer

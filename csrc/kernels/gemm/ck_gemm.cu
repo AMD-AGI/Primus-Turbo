@@ -2,8 +2,8 @@
 //
 // See LICENSE for license information.
 
-#include "ck_gemm_kernel_instance_factory.h"
-#include "ck_gemm_kernel_template.h"
+#include "ck/ck_gemm_kernel_instance_factory.h"
+#include "ck/ck_gemm_kernel_template.h"
 #include "ck_tile/ops/gemm_quant.hpp"
 #include "primus_turbo/gemm.h"
 namespace primus_turbo {
