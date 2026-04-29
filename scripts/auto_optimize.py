@@ -295,6 +295,25 @@ def parse_args() -> argparse.Namespace:
         help="High-level optimization goal injected into every round's prompt.",
     )
     p.add_argument(
+        "--task-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a UTF-8 text file whose contents replace --task. Use this when "
+            "the task body contains shell-active characters (backticks, $, parens) "
+            "that get mangled by `--task \"$VAR\"` quoting."
+        ),
+    )
+    p.add_argument(
+        "--prompt-extra-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a UTF-8 text file whose contents replace --prompt-extra. "
+            "Same shell-safety rationale as --task-file."
+        ),
+    )
+    p.add_argument(
         "--skill-path",
         type=str,
         default=DEFAULT_SKILL,
@@ -1288,6 +1307,23 @@ def write_summary(summary_path: Path, args: argparse.Namespace, state: Trajector
 
 def main() -> int:
     args = parse_args()
+    if args.task_file:
+        try:
+            args.task = Path(args.task_file).read_text(encoding="utf-8")
+            print(f"[task-file] loaded {len(args.task)} chars from {args.task_file}", flush=True)
+        except OSError as exc:
+            print(f"--task-file {args.task_file} unreadable: {exc}", file=sys.stderr)
+            return 2
+    if args.prompt_extra_file:
+        try:
+            args.prompt_extra = Path(args.prompt_extra_file).read_text(encoding="utf-8")
+            print(
+                f"[prompt-extra-file] loaded {len(args.prompt_extra)} chars from "
+                f"{args.prompt_extra_file}", flush=True,
+            )
+        except OSError as exc:
+            print(f"--prompt-extra-file {args.prompt_extra_file} unreadable: {exc}", file=sys.stderr)
+            return 2
     workspace = Path(args.workspace).resolve()
     if not workspace.is_dir():
         print(f"workspace {workspace} is not a directory", file=sys.stderr)
