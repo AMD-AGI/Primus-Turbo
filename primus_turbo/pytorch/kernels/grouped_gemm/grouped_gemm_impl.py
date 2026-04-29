@@ -28,23 +28,20 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _HIPKITTEN_SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
-def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
-    return [int(x) for x in group_offs.detach().cpu().tolist()]
+def _avg_group_m(a_total_rows: int, bs: int) -> int:
+    """Return ``a_total_rows // bs`` (>=1) for cfg selection only.
 
-
-def _uniform_group_m(a_total_rows: int, group_lens: torch.Tensor) -> int | None:
-    """Return ``m_avg = a_total_rows // bs`` when bs > 0 and divisible; else None.
-
-    The HipKittens persistent grouped launcher consumes a device-side
-    ``group_offs`` prefix-sum and handles arbitrary per-group sizes
-    correctly on the GPU (O(G) linear scan inside the kernel). It does
-    NOT use the host-side ``m`` value for correctness — the helper is
-    only for choosing a config.
+    The HipKittens persistent grouped launcher consumes ``group_offs``
+    device-side via O(G) linear scan and handles arbitrary per-group
+    sizes correctly. The host-side ``m`` is **only** used to pick a
+    config (group_m / num_xcds / kernel variant) — it does NOT affect
+    correctness, so we never check uniformity. Project rule: any
+    ``if uniform: fast-path else: fallback`` branch on group_lens is
+    forbidden — host端禁止 uniform 判断。
     """
-    bs = group_lens.numel()
-    if bs <= 0 or a_total_rows % bs != 0:
-        return None
-    return a_total_rows // bs
+    if bs <= 0:
+        return max(a_total_rows, 1)
+    return max(a_total_rows // bs, 1)
 
 
 class GroupedGEMMCKBackend(KernelBackend):
@@ -244,44 +241,20 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
         layout = "rcr" if trans_b else "rrr"
-
-        m = _uniform_group_m(a.shape[0], group_lens)
-        if m is not None:
-            # Uniform-M (DeepSeek-V3 / gpt_oss / metric case): single
-            # CPU-sync-free persistent grouped launch on the unpadded
-            # shape. ``group_offs`` is consumed device-side via O(G)
-            # scan inside the HK kernel.
-            cfg = hipkitten.select_default_config(
-                m, n, k, layout, "bf16", m_total=a.shape[0]
-            )
-            out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
-            a_in = a if a.is_contiguous() else a.contiguous()
-            b_in = b if b.is_contiguous() else b.contiguous()
-            hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
-            return out
-
-        # Non-uniform fallback: per-group dense_run loop on unpadded
-        # shapes. The HK BF16 dense kernel natively handles non-aligned
-        # (M, N, K) (Phase 1 + Phase 4: column-masked C store + scalar
-        # tail). ``out`` zero-init covers ``mg <= 0`` groups whose rows
-        # the loop skips.
-        out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
-        offs = _group_offsets_cpu(group_offs)
-        for group_idx in range(bs):
-            start, end = offs[group_idx], offs[group_idx + 1]
-            mg = end - start
-            if mg <= 0:
-                continue
-            cfg = hipkitten.select_default_config(
-                mg, n, k, layout, "bf16", m_total=a.shape[0]
-            )
-            hipkitten.dense_run(
-                hk,
-                cfg,
-                a[start:end].contiguous(),
-                b[group_idx].contiguous(),
-                out[start:end],
-            )
+        # Single CPU-sync-free persistent grouped launch on the unpadded
+        # shape. The HipKittens grouped main kernel must natively handle
+        # arbitrary ``group_lens`` (uniform or non-uniform) and arbitrary
+        # (M, N, K) — including misaligned N/K — via column-masked C
+        # store + LDS K-tail + per-group SRD on the device side.
+        # Host端禁止 uniform 判断，禁止 per-group fallback。
+        cfg = hipkitten.select_default_config(
+            _avg_group_m(a.shape[0], bs), n, k, layout, "bf16",
+            m_total=a.shape[0],
+        )
+        out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
+        a_in = a if a.is_contiguous() else a.contiguous()
+        b_in = b if b.is_contiguous() else b.contiguous()
+        hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
         return out
 
 
@@ -332,64 +305,28 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         bs = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
-        # Persistent CPU-sync-free variable-K kernel fast path. Replaces
-        # the per-group ``dense_run`` loop with a single launch when
-        # (a) the HK BF16 binding ships the ``grouped_variable_k_crr``
-        # entrypoint (added round 1) and (b) ``M_g`` is uniform across
-        # groups (>= 128). Round-2 dropped the (n, k) BLOCK_SIZE
-        # alignment requirement: the kernel now uses ``ceil_div`` on
-        # both output axes with a two-axis-masked C store
-        # (``store_c_tile_mn_masked_grouped``) so partial last tiles
-        # in either axis are handled natively. The remaining uniform-M
-        # gate is a safety belt — the kernel itself reads group_offs
-        # device-side so non-uniform groups would also work; round-3
-        # can drop this gate after a probe.
+        # Single CPU-sync-free persistent variable-K (CRR / dB) launch.
+        # The HipKittens kernel must natively handle arbitrary group_lens
+        # via on-device O(G) scan of ``group_offs``. Host端禁止 uniform
+        # 判断、禁止 per-group fallback —— kernel 端的 m/n/k 限制必须
+        # 在 HK 仓库修。
         var_k_fn = getattr(hk.module, "grouped_variable_k_crr", None)
-        m_uniform = _uniform_group_m(a.shape[0], group_lens)
-        if var_k_fn is not None and m_uniform is not None and m_uniform >= 128:
-            cfg = hipkitten.select_default_config(
-                n, k, m_uniform, "crr", "bf16", m_total=a.shape[0]
+        if var_k_fn is None:
+            raise RuntimeError(
+                "HipKittens BF16 binding lacks grouped_variable_k_crr; "
+                "rebuild tk_bf16_layouts.so with the persistent var-K kernel."
             )
-            # ``a`` is x [M_total, K_fwd]; ``b`` is grad_out [M_total, N_fwd].
-            # The new kernel takes (grad_out, x, grad_b, group_offs) so we
-            # pass ``b`` as the kernel's A and ``a`` as the kernel's B,
-            # matching the per-group ``dense_run(b[s:e], a[s:e], out[g])``
-            # call this fast path replaces.
-            grad_out_2d = b if b.is_contiguous() else b.contiguous()
-            x_2d = a if a.is_contiguous() else a.contiguous()
-            # ``empty`` is safe: every (group, m_tile, n_tile) cell is
-            # written by the persistent kernel — either by the in-bounds
-            # store fast path, or by ``store_c_tile_mn_masked_grouped``
-            # which writes valid cells and skips OOB ones (those map
-            # outside the [n, k] per-group sub-tensor anyway, so they
-            # never enter the user-visible output).
-            out = torch.empty((bs, n, k), dtype=a.dtype, device=a.device)
-            var_k_fn(grad_out_2d, x_2d, out, group_offs, cfg.group_m, cfg.num_xcds)
-            return out
-
-        # Fallback: per-group dB CRR loop. Reachable only when (a) HK
-        # binding lacks ``grouped_variable_k_crr`` (older .so) or
-        # (b) groups are non-uniform / M_g < 128. The bench / autograd
-        # path always has uniform M_g >= 2048, so this branch is dead
-        # in practice; it stays for safety on smoke tests / unusual
-        # shapes.
-        out = torch.zeros((bs, n, k), dtype=a.dtype, device=a.device)
-        offs = _group_offsets_cpu(group_offs)
-        for group_idx in range(bs):
-            start, end = offs[group_idx], offs[group_idx + 1]
-            mg = end - start
-            if mg <= 0:
-                continue
-            cfg = hipkitten.select_default_config(
-                n, k, mg, "crr", "bf16", m_total=a.shape[0]
-            )
-            hipkitten.dense_run(
-                hk,
-                cfg,
-                b[start:end].contiguous(),
-                a[start:end].contiguous(),
-                out[group_idx],
-            )
+        cfg = hipkitten.select_default_config(
+            n, k, _avg_group_m(a.shape[0], bs), "crr", "bf16",
+            m_total=a.shape[0],
+        )
+        # Kernel signature is ``crr(grad_out, x, grad_b, group_offs, ...)``;
+        # the dispatcher's ``a`` is x [M_total, K_fwd] and ``b`` is grad_out
+        # [M_total, N_fwd], so pass them in (b, a) order to match.
+        grad_out_2d = b if b.is_contiguous() else b.contiguous()
+        x_2d = a if a.is_contiguous() else a.contiguous()
+        out = torch.empty((bs, n, k), dtype=a.dtype, device=a.device)
+        var_k_fn(grad_out_2d, x_2d, out, group_offs, cfg.group_m, cfg.num_xcds)
         return out
 
 

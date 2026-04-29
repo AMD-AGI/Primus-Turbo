@@ -49,8 +49,16 @@ _HYBRID_SUPPORTED_DTYPES = (
 )
 
 
-def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
-    return [int(x) for x in group_offs.detach().cpu().tolist()]
+def _avg_group_m(a_total_rows: int, bs: int) -> int:
+    """Return ``a_total_rows // bs`` (>=1) for cfg selection only.
+
+    Host端禁止 uniform 判断 / 禁止 per-group fallback —— ``m`` 仅用于
+    select_default_config 选 cfg，kernel 内部 ``group_offs`` device-side
+    O(G) scan 处理任意 group_lens 的 correctness。
+    """
+    if bs <= 0:
+        return max(a_total_rows, 1)
+    return max(a_total_rows // bs, 1)
 
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
@@ -301,63 +309,34 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         sa_h, sb_h, sa_d, sb_d = _resolve_fp8_scales(
             a_scales, b_scales, hipkitten.fp8_has_dscale(hk, layout)
         )
-
-        m_uniform = (a.shape[0] // bs) if (bs > 0 and a.shape[0] % bs == 0) else None
-
-        # Uniform-M fast path: single CPU-sync-free persistent grouped
-        # launch on the unpadded shape. The HK FP8 grouped main kernel
-        # natively handles non-aligned (N, K) (column-masked C store +
-        # scalar tail kernel cover partial last tiles); ``group_offs``
-        # is consumed device-side via O(G) scan inside the kernel.
-        # Only RCR has a persistent grouped binding today.
-        grouped_fn = hk.grouped(layout) if layout == "rcr" else None
-        grouped_dscale_fn = hk.grouped_dscale(layout) if layout == "rcr" else None
-        if m_uniform is not None and grouped_fn is not None:
-            cfg = hipkitten.select_default_config(
-                m_uniform, n, k, layout, "fp8", m_total=a.shape[0],
+        # Single CPU-sync-free persistent grouped launch on the unpadded
+        # shape. The HK FP8 grouped main kernel must natively handle
+        # arbitrary group_lens AND arbitrary (N, K) — including
+        # misaligned — via column-masked C store, LDS K-tail, and
+        # per-group SRD on the device side. Host端禁止 uniform 判断、
+        # 禁止 per-group fallback 路径。
+        grouped_fn = hk.grouped(layout)
+        grouped_dscale_fn = hk.grouped_dscale(layout)
+        if grouped_fn is None:
+            raise RuntimeError(
+                f"HipKittens FP8 binding lacks grouped_{layout}; "
+                "rebuild tk_fp8_layouts.so with the persistent grouped kernel "
+                "for this layout."
             )
-            out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
-            a_in = a if a.is_contiguous() else a.contiguous()
-            b_in = b if b.is_contiguous() else b.contiguous()
-            if grouped_dscale_fn is not None and sa_d is not None and sb_d is not None:
-                grouped_dscale_fn(
-                    a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m
-                )
-            else:
-                grouped_fn(
-                    a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m
-                )
-            return out
-
-        # Non-uniform / non-RCR fallback: per-group dense_run loop on
-        # unpadded shapes. The HK FP8 dense kernel natively handles
-        # non-aligned (M, N, K) (Phase 4 column-masked C store).
+        cfg = hipkitten.select_default_config(
+            _avg_group_m(a.shape[0], bs), n, k, layout, "fp8",
+            m_total=a.shape[0],
+        )
         out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
-        offs = _group_offsets_cpu(group_offs)
-        for group_idx in range(bs):
-            start, end = offs[group_idx], offs[group_idx + 1]
-            m = end - start
-            if m <= 0:
-                continue
-            cfg = hipkitten.select_default_config(
-                m, n, k, layout, "fp8", m_total=a.shape[0],
+        a_in = a if a.is_contiguous() else a.contiguous()
+        b_in = b if b.is_contiguous() else b.contiguous()
+        if grouped_dscale_fn is not None and sa_d is not None and sb_d is not None:
+            grouped_dscale_fn(
+                a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m
             )
-            ag = a[start:end]
-            bg = b[group_idx]
-            if not ag.is_contiguous():
-                ag = ag.contiguous()
-            if not bg.is_contiguous():
-                bg = bg.contiguous()
-            hipkitten.dense_run(
-                hk,
-                cfg,
-                ag,
-                bg,
-                out[start:end],
-                scale_a=sa_h,
-                scale_b=sb_h,
-                scale_a_dev=sa_d,
-                scale_b_dev=sb_d,
+        else:
+            grouped_fn(
+                a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m
             )
         return out
 
@@ -483,75 +462,34 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         group_num = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
-        out = torch.empty((group_num, n, k), dtype=out_dtype, device=a.device)
         # CRR dB: kernel computes grad_out.T @ x → [N, K]. The kernel's
         # ``scale_a`` is grad_out's scale; ``scale_b`` is x's scale —
         # so resolve with (b_scales=grad_out_scale, a_scales=x_scale).
         sa_h, sb_h, sa_d, sb_d = _resolve_fp8_scales(
             b_scales, a_scales, hipkitten.fp8_has_dscale(hk, "crr")
         )
-
         var_k_fn = getattr(hk.module, "grouped_variable_k_crr", None)
         var_k_dscale_fn = getattr(
             hk.module, "grouped_variable_k_crr_dscale", None
         )
-        m_uniform = (
-            (a.shape[0] // group_num)
-            if (group_num > 0 and a.shape[0] % group_num == 0)
-            else None
-        )
-        # Persistent CPU-sync-free FP8 var-K CRR kernel: single launch,
-        # native non-aligned (N, K) via ``store_c_tile_mn_masked_grouped``
-        # + full-tensor SRD load. Required uniform M_g >= 256 (= 2*HB,
-        # prologue + 2 epilogues schedule).
+        if var_k_fn is None:
+            raise RuntimeError(
+                "HipKittens FP8 binding lacks grouped_variable_k_crr; "
+                "rebuild tk_fp8_layouts.so with the persistent var-K kernel."
+            )
+        # Single CPU-sync-free persistent var-K CRR launch. Host端禁止
+        # uniform 判断、禁止 per-group fallback —— kernel 端的 m/n/k
+        # 限制必须在 HK 仓库修，不许在 host 端 gate。
+        out = torch.empty((group_num, n, k), dtype=out_dtype, device=a.device)
+        grad_out_2d = b if b.is_contiguous() else b.contiguous()
+        x_2d = a if a.is_contiguous() else a.contiguous()
         if (
-            var_k_fn is not None
-            and m_uniform is not None
-            and m_uniform >= 256
+            sa_d is not None and sb_d is not None
+            and var_k_dscale_fn is not None
         ):
-            grad_out_2d = b if b.is_contiguous() else b.contiguous()
-            x_2d = a if a.is_contiguous() else a.contiguous()
-            if (
-                sa_d is not None and sb_d is not None
-                and var_k_dscale_fn is not None
-            ):
-                var_k_dscale_fn(
-                    grad_out_2d, x_2d, out, sa_d, sb_d, group_offs
-                )
-            else:
-                var_k_fn(grad_out_2d, x_2d, out, sa_h, sb_h, group_offs)
-            return out
-
-        # Non-uniform / small-M fallback: per-group dense CRR loop on
-        # unpadded shapes. The HK FP8 dense CRR kernel natively handles
-        # non-aligned (M, N, K).
-        offs = _group_offsets_cpu(group_offs)
-        for group_idx in range(group_num):
-            start, end = offs[group_idx], offs[group_idx + 1]
-            m = end - start
-            if m <= 0:
-                out[group_idx].zero_()
-                continue
-            cfg = hipkitten.select_default_config(
-                n, k, m, "crr", "fp8", m_total=a.shape[0],
-            )
-            ag = a[start:end]
-            bg = b[start:end]
-            if not ag.is_contiguous():
-                ag = ag.contiguous()
-            if not bg.is_contiguous():
-                bg = bg.contiguous()
-            hipkitten.dense_run(
-                hk,
-                cfg,
-                bg,
-                ag,
-                out[group_idx],
-                scale_a=sa_h,
-                scale_b=sb_h,
-                scale_a_dev=sa_d,
-                scale_b_dev=sb_d,
-            )
+            var_k_dscale_fn(grad_out_2d, x_2d, out, sa_d, sb_d, group_offs)
+        else:
+            var_k_fn(grad_out_2d, x_2d, out, sa_h, sb_h, group_offs)
         return out
 
 
