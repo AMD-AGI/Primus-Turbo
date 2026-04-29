@@ -54,7 +54,8 @@ def _moe_combine_abstract_eval(
     recv_x = ShapedArray((num_recv_tokens, hidden_size), x.dtype)
     shape = (num_recv_tokens, topk_weights.shape[1]) if topk_weights.size > 0 else topk_weights.shape
     recv_topk_weights = ShapedArray(shape, topk_weights.dtype)
-    return recv_x, recv_topk_weights
+    send_head_work = ShapedArray(send_head.shape, send_head.dtype)
+    return recv_x, recv_topk_weights, send_head_work
 
 
 ABSTRACT_EVAL_TABLE[moe_combine_p] = _moe_combine_abstract_eval
