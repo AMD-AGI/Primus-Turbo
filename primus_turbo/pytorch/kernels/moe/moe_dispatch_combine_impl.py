@@ -477,8 +477,7 @@ class _DeepEPLikeBackend:
                 f"[{self.__class__.__name__} init] world_size={group.size()} "
                 f"rank={group.rank()} hidden={hidden_size} "
                 f"fp8_dispatch={fp8_dispatch} num_nvl_bytes={num_nvl_bytes} "
-                f"num_rdma_bytes={num_rdma_bytes} "
-                f"dispatch_config={dispatch_config} combine_config={combine_config}",
+                f"num_rdma_bytes={num_rdma_bytes} ",
                 rank=0,
             )
 
