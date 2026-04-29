@@ -573,10 +573,11 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
         // Barrier after cleaning
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     } else {
-        const auto channel_id = sm_id - 1;
-        const auto thread_id  = static_cast<int>(threadIdx.x);
-        const auto rank_id    = thread_id / kWarpSize;
-        const auto lane_id    = thread_id % kWarpSize;
+        constexpr int kNotifyWarpSize = kEmulatedWarpSize;
+        const auto    channel_id      = sm_id - 1;
+        const auto    thread_id       = static_cast<int>(threadIdx.x);
+        const auto    rank_id         = thread_id / kNotifyWarpSize;
+        const auto    lane_id         = thread_id % kNotifyWarpSize;
         if (rank_id >= kNumRanks)
             return;
 
@@ -587,13 +588,13 @@ __global__ void cached_notify_combine(void **buffer_ptrs, int *send_head, int nu
         // NOTES: `1 << 25` is a heuristic large number
         int last_head = 1 << 25;
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx;
-             token_idx_tail -= kWarpSize) {
+             token_idx_tail -= kNotifyWarpSize) {
             int  token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx)
                                     ? __ldg(send_head + token_idx * kNumRanks + rank_id)
                                     : -1;
-            for (int i = 0; i < min(kWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
-                const int head = __shfl_sync(kFullWarpMask, current_head, i);
+            for (int i = 0; i < min(kNotifyWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
+                const int head = shfl_sync(current_head, i, kNotifyWarpSize);
                 if (head < 0) {
                     if (lane_id == i)
                         expected_head = -last_head - 1;
@@ -616,7 +617,7 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
                                   barrier_signal_ptrs, rank);                                      \
     break
 
-    const int num_threads = std::max(128, kWarpSize * num_ranks);
+    const int num_threads = std::max(128, kEmulatedWarpSize * num_ranks);
     PRIMUS_TURBO_CHECK(num_ranks <= num_threads);
     PRIMUS_TURBO_CHECK(num_threads <= 1024);
     PRIMUS_TURBO_CHECK(1 + num_channels <= num_channels * 2);
