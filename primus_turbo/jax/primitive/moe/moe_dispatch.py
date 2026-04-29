@@ -132,8 +132,8 @@ ABSTRACT_EVAL_TABLE[moe_cached_dispatch_p] = _moe_cached_dispatch_abstract_eval
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
-LOWERING_TABLE[moe_dispatch_p] = jax.ffi.ffi_lowering("moe_dispatch")
-LOWERING_TABLE[moe_cached_dispatch_p] = jax.ffi.ffi_lowering("moe_cached_dispatch")
+LOWERING_TABLE[moe_dispatch_p] = jax.ffi.ffi_lowering("moe_dispatch", has_side_effect=True)
+LOWERING_TABLE[moe_cached_dispatch_p] = jax.ffi.ffi_lowering("moe_cached_dispatch", has_side_effect=True)
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------
