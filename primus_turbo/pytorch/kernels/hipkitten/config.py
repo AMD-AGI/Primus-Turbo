@@ -122,25 +122,15 @@ the round-7 commit message):
     entries and 4 or 8 in ~95%, ``kernel`` is "8" in 46/48 RCR entries.
     Rules:
       - default ``(group_m=4, kernel="8")``
-    Round 4 update (2026-04-28): the round-1 ``kernel="4"`` outlier rule
-    keyed on ``layout=="rcr" and tiles_n>=86 and K<=4096`` (covering
-    ``(4096,22016,4096)`` and ``(8192,28672,4096)``) is REMOVED — it
-    was based on the offline cache's ``ms`` numbers, which were taken
-    against an older HipKittens FP8 ``.so``. Re-bench on the current
-    .so (HK SHA bf6b0cf9 "switch large-N RCR autotune cache to 4-wave
-    kernel for two LLM shapes" — note the cache was bumped, not the
-    kernel template selector code) shows ``kernel="8"`` wins on both
-    metric shapes by a clear margin:
-      - ``(4096, 22016, 4096)``: (gm=4, k="8") = 2551.0 TF vs
-        (gm=4, k="4") = 2475.4 TF (+3.05pp; see /tmp/sweep_fp8_fwd_round4_v3.log)
-      - ``(8192, 28672, 4096)``: (gm=4, k="8") = 2579.6 TF vs
-        (gm=4, k="4") = 2533.6 TF (+1.81pp)
-    Numerically, switching kernel="4"->"8" is bit-identical on these
-    two shapes (cross max_abs = 0.0000, SNR = 49.61 dB unchanged; see
-    /tmp/probe_fp8_round4.log) — the kernel template only affects the
-    schedule, not the precision. With the rule gone every aligned RCR
-    FP8 call falls through to the binding default, which the rest of
-    the cache (46/48 entries) already endorses.
+    The historical ``layout=="rcr" and tiles_n>=86 and K<=4096``
+    outlier rule (offline-cache-derived ``kernel="4"`` for two LLM
+    shapes) was removed once re-benches on the current ``.so`` showed
+    the binding's auto-pick (8-wave for grid<3200, 4-wave for grid>=3200
+    && k<=8192) is bit-equivalent within ±0.1pp on every metric shape.
+    Default ``kernel=None`` keeps the dispatcher's ``force_rcr_kernel``
+    context manager off the hot path; per-shape overrides are added
+    only when sweep evidence shows kernel-level wins above the ~1us CM
+    cost.
 
 The functions in this module return ``HipKittenConfig`` objects directly;
 backends pass them to :mod:`primus_turbo.pytorch.kernels.hipkitten.dispatch`
@@ -193,6 +183,7 @@ def select_default_config(
     k: int,
     layout: Layout,
     dtype: DType,
+    m_total: int | None = None,
 ) -> HipKittenConfig:
     """Pick a kernel config for ``(M, N, K, layout, dtype)`` via if/else rules.
 
@@ -200,6 +191,16 @@ def select_default_config(
     no JSON parse, no dict get. The function is total over its input space
     (every aligned shape gets a config back); the alignment / dtype gates
     happen earlier in each backend's ``can_handle``.
+
+    ``m`` is the *per-launch* M dimension (= per-group M for grouped, full
+    M for dense). ``m_total`` is the **summed** M across the launch (= ``m``
+    for dense, ``B * m_per_group`` for the persistent grouped kernel) and
+    is consumed only by rules that need to discriminate launches with the
+    same per-group tile geometry but very different total tile count
+    (e.g. K-padded gpt_oss grouped at B=4 vs B=32 — same (m_pad, n_pad,
+    k_pad) per the launcher's view but the persistent grid sees 4× / 32×
+    more tiles, which flips the optimal ``group_m``). Dense callers leave
+    ``m_total`` as ``None``; grouped callers pass ``a.shape[0]``.
 
     Returns a :class:`HipKittenConfig` whose fields match the binding
     signature of the layout-specific entry point; pass directly to
@@ -219,6 +220,61 @@ def select_default_config(
         # /tmp/bench_rule_validation.log.
         tiles_m = m // 256
         tiles_n = n // 256
+        # Round-26 rule. K-padded gpt_oss-style grouped BF16 RCR: the
+        # per-launch tile geometry (m_pad ∈ {2048, 4096}, n_pad ∈
+        # {3072, 5888}, k_pad = 2944) is what the persistent grouped
+        # launcher computes per group, but the launcher's grid spans
+        # ``B`` groups so the *total* tile count flips the optimal
+        # ``(group_m, num_xcds)`` choice between B=4 and B=32 of the
+        # same (m_per_group, n, k). Without an ``m_total`` discriminator
+        # one rule cannot cover the family — falling back to the binding
+        # default (gm=4, xcd=8) leaves 1-2pp on the table for the
+        # 6 / 8 gpt_oss shapes with m_total >= 16384.
+        #
+        # 24-config sweep (gm × xcd from /tmp/sweep_bf16_gptoss_grouped.py)
+        # confirmed by /tmp/verify_bf16_gptoss.py (80 iters × 5 repeats):
+        #
+        #   tiles_n=23 (GateUP, n_pad=5888) — winners by m_total:
+        #     m_total=8192   default(4,8) wins (skip rule, fall through)
+        #     m_total=16384  (8,4) +0.41pp over default
+        #     m_total=65536  (8,4) +1.62pp over default
+        #     m_total=131072 (8,4) +1.95pp over default
+        #
+        #   tiles_n=12 (Down, n_pad=3072) — winners by m_total:
+        #     m_total=8192   default(4,8) wins (skip rule, fall through)
+        #     m_total=16384  (24,4) +0.60pp / (8,4) +0.41pp
+        #     m_total=65536  (24,4) +1.73pp / (8,4) +0.98pp
+        #     m_total=131072 (24,4) +0.16pp / (8,4) +0.44pp
+        #     -> (24,4) is the more consistent winner, keep it for tiles_n=12.
+        #
+        # The ``m_total >= 16384`` gate excludes the 2 B=4 M=2048 shapes
+        # (m_total=8192) where (8,4) actually regresses by -8.18pp on
+        # tiles_n=12 — gating on m_total instead of bs is essential
+        # because (m, n, k) alone cannot tell B=4 M=2048 apart from
+        # B=32 M=2048. Bit-identical output (group_m / num_xcds only
+        # change tile scheduling order, not arithmetic).
+        #
+        # Rule scope check: ``k == 2944`` is only hit by gpt_oss
+        # padded shapes (K=2880 → K_pad=2944). Dense BF16 has K ∈
+        # {4096, 11008, 14336, ...}; grouped DSV3 has K_pad ∈
+        # {2048, 7168}. ``tiles_m ∈ {8, 16}`` covers M_per_group
+        # ∈ {2048, 4096}; ``tiles_n ∈ {12, 23}`` covers Down n_pad=3072
+        # / GateUP n_pad=5888.
+        if (
+            layout == "rcr"
+            and k == 2944
+            and tiles_m in (8, 16)
+            and m_total is not None
+            and m_total >= 16384
+        ):
+            if tiles_n == 23:
+                return HipKittenConfig(
+                    layout=layout, group_m=8, num_xcds=4, kernel=None
+                )
+            if tiles_n == 12:
+                return HipKittenConfig(
+                    layout=layout, group_m=24, num_xcds=4, kernel=None
+                )
         if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
             # Cube-ish small (16x16 grid). Round 1: 4096^3 fwd RCR and
             # 4096x4096x11008 win on (gm=2, xcd=32). Round 5 extends the
@@ -237,6 +293,56 @@ def select_default_config(
             # we pick (2, 32) because it is within ~1pp of (2, 16) on
             # rcr and matches the rrr/crr backward-pass winners exactly.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "rcr" and tiles_m == 8 and tiles_n == 16 and k <= 7168:
+            # Round-10 rule. DeepSeek-V3-GateUP-M2048 grouped RCR family:
+            # per-group GEMM with N=4096, K=7168, M_per_group=2048.
+            # The cube-small rule above only matches tiles_m == tiles_n
+            # (i.e. M_per_group=4096); the M_per_group=2048 sibling shapes
+            # were falling to the binding default (gm=4, xcd=8). 36-config
+            # sweep on the 2 metric shapes (B ∈ {16, 32}) shows
+            # (gm=1, xcd=4) wins both:
+            #   B=16 M=2048: 1419.6 vs default 1396.9 = +1.62pp   (top1)
+            #   B=32 M=2048: 1407.2 vs default 1390.7 = +1.19pp   (top1)
+            # Also strictly beats the cube-small (gm=2, xcd=32) cfg by
+            # +2.46-2.64pp (those shapes do NOT match the cube-small
+            # tiles_m == tiles_n predicate today, but the comparison
+            # confirms the rule placement). See /tmp/sweep_gateup.log
+            # archived in the round-10 commit. Bit-identical output
+            # vs default (cross max_abs = 0.0000, SNR 47.85 dB unchanged).
+            #
+            # Rule scope check: tiles_m == 8 means M_per_group == 2048,
+            # which only occurs in metric-grouped shapes (dense BF16
+            # smallest M is 4096 ⇒ tiles_m ≥ 16). tiles_n == 16 with
+            # k <= 7168 in the metric-grouped space matches:
+            #  - DeepSeek-V3-GateUP-M2048-{B16,B32}  (target)
+            #  - DeepSeek-V3-Down has tiles_n == 28 → no match.
+            #  - gpt_oss padded: tiles_n ∈ {12, 24} → no match.
+            return HipKittenConfig(layout=layout, group_m=1, num_xcds=4, kernel=None)
+        if layout == "rcr" and tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
+            # Round-10 rule. DeepSeek-V3-Down grouped RCR family: per-group
+            # GEMM with N=7168, K=2048, M_per_group ∈ {2048, 4096}. The
+            # persistent grouped kernel runs this layout on uniform-M aligned
+            # inputs (no padding); the only choice is (group_m, num_xcds).
+            # 36-config sweep on the 4 metric shapes (B ∈ {16,32}, M ∈
+            # {2048,4096}) shows (gm=16, xcd=2) wins or ties top-2 each time:
+            #   B=16 M=2048: 1214.3 vs default 1203.0 = +0.94pp   (top1)
+            #   B=16 M=4096: 1227.9 vs default 1214.6 = +1.10pp   (top2 tie)
+            #   B=32 M=2048: 1198.7 vs default 1183.9 = +1.25pp   (top2)
+            #   B=32 M=4096: 1210.6 vs default 1197.3 = +1.11pp   (top3)
+            # See /tmp/sweep_deepseek_down.log archived in the round-10
+            # commit message. Bit-identical output vs default (cross
+            # max_abs = 0.0000, SNR 47.86 dB unchanged).
+            #
+            # Rule scope check: ``tiles_n == 28`` ⇔ N == 7168, which only
+            # occurs in the metric for these 4 grouped DeepSeek-V3-Down
+            # forward shapes. No dense BF16 metric shape has N=7168 (Llama
+            # / Qwen / Mistral / Llama-3.1 don't combine to 7168). The
+            # backward dispatches for DeepSeek-V3-Down hit different layouts
+            # (dA RRR with N=2048, dB CRR with M-axis=7168) that cannot
+            # match this rcr-only rule. The DeepSeek-V3-GateUP forward
+            # (N=4096) and any gpt_oss padded shape (n_pad ∈ {3072, 6144})
+            # also do not match tiles_n == 28.
+            return HipKittenConfig(layout=layout, group_m=16, num_xcds=2, kernel=None)
         if layout == "rcr" and tiles_n >= 86 and k <= 4096:
             # Round-7 rule. Long-N RCR with shallow K — covers
             # Llama-2-7B mlp_gate_up (4096x22016x4096) and gpt_oss /
@@ -340,39 +446,95 @@ def select_default_config(
     # FP8: kernel template ID matters only for RCR (the binding ignores it
     # for RRR / CRR). Default ``cfg.kernel = None`` so the dispatcher's
     # ``force_rcr_kernel`` context manager is skipped — the binding's own
-    # default (kernel template 8) is selected at link time and matches what
-    # ``TK_RCR_FORCE_KERNEL="8"`` would have set anyway, so leaving the
-    # env var alone is bit-equivalent but avoids the per-dispatch lock +
-    # env get/set/restore (~7-12us on 8192x28672x4096; see
-    # /tmp/profile_execute_internals.py round-6 archive).
-    #
-    # Round 6 — single-shape exception. The 8192x28672x4096 RCR shape
-    # (Llama-3.1-8B mlp_gate_up forward) is the only one in the metric
-    # suite where kernel template "4" beats template "8" on the *current*
-    # HK FP8 ``.so``. Tight bench (200 iters x 5 repeats, p20):
-    #   (gm=4, k="8") = 2727.9 TF (median)
-    #   (gm=4, k="4") = 2768.4 TF (median)  +1.5pp
-    # The 4 other long-N RCR Llama shapes that share ``k <= 4096`` keep
-    # kernel="8" winning (sweep_fp8_fwd_round6.log archived in commit),
-    # so the rule is intentionally narrow:
-    #   tiles_m == 32  (m == 8192)
-    #   tiles_n >= 112 (n >= 28672)
-    #   k <= 4096
-    # Round-4's "8 wins everywhere" rebench was on a different .so /
-    # different GPU rotation; round-6 verification was on the round-6
-    # binary checked into HipKittens HEAD with REPEATS=5 so the
-    # 1.5pp margin is real. Numerically bit-identical on those 5
-    # repeats (kernel template only changes the schedule, not the
-    # arithmetic — see /tmp/probe_fp8_kernel_round6.log).
+    # ``dispatch<RCR>`` (analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp)
+    # auto-picks the right 4-wave / 8-wave template based on
+    # ``grid_size >= RCR_4WAVE_MIN_GRID(=3200) && k <= RCR_4WAVE_MAX_K(=8192)``,
+    # so leaving ``kernel=None`` is bit-equivalent to a manual override
+    # while saving the per-dispatch lock + env get/set/restore on every
+    # call. Per-shape rules below override this default only when the
+    # binding's auto-pick is sub-optimal AND the kernel-level win exceeds
+    # the ~1us context-manager overhead.
     if layout == "rcr":
         tiles_m = m // 256
         tiles_n = n // 256
-        if tiles_m == 32 and tiles_n >= 112 and k <= 4096:
+        if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
+            # Round-20 rule. DeepSeek-V3-Down grouped FP8 RCR family:
+            # per-group GEMM N=7168, K=2048, M_per_group ∈ {2048, 4096},
+            # B ∈ {16, 32}. Mirrors the existing BF16 ``tiles_n==28``
+            # rule above; the same shape family (tiles_n=28, k=2048)
+            # falls through to the FP8 default ``group_m=4`` and was
+            # the worst grpFP8 tier outside gpt_oss (ratios 0.89-0.94
+            # vs Triton in round-19 metric).
+            #
+            # 6-candidate sweep (3 trials × 30 iters) at
+            # /tmp/sweep_fp8_deepseek_down.py over
+            # group_m ∈ {1, 2, 4, 8, 16, 24} on all 4 metric shapes:
+            #   B16-M2048   default(gm=4)=1662  gm=24=1690  +1.7pp  (top1)
+            #   B16-M4096   default(gm=4)=1688  gm=24=1697  +0.5pp  (top1)
+            #   B32-M2048   default(gm=4)=1633  gm=24=1673  +2.4pp  (top1)
+            #   B32-M4096   default(gm=4)=1652  gm=24=1665  +0.8pp  (top1)
+            # gm=24 wins on all 4 shapes; +1.4pp average over default.
+            # group_m only changes tile scheduling order on the dense /
+            # persistent RCR kernel, not arithmetic — bit-identical
+            # output across all 6 group_m values (cross max_abs = 0.0,
+            # SNR vs fp32 reference unchanged across the family).
+            #
+            # Rule scope check: ``tiles_n == 28`` ⇔ N == 7168, which
+            # only occurs in the metric for these 4 grouped DSV3-Down
+            # forward shapes. No dense FP8 metric shape has N=7168;
+            # DSV3-GateUP has tiles_n==16 (N=4096) and matches its
+            # binding-default (gm=4) winner per the same sweep
+            # (B16-M2048 gm=4=2507 top1, B32-M4096 gm=2=2554 top1
+            # +1.0pp — too narrow to anchor a separate rule);
+            # gpt_oss has tiles_n ∈ {12, 23} (n_pad=3072 / 5888) ⇒
+            # neither matches. The k<=4096 bound excludes the
+            # DSV3-GateUP (K=7168) cousin, which the same sweep shows
+            # already runs near gm=4-best; pinning a different group_m
+            # there is unjustified.
             return HipKittenConfig(
                 layout=layout,
-                group_m=_FP8_DEFAULT_GROUP_M,
+                group_m=24,
                 num_xcds=None,
-                kernel="4",
+                kernel=None,
+            )
+        if tiles_m == 16 and 64 <= tiles_n <= 96 and k <= 4096:
+            # Round-16 rule. Long-N shallow-K FP8 dense RCR. Anchor:
+            # ``(4096, 22016, 4096)`` (tiles_m=16, tiles_n=86, k=4096),
+            # the 2nd-worst FP8_fwd metric shape at ratio 0.894 vs
+            # hipBLASLt. The binding default ``(group_m=4)`` is suboptimal
+            # for this single-CU-band-wide grid (tiles_m=16 fits in
+            # NUM_CUS=256, so a small group_m better preserves L2 reuse
+            # on the long N axis where each tile sweeps a full K=4096
+            # column once and never re-reads it).
+            #
+            # 6-candidate sweep (3 trials × 200 iters) at
+            # /tmp/sweep_fp8_22016.py:
+            #   gm=1   median  1683.7 TF  *winner
+            #   gm=2   median  1657.5 TF
+            #   gm=4   median  1674.6 TF  (binding default)
+            #   gm=8   median  1677.3 TF
+            #   gm=16  median  1674.9 TF
+            #   gm=24  median  1674.9 TF
+            # gm=1 wins +9.1 TF (+0.54pp) over the binding default.
+            # Bit-identical output (group_m only changes the tile
+            # scheduling order on the dense RCR kernel, not the
+            # arithmetic); SNR vs fp32 ref unchanged.
+            #
+            # Rule scope check: ``tiles_m == 16`` excludes the 8192xN
+            # family (tiles_m=32). ``64 <= tiles_n <= 96`` is the band
+            # around tiles_n=86: it excludes tiles_n=112 (which the
+            # binding auto-picks 4-wave for, no override needed) and
+            # tiles_n=48 (which the sweep shows is gm=4-best).
+            # ``k <= 4096`` excludes deep-K shapes (those have low
+            # tiles per CU and different scheduling preferences). No
+            # grouped FP8 metric shape has tiles_n >= 64 with k <= 4096
+            # (DeepSeek N=4096 → tiles_n=16; gpt_oss n_pad=3072 or 5888
+            # → tiles_n=12 or 23).
+            return HipKittenConfig(
+                layout=layout,
+                group_m=1,
+                num_xcds=None,
+                kernel=None,
             )
     kernel = _FP8_DEFAULT_KERNEL if layout == "rcr" else None
 

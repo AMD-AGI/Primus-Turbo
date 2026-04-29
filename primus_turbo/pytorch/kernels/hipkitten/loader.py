@@ -105,6 +105,15 @@ class HipKittenModule:
     grouped_rcr: Any
     grouped_rrr: Any
     grouped_crr: Any
+    # FP8-only device-pointer scale grouped variants. None on BF16, and
+    # on FP8 builds where the binding does not yet expose
+    # ``grouped_*_dscale``. Mirrors the ``gemm_*_dscale`` family — saves
+    # the per-dispatch ``.item()`` host sync the host-scalar grouped
+    # path would otherwise pay (~10-20 us / dispatch on small grouped
+    # FP8 shapes where the kernel itself is only ~1 ms).
+    grouped_rcr_dscale: Any
+    grouped_rrr_dscale: Any
+    grouped_crr_dscale: Any
 
     def gemm(self, layout: str) -> Any:
         """Return the dense kernel callable for ``layout``."""
@@ -134,6 +143,18 @@ class HipKittenModule:
         if layout == "rrr":
             return self.grouped_rrr
         return self.grouped_crr
+
+    def grouped_dscale(self, layout: str) -> Any:
+        """Return the device-scale grouped launcher for ``layout`` or None.
+
+        FP8-only. None on BF16 (no scaling) and on FP8 builds where the
+        binding does not yet expose the ``_dscale`` grouped variant.
+        """
+        if layout == "rcr":
+            return self.grouped_rcr_dscale
+        if layout == "rrr":
+            return self.grouped_rrr_dscale
+        return self.grouped_crr_dscale
 
     def has_grouped(self) -> bool:
         return self.grouped_rcr is not None
@@ -166,6 +187,9 @@ def _build_module(module: Any, dtype: Literal["bf16", "fp8"], default_bs: int, d
         grouped_rcr=_resolve_grouped_attr(module, "rcr"),
         grouped_rrr=_resolve_grouped_attr(module, "rrr"),
         grouped_crr=_resolve_grouped_attr(module, "crr"),
+        grouped_rcr_dscale=getattr(module, "grouped_rcr_dscale", None),
+        grouped_rrr_dscale=getattr(module, "grouped_rrr_dscale", None),
+        grouped_crr_dscale=getattr(module, "grouped_crr_dscale", None),
     )
 
 

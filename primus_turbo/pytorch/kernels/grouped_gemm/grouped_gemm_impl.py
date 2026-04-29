@@ -29,10 +29,22 @@ _HIPKITTEN_SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
 def _pad_2d(x: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Allocate ``(rows, cols)`` and ``copy_`` ``x`` into the leading region.
+
+    Only the right / bottom *padding* margins are zero-initialised — the
+    leading data region is filled by ``copy_``. This avoids the redundant
+    bulk zero-init that ``torch.zeros`` would perform before ``copy_``
+    overwrites it. Mirrors ``_pad_2d`` in ``grouped_gemm_fp8_impl.py``.
+    """
     if x.shape[0] == rows and x.shape[1] == cols:
         return x
-    out = torch.zeros((rows, cols), dtype=x.dtype, device=x.device)
-    out[: x.shape[0], : x.shape[1]] = x
+    out = torch.empty((rows, cols), dtype=x.dtype, device=x.device)
+    r, c = x.shape
+    out[:r, :c].copy_(x)
+    if cols > c:
+        out[:r, c:].zero_()
+    if rows > r:
+        out[r:, :].zero_()
     return out
 
 
@@ -41,27 +53,27 @@ def _group_offsets_cpu(group_offs: torch.Tensor) -> list[int]:
 
 
 def _uniform_group_m(a_total_rows: int, group_lens: torch.Tensor) -> int | None:
-    """Return per-group M iff every entry of ``group_lens`` is equal; else None.
+    """Return ``m_avg = a_total_rows // bs`` when bs > 0 and divisible; else None.
 
-    Uses ``(group_lens == m_avg).all().item()`` — one tiny GPU reduction
-    plus one GPU→CPU sync (≈ tens of microseconds for typical B≤32).
-    Forwarded by the HipKittens grouped backends as a *fast-path*
-    detector: the native HK grouped launcher today consumes a single
-    per-group M (the kernel iterates ``B`` groups of identical size),
-    so when this returns ``None`` we route to the per-group
-    :func:`...dispatch.dense_run` loop instead — never reject.
+    The HipKittens persistent grouped launcher consumes a device-side
+    ``group_offs`` prefix-sum (see :func:`grouped_gemm_compute_offs`)
+    and handles **arbitrary** per-group sizes correctly on the GPU
+    (O(G) linear scan inside the kernel). It does NOT use the host-side
+    ``m`` value for correctness. So this helper exists only to choose a
+    config (``select_default_config(m, n, k, ...)``) — picking ``m_avg``
+    is a fine heuristic for non-uniform groups too: the cfg ends up
+    slightly suboptimal vs the true max-per-group M, but the kernel
+    still produces correct outputs because rows are ranged by
+    group_offs.
 
-    Per project policy this is NOT a ``can_handle`` resume / reject
-    helper: HipKittens ``can_handle`` accepts arbitrary ``group_lens``,
-    and the *execute* path uses this to pick an implementation. New HK
-    grouped bindings should accept cumulative-offsets directly so this
-    fast-path detector becomes redundant.
+    Crucially this avoids the ``(group_lens == m_avg).all().item()``
+    GPU→CPU sync that the previous heuristic paid on every grouped
+    call (tens of microseconds per dispatch on typical B ≤ 32).
     """
     bs = group_lens.numel()
     if bs <= 0 or a_total_rows % bs != 0:
         return None
-    m_avg = a_total_rows // bs
-    return m_avg if bool((group_lens == m_avg).all().item()) else None
+    return a_total_rows // bs
 
 
 def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
@@ -273,15 +285,39 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         bs = b.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
-        out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
         layout = "rcr" if trans_b else "rrr"
 
         m = _uniform_group_m(a.shape[0], group_lens)
         if m is not None:
             m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "bf16")
-            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "bf16")
+            # Pass ``m_total = a.shape[0]`` so :func:`select_default_config`
+            # rules that need to discriminate same-(m_pad, n_pad, k_pad)
+            # launches at different total tile counts (e.g. K-padded
+            # gpt_oss grouped at B=4 M=2048 vs B=32 M=2048) can fire
+            # correctly. Dense callers leave it as None.
+            cfg = hipkitten.select_default_config(
+                m_pad, n_pad, k_pad, layout, "bf16", m_total=a.shape[0]
+            )
             if (m_pad, n_pad, k_pad) == (m, n, k):
-                hipkitten.grouped_run(hk, cfg, a.contiguous(), b.contiguous(), out)
+                # group_offs (already a [G+1] int64 device tensor; computed
+                # CPU-sync-free upstream via primus_turbo_cpp_extension's
+                # grouped_gemm_compute_offs) goes straight to the binding.
+                # The persistent kernel reads it on-device via O(G) scan,
+                # which spans [group_offs[0]=0, group_offs[bs]=sum(group_lens))
+                # — by the grouped-GEMM contract this is the full [0, M_total)
+                # range, so the kernel writes every row of ``out``. Skip the
+                # ~30 µs HBM zero-init that ``torch.zeros`` does and use
+                # ``empty``.
+                out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
+                # Skip the ``contiguous()`` call on already-contiguous
+                # tensors. ``torch.Tensor.contiguous()`` is a no-op on
+                # contiguous inputs but still walks strides + bumps the
+                # refcount (~1 µs / call); on hot grouped BF16 paths the
+                # caller almost always passes contiguous a / b already.
+                # Mirrors the FP8 dense gemm_fp8_impl.execute pattern.
+                a_in = a if a.is_contiguous() else a.contiguous()
+                b_in = b if b.is_contiguous() else b.contiguous()
+                hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
                 return out
             if m_pad == m:
                 # M is aligned, but N and / or K need padding (the gpt_oss_20B
@@ -290,27 +326,70 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
                 # tensors, then slice the unpadded N columns back into
                 # ``out``. Padded zero rows / columns contribute nothing
                 # to the used [:, :n] slice of C.
+                #
+                # Allocate with ``empty`` and zero-init only the padding
+                # margins: the data sub-region is filled by ``copy_`` and
+                # the kernel writes c_pad in full. A ``zeros`` pre-init
+                # of e.g. (B*M=8192, k_pad=3072) bf16 = 48 MB / dispatch
+                # is pure HBM-bandwidth waste (~30 µs on MI355X) when
+                # 90%+ of the tensor will be overwritten by ``copy_``;
+                # padding-only zeros reduce that to ~3 MB on gpt_oss.
                 if k_pad == k:
-                    a_in = a.contiguous()
+                    a_in = a if a.is_contiguous() else a.contiguous()
                 else:
-                    a_in = torch.zeros((bs * m, k_pad), dtype=a.dtype, device=a.device)
+                    a_in = torch.empty((bs * m, k_pad), dtype=a.dtype, device=a.device)
                     a_in[:, :k].copy_(a)
+                    a_in[:, k:].zero_()
+                # N-pad slabs (b_in[:, n:, :] for RCR / b_in[:, :, n:] for RRR)
+                # are intentionally left uninitialised. mma is `c[m, n] =
+                # sum_k a[m, k] * b'[n, k]` — each output position uses
+                # exactly one N-slot of b, so a garbage row/col at n_idx >= n
+                # only feeds c[*, n_idx >= n]. Those output cols are written
+                # to c_pad[:, n:n_pad] which the caller never reads (we
+                # return ``c_pad[:, :n]`` slice). K-pad slabs *are* still
+                # zeroed because mma sums across K, so K-pad garbage would
+                # contaminate every valid (m, n_idx < n) output.
                 if trans_b:
                     if (n_pad, k_pad) == (n, k):
-                        b_in = b.contiguous()
+                        b_in = b if b.is_contiguous() else b.contiguous()
                     else:
-                        b_in = torch.zeros((bs, n_pad, k_pad), dtype=b.dtype, device=b.device)
+                        b_in = torch.empty((bs, n_pad, k_pad), dtype=b.dtype, device=b.device)
                         b_in[:, :n, :k].copy_(b)
+                        if k_pad > k:
+                            b_in[:, :n, k:].zero_()
                 else:
                     if (n_pad, k_pad) == (n, k):
-                        b_in = b.contiguous()
+                        b_in = b if b.is_contiguous() else b.contiguous()
                     else:
-                        b_in = torch.zeros((bs, k_pad, n_pad), dtype=b.dtype, device=b.device)
+                        b_in = torch.empty((bs, k_pad, n_pad), dtype=b.dtype, device=b.device)
                         b_in[:, :k, :n].copy_(b)
-                c_pad = torch.zeros((bs * m, n_pad), dtype=a.dtype, device=a.device)
-                hipkitten.grouped_run(hk, cfg, a_in, b_in, c_pad)
-                out.copy_(c_pad[:, :n])
-                return out
+                        if k_pad > k:
+                            b_in[:, k:, :].zero_()
+                # ``c_pad`` is fully written by the kernel (the tail
+                # kernel doesn't gate on c.shape vs (m, n) — it writes
+                # every (row, col) up to c.shape), so we can skip the
+                # zero-init entirely. Only the trailing N-cols
+                # ``c_pad[:, n:n_pad]`` are kernel-written-but-unread —
+                # they correspond to padded zero columns of B and so
+                # contain validly-computed zeros (or near-zero noise
+                # bounded by the unpadded contribution).
+                c_pad = torch.empty((bs * m, n_pad), dtype=a.dtype, device=a.device)
+                # group_offs already maps to the original ``m`` (= m_pad here);
+                # the same prefix-sum is valid on the padded tensor since A
+                # rows / C rows have not been re-laid (only N / K columns
+                # were padded). No new alloc needed.
+                hipkitten.grouped_run(hk, cfg, a_in, b_in, c_pad, group_offs)
+                # Return a non-contig view of ``c_pad`` instead of
+                # allocating a fresh ``out`` and copying. Stride is
+                # ``(n_pad, 1)`` instead of contig ``(n, 1)``, but every
+                # downstream torch op (next-layer GEMM / activation /
+                # cast) handles non-contig inputs natively. Mirrors the
+                # FP8 grouped K-pad fast-path return-non-contig style
+                # (round 18 commit). Saves the
+                # ``torch.empty((B*M, n))`` alloc + the
+                # ``out.copy_(c_pad[:, :n])`` (~50 MB / 20 µs on
+                # gpt_oss-Down-B4-M2048).
+                return c_pad[:, :n]
             # M is misaligned: fall through to the per-group dense_run
             # loop. M-pad of a uniform-M grouped layout would require
             # interleaving zeros between groups, which is only marginally
@@ -322,15 +401,40 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # Per-group dense_run fallback. Slower than the native ``grouped_*``
         # launcher but correct for non-uniform ``group_lens`` and for
         # shapes where M and / or K need padding. Mirrors the FP8 grouped
-        # fallback in ``grouped_gemm_fp8_impl.py``.
+        # fallback in ``grouped_gemm_fp8_impl.py``. Unlike the fast paths
+        # above, this loop ``continue``s on ``mg <= 0`` groups (leaving
+        # those rows untouched), so ``out`` MUST be ``torch.zeros`` here
+        # for correctness when caller's group_lens contain any zero-len
+        # entries; the kernel writes only the non-zero-len group slices.
+        out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
+        #
+        # Re-use the (m_pad, n_pad, k_pad, cfg) already computed above when
+        # ``m is not None`` (uniform-M path with M misaligned w.r.t. tile);
+        # avoids a second redundant ``padded_shape`` + ``select_default_config``
+        # pair per group. On B=32 grouped this saves ~480 µs / dispatch of
+        # repeated python function-call + dict-lookup overhead.
+        m_pad_pre = m_pad if m is not None else 0
+        n_pad_pre = n_pad if m is not None else 0
+        k_pad_pre = k_pad if m is not None else 0
+        cfg_pre = cfg if m is not None else None
         offs = _group_offsets_cpu(group_offs)
         for group_idx in range(bs):
             start, end = offs[group_idx], offs[group_idx + 1]
             mg = end - start
             if mg <= 0:
                 continue
-            m_pad, n_pad, k_pad = hipkitten.padded_shape(mg, n, k, layout, "bf16")
-            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, layout, "bf16")
+            if cfg_pre is not None and mg == m:
+                m_pad, n_pad, k_pad = m_pad_pre, n_pad_pre, k_pad_pre
+                cfg = cfg_pre
+            else:
+                m_pad, n_pad, k_pad = hipkitten.padded_shape(mg, n, k, layout, "bf16")
+                # Per-group fallback: m_total = a.shape[0] is the total
+                # M across all groups (same value as the fast-path's
+                # ``m_total``); rules that gate on it stay consistent
+                # across the fast-path and the per-group fallback.
+                cfg = hipkitten.select_default_config(
+                    m_pad, n_pad, k_pad, layout, "bf16", m_total=a.shape[0]
+                )
             if (m_pad, n_pad, k_pad) == (mg, n, k):
                 hipkitten.dense_run(
                     hk,
@@ -340,9 +444,12 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
                     out[start:end],
                 )
             else:
+                # ``out_pad`` is fully written by the BF16 dense kernel
+                # (which iterates ``c.shape``-bounded coords); skip the
+                # zero-init since only out_pad[:mg, :n] is read back.
                 b_pad_rows = n_pad if trans_b else k_pad
                 b_pad_cols = k_pad if trans_b else n_pad
-                out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
+                out_pad = torch.empty((m_pad, n_pad), dtype=a.dtype, device=a.device)
                 hipkitten.dense_run(
                     hk,
                     cfg,
@@ -408,16 +515,21 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         k = a.shape[1]
         out = torch.zeros((bs, n, k), dtype=a.dtype, device=a.device)
 
-        m = _uniform_group_m(a.shape[0], group_lens)
-        if m is not None:
-            cfg = hipkitten.select_default_config(n, k, m, "crr", "bf16")
-            hipkitten.grouped_run(hk, cfg, b.contiguous(), a.contiguous(), out)
-            return out
-
-        # Non-uniform-M fallback: per-group dense_run via gemm_crr, with
-        # per-group padding for any individual group whose K_logical
-        # (= per-group M) breaks the crr alignment that ``can_handle``
-        # checked using the *average* M.
+        # Variable-K (dB backward) cannot use the new persistent grouped
+        # CRR kernel: that kernel produces an M-stacked C of shape
+        # ``[M_total, N]``, but the variable-K dB output is ``[B, K, N]``
+        # — one full K x N matrix per group, with K being the *shared*
+        # (reduction) dimension that varies group-to-group, not the
+        # output spatial axis. The two kernels solve different problems.
+        #
+        # Until a dedicated persistent variable-K binding lands (HK kernel
+        # work, separate cycle), this path always loops :func:`dense_run`
+        # via ``gemm_crr`` per group. The per-group launch pattern is the
+        # less-preferred branch the project policy bans for the *forward*
+        # grouped path; here it is the only correctness-preserving option,
+        # and the variable-K backward path is not in the current metric
+        # suite, so the perf cost is bounded to the BF16_bwd dispatch
+        # budget (already PASSing at 0.97).
         offs = _group_offsets_cpu(group_offs)
         for group_idx in range(bs):
             start, end = offs[group_idx], offs[group_idx + 1]
@@ -425,7 +537,14 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
             if mg <= 0:
                 continue
             m_pad, n_pad, k_pad = hipkitten.padded_shape(n, k, mg, "crr", "bf16")
-            cfg = hipkitten.select_default_config(m_pad, n_pad, k_pad, "crr", "bf16")
+            # VariableK / dB CRR per-group launch — m_total semantically
+            # equals a.shape[0] (the total M_fwd across groups). The
+            # round-26 grouped-only rule gates on layout=="rcr" so this
+            # CRR call site never matches it, but pass the value for
+            # parity with the forward / variable-K K-padded fast paths.
+            cfg = hipkitten.select_default_config(
+                m_pad, n_pad, k_pad, "crr", "bf16", m_total=a.shape[0]
+            )
             if (m_pad, n_pad, k_pad) == (n, k, mg):
                 hipkitten.dense_run(
                     hk,
@@ -435,7 +554,9 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
                     out[group_idx],
                 )
             else:
-                out_pad = torch.zeros((m_pad, n_pad), dtype=a.dtype, device=a.device)
+                # ``out_pad`` is fully written by the BF16 dense kernel;
+                # skip zero-init (only out_pad[:n, :k] is read back).
+                out_pad = torch.empty((m_pad, n_pad), dtype=a.dtype, device=a.device)
                 hipkitten.dense_run(
                     hk,
                     cfg,

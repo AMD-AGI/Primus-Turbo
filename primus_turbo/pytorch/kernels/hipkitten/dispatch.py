@@ -13,10 +13,14 @@ The binding signatures differ slightly between precisions:
 
   * FP8 (``tk_fp8_layouts``):
       ``gemm_{rcr,rrr,crr}(a, b, c, scale_a, scale_b, group_m)``
-      (no grouped entrypoint yet; the FP8 grouped backend either falls
-      back to a per-group dense_run loop, or — once the HK FP8 .cpp
-      grows ``grouped_{rcr,rrr,crr}`` bindings — uses :func:`grouped_run`
-      directly via the same path as BF16.)
+      ``grouped_rcr(a, b, c, scale_a, scale_b, group_offs, group_m)`` (round-12+)
+      ``grouped_rcr_dscale(a, b, c, sa_d, sb_d, group_offs, group_m)`` (round-12+)
+      The FP8 grouped backend uses the persistent ``grouped_rcr*`` binding
+      directly when groups are aligned + uniform-M (DeepSeek-V3 case);
+      RRR/CRR or padded shapes (gpt_oss with K=2880) still fall back to a
+      per-group :func:`dense_run` loop. Wiring lives in
+      ``grouped_gemm_fp8_impl.py``; this module's :func:`grouped_run`
+      keeps the BF16 signature and is **not** used for FP8.
 
 This module hides the difference behind :func:`dense_run` and
 :func:`grouped_run`, plus a thread-safe context manager for the
@@ -156,14 +160,31 @@ def grouped_run(
     a: torch.Tensor,
     b: torch.Tensor,
     c: torch.Tensor,
+    group_offs: torch.Tensor,
 ) -> None:
     """Dispatch the precision's native grouped launcher for ``cfg.layout``.
 
     The grouped launcher is pre-resolved at module-load time and exposed
-    via :meth:`HipKittenModule.grouped`. Returns immediately if the
-    binding does not expose a grouped entrypoint for the precision —
-    callers should check :meth:`HipKittenModule.has_grouped` (or fall
-    back to a per-group :func:`dense_run` loop) before dispatching here.
+    via :meth:`HipKittenModule.grouped`. ``group_offs`` MUST be a
+    ``[G+1] int64`` device tensor (prefix-sum of per-group M); the kernel
+    consumes it on the GPU side via an O(G) linear scan, so the call
+    itself is CPU-sync-free (no ``.item()`` / ``.cpu()`` / ``.tolist()``
+    against ``group_offs``).
+
+    Raises :class:`AttributeError` when the binding does not expose a
+    grouped entrypoint for the precision — callers should check
+    :meth:`HipKittenModule.has_grouped` (or fall back to a per-group
+    :func:`dense_run` loop) before dispatching here.
+
+    Binding signature (BF16 ``tk_bf16_layouts.so`` post round-1 rebuild):
+
+        grouped_{rcr,rrr,crr}(a, b, c, group_offs, group_m=4, num_xcds=8)
+
+    NOTE: this helper is BF16-only. The FP8 grouped binding has a
+    different signature (extra ``scale_a`` / ``scale_b`` args, no
+    ``num_xcds``) and is wired directly from
+    :class:`...grouped_gemm_fp8_impl.GroupedGEMMFP8HipKittenBackend`
+    rather than via this generic helper.
     """
     fn = hk.grouped(cfg.layout)
     if fn is None:
@@ -172,4 +193,4 @@ def grouped_run(
             "Rebuild tk_*_layouts.so with the grouped binding, or use the "
             "per-group dense_run fallback."
         )
-    fn(a, b, c, cfg.group_m, cfg.num_xcds)
+    fn(a, b, c, group_offs, cfg.group_m, cfg.num_xcds)

@@ -105,12 +105,23 @@ def _gpu_pool() -> Optional[set[int]]:
 def _pick_idle_gpu() -> Optional[str]:
     """Return the smallest idle GPU id within HIPKITTEN_GPU_POOL.
 
-    Falls back to None when rocm-smi is unavailable so the caller can let the
-    runtime choose the default device.
+    A GPU counts as "busy" if EITHER:
+      * a KFD process holds > 100MB of VRAM on it, OR
+      * its `GPU use (%)` reading from rocm-smi --showuse is > 30.
+
+    The `use %` check matters because some workloads (other containers,
+    non-KFD HIP processes, processes that hold a fd without an active
+    allocation) show up at 100% utilization with VRAM=0 in the KFD list,
+    or don't appear in the KFD list at all. Without the use% check we'd
+    happily pick a GPU that's already pinned at 100% by someone else.
+
+    Falls back to None when rocm-smi is unavailable so the caller can let
+    the runtime choose the default device.
     """
     import re
     import subprocess
-    THR = 100 * 1024 * 1024
+    VRAM_THR = 100 * 1024 * 1024
+    USE_PCT_THR = 30
     pool = _gpu_pool()
     try:
         out = subprocess.check_output(
@@ -125,6 +136,12 @@ def _pick_idle_gpu() -> Optional[str]:
     if pool is not None:
         all_gpus = [g for g in all_gpus if g in pool]
     busy: set[int] = set()
+    for m in re.finditer(
+        r"^GPU\[(\d+)\]\s*:\s*GPU use \(%\):\s*(\d+)", out, flags=re.M,
+    ):
+        gid, pct = int(m.group(1)), int(m.group(2))
+        if pct > USE_PCT_THR:
+            busy.add(gid)
     in_kfd = False
     for line in out.splitlines():
         if "KFD process information" in line:
@@ -141,7 +158,7 @@ def _pick_idle_gpu() -> Optional[str]:
             vram = int(cols[3])
         except ValueError:
             continue
-        if vram <= THR:
+        if vram <= VRAM_THR:
             continue
         for gid in re.findall(r"\d+", cols[2]):
             busy.add(int(gid))

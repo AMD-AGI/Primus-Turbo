@@ -70,13 +70,19 @@ fi
 HIPKITTEN_PATH="${HIPKITTEN_PATH:-/workspace/code/HipKittens}"
 
 pick_idle_gpus() {
-    # Returns comma-separated IDs of GPUs whose KFD process table shows
-    # no PID using more than VRAM_BUSY_THRESHOLD bytes (default 100 MiB).
+    # Returns comma-separated IDs of GPUs that look idle: a GPU is "busy"
+    # if EITHER a KFD process holds > VRAM_BUSY_THRESHOLD bytes (default
+    # 100 MiB) OR rocm-smi reports `GPU use (%)` > USE_PCT_THRESHOLD
+    # (default 30). The use% check matters because some workloads (other
+    # containers, non-KFD HIP processes) show up at 100% utilization with
+    # VRAM=0 in --showpids — without it we'd happily pick a GPU pinned at
+    # 100% by someone else.
     # Honors HIPKITTEN_GPU_POOL='0,1,2,3' (or via env) to restrict to a subset.
     # Falls back to "0" if rocm-smi is unavailable / parse fails.
     python3 - <<'PYEOF' 2>/dev/null || echo 0
 import os, re, subprocess, sys
 THR = int(os.environ.get("VRAM_BUSY_THRESHOLD", 100 * 1024 * 1024))
+USE_PCT_THR = int(os.environ.get("GPU_USE_PCT_THRESHOLD", 30))
 pool_raw = os.environ.get("HIPKITTEN_GPU_POOL", "").strip()
 pool = None
 if pool_raw:
@@ -106,6 +112,12 @@ all_gpus = sorted({int(m) for m in re.findall(r"^GPU\[(\d+)\]", out, flags=re.M)
 if pool is not None:
     all_gpus = [g for g in all_gpus if g in pool]
 busy = set()
+for m in re.finditer(
+    r"^GPU\[(\d+)\]\s*:\s*GPU use \(%\):\s*(\d+)", out, flags=re.M,
+):
+    gid, pct = int(m.group(1)), int(m.group(2))
+    if pct > USE_PCT_THR:
+        busy.add(gid)
 in_kfd = False
 for line in out.splitlines():
     if "KFD process information" in line:

@@ -437,8 +437,110 @@ def section(msg: str) -> None:
     print(f"\n--- {msg} ---", flush=True)
 
 
-def run_metric(cmd: str, cwd: str, timeout: int) -> Optional[float]:
+def _pick_idle_gpu(pool_csv: str) -> Optional[str]:
+    """Pick the smallest idle GPU id from ``pool_csv`` (e.g. "0,2,3").
+
+    Same algorithm as scripts/_metric_hk_ratio.py::_pick_idle_gpu — a GPU
+    counts as busy if a KFD process holds > 100MB of VRAM on it OR its
+    rocm-smi `GPU use (%)` is > 30. The 30% threshold catches GPUs that
+    are pinned at 100% by other containers / non-KFD processes (which
+    show up in --showuse but with VRAM=0 in --showpids).
+
+    Returns the chosen id as a string ("2"), or None if rocm-smi is
+    unavailable AND the pool is empty / unparseable.
+
+    The auto_optimize loop calls this once per round and pins
+    ``HIP_VISIBLE_DEVICES`` into every cursor-agent / metric subprocess
+    so the agent literally cannot see any other GPU — no matter what
+    it does in shell (``HIP_VISIBLE_DEVICES=0`` from inside the agent
+    just remaps to the one visible card we gave it).
+    """
+    import re
+    VRAM_THR = 100 * 1024 * 1024
+    USE_PCT_THR = 30
+    pool: Optional[set[int]] = None
+    if pool_csv.strip():
+        pool = set()
+        for tok in pool_csv.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                pool.add(int(tok))
+            except ValueError:
+                pass
+        if not pool:
+            pool = None
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "--showuse", "--showpids"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except Exception:
+        if pool:
+            return str(min(pool))
+        return None
+    all_gpus = sorted({int(m) for m in re.findall(r"^GPU\[(\d+)\]", out, flags=re.M)})
+    if pool is not None:
+        all_gpus = [g for g in all_gpus if g in pool]
+    busy: set[int] = set()
+    for m in re.finditer(
+        r"^GPU\[(\d+)\]\s*:\s*GPU use \(%\):\s*(\d+)", out, flags=re.M,
+    ):
+        gid, pct = int(m.group(1)), int(m.group(2))
+        if pct > USE_PCT_THR:
+            busy.add(gid)
+    in_kfd = False
+    for line in out.splitlines():
+        if "KFD process information" in line:
+            in_kfd = True
+            continue
+        if not in_kfd:
+            continue
+        if line.startswith("=") or "PROCESS NAME" in line:
+            continue
+        cols = line.split()
+        if len(cols) < 4 or not cols[0].isdigit():
+            continue
+        try:
+            vram = int(cols[3])
+        except ValueError:
+            continue
+        if vram <= VRAM_THR:
+            continue
+        for gid in re.findall(r"\d+", cols[2]):
+            busy.add(int(gid))
+    idle = [g for g in all_gpus if g not in busy]
+    if idle:
+        return str(idle[0])
+    return str(all_gpus[0]) if all_gpus else None
+
+
+def _subprocess_env_with_pinned_gpu(pool_csv: str) -> tuple[dict, Optional[str]]:
+    """Build a subprocess env dict with HIP_VISIBLE_DEVICES pinned to an
+    idle GPU from ``pool_csv``.
+
+    Returns (env_dict, picked_id). When ``picked_id`` is None we fall
+    through to the parent's env unchanged (pool was empty or rocm-smi
+    failed) — the called script can still do its own selection.
+
+    HIPKITTEN_GPU_POOL is also forwarded so child scripts (e.g.
+    _metric_hk_ratio.py) keep their pool semantics.
+    """
+    env = os.environ.copy()
+    if pool_csv.strip():
+        env["HIPKITTEN_GPU_POOL"] = pool_csv
+    picked = _pick_idle_gpu(pool_csv)
+    if picked is not None:
+        env["HIP_VISIBLE_DEVICES"] = picked
+    return env, picked
+
+
+def run_metric(cmd: str, cwd: str, timeout: int, gpu_pool: str = "") -> Optional[float]:
     section(f"measuring metric: {cmd[:120]}{'...' if len(cmd) > 120 else ''}")
+    env, picked = _subprocess_env_with_pinned_gpu(gpu_pool)
+    if picked is not None:
+        print(f"[metric] pinned HIP_VISIBLE_DEVICES={picked}", flush=True)
     try:
         result = subprocess.run(
             cmd,
@@ -447,6 +549,7 @@ def run_metric(cmd: str, cwd: str, timeout: int) -> Optional[float]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         print(f"[metric] TIMEOUT after {timeout}s", flush=True)
@@ -508,6 +611,7 @@ def _build_resume_prompt(
     head_sha: str,
     recent_log: str,
     short_status: str,
+    pinned_gpu: Optional[str] = None,
 ) -> str:
     """Lightweight follow-up prompt — same chat as previous round.
 
@@ -531,6 +635,14 @@ def _build_resume_prompt(
     if state.chat_started_at is not None:
         chat_age_min = (time.monotonic() - state.chat_started_at) / 60.0
 
+    if pinned_gpu is not None:
+        gpu_line = (
+            f"- **本轮 GPU**: HIP_VISIBLE_DEVICES={pinned_gpu}（auto_optimize.py 已 pin；"
+            f"shell 里不要再写 `HIP_VISIBLE_DEVICES=N`，写了也只能用这张）。"
+        )
+    else:
+        gpu_line = ""
+
     dod_line = ""
     if args.dod_every > 0 and state.last_dod_score is not None:
         dod_line = (
@@ -550,6 +662,7 @@ FROZEN 列表 / phased 路线 / 严禁假优化清单 —— **不要重新读 S
 - 上一轮 metric = {last_metric}（improved={last_improved}）
 - 已连续 {state.rounds_without_improvement} 轮未提升（patience={args.patience}）
 - baseline (开始时) = {baseline_metric}
+{gpu_line}
 {('- ' + dod_line) if dod_line else ''}
 
 【近 3 轮】
@@ -582,6 +695,7 @@ def build_prompt(
     recent_log: str,
     short_status: str,
     is_resume: bool = False,
+    pinned_gpu: Optional[str] = None,
 ) -> str:
     """Build the per-round prompt fed to cursor-agent.
 
@@ -607,6 +721,7 @@ def build_prompt(
     if is_resume:
         return _build_resume_prompt(
             args, state, round_idx, baseline_metric, head_sha, recent_log, short_status,
+            pinned_gpu=pinned_gpu,
         )
     last = state.rounds[-1] if state.rounds else None
     last_metric = last.metric if last else baseline_metric
@@ -622,6 +737,20 @@ def build_prompt(
     history_block = "\n".join(history_lines) if history_lines else "  (尚无历史)"
 
     gpu_pool = args.gpu_pool or "(unrestricted)"
+    if pinned_gpu is not None:
+        pinned_gpu_block = (
+            f"  **本轮已为你 pin** `HIP_VISIBLE_DEVICES={pinned_gpu}`（auto_optimize.py 在每轮开始前\n"
+            f"  从 `HIPKITTEN_GPU_POOL={gpu_pool}` 里挑了一张 use% < 30 且无 KFD VRAM 占用的 idle GPU\n"
+            f"  并通过 subprocess env 传进 cursor-agent 进程）。在本进程下 ROCm 只能看到这 1 张物理\n"
+            f"  卡，shell 命令里**不要再写** `HIP_VISIBLE_DEVICES=N`：写了也没用（你看到的 device 0\n"
+            f"  就是这张 pin 好的卡，不是物理 GPU 0）。**绝不许**手动 export `HIP_VISIBLE_DEVICES`。"
+        )
+    else:
+        pinned_gpu_block = (
+            f"  rocm-smi 不可用或 pool 为空 — 没 pin。**跑前必须** `rocm-smi --showuse --showpids`\n"
+            f"  在 pool 里挑 GPU use% < 30 且 KFD VRAM ≈ 0 的卡，metric 脚本会自动选；不要硬编码\n"
+            f"  `HIP_VISIBLE_DEVICES=N`。"
+        )
 
     dod_block = ""
     if args.dod_every > 0:
@@ -796,9 +925,11 @@ ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 
 
 【脚本机制硬约束 - 不可违反】
 - **GPU 池**：本次 run 只允许使用 `HIPKITTEN_GPU_POOL={gpu_pool}`（已经写进环境变量；GPU 1
-  当前被其他作业占用，绝不许动）。metric / DoD / 你自己的任何 benchmark/probe 都**只能从这个池
-  里挑卡**，跑前先 `rocm-smi --showuse --showpids` 看哪张空闲。**绝不许手动 export
-  HIP_VISIBLE_DEVICES** 去用池外的卡。
+  当前被其他作业占用，绝不许动）。
+{pinned_gpu_block}
+  你**只**能在 pin 给你的这一张卡上跑任何 benchmark / probe / metric。判 idle 的标准：
+  rocm-smi `GPU use (%)` ≤ 30 **且** KFD process VRAM ≈ 0 — 光看 KFD list 不够，有些
+  workload 跑在 100% 但 KFD VRAM=0（这就是上一次手动选 GPU 0 撞上正在跑的卡的原因）。
 - BackendType.HIPKITTEN 必须保持 `BackendEntry(..., autotune=False)` —— 它是手动 backend，
   不能进 autotune 池。
 - 任何动 dispatch / can_handle / group_m 规则的修改都必须配一个小 python 数值 probe
@@ -886,6 +1017,7 @@ def run_cursor_round(
     prompt: str,
     log_dir: Path,
     resume_chat_id: Optional[str] = None,
+    pinned_gpu: Optional[str] = None,
 ) -> tuple[int, Optional[str]]:
     """Run one cursor-agent round.
 
@@ -932,9 +1064,14 @@ def run_cursor_round(
     captured_session_id: Optional[str] = None
     last_assistant_text = ""
 
+    child_env = os.environ.copy()
+    if pinned_gpu is not None:
+        child_env["HIP_VISIBLE_DEVICES"] = pinned_gpu
+
     with log_path.open("w") as logf, raw_path.open("w") as rawf:
         logf.write(f"# Command: {pretty_cmd} <prompt>\n")
         logf.write(f"# Resume chat_id: {resume_chat_id or '(none — fresh chat)'}\n")
+        logf.write(f"# Pinned GPU: HIP_VISIBLE_DEVICES={pinned_gpu or '(unset — agent picks)'}\n")
         logf.write(f"# Started at: {now_iso()}\n\n")
         logf.flush()
         try:
@@ -945,6 +1082,7 @@ def run_cursor_round(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=child_env,
             )
         except FileNotFoundError:
             print("[cursor] cursor-agent not on PATH - aborting.", flush=True)
@@ -1185,7 +1323,10 @@ def main() -> int:
     try:
         banner(f"AUTO-OPTIMIZE start | rounds={args.rounds} | patience={args.patience} | log_dir={log_dir}")
         section("baseline metric")
-        baseline = run_metric(args.metric_cmd, str(workspace), args.metric_timeout)
+        baseline = run_metric(
+            args.metric_cmd, str(workspace), args.metric_timeout,
+            gpu_pool=args.gpu_pool,
+        )
         state.best_metric = baseline
         state.best_sha = get_head_sha(str(workspace))
         write_summary(summary_path, args, state, baseline)
@@ -1232,9 +1373,17 @@ def main() -> int:
             sha_before = get_head_sha(str(workspace))
             recent_log = get_recent_log(str(workspace))
             short_status = get_short_status(str(workspace))
+            pinned_gpu = _pick_idle_gpu(args.gpu_pool) if args.gpu_pool else None
+            if pinned_gpu is not None:
+                print(
+                    f"[gpu-pin] round {i} pinned HIP_VISIBLE_DEVICES={pinned_gpu} "
+                    f"(picked from pool {args.gpu_pool})",
+                    flush=True,
+                )
             prompt = build_prompt(
                 args, state, i, baseline, sha_before, recent_log, short_status,
                 is_resume=(not cold_start),
+                pinned_gpu=pinned_gpu,
             )
 
             round_dir = log_dir / f"round_{i:03d}"
@@ -1250,6 +1399,7 @@ def main() -> int:
                 cursor_exit, returned_session_id = run_cursor_round(
                     args, prompt, round_dir,
                     resume_chat_id=state.chat_id if not cold_start else None,
+                    pinned_gpu=pinned_gpu,
                 )
 
             # Update chat-window state: cold start banks the new session_id;
@@ -1272,7 +1422,10 @@ def main() -> int:
             duration = time.monotonic() - t0
 
             sha_after = get_head_sha(str(workspace))
-            metric = run_metric(args.metric_cmd, str(workspace), args.metric_timeout)
+            metric = run_metric(
+                args.metric_cmd, str(workspace), args.metric_timeout,
+                gpu_pool=args.gpu_pool,
+            )
 
             improved = False
             if metric is not None:
