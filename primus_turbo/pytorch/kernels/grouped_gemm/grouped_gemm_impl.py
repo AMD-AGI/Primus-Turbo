@@ -214,13 +214,10 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         # Hard constraints only — dtype, dim, device, B-divisibility.
-        # We do NOT reject on misaligned (M, N, K): the ``execute`` path
-        # K-pads when needed and dispatches a single persistent grouped
-        # launch on the padded shape (the HK BF16 grouped binding's
-        # scalar tail kernel is HBM-traffic-bound on K=2880-class
-        # shapes, so the K-pad fast path is still strictly faster than
-        # a native non-aligned grouped launch — this trade reverses
-        # once the HK grouped binding picks up a vectorised K-tail).
+        # No alignment gate: the HipKittens BF16 grouped main kernel
+        # natively handles non-aligned (M, N, K) (main kernel sweeps
+        # the BLOCK_SIZE-aligned interior; ``grouped_tail_kernel``
+        # handles partial M / N / K cells on the same launch).
         if a.dim() != 2 or b.dim() != 3 or trans_a:
             return False
         if a.dtype not in _HIPKITTEN_SUPPORTED_DTYPES or b.dtype not in _HIPKITTEN_SUPPORTED_DTYPES:
@@ -250,64 +247,24 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
 
         m = _uniform_group_m(a.shape[0], group_lens)
         if m is not None:
-            m_pad, n_pad, k_pad = hipkitten.padded_shape(m, n, k, layout, "bf16")
+            # Uniform-M (DeepSeek-V3 / gpt_oss / metric case): single
+            # CPU-sync-free persistent grouped launch on the unpadded
+            # shape. ``group_offs`` is consumed device-side via O(G)
+            # scan inside the HK kernel.
             cfg = hipkitten.select_default_config(
-                m_pad, n_pad, k_pad, layout, "bf16", m_total=a.shape[0]
+                m, n, k, layout, "bf16", m_total=a.shape[0]
             )
-            if (m_pad, n_pad, k_pad) == (m, n, k):
-                # Aligned uniform-M: persistent grouped binding consumes
-                # ``group_offs`` device-side via O(G) scan; one launch
-                # writes every row of ``out``. Skip the ~30 µs HBM
-                # zero-init that ``torch.zeros`` does and use ``empty``.
-                out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
-                a_in = a if a.is_contiguous() else a.contiguous()
-                b_in = b if b.is_contiguous() else b.contiguous()
-                hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
-                return out
-            if m_pad == m:
-                # M is aligned but N / K need padding (gpt_oss_20B
-                # K=2880→3072, N=2880→3072). One grouped launch on
-                # K-and-N padded tensors, then return a non-contig
-                # slice of c_pad. Allocate via ``empty`` and zero only
-                # the K-pad slab (mma sums across K so K-pad garbage
-                # would contaminate every valid output); N-pad slab is
-                # left uninitialised because each output position
-                # consumes exactly one N-row of B and N-pad cols are
-                # never read by the caller via the ``c_pad[:, :n]``
-                # slice return.
-                if k_pad == k:
-                    a_in = a if a.is_contiguous() else a.contiguous()
-                else:
-                    a_in = torch.empty((bs * m, k_pad), dtype=a.dtype, device=a.device)
-                    a_in[:, :k].copy_(a)
-                    a_in[:, k:].zero_()
-                if trans_b:
-                    if (n_pad, k_pad) == (n, k):
-                        b_in = b if b.is_contiguous() else b.contiguous()
-                    else:
-                        b_in = torch.empty((bs, n_pad, k_pad), dtype=b.dtype, device=b.device)
-                        b_in[:, :n, :k].copy_(b)
-                        if k_pad > k:
-                            b_in[:, :n, k:].zero_()
-                else:
-                    if (n_pad, k_pad) == (n, k):
-                        b_in = b if b.is_contiguous() else b.contiguous()
-                    else:
-                        b_in = torch.empty((bs, k_pad, n_pad), dtype=b.dtype, device=b.device)
-                        b_in[:, :k, :n].copy_(b)
-                        if k_pad > k:
-                            b_in[:, k:, :].zero_()
-                c_pad = torch.empty((bs * m, n_pad), dtype=a.dtype, device=a.device)
-                hipkitten.grouped_run(hk, cfg, a_in, b_in, c_pad, group_offs)
-                return c_pad[:, :n]
+            out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
+            a_in = a if a.is_contiguous() else a.contiguous()
+            b_in = b if b.is_contiguous() else b.contiguous()
+            hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs)
+            return out
 
-        # Non-uniform / M-misaligned fallback: per-group dense_run loop.
-        # Phase 4 simplification: BF16 dense kernel handles any (M, N, K)
-        # natively after Phase 1 (round-1 ``feat(bf16-dense): native
-        # non-aligned M/N/K``), so this path no longer pads — just slice
-        # per group and dispatch ``dense_run``. ``out`` zero-init is
-        # required for ``mg <= 0`` groups (loop ``continue``s and
-        # leaves those rows untouched).
+        # Non-uniform fallback: per-group dense_run loop on unpadded
+        # shapes. The HK BF16 dense kernel natively handles non-aligned
+        # (M, N, K) (Phase 1 + Phase 4: column-masked C store + scalar
+        # tail). ``out`` zero-init covers ``mg <= 0`` groups whose rows
+        # the loop skips.
         out = torch.zeros((a.shape[0], n), dtype=a.dtype, device=a.device)
         offs = _group_offsets_cpu(group_offs)
         for group_idx in range(bs):
