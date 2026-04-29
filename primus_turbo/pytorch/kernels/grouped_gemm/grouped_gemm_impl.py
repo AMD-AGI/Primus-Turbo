@@ -375,19 +375,51 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         bs = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
-        # Per-group dB CRR loop — no host pad. The BF16 dense CRR kernel
-        # natively handles any (M, N, K) via its scalar fp32 tail kernel
-        # so each iteration is just a direct dense_run on the per-group
-        # slice. ``out`` zero-init is required because the loop ``continue``s
-        # on ``mg <= 0`` groups (leaving those rows untouched). There's
-        # no persistent variable-K binding yet (the forward grouped
-        # kernel produces M-stacked C with shape [M_total, N], whereas
-        # variable-K dB needs per-group [K, N] of shape [B, K, N]), so
-        # the per-group launch pattern stays here. This path is not
-        # exercised by the current metric suite (BF16_bwd uses the
-        # forward grouped layout); it lives on the BF16 backward dB
-        # branch and is gated outside the project rule banning per-group
-        # launches in the *forward* grouped path.
+        # Round-1 fast path: persistent CPU-sync-free variable-K kernel.
+        # Replaces the per-group ``dense_run`` loop with a single launch
+        # when (a) the HK BF16 binding ships the new ``grouped_variable_k_crr``
+        # entrypoint, (b) ``n`` and ``k`` are both BLOCK_SIZE-aligned
+        # (the v0 kernel has no N/K tail handler — round-2 work), and
+        # (c) ``M_g`` is uniform (the kernel itself accepts non-uniform
+        # via its device-side ``group_offs`` scan, but the bench cases
+        # are all balanced and the uniform check guards the BLK
+        # alignment of ``m_start_g`` that the K-axis offset relies on).
+        # gpt_oss-Down (n=k=2880) flunks (b) and falls back to the
+        # per-group loop, matching round-0 behavior on those shapes.
+        var_k_fn = getattr(hk.module, "grouped_variable_k_crr", None)
+        m_uniform = _uniform_group_m(a.shape[0], group_lens)
+        if (
+            var_k_fn is not None
+            and m_uniform is not None
+            and m_uniform >= 128
+            and (n % hk.block_size == 0)
+            and (k % hk.block_size == 0)
+        ):
+            cfg = hipkitten.select_default_config(
+                n, k, m_uniform, "crr", "bf16", m_total=a.shape[0]
+            )
+            # ``a`` is x [M_total, K_fwd]; ``b`` is grad_out [M_total, N_fwd].
+            # The new kernel takes (grad_out, x, grad_b, group_offs) so we
+            # pass ``b`` as the kernel's A and ``a`` as the kernel's B,
+            # matching the per-group ``dense_run(b[s:e], a[s:e], out[g])``
+            # call this fast path replaces.
+            grad_out_2d = b if b.is_contiguous() else b.contiguous()
+            x_2d = a if a.is_contiguous() else a.contiguous()
+            # ``empty`` is safe (every (group, n_tile, k_tile) cell is
+            # either fully-written by the persistent kernel or — when
+            # ``ki_g < 2``, i.e., M_g < 128 — left out by the kernel's
+            # ``continue``. The uniform-M >= 128 gate above rules out
+            # the latter for the bench cases, and the user contract
+            # for grouped variable-K is M_g >= 128 anyway).
+            out = torch.empty((bs, n, k), dtype=a.dtype, device=a.device)
+            var_k_fn(grad_out_2d, x_2d, out, group_offs, cfg.group_m, cfg.num_xcds)
+            return out
+
+        # Fallback: per-group dB CRR loop (round-0 behavior). Used for
+        # misaligned (n, k) — gpt_oss-Down with n=k=2880 — and for any
+        # non-uniform M_g future cases. Both still violate the project
+        # rule banning per-group launches; round-2 will lift the
+        # alignment requirement via a tail kernel and remove this path.
         out = torch.zeros((bs, n, k), dtype=a.dtype, device=a.device)
         offs = _group_offsets_cpu(group_offs)
         for group_idx in range(bs):
