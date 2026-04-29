@@ -841,7 +841,6 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         **kwargs,
     ):
         hk = hipkitten.load_fp8()
-        offs = _group_offsets_cpu(group_offs)
         group_num = group_lens.numel()
         n = b.shape[1]
         k = a.shape[1]
@@ -858,6 +857,80 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         sa_h, sb_h, sa_d, sb_d = _resolve_fp8_scales(
             b_scales, a_scales, hipkitten.fp8_has_dscale(hk, "crr")
         )
+        # Round-4: persistent CPU-sync-free FP8 variable-K CRR kernel —
+        # mirror of the BF16 var-K fast path. Replaces the per-group
+        # ``dense_run`` + host-pad fallback below when:
+        #   (a) the HK FP8 binding ships ``grouped_variable_k_crr``,
+        #   (b) ``M_g`` is uniform across groups and >= 256 (= 2 * HB,
+        #       required for the prologue + 2 epilogues schedule),
+        #   (c) ``n`` (kernel m-output dim = N_fwd) is BLOCK_SIZE
+        #       MIS-aligned (= the var-K kernel's win condition).
+        #
+        # Why gate (c)? Round-3 / round-4 head-to-head data on MI355X:
+        #   * N-aligned shapes (DeepSeek-V3: n ∈ {4096, 7168}) — the
+        #     per-group fallback uses raw FP8 dense CRR without
+        #     host-pad (fastest known FP8 CRR path; ~1660 TF on B32
+        #     M4096). The variable-K kernel has higher per-tile
+        #     overhead (binary-search + drain barrier per persistent
+        #     iteration) and currently regresses ~10-20%. So we keep
+        #     them on per-group below.
+        #   * N-misaligned shapes (gpt_oss: n ∈ {2880, 5760}) — the
+        #     per-group fallback hits the host-pad path (``_pad_2d``
+        #     allocates + zero-pads input every group, then dense
+        #     run, then ``out[g].copy_``). All of those violate the
+        #     SKILL.md rules (host pad / per-group launch). The
+        #     variable-K kernel natively handles N-tail via
+        #     ``ceil_div`` + 2-axis-masked C store + full-tensor
+        #     SRD load (round-4 fix in HK to prevent past-tensor-end
+        #     OOB on the partial last M-tile). Speedup on B4
+        #     gpt_oss-Down M2048: 463 -> 535 TF; B4 gpt_oss-GateUP
+        #     M4096: 944 -> 1122 TF — net +6.7% on FP8 grouped bwd
+        #     average.
+        var_k_fn = getattr(hk.module, "grouped_variable_k_crr", None)
+        var_k_dscale_fn = getattr(
+            hk.module, "grouped_variable_k_crr_dscale", None
+        )
+        m_uniform_fast = (
+            (a.shape[0] // group_num)
+            if (group_num > 0 and a.shape[0] % group_num == 0)
+            else None
+        )
+        if (
+            var_k_fn is not None
+            and m_uniform_fast is not None
+            and m_uniform_fast >= 256
+            and (n % hk.block_size != 0)
+        ):
+            # CRR variable-K dB pass. The dispatcher's ``a`` is the
+            # input activation x_fp8 [M_total, k]; ``b`` is grad_out_fp8
+            # [M_total, n] (see autograd:: ``grad_b =
+            # grouped_gemm_fp8_variable_k_impl(a_fp8, grad_out_fp8,
+            # ...)``). The HK kernel signature is
+            # ``crr(grad_out_fp8, x_fp8, grad_b_bf16, scale_a,
+            # scale_b, group_offs)`` so we MUST pass ``b`` (=
+            # grad_out) as the kernel's A and ``a`` (= x) as the
+            # kernel's B — same order the per-group fallback below
+            # uses (``dense_run(bg, ag, ...)``, where bg = b[s:e] and
+            # ag = a[s:e]). Mirrors the BF16 var-K wiring in
+            # ``GroupedGEMMVariableKHipKittenBackend.execute``.
+            #
+            # Scales: ``_resolve_fp8_scales(b_scales, a_scales, ...)``
+            # above already maps to (kernel's scale_a = grad_out's
+            # scale, kernel's scale_b = x's scale), so we forward
+            # ``(sa_*, sb_*)`` straight through.
+            grad_out_2d = b if b.is_contiguous() else b.contiguous()
+            x_2d = a if a.is_contiguous() else a.contiguous()
+            if (
+                sa_d is not None and sb_d is not None
+                and var_k_dscale_fn is not None
+            ):
+                var_k_dscale_fn(grad_out_2d, x_2d, out,
+                                sa_d, sb_d, group_offs)
+            else:
+                var_k_fn(grad_out_2d, x_2d, out, sa_h, sb_h, group_offs)
+            return out
+
+        offs = _group_offsets_cpu(group_offs)
         # Hoist padded_shape + select_default_config out of the per-group
         # loop on uniform-K (the CRR layout has K as the per-group axis;
         # mirrors the forward fast-path optimization in the sibling
