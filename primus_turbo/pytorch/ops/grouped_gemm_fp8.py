@@ -91,7 +91,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_impl(
@@ -147,7 +147,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         # Quantize grad_out with segment padding for wgrad (colwise quantization)
@@ -174,7 +174,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -217,7 +217,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         # we need a/b do col quant for backward.
@@ -257,7 +257,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         # For grad_b
@@ -278,7 +278,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
@@ -318,7 +318,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=a.dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
             maybe_pre_sync=True,
         )
 
@@ -350,7 +350,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         # For grad_b
@@ -367,7 +367,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.HIPKITTEN.value,
         )
 
         return grad_a, grad_b, None, None, None, None, None
