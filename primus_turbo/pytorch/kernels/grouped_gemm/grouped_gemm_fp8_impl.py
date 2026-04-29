@@ -323,20 +323,32 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
                 "rebuild tk_fp8_layouts.so with the persistent grouped kernel "
                 "for this layout."
             )
+        avg_m = _avg_group_m(a.shape[0], bs)
         cfg = hipkitten.select_default_config(
-            _avg_group_m(a.shape[0], bs), n, k, layout, "fp8",
+            avg_m, n, k, layout, "fp8",
             m_total=a.shape[0],
         )
         out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
         a_in = a if a.is_contiguous() else a.contiguous()
         b_in = b if b.is_contiguous() else b.contiguous()
+        # Round-13: ``m_per_group=avg_m`` is a host hint consumed by the
+        # FP8 LDS-staged K-tail kernel (``grouped_ktail_kernel_lds``) to
+        # gate the cooperative LDS path. The kernel additionally checks
+        # ``row_block_base + TBM <= s_offs[group_idx + 1]`` per block so
+        # passing ``avg_m`` is always safe — non-uniform group_lens whose
+        # avg happens to be TBM-aligned fall back to the per-row scalar
+        # K-tail correction in the same kernel. Default ``0`` keeps the
+        # legacy scalar-tail path (binding signature is back-compat via
+        # pybind11 default arg). Mirror BF16 round-9 wiring.
         if grouped_dscale_fn is not None and sa_d is not None and sb_d is not None:
             grouped_dscale_fn(
-                a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m
+                a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m,
+                m_per_group=avg_m,
             )
         else:
             grouped_fn(
-                a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m
+                a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m,
+                m_per_group=avg_m,
             )
         return out
 
