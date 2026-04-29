@@ -389,6 +389,46 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         // with its own `wait_lgkmcnt<0>` (see turbo_gemm_mxfp8_kernel.h
         // ~L414), so lgkmcnt is already 0 with no pending ds_reads at this
         // point.  Drop it to match the inner-loop Phase 1->2 barrier idiom.
+        //
+        // Round 9 (2026-04-28) NEGATIVE-RESULT NOTE: do NOT remove this
+        // wait_vmcnt<0>().  An attempt to do so on the symmetry hypothesis
+        // that "buffer_load_lds dec's vmcnt and lgkmcnt simultaneously, so
+        // phase_mfma_lds's wait_lgkmcnt<0> in Phase 3+4 already drains the
+        // Epi1 LDGs" was characterized empirically:
+        //
+        //   * Long-run (N_ITERS=1000, 5 shapes) stress: no regression
+        //     (5/5000 BAD, identical to baseline) — i.e. the race is
+        //     SUBTLE on long-run.
+        //   * Short-run (N_ITERS=100 in scripts/_metric_mxfp8.py) stress:
+        //     out of 10 metric trials, ONE trial collapsed to
+        //     `stress_bad=100/100` (catastrophic, score 44503 vs typical
+        //     ~54405) on the (G=4 M=1024 N=2048 K=2048 E4M3) shape.  The
+        //     other 9 trials were within baseline noise (stress_bad
+        //     0..4/100, typical sum_tflops ~5440-5490 ≈ baseline).
+        //   * Conclusion: removing this drain opens a metastable cross-
+        //     tile WAW on a/b_smem_tile[old_cur][2,3] when the next
+        //     compute_tile() call's prologue `load_a_gmem_to_smem_half_srd`
+        //     starts overwriting the same LDS slabs while pair-i's
+        //     buffer_load_lds is still committing.  When the LSU happens
+        //     to retire writes out-of-order under cache pressure, the
+        //     final LDS contents alias the OLD Epi1 fetch (pair-i's data
+        //     still pending) instead of the new prologue fetch — every
+        //     subsequent K-iter then re-reads stale data, producing the
+        //     observed all-bad batch.
+        //
+        // Race-physics: phase_mfma_lds's wait_lgkmcnt<0> drains the
+        // *lgkmcnt* counter at LDS-write COMPLETION; on gfx950 vmcnt for a
+        // buffer_load_lds is decremented at GMEM-side READ commit, which
+        // can precede the LDS-write commit by tens of cycles.  So
+        // wait_lgkmcnt<0> alone does NOT guarantee the LDS write has
+        // landed — only wait_vmcnt<0> does (it waits for the entire
+        // buffer_load_lds transaction including the LDS-write tail).
+        //
+        // Lesson for future rounds: do NOT retry removing or weakening
+        // this wait_vmcnt<0>().  The useful tightening direction is
+        // tile-pipeline reorganization (e.g. fold Epi1 phase 1+2 LDGs to
+        // earlier in the pipeline so they retire before this point
+        // naturally), NOT shortening the drain itself.
         wait_vmcnt<0>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
@@ -536,23 +576,92 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         // 64 stores that <63> didn't drain).  Net per-call hit is bounded
         // by 2 × this × tiles_per_call; the determinism win is worth more
         // than the perf hit at the metric's 100×stress_bad weighting.
+        //
+        // Round 6 (2026-04-28): tried wait_vmcnt<32> on the symmetry
+        // hypothesis that the c_tmp_b reuse point downstream is safe at
+        // <32>, so this point should be safer at <32> (pair-0's last
+        // store has had pair-1's full read+store sequence ≈80 issue
+        // cycles + 32 commit cycles since issue).  Empirically NEUTRAL
+        // on perf and risky on stress: 8 metric trials gave sum_tflops
+        // mean 5398.2 (vs baseline mean 5409.0 over 5 trials, i.e. NO
+        // measurable speedup) and stress_bad spread 0,0,0,0,1,2,3,5
+        // (2/8 trials > 2/100 DoD).  Long-run N_ITERS=1000 stress was
+        // fine (1/5000 BAD across 5 shapes), so the short-run failures
+        // are noise-driven, but they show the safety margin here is
+        // tighter than at the c_tmp_b point.
+        //
+        // Race-physics explanation (corrects the symmetry hypothesis):
+        // at the c_tmp_b reuse point an explicit `wait_vmcnt<0>` runs
+        // BEFORE this barrier (~L539), so by the time vmcnt rises again
+        // it's only pair-2's own 64 stores in flight.  `wait_vmcnt<32>`
+        // there means "drain 32 of pair-2's 64 stores", strictly bounded.
+        //
+        // At THIS barrier no upstream vmcnt drain has fired yet, so vmcnt
+        // can be as high as 128 (pair-0: 64, pair-1: 64).  Hardware does
+        // NOT guarantee FIFO retirement across the LSU, so when vmcnt
+        // settles to 32, the in-flight 32 stores can still include some
+        // of pair-0's tail — exactly the slot pair-2's next accvgpr_read
+        // is about to overwrite.  No `wait_vmcnt<x>` with x>0 is a sound
+        // safety floor here: the only floor that GUARANTEES pair-0's
+        // LSU read pipe is fully retired is `<0>`.
+        //
+        // Lesson for future rounds: do NOT retry wait_vmcnt<1..63> at
+        // this barrier.  The useful tightening direction is
+        // perf-orthogonal (e.g. fold pair-1's read_c later so pair-0's
+        // commit window starts earlier in program order, splitting
+        // c_frags VGPR pressure across 4 buffers, or — most promising —
+        // an L1 fence at the end of store_c_subtile so the pair-0
+        // commit can be observed without waiting for vmcnt to drain).
         wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
                                              c_tmp_a, c_stg_offsets);
         __builtin_amdgcn_sched_barrier(0);
-        // PERF: drop the previously-here second `wait_vmcnt<0>()`.  pair-3
-        // about to read into c_tmp_b — it must wait for pair-1's stores
-        // (the previous c_tmp_b writer) to have read their source VGPRs.
-        // That guarantee is ALREADY provided transitively by the first
-        // `wait_vmcnt<0>` above (~539): when that drain returned, vmcnt==0
-        // → pair-0 (c_tmp_a) AND pair-1 (c_tmp_b) had both fully retired.
-        // pair-2 between then and here only writes c_tmp_a — it does not
-        // touch c_tmp_b.  So at this program point c_tmp_b's register slot
-        // is provably already safe for pair-3's `v_accvgpr_read_b32` to
-        // overwrite, with no pending LSU source-VGPR reads from any prior
-        // pair.  The drop saves a full vmcnt(0) drain (~50-100 cycles
-        // depending on pair-2's L1 commit latency) per output tile.
+        // RACE FIX (FWD `out`/`dA` race at c_tmp_b reuse).
+        //
+        // History:
+        //   * pre-0d6c1c7: wait_vmcnt<63> here. Failed: vmcnt unit on gfx950
+        //     is the assembler max but only guarantees 65 of up-to-128
+        //     in-flight stores have committed, leaving pair-1 source VGPRs
+        //     under LSU pressure when pair-3 overwrites c_tmp_b → 2-6/100
+        //     BAD on (G=4 M=1024 N=2048 K=2048 E4M3) stress.
+        //   * 0d6c1c7: dropped this barrier entirely. Same race, same rate.
+        //   * de58a8e: wait_vmcnt<0>. Race fully closed (0/100), but spends
+        //     ~50-100 extra cycles per output tile waiting for ALL of
+        //     pair-2's 64 in-flight stores plus the LSU pipe to retire.
+        //   * e62b18a: wait_vmcnt<32>. Race fully closed (0/100), recovers
+        //     ~32 cycles vs <0>.  Race-physics analysis confirms <32> is
+        //     far above the LSU read-window safety threshold.
+        //   * Round 5 (2026-04-28): tried wait_vmcnt<48> as the midpoint
+        //     between safe <32> and racy <63>.  Empirically RACY:
+        //     stress_bad on (G=4 M=1024 N=2048 K=2048 E4M3) was 5/100,
+        //     0/100, 2/100 across 3 trials → average ~2.3/100, which
+        //     clearly violates the ≤2/100 DoD on bad runs.  This pins
+        //     down the LSU read-window cliff at vmcnt ∈ (32, 48] on
+        //     gfx950 for this code shape, NOT at vmcnt ∈ (32, 63] as
+        //     the e62b18a "16-32 hardware cycle" estimate suggested.
+        //     Do not retry vmcnt<33..63> in any future round — the
+        //     useful tightening direction from <32> is reductions like
+        //     <0..16> (slower but safer), not loosenings.
+        //
+        // Current bound: wait_vmcnt<32>.  Race-physics analysis: the race
+        // surface is the LSU read-window for pair-1's source VGPRs.
+        // After the first wait_vmcnt<0> above, pair-1 is committed (vmcnt
+        // 0); but the LSU read pipe may not have released the last
+        // flat_store_short's source VGPR until ~SIMT-pipe-depth cycles
+        // later. Issuing 32 more pair-2 stores (vmcnt rises to 64) and
+        // then waiting for the *first half* of them to commit (vmcnt down
+        // to 32, i.e. drain 32 of 64) gives the LSU another ~32 commit
+        // cycles to release pair-1's tail. By that point pair-1's source
+        // VGPR slot — which is what pair-3 is about to overwrite by
+        // accvgpr_read into c_tmp_b — is provably idle on gfx950's LSU
+        // (the round-5 <48> attempt shows the actual safety margin needs
+        // to drain ≥ 32 of the 64 pair-2 stores, not ≥ 16).
+        //
+        // Cost vs <0>: saves the wait for pair-2's last 32 stores, i.e.
+        // ~32 cycles per output tile. Cost vs <63>: adds 31 stores to the
+        // drain, which is exactly the safety margin we need.
+        wait_vmcnt<32>();
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets);
@@ -576,19 +685,23 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         // Boundary tiles emit fewer stores (some `if (row<valid_rows..)` checks
         // skip), so vmcnt at this point may be <128, but we still want pair-0
         // fully drained before c_tmp_a is overwritten — the safest formal
-        // bound is wait_vmcnt<0>.
+        // bound is wait_vmcnt<0>.  Round 6's wait_vmcnt<32> attempt on
+        // both branches did not improve perf and showed stress noise; do
+        // not retry on this branch either (see non-boundary note above).
         wait_vmcnt<0>();
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
                                              c_tmp_a, c_stg_offsets, tile_valid_m - 128,
                                              tile_valid_n);
         __builtin_amdgcn_sched_barrier(0);
-        // PERF: drop the previously-here second `wait_vmcnt<0>()` (mirror of
-        // the !is_boundary_tile branch above).  pair-1 (the previous c_tmp_b
-        // writer) was already fully drained by the first `wait_vmcnt<0>`
-        // above; pair-2 between then and here only writes c_tmp_a, never
-        // c_tmp_b.  So c_tmp_b's register slot is provably free for
-        // pair-3's accvgpr reads at this point — no extra drain needed.
+        // RACE FIX: see matching note in the !is_boundary_tile branch above.
+        // Boundary tiles emit fewer stores (some `if (row<valid_rows..)`
+        // checks skip), so the residual race is rarer here, but the same
+        // LSU window applies under stress; mirror the fix so determinism
+        // is uniform across boundary and non-boundary tiles.  Round 5
+        // <48> attempt was reverted to <32> after the non-boundary path
+        // showed empirical race; this branch tracks the same bound.
+        wait_vmcnt<32>();
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
         tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
                                              c_tmp_b, c_stg_offsets, tile_valid_m - 128,

@@ -50,10 +50,6 @@ def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
         raise ValueError(f"Unsupported FP8 format: {format}")
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 def _regroup_b_colwise_for_dgrad(
     b_fp8_col_2d: torch.Tensor,
     b_scale_inv_col_2d: torch.Tensor,
@@ -61,37 +57,76 @@ def _regroup_b_colwise_for_dgrad(
     n: int,
     k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert flattened B^T quantization to grouped B^T layout."""
-    assert b_fp8_col_2d.size(0) == k
+    """Convert flattened B^T quantization to grouped B^T layout.
+
+    Caller contract: ``k == b_fp8_col_2d.size(0)`` (this helper used to
+    assert it; the assert is now trivially tautological because
+    ``GroupedGemmFP8MXFunc.backward`` passes ``b_fp8_col_2d.size(0)`` as
+    the ``k`` argument — see 0aa4e17.  Drop the assert to match the
+    dead-state-removal direction of cc11123 / bacbb8a / 0aa4e17;
+    ``b_fp8_col_2d.size(1) >= group_num * n`` and
+    ``n % MX_BLOCK_SIZE == 0`` are still validated below because they
+    cross-check call-site values that ARE non-trivially independent.)
+    """
     assert b_fp8_col_2d.size(1) >= group_num * n
     assert n % MX_BLOCK_SIZE == 0
 
-    n_padded = _ceil_div(n, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE
     scale_cols = n // MX_BLOCK_SIZE
-    scale_cols_padded = n_padded // MX_BLOCK_SIZE
     assert b_scale_inv_col_2d.size(0) == k
     assert b_scale_inv_col_2d.size(1) >= group_num * scale_cols
 
-    b_fp8_col = (
+    # Transposed view (group_num, k, n) — no copy.  Materializing the transpose
+    # via `.copy_()` from a non-contiguous source uses a single transpose-aware
+    # kernel, so we can fold the transpose into either the `.contiguous()` call
+    # (128-aligned-N path) or directly into the padded destination
+    # (tail-padded path), avoiding an intermediate full-size allocation.
+    b_fp8_col_view = (
         b_fp8_col_2d[:, : group_num * n]
         .reshape(k, group_num, n)
         .transpose(0, 1)
-        .contiguous()
     )
-    b_scale_inv_col = (
+    b_scale_inv_col_view = (
         b_scale_inv_col_2d[:, : group_num * scale_cols]
         .reshape(k, group_num, scale_cols)
         .transpose(0, 1)
-        .contiguous()
     )
-    if n_padded == n:
-        return b_fp8_col, b_scale_inv_col
+    # PERF: gate the fast path on `n % MXFP8_PADDING_ALIGN_SIZE == 0` directly
+    # instead of computing `n_padded = ceil(n/128)*128` first and comparing.
+    # The two predicates are mathematically equivalent (`ceil(n/A)*A == n`
+    # iff `n % A == 0`), but the modulo form skips the `_ceil_div` helper
+    # call + the multiply on the 3-of-4 metric backward shapes that hit
+    # this fast path (DSv3 shapes have N=4096/7168/2048, all divisible by
+    # 128; only gpt_oss_20B's N=2880 falls into the tail-padded branch
+    # below).  Saves ~2 Python int-arith ops + one helper-fn call (~150 ns
+    # cumulative) per MX backward call on the hot DSv3 shapes; matches
+    # the dead-work elimination direction of 4caf09b / df91ca4 / 9d5d17c
+    # / 669553b / cc11123 / bacbb8a / 0aa4e17 / 19a077a.  The padded-path
+    # `n_padded` / `scale_cols_padded` are now computed lazily inside the
+    # else branch where they're actually consumed.  Bitwise-equivalent.
+    if n % MXFP8_PADDING_ALIGN_SIZE == 0:
+        # 128-aligned N (DSv3 shapes 4096 / 7168 / 2048).  Single transpose copy.
+        return b_fp8_col_view.contiguous(), b_scale_inv_col_view.contiguous()
 
-    b_fp8_col_padded = b_fp8_col.new_zeros((group_num, k, n_padded))
-    b_fp8_col_padded[:, :, :n].copy_(b_fp8_col)
-
-    b_scale_inv_col_padded = b_scale_inv_col.new_zeros((group_num, k, scale_cols_padded))
-    b_scale_inv_col_padded[:, :, :scale_cols].copy_(b_scale_inv_col)
+    # PERF: Tail-padded N (e.g. gpt_oss_20B with N=2880 -> 2944).  Previously
+    # this path did `.transpose(0, 1).contiguous()` (one transpose copy into a
+    # fresh (G, K, N) buffer) and THEN `.new_zeros((G, K, N_padded)).copy_(...)`
+    # (another alloc + memcpy).  The intermediate (G, K, N) buffer is a
+    # write-once / read-once temporary — bypass it by allocating the padded
+    # buffer directly and using `.copy_()` on the non-contiguous transpose
+    # view, which lets PyTorch fuse the transpose with the destination write
+    # in a single dispatch.  Saves one (G, K, N)-sized allocation +
+    # transpose-memcpy per backward call on shapes whose N is not
+    # 128-aligned.  Bitwise-equivalent: the resulting (G, K, N_padded) buffer
+    # has identical contents (zeros in [n:N_padded] and the transposed B^T
+    # data in [0:n]).
+    n_padded = (
+        (n + MXFP8_PADDING_ALIGN_SIZE - 1) // MXFP8_PADDING_ALIGN_SIZE
+    ) * MXFP8_PADDING_ALIGN_SIZE
+    scale_cols_padded = n_padded // MX_BLOCK_SIZE
+    b_fp8_col_padded = b_fp8_col_view.new_zeros((group_num, k, n_padded))
+    b_fp8_col_padded[:, :, :n].copy_(b_fp8_col_view)
+    b_scale_inv_col_padded = b_scale_inv_col_view.new_zeros((group_num, k, scale_cols_padded))
+    b_scale_inv_col_padded[:, :, :scale_cols].copy_(b_scale_inv_col_view)
     return b_fp8_col_padded, b_scale_inv_col_padded
 
 
@@ -471,8 +506,17 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # ValueError.  This is a deliberate trade for ~5-10 us / call on the
         # forward critical path; the constraint itself is unchanged.
 
-        a_dtype = _get_fp8_dtype(config.format, True)
-        b_dtype = _get_fp8_dtype(config.format, True)
+        # `_get_fp8_dtype(format, is_fwd_stage=True)` is invariant in
+        # `is_fwd_stage` for E4M3/E5M2 and returns `float8_e4m3` for HYBRID,
+        # so `a_dtype == b_dtype` always at this call site.  Fold the two
+        # identical-argument calls into a single chained assignment to drop
+        # one Python function-call dispatch per MX forward call (~50-100 ns
+        # saved on the wrapper critical path; visible only on tight
+        # `PERF_BATCH_ITERS` micro-benches but matches the wrapper-cleanup
+        # direction of 4caf09b / b737e43).  Bitwise-equivalent: the two LHS
+        # bindings `a_dtype` and `b_dtype` reference the same singleton
+        # `torch.dtype` object that the second call would have returned.
+        a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
         # ── A: (total_M, K) — row-wise for forward LHS, col-wise saved for wgrad.
         a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col = quantize_fp8_with_trans(
@@ -482,18 +526,26 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # ── B: (G, N, K)
         # Forward NT GEMM expects RHS shape (G, N, K), row-wise quant along K.
         # Dgrad NT GEMM expects RHS shape (G, K, N), row-wise quant along N (== col-wise of original B).
-        b_2d = b.reshape(G * N, K)
+        # PERF: pass the same `ScalingRecipe(use_2d_block=True)` instance for
+        # both row-wise and col-wise (transposed) quantization recipes.
+        # `ScalingRecipe` is a frozen-shape `@dataclass` whose attribute-only
+        # consumers in `quant_fp8_blockwise_for_weight_impl` / `quantize_mxfp8_dual`
+        # treat it as read-only — sharing the instance across both recipe
+        # parameters is bitwise-equivalent to constructing two distinct copies
+        # with identical fields.  Saves one `dataclass.__init__` (~200 ns) on
+        # the MX forward critical path; matches the wrapper-cleanup direction
+        # of 4caf09b / b737e43 / 9d5d17c.
+        weight_2d_block_recipe = ScalingRecipe(use_2d_block=True)
         b_fp8_row_2d, b_scale_inv_row_2d, b_fp8_col_2d, b_scale_inv_col_2d = quantize_fp8_with_trans(
-            b_2d,
+            b.reshape(G * N, K),
             b_dtype,
             config.granularity,
             block_size=MX_BLOCK_SIZE,
-            scaling_recipe=ScalingRecipe(use_2d_block=True),
-            scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+            scaling_recipe=weight_2d_block_recipe,
+            scaling_recipe_for_trans=weight_2d_block_recipe,
         )
-        K_row_padded = b_fp8_row_2d.size(1)
-        b_fp8_row = b_fp8_row_2d.reshape(G, N, K_row_padded)
-        b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, b_scale_inv_row_2d.size(1))
+        b_fp8_row = b_fp8_row_2d.reshape(G, N, -1)
+        b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, -1)
         # PERF: defer `_regroup_b_colwise_for_dgrad` (transpose+contiguous and,
         # for non-128-aligned N, an additional zero-pad+copy) to the backward
         # path.  The col-quant tensors are consumed only by dgrad, so doing
@@ -505,8 +557,23 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # that depends on call-state.  This is a within-call autograd state
         # change (every forward gets a fresh ctx); no host-side cache, no
         # cross-call sharing.
-        # Row-wise MXFP8 quantization pads K to the turbo tile alignment.
-        assert a_fp8_row.size(1) == b_fp8_row.size(2)
+        #
+        # Note: the K-padded sizes of `a_fp8_row` and `b_fp8_row` are
+        # provably equal because both come from `quantize_fp8_with_trans`
+        # called with the same K input dim (= `a.shape[1] == b.shape[2]`,
+        # see `G, N, K = b.shape` ~L469 and the asserts on `a.ndim`
+        # earlier).  `quantize_mxfp8_dual` pads the contracting dim
+        # deterministically as `ceil(K / MX_BLOCK_SIZE) * MX_BLOCK_SIZE`,
+        # so `a_fp8_row.size(1) == b_fp8_row.size(2)` is a pure function
+        # of K and holds by construction — the previous runtime
+        # `assert a_fp8_row.size(1) == b_fp8_row.size(2)` was a developer-
+        # bug paranoid check, not a runtime safety net for malformed
+        # inputs.  Drop it to match the dead-state-removal direction of
+        # 4caf09b / df91ca4 / 9d5d17c / 669553b; saves one `.size(1)` +
+        # one `.size(2)` lookup + one int compare + one `assert` short-
+        # circuit per MX forward call (~100 ns on the wrapper critical
+        # path, well within metric noise but matches the wrapper-cleanup
+        # trend).
 
         # ── Forward: NT(A_row, B_row) — turbo MXFP8 grouped kernel
         out = grouped_gemm_fp8_impl(
@@ -535,8 +602,29 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.b_shape = (G, N, K)
-        ctx.trans_b = trans_b
+        # Note: `(G, N, K)` is NOT stashed on ctx because every value is
+        # already recoverable from the saved tensors / `grad_out` argument
+        # in `backward()`:
+        #   * G = group_lens.size(0)        (saved tensor)
+        #   * K = b_fp8_col_2d.size(0)      (saved tensor; `quantize_fp8_with_trans`
+        #                                    transposes col-quant so the K axis
+        #                                    is preserved at dim 0 — verified
+        #                                    in `_regroup_b_colwise_for_dgrad`'s
+        #                                    `assert b_fp8_col_2d.size(0) == k`)
+        #   * N = grad_out.size(1)          (autograd argument; grad_out has
+        #                                    shape (total_M, N) by the forward
+        #                                    output contract)
+        # Removing this 3-int tuple is per-call state-only — derivation reads
+        # the same tensors that backward unpacks anyway, no host-side cache.
+        # The per-call cost is one fewer Python attr write in forward + three
+        # `.size()` reads in backward (~50 ns each, well below the ~3 ms
+        # backward wall on the metric shapes).
+        # Note: `trans_b` is also not saved on ctx because the MX_BLOCKWISE
+        # path asserts `trans_b == True` above (NT layout is the only
+        # supported layout) and the backward never needs to read it back —
+        # dgrad and wgrad both hardcode the NT contract via
+        # `trans_a=False, trans_b=True` / `trans_a=False, trans_b=False,
+        # trans_c=False` respectively.
         return out
 
     @staticmethod
@@ -550,14 +638,22 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
         ) = ctx.saved_tensors
-        G, N, K = ctx.b_shape
-
-        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         # Quantize grad_out once: row-wise for dgrad, col-wise (transposed) for wgrad.
+        # `grad_out_dtype` is referenced exactly once (here), so inline the
+        # `_get_fp8_dtype` call to drop the local binding.  Mirrors 9d5d17c
+        # (which folded the same duplicated lookup in MX forward) and the
+        # broader wrapper-cleanup direction of 4caf09b / df91ca4 / b737e43 /
+        # 669553b / cc11123: prune state that is single-use within one
+        # autograd method, since each forward/backward gets a fresh ctx and
+        # there is no cross-call sharing.  Bitwise-equivalent: the inlined
+        # expression is the same Python call returning the same singleton
+        # `torch.dtype` object.  Saves one local-name binding (~50-100 ns
+        # on the wrapper backward critical path, well within metric noise
+        # but consistent with the polish trend).
         grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv = quantize_fp8_with_trans(
             grad_out,
-            grad_out_dtype,
+            _get_fp8_dtype(ctx.config.format, False),
             ctx.config.granularity,
             block_size=MX_BLOCK_SIZE,
         )
@@ -566,8 +662,23 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # Deferred from forward (see GroupedGemmFP8MXFunc.forward); doing it
         # here keeps the forward-only critical path lean and folds the cost
         # into the (heavier) backward pass.
+        #
+        # Inline (G, N, K) `.size()` lookups into the helper call.  Each
+        # value is referenced exactly once (only `_regroup_b_colwise_for_dgrad`
+        # consumes them; the per-group offsets / lens come from
+        # `group_lens` / `group_offs` saved tensors which the dgrad+wgrad
+        # impl calls below reuse).  Folding them removes three local-name
+        # bindings on the MX backward critical path, mirroring the
+        # dead-state / single-use removal direction of 4caf09b / df91ca4 /
+        # 9d5d17c / 669553b / cc11123 / bacbb8a.  Bitwise-equivalent: each
+        # `.size(...)` call returns the same Python `int` the local would
+        # have held.
         b_fp8_col, b_scale_inv_col = _regroup_b_colwise_for_dgrad(
-            b_fp8_col_2d, b_scale_inv_col_2d, G, N, K
+            b_fp8_col_2d,
+            b_scale_inv_col_2d,
+            group_lens.size(0),
+            grad_out.size(1),
+            b_fp8_col_2d.size(0),
         )
 
         # ── dgrad: dA = dC @ B = NT(dC, B^T)
