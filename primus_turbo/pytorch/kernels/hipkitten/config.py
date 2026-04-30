@@ -486,6 +486,54 @@ def select_default_config(
     if layout == "rcr":
         tiles_m = m // 256
         tiles_n = n // 256
+        # Round-61 rule. Unpadded gpt_oss FP8 RCR — small-batch (B=4)
+        # GateUP family (per-launch tile geometry m_per_group ∈
+        # {2048, 4096}, n=5760, k=2880). The persistent grouped grid for
+        # B=4 sees only 4× as many tiles vs the per-group view, which
+        # makes the persistent scheduler much more sensitive to the
+        # ``group_m`` tile-batching factor than the B=32 sibling (where
+        # the grid already saturates the GPU and ``group_m`` only
+        # re-orders within each XCD slice).
+        #
+        # 7-candidate sweep ``group_m ∈ {1, 2, 4, 8, 16, 24, 32}`` over
+        # the 4 metric gpt_oss FP8 shapes (200-iter × 3-repeat median at
+        # /tmp/sweep_fp8_gptoss_gm_wide.py archived in the round-61
+        # commit message). Kernel TF (higher is better):
+        #
+        #   shape              gm=1   gm=2*  gm=4   gm=8   gm=16  gm=24  gm=32
+        #   GateUP-B4-M2048    1160   1192   1182   1178   1182   1123   1122
+        #   GateUP-B4-M4096    1065   1070   1069   1049   1055   1039   1039
+        #   GateUP-B32-M2048   1067   1089   1098*  1084   1084   1061   1061
+        #   GateUP-B32-M4096   1105   1117   1116*  1101   1092   1088   1088
+        #
+        # gm=2 wins B=4 GateUP shapes (m_total ∈ {8192, 16384}); B=32
+        # GateUP (m_total ≥ 65536) prefers default gm=4. Down family is
+        # flat across {1, 2, 4, 8} (no rule needed).
+        #
+        # Net delta over default gm=4: GateUP-B4-M2048 +0.85pp, the only
+        # case with a clear margin (others within ±0.1pp). Bit-identical
+        # output (``group_m`` is a pure scheduling knob); SNR unchanged.
+        #
+        # Rule scope check: ``tiles_n == 22`` (N=5760) is unique to
+        # gpt_oss-GateUP. ``k == 2880`` is unique to gpt_oss in the FP8
+        # metric. ``m_total <= 16384`` selects B ∈ {4} (B=4 M=2048
+        # gives 8192, B=4 M=4096 gives 16384; B=32 M=2048 gives 65536,
+        # which is excluded). The default gm=4 path is preserved for
+        # B=32, where the wider grid already absorbs the scheduling
+        # overhead.
+        if (
+            tiles_n == 22
+            and tiles_m in (8, 16)
+            and k == 2880
+            and m_total is not None
+            and m_total <= 16384
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=2,
+                num_xcds=None,
+                kernel=None,
+            )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
             # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
             # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
