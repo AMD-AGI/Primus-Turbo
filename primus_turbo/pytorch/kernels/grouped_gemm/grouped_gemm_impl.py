@@ -266,7 +266,25 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # body's K-tail-fuse hard constraint is "K=[fast_k, k) accumulate
         # in main kernel epilog"; we still hit that constraint via the
         # working RCR fuse, just on transposed B.
-        if not trans_b:
+        # Round-19 H4 gate: skip transpose when both K_RRR and N_RRR are
+        # already aligned to the BF16 main-kernel block sizes (K_BLOCK=64
+        # for K-axis, BLOCK_SIZE=256 for N-axis — kernel_bf16_dynamic.cpp:5).
+        # When fully aligned, the BF16 RRR ``dispatch_grouped_*`` path runs
+        # the main kernel ONLY (no external grouped_ktail/ntail/scalar tail
+        # launches because need_tail_run = false). Forcing transpose there
+        # paid ~b.numel() * 2 bytes rd+wr without saving any external
+        # launch — pure regression.
+        #
+        # gpt_oss-Down (K_RRR=2880 misaligned) and gpt_oss-GateUP
+        # (N_RRR=2880 misaligned) still trigger the reroute and continue
+        # to use the working RCR fuse path. DSV3 cases (K_RRR ∈ {4096,
+        # 7168} and N_RRR ∈ {2048, 4096, 7168} all 64/256-multiples) skip
+        # the transpose and run native RRR — saving ~b.numel() * 2 bytes
+        # per dA call.
+        K_BLOCK = 64        # BF16 main-kernel K_BLOCK
+        BLOCK_SIZE = 256    # BF16 main-kernel N BLOCK_SIZE
+        if not trans_b and ((a.shape[1] % K_BLOCK) != 0
+                            or (b.shape[-1] % BLOCK_SIZE) != 0):
             b = b.transpose(-2, -1).contiguous()
             trans_b = True
         bs = b.shape[0]
