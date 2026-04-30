@@ -470,11 +470,19 @@ def _grouped_variable_k_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
     """Persistent grouped variable-K GEMM kernel for backward pass (CPU-sync-free).
 
     All groups share the same output dims (OUT_M × OUT_N), only the inner product
     dimension M_g varies per group. Group→tile mapping is simple div/mod.
+
+    When ``BETA_IS_ONE=True`` the kernel computes ``C = C + LHS_g^T @ RHS_g`` (i.e.
+    a fused gradient accumulation D += A^T @ B). This implements the
+    ``D = beta·D + alpha·A·B`` pattern with beta=1 by reading the previous tile
+    of ``C`` once per output tile and folding it into the FP32 accumulator before
+    the dtype cast / store. This is the primitive used to fuse the per-layer MoE
+    weight-grad accumulation into the wgrad GEMM.
     """
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -577,13 +585,22 @@ def _grouped_variable_k_gemm_kernel(
         # ── Apply scaling and store ──
         if IS_FP8:
             acc *= scale
-        c = acc.to(C.type.element_ty)
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         # Cast group_idx to int64 to prevent overflow in C group offset
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if BETA_IS_ONE:
+            # Fused grad-accumulation: read previous main_grad tile, fold into
+            # FP32 accumulator, then cast & store. One extra HBM read per tile;
+            # the tile is going to be written anyway so this is ~free in
+            # bandwidth-limited regime, and removes the standalone
+            # ``aten::add_(main_grad, wgrad)`` kernel that AccumulateGrad would
+            # otherwise schedule.
+            prev = tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+            acc = acc + prev
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
 

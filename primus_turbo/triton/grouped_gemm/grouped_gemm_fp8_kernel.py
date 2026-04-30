@@ -610,10 +610,12 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     rhs_scale: torch.Tensor,
     group_offs: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+    beta: float = 0.0,
 ) -> torch.Tensor:
     """Variable-K grouped FP8 GEMM (backward, per-tensor scaling) using Triton.
 
-    Computes C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]] * lhs_scale * rhs_scale
+    Computes C[g] = beta * C[g] + lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]] * lhs_scale * rhs_scale
     Output: [G, OUT_M, OUT_N].
 
     Args:
@@ -622,10 +624,22 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         lhs_scale: Per-tensor scale for LHS, scalar fp32.
         rhs_scale: Per-tensor scale for RHS, scalar fp32.
         group_offs: [G+1] int64 prefix sum.
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default bfloat16). Ignored when ``out`` is provided
+            (the kernel writes whatever dtype ``out`` has).
+        out: Optional pre-allocated output buffer of shape ``(G, OUT_M, OUT_N)``.
+            When provided, the kernel writes (or accumulates, see ``beta``)
+            directly into this buffer instead of allocating a new one. Strides
+            are read from the tensor, so non-contiguous views (e.g. a
+            ``param.main_grad.view_as(weight_view)``) are supported.
+        beta: Either ``0.0`` (overwrite, default) or ``1.0`` (fused
+            accumulation: ``out += A^T @ B``). Only those two values are
+            supported. With ``beta=1.0`` and ``out=param.main_grad.view_as(...)``,
+            this implements the ``D = beta·D + alpha·A·B`` fused-grad-accum
+            pattern, removing the standalone ``aten::add_(main_grad, wgrad)``
+            kernel that AccumulateGrad would otherwise schedule per layer.
 
     Returns:
-        [G, OUT_M, OUT_N] output.
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` if it was provided).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
@@ -633,7 +647,16 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    else:
+        assert tuple(out.shape) == (G, OUT_M, OUT_N), (
+            f"out shape {tuple(out.shape)} must equal (G, OUT_M, OUT_N) = {(G, OUT_M, OUT_N)}"
+        )
+        assert out.device == lhs.device, "out must be on same device as lhs"
+    BETA_IS_ONE = beta == 1.0
     num_sms = _get_num_cus()
 
     if _is_gfx950():
@@ -670,6 +693,7 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         IS_FP8=True,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=BETA_IS_ONE,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,

@@ -3,6 +3,9 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import os
+from functools import reduce
+from operator import mul
 from typing import Union
 
 import torch
@@ -30,6 +33,88 @@ from primus_turbo.pytorch.ops.quantization import quantize_fp8
 __all__ = [
     "grouped_gemm_fp8",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fused MoE wgrad accumulation helpers
+#
+# When ``PRIMUS_TURBO_FUSED_WGRAD_ACCUM=1`` (default) and the underlying weight
+# parameter exposes a ``main_grad`` buffer (Megatron-LM style), the backward of
+# ``GroupedGemmFP8TensorFunc`` writes the wgrad directly into ``main_grad`` via
+# the modified Triton variable-K kernel (β=1 fused accumulation) and returns a
+# *dummy* ``grad_weight`` tensor for the weight slot, mirroring the protocol
+# used by Megatron's own ``LinearWithGradAccumulationAndAsyncCommunication``:
+#
+#   1. Set ``param.grad_added_to_main_grad = True`` so the DDP post-hook
+#      (``_make_backward_post_hook``) skips its ``param.main_grad.add_(param.grad)``
+#      step — the wgrad has already been folded into main_grad by the GEMM.
+#   2. Return an uninitialized ``torch.empty(b.shape, dtype=out_dtype)`` for
+#      the weight slot. AccumulateGrad assigns this to ``param.grad`` (no
+#      kernel work because ``param.grad`` was reset to None by the previous
+#      step's hook), satisfying the ``param.grad is not None`` assertion in
+#      the DDP hook when ``overlap_grad_reduce=True``.
+#   3. The dummy tensor's data is never read by Megatron (the conditional in
+#      the post-hook short-circuits on ``grad_added_to_main_grad``); the hook
+#      then resets ``param.grad = None`` and triggers the bucket reduction.
+#
+# The expensive ``aten::add_(main_grad, wgrad)`` kernel that AccumulateGrad
+# would otherwise schedule per MoE expert weight per layer per step is gone —
+# the accumulation is paid for inside the wgrad GEMM tile loop at near-zero
+# extra cost (one HBM read per output tile that was going to be written
+# anyway).
+# ──────────────────────────────────────────────────────────────────────────────
+
+_FUSED_WGRAD_ENV = "PRIMUS_TURBO_FUSED_WGRAD_ACCUM"
+
+
+def _fused_wgrad_enabled() -> bool:
+    return os.environ.get(_FUSED_WGRAD_ENV, "1") == "1"
+
+
+def _resolve_main_grad_view(weight_param, target_shape):
+    """If ``weight_param`` exposes a ``main_grad`` buffer that can be reshaped
+    to ``target_shape``, return that reshaped view; else None.
+
+    Megatron-LM allocates ``param.main_grad`` with the same storage layout as
+    the parameter itself, so a contiguous reshape from main_grad's native 2D
+    shape to the 3D wgrad-output layout is always valid for the GroupedMLP
+    expert weights (b = weight.view(num_experts, hidden, -1)).
+    """
+    if weight_param is None:
+        return None
+    main_grad = getattr(weight_param, "main_grad", None)
+    if main_grad is None:
+        return None
+    if not main_grad.is_cuda:
+        return None
+    expected_numel = reduce(mul, target_shape, 1)
+    if main_grad.numel() != expected_numel:
+        return None
+    if not main_grad.is_contiguous():
+        # Non-contig main_grad: skip the fused path; the kernel can be
+        # extended to support it but Megatron-LM main_grad buffers are
+        # always contiguous so we don't bother.
+        return None
+    try:
+        return main_grad.view(target_shape)
+    except RuntimeError:
+        return None
+
+
+# Process-wide cache of dummy wgrad buffers, keyed by (shape, dtype, device).
+# Mirrors Transformer Engine's ``get_dummy_wgrad`` helper: a single buffer is
+# reused across layers and microbatches so we don't pay the per-call
+# ``torch.empty`` allocation cost (~0.5 GB for the gate_up wgrad shape).
+_DUMMY_WGRAD_CACHE: dict = {}
+
+
+def _get_dummy_wgrad(shape, dtype, device):
+    key = (tuple(shape), dtype, device)
+    buf = _DUMMY_WGRAD_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+        _DUMMY_WGRAD_CACHE[key] = buf
+    return buf
 
 
 def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
@@ -344,6 +429,14 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = a.dtype
         ctx.num_cu = num_cu
+
+        # Stash the underlying weight parameter and the wgrad-output shape so
+        # the backward can fuse the wgrad accumulation directly into
+        # ``param.main_grad`` (see ``_resolve_main_grad_view`` above). We
+        # store the parameter (not the view) to avoid holding a redundant
+        # reference to the autograd-leaf view tensor.
+        ctx.weight_param = b._base if b._base is not None else b
+        ctx.weight_view_shape = tuple(b.shape)
         return out
 
     @staticmethod
@@ -369,7 +462,73 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        # For grad_b
+        # ── Fused wgrad accumulation path ─────────────────────────────────
+        # If the weight has a ``main_grad`` buffer (Megatron-LM main-grad
+        # accumulation), call the modified Triton variable-K kernel directly
+        # with ``out=main_grad_view`` and ``beta=1.0``. The kernel folds the
+        # previous main_grad value into the FP32 accumulator before the dtype
+        # cast / store, so the standalone ``aten::add_(main_grad, wgrad)`` that
+        # AccumulateGrad would otherwise schedule disappears entirely.
+        #
+        # We then return a dummy ``grad_weight`` (uninitialized memory) and
+        # set ``weight_param.grad_added_to_main_grad = True``. This is the
+        # exact contract Megatron's
+        # ``LinearWithGradAccumulationAndAsyncCommunication`` uses with the
+        # ``DistributedDataParallel`` backward post-hook: the post-hook checks
+        # ``grad_added_to_main_grad`` and skips its ``param.main_grad.add_(
+        # param.grad)`` step when set, while still satisfying the
+        # ``param.grad is not None`` assertion under
+        # ``overlap_grad_reduce=True``.
+        if _fused_wgrad_enabled():
+            weight_param = getattr(ctx, "weight_param", None)
+            view_shape = getattr(ctx, "weight_view_shape", None)
+            if weight_param is not None and view_shape is not None:
+                main_grad_view = _resolve_main_grad_view(weight_param, view_shape)
+                if main_grad_view is not None:
+                    # Replicate the dispatcher's trans_c-based operand swap.
+                    # ``ctx.trans_b == False`` (Megatron call site) ⇒
+                    # ``trans_c == False`` ⇒ lhs=a_fp8, rhs=grad_out_fp8.
+                    if ctx.trans_b:
+                        lhs_fp8, rhs_fp8 = grad_out_fp8, a_fp8
+                        lhs_scale, rhs_scale = grad_out_scale_inv, a_scale_inv
+                    else:
+                        lhs_fp8, rhs_fp8 = a_fp8, grad_out_fp8
+                        lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
+                    # Local import to avoid a top-level dependency on the
+                    # Triton kernel module (matches the pattern used in
+                    # ``grouped_gemm_fp8_impl.py``).
+                    from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+                        grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+                    )
+                    grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
+                        lhs_fp8,
+                        rhs_fp8,
+                        lhs_scale,
+                        rhs_scale,
+                        group_offs,
+                        out_dtype=ctx.out_dtype,
+                        out=main_grad_view,
+                        beta=1.0,
+                    )
+                    # Tell Megatron's DDP post-hook that ``main_grad`` has
+                    # already absorbed this step's wgrad — it must NOT re-add
+                    # ``param.grad`` (the dummy tensor below).
+                    weight_param.grad_added_to_main_grad = True
+                    # Dummy grad: shape == ``b.shape`` (3D wgrad layout) so
+                    # autograd's ViewBackward chain reshapes it to
+                    # ``param.shape`` cleanly before AccumulateGrad assigns
+                    # it to ``param.grad``. The data is never read by the
+                    # post-hook (the ``not grad_added_to_main_grad`` branch
+                    # short-circuits). One shared buffer per (shape, dtype,
+                    # device) is reused across all layers / microbatches.
+                    grad_b_dummy = _get_dummy_wgrad(
+                        view_shape,
+                        dtype=ctx.out_dtype,
+                        device=main_grad_view.device,
+                    )
+                    return grad_a, grad_b_dummy, None, None, None, None, None
+
+        # ── Fallback: original out-of-place wgrad path ────────────────────
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8,
             grad_out_fp8,
