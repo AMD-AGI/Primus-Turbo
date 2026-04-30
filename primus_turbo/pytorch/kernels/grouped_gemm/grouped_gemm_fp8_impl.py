@@ -340,15 +340,24 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # K-tail correction in the same kernel. Default ``0`` keeps the
         # legacy scalar-tail path (binding signature is back-compat via
         # pybind11 default arg). Mirror BF16 round-9 wiring.
+        # Round-67: optional ``num_xcds`` wired through from the
+        # HipKittenConfig. The FP8 grouped binding's pybind11 signature
+        # has ``num_xcds=0`` as default; passing 0 makes the kernel
+        # fall back to its built-in ``BLOCK_SWIZZLE_NUM_XCDS=8``.
+        # The Python-side rule lives in
+        # ``hipkitten/config.py::select_default_config`` and only
+        # overrides for shapes where a non-default xcds is empirically
+        # better (mirrors BF16 grouped's tunable num_xcds path).
+        xcds_arg = cfg.num_xcds if cfg.num_xcds is not None else 0
         if grouped_dscale_fn is not None and sa_d is not None and sb_d is not None:
             grouped_dscale_fn(
                 a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m,
-                m_per_group=avg_m,
+                m_per_group=avg_m, num_xcds=xcds_arg,
             )
         else:
             grouped_fn(
                 a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m,
-                m_per_group=avg_m,
+                m_per_group=avg_m, num_xcds=xcds_arg,
             )
         return out
 

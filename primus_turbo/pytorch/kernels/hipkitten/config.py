@@ -577,10 +577,30 @@ def select_default_config(
             # tiles_n ∈ {12, 23}, neither matches. The k<=4096 bound
             # excludes the DSV3-GateUP (K=7168) cousin (already best at
             # default gm=4 per the same wide sweep).
+            #
+            # Round-67: ``num_xcds=4`` for DSV3-Down family. Round-67
+            # added a tunable ``num_xcds`` plumb to the FP8 grouped
+            # binding (mirrors BF16 grouped's existing knob); the
+            # default xcds=8 is preserved for DSV3-GateUP / gpt_oss /
+            # all unmatched shapes (cfg.num_xcds=None → 0 to binding
+            # → kernel falls back to BLOCK_SWIZZLE_NUM_XCDS=8).
+            #
+            # 250-iter × 3-repeat median A/B at
+            # /tmp/sweep_fp8_xcds_round67.py (xcds=8 baseline vs xcds=4
+            # rebuild):
+            #   shape           xcds=8    xcds=4   Δ
+            #   Down-B16-M2048  1730.5    1744.4   +13.9 TF (+0.80pp)
+            #   Down-B16-M4096  1759.2    1774.6   +15.4 TF (+0.88pp)
+            #   Down-B32-M2048  1741.5    1759.7   +18.2 TF (+1.04pp)
+            #   Down-B32-M4096  1776.8    1800.8   +24.0 TF (+1.36pp)
+            # Net: +71.5 TF total, +1.02pp avg. The same sweep showed
+            # DSV3-GateUP (tiles_n=16, k=7168) PREFERS xcds=8 (-94 TF
+            # at xcds=4 on B16-M4096) so the rule is gated to
+            # tiles_n==28 only.
             return HipKittenConfig(
                 layout=layout,
                 group_m=32,
-                num_xcds=None,
+                num_xcds=4,
                 kernel=None,
             )
         if tiles_m == 16 and 64 <= tiles_n <= 96 and k <= 4096:
