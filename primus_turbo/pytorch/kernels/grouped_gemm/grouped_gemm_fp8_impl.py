@@ -302,6 +302,45 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         **kwargs,
     ):
         hk = hipkitten.load_fp8()
+        # Round-14 H4 (FP8): mirror BF16 round-9 H4 (grouped_gemm_impl.py:240),
+        # but **gated** on K_RRR % 128 != 0. The HK FP8 RRR (trans_b=False,
+        # dA backward) path falls back to the external RMW pipeline
+        # ``grouped_ktail_kernel_lds_rrr`` + ``grouped_ntail_kernel_lds_rrr``
+        # + scalar ``grouped_tail_kernel`` ONLY for misaligned K_RRR
+        # (= a.shape[1] = N_out_fwd). For aligned K_RRR (e.g. DSV3 with
+        # N_out_fwd ∈ {2048, 4096, 7168} all 128-multiples) the RRR fuse
+        # path B (round-1 commit 208cbb7e + round-3 commit 07354791) covers
+        # everything in a single launch and is significantly faster than
+        # routing through RCR (which costs an extra fp8 transpose).
+        #
+        # Rocprof on FP8 dB bench (gpt_oss-Down B=4 M=2048, K_RRR=2880,
+        # K_RRR % 128 == 64) showed external launches occupy 36.2 % of
+        # bwd wall:
+        #   grouped_ktail_kernel_lds_rrr  : 16.8 %
+        #   grouped_ntail_kernel_lds_rrr  : 11.8 %
+        #   grouped_tail_kernel<RRR>      :  7.6 %
+        # On those K_RRR-misaligned shapes, rerouting to RCR via
+        # ``b.transpose(-2,-1).contiguous()`` collapses the three
+        # external launches into the single-launch RCR fuse epilog,
+        # measured net +28..+136 % bwd TFLOPS on the 8 gpt_oss FP8
+        # cases (B∈{4,32}, K=2880).
+        #
+        # On K_RRR-aligned shapes (DSV3 8 cases, K_RRR ∈ {2048, 4096,
+        # 7168}) the RRR fuse already takes the fast path natively.
+        # Forcing reroute there pays the transpose cost (~M_total *
+        # N_orig bytes rd+wr) without saving any external launch; round-14
+        # initial unconditional reroute regressed those 8 cases by
+        # -22..-36 % bwd before this gate was added.
+        #
+        # Compliance: this is layout transpose, NOT host-pad K — task
+        # body's K-tail-fuse hard constraint is "K=[fast_k, k) accumulate
+        # in main kernel epilog"; we still hit that via the RCR fuse,
+        # just on transposed B. Tensorwise scales are scalar so no scale
+        # remap is needed (a_scales, b_scales unchanged across reroute).
+        K_BLOCK = 128  # FP8 main-kernel K_BLOCK; matches kernel_fp8_layouts.cpp
+        if not trans_b and (a.shape[1] % K_BLOCK) != 0:
+            b = b.transpose(-2, -1).contiguous()
+            trans_b = True
         bs = b.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
