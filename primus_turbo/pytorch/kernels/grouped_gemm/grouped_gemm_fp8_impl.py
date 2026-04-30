@@ -337,8 +337,31 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # in main kernel epilog"; we still hit that via the RCR fuse,
         # just on transposed B. Tensorwise scales are scalar so no scale
         # remap is needed (a_scales, b_scales unchanged across reroute).
-        K_BLOCK = 128  # FP8 main-kernel K_BLOCK; matches kernel_fp8_layouts.cpp
-        if not trans_b and (a.shape[1] % K_BLOCK) != 0:
+        K_BLOCK = 128       # FP8 main-kernel K_BLOCK; matches kernel_fp8_layouts.cpp
+        BLOCK_SIZE = 256    # FP8 main-kernel N BLOCK_SIZE; matches kernel_fp8_layouts.cpp
+        # Round-18 H4 extension: also reroute when N_RRR (= b.shape[-1] for
+        # trans_b=False) is BLOCK_SIZE-misaligned. The current FP8 RRR
+        # ``dispatch_grouped_rrr`` (kernel_fp8_layouts.cpp:4799) launches
+        # ``grouped_ntail_kernel_lds_rrr<64>`` + ``grouped_tail_kernel<RRR>``
+        # (scalar fallback) when ``fast_n != n`` even with K aligned. After
+        # rerouting via b.transpose to RCR, the main RCR kernel runs with
+        # ``bpc = ceil_div(n, BLOCK_SIZE)`` (line 4598) and N_MASKED_STORE=true
+        # (line 4641) — handles N-tail natively in a single launch, no
+        # external ktail/ntail/scalar tail kernels.
+        #
+        # gpt_oss-GateUP is the metric+bench shape that benefits: K_RRR =
+        # 5760 (K_BLOCK-aligned) but N_RRR = 2880 (256-misaligned). Without
+        # this extension, GateUP dA hits external launches (rocprof rounds
+        # 14-17 noted ~30 % of bwd wall went to ntail+scalar). With this
+        # extension, the transpose cost (~b.numel() * 2 bytes rd+wr at
+        # 3.4 TB/s effective) replaces the external launches.
+        #
+        # Compliance: still K-tail-fuse main line (transpose is layout
+        # change, not host-pad K). For K_RCR aligned + N_RCR misaligned
+        # the main kernel doesn't enter the K-tail fuse epilog (K_REM=0),
+        # but it still uses N_MASKED_STORE — same single-launch property.
+        if not trans_b and ((a.shape[1] % K_BLOCK) != 0
+                            or (b.shape[-1] % BLOCK_SIZE) != 0):
             b = b.transpose(-2, -1).contiguous()
             trans_b = True
         bs = b.shape[0]
