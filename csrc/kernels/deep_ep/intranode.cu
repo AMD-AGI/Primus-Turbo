@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales,
                       channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
-    BAR_SYNC_INIT();
+    BARRIER_SYNC_INIT();
 
     if (is_sender) {
         // Workers for sending
@@ -361,7 +361,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            BAR_SYNC(__threadfence(), responsible_rank, num_threads_per_rank);
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       cached_channel_tail_idx);
@@ -429,7 +429,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            BAR_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -486,7 +486,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            BAR_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -637,7 +637,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto          bias_1_int4   = reinterpret_cast<const int4 *>(bias_1);
     auto          recv_int4     = reinterpret_cast<int4 *>(recv_x);
 
-    BAR_SYNC_INIT();
+    BARRIER_SYNC_INIT();
 
     if (is_sender) {
         // Workers for sending
@@ -740,7 +740,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            BAR_SYNC(__threadfence(), send_rank_id, num_threads_per_rank);
+            BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       current_channel_tail_idx);

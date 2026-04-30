@@ -12,14 +12,14 @@
 
 #define NUM_MAX_BARRIERS 16
 
-#define BAR_SYNC_INIT()                                                                            \
+#define BARRIER_SYNC_INIT()                                                                        \
     __shared__ int ___bar_sync_wg_state[NUM_MAX_BARRIERS];                                         \
     if (threadIdx.x < NUM_MAX_BARRIERS)                                                            \
         ___bar_sync_wg_state[threadIdx.x] = 0;                                                     \
     int ___bar_sync_wg_expected_reg = 0;                                                           \
     __syncthreads();
 
-#define BAR_SYNC(__fence, ___bar_id, ___num_threads_per_group)                                     \
+#define BARRIER_SYNC(__fence, ___bar_id, ___num_threads_per_group)                                 \
     {                                                                                              \
         auto ___num_wave_per_group = ___num_threads_per_group / kWarpSize;                         \
         ___bar_sync_wg_expected_reg += ___num_wave_per_group;                                      \
@@ -29,7 +29,7 @@
                                    __HIP_MEMORY_SCOPE_WORKGROUP);                                  \
             while (__hip_atomic_load(___bar_sync_wg_state + ___bar_id, __ATOMIC_RELAXED,           \
                                      __HIP_MEMORY_SCOPE_WORKGROUP) < ___bar_sync_wg_expected_reg)  \
-                ;                                                                                  \
+                __builtin_amdgcn_s_sleep(1);                                                       \
         }                                                                                          \
         __syncwarp();                                                                              \
     }
