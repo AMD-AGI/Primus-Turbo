@@ -521,9 +521,32 @@ def select_default_config(
         # which is excluded). The default gm=4 path is preserved for
         # B=32, where the wider grid already absorbs the scheduling
         # overhead.
+        #
+        # Round-68: ``num_xcds=4`` ONLY for the M_per_group=2048 sub-rule
+        # (tiles_m == 8). 800-iter × 5-repeat median A/B/C/D at
+        # /tmp/verify_gpt_oss_xcds_round68.py:
+        #   shape                      xcds=8     xcds=2     xcds=4     xcds=16
+        #   gpt_oss-GateUP-B4-M2048    1167.5     1172.7     1183.8 *   1168.3   (x=4 +16.4)
+        #   gpt_oss-GateUP-B4-M4096    1064.9 *   1063.3     1049.0     1064.9   (x=8 best, x=4 -15.9)
+        # Setting xcds=4 unconditionally would gain +16.4 TF on B4-M2048
+        # but lose -15.9 TF on B4-M4096. Splitting by tiles_m captures
+        # the win cleanly (+1.40pp on B4-M2048, no change on B4-M4096).
         if (
             tiles_n == 22
-            and tiles_m in (8, 16)
+            and tiles_m == 8
+            and k == 2880
+            and m_total is not None
+            and m_total <= 16384
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=2,
+                num_xcds=4,
+                kernel=None,
+            )
+        if (
+            tiles_n == 22
+            and tiles_m == 16
             and k == 2880
             and m_total is not None
             and m_total <= 16384
@@ -585,22 +608,29 @@ def select_default_config(
             # all unmatched shapes (cfg.num_xcds=None → 0 to binding
             # → kernel falls back to BLOCK_SWIZZLE_NUM_XCDS=8).
             #
-            # 250-iter × 3-repeat median A/B at
-            # /tmp/sweep_fp8_xcds_round67.py (xcds=8 baseline vs xcds=4
-            # rebuild):
-            #   shape           xcds=8    xcds=4   Δ
-            #   Down-B16-M2048  1730.5    1744.4   +13.9 TF (+0.80pp)
-            #   Down-B16-M4096  1759.2    1774.6   +15.4 TF (+0.88pp)
-            #   Down-B32-M2048  1741.5    1759.7   +18.2 TF (+1.04pp)
-            #   Down-B32-M4096  1776.8    1800.8   +24.0 TF (+1.36pp)
-            # Net: +71.5 TF total, +1.02pp avg. The same sweep showed
-            # DSV3-GateUP (tiles_n=16, k=7168) PREFERS xcds=8 (-94 TF
-            # at xcds=4 on B16-M4096) so the rule is gated to
-            # tiles_n==28 only.
+            # Round-68 widened the search from {8,4} to {8,2,4,16}.
+            # 800-iter × 5-repeat median (/tmp/verify_dsv3_down_xcds_round68.py)
+            # on all 4 DSV3-Down shapes:
+            #   shape           xcds=8    xcds=2    xcds=4
+            #   Down-B16-M2048  1724.9    1741.2    1729.1   x2 wins +12.1 vs x4
+            #   Down-B16-M4096  1752.1    1773.3    1765.0   x2 wins +8.3  vs x4
+            #   Down-B32-M2048  1741.3    1761.1    1755.1   x2 wins +6.0  vs x4
+            #   Down-B32-M4096  1774.8    1802.2    1796.2   x2 wins +6.0  vs x4
+            # xcds=2 dominates xcds=4 on all 4 shapes (+8.1 TF avg,
+            # +0.46pp avg). Cumulative gain over the original xcds=8:
+            #   B16-M2048 +16.3 TF (+0.95pp), B16-M4096 +21.2 TF (+1.21pp),
+            #   B32-M2048 +19.8 TF (+1.14pp), B32-M4096 +27.4 TF (+1.54pp).
+            # Same sweep at xcds=16 shows it never beats xcds=2 (always
+            # ≤ xcds=8 on Down family), confirming xcds=2 is the optimum
+            # in the DSV3-Down N=7168/K=2048 regime — small XCD-swizzle
+            # group fits the ``tiles_n=28 × tiles_m_per_group`` count
+            # pattern best (28 N-tiles × 8 or 16 M-tiles per group ≈
+            # 224 or 448 tiles per group, divisible by 2 with no
+            # remainder, so xcds=2 partitions cleanly).
             return HipKittenConfig(
                 layout=layout,
                 group_m=32,
-                num_xcds=4,
+                num_xcds=2,
                 kernel=None,
             )
         if tiles_m == 16 and 64 <= tiles_n <= 96 and k <= 4096:
