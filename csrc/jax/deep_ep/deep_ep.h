@@ -34,7 +34,9 @@ public:
 
     // Synchronize buffer pointers using IPC handles gathered from all ranks.
     // Each element is the raw bytes of a hipIpcMemHandle_t (size HIP_IPC_HANDLE_SIZE).
-    void SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytearray>> &all_handles);
+    void SyncFromIPCHandles(
+        const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+        const std::optional<pybind11::bytes>                  &root_unique_id_opt = std::nullopt);
 
     int64_t num_nvl_bytes() const { return num_nvl_bytes_; }
     int64_t num_rdma_bytes() const { return num_rdma_bytes_; }
@@ -150,6 +152,7 @@ private:
     // NVSHMEM Buffer
     int64_t num_rdma_bytes_;
     void   *rdma_buffer_ptr_ = nullptr;
+    bool    rocshmem_initialized_ = false;
 
     // Device info and communication
     int device_id_;
@@ -169,7 +172,7 @@ private:
     int  *barrier_signal_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
     int **barrier_signal_ptrs_gpu_                = nullptr;
 
-    // Workspace
+    // Workspace reserved for future low-latency kernels.
     void *workspace_ = nullptr;
 
     // Host-side MoE info
@@ -194,7 +197,8 @@ Buffer *get_per_process_buffer();
 pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t num_nvl_bytes,
                                               int64_t num_rdma_bytes);
 void sync_per_process_buffer(
-    const std::vector<std::optional<pybind11::bytearray>> &all_handles);
+    const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+    const std::optional<pybind11::bytes>                  &root_unique_id_opt = std::nullopt);
 void destroy_per_process_buffer();
 bool is_per_process_buffer_ready();
 int64_t per_process_buffer_nvl_bytes();

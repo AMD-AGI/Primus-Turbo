@@ -15,6 +15,8 @@ from jax.interpreters import xla
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.primitive import ABSTRACT_EVAL_TABLE, IMPL_TABLE, LOWERING_TABLE
 
+NUM_MAX_NVL_PEERS = deep_ep_runtime.NUM_MAX_NVL_PEERS
+
 # ----------------------------------------
 # Step-1: Primitive Define
 # ----------------------------------------
@@ -49,6 +51,13 @@ def _get_recv_x_scale_shape(x_scales: jnp.ndarray, num_worst_tokens: int) -> Sha
             return ShapedArray((num_worst_tokens, x_scales.shape[1]), jnp.float32)
     else:
         return ShapedArray(x_scales.shape, jnp.float32)
+
+
+def _get_num_rdma_ranks(ep_size: int) -> int:
+    assert (
+        ep_size % NUM_MAX_NVL_PEERS == 0
+    ), f"internode ep_size must be divisible by NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got {ep_size}"
+    return ep_size // NUM_MAX_NVL_PEERS
 
 
 def _moe_dispatch_abstract_eval(
@@ -172,7 +181,7 @@ def _moe_internode_dispatch_abstract_eval(
     assert topk_idx.ndim == 2
 
     num_ranks = ep_size
-    num_rdma_ranks = num_ranks // 8
+    num_rdma_ranks = _get_num_rdma_ranks(num_ranks)
     num_tokens, hidden_size = x.shape
     num_topk = topk_idx.shape[1]
     num_channels = num_sms // 2
@@ -195,7 +204,7 @@ def _moe_internode_dispatch_abstract_eval(
         ShapedArray((num_rdma_ranks, num_channels), jnp.int32),           # recv_rdma_channel_prefix_matrix
         ShapedArray((num_ranks, num_channels), jnp.int32),                # recv_gbl_channel_prefix_matrix
         ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),             # send_rdma_head
-        ShapedArray((num_worst_tokens, 8), jnp.int32),                    # send_nvl_head (NUM_MAX_NVL_PEERS)
+        ShapedArray((num_worst_tokens, NUM_MAX_NVL_PEERS), jnp.int32),    # send_nvl_head
     )
 
 
@@ -228,7 +237,7 @@ def _moe_internode_cached_dispatch_abstract_eval(
     assert x.ndim == 2
     num_tokens, hidden_size = x.shape
     num_ranks = ep_size
-    num_rdma_ranks = num_ranks // 8
+    num_rdma_ranks = _get_num_rdma_ranks(num_ranks)
     num_channels = num_sms // 2
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_recv_tokens)
 
@@ -238,7 +247,7 @@ def _moe_internode_cached_dispatch_abstract_eval(
         ShapedArray((num_rdma_ranks, num_channels), jnp.int32),           # recv_rdma_channel_prefix_matrix
         ShapedArray((num_ranks, num_channels), jnp.int32),                # recv_gbl_channel_prefix_matrix
         ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),             # send_rdma_head
-        ShapedArray((num_rdma_recv_tokens, 8), jnp.int32),                # send_nvl_head
+        ShapedArray((num_rdma_recv_tokens, NUM_MAX_NVL_PEERS), jnp.int32), # send_nvl_head
     )
 
 
@@ -265,6 +274,9 @@ LOWERING_TABLE[moe_cached_dispatch_p] = _moe_cached_dispatch_lowering
 
 
 def _moe_internode_dispatch_lowering(ctx, *args, **kwargs):
+    kwargs = dict(kwargs)
+    # Used only by abstract eval to shape recv_src_meta; C++ derives the size itself.
+    kwargs.pop("source_meta_bytes", None)
     return jax.ffi.ffi_lowering("moe_internode_dispatch_per_process")(ctx, *args, **kwargs)
 
 

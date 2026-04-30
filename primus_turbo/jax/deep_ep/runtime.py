@@ -125,7 +125,7 @@ def get_target_name(
 # ---------------------------------------------------------------------------
 
 _per_process_nvl_bytes: int = 0
-_rocshmem_initialized: bool = False
+_per_process_rdma_bytes: int = 0
 
 NUM_MAX_NVL_PEERS = 8
 
@@ -139,18 +139,31 @@ def _get_c_deep_ep():
 
 def is_internode(*, lock: bool = False) -> bool:
     """Return True if ep_size > NUM_MAX_NVL_PEERS (internode communication)."""
-    return get_ep_size(lock=lock) > NUM_MAX_NVL_PEERS
+    mode = get_mode(lock=lock)
+    if mode.ep_size <= NUM_MAX_NVL_PEERS:
+        return False
+    if mode is not MODE_PER_PROCESS:
+        raise RuntimeError(
+            "JAX DeepEP internode communication currently requires per_process mode. "
+            f"Got mode='{mode.mode_name}' with ep_size={mode.ep_size}."
+        )
+    return True
 
 
-def _init_rocshmem_if_needed(dep, rank: int, num_ranks: int) -> None:
-    """Initialize rocSHMEM once for the internode path.
+def _check_internode_rank_count(num_ranks: int) -> None:
+    if num_ranks % NUM_MAX_NVL_PEERS != 0:
+        raise ValueError(
+            f"Internode DeepEP requires process_count to be divisible by "
+            f"NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got {num_ranks}"
+        )
 
-    Only processes whose ``rdma_rank == 0`` generate a unique ID; this is
-    allgathered so every rank on the same NVL group shares the same root.
+
+def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
+    """Collect and return the root rocSHMEM unique ID for this rank's NVL slot.
+
+    Every process generates a same-sized ID for JAX array allgather, but only
+    the ID from ``rdma_rank == 0`` for the same NVL slot is passed to C++.
     """
-    global _rocshmem_initialized
-    if _rocshmem_initialized:
-        return
     if not dep.has_rocshmem():
         raise RuntimeError(
             "Internode DeepEP requires rocSHMEM but it was not available at build time. "
@@ -162,12 +175,10 @@ def _init_rocshmem_if_needed(dep, rank: int, num_ranks: int) -> None:
     from jax.experimental import multihost_utils
 
     rdma_rank = rank // NUM_MAX_NVL_PEERS
-    num_rdma_ranks = num_ranks // NUM_MAX_NVL_PEERS
 
-    if rdma_rank == 0:
-        uid_bytes = dep.get_unique_id()
-    else:
-        uid_bytes = b"\x00" * 128  # placeholder; will be overwritten by allgather
+    # Every process generates a fixed-size rocSHMEM unique ID so JAX's array allgather can use a
+    # uniform shape. Only the ID from the root RDMA rank of each NVL slot is used below.
+    uid_bytes = dep.get_unique_id()
 
     uid_np = np.frombuffer(uid_bytes, dtype=np.uint8).copy()
     all_uids_jax = multihost_utils.process_allgather(jnp.array(uid_np))
@@ -176,15 +187,11 @@ def _init_rocshmem_if_needed(dep, rank: int, num_ranks: int) -> None:
     nvl_rank = rank % NUM_MAX_NVL_PEERS
     root_global_rank = nvl_rank  # rdma_rank==0 on same NVL slot
     root_uid = bytes(all_uids_np[root_global_rank])
-
-    pe = dep.init_rocshmem(root_uid, rdma_rank, num_rdma_ranks)
-    assert pe == rdma_rank, f"rocSHMEM PE mismatch: got {pe}, expected {rdma_rank}"
-    dep.barrier_rocshmem()
-    _rocshmem_initialized = True
     log.info(
-        "rocSHMEM initialized: rank=%d, rdma_rank=%d, num_rdma_ranks=%d",
-        rank, rdma_rank, num_rdma_ranks,
+        "rocSHMEM root unique ID gathered: rank=%d, rdma_rank=%d",
+        rank, rdma_rank,
     )
+    return root_uid
 
 
 def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
@@ -193,7 +200,7 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     All processes must call this collectively; the IPC handle allgather acts as
     an implicit barrier.
     """
-    global _per_process_nvl_bytes
+    global _per_process_nvl_bytes, _per_process_rdma_bytes
 
     import numpy as np
     import jax.numpy as jnp
@@ -204,8 +211,10 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     num_ranks = jax.process_count()
 
     internode = num_ranks > NUM_MAX_NVL_PEERS
+    if internode:
+        _check_internode_rank_count(num_ranks)
 
-    needed = dep.get_nvl_buffer_size_hint(
+    num_nvl_bytes = dep.get_nvl_buffer_size_hint(
         hidden_bytes,
         num_ranks,
         config.num_sms,
@@ -214,20 +223,6 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
         config.num_max_rdma_chunked_send_tokens,
         config.num_max_rdma_chunked_recv_tokens,
     )
-
-    if dep.is_per_process_buffer_ready() and _per_process_nvl_bytes >= needed:
-        return
-
-    if dep.is_per_process_buffer_ready():
-        log.info(
-            "Growing per-process DeepEP buffer: %d -> %d bytes",
-            _per_process_nvl_bytes,
-            needed,
-        )
-        dep.destroy_per_process_buffer()
-
-    if internode:
-        _init_rocshmem_if_needed(dep, rank, num_ranks)
 
     num_rdma_bytes = 0
     if internode:
@@ -241,23 +236,50 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
             config.num_max_rdma_chunked_recv_tokens,
         )
 
-    local_handle: bytearray = dep.create_per_process_buffer(
-        rank, num_ranks, needed, num_rdma_bytes
+    if (
+        dep.is_per_process_buffer_ready()
+        and _per_process_nvl_bytes >= num_nvl_bytes
+        and _per_process_rdma_bytes >= num_rdma_bytes
+    ):
+        return
+
+    if dep.is_per_process_buffer_ready():
+        log.info(
+            "Growing per-process DeepEP buffer: nvl %d -> %d bytes, rdma %d -> %d bytes",
+            _per_process_nvl_bytes,
+            num_nvl_bytes,
+            _per_process_rdma_bytes,
+            num_rdma_bytes,
+        )
+        dep.destroy_per_process_buffer()
+        _per_process_nvl_bytes = 0
+        _per_process_rdma_bytes = 0
+
+    root_uid = None
+    if internode:
+        root_uid = _get_root_rocshmem_unique_id(dep, rank, num_ranks)
+
+    local_ipc_handle: bytearray = dep.create_per_process_buffer(
+        rank, num_ranks, num_nvl_bytes, num_rdma_bytes
     )
 
-    handle_np = np.frombuffer(local_handle, dtype=np.uint8).copy()
-    all_handles_jax = multihost_utils.process_allgather(jnp.array(handle_np))
+    local_ipc_handle_np = np.frombuffer(local_ipc_handle, dtype=np.uint8).copy()
+    all_ipc_handles_jax = multihost_utils.process_allgather(jnp.array(local_ipc_handle_np))
 
-    all_handles_np = np.asarray(all_handles_jax).reshape(num_ranks, -1)
-    handles_list = [bytearray(all_handles_np[i]) for i in range(num_ranks)]
+    all_ipc_handles_np = np.asarray(all_ipc_handles_jax).reshape(num_ranks, -1)
+    ipc_handles_list = [bytearray(all_ipc_handles_np[i]) for i in range(num_ranks)]
 
-    dep.sync_per_process_buffer(handles_list)
-    _per_process_nvl_bytes = needed
+    if root_uid is None:
+        dep.sync_per_process_buffer(ipc_handles_list)
+    else:
+        dep.sync_per_process_buffer(ipc_handles_list, root_uid)
+    _per_process_nvl_bytes = num_nvl_bytes
+    _per_process_rdma_bytes = num_rdma_bytes
 
     log.info(
         "Per-process DeepEP buffer ready: rank=%d, num_ranks=%d, "
         "nvl_bytes=%d, rdma_bytes=%d, internode=%s",
-        rank, num_ranks, needed, num_rdma_bytes, internode,
+        rank, num_ranks, num_nvl_bytes, num_rdma_bytes, internode,
     )
 
 
@@ -285,10 +307,10 @@ def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) ->
 
 
 def reset_runtime() -> None:
-    global _locked_mode, _per_process_nvl_bytes, _rocshmem_initialized
+    global _locked_mode, _per_process_nvl_bytes, _per_process_rdma_bytes
     _locked_mode = None
     _per_process_nvl_bytes = 0
-    _rocshmem_initialized = False
+    _per_process_rdma_bytes = 0
     try:
         dep = _get_c_deep_ep()
         if dep.is_per_process_buffer_ready():

@@ -493,6 +493,14 @@ ffi::Error MoEInternodeDispatchPerProcessFFI(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "per_process buffer not initialized");
     }
+    if (buffer->num_ranks() != ep_size) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode dispatch ep_size mismatch with buffer num_ranks");
+    }
+    if (!buffer->is_internode_available()) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode dispatch requires an initialized RDMA buffer");
+    }
 
     auto cfg = primus_turbo::deep_ep::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
@@ -550,6 +558,14 @@ ffi::Error MoEInternodeCachedDispatchPerProcessFFI(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "per_process buffer not initialized");
     }
+    if (buffer->num_ranks() != ep_size) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode cached dispatch ep_size mismatch with buffer num_ranks");
+    }
+    if (!buffer->is_internode_available()) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode cached dispatch requires an initialized RDMA buffer");
+    }
 
     auto cfg = primus_turbo::deep_ep::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
@@ -599,6 +615,14 @@ ffi::Error MoEInternodeCombinePerProcessFFI(
     if (buffer == nullptr || !buffer->is_available()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "per_process buffer not initialized");
+    }
+    if (buffer->num_ranks() != ep_size) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode combine ep_size mismatch with buffer num_ranks");
+    }
+    if (!buffer->is_internode_available()) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "internode combine requires an initialized RDMA buffer");
     }
 
     auto cfg = primus_turbo::deep_ep::Config(

@@ -12,7 +12,7 @@ Each process manages 1 GPU, and rocSHMEM is used for cross-node RDMA.
 
 Run with::
 
-    pytest tests/jax/lax/test_internode_dispatch_combine.py --dist-only
+    pytest tests/jax/test_internode_dispatch_combine.py --dist-only
 """
 
 import pytest
@@ -144,7 +144,7 @@ class TestInternodeDispatchCombine(JaxMultiProcessTestCase):
         import jax
 
         if jax.local_device_count() <= 8:
-            pytest.skip("Need more than 8 GPUs for internode mode")
+            pytest.skip("Need more than 8 local GPUs for this per-process internode harness")
 
     @pytest.mark.multigpu
     def test_internode_dispatch_combine_fwd_bf16(self):

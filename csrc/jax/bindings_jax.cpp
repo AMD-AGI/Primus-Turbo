@@ -103,7 +103,8 @@ PYBIND11_MODULE(_C, m) {
     dep_m.def("create_per_process_buffer", &dep::create_per_process_buffer,
               py::arg("rank"), py::arg("num_ranks"), py::arg("num_nvl_bytes"),
               py::arg("num_rdma_bytes") = 0);
-    dep_m.def("sync_per_process_buffer", &dep::sync_per_process_buffer);
+    dep_m.def("sync_per_process_buffer", &dep::sync_per_process_buffer,
+              py::arg("all_handles"), py::arg("root_unique_id") = py::none());
     dep_m.def("destroy_per_process_buffer", &dep::destroy_per_process_buffer);
     dep_m.def("is_per_process_buffer_ready", &dep::is_per_process_buffer_ready);
     dep_m.def("per_process_buffer_nvl_bytes", &dep::per_process_buffer_nvl_bytes);
@@ -114,15 +115,6 @@ PYBIND11_MODULE(_C, m) {
                   return {reinterpret_cast<const char *>(uid.data()),
                           uid.size()};
               });
-    dep_m.def("init_rocshmem",
-              [](const pybind11::bytes &root_uid, int rank, int num_ranks) -> int {
-                  auto uid_str = std::string(root_uid);
-                  std::vector<uint8_t> uid_vec(uid_str.begin(), uid_str.end());
-                  return primus_turbo::deep_ep::internode::init(uid_vec, rank, num_ranks, false);
-              },
-              py::arg("root_unique_id"), py::arg("rank"), py::arg("num_ranks"));
-    dep_m.def("barrier_rocshmem", &primus_turbo::deep_ep::internode::barrier);
-    dep_m.def("finalize_rocshmem", &primus_turbo::deep_ep::internode::finalize);
     dep_m.def("get_rdma_buffer_size_hint",
               [](int64_t hidden_bytes, int num_ranks, int num_sms,
                  int nvl_send, int nvl_recv, int rdma_send, int rdma_recv) -> int64_t {
