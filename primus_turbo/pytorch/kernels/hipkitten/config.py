@@ -289,8 +289,28 @@ def select_default_config(
                     return HipKittenConfig(
                         layout=layout, group_m=8, num_xcds=4, kernel=None
                     )
+                # Round-70: gpt_oss-GateUP-B32-M4096 (tiles_n=22, tiles_m=16,
+                # k=2880, m_total=131072). Wider sweep over
+                # (group_m, num_xcds) ∈ {1..24} × {1, 2, 4, 8, 16, 32}
+                # at /tmp/sweep_round1.py and /tmp/verify_round1.py
+                # (200-iter × p20 verify) shows num_xcds=2 consistently
+                # beats round-69 num_xcds=4 on this single shape:
+                #
+                #   shape                        gm=1,xcd=4    gm=1,xcd=2
+                #   gpt_oss-GateUP-B32-M4096     927.0 TF       929.9 TF   (+2.9 TF, +0.31pp)
+                #
+                # Wider exploratory sweep showed (1, 2) at the top of the
+                # candidate space (939 TF p20 in the wider sweep with looser
+                # warmup; tighter verify converges to +2.9 TF). Bit-identical
+                # output verified (group_m / num_xcds are pure scheduling
+                # knobs on the persistent grouped tile schedule).
+                #
+                # Rule scope: ``m_total > 65536`` ⇔ B=32 M_per=4096 in the
+                # metric (gpt_oss-GateUP family); B=32 M_per=2048 lands on
+                # the m_total<=65536 branch above. No other metric shape
+                # has tiles_n==22 with m_total>65536.
                 return HipKittenConfig(
-                    layout=layout, group_m=1, num_xcds=4, kernel=None
+                    layout=layout, group_m=1, num_xcds=2, kernel=None
                 )
             if tiles_n == 11:  # Down N=2880
                 if m_total <= 8192:
@@ -583,9 +603,27 @@ def select_default_config(
             and m_total is not None
             and m_total >= 65536
         ):
+            # Round-70: gpt_oss-GateUP-B32 family (tiles_n=22, k=2880,
+            # m_total ∈ {65536, 131072}). Wider (group_m, num_xcds) sweep
+            # (/tmp/sweep_round1.py) over {1..24} × {1, 2, 4, 8, 16, 32}
+            # plus 200-iter × p20 verify (/tmp/verify_round1.py) shows
+            # gm=8 dominates the round-69 gm=4 on both M_per shapes:
+            #
+            #   shape                        gm=4,xcd=4   gm=8,xcd=4
+            #   gpt_oss-GateUP-B32-M2048     832.1 TF      835.6 TF   (+3.5 TF, +0.42pp)
+            #   gpt_oss-GateUP-B32-M4096     922.4 TF      935.2 TF   (+12.8 TF, +1.39pp)
+            #
+            # Wider sweep over the candidate space confirmed (8, 4) is at
+            # the top (alternates: (8, 2)=930 < (8, 4)=937 on M=4096; xcds
+            # ≥ 8 / xcds == 1 all underperform (8, 4)). xcds=4 unchanged
+            # from round-69 (the chiplet-swizzle rule retained).
+            #
+            # Rule scope unchanged from round-69: m_total >= 65536 covers
+            # B=32 M_per ∈ {2048, 4096} which are the only metric shapes
+            # in this band (B<32 GateUP m_total < 65536).
             return HipKittenConfig(
                 layout=layout,
-                group_m=4,
+                group_m=8,
                 num_xcds=4,
                 kernel=None,
             )
