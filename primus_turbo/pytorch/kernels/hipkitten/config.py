@@ -487,42 +487,51 @@ def select_default_config(
         tiles_m = m // 256
         tiles_n = n // 256
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
-            # Round-20 rule. DeepSeek-V3-Down grouped FP8 RCR family:
-            # per-group GEMM N=7168, K=2048, M_per_group ∈ {2048, 4096},
-            # B ∈ {16, 32}. Mirrors the existing BF16 ``tiles_n==28``
-            # rule above; the same shape family (tiles_n=28, k=2048)
-            # falls through to the FP8 default ``group_m=4`` and was
-            # the worst grpFP8 tier outside gpt_oss (ratios 0.89-0.94
-            # vs Triton in round-19 metric).
+            # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
+            # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
+            # ∈ {2048, 4096}, B ∈ {16, 32}. Mirrors the BF16
+            # ``tiles_n==28`` rule above. Round-20's gm=24 was derived
+            # from a 6-candidate sweep capped at gm<=24; round-58 reran
+            # with the upper bound extended to gm=64 (a 9-candidate
+            # 80-iter × 3-repeat median sweep at
+            # /tmp/sweep_fp8_dsv3_down_wide.py followed by a tighter
+            # 160-iter × 5-repeat verification at
+            # /tmp/verify_dsv3_down_gm48.py) and found gm=32 dominates
+            # gm=24 on all 4 metric shapes:
             #
-            # 6-candidate sweep (3 trials × 30 iters) at
-            # /tmp/sweep_fp8_deepseek_down.py over
-            # group_m ∈ {1, 2, 4, 8, 16, 24} on all 4 metric shapes:
-            #   B16-M2048   default(gm=4)=1662  gm=24=1690  +1.7pp  (top1)
-            #   B16-M4096   default(gm=4)=1688  gm=24=1697  +0.5pp  (top1)
-            #   B32-M2048   default(gm=4)=1633  gm=24=1673  +2.4pp  (top1)
-            #   B32-M4096   default(gm=4)=1652  gm=24=1665  +0.8pp  (top1)
-            # gm=24 wins on all 4 shapes; +1.4pp average over default.
-            # group_m only changes tile scheduling order on the dense /
-            # persistent RCR kernel, not arithmetic — bit-identical
-            # output across all 6 group_m values (cross max_abs = 0.0,
-            # SNR vs fp32 reference unchanged across the family).
+            #   shape           gm=24    gm=32    Δ vs gm=24
+            #   Down-B16-M2048  1725.4   1729.8   +0.26pp
+            #   Down-B16-M4096  1741.0   1757.7   +0.96pp
+            #   Down-B32-M2048  1743.6   1751.3   +0.44pp
+            #   Down-B32-M4096  1751.9   1781.6   +1.69pp
             #
-            # Rule scope check: ``tiles_n == 28`` ⇔ N == 7168, which
-            # only occurs in the metric for these 4 grouped DSV3-Down
-            # forward shapes. No dense FP8 metric shape has N=7168;
-            # DSV3-GateUP has tiles_n==16 (N=4096) and matches its
-            # binding-default (gm=4) winner per the same sweep
-            # (B16-M2048 gm=4=2507 top1, B32-M4096 gm=2=2554 top1
-            # +1.0pp — too narrow to anchor a separate rule);
-            # gpt_oss has tiles_n ∈ {12, 23} (n_pad=3072 / 5888) ⇒
-            # neither matches. The k<=4096 bound excludes the
-            # DSV3-GateUP (K=7168) cousin, which the same sweep shows
-            # already runs near gm=4-best; pinning a different group_m
-            # there is unjustified.
+            # gm=32 is also the most robust pick across the family:
+            # gm=48 wins B16 by ≤0.1pp but loses B32-M2048 by 0.4pp;
+            # gm=64 wins B16-M4096 by 0.1pp but loses B32-M4096 by 0.2pp.
+            # gm=32 is top-1 or within 0.1pp of top-1 on every shape,
+            # whereas the round-20 gm=24 was top-1 *only within the
+            # ≤24 search* and is uniformly dominated once the search
+            # extends. Net delta over round-20 (gm=24): +0.84pp / shape
+            # average, +1.69pp on the worst-ratio Down-B32-M4096 shape
+            # (was 0.939 vs Triton in round-58 baseline).
+            #
+            # Bit-identical output verified at /tmp/verify_fp8_dsv3_repeatable.py:
+            # gm=24 vs gm=32 on Down-B16-M2048 → max_abs=0.0, bit_eq=True;
+            # SNR vs fp32 ref = 28.49 dB on both. group_m only re-orders
+            # the persistent tile schedule on the FP8 grouped RCR
+            # launcher; arithmetic and FP8 quantization rounding are
+            # invariant.
+            #
+            # Rule scope check (unchanged from round-20): ``tiles_n == 28``
+            # ⇔ N == 7168, which only occurs in the metric for these 4
+            # DSV3-Down forward shapes. No dense FP8 metric shape has
+            # N=7168; DSV3-GateUP has tiles_n==16 (N=4096), gpt_oss has
+            # tiles_n ∈ {12, 23}, neither matches. The k<=4096 bound
+            # excludes the DSV3-GateUP (K=7168) cousin (already best at
+            # default gm=4 per the same wide sweep).
             return HipKittenConfig(
                 layout=layout,
-                group_m=24,
+                group_m=32,
                 num_xcds=None,
                 kernel=None,
             )
