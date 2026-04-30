@@ -557,6 +557,63 @@ def select_default_config(
                 num_xcds=None,
                 kernel=None,
             )
+        # Round-69 rule. gpt_oss-GateUP-B32 family (tiles_n=22, n=5760,
+        # k=2880, m_total ∈ {65536, 131072} for B=32 M_per_g ∈
+        # {2048, 4096}). The persistent grid for B=32 is ~16x larger
+        # than B=4 so the default gm=4 already saturates the GPU; the
+        # remaining lever is the chiplet-swizzle XCD grouping. 1500-iter
+        # × 7-repeat tight verify at
+        # /tmp/verify_gpt_oss_b32_xcds_round69.py:
+        #
+        #   shape                       xcds=8     xcds=4    Δ
+        #   gpt_oss-GateUP-B32-M2048    1099.5     1103.9    +4.4 (+0.40pp)
+        #   gpt_oss-GateUP-B32-M4096    1115.7     1119.9    +4.2 (+0.38pp)
+        #
+        # Both M_per_g shapes prefer xcds=4 by a small but consistent
+        # margin (round-68 wide sweep at 250-iter × 3-repeat showed
+        # +5.6 / +5.2 — the 1500-iter retest confirms the direction
+        # albeit slightly smaller magnitude). Same sweep verified
+        # gpt_oss-Down-B32 is split (M=2048 +2.2 noise, M=4096 -7.8
+        # regression at xcds=4) so the rule is gated to GateUP only.
+        # Setting num_xcds=4 here, default gm=4 unchanged.
+        if (
+            tiles_n == 22
+            and tiles_m in (8, 16)
+            and k == 2880
+            and m_total is not None
+            and m_total >= 65536
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=4,
+                num_xcds=4,
+                kernel=None,
+            )
+        # Round-69 rule. gpt_oss-Down-B4-M4096 (tiles_n=11 for n=2880
+        # since 2880//256 = 11, k=2880, m_total=16384). Single shape:
+        # 1500-iter × 7-repeat at
+        # /tmp/verify_gpt_oss_b32_xcds_round69.py:
+        #
+        #   shape                  xcds=8    xcds=4    Δ
+        #   gpt_oss-Down-B4-M4096  1170.3    1181.4    +11.1 (+0.95pp)
+        #
+        # Sibling B4-M2048 LOSES at xcds=4 (-23.6 TF / -2.5%) so the
+        # rule is gated to ``tiles_m == 16`` only (m_per_g=4096).
+        # ``m_total == 16384`` further excludes any incidental B=8
+        # M=2048 case.
+        if (
+            tiles_n == 11
+            and tiles_m == 16
+            and k == 2880
+            and m_total is not None
+            and m_total == 16384
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=4,
+                num_xcds=4,
+                kernel=None,
+            )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
             # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
             # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
