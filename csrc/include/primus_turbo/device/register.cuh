@@ -21,7 +21,7 @@ namespace primus_turbo::device {
 template <int AGPR> __device__ __forceinline__ void clobber_agpr_one() {
     static_assert(AGPR >= 0 && AGPR <= 255, "AGPR must be in [0, 255]");
     // clang-format off
-#define CLOBBER_AREG_CASE(N) case N: asm volatile("" ::: "a" #N); break;
+#define CLOBBER_AREG_CASE(N) case N: asm volatile("" ::: "a" #N, "memory"); break;
     switch (AGPR) {
         CLOBBER_AREG_CASE(0)   CLOBBER_AREG_CASE(1)   CLOBBER_AREG_CASE(2)   CLOBBER_AREG_CASE(3)   CLOBBER_AREG_CASE(4)   CLOBBER_AREG_CASE(5)   CLOBBER_AREG_CASE(6)   CLOBBER_AREG_CASE(7)
         CLOBBER_AREG_CASE(8)   CLOBBER_AREG_CASE(9)   CLOBBER_AREG_CASE(10)  CLOBBER_AREG_CASE(11)  CLOBBER_AREG_CASE(12)  CLOBBER_AREG_CASE(13)  CLOBBER_AREG_CASE(14)  CLOBBER_AREG_CASE(15)
@@ -61,7 +61,8 @@ template <int AGPR> __device__ __forceinline__ void clobber_agpr_one() {
 }
 
 template <int AC> __device__ __forceinline__ void zero_agpr() {
-    asm volatile("v_accvgpr_write_b32 a[%0], 0" : : "n"(AC));
+    asm volatile("v_accvgpr_write_b32 a[%0], 0" : : "n"(AC) : "memory");
+    clobber_agpr_one<AC>();
 }
 
 // Read N consecutive AGPRs starting at AC, returned as type T.
@@ -72,22 +73,22 @@ template <typename T, int AC> __device__ __forceinline__ T read_agpr() {
     static_assert(N >= 1 && N <= 16, "read_agpr supports 1-16 registers");
     uint32_t raw[N];
     // clang-format off
-    if constexpr (N >=  1) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[0])  : "n"(AC));
-    if constexpr (N >=  2) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[1])  : "n"(AC + 1));
-    if constexpr (N >=  3) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[2])  : "n"(AC + 2));
-    if constexpr (N >=  4) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[3])  : "n"(AC + 3));
-    if constexpr (N >=  5) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[4])  : "n"(AC + 4));
-    if constexpr (N >=  6) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[5])  : "n"(AC + 5));
-    if constexpr (N >=  7) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[6])  : "n"(AC + 6));
-    if constexpr (N >=  8) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[7])  : "n"(AC + 7));
-    if constexpr (N >=  9) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[8])  : "n"(AC + 8));
-    if constexpr (N >= 10) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[9])  : "n"(AC + 9));
-    if constexpr (N >= 11) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[10]) : "n"(AC + 10));
-    if constexpr (N >= 12) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[11]) : "n"(AC + 11));
-    if constexpr (N >= 13) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[12]) : "n"(AC + 12));
-    if constexpr (N >= 14) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[13]) : "n"(AC + 13));
-    if constexpr (N >= 15) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[14]) : "n"(AC + 14));
-    if constexpr (N >= 16) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[15]) : "n"(AC + 15));
+    if constexpr (N >=  1) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[0])  : "n"(AC) : "memory");
+    if constexpr (N >=  2) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[1])  : "n"(AC + 1) : "memory");
+    if constexpr (N >=  3) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[2])  : "n"(AC + 2) : "memory");
+    if constexpr (N >=  4) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[3])  : "n"(AC + 3) : "memory");
+    if constexpr (N >=  5) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[4])  : "n"(AC + 4) : "memory");
+    if constexpr (N >=  6) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[5])  : "n"(AC + 5) : "memory");
+    if constexpr (N >=  7) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[6])  : "n"(AC + 6) : "memory");
+    if constexpr (N >=  8) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[7])  : "n"(AC + 7) : "memory");
+    if constexpr (N >=  9) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[8])  : "n"(AC + 8) : "memory");
+    if constexpr (N >= 10) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[9])  : "n"(AC + 9) : "memory");
+    if constexpr (N >= 11) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[10]) : "n"(AC + 10) : "memory");
+    if constexpr (N >= 12) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[11]) : "n"(AC + 11) : "memory");
+    if constexpr (N >= 13) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[12]) : "n"(AC + 12) : "memory");
+    if constexpr (N >= 14) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[13]) : "n"(AC + 13) : "memory");
+    if constexpr (N >= 15) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[14]) : "n"(AC + 14) : "memory");
+    if constexpr (N >= 16) asm volatile("v_accvgpr_read_b32 %0, a[%1]" : "=v"(raw[15]) : "n"(AC + 15) : "memory");
     // clang-format on
     return __builtin_bit_cast(T, raw);
 }
@@ -119,7 +120,7 @@ template <int START, int END> __device__ __forceinline__ void zero_agpr_range() 
 template <int VGPR> __device__ __forceinline__ void clobber_vgpr_one() {
     static_assert(VGPR >= 0 && VGPR <= 255, "VGPR must be in [0, 255]");
     // clang-format off
-#define CLOBBER_VREG_CASE(N) case N: asm volatile("" ::: "v" #N); break;
+#define CLOBBER_VREG_CASE(N) case N: asm volatile("" ::: "v" #N, "memory"); break;
     switch (VGPR) {
         CLOBBER_VREG_CASE(0)   CLOBBER_VREG_CASE(1)   CLOBBER_VREG_CASE(2)   CLOBBER_VREG_CASE(3)   CLOBBER_VREG_CASE(4)   CLOBBER_VREG_CASE(5)   CLOBBER_VREG_CASE(6)   CLOBBER_VREG_CASE(7)
         CLOBBER_VREG_CASE(8)   CLOBBER_VREG_CASE(9)   CLOBBER_VREG_CASE(10)  CLOBBER_VREG_CASE(11)  CLOBBER_VREG_CASE(12)  CLOBBER_VREG_CASE(13)  CLOBBER_VREG_CASE(14)  CLOBBER_VREG_CASE(15)

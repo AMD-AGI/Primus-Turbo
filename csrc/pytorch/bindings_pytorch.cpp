@@ -78,6 +78,13 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hipblaslt_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, bool pre_sync) -> Tensor");
+    m.def("turbo_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
+          "ScalarType out_dtype, str granularity, int grid_x_hint=0, "
+          "bool b_scale_preshuffled=False) -> Tensor");
+    m.def("turbo_preshuffle_mxfp8_scale_16x4(Tensor scale) -> Tensor");
+    m.def("turbo_grouped_gemm_variable_k_fp8(Tensor lhs, Tensor lhs_scales, Tensor rhs, Tensor rhs_scales, "
+          "Tensor group_lens, Tensor group_offs, ScalarType out_dtype, str granularity) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 }
 
@@ -117,6 +124,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
+    m.impl("turbo_grouped_gemm_fp8", turbo_grouped_gemm_fp8);
+    m.impl("turbo_grouped_gemm_variable_k_fp8", turbo_grouped_gemm_variable_k_fp8);
+    m.impl("turbo_preshuffle_mxfp8_scale_16x4", turbo_preshuffle_mxfp8_scale_16x4);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -155,6 +165,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm_meta);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
+    m.impl("turbo_grouped_gemm_fp8", turbo_grouped_gemm_fp8_meta);
+    m.impl("turbo_grouped_gemm_variable_k_fp8", turbo_grouped_gemm_variable_k_fp8_meta);
+    m.impl("turbo_preshuffle_mxfp8_scale_16x4", turbo_preshuffle_mxfp8_scale_16x4_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

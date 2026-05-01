@@ -151,17 +151,22 @@ __device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float
         result = tmp1;
         result = (result << 16) | tmp0;
     } else if constexpr (std::is_same_v<DType, dtype::float8_e5m2>) {
+        const float lim = FP8E5M2_MAX * scale;
+        const float v0c = fminf(fmaxf(v0, -lim), lim);
+        const float v1c = fminf(fmaxf(v1, -lim), lim);
+        const float v2c = fminf(fmaxf(v2, -lim), lim);
+        const float v3c = fminf(fmaxf(v3, -lim), lim);
         uint16_t tmp0 = 0;
         // Convert first pair (v0, v1) to 16-bit packed BF8 (E5M2)
         asm volatile("v_cvt_scalef32_pk_bf8_f32 %0, %1, %2, %3"
                      : "+v"(tmp0)
-                     : "v"(v0), "v"(v1), "v"(scale));
+                     : "v"(v0c), "v"(v1c), "v"(scale));
 
         // Convert second pair (v2, v3) to 16-bit packed BF8 (E5M2)
         uint16_t tmp1 = 0;
         asm volatile("v_cvt_scalef32_pk_bf8_f32 %0, %1, %2, %3"
                      : "+v"(tmp1)
-                     : "v"(v2), "v"(v3), "v"(scale));
+                     : "v"(v2c), "v"(v3c), "v"(scale));
 
         // Combine into 32-bit result: [v0, v1] in low 16 bits, [v2, v3] in high 16 bits
         result = tmp1;

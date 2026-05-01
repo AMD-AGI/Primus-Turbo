@@ -274,6 +274,10 @@ public:
         c_out[3][3]     = read_agpr<float32x4, B + 60>();
     }
 
+    // VolatileStore: true emits per-element flat_store + s_waitcnt vmcnt(0);
+    // false coalesces and lets the caller drain once at the end (~2x faster
+    // on the persistent FWD kernel).
+    template <bool VolatileStore = true>
     __device__ __forceinline__ void store_c_subtile(CType *c_stg_base_ptr, const int32_t n,
                                                     float32x4 (&c_frags)[4][4],
                                                     uint32_t (&c_stg_offsets)[4],
@@ -288,8 +292,16 @@ public:
                 for (int i = 0; i < 4; ++i) {
                     int32_t row = tr * MFMA_SIZE_M + lane_id / 16 * 4 + i;
                     int32_t col = tc * MFMA_SIZE_N + lane_id % 16;
-                    if (row < valid_rows && col < valid_cols)
-                        c_stg_ptr[c_stg_offsets[i]] = CType(c_frags[tr][tc][i]);
+                    if (row < valid_rows && col < valid_cols) {
+                        const CType    out_val = CType(c_frags[tr][tc][i]);
+                        const uint16_t raw     = __builtin_bit_cast(uint16_t, out_val);
+                        if constexpr (VolatileStore) {
+                            *reinterpret_cast<volatile uint16_t *>(c_stg_ptr +
+                                                                   c_stg_offsets[i]) = raw;
+                        } else {
+                            *reinterpret_cast<uint16_t *>(c_stg_ptr + c_stg_offsets[i]) = raw;
+                        }
+                    }
                 }
             }
         }
@@ -346,6 +358,10 @@ public:
     template <int PIN_A, int PIN_B, int PIN_ACC, int PIN_SA, int PIN_SB>
     __device__ __forceinline__ static void mfma_scale_pinned() {
         Mfma::template run_pinned_acc_agpr<PIN_A, PIN_B, PIN_ACC, PIN_SA, PIN_SB>();
+        clobber_agpr_one<PIN_ACC + 0>();
+        clobber_agpr_one<PIN_ACC + 1>();
+        clobber_agpr_one<PIN_ACC + 2>();
+        clobber_agpr_one<PIN_ACC + 3>();
     }
 
     // 16 MFMA + LDS prefetch (no GMEM prefetch). Used in epilogue phases.
@@ -387,6 +403,7 @@ public:
         mfma_scale_pinned<PIN_A + 24, PIN_B + 8, ACC + 52, PIN_SA + 3, PIN_SB + 1>();
         mfma_scale_pinned<PIN_A + 24, PIN_B + 16, ACC + 56, PIN_SA + 3, PIN_SB + 2>();
         mfma_scale_pinned<PIN_A + 24, PIN_B + 24, ACC + 60, PIN_SA + 3, PIN_SB + 3>();
+        wait_lgkmcnt<0>();
     }
 
     // 16 MFMA only (no memory ops). Used for the final epilogue phases.
@@ -447,7 +464,9 @@ public:
         ds_read_pinned<4, PIN_NEXT_S + 2, 512>(sbase);
         ds_read_pinned<4, PIN_NEXT_S + 3, 768>(sbase);
 
-        // WAR barrier
+        // WAR barrier: all LDS reads for the next pinned register set must
+        // retire before buffer_load_lds overwrites the same LDS region.
+        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         // MFMA #6-#15: GMEM->SMEM prefetch spread across MFMA gaps
@@ -653,6 +672,11 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
                 base_scale_soff[3] + scale_off);
         }
 
+        // RACE FIX: full Phase 1->2 drain — single-GEMM `<4>` leaked ~0.007%
+        // at 5000-iter K=16384 stress; `<0>` is clean at 15000+ runs.
+        wait_vmcnt<0>();
+        __builtin_amdgcn_s_barrier();
+
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {
             uint32_t dm0_0 = __builtin_amdgcn_readfirstlane(a_smem_tile[cur][2].u32_ptr()) + sts_wb;
@@ -711,6 +735,8 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
                 base_scale_soff[1] + next_scale_off);
         }
 
+        // End-of-loop drain `<12>`: full drain is redundant given the
+        // Phase 1->2 barrier above.
         wait_vmcnt<12>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
@@ -764,7 +790,9 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        wait_vmcnt<6>();
+        // Drain Epi1 prefetch + ds_reads before the buffer flip.
+        wait_vmcnt<0>();
+        wait_lgkmcnt<0>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
@@ -863,10 +891,8 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
 #endif // __gfx950__
 }
 
-// ── Pre-shuffle E8M0 scale for MFMA consumption ──
-// Reorders scale data into 16x4 column-major blocks to match the MFMA scale input layout.
-// Also performs type conversion (e.g., E8M0 uint8 -> uint32 zero-extension).
-
+// Pre-shuffle E8M0 scale into 16x4 column-major blocks for MFMA consumption
+// (also zero-extends uint8 -> uint32).
 template <typename InT, typename OutT>
 __global__ void preshuffle_scale_16x4_kernel(const InT *in_scale_ptr, OutT *out_scale_ptr,
                                              const int rows, const int cols) {
@@ -884,6 +910,41 @@ __global__ void preshuffle_scale_16x4_kernel(const InT *in_scale_ptr, OutT *out_
         out_scale_ptr[tid] = val;
         in_scale_ptr += 4;
         out_scale_ptr += BLOCK_SIZE_ROW * BLOCK_SIZE_COL;
+    }
+}
+
+// Fused dual preshuffle: two independent (rows, cols) tensors sharing the
+// same `cols` in a single launch (grid = (rows0+rows1)/16 blocks; first
+// rows0/16 blocks handle tensor 0, the rest handle tensor 1).
+template <typename InT, typename OutT>
+__global__ void preshuffle_scale_16x4_dual_kernel(const InT *in_scale_ptr0,
+                                                  OutT      *out_scale_ptr0,
+                                                  const int  rows0,
+                                                  const InT *in_scale_ptr1,
+                                                  OutT      *out_scale_ptr1,
+                                                  const int  cols) {
+    const int BLOCK_SIZE_ROW = 16;
+    const int BLOCK_SIZE_COL = 4;
+    const int tid            = threadIdx.x;
+    const int bid            = blockIdx.x;
+    const int blocks0        = rows0 / BLOCK_SIZE_ROW;
+
+    const InT *in_ptr;
+    OutT      *out_ptr;
+    if (bid < blocks0) {
+        in_ptr  = in_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
+        out_ptr = out_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
+    } else {
+        const int sub_bid = bid - blocks0;
+        in_ptr  = in_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
+        out_ptr = out_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
+    }
+
+    for (int i = 0; i < (cols / BLOCK_SIZE_COL); ++i) {
+        const OutT val = static_cast<OutT>(in_ptr[tid % 16 * cols + tid / 16]);
+        out_ptr[tid]   = val;
+        in_ptr += 4;
+        out_ptr += BLOCK_SIZE_ROW * BLOCK_SIZE_COL;
     }
 }
 
