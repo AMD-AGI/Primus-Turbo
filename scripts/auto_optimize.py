@@ -66,26 +66,21 @@ from typing import Optional
 DEFAULT_MODEL = "claude-opus-4-7-thinking-max"
 DEFAULT_SKILL = "/root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 DEFAULT_TASK = (
-    "**最终目标**（6 段独立判定，每段都必须 PASS；看 metric stderr 的 "
-    "`Goals:` 6 行 PASS/FAIL）：\n"
-    "  (1) **BF16_fwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM forward (8 shape) [w=1]\n"
-    "  (2) **BF16_bwd vs HIPBLASLT** ≥ 0.97 —— dense BF16 GEMM backward (8 shape) [w=1]\n"
-    "  (3) **FP8_fwd  vs HIPBLASLT** ≥ 0.97 —— dense FP8 tensorwise GEMM forward (8 shape) [w=2]\n"
-    "  (4) **FP8_bwd  vs TRITON**    ≥ 1.20 —— dense FP8 tensorwise GEMM backward (8 shape) [w=2]\n"
-    "  (5) **grp_BF16 vs TRITON**    ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B) [w=4]\n"
-    "  (6) **grp_FP8  vs TRITON**    ≥ 1.20 —— grouped FP8 tensorwise GEMM (同 16 shape) [w=4]\n\n"
-    "**Score = 1000 × weighted-geomean(min(progress_i / target_i, 1.0))**，权重\n"
-    "`BF16fwd:1 BF16bwd:1 FP8fwd:2 FP8bwd:2 grpBF16:4 grpFP8:4`（sum=14）。\n"
+    "**任务范围**：本轮**只**搞 HipKittens grouped GEMM kernel —— BF16 + FP8 tensorwise，\n"
+    "forward + variable-K backward + dA backward 全部归 grouped 任务。**不要碰 dense GEMM**\n"
+    "（dense 路径有自己的优化通道，本 run 不测 dense）。\n\n"
+    "**最终目标**（2 段独立判定，每段都必须 PASS；看 metric stderr 的 `Goals:` 2 行 PASS/FAIL）：\n"
+    "  (1) **grp_BF16 vs TRITON** ≥ 1.20 —— grouped BF16 GEMM (16 shape, DeepSeek-V3 + gpt_oss_20B)\n"
+    "  (2) **grp_FP8  vs TRITON** ≥ 1.20 —— grouped FP8 tensorwise GEMM (同 16 shape)\n\n"
+    "**Score = 1000 × geomean(min(progress_i / 1.20, 1.0))**，两段等权重 (1, 1)。\n"
     "解读：\n"
-    "  • 每段 progress 上限锁 1.0：把 BF16_fwd 从 0.97 推到 1.05 **不加分**；要花\n"
+    "  • 每段 progress 上限锁 1.0：把 grp_BF16 从 1.20 推到 1.50 **不加分**；要花\n"
     "    cycle 在还没 PASS 的段上才有 score 收益。\n"
-    "  • grp_BF16 / grp_FP8 权重 4 ——把 grouped 从 0.5 推到 1.0 比把 BF16_fwd 从 0.95 推到 1.0\n"
-    "    多 4× 分。FP8 dense 权重 2，BF16 dense 权重 1。这条权重表是 user 拍板的\n"
-    "    优先级体现 —— **挑分最大的方向打**，不要均匀分配 cycles。\n"
-    "  • 6 段全 PASS（每段 progress=1.0）= score 1000；任何段 progress<1 ⇒ score<1000。\n"
-    "  • Reject 把 ratio 钉到 0.01：grp_FP8 中 1/16 reject = 该段 geomean 大跌 → 段权重 4×\n"
-    "    放大冲击 ⇒ score 直接跌穿。所以**收紧 can_handle 在新打分里更亏**。\n"
-    "6 段全 PASS 才算交付；score 只是 ranking 信号，**不是验收标准**。\n\n"
+    "  • 2 段全 PASS（每段 progress=1.0）= score 1000；任何段 progress<1 ⇒ score<1000。\n"
+    "  • Reject（HIPKITTEN raise / NaN / Inf）把 ratio 钉到 0.01：grp_FP8 中 1/16 reject\n"
+    "    = 该段 geomean 大跌 → 段进度塌掉 → score 直接跌穿。**收紧 can_handle 排除难\n"
+    "    shape = 扣分**，不是好优化。\n"
+    "2 段全 PASS 才算交付；score 只是 ranking 信号，**不是验收标准**。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
     "**核心架构方向（必读，决定本轮所有判断）**\n"
     "═══════════════════════════════════════════════════════════════════════\n\n"
@@ -120,26 +115,31 @@ DEFAULT_TASK = (
     "     **开发者手动**把结论写回 `select_default_config` 的规则里，**结果不存盘**。\n"
     "     不是 runtime 路径 —— 第一刀做完后再考虑，可选。\n\n"
     "═══════════════════════════════════════════════════════════════════════\n"
-    "**起点（架构第一/二刀完成后的近期实测，权重表上线后会偏低）**：\n"
-    "  • BF16_fwd  (8)   geomean ≈ 0.94-1.05 vs HIPBLASLT  [w=1] ← 容易 PASS，progress 已 cap 1.0\n"
-    "  • BF16_bwd  (8)   geomean ≈ 0.74      vs HIPBLASLT  [w=1] ← bwd 走 3 次 dispatch，host overhead\n"
-    "  • FP8_fwd   (8)   geomean ≈ 0.93      vs HIPBLASLT  [w=2] ← 离 0.97 一步之遥\n"
-    "  • FP8_bwd   (8)   geomean ≈ 1.07      vs TRITON     [w=2] ← 距 1.20 还有 12% gap\n"
-    "  • grp_BF16 (16)   geomean ≈ 0.10-0.40 vs TRITON     [w=4] ← gpt_oss_20B (N=K=2880) 不对齐\n"
-    "  • grp_FP8  (16)   geomean ≈ 0.05-0.10 vs TRITON     [w=4] ← HK FP8 .so 缺 grouped binding\n"
-    "**权重 4× 决定攻坚顺序**：grp_FP8 + grp_BF16 是 score 大头（合占 8/14 = 57%）。\n"
+    "**起点（host-pad + uniform 判断 + per-group fallback 全删除之后的实测）**：\n"
+    "  • grp_BF16 (16)   8/16 case FAIL —— gpt_oss misaligned (N=2880/5760, K=2880) 数值错\n"
+    "                    avg fwd ≈ 515 TF (vs Triton 1119 ⇒ ratio ≈ 0.46) — 两段都没接近 1.20\n"
+    "  • grp_FP8  (16)   16/16 RuntimeError —— backward dA 路径用 trans_b=False (RRR layout)，\n"
+    "                    HipKittens FP8 binding 缺 grouped_rrr，Primus raise → ratio clip 0.01\n"
+    "**第一轮必做**（grp_FP8 整段被一个缺失 binding 卡死）：在 HipKittens 仓库\n"
+    "  /workspace/code/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp\n"
+    "里 mirror BF16 grouped 的实现写一个 persistent `grouped_rrr` (含 _dscale 变体)，\n"
+    "**接受任意 group_lens**（device 端 O(G) scan group_offs；不许 host 判 uniform）+\n"
+    "**接受任意 (N, K)**（column-masked C store + LDS K-tail + per-group SRD）。\n"
     "**唯一允许的路径（user 拍板）**：HK 仓库新加 **persistent + CPU-sync-free** grouped\n"
-    "kernel（mirror Triton 的 `grouped_gemm_kernel.py`，详见第四+五刀），**不许** multi-stream\n"
-    "/ per-group launch / pad-and-copy 凑数。pad-and-copy 在非对齐 N/K 上能挤出局部分数但**永远**\n"
-    "无法跨过 1.20 vs TRITON 的目标 —— Triton 是 single-launch persistent，per-group launch\n"
-    "永远输给它。所以两段必须**一并**用 persistent kernel 解。建议路径：\n"
-    "  ① HK BF16 grouped binding 重写为 persistent + accept group_offs（轮 N）→ grp_BF16 +28%\n"
-    "  ② HK FP8 grouped binding 新加（同款 persistent，mirror BF16）（轮 N+1）→ grp_FP8 +28%\n"
-    "  ③ FP8_fwd / FP8_bwd 凑零头 → +14%\n"
-    "  ④ BF16_bwd 最后做（dispatch overhead 可能 1 次重写解决多段）→ +7%\n"
-    "新架构下 reject 全部源于**真硬约束**（dtype / layout / tile alignment），不再有 cache miss 类\n"
-    "假 reject。**收紧 can_handle 反而扣分**：reject → ratio clip 0.01 → 整段 geomean 塌掉，\n"
-    "在 grp_BF16/grp_FP8 (w=4) 段上一次 reject 就能让 score 掉 100+ 分。\n\n"
+    "kernel（mirror Triton 的 `primus_turbo/triton/grouped_gemm/grouped_gemm_kernel.py::\n"
+    "_grouped_bf16_persistent_gemm_kernel`，line 182-330）。**不许** multi-stream / per-group\n"
+    "launch / pad-and-copy 凑数。Triton 是 single-launch persistent + device-side group_offs\n"
+    "scan，per-group launch 永远输给它，pad-and-copy 在非对齐 N/K 上能挤出局部分数但**永远**\n"
+    "无法跨过 1.20 vs TRITON 的目标。两段必须**一并**用 persistent kernel 解。\n"
+    "建议路径：\n"
+    "  ① HK FP8 grouped binding 新加 grouped_rrr (+ _dscale)（轮 1）→ grp_FP8 unblock\n"
+    "  ② HK BF16 grouped main kernel 修 misaligned (N, K)（column-masked C + LDS K-tail）\n"
+    "    （轮 2-3）→ grp_BF16 8/16 FAIL → 16/16 PASS\n"
+    "  ③ HK FP8 grouped main kernel 修 misaligned (mirror BF16)（轮 4-5）→ grp_FP8 性能爬升\n"
+    "  ④ 两段一起 persistent kernel 性能调优（XCD 调度、wave layout、swizzle）（轮 6+）\n"
+    "    → 推到 1.20x Triton\n"
+    "**收紧 can_handle 反而扣分**：reject → ratio clip 0.01 → 整段 geomean 塌掉，\n"
+    "1 个 reject 就能让 score 掉 100+ 分。\n\n"
     "**严禁的『假优化』模式**（违反 = 本轮立即作废）：\n"
     "  ✗ **runtime 读任何 .json / .pkl / .autotune_cache.json**（开发期 bench 用、归纳完后\n"
     "    runtime 不再 import；任何 hipkitten 路径上看到 `json.load`/`pickle.load` 都是违规）\n"
@@ -148,14 +148,29 @@ DEFAULT_TASK = (
     "  ✗ case-by-case 形状表：`if (M,N,K)==(X,Y,Z): return cfg`（**通用规则**才允许，\n"
     "    例如 `if K>=4096`、`if min(tiles)<16`、`if N>=K`）\n"
     "  ✗ 收紧 can_handle 把难 shape 排除掉（geomean clip 0.01，分数立刻塌）\n"
+    "  ✗ **grouped 路径严禁 host-side padding**（user 拍板，新规）：\n"
+    "    1) **禁止** `torch.empty(...) + .copy_() + .zero_()` 套路把输入 K/N 凑齐对齐再\n"
+    "       喂 kernel —— 这是变相绕过 misaligned 支持。agent 必须在 HK kernel 端 native\n"
+    "       处理（column-masked C store + LDS K-tail + per-group SRD）。这一条覆盖\n"
+    "       forward / dB / 任何 grouped fallback 所有路径，**没有例外**。\n"
+    "    2) **禁止** `_pad_2d` / `_pad_2d_into` / `padded_shape(...)` 等 host-pad helper\n"
+    "       在 dispatch 路径上调用。这些 helper 即便保留作为开发期 probe 也不许出现\n"
+    "       在 `grouped_gemm{,_fp8}_impl.py` 的 `execute` 函数里。\n"
+    "  ✗ **grouped 路径严禁 uniform-M 判断**（user 拍板，新规）：\n"
+    "    1) **禁止** 任何形如 `_uniform_group_m(...)` / `if a.shape[0] % bs == 0` /\n"
+    "       `m_uniform is not None: fast-path else: fallback` 的分支。host 端**永远走\n"
+    "       同一条 persistent grouped launch**，kernel 端用 device-side `group_offs`\n"
+    "       处理任意 group_lens（uniform 或非 uniform 都是同一条路径，不许二分）。\n"
+    "    2) `m_avg = a_total // bs` **只能** 用作 `select_default_config(...)` 选 cfg\n"
+    "       （group_m / num_xcds / kernel variant），**绝不能** 用作分支条件。cfg 选不\n"
+    "       准 = 慢，但仍然 correct，因为 kernel 端 `group_offs` 自己 O(G) scan。\n"
     "  ✗ **grouped 路径严禁任何形式的 balanced 假设**（命名 + 资格判定都不准）：\n"
     "    1) `can_handle` / dispatch 路径**禁止**加任何形如 `_is_balanced_group_lens` /\n"
     "       `all(g==g[0] for g in group_lens)` 的检查去 reject 非均匀 `group_lens` —— 真实\n"
     "       MoE 训练里 group_lens 永远是稀疏不均匀的，reject 一个 shape → ratio clip 0.01\n"
-    "       → 整段 geomean 塌掉。HK kernel 必须能跑任意 group_lens；当前 HK BF16 grouped\n"
-    "       launcher 只接受均匀 M-per-group，是 launcher 实现细节，所以 `execute` 用\n"
-    "       `_uniform_group_m` 做 *fast-path detection*（detect 不到 → per-group `dense_run`\n"
-    "       fallback），**不是 reject**。\n"
+    "       → 整段 geomean 塌掉。HK kernel 必须用**单条 persistent grouped launch** 处理\n"
+    "       任意 group_lens（uniform 或非 uniform 都同一条路径），host 端不许判断、\n"
+    "       不许 fast-path/fallback 二分（重复参考上一条 uniform 严禁）。\n"
     "    2) **命名同样禁止传播 balanced 污染**：HK 仓库 BF16 .so 当前暴露的 `grouped_*_balanced`\n"
     "       是历史遗留命名，Primus 内部已经统一别名为 `grouped_*`（loader 通过\n"
     "       `_resolve_grouped_attr` 兼容老 .so，新代码不暴露 `_balanced` 后缀）。任何**新加**\n"
@@ -163,12 +178,13 @@ DEFAULT_TASK = (
     "       不准带 `_balanced` 后缀；任何**新加**的 Primus 端 grouped API 也不准带 `_balanced` 后缀。\n"
     "       这条规则覆盖 BF16 grouped、新加的 FP8 grouped、未来一切 grouped 入口。\n"
     "  ✗ **grouped 路径严禁 multi-stream / per-group launch / cudaStream 池**（user 拍板）：\n"
-    "    1) **禁止**任何形式的 `for g in range(B): launch_dense_kernel(...)` 一组一发，\n"
-    "       哪怕是分摊到 `torch.cuda.Stream()` 池里『并行』也不准。这是当前 Primus 端\n"
-    "       `GroupedGEMMFP8HipKittenBackend.execute` 的 fallback 路径，必须**整体替换**\n"
-    "       为单次 launch 的 persistent kernel（见第五刀）。MI355X 有 256 个 CU + 8 个 XCD，\n"
-    "       一个 persistent kernel 单次 launch 用满 256 个 program 就能 saturate；切多 stream\n"
-    "       既增加 host overhead 又破坏 XCD chiplet 调度。\n"
+    "    1) **禁止**任何形式的 `for g in range(B): launch_dense_kernel(...)` 一组一发 ——\n"
+    "       不论 uniform 还是非 uniform，不论 fast-path 还是 fallback，**唯一允许**的\n"
+    "       grouped 入口是 single-launch persistent grouped kernel（kernel 内部消费\n"
+    "       `group_offs`）。哪怕分摊到 `torch.cuda.Stream()` 池『并行』也不准。MI355X\n"
+    "       有 256 个 CU + 8 个 XCD，一个 persistent kernel 单次 launch 用满 256 个\n"
+    "       program 就能 saturate；切多 stream 既增加 host overhead 又破坏 XCD chiplet\n"
+    "       调度。\n"
     "    2) **禁止**给 HK kernel binding 加 `stream` 参数 / `hipStream_t` 透传 / device-side\n"
     "       stream pool —— 这是 multi-stream 的前置铺垫。HK 仓库 BF16/FP8 binding 只接受\n"
     "       默认流（hipStream_t = 0）；如果 Primus 在非默认流上调用，是 Primus 端的责任在\n"
@@ -195,17 +211,26 @@ DEFAULT_TASK = (
     "  - /workspace/code/Primus-Turbo —— dispatch 仓：写 `select_default_config` 的通用规则\n"
     "    + can_handle 硬约束检查；不写形状表。\n\n"
     "**FROZEN（不可修改）**：\n"
-    "  - scripts/_metric_hk_ratio.py / scripts/auto_optimize.py / scripts/run_dod_metric.sh\n"
+    "  - scripts/_metric_grouped_only.py / scripts/_metric_hk_ratio.py / scripts/auto_optimize.py /\n"
+    "    scripts/run_dod_metric.sh（任何 metric / 调度脚本都属于 FROZEN，agent 不许动）\n"
     "  - tests/pytorch/ops/test_*.py（不能加 skip / 删 parametrize / 调 SNR 阈值）\n"
-    "  - benchmark/ops/config.py（shape ground truth）\n"
+    "  - benchmark/ops/config.py / benchmark/ops/bench_grouped_gemm_turbo.py（shape ground truth）\n"
     "  - /root/.cursor/skills/hipkittens-primus-turbo-backend/SKILL.md"
 )
-# Loop metric: real benchmark of HIPKITTEN vs default-backend TFLOPS on a
-# fixed 16-shape LLM-typical suite (BF16 + FP8 tensorwise dense). Score is
-# int(geomean(hk_tflops / ref_tflops) * 1000); target >= 900 (= 90%).
-# HIPKITTEN reject -> ratio clipped to 0.01 -> ~100x geomean penalty so the
-# agent can't game the score by narrowing can_handle. ~10s wall.
-DEFAULT_METRIC_CMD = "python3 scripts/_metric_hk_ratio.py"
+# Loop metric: focused grouped-only benchmark of HIPKITTEN vs TRITON on the
+# 16 MoE shape suite (DeepSeek-V3 + gpt_oss_20B), measured for both BF16
+# grouped GEMM and FP8 tensorwise grouped GEMM (32 cases). Score is
+# int(weighted_geomean(min(g_i/1.20, 1.0)) * 1000); 1000 = both sections
+# at >= 1.20x TRITON (= PASS). HIPKITTEN reject clips that shape's ratio
+# to 0.01 — section geomean drops sharply, agent can't game by narrowing
+# can_handle. ~15-25s wall.
+#
+# The 6-segment dense+grouped metric (scripts/_metric_hk_ratio.py) is
+# preserved for backward compat / future runs that re-include dense GEMM
+# objectives. For the current run the user has scoped the work to
+# grouped GEMM kernels only — measuring dense sections every round
+# would just waste cycles and add noise.
+DEFAULT_METRIC_CMD = "python3 scripts/_metric_grouped_only.py"
 # Final acceptance is the full DoD pytest suite (all 4 files, both default and
 # --deterministic-only). Too slow for every round; the agent / user runs this
 # occasionally to confirm we haven't regressed the broader sweeps. Empty by
@@ -275,12 +300,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    p.add_argument("--rounds", type=int, default=80, help="Maximum number of optimization rounds.")
+    p.add_argument("--rounds", type=int, default=40, help="Maximum number of optimization rounds.")
     p.add_argument(
         "--patience",
         type=int,
-        default=5,
-        help="Stop early once this many consecutive rounds end without metric improvement.",
+        default=8,
+        help=(
+            "Stop early once this many consecutive rounds end without metric improvement. "
+            "Default 8 (was 5): writing a new persistent grouped HK kernel typically spans "
+            "3-5 rounds (write .cpp → compile → numerical probe → fix → re-bench) before "
+            "the metric reflects the win, so a tight patience prematurely kills long tasks."
+        ),
     )
     p.add_argument(
         "--min-delta",
@@ -331,7 +361,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--metric-name",
         type=str,
-        default="hk_ratio_score",
+        default="grouped_only_score",
         help="Human-readable metric label (used in logs only).",
     )
     p.add_argument(
@@ -370,6 +400,17 @@ def parse_args() -> argparse.Namespace:
             "Seconds to allow each DoD checkpoint (default 60 min). "
             "Full 4-file pytest with -n=#idle-pool-GPUs can legitimately "
             "take 40+ min on a busy box."
+        ),
+    )
+    p.add_argument(
+        "--dod-strict",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, EARLY-STOP the run when a DoD checkpoint regresses "
+            "(score < 0). Default is OFF — DoD score is informational only "
+            "(recorded in summary.json + dod_checkpoints, surfaced to the "
+            "agent prompt) so a pre-existing red baseline can't kill the run."
         ),
     )
     p.add_argument(
@@ -436,9 +477,42 @@ def parse_args() -> argparse.Namespace:
         help="Additional text appended to every round's prompt (e.g. extra constraints).",
     )
     p.add_argument(
+        "--focus-model",
+        type=str,
+        default="all",
+        choices=["all", "gpt_oss", "deepseek", "dsv3"],
+        help=(
+            "Which model's shapes drive the score / Goals geomean. 'all' (default) "
+            "counts both DSV3 and gpt_oss; 'gpt_oss' / 'deepseek' restricts the "
+            "geomean to that model only. The other model is still benchmarked + "
+            "correctness-checked every round (visible as [watch] rows in the metric "
+            "table) so silent regressions on the un-focused model still surface in "
+            "stderr — they just don't move the score. Use to spend rounds on the "
+            "model whose gap-to-target dominates without distractor cycles on the "
+            "well-tuned path. Propagates as METRIC_MODEL_FILTER env to the metric."
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Skip cursor-agent invocations, just measure the metric N times. Useful for testing.",
+    )
+    p.add_argument(
+        "--resume-state",
+        type=str,
+        default="",
+        help=(
+            "Path to a previous run's summary.json. When set, the loop:\n"
+            "  - Skips the startup baseline metric measurement\n"
+            "  - Restores baseline_metric / best_metric / best_sha / rounds list /\n"
+            "    last_dod_score / last_dod_sha from the file\n"
+            "  - Continues the round counter past the saved rounds_run (so logs go\n"
+            "    into round_006, round_007, ... instead of overwriting)\n"
+            "Use case: bumping --rounds / --patience mid-run without losing 1h+ of\n"
+            "metric history and HK commits. Chat session_id is NOT restored — the\n"
+            "next round cold-starts a new cursor-agent chat (which is fine since the\n"
+            "agent reads git log + task body to recover context)."
+        ),
     )
     return p.parse_args()
 
@@ -662,18 +736,37 @@ def _build_resume_prompt(
     else:
         gpu_line = ""
 
+    focus_resume_block = ""
+    focus_pick_hint = ""
+    if args.focus_model and args.focus_model != "all":
+        focus_resume_block = (
+            f"\n【focus={args.focus_model}】metric score 只统计 {args.focus_model} 段；DSV3 / 另一段在表里以 [watch] 出现，"
+            f"不计入 score 但 correctness FAIL 仍是硬错误。**不要再啃未 focus 那段的 kernel** —— score 不奖励。"
+        )
+        focus_pick_hint = (
+            f"  ⚠️ focus={args.focus_model}：选攻坚 shape 时**只看不带 [watch] 的行**。"
+        )
+
     dod_line = ""
     if args.dod_every > 0 and state.last_dod_score is not None:
+        if args.dod_strict:
+            dod_tail = f"提醒：每 {args.dod_every} 轮自动跑一次，failed > 0 立刻 EARLY-STOP。"
+        else:
+            dod_tail = (
+                f"提醒：每 {args.dod_every} 轮自动跑一次，仅作参考记录，不会 EARLY-STOP；"
+                f"但 failed 数应尽量收敛。"
+            )
         dod_line = (
             f"上次 DoD={state.last_dod_score} (sha {(state.last_dod_sha or '')[:8]}). "
-            f"提醒：每 {args.dod_every} 轮自动跑一次，failed > 0 立刻 EARLY-STOP。"
+            f"{dod_tail}"
         )
 
     return f"""【第 {round_idx} / {args.rounds} 轮 — 接续上一轮 chat】
 本 chat session 已运行 {state.chat_round_count + 1} 轮 / {chat_age_min:.0f} 分钟（窗口上限
-{args.reuse_chat_window_secs / 60:.0f} 分钟，超过会换新 chat）。你已知道 task / 6 段目标 /
-FROZEN 列表 / phased 路线 / 严禁假优化清单 —— **不要重新读 SKILL.md，不要重 quote 上面这些**，
-直接干活。如果你忘了某条规则，自己回去翻本 chat 历史，不要再让用户复述。
+{args.reuse_chat_window_secs / 60:.0f} 分钟，超过会换新 chat）。你已知道 task body / 优化方向 /
+FROZEN 列表 / 严禁假优化清单（host-pad / uniform 判断 / per-group launch / CPU sync 等）——
+**不要重新读 SKILL.md，不要重 quote 上面这些**，直接干活。如果你忘了某条规则，
+自己回去翻本 chat 历史，不要再让用户复述。
 
 【本轮数据增量】
 - Primus-Turbo HEAD: {head_sha}
@@ -692,15 +785,18 @@ FROZEN 列表 / phased 路线 / 严禁假优化清单 —— **不要重新读 S
 
 【working tree 状态】
 {short_status or "(干净)"}
-
+{focus_resume_block}
 【本轮指令】
 1. 第一步：跑 metric `{args.metric_cmd} 2>&1 | tee /tmp/metric_round_{round_idx}.log`，
-   看 stderr 表里 ratio 最低 + 权重最高的 shape (grp_FP8 / grp_BF16 weight=4，
-   FP8_fwd / FP8_bwd weight=2，BF16_fwd / BF16_bwd weight=1). 选 1 个攻坚目标。
+   看 stderr 表里 ratio < target 的 shape，按 ratio 升序选 1 个攻坚目标 ——
+   不许凭印象选 shape，必须用本轮 metric 数据决定。{focus_pick_hint}
 2. 你**记得**上一轮在做什么 —— 如果是跨轮长任务（写 HK .cpp kernel / 编译 / 数值 probe），
    continue 那条主线，不要换方向。如果上一轮已 commit 完整工作，再选新目标。
 3. 改完跑 metric 验证，再 commit。每仓库最多 1 commit/轮。
-4. 末尾 markdown 小结：本轮目标 / 改了什么 / before-after metric / commit SHA / 下一轮建议。
+4. **backward 改动**（dB / dA / variable-K）metric 看不到 —— 必须自跑
+   `bench_grouped_gemm_turbo.py --dtype {{bf16,fp8}}`，把 fwd+bwd TFLOPS 和
+   correctness 贴进 commit message。
+5. 末尾 markdown 小结：本轮目标 / 改了什么 / before-after metric / commit SHA / 下一轮建议。
 
 {args.prompt_extra}"""
 
@@ -778,19 +874,53 @@ def build_prompt(
             if state.last_dod_score is not None
             else "尚未跑过 DoD checkpoint"
         )
+        if args.dod_strict:
+            gate_line = (
+                f"它跑 curated DoD smoke regression set（test_dod_smoke.py，约 610 cases，dense + "
+                f"grouped 全覆盖），任何 failed > 0 都会让脚本立刻 EARLY-STOP。\n"
+            )
+            commit_warn = (
+                f"    后再 commit；否则脚本下次 checkpoint 会因为你的改动 EARLY-STOP，整个 run 报废。\n"
+            )
+        else:
+            gate_line = (
+                f"它跑 curated DoD smoke regression set（test_dod_smoke.py，约 610 cases，dense + "
+                f"grouped 全覆盖），分数仅作参考记录到 summary.json，不会 EARLY-STOP（baseline\n"
+                f"已经红的 case 不影响整轮自动化）。但 failed 数仍是回归信号，请尽量收敛。\n"
+            )
+            commit_warn = (
+                f"    后再 commit。脚本不再因 DoD 红而停，但 failed 数会写进 summary.json + 下轮 prompt，\n"
+                f"    便于追踪你这轮是否引入了新回归。\n"
+            )
         dod_block = (
             f"\n【DoD 检查点（每 {args.dod_every} 轮自动跑一次，不需要你手动跑）】\n"
             f"脚本会在第 {args.dod_every}, {2*args.dod_every}, ... 轮结束后自动执行：\n"
             f"  {args.dod_cmd}\n"
-            f"它跑 4 文件全套 pytest（test_gemm{{,_fp8}}, test_grouped_gemm{{,_fp8}}），"
-            f"任何 failed > 0 都会让脚本立刻 EARLY-STOP。所以你 commit 的时候要小心：\n"
-            f"  - 如果你的改动只触及 HIPKITTEN 路径（grouped_gemm_impl.GroupedGEMMHipKittenBackend、"
-            f"gemm_fp8_impl.GEMMFP8HipKittenBackend、kernels/hipkitten/* 等），快 metric 通常足够。\n"
-            f"  - 如果你触及任何**共用代码**（autograd 入口、dispatcher、quantize_fp8_*、"
-            f"grouped_gemm.py 顶层、torch.library custom_op 注册等），你**必须**怀疑会影响"
-            f"非 HIPKITTEN 后端，主动跑一次 `{args.dod_cmd}`（约 5-10 分钟）确认 0 failed 后再 commit；"
-            f"否则脚本下次 checkpoint 会因为你的改动 EARLY-STOP，整个 run 报废。\n"
+            f"{gate_line}"
+            f"本 run 任务范围**只**是 grouped GEMM (BF16 + FP8)，但 smoke 还是测了 dense ——\n"
+            f"为了兜住跨 backend 共用代码（autograd 入口、dispatcher、quantize_fp8、torch.library\n"
+            f"custom_op 注册等）的意外回归。所以 commit 的时候要小心：\n"
+            f"  - 改动**只**触及 grouped HIPKITTEN 路径（grouped_gemm_impl.py / grouped_gemm_fp8_impl.py /\n"
+            f"    kernels/hipkitten/grouped*）：快 metric 通常足够。\n"
+            f"  - 改动触及任何**共用代码**（autograd / dispatcher / quantize_fp8 / grouped_gemm.py 顶层 /\n"
+            f"    custom_op 注册）：必须自己跑一次 `{args.dod_cmd}`（约 5-10 分钟）确认 0 failed\n"
+            f"{commit_warn}"
             f"  - {last_dod_line}\n"
+        )
+
+    focus_block = ""
+    if args.focus_model and args.focus_model != "all":
+        focus_block = (
+            f"\n【**本 run 焦点：`{args.focus_model}`**（user 拍板，metric 已切到 focused 模式）】\n"
+            f"metric 的 score / Goals geomean **只统计 {args.focus_model} shapes**，另一段（DSV3 或\n"
+            f"gpt_oss）虽然每轮仍然跑 + correctness check，但在 stderr 表里被打 `[watch]` 标签、\n"
+            f"**不计入 score**。这意味着：\n"
+            f"  • 本轮选攻坚 shape 时**只看不带 [watch] 的行**；DSV3 ratio 怎么动都不影响 score。\n"
+            f"  • 但 **[watch] correctness FAIL 仍是硬错误** —— 不许为了 focused 段提分而让\n"
+            f"    DSV3 数值跑挂；watch 段 `correct_fail > 0` 一定要修。\n"
+            f"  • 不许动 metric / shape suite 把 [watch] 行删掉来 fake 提速 —— FROZEN 列里都标了。\n"
+            f"  • 接续旧 chat 的轮里如果 agent 又开始啃**未 focus 那段**的 kernel（典型：BF16 RRR\n"
+            f"    K-tail fuse），先停手；本 run 的 score 不再奖励那条线。\n"
         )
 
     return f"""你是 HipKittens × Primus-Turbo 联合优化协作者。本次是第 {round_idx} / {args.rounds} 轮，由脚本自动调度。
@@ -806,26 +936,37 @@ def build_prompt(
 
 【优化目标】
 {args.task}
-
+{focus_block}
 【本轮的快速验收命令】
-metric 命令（约 10-30 秒、单 GPU、自动选空闲卡）：
+metric 命令（grouped-only，约 15-25 秒、单 GPU、自动选空闲卡）：
   {args.metric_cmd}
-含义：在 48 个 LLM 典型 shape（BF16/FP8 dense fwd+bwd 各 8 + BF16 grouped 16）上跑
-HIPKITTEN vs reference 的 TFLOPS 实测。score = int(geomean²(hk/ref) × 1000)。
-**新架构下 HIPKITTEN 不应该 reject 任何 shape** —— select_default_config 永远返回 cfg，
-kernel 永远能跑。reject 一个 shape → ratio clip 0.01 → geomean 大幅下跌，所以收紧
-can_handle 反而扣分。新架构下，本轮的真实压力来自 (a) dispatch overhead 是否清掉、
-(b) HK kernel 跟 reference 的相对速度。
+metric 跑的 shape 数 / score 公式 / target —— 看 task body。**通用规则**：
+  • score 越高越好；1000 = 全部 PASS；< 1000 = 还有段没到 target。
+  • HIPKITTEN reject（raise / NaN / Inf）会让那个 shape 的 ratio clip 到 0.01 →
+    geomean 大跌 → 段权重放大冲击。**收紧 can_handle 排除难 shape = 扣分**。
+  • 真实压力来自 (a) HK kernel 相对 reference 的速度 + (b) dispatch / quantize /
+    launch overhead 是否清掉。
 
 【**首要数据源** — metric 的 stderr 表】
-metric 命令的 stderr 会打印一张逐 shape 表，列出 dtype / (M,N,K) / hk_tflops / ref_tflops /
-ratio / status。**本轮第一步先跑一次 metric**，从那张表里找出 ratio < 0.9 的 shape，
-按 ratio 升序选 1 个作为本轮攻坚目标。**不许凭印象选 shape**，必须用上一轮 metric 数据。
+metric 命令的 stderr 会打印一张逐 shape 表，列出 name / hk_tflops / ref_tflops / ratio /
+status，以及每段 geomean + Goals: PASS/FAIL 块。**本轮第一步先跑一次 metric**，
+从那张表里找出 ratio < target 的 shape，按 ratio 升序选 1 个作为本轮攻坚目标。
+**不许凭印象选 shape**，必须用上一轮 metric 数据决定。
 跑命令：`{args.metric_cmd} 2>&1 | tee /tmp/metric_round_{round_idx}.log`。
 **改完一次、commit 前一次** —— 不要每改一行都跑。
+
+【grouped backward 验证（agent 自查，不归 metric）】
+本 metric 只测 grouped FORWARD（追求快）。任何动 backward 路径（dB / dA / variable-K）
+的改动，agent **必须**自己跑：
+  PRIMUS_TURBO_HIPKITTEN_PATH=/workspace/code/HipKittens \\
+  PRIMUS_TURBO_GROUPED_GEMM_BACKEND=HIPKITTEN \\
+    python3 benchmark/ops/bench_grouped_gemm_turbo.py --dtype bf16 --output /tmp/hk_bf16.csv
+  （fp8 同理）—— bench 含 fwd + bwd + correctness check (allclose / SNR)。
+fwd-OK 但 bwd-broken 的回归 metric 看不到，所以 backward 改动**必须**贴 bench 输出
+到 commit message 才算交付。
 {dod_block}
 
-【度量指标】指标名: {args.metric_name}（数值越高越好；900 = 90% 是 DoD）
+【度量指标】指标名: {args.metric_name}（数值越高越好；1000 = 全部段 PASS）
 - 基线 (优化开始前) = {baseline_metric}
 - 历史最佳 = {state.best_metric}
 - 上一轮 = {last_metric}（improved={last_improved}）
@@ -1254,6 +1395,21 @@ def main() -> int:
         print("cursor-agent not on PATH; install Cursor CLI first", file=sys.stderr)
         return 2
 
+    # Propagate focus to the metric subprocess via env var (the metric reads
+    # METRIC_MODEL_FILTER directly). Setting in os.environ here means
+    # _subprocess_env_with_pinned_gpu's os.environ.copy() picks it up
+    # automatically, no need to thread the flag through run_metric.
+    if args.focus_model and args.focus_model != "all":
+        os.environ["METRIC_MODEL_FILTER"] = args.focus_model
+        print(
+            f"[focus] METRIC_MODEL_FILTER={args.focus_model} "
+            f"(score / Goals geomean restricted to {args.focus_model} shapes; "
+            "other model still benchmarked + correctness-gated as [watch])",
+            flush=True,
+        )
+    else:
+        os.environ.pop("METRIC_MODEL_FILTER", None)
+
     skill_path = Path(args.skill_path)
     if not skill_path.exists():
         print(
@@ -1275,20 +1431,73 @@ def main() -> int:
         print(f"[gpu-pool] HIPKITTEN_GPU_POOL={args.gpu_pool}", flush=True)
 
     state = TrajectoryState()
-    baseline = None
+    baseline: Optional[float] = None
+    round_offset = 0
 
-    try:
-        banner(f"AUTO-OPTIMIZE start | rounds={args.rounds} | patience={args.patience} | log_dir={log_dir}")
-        section("baseline metric")
-        baseline = run_metric(
-            args.metric_cmd, str(workspace), args.metric_timeout,
-            gpu_pool=args.gpu_pool,
-        )
-        state.best_metric = baseline
-        state.best_sha = get_head_sha(str(workspace))
+    if args.resume_state:
+        try:
+            saved = json.loads(Path(args.resume_state).read_text())
+        except Exception as exc:
+            print(f"--resume-state {args.resume_state} unreadable: {exc}", file=sys.stderr)
+            return 2
+        baseline = saved.get("baseline_metric")
+        state.best_metric = saved.get("best_metric")
+        state.best_sha = saved.get("best_sha")
+        state.last_dod_score = saved.get("last_dod_score")
+        state.last_dod_sha = saved.get("last_dod_sha")
+        state.dod_checkpoints = list(saved.get("dod_checkpoints") or [])
+        for r_dict in saved.get("rounds") or []:
+            state.rounds.append(RoundResult(
+                index=r_dict["index"],
+                started_at=r_dict["started_at"],
+                finished_at=r_dict["finished_at"],
+                duration_s=r_dict["duration_s"],
+                metric=r_dict.get("metric"),
+                best_so_far=r_dict.get("best_so_far"),
+                improved=r_dict.get("improved", False),
+                head_sha_before=r_dict.get("head_sha_before", ""),
+                head_sha_after=r_dict.get("head_sha_after", ""),
+                cursor_exit_code=r_dict.get("cursor_exit_code", 0),
+                log_dir=r_dict.get("log_dir", ""),
+            ))
+        round_offset = saved.get("rounds_run", len(state.rounds))
+        # Reconstruct rounds_without_improvement by tail-counting non-improving
+        # rounds at the end of the restored history.
+        streak = 0
+        for r in reversed(state.rounds):
+            if r.improved:
+                break
+            streak += 1
+        state.rounds_without_improvement = streak
         write_summary(summary_path, args, state, baseline)
 
-        for i in range(1, args.rounds + 1):
+    try:
+        if args.resume_state:
+            remaining = max(args.rounds - round_offset, 0)
+            banner(
+                f"AUTO-OPTIMIZE RESUME | restored {round_offset} rounds | "
+                f"--rounds={args.rounds} (absolute cap; running rounds "
+                f"{round_offset + 1}..{args.rounds}, {remaining} more) | "
+                f"patience={args.patience} | streak={state.rounds_without_improvement} | "
+                f"baseline={baseline} | best={state.best_metric} | log_dir={log_dir}"
+            )
+            if remaining <= 0:
+                banner(f"AUTO-OPTIMIZE: --rounds {args.rounds} <= already-run {round_offset}, nothing to do.")
+                return 0
+            range_iter = range(round_offset + 1, args.rounds + 1)
+        else:
+            banner(f"AUTO-OPTIMIZE start | rounds={args.rounds} | patience={args.patience} | log_dir={log_dir}")
+            section("baseline metric")
+            baseline = run_metric(
+                args.metric_cmd, str(workspace), args.metric_timeout,
+                gpu_pool=args.gpu_pool,
+            )
+            state.best_metric = baseline
+            state.best_sha = get_head_sha(str(workspace))
+            write_summary(summary_path, args, state, baseline)
+            range_iter = range(1, args.rounds + 1)
+
+        for i in range_iter:
             # Decide whether to resume the previous chat or cold-start a new
             # one. Cold-start when (a) no chat yet, (b) last cursor invocation
             # didn't return a session_id (failure / signaled before init), or
@@ -1435,17 +1644,29 @@ def main() -> int:
                     "log_path": str(dod_log.relative_to(log_dir.parent)),
                     "at": now_iso(),
                 })
-                if dod_score is not None and dod_score >= 0:
+                # ``last_dod_score`` / ``last_dod_sha`` always track the most
+                # recent checkpoint (green or red) so the next-round prompt
+                # can surface "you're at score=X" regardless. The early-stop
+                # decision (gated by --dod-strict) is made separately below.
+                if dod_score is not None:
                     state.last_dod_score = dod_score
                     state.last_dod_sha = sha_after
                 write_summary(summary_path, args, state, baseline)
-                if dod_score is None or dod_score < 0:
+                regressed = dod_score is None or dod_score < 0
+                if regressed and args.dod_strict:
                     banner(
                         f"EARLY-STOP: DoD checkpoint regressed (score={dod_score}, rc={dod_rc}) "
-                        f"after round {i}. Last green DoD SHA = {state.last_dod_sha or '(never green)'}. "
+                        f"after round {i}. --dod-strict was set. "
                         f"Inspect {dod_log} for details."
                     )
                     return 0
+                if regressed:
+                    banner(
+                        f"DoD checkpoint regressed after round {i} "
+                        f"(score={dod_score}, rc={dod_rc}) — recorded as informational; "
+                        f"continuing because --dod-strict is OFF. "
+                        f"Inspect {dod_log} for details."
+                    )
 
             if state.rounds_without_improvement >= args.patience:
                 banner(
