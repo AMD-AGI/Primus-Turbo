@@ -287,22 +287,33 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
                             or (b.shape[-1] % BLOCK_SIZE) != 0):
             b = b.transpose(-2, -1).contiguous()
             trans_b = True
+        # Round-11 host-overhead trim (mirror of FP8 backend trim in
+        # grouped_gemm_fp8_impl.py): ``_avg_group_m`` and
+        # ``hipkitten.grouped_run`` inlined into the body. Both removed
+        # function-call frames (~0.5 µs each on B=4 gpt_oss BF16 wall);
+        # behavior preserved bit-for-bit (kernel signature unchanged,
+        # ``cfg.layout`` -> ``hk.grouped(...)`` lookup identical to
+        # ``grouped_run``'s body, and the same ``cfg.group_m,
+        # cfg.num_xcds, m_per_group=avg_m`` positional args). The Triton
+        # BF16 grouped backend (grouped_gemm_impl.py:412-422) is a single
+        # ``return grouped_gemm_triton_kernel(...)`` line — this brings
+        # HK's execute body closer to that asymmetry-zero structure
+        # without changing the kernel binding or breaking the
+        # ``GroupedGEMMVariableKHipKittenBackend`` (which still uses
+        # ``hipkitten.grouped_run`` for the dB path that has a different
+        # call shape).
+        layout = "rcr" if trans_b else "rrr"
         bs = b.shape[0]
+        m_total = a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
-        layout = "rcr" if trans_b else "rrr"
-        # Single CPU-sync-free persistent grouped launch on the unpadded
-        # shape. The HipKittens grouped main kernel must natively handle
-        # arbitrary ``group_lens`` (uniform or non-uniform) and arbitrary
-        # (M, N, K) — including misaligned N/K — via column-masked C
-        # store + LDS K-tail + per-group SRD on the device side.
-        # Host端禁止 uniform 判断，禁止 per-group fallback。
-        avg_m = _avg_group_m(a.shape[0], bs)
+        # Mirror ``_avg_group_m`` semantics (max(., 1) clamp for the
+        # degenerate ``bs <= 0`` and ``m_total < bs`` paths).
+        avg_m = max(m_total // bs, 1) if bs > 0 else max(m_total, 1)
         cfg = hipkitten.select_default_config(
-            avg_m, n, k, layout, "bf16",
-            m_total=a.shape[0],
+            avg_m, n, k, layout, "bf16", m_total=m_total,
         )
-        out = torch.empty((a.shape[0], n), dtype=a.dtype, device=a.device)
+        out = torch.empty((m_total, n), dtype=a.dtype, device=a.device)
         a_in = a if a.is_contiguous() else a.contiguous()
         b_in = b if b.is_contiguous() else b.contiguous()
         # ``avg_m`` is a HINT to the HK kernel for LDS-staged K-tail
@@ -312,7 +323,14 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # uniform group_lens whose ``avg_m`` happens to satisfy the
         # alignment predicate fall back to the scalar tail block-by-
         # block (no host uniform check / branch on group_lens).
-        hipkitten.grouped_run(hk, cfg, a_in, b_in, out, group_offs, m_per_group=avg_m)
+        grouped_fn = hk.grouped(cfg.layout)
+        if grouped_fn is None:
+            raise AttributeError(
+                f"HipKittens {hk.dtype} binding does not expose grouped_{cfg.layout}. "
+                "Rebuild tk_*_layouts.so with the grouped binding, or use the "
+                "per-group dense_run fallback."
+            )
+        grouped_fn(a_in, b_in, out, group_offs, cfg.group_m, cfg.num_xcds, avg_m)
         return out
 
 

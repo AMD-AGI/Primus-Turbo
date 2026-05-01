@@ -364,33 +364,70 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
                             or (b.shape[-1] % BLOCK_SIZE) != 0):
             b = b.transpose(-2, -1).contiguous()
             trans_b = True
+        # Round-11 (sha 17a62c8d → this commit) host-overhead trim: the
+        # current execute body adds ~4.8 µs of pure-Python work over the
+        # raw kernel call (probe `/tmp/probe_hk_layers.py` — same probe
+        # path documented in the commit body). For B=4 gpt_oss FP8 cases
+        # (T_HK_impl ≈ 130-200 µs, T_HK_kernel ≈ 120-190 µs) that 4.8 µs
+        # is 2.4-3.7 % of total wall and shows up directly as a ratio
+        # gap vs Triton (Triton's execute body is 0.04 µs — see
+        # `/tmp/probe_trt_layers.py`). The trims below are bit-identical
+        # (verified at /tmp/probe_execute_cleanup.py: max_abs_diff=0.0,
+        # bit_eq=True over the 4 metric gpt_oss FP8 shapes); each rests
+        # on a tighter caller contract:
+        #
+        #   (a) ``_resolve_fp8_scales`` skipped on the dscale fast path —
+        #       FP8 tensorwise scales come from ``quantize_fp8(...,
+        #       TENSORWISE)`` which always returns numel==1 / fp32 /
+        #       contiguous / cuda tensors (hot path in
+        #       ops/grouped_gemm_fp8.py:306-307 forward,
+        #       :340 backward grad_a). The 8-condition check inside
+        #       ``_resolve_fp8_scales`` is ~0.42 µs of redundant work
+        #       (each condition evaluates True by construction). The
+        #       fallback host-scalar branch is preserved for the (rare)
+        #       case where the binding doesn't expose ``_dscale``.
+        #   (b) ``hk.grouped(layout)`` lookup deferred into the (rare)
+        #       fallback branch — the dscale path doesn't use it; saves
+        #       one attribute access (~0.05 µs) and removes the dead
+        #       error path from the hot trace.
+        #   (c) ``_avg_group_m`` inlined — single ``//`` arithmetic, no
+        #       function call frame (~0.10 µs).
+        #
+        # Net measured saving on B=4-M2048 FP8 (the dominant gpt_oss B=4
+        # ratio gap): T_HK_impl 192.20 → 191.36 µs (-0.84 µs ≈ -0.4pp
+        # ratio); same magnitude on the 7 sibling FP8 shapes
+        # (B=32-M4096 -0.96 µs ≈ -0.05pp absolute, but every shape
+        # contributes to the geomean).
+        #
+        # The Python contract preserved by the trim:
+        #   - kernel signatures unchanged (still takes m_per_group
+        #     hint + num_xcds). Bindings .so untouched.
+        #   - ``is_contiguous()`` checks kept (input contract violation
+        #     is already a kernel-level bug, but keep the defensive
+        #     copy as an escape valve for future callers).
+        #   - dscale fallback path keeps the original ``_resolve_fp8_scales``
+        #     8-check + dual-fn lookup so any binding that doesn't ship
+        #     the ``_dscale`` symbol still works (host scalar pass-through).
+        layout = "rcr" if trans_b else "rrr"
         bs = b.shape[0]
+        m_total = a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[1]
-        layout = "rcr" if trans_b else "rrr"
-        sa_h, sb_h, sa_d, sb_d = _resolve_fp8_scales(
-            a_scales, b_scales, hipkitten.fp8_has_dscale(hk, layout)
-        )
-        # Single CPU-sync-free persistent grouped launch on the unpadded
-        # shape. The HK FP8 grouped main kernel must natively handle
-        # arbitrary group_lens AND arbitrary (N, K) — including
-        # misaligned — via column-masked C store, LDS K-tail, and
-        # per-group SRD on the device side. Host端禁止 uniform 判断、
-        # 禁止 per-group fallback 路径。
-        grouped_fn = hk.grouped(layout)
+        # Mirror ``_avg_group_m`` semantics (max(., 1) clamp for the
+        # degenerate ``bs <= 0`` and ``m_total < bs`` paths).
+        avg_m = max(m_total // bs, 1) if bs > 0 else max(m_total, 1)
+        # Hot path: dscale binding present AND tensorwise scales sit on
+        # the device side (which they do by construction — see comment
+        # (a) above; the ``a_scales.is_cuda`` guard preserves the
+        # original ``_resolve_fp8_scales`` behavior of falling back to
+        # the host-scalar path when a caller passes CPU scales, even
+        # though no in-tree caller does so today).
         grouped_dscale_fn = hk.grouped_dscale(layout)
-        if grouped_fn is None:
-            raise RuntimeError(
-                f"HipKittens FP8 binding lacks grouped_{layout}; "
-                "rebuild tk_fp8_layouts.so with the persistent grouped kernel "
-                "for this layout."
-            )
-        avg_m = _avg_group_m(a.shape[0], bs)
+        use_dscale = grouped_dscale_fn is not None and a_scales.is_cuda
         cfg = hipkitten.select_default_config(
-            avg_m, n, k, layout, "fp8",
-            m_total=a.shape[0],
+            avg_m, n, k, layout, "fp8", m_total=m_total,
         )
-        out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
+        out = torch.empty((m_total, n), dtype=out_dtype, device=a.device)
         a_in = a if a.is_contiguous() else a.contiguous()
         b_in = b if b.is_contiguous() else b.contiguous()
         # Round-13: ``m_per_group=avg_m`` is a host hint consumed by the
@@ -411,12 +448,29 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # overrides for shapes where a non-default xcds is empirically
         # better (mirrors BF16 grouped's tunable num_xcds path).
         xcds_arg = cfg.num_xcds if cfg.num_xcds is not None else 0
-        if grouped_dscale_fn is not None and sa_d is not None and sb_d is not None:
+        if use_dscale:
             grouped_dscale_fn(
-                a_in, b_in, out, sa_d, sb_d, group_offs, cfg.group_m,
+                a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
                 m_per_group=avg_m, num_xcds=xcds_arg,
             )
         else:
+            # Fallback: dscale binding not present (older .so without the
+            # _dscale symbol) OR scales are on CPU. Use the host-scalar
+            # path which materializes ``a_scales * b_scales`` via
+            # ``.item()`` (one CPU sync per call — acceptable here
+            # because this branch is taken only when the kernel build
+            # doesn't expose the device-pointer path or when caller
+            # explicitly passes CPU scales).
+            grouped_fn = hk.grouped(layout)
+            if grouped_fn is None:
+                raise RuntimeError(
+                    f"HipKittens FP8 binding lacks grouped_{layout}; "
+                    "rebuild tk_fp8_layouts.so with the persistent grouped kernel "
+                    "for this layout."
+                )
+            sa_h, sb_h, _sa_d, _sb_d = _resolve_fp8_scales(
+                a_scales, b_scales, False
+            )
             grouped_fn(
                 a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m,
                 m_per_group=avg_m, num_xcds=xcds_arg,

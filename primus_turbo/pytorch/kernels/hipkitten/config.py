@@ -278,48 +278,312 @@ def select_default_config(
         ):
             if tiles_n == 22:  # GateUP N=5760
                 if m_total <= 8192:
-                    return HipKittenConfig(
-                        layout=layout, group_m=2, num_xcds=4, kernel=None
-                    )
-                if m_total <= 16384:
+                    # Round-9: refined from round-44/45/70's narrow 5-cell
+                    # `{(4,8), (1,4), (8,4), (2,4), (2,2)}` probe to (gm=2,
+                    # xcd=2) via a 60-cell `{1..32} × {1,2,4,8,16,32}` sweep
+                    # (/tmp/sweep_bf16_gateup_b4_m2048_round9.py) followed
+                    # by 1500-iter × 7-repeat p20 tight verify
+                    # (/tmp/verify_bf16_gateup_b4_m2048.py). The 200-iter
+                    # sweep top1 (gm=2, xcd=8) at +1.84pp turned out to be
+                    # measurement noise — at tighter REPEATS=7 p20 it sits
+                    # at -0.24pp vs baseline. Top-3 by p20 median:
+                    #
+                    #   cfg          p20 median   Δ vs (2, 4) baseline
+                    #   (2, 4)        1033.26 TF  baseline
+                    #   (2, 2)        1045.50 TF  +12.25 (+1.19pp)  *winner
+                    #   (1, 2)        1043.26 TF  +10.00 (+0.97pp)
+                    #   (16, 4)       1042.61 TF   +9.36 (+0.91pp)
+                    #   (4, 1)        1039.42 TF   +6.16 (+0.60pp)
+                    #   (4, 8) close3 1037.36 TF   +4.11 (+0.40pp)
+                    #   (2, 8) sweep1 1030.75 TF   -2.50 (-0.24pp)  *fake
+                    #
+                    # ``(gm=2, xcd=2)`` p20 spread 1044.5..1047.3 (2.8 TF
+                    # range across 7 trials) — wins by +2.2 TF over (1, 2)
+                    # and +2.9 TF over (16, 4), both gaps clear of cell
+                    # noise. Bit-identical output vs (2, 4) verified
+                    # (max_abs_diff=0.0, bit_eq=True; group_m / num_xcds
+                    # are pure scheduling knobs on the BF16 grouped RCR
+                    # persistent tile schedule).
+                    #
+                    # Rule scope check: ``tiles_n == 22 + tiles_m == 8 +
+                    # k == 2880 + m_total <= 8192`` matches only B=4
+                    # M=2048 in the metric (gpt_oss-GateUP family); the
+                    # m_total <= 16384 branch (B=4 M=4096) already returns
+                    # (gm=2, xcd=2) so this change makes both B=4 GateUP
+                    # cases use the same cfg — also makes the rule simpler
+                    # to read (consistency across the B=4 GateUP family).
                     return HipKittenConfig(
                         layout=layout, group_m=2, num_xcds=2, kernel=None
                     )
-                if m_total <= 65536:
+                if m_total <= 16384:
+                    # Round-21 re-tune for gpt_oss-GateUP-B4-M4096 BF16
+                    # (tiles_n=22, tiles_m=16, k=2880, m_total=16384).
+                    # Round-9 picked (gm=2, xcd=2) for *both* B=4 GateUP
+                    # cases (M=2048 m_total=8192 and M=4096 m_total=16384)
+                    # for "consistency". The post-round-19/20 BUFFER kernel
+                    # diverges these two — M=4096 (this branch) prefers a
+                    # larger gm × xcd=4 configuration; M=2048 (branch
+                    # above) keeps (gm=2, xcd=2) as the per-iter-sync
+                    # winner.
+                    #
+                    # PER-ITER-SYNC verify at /tmp/verify_bf16_metric_aligned.py
+                    # (60-iter × 5-trial p20 median; mirrors
+                    # `_metric_grouped_only.py::_time_op` 50-iter p20):
+                    #
+                    #   cfg          med_p20    spread%   Δ vs (2,2)
+                    #   (12, 4)       1204.53   0.78%    +20.68  +1.75%  *winner
+                    #   (8,  4)       1202.07   1.41%    +18.22  +1.54%
+                    #   (2,  8)       1193.94   1.26%    +10.09  +0.85%
+                    #   (16, 4)       1192.47   1.27%     +8.62  +0.73%
+                    #   (6,  4)       1191.22   1.12%     +7.37  +0.62%
+                    #   (2,  2)       1183.85   1.64%     +0.00   0.00%  ←round-9
+                    #
+                    # (gm=12, xcd=4) wins by +20.7 TF (+1.75%) over the
+                    # round-9 (gm=2, xcd=2) — the largest BF16 metric-
+                    # aligned win in the round-21 sweep on the GateUP
+                    # B=4 family. The (gm ∈ {8,12,16}, xcd=4) cluster
+                    # all sits 8-21 TF above (2, 2); (gm=12, xcd=4)
+                    # picked as the unique top by p20 (tighter spread
+                    # than (8, 4) at 0.78% vs 1.41%).
+                    #
+                    # Bit-identical output vs round-9 (gm=2, xcd=2)
+                    # implied by the round-9 commentary (group_m /
+                    # num_xcds are pure scheduling knobs on the BF16
+                    # grouped RCR persistent tile schedule).
+                    #
+                    # Rule scope unchanged: tiles_n=22 (n=5760) +
+                    # tiles_m=16 (m_per_group=4096) + k=2880 +
+                    # 8192 < m_total <= 16384 matches only B=4 M=4096
+                    # GateUP in the metric.
                     return HipKittenConfig(
-                        layout=layout, group_m=8, num_xcds=4, kernel=None
+                        layout=layout, group_m=12, num_xcds=4, kernel=None
                     )
-                # Round-70: gpt_oss-GateUP-B32-M4096 (tiles_n=22, tiles_m=16,
-                # k=2880, m_total=131072). Wider sweep over
-                # (group_m, num_xcds) ∈ {1..24} × {1, 2, 4, 8, 16, 32}
-                # at /tmp/sweep_round1.py and /tmp/verify_round1.py
-                # (200-iter × p20 verify) shows num_xcds=2 consistently
-                # beats round-69 num_xcds=4 on this single shape:
+                if m_total <= 65536:
+                    # Round-26 anchor + marginal re-tune for gpt_oss-GateUP-
+                    # B32-M2048 BF16 (tiles_n=22, tiles_m=8, k=2880,
+                    # m_total=65536). Was the only un-anchored BF16 rule in
+                    # the gpt_oss family — `(gm=8, xcd=4)` came from an
+                    # early defensive default and never had a per-iter-sync
+                    # sweep verify after the post-round-19/20 BUFFER
+                    # kernel reroute (round-21 re-swept the 3 sibling
+                    # m_total branches; this one was missed).
+                    #
+                    # 40-cell coarse sweep `gm ∈ {1,2,4,6,8,12,16,24,32,48}
+                    # × xcd ∈ {1,2,4,8}` (5 trials × 60 iters,
+                    # /tmp/sweep_bf16_gateup_b32_m2048_round26.py) followed
+                    # by 7-trial × 200-iter tight verify on top-8
+                    # candidates (/tmp/verify_bf16_gateup_b32_m2048_round26.py):
+                    #
+                    #   cfg          med p20    p20      p80      spread%
+                    #   ( 4, 4)      1255.71    1253.92  1257.02   0.26  *winner
+                    #   ( 8, 4)      1254.55    1252.21  1255.16   0.45  ←round-?
+                    #   ( 6, 4)      1250.89    1250.51  1251.78   0.25
+                    #   ( 2, 4)      1247.50    1247.21  1249.28   0.27
+                    #   ( 4, 8)      1244.96    1244.10  1245.01   0.22
+                    #   (12, 4)      1244.84    1243.56  1246.81   0.39
+                    #   ( 4, 1)      1242.68    1242.17  1244.39   0.24
+                    #   ( 4, 2)      1240.49    1240.13  1241.09   0.26
+                    #
+                    # `(gm=4, xcd=4)` is the unique top by +1.16 TF (+0.09pp)
+                    # over `(gm=8, xcd=4)`. Margin is within run-to-run
+                    # spread but the (4,4) p20 (1253.92) > (8,4) p20
+                    # (1252.21) is consistent across all 7 trials, and the
+                    # `xcd=4` plateau dominates the entire `xcd ∈ {1,2,8}`
+                    # column by 5-15 TF — both knobs at a clear local
+                    # optimum, just a flat top within the gm ∈ {2,4,6,8}
+                    # neighborhood.
+                    #
+                    # The sweep also confirms the larger gm cluster
+                    # (gm ∈ {24, 32, 48}) regresses heavily at xcd=1/8 —
+                    # bottom-4 are (48,1)/(48,8)/(32,8)/(32,1) all
+                    # ~1067-1069 TF (-15% from top) — confirming the
+                    # XCD-swizzle interaction with the persistent grouped
+                    # tile schedule for this tiles_m=8 / tiles_n=22 grid
+                    # is sensitive to the XCD partitioning.
+                    #
+                    # Bit-identical output vs prior (8,4) verified at
+                    # /tmp/verify_bf16_gateup_b32_m2048_round26.py:
+                    # max_abs_diff=0.0, bit_eq=True (group_m / num_xcds
+                    # are pure scheduling knobs on the BF16 grouped RCR
+                    # persistent tile schedule).
+                    #
+                    # Rule scope: tiles_n=22 + tiles_m=8 + k=2880 +
+                    # 16384 < m_total <= 65536 matches only B=32 M=2048
+                    # GateUP in the metric (B<32 GateUP M=2048 → m_total
+                    # ≤ 16384 hits the prior branches). Net delta is
+                    # marginal (+0.09pp = +1.16 TF) but anchors the rule
+                    # to a verified local optimum and brings this branch
+                    # in line with the round-21 anchor coverage of the
+                    # other 3 m_total tiers.
+                    return HipKittenConfig(
+                        layout=layout, group_m=4, num_xcds=4, kernel=None
+                    )
+                # Round-21 re-tune for gpt_oss-GateUP-B32-M4096 BF16
+                # (tiles_n=22, tiles_m=16, k=2880, m_total=131072).
+                # Round-70 picked (gm=1, xcd=2) against the FLAT-store
+                # kernel; the post-round-19/20 BUFFER kernel changes the
+                # XCD-swizzle interaction with the per-tile completion
+                # time and a *larger* group_m × xcd=4 wins.
                 #
-                #   shape                        gm=1,xcd=4    gm=1,xcd=2
-                #   gpt_oss-GateUP-B32-M4096     927.0 TF       929.9 TF   (+2.9 TF, +0.31pp)
+                # PER-ITER-SYNC verify at /tmp/verify_bf16_metric_aligned.py
+                # (60-iter × 5-trial p20 median):
                 #
-                # Wider exploratory sweep showed (1, 2) at the top of the
-                # candidate space (939 TF p20 in the wider sweep with looser
-                # warmup; tighter verify converges to +2.9 TF). Bit-identical
-                # output verified (group_m / num_xcds are pure scheduling
-                # knobs on the persistent grouped tile schedule).
+                #   cfg          med_p20    spread%   Δ vs (1,2)
+                #   (8,  4)       1273.33   0.87%    +18.69  +1.49%  *winner
+                #   (6,  4)       1266.45   0.51%    +11.81  +0.94%
+                #   (2,  1)       1262.52   0.51%     +7.88  +0.63%
+                #   (12, 4)       1260.56   0.43%     +5.92  +0.47%
+                #   (2,  2)       1258.55   0.80%     +3.91  +0.31%
+                #   (4,  4)       1257.24   0.34%     +2.60  +0.21%
+                #   (1,  2)       1254.64   0.33%     +0.00   0.00%  ←round-70
                 #
-                # Rule scope: ``m_total > 65536`` ⇔ B=32 M_per=4096 in the
-                # metric (gpt_oss-GateUP family); B=32 M_per=2048 lands on
-                # the m_total<=65536 branch above. No other metric shape
-                # has tiles_n==22 with m_total>65536.
+                # (gm=8, xcd=4) wins by +18.7 TF (+1.49%) over the
+                # round-70 (gm=1, xcd=2). Both knobs at a clear local
+                # optimum: gm=8 dominates the gm ∈ {6,12} neighbors by
+                # +6.9 / +12.8 TF; xcd=4 dominates xcd=1 / xcd=2 / xcd=8
+                # by +10-21 TF in the gm=8 column from the wider coarse
+                # sweep at /tmp/sweep_bf16_worst_round21.py.
+                #
+                # Bit-identical output (group_m / num_xcds are pure
+                # scheduling knobs on the BF16 grouped RCR persistent
+                # tile schedule).
+                #
+                # Rule scope: ``m_total > 65536`` ⇔ B=32 M_per=4096 in
+                # the metric (gpt_oss-GateUP family); B=32 M_per=2048
+                # lands on the m_total<=65536 branch above. No other
+                # metric shape has tiles_n==22 with m_total>65536.
                 return HipKittenConfig(
-                    layout=layout, group_m=1, num_xcds=2, kernel=None
+                    layout=layout, group_m=8, num_xcds=4, kernel=None
                 )
             if tiles_n == 11:  # Down N=2880
                 if m_total <= 8192:
+                    # Round-10 NOTE — kept (gm=2, xcd=2). The tight-verify
+                    # winner (gm=32, xcd=8) gained +1.84pp on a 1500-iter
+                    # × 7-repeat p20 bench (810.8 vs 796.9) but the
+                    # `_metric_grouped_only.py` 50-iter min-time bench
+                    # showed -1.0pp / -10 TF noise (range 770-790 TF
+                    # over 3 runs vs verify p20 spread 810.8-812.0 of
+                    # 1.2 TF). Hypothesis: the persistent grouped
+                    # schedule for (gm=32, xcd=8) at m_total=8192
+                    # (only 32 tiles per group × 11 N-tiles ≈ 352
+                    # tiles, ~1.4 wave) has a higher tail/variance than
+                    # the tighter (gm=2, xcd=2) schedule, so 50-iter min
+                    # randomly picks bad iters more often. Tight p20 is
+                    # the right metric for kernel ordering decisions; 50-
+                    # iter min is the *acceptance* metric. The rule needs
+                    # to win on both. (gm=32, xcd=8) wins on tight but
+                    # loses on min — leave (gm=2, xcd=2) until/unless
+                    # we find a cfg that wins on both. Sibling B=4-M4096
+                    # rule below DOES win on both → kept.
                     return HipKittenConfig(
                         layout=layout, group_m=2, num_xcds=2, kernel=None
                     )
                 if m_total <= 16384:
+                    # Round-10 originally picked (gm=8, xcd=4) from a
+                    # 60-cell sweep against the round-9 (FLAT-store) BF16
+                    # grouped kernel. The pre-round-19/20 timing put the
+                    # entire `(gm ∈ {8,16,24,32}, xcd=4)` cluster within
+                    # 1.4 TF of each other; (8, 4) was picked as the
+                    # tightest-spread defensive choice.
+                    #
+                    # Round-21 re-sweep against the post-round-19/20
+                    # (col-layout C-store FLAT->BUFFER + K-tail/N-tail
+                    # FLAT->BUFFER) kernel changes the picture: the
+                    # ISA-level reduction in cross-WG memory traffic
+                    # rebalances the persistent grouped tile schedule's
+                    # tail behavior, and a *larger* group_m now wins the
+                    # metric-aligned per-iter-sync timing (which is the
+                    # acceptance criterion in `_metric_grouped_only.py`'s
+                    # `_time_op` / 50-iter p20 path).
+                    #
+                    # Sweep + verify at /tmp/sweep_bf16_worst_round21.py
+                    # then /tmp/verify_bf16_down_b4_m4096.py: 11 cfg
+                    # neighbors at gm ∈ {1,8,12,16,24,32,40,48,56,64} ×
+                    # xcd ∈ {2,4} timed in BOTH (a) steady-state queued
+                    # (500 iters x 7 trials) and (b) per-iter-sync (80
+                    # iters x 7 trials, mirrors `_time_op`).
+                    #
+                    # PER-ITER-SYNC mode (the acceptance metric):
+                    #   cfg          med_p20   spread%   Δ vs (8,4)
+                    #   (32, 4)       1179.02   0.17%   +8.93  +0.76%  *winner
+                    #   (48, 4)       1178.21   0.35%   +8.12  +0.69%
+                    #   (64, 4)       1177.59   0.36%   +7.50  +0.64%
+                    #   (40, 4)       1176.57   0.29%   +6.48  +0.55%
+                    #   (56, 4)       1176.16   0.33%   +6.07  +0.52%
+                    #   (24, 4)       1175.96   0.41%   +5.87  +0.50%
+                    #   (12, 4)       1173.12   0.69%   +3.03  +0.26%
+                    #   (24, 2)       1170.69   0.55%   +0.60  +0.05%
+                    #   (16, 2)       1170.09   0.91%   +0.00   0.00%
+                    #   (8,  4)       1170.09   1.41%   +0.00   0.00%  ←round-10
+                    #   (1,  4)       1156.74   0.46%  -13.35  -1.14%
+                    #
+                    # The entire `(gm ∈ {24,32,40,48,56,64}, xcd=4)`
+                    # cluster wins by +6 to +9 TF (+0.50% to +0.76%) on
+                    # metric-aligned timing; (8, 4) sits at the bottom
+                    # of the high cluster with the *highest* spread (1.41%
+                    # vs <0.4% for the new winners). (gm=32, xcd=4)
+                    # picked as the unique top by p20 with the tightest
+                    # spread (0.17%) — both knobs at a clear local
+                    # optimum.
+                    #
+                    # Bit-identical output vs round-10 (gm=8, xcd=4)
+                    # verified at /tmp/verify_bf16_down_b4_m4096_bit_eq.py:
+                    # max_abs_diff=0.0, bit_eq=True; SNR vs fp32 ref =
+                    # 49.62 dB on both (group_m / num_xcds are pure
+                    # scheduling knobs on the persistent BF16 grouped
+                    # RCR tile schedule, identical to the round-10
+                    # commentary).
+                    #
+                    # Rule scope unchanged: tiles_n == 11 (n=2880) +
+                    # tiles_m == 16 (m_per_group=4096) + k == 2880 +
+                    # 8192 < m_total <= 16384 matches only B=4 M=4096
+                    # in the metric (gpt_oss-Down family).
                     return HipKittenConfig(
-                        layout=layout, group_m=2, num_xcds=4, kernel=None
+                        layout=layout, group_m=32, num_xcds=4, kernel=None
+                    )
+                if m_total <= 65536:
+                    # Round-21 split: gpt_oss-Down-B32-M2048 BF16
+                    # (tiles_n=11, tiles_m=8, k=2880, m_total=65536).
+                    # Was sharing the Down-B32 catch-all (gm=1, xcd=4)
+                    # with B=32-M=4096 (m_total=131072). Round-21 sweep
+                    # shows the two B=32 Down shapes diverge in their
+                    # optimum after the post-round-19/20 BUFFER kernel:
+                    # M=2048 prefers a much larger gm × xcd=4; M=4096
+                    # keeps (gm=1, xcd=4) (verified separately as still
+                    # the per-iter-sync winner).
+                    #
+                    # PER-ITER-SYNC verify at /tmp/verify_bf16_metric_aligned.py:
+                    #
+                    #   cfg          med_p20    spread%   Δ vs (1,4)
+                    #   (16, 4)       1198.31   1.18%    +11.51  +0.97%  *winner
+                    #   (32, 4)       1197.68   1.00%    +10.88  +0.92%
+                    #   (48, 4)       1197.36   0.42%    +10.56  +0.89%
+                    #   (24, 4)       1194.89   1.64%     +8.09  +0.68%
+                    #   (12, 4)       1192.16   0.61%     +5.36  +0.45%
+                    #   (1,  4)       1186.80   0.66%     +0.00   0.00%  ←default
+                    #   (8,  4)       1181.55   0.27%     -5.25  -0.44%
+                    #   (4,  4)       1179.95   0.75%     -6.85  -0.58%
+                    #
+                    # The (gm ∈ {16, 32, 48}, xcd=4) cluster wins by
+                    # +10-12 TF (+0.9-1.0%); (gm=16, xcd=4) picked as
+                    # the unique top by p20 median (just edges out
+                    # (gm=32, xcd=4) by 0.6 TF — well within the 1.18%
+                    # spread, but tightest median of the cluster).
+                    #
+                    # Bit-identical output (group_m / num_xcds are pure
+                    # scheduling knobs).
+                    #
+                    # Rule scope: tiles_n=11 (n=2880) + 16384 < m_total
+                    # <= 65536 matches only B=32 M_per=2048 in the
+                    # metric (gpt_oss-Down family). Down-B32-M4096
+                    # (m_total=131072) falls through to the default
+                    # (gm=1, xcd=4) below — verified at the same
+                    # /tmp/verify_bf16_metric_aligned.py probe that
+                    # (gm=1, xcd=4) is still the unique top at 1230.62
+                    # p20, with (gm=4, xcd=4) the closest contender at
+                    # -3.91 TF (-0.32%, all else worse).
+                    return HipKittenConfig(
+                        layout=layout, group_m=16, num_xcds=4, kernel=None
                     )
                 return HipKittenConfig(
                     layout=layout, group_m=1, num_xcds=4, kernel=None
@@ -558,9 +822,68 @@ def select_default_config(
             and m_total is not None
             and m_total <= 16384
         ):
+            # Round-23 re-tune in the metric-aligned per-iter-sync regime.
+            # Round-68's (gm=2, xcd=4) was picked from a steady-state
+            # 800-iter × 5-repeat median bench; the metric script uses
+            # ``WARMUP=10, ITERS=50`` per-iter ``cudaDeviceSynchronize()``
+            # cold-call timing (see ``scripts/_metric_hk_ratio.py``
+            # ``_time_op``), which exposes a different per-tile completion
+            # latency profile. A 36-cell coarse sweep
+            # (/tmp/probe_xcds_disable_round23.py) on the 4 B=4 FP8 gpt_oss
+            # shapes flagged ``(gm=1, xcd=4)`` as a winner here — confirmed
+            # by a 9-cell × 7-repeat × 120-iter tight verify
+            # (/tmp/verify_fp8_gateup_b4_m2048_round23.py):
+            #
+            #   cfg          med p20    min       max     spread
+            #   ( 1, 4)      1013.81    1006.90   1018.22   1.12%   *winner
+            #   ( 1, 2)      1008.70    1005.26   1011.25   0.59%   -5.11
+            #   ( 3, 4)      1005.56    1002.15   1009.59   0.74%   -8.25
+            #   ( 2, 8)      1004.22     999.64   1006.31   0.66%   -9.59
+            #   ( 4, 4)      1002.44    1000.38   1006.30   0.59%  -11.37
+            #   ( 2, 4)      1001.56     997.58   1009.44   1.18%  -12.25  ←round-68
+            #   ( 1, 8)       972.46     968.85    975.81   0.72%  -41.35
+            #   ( 1, 1)       970.79     968.02    974.13   0.63%  -43.02
+            #   ( 1, 16)      971.63     968.58    975.39   0.70%  -42.18
+            #
+            # ``(gm=1, xcd=4)`` is the unique top of a (gm=1)-favouring
+            # cluster with (1, 4) > (1, 2) > (3-4, 4) > (2, 4)=round-68.
+            # The +12.25 TF (+1.22pp) gap over round-68 (2, 4) lies above
+            # the run-to-run spread (1.12%): the candidate's min (1006.90)
+            # still beats the default's max (1009.44) only marginally —
+            # but the median gap is consistent across all 7 repeats.
+            #
+            # Why gm=1 wins here: B=4 M=2048 ⇒ 16384 rows ⇒ 64 M-tiles per
+            # batch × 23 N-tiles × 4 batches = 5888 tile-steps. With
+            # NUM_CUS=256 persistent slots, that's 23 wave-steps per slot.
+            # gm=2 groups 2 M-tiles together to reuse the A-pack across
+            # the M-axis, which is a win on shapes where A-load bandwidth
+            # is the bottleneck. But for tiles_m=8 (M=2048 per group)
+            # there are only 8 M-tiles per group; gm=2 forces the
+            # persistent loop to stride over only 4 N-tile groups per
+            # XCD-pair before starting the next M-pair, which loses the
+            # L2 reuse on the B-side N-tile (N=5760 ⇒ 23 N-tiles, larger
+            # than M-axis). gm=1 lets the schedule walk the entire N-row
+            # for each M-tile before moving on, maximising B-tile L2
+            # reuse — better fit for tiles_m << tiles_n shapes.
+            #
+            # xcd=4 unchanged from round-68 — both the round-68 200-iter
+            # sweep and this round-23 metric-aligned verify pick xcd=4
+            # over xcd=2 / xcd=8 / xcd=16 by ≥5 TF (+0.5pp).
+            #
+            # Bit-equivalence verified at the same path:
+            # max_abs_diff=0.0 between (gm=2, xcd=4) and (gm=1, xcd=4)
+            # outputs (group_m / num_xcds are pure scheduling knobs on
+            # the FP8 grouped RCR persistent tile schedule, not
+            # arithmetic-affecting).
+            #
+            # Rule scope unchanged from round-68: tiles_n == 22 + tiles_m
+            # == 8 + k == 2880 + m_total <= 16384 covers only
+            # gpt_oss-GateUP-B4-M2048 in the metric shapes (B<4 GateUP
+            # M=2048 has no metric shape, B=8 GateUP M=2048 ⇒ m_total
+            # =16384 — hypothetically same rule but no metric shape).
             return HipKittenConfig(
                 layout=layout,
-                group_m=2,
+                group_m=1,
                 num_xcds=4,
                 kernel=None,
             )
@@ -571,10 +894,50 @@ def select_default_config(
             and m_total is not None
             and m_total <= 16384
         ):
+            # gpt_oss-GateUP-B4-M4096 (tiles_n=22, tiles_m=16, k=2880,
+            # m_total=16384). This rule was discovered in round-7 via an
+            # 8 × 5 = 40-candidate sweep at /tmp/sweep_fp8_b4_round7.py
+            # against the round-18 (FLAT-store) FP8 grouped kernel.
+            #
+            # Round-10-dm verification (post-round-19/20 BUFFER-store
+            # kernel): a 1500-iter × 7-repeat re-sweep at
+            # ``/tmp/probe_gateup_b4_m4096_round10.py`` confirms
+            # ``(gm=14, xcd=4)`` is still the optimum within ±1.4 TF
+            # (±0.1 pp) of every neighbor. Median p14 TFLOPS:
+            #
+            #   cfg     | TFLOPS  | Δ vs (14,4)
+            #   (14, 4) | 1240.33 | +0.00 *rule
+            #   (14, 8) | 1241.28 | +0.95
+            #   (14, 2) | 1241.25 | +0.92
+            #   ( 8, 8) | 1240.80 | +0.47
+            #   (16, 4) | 1240.18 | -0.16
+            #   (10, 4) | 1239.61 | -0.72
+            #   (12, 4) | 1239.31 | -1.02
+            #   ( 8, 4) | 1238.93 | -1.40
+            #
+            # The full sweep is at the metric's noise floor — no candidate
+            # dominates. Confirms ``(gm=14, xcd=4)`` is still the right
+            # rule on the BUFFER-store kernel.
+            #
+            # Historical falsification: a previous comment block here
+            # cited a "Round-21" sweep claiming ``(gm=8, xcd=4)`` won by
+            # +29.2 TF over (gm=14, xcd=4). That sweep was run against
+            # the round-18 FLAT-store kernel just before the round-19
+            # FLAT->BUFFER reroute (+85pp metric) shifted the per-tile
+            # completion latency. The round-10-dm probe table above
+            # (against the live BUFFER kernel) shows ``(gm=8, xcd=4)``
+            # is the WORST candidate in the sweep, opposite of the stale
+            # claim. See ``analysis/_notes/round-10-dm-fp8-config-saturation-audit.md``.
+            #
+            # Rule scope unchanged: ``tiles_n=22 + tiles_m=16 + k=2880 +
+            # m_total<=16384`` matches only gpt_oss-GateUP-B4-M4096 in the
+            # metric (B<4 GateUP M=4096 has no metric shape; B=2 / B=1
+            # M=4096 → m_total<=8192 → would fail tiles_m=16 since
+            # tiles_m=16 ⇒ m=4096 ⇒ m_total ≥ 4096; only B=4 gives 16384).
             return HipKittenConfig(
                 layout=layout,
-                group_m=2,
-                num_xcds=None,
+                group_m=14,
+                num_xcds=4,
                 kernel=None,
             )
         # Round-69 rule. gpt_oss-GateUP-B32 family (tiles_n=22, n=5760,
@@ -627,18 +990,50 @@ def select_default_config(
                 num_xcds=4,
                 kernel=None,
             )
-        # Round-69 rule. gpt_oss-Down-B4-M4096 (tiles_n=11 for n=2880
-        # since 2880//256 = 11, k=2880, m_total=16384). Single shape:
-        # 1500-iter × 7-repeat at
-        # /tmp/verify_gpt_oss_b32_xcds_round69.py:
+        # Round-12 refinement of round-69 rule for gpt_oss-Down-B4-M4096
+        # (tiles_n=11 for n=2880 since 2880//256 = 11, k=2880,
+        # m_total=16384). Round-69 only swept xcds ∈ {4, 8} at gm=4
+        # fixed and picked (gm=4, xcd=4); a wider 9 × 6 = 54-candidate
+        # sweep this round (gm ∈ {1,2,3,4,6,8,12,16,32} × xcd ∈
+        # {1,2,4,8,16,32}, /tmp/sweep_fp8_down_b4_m4096_round12.py)
+        # showed an entire xcd=4 plateau dominating: gm ∈ {8,12,16,32}
+        # all sit within 5 TF of each other and 13-15 TF above
+        # (gm=4, xcd=4).
         #
-        #   shape                  xcds=8    xcds=4    Δ
-        #   gpt_oss-Down-B4-M4096  1170.3    1181.4    +11.1 (+0.95pp)
+        # Tight verify (1500-iter × 7-repeat p20 at
+        # /tmp/verify_fp8_down_b4_m4096_round12.py):
         #
-        # Sibling B4-M2048 LOSES at xcds=4 (-23.6 TF / -2.5%) so the
-        # rule is gated to ``tiles_m == 16`` only (m_per_g=4096).
-        # ``m_total == 16384`` further excludes any incidental B=8
-        # M=2048 case.
+        #   cfg          p20 median   Δ vs (gm=4,xcd=4)
+        #   ( 4, 4)        1456.22 TF  baseline (round-69)
+        #   (32, 4)        1473.58 TF  +17.37 (+1.19pp)  *winner
+        #   ( 8, 4)        1471.99 TF  +15.77 (+1.08pp)
+        #   (16, 4)        1471.03 TF  +14.82 (+1.02pp)
+        #   (12, 4)        1470.72 TF  +14.51 (+1.00pp)
+        #   (16, 2)        1466.27 TF  +10.06 (+0.69pp)  *xcd matters
+        #
+        # (gm=32, xcd=4) is the tight-verify top with the smallest
+        # spread (1.9 TF range across 7 trials = 0.13 % CV); the
+        # entire xcd=4 plateau wins over xcd=2 / xcd=8 by 5-15 TF,
+        # confirming xcd=4 is the right XCD distribution for B=4
+        # M=4096 (16384 rows / 11 N-tiles ≈ 720 tiles ≈ 1.4 wave on
+        # MI355X 256 CUs — xcd=4 splits the work evenly across 4
+        # of 8 XCDs, matching the 720/8 ≈ 90 tile-per-XCD slice;
+        # xcd=8 over-distributes and pays per-XCD launch / drain
+        # overhead). Bit-identical output verified at the same path
+        # (max_abs_diff=0.0, bit_eq=True; group_m and num_xcds are
+        # pure scheduling knobs on the FP8 grouped RCR persistent
+        # tile schedule, not arithmetic-affecting).
+        #
+        # Rule scope check: ``tiles_n == 11`` (n=2880, gpt_oss only
+        # in the FP8 metric — DSV3 N ∈ {4096, 7168} → tiles_n ∈
+        # {16, 28}) + ``tiles_m == 16`` (m_per_group=4096) + ``k ==
+        # 2880`` (gpt_oss only) + ``m_total == 16384`` (B=4 only,
+        # since B=8 M=2048 would give tiles_m=8). Sibling B4-M2048
+        # (tiles_m=8, m_total=8192) is on the round-7 (gm=2, xcd=2)
+        # rule below and unaffected. Sibling B=4 M=4096 GateUP
+        # (tiles_n=22, tiles_m=16) hits the round-69 GateUP rule
+        # earlier in the function. No metric shape regression
+        # expected.
         if (
             tiles_n == 11
             and tiles_m == 16
@@ -648,8 +1043,121 @@ def select_default_config(
         ):
             return HipKittenConfig(
                 layout=layout,
-                group_m=4,
+                group_m=32,
                 num_xcds=4,
+                kernel=None,
+            )
+        if (
+            tiles_n == 11
+            and tiles_m == 8
+            and k == 2880
+            and m_total is not None
+            and m_total == 65536
+        ):
+            # Round-8 rule. gpt_oss-Down-B32-M2048 (tiles_n=11 for n=2880,
+            # tiles_m=8 for m_per_group=2048, k=2880, m_total=B*M=65536).
+            # Was previously the only Down-B32 shape falling through to
+            # the binding default ``(gm=4, xcds=None=8)`` because no
+            # rule matched. Round-70 only compared {(8,4) vs (4,4)} on
+            # the Down-B32 family and concluded "split signals" — but a
+            # wider grid (this round, /tmp/sweep_fp8_down_b32_round8.py
+            # archived in commit message: 9 × 6 = 54 candidates over
+            # ``gm ∈ {1..32}`` × ``xcd ∈ {1,2,4,8,16,32}``) shows the
+            # entire ``xcd=4`` column dominates every other xcd column
+            # by 8-14 TF on this shape — round-70's 2-cell comparison
+            # missed the right xcd by an order of magnitude.
+            #
+            # Tight verify (1500-iter × 7-repeat p20 at
+            # /tmp/verify_fp8_down_b32_m2048.py) — top-5 candidates with
+            # very tight p20 spread (each ≤0.6 TF range across 7 trials):
+            #
+            #   cfg          p20 median   Δ vs default
+            #   (4, None=8)    933.02 TF  baseline
+            #   (16, 4)        947.36 TF  +14.34 (+1.54pp)  *winner
+            #   (32, 4)        947.33 TF  +14.31 (+1.53pp)
+            #   (12, 4)        947.00 TF  +13.98 (+1.50pp)
+            #   ( 6, 4)        945.91 TF  +12.89 (+1.38pp)  *200-iter sweep top1
+            #   (32, 2)        945.25 TF  +12.23 (+1.31pp)
+            #   ( 7, 4)        942.43 TF  + 9.41 (+1.01pp)
+            #   ( 5, 4)        938.14 TF  + 5.12 (+0.55pp)
+            #   ( 8, 4)        937.30 TF  + 4.28 (+0.46pp)
+            #   ( 6, 8)        919.79 TF  -13.23 (-1.42pp)  *xcd matters
+            #
+            # ``(16, 4)`` is the unique top with the tightest spread and
+            # sits squarely in the ``(gm=12, gm=16, gm=32) × xcd=4``
+            # plateau. The 200-iter sweep had picked (6, 4) on lower
+            # statistical confidence — verify with REPEATS=7 p20 settled
+            # the choice. Bit-identical output verified at the same path
+            # (max_abs_diff=0.0, bit_eq=True; group_m and num_xcds are
+            # pure scheduling knobs on the FP8 grouped RCR persistent
+            # tile schedule, not arithmetic-affecting).
+            #
+            # Rule scope check: ``tiles_n == 11`` (n=2880) + ``tiles_m == 8``
+            # (m_per_group=2048) + ``k == 2880`` (gpt_oss only) +
+            # ``m_total == 65536`` matches only B=32 M=2048 in the
+            # metric. Sibling shapes preserved: B=4 M=2048 (m_total=8192)
+            # uses the round-7 (gm=2, xcd=2) rule below; B=4 M=4096
+            # (m_total=16384) uses the round-69 (gm=4, xcd=4) rule above;
+            # B=32 M=4096 (m_total=131072) stays on default — this round's
+            # M=4096 sub-sweep showed only +0.15pp at best (within noise
+            # floor of the 200-iter measurement, 4 TF spread vs 1.7 TF
+            # gap), so no rule added there.
+            return HipKittenConfig(
+                layout=layout,
+                group_m=16,
+                num_xcds=4,
+                kernel=None,
+            )
+        if (
+            tiles_n == 11
+            and tiles_m == 8
+            and k == 2880
+            and m_total is not None
+            and m_total == 8192
+        ):
+            # Round-7 rule. gpt_oss-Down-B4-M2048 (tiles_n=11 for n=2880
+            # since 2880//256=11, k=2880, m_total=8192). Sibling of the
+            # round-69 ``tiles_n=11+tiles_m=16+m_total=16384`` rule above
+            # but sized for B=4 M=2048 (8192 vs 16384). Was previously
+            # falling through to the binding default ``(group_m=4,
+            # num_xcds=None=8)``.
+            #
+            # 8 × 5 = 40-candidate sweep (``gm ∈ {1,2,3,4,6,8,12,16}`` ×
+            # ``xcd ∈ {1,2,4,8,16}`` at /tmp/sweep_fp8_b4_round7.py) with
+            # 7-repeat × 500-iter p20 + tight verify
+            # (1500-iter × 7-repeat p20 at /tmp/verify_fp8_b4_round7.py).
+            #
+            # Tight-verify p20 (single-trial, range across 7 repeats):
+            #   cfg          p20      range
+            #   (4, 8)       749.86   749.51..750.69     # default baseline
+            #   (2, 2)       753.47   753.44..754.00     # winner +0.48pp
+            #
+            # Neighbor robustness (single-trial p20 at
+            # /tmp/verify_fp8_b4_round7_neighbors.py):
+            #   (1,2)=751.28  (2,1)=747.37  (2,2)=754.23 *  (2,4)=731.47
+            #   (3,2)=742.39  (4,2)=746.95  (1,1)=743.78
+            # (2, 2) is the unique top of a sharp local optimum: (2, 4) is
+            # 23 TF below (xcd matters at gm=2), and gm ∈ {3, 4} are 8-12
+            # TF below at the same xcd=2. Bit-identical output verified
+            # at /tmp/verify_fp8_b4_round7_neighbors.py
+            # (max_abs_diff=0.0, bit_eq=True).
+            #
+            # Round-13 re-tested this rule with a fresh wide sweep and
+            # both kernel-only tight verify and a metric-aligned probe;
+            # both kernel-side winners (gm=1, xcd=1) and (gm=1, xcd=8)
+            # regressed -3 score in the metric. Retain (gm=2, xcd=2).
+            # See analysis/_notes/round-13-config-tuning-saturation.md
+            # for the full analysis (B=4 metric/verify divergence).
+            #
+            # Rule scope check: ``tiles_n == 11`` (n=2880) + ``tiles_m == 8``
+            # (m_per_group=2048) + ``m_total == 8192`` matches only B=4
+            # M_per_group=2048 in the metric. The B=4 M=4096 case (the
+            # round-69 rule above) has m_total=16384; B=8 M=2048 (no
+            # metric shape) would also have m_total=16384.
+            return HipKittenConfig(
+                layout=layout,
+                group_m=2,
+                num_xcds=2,
                 kernel=None,
             )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
