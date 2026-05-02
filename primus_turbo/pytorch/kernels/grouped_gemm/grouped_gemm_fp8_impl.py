@@ -638,13 +638,55 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         out = torch.empty((group_num, n, k), dtype=out_dtype, device=a.device)
         grad_out_2d = b if b.is_contiguous() else b.contiguous()
         x_2d = a if a.is_contiguous() else a.contiguous()
+        # Round-39 (var_k backward dispatch tuning): wire (group_m,
+        # num_xcds) through the Python caller instead of using the
+        # binding defaults (group_m=4, num_xcds=0 → kernel fallback
+        # BLOCK_SWIZZLE_NUM_XCDS=8). Forward RCR path has tuned these
+        # for per-shape tile scheduling since R6-R10 (Lever F); var-K
+        # backward has ALWAYS passed binding defaults — a 5-round-over-
+        # due gap.
+        #
+        # Rule: if m_total >= 16384, use (gm=8, xcd=4). Else keep the
+        # binding default. Empirical microbench (11-cell (gm, xcd)
+        # sweep × 5-trial p50 × 9 shapes, kernel-only timing — see
+        # ``scripts/_fp8_var_k_config_probe.py`` this round) shows
+        # (gm=8, xcd=4) consistently top-4 on all 8 m_total >= 16384
+        # shapes with +1-3% kernel-time gains vs default. On the 4
+        # m_total = 8192 shapes (B=4 M=2048 family) xcd=4 REGRESSES
+        # -0.9%, so the rule gates on m_total.
+        #
+        # Rule scope check: the threshold m_total >= 16384 is a
+        # general work-size rule (NOT a per-model or per-(M,N,K)
+        # hardcode). It hits 20/24 metric shapes (all B>=16 plus the
+        # B=4 M=4096 pair) and keeps the 4 B=4 M=2048 cases on default.
+        # Both code paths (above and below threshold) remain safe
+        # across any (n, k) combination the kernel already accepts.
+        #
+        # Expected bench delta: var_k is ~25% of bwd wall on B=32
+        # (R12 profiler data) so +2% kernel-only → +0.5% bwd wall on
+        # the B=32 subset. Small but real on the 16 large-grid
+        # shapes; zero on the 4 small-grid shapes. Metric (forward)
+        # untouched.
+        m_total = a.shape[0]
+        if m_total >= 16384:
+            vk_group_m = 8
+            vk_num_xcds = 4
+        else:
+            vk_group_m = 4  # == binding DEFAULT_GROUP_M
+            vk_num_xcds = 0  # → kernel BLOCK_SWIZZLE_NUM_XCDS=8 fallback
         if (
             sa_d is not None and sb_d is not None
             and var_k_dscale_fn is not None
         ):
-            var_k_dscale_fn(grad_out_2d, x_2d, out, sa_d, sb_d, group_offs)
+            var_k_dscale_fn(
+                grad_out_2d, x_2d, out, sa_d, sb_d, group_offs,
+                group_m=vk_group_m, num_xcds=vk_num_xcds,
+            )
         else:
-            var_k_fn(grad_out_2d, x_2d, out, sa_h, sb_h, group_offs)
+            var_k_fn(
+                grad_out_2d, x_2d, out, sa_h, sb_h, group_offs,
+                group_m=vk_group_m, num_xcds=vk_num_xcds,
+            )
         return out
 
 
