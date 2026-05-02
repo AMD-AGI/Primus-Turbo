@@ -75,22 +75,51 @@ def _fp8_transpose_3d_kernel(
     tl.store(dst_ptr + dst_off, block_t, mask=dst_mask)
 
 
-def fp8_transpose_3d(
-    b: torch.Tensor,
-    bk: int = 128,
-    bn: int = 128,
-) -> torch.Tensor:
+def _select_block_shape(K: int, N: int) -> tuple[int, int]:
+    """Round-15 (Lever Q) per-shape (BK, BN) heuristic.
+
+    Source: R14 microbench sweep (``/tmp/tri_transpose_sweep.py``) over 4
+    gpt_oss reroute shapes ([4|32, 5760|2880, 2880]) at BK,BN ∈
+    {64,128,256}^2. Per-shape winners cluster by K vs N relationship:
+
+      - K > N   (e.g. gpt_oss-GateUP K=5760, N=2880): (BK=128, BN=256)
+        — fewer N-blocks (12 vs 23 at BN=128) keeps the per-program
+        work-set in L2.  Wall: 23.0 μs B4 / 187.7 μs B32 (vs 25.5 / 193
+        at default).
+
+      - K == N (e.g. gpt_oss-Down K=N=2880): (BK=256, BN=128) — half the
+        K-blocks (12 vs 23) and N-blocks unchanged.  Wall: 13.2 μs B4 /
+        129.5 μs B32 (vs 14.1 / 139.4 at default, -7.1 % B32 worst case).
+
+      - K < N (default): (BK=128, BN=128) — the default sweep saturates
+        at this block shape for K=1536-N=4096 (Qwen3-Down) etc.  No FP8
+        metric shape currently triggers this branch (the H4 reroute only
+        fires for gpt_oss K=2880 cases where K ≥ N).
+
+    Static heuristic instead of @triton.autotune to avoid the per-call
+    cache lookup overhead and the 30 ms first-call sweep that polluted
+    R15's 5-trial metric distribution (range 958-964 with autotune vs
+    961-963 with static defaults).
+    """
+    if K > N:
+        return 128, 256
+    if K == N:
+        return 256, 128
+    return 128, 128
+
+
+def fp8_transpose_3d(b: torch.Tensor) -> torch.Tensor:
     """Fused [B, K, N] -> [B, N, K] transpose for any 8-bit dtype.
+
+    Round-15 (Lever Q): the (BK, BN) tile shape is selected per-shape via
+    ``_select_block_shape(K, N)``; see that helper for the empirical
+    sweep data and rationale.  Default fallback (BK=BN=128) preserved for
+    K < N inputs which the FP8 metric never triggers.
 
     Args:
         b: Source tensor with shape ``[B, K, N]``. Must be contiguous and
             have an 8-bit dtype (``float8_e4m3fn`` /
             ``float8_e4m3fnuz`` / ``float8_e5m2``).
-        bk: K-tile size (default 128). The microbench in
-            ``analysis/_notes/round-13-fp8-grouped-Lever-H-...md`` showed
-            BK=BN=128 saturates the HBM at 138 μs for the
-            ``B=32 K=N=2880`` shape; smaller tiles regress.
-        bn: N-tile size (default 128). Same source as ``bk``.
 
     Returns:
         A new contiguous tensor with shape ``[B, N, K]`` and the same dtype
@@ -103,6 +132,7 @@ def fp8_transpose_3d(
     )
     assert b.is_contiguous(), "fp8_transpose_3d expects a contiguous source"
     B, K, N = b.shape
+    bk, bn = _select_block_shape(K, N)
     out = torch.empty((B, N, K), dtype=b.dtype, device=b.device)
     src_v = b.view(torch.uint8)
     dst_v = out.view(torch.uint8)
