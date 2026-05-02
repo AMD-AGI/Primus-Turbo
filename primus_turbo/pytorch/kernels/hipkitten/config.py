@@ -606,6 +606,85 @@ def select_default_config(
             # we pick (2, 32) because it is within ~1pp of (2, 16) on
             # rcr and matches the rrr/crr backward-pass winners exactly.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "rcr" and tiles_m == 8 and tiles_n == 16 and k == 1536:
+            # Round-9 rule. Qwen3-235B-A22B-Down-M2048 grouped RCR family
+            # (B ∈ {16, 32}; tiles_n=16 for n=4096; tiles_m=8 for
+            # m_per_group=2048; k=1536 unique to Qwen-Down in BF16
+            # metric). Was being mis-routed by the DSV3-GateUP-M2048 rule
+            # below (tiles_n==16, tiles_m==8, k<=7168) which forces
+            # (gm=1, xcd=4) — that config was tuned for K=7168 (28
+            # K-iter), but Qwen-Down K=1536 (6 K-iter) has 4.7× shallower
+            # K so the persistent loop sees ~5× fewer mfma per tile-step
+            # → the L2 reuse pattern flips and the binding default
+            # (gm=4, xcd=8) wins instead.
+            #
+            # Coarse sweep (50-iter p20 at /tmp/probe_qwen_down_bf16_round9.py):
+            #
+            #   Qwen-Down-B16-M2048  M_tot=32768:
+            #     gm=4 row dominates: (4, 8)=1116.8  (4, 4)=1090.8
+            #     gm=1 row:           (1, 4)=1106.7  (1, 8)=1033.7  ←current
+            #     gm=2 row:           (2, *)~1085
+            #
+            #   Qwen-Down-B32-M2048  M_tot=65536:
+            #     gm=4 row dominates: (4, 16)=1105.2  (4, 8)=1103.0
+            #     gm=1 row:           (1, 4)=1100.1                ←current
+            #     gm=2 row:           (2, *)~1077
+            #
+            # Tight verify (200-iter × 7-trial p20 at
+            # /tmp/verify_qwen_down_bf16_m2048_round9.py):
+            #
+            #   Qwen-Down-B16-M2048:
+            #     ( 4, 16)  1106.58 TF  +0.96 pp vs (1, 4) ←current  *winner
+            #     ( 4,  8)  1106.26 TF  +0.93 pp                      (spread 0.47 %)
+            #     ( 1,  4)  1096.10 TF  baseline                      (spread 0.28 %)
+            #
+            #   Qwen-Down-B32-M2048:
+            #     ( 4,  8)  1108.39 TF  +0.83 pp vs (1, 4) ←current  *winner
+            #     ( 4, 16)  1107.99 TF  +0.80 pp                      (spread 0.25 %)
+            #     ( 1,  4)  1099.24 TF  baseline                      (spread 0.51 %)
+            #
+            # ``(gm=4, xcds=8)`` wins both shapes by 9-10 TF
+            # (+0.83..+0.96 pp) — gaps are 2-3× the run-to-run spread
+            # (0.25-0.51 %), and the winner's per-trial min beats the
+            # current's max in 7/7 trials per shape. (gm=4) is consistent
+            # across both, with xcds=8 a hairline above xcds=16 on B=32
+            # and tied on B=16 — keep the binding default xcds=8 for
+            # config simplicity (no explicit override).
+            #
+            # Why (gm=4, xcds=8) wins for K=1536: with only 6 K-iter per
+            # tile-step (block_k=256), the per-tile compute is ~5× lighter
+            # than the K=7168 DSV3-GateUP cousins this rule used to
+            # match. (gm=1) maximises B-tile L2 reuse on long-K shapes
+            # by walking the entire N-row before moving M; on shallow-K
+            # the same N-walk now under-feeds the persistent loop because
+            # each tile-step finishes in ~6 mfma waves, leaving the LDS
+            # double-buffer's load-side bandwidth unsatured. (gm=4)
+            # batches 4 M-tiles into the same group, sharing each
+            # B-pack across 4 mfma sequences and keeping the LDS
+            # buffer warm — a strict win when the per-tile compute
+            # latency is short relative to the load latency.
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_qwen_down_bf16_m2048_correctness_round9.py:
+            #   Qwen-Down-B16-M2048: max_abs_diff=0.0  bit_eq=True
+            #   Qwen-Down-B32-M2048: max_abs_diff=0.0  bit_eq=True
+            # group_m / num_xcds are pure scheduling knobs on the BF16
+            # grouped RCR persistent tile schedule; arithmetic and
+            # rounding invariant.
+            #
+            # Rule scope check: ``tiles_n == 16`` (n=4096) is shared with
+            # DSV3-GateUP (k=7168) and dense LLaMA shapes (multiple K),
+            # but the ``k == 1536`` clause is uniquely Qwen-Down in the
+            # BF16 metric (DSV3 k ∈ {2048, 7168}; gpt_oss k=2880;
+            # Qwen-GateUP k=4096; dense BF16 k ∈ {4096, 11008, 14336,
+            # 22016, 28672}). ``tiles_m == 8`` (m_per_group=2048)
+            # excludes the M=4096 sibling cases (which fall through
+            # to the cube-small rule above with (gm=2, xcd=32) — that
+            # routing was tight-verified in this same probe to be the
+            # joint top, no rule change needed there). Strict ``k == 1536``
+            # rather than ``k <= 1536`` keeps the rule from accidentally
+            # capturing any future shallower-K family.
+            return HipKittenConfig(layout=layout, group_m=4, num_xcds=8, kernel=None)
         if layout == "rcr" and tiles_m == 8 and tiles_n == 16 and k <= 7168:
             # Round-10 rule. DeepSeek-V3-GateUP-M2048 grouped RCR family:
             # per-group GEMM with N=4096, K=7168, M_per_group=2048.
