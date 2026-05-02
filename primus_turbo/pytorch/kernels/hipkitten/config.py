@@ -1160,6 +1160,78 @@ def select_default_config(
                 num_xcds=2,
                 kernel=None,
             )
+        if tiles_n == 16 and tiles_m == 16 and k == 1536:
+            # Round-6 rule. Qwen3-235B-A22B Down M_per_group=4096 family
+            # (B ∈ {16, 32}; tiles_n=16 for n=4096; k=1536; tiles_m=16
+            # for m_per_group=4096; m_total ∈ {65536, 131072}). Was the
+            # only Qwen-Down sub-family falling >5% behind Triton in the
+            # round-5 baseline (B16-M4096 ratio=1.056, B32-M4096
+            # ratio=1.090, vs 1.098/1.139 for the M_per=2048 siblings
+            # which already sat best at default).
+            #
+            # 28-cell coarse sweep ``gm ∈ {1,2,4,8,12,16,32} × xcds ∈
+            # {2,4,8,16}`` over the 4 Qwen-Down metric shapes (50-iter
+            # × p20 at /tmp/probe_qwen_down_round6.py archived in this
+            # commit message) flagged ``(gm=2, xcds=16)`` / ``(gm=2,
+            # xcds=8)`` as joint top on both M_per=4096 shapes (~+3.3%
+            # over default). Tight verify (200-iter × 7-trial p20 at
+            # /tmp/verify_qwen_down_m4096_round6.py) resolves the pair
+            # to ``(gm=2, xcds=8)`` by a hairline margin and confirms
+            # the win is well above run-to-run spread:
+            #
+            #   Qwen-Down-B16-M4096 (200i × 7t p20):
+            #     ( 2,  8)  1835.11 TF  +3.17pp vs default *winner
+            #     ( 2, 16)  1834.46 TF  +3.13pp vs default
+            #     ( 1,  4)  1779.05 TF  +0.02pp
+            #     ( 4,  8)  1778.75 TF  +0.00pp baseline
+            #     (32,  4)  1770.04 TF  -0.49pp
+            #
+            #   Qwen-Down-B32-M4096 (200i × 7t p20):
+            #     ( 2,  8)  1843.81 TF  +2.69pp vs default *winner
+            #     ( 2, 16)  1843.40 TF  +2.66pp vs default
+            #     ( 4,  8)  1795.55 TF  +0.00pp baseline
+            #     ( 1,  4)  1794.46 TF  -0.06pp
+            #     (32,  4)  1787.46 TF  -0.45pp
+            #
+            # ``(gm=2, xcds=8)`` wins both M=4096 shapes by 47-50 TF
+            # (+2.7..+3.2 pp) over the default; spread on the winners
+            # is 0.35-0.39 % so the gap is ~10× the run-to-run noise.
+            # The (gm=2) pattern matches the Lever F hypothesis: Qwen-
+            # Down K=1536 has only 12 K-iter (vs gpt_oss K=2880 = 23
+            # K-iter, DSV3-Down K=2048 = 16 K-iter), so the persistent
+            # main loop sees ~1.4-2x fewer mfma per tile-step → smaller
+            # group_m better preserves L2 reuse on the long N axis
+            # (n=4096, 16 N-tiles, larger than M-axis 16 tiles per group).
+            # xcds=8 left at the binding default (cfg.num_xcds=None →
+            # 0 → kernel falls back to BLOCK_SWIZZLE_NUM_XCDS=8) — both
+            # the sweep and tight verify show xcds=8 ties or beats
+            # xcds=16 by hairline; no need to add an explicit override.
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_qwen_down_correctness_round6.py:
+            #   Qwen-Down-B16-M4096: max_abs=0.0  bit_eq=True
+            #   Qwen-Down-B32-M4096: max_abs=0.0  bit_eq=True
+            # group_m / num_xcds are pure scheduling knobs on the FP8
+            # grouped RCR persistent tile schedule; arithmetic and
+            # quantization rounding invariant.
+            #
+            # Rule scope check: ``tiles_n == 16`` (n=4096) is shared
+            # with DSV3-GateUP (k=7168) and dense (8192,4096,*); the
+            # ``k == 1536`` clause is uniquely Qwen-Down in the metric
+            # (DSV3 k ∈ {2048, 7168}, gpt_oss k=2880, Qwen-GateUP
+            # k=4096, dense k ∈ {4096, 11008, 14336, 22016, 28672}).
+            # ``tiles_m == 16`` (m_per_group=4096) excludes the M=2048
+            # sibling cases which sit best at the default (sweep showed
+            # B16-M2048 default 1765 TF beat (gm=2, xcds=8) which sat
+            # below 1695, a -3.95pp regression — must NOT extend rule
+            # to tiles_m=8). M_per=2048 left on default; this round
+            # only touches the 2 M=4096 shapes (B16-M4096 + B32-M4096).
+            return HipKittenConfig(
+                layout=layout,
+                group_m=2,
+                num_xcds=None,
+                kernel=None,
+            )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
             # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
             # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
