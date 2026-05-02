@@ -1311,6 +1311,78 @@ def select_default_config(
                 num_xcds=None,
                 kernel=None,
             )
+        if (tiles_n == 12 and tiles_m == 16 and k == 4096
+                and m_total is not None and m_total >= 131072):
+            # Round-10 rule. Qwen3-235B-A22B GateUP-B32-M4096 single-tier
+            # (tiles_n=12 for n=3072; tiles_m=16 for m_per_group=4096;
+            # k=4096; m_total >= 131072 → only B=32). Re-tested in R10
+            # the R7-falsified Qwen-GateUP-M4096 candidate (gm=1, xcd=4):
+            # at R7 the B16-M4096 sibling was at the noise floor (+0.23pp,
+            # 0.64% spread) and the M=4096 family rule was reverted to
+            # avoid landing a noisy gain. The B32-M4096 sub-shape alone
+            # had a clean +0.80pp gain even in R7 — R10 narrows the rule
+            # to that single tier so the clean B32 signal lands without
+            # over-extending to the noisy B16 sibling.
+            #
+            # Tight verify (200-iter × 7-trial p20 at
+            # /tmp/verify_qwen_gateup_b32_m4096_round10.py):
+            #
+            #   Qwen-GateUP-B32-M4096:
+            #     ( 1,  4)  2461.49 TF  +0.93 pp vs default *winner
+            #                            (spread 0.51 %; min=2459.66, max=2472.15)
+            #     ( 4,  4)  2452.03 TF  +0.54 pp                (spread 0.20 %)
+            #     ( 4,  8)  2438.79 TF  baseline                (spread 0.50 %)
+            #
+            # Gap = 22.7 TF (+0.93 pp) at 1.85× spread; the winner's
+            # per-trial min (2459.66 TF) exceeds the default's per-trial
+            # max (2446.60 TF) by 13.06 TF (+0.54 pp) — clean
+            # separation in 7/7 trials.
+            #
+            # Sibling B16-M4096 re-tested at the same probe:
+            # (1, 4)=2432.96 vs default 2421.51 = +0.47 pp at 0.6× spread.
+            # Winner-min (2427.00) is 0.5 TF BELOW default-max (2427.51)
+            # — the distributions still overlap, so B16 stays excluded
+            # via the ``m_total >= 131072`` guard. (B16-M4096 has
+            # m_total = 16×4096 = 65536; B32-M4096 has m_total = 131072.)
+            # The B16 result moved up vs R7 (+0.23pp → +0.47pp) but
+            # remains below the R7-protocol clean-signal threshold
+            # (gap ≥ 1× spread).
+            #
+            # Why (gm=1) wins for tiles_n=12 + tiles_m=16: m_per_group=4096
+            # ⇒ 16 M-tiles per group × 12 N-tiles per group = 192
+            # tile-steps × 32 batches = 6144 tile-steps. NUM_CUS=256
+            # persistent slots ⇒ 24 wave-steps per slot. tiles_n=12 is
+            # smaller than tiles_m=16 → the persistent loop benefits
+            # from stretching the N-axis traversal under each M-tile,
+            # which (gm=1) does (one M-tile fully consumed before
+            # advancing). xcds=4 picked over xcds=8 because the
+            # (1, 4) p20 (2461.49) cleanly beats (1, 8) (2374.17,
+            # -2.65 pp) — the smaller XCD chiplet partition keeps
+            # more shaping work inside each XCD's L2.
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_qwen_gateup_b32_m4096_correctness_round10.py:
+            #   Qwen-GateUP-B32-M4096: max_abs_diff=0.0  bit_eq=True
+            # group_m / num_xcds are pure scheduling knobs on FP8
+            # grouped RCR persistent tile schedule; arithmetic and
+            # quantization rounding invariant.
+            #
+            # Rule scope check: ``tiles_n == 12`` (n=3072) is uniquely
+            # Qwen-GateUP in the metric grouped FP8 suite (DSV3 N ∈
+            # {4096, 7168} → tiles_n ∈ {16, 28}; gpt_oss N ∈ {2880, 5760}
+            # → tiles_n ∈ {11, 22}; Qwen-Down N=4096 → tiles_n=16).
+            # ``tiles_m == 16`` (m_per_group=4096) excludes the M=2048
+            # sibling (covered by the round-7 rule below). ``k == 4096``
+            # is uniquely Qwen-GateUP in the grouped suite. ``m_total >=
+            # 131072`` selects B=32 only (B16-M4096 has m_total=65536,
+            # excluded). The B16 sibling stays on the binding default
+            # (gm=4, xcds=8) until a stronger signal materialises.
+            return HipKittenConfig(
+                layout=layout,
+                group_m=1,
+                num_xcds=4,
+                kernel=None,
+            )
         if tiles_n == 12 and tiles_m == 8 and k == 4096:
             # Round-7 rule. Qwen3-235B-A22B GateUP M_per_group=2048 family
             # (B ∈ {16, 32}; tiles_n=12 for n=3072; k=4096; tiles_m=8 for
