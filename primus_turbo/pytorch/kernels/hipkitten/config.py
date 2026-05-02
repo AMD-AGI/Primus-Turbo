@@ -1309,6 +1309,110 @@ def select_default_config(
                 num_xcds=4,
                 kernel=None,
             )
+        if tiles_n == 16 and tiles_m == 16 and k == 7168:
+            # Round-8 rule. DeepSeek-V3 GateUP M_per_group=4096 family
+            # (B ∈ {16, 32}; tiles_n=16 for n=4096; k=7168; tiles_m=16
+            # for m_per_group=4096; m_total ∈ {65536, 131072}). Was
+            # the only DSV3-GateUP sub-family with a clean tight-verify
+            # signal that survived a 200-iter × 7-trial p20 sweep
+            # (B16-M2048 had +0.13 % top1 = solid noise; B32-M2048
+            # had a single-shape tight-verify win covered by the
+            # adjacent rule below).
+            #
+            # Tight verify (200-iter × 7-trial p20 at
+            # /tmp/verify_dsv3_gateup_round8.py):
+            #
+            #   DSV3-GateUP-B16-M4096:
+            #     ( 2,  8)  2787.94 TF  +0.64 pp vs default *winner (spread 0.25 %)
+            #     ( 2, 16)  2786.89 TF  +0.60 pp                    (spread 0.21 %)
+            #     ( 4,  8)  2770.20 TF  baseline                    (spread 0.22 %)
+            #
+            #   DSV3-GateUP-B32-M4096:
+            #     ( 2, 16)  2775.04 TF  +0.49 pp vs default         (spread 0.33 %)
+            #     ( 2,  8)  2774.24 TF  +0.46 pp vs default *winner (spread 0.31 %)
+            #     ( 4,  8)  2761.58 TF  baseline                    (spread 0.43 %)
+            #
+            # ``(gm=2, xcds=8)`` wins both M=4096 shapes by 13-18 TF
+            # (+0.46..+0.64 pp) — gaps are 1.5-2.5× the run-to-run
+            # spread; the winner's per-trial min beats the default's
+            # max in 6-7 of 7 trials per shape. xcds=8 is the binding
+            # default (cfg.num_xcds=None → 0 → kernel falls back to
+            # BLOCK_SWIZZLE_NUM_XCDS=8); the tight verify shows xcds=8
+            # vs xcds=16 are within 0.04 pp on both shapes — keep
+            # xcds=None for cleaner config (no explicit override
+            # needed).
+            #
+            # Why (gm=2) wins for tiles_m=16 + tiles_n=16: m_per_group=4096
+            # ⇒ 16 M-tiles per group; tiles_n=16; with K=7168 (56 K-iter)
+            # the per-tile compute is 4× heavier than gpt_oss K=2880, so
+            # the persistent loop scheduler benefits from a smaller gm
+            # that doesn't over-batch M-tiles together (lets each slot
+            # walk N before M, maximising B-tile L2 reuse on the
+            # K=7168 long-K axis where each B-tile is read once for each
+            # of 56 K-iter).
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_dsv3_gateup_correctness_round8.py:
+            #   DSV3-GateUP-B16-M4096: max_abs=0.0  bit_eq=True
+            #   DSV3-GateUP-B32-M4096: max_abs=0.0  bit_eq=True
+            # group_m / num_xcds are pure scheduling knobs on FP8
+            # grouped RCR persistent tile schedule; arithmetic and
+            # quantization rounding invariant.
+            #
+            # Rule scope check: ``tiles_n == 16`` (n=4096) is shared
+            # with Qwen-Down (k=1536) and dense (8192,4096,K), but the
+            # ``k == 7168`` clause is uniquely DSV3-GateUP in the
+            # metric grouped FP8 suite (DSV3-Down k=2048 → tiles_n=28
+            # rule below; gpt_oss k=2880; Qwen-GateUP k=4096; Qwen-Down
+            # k=1536). Dense FP8 LLaMA shapes have K ∈ {4096, 11008,
+            # 14336} — no K=7168. ``tiles_m == 16`` (m_per_group=4096)
+            # selects M=4096 only; M=2048 sibling cases (B16-M2048
+            # default-optimal at tight verify, B32-M2048 covered by
+            # the m_total>=65536 rule below).
+            return HipKittenConfig(
+                layout=layout,
+                group_m=2,
+                num_xcds=None,
+                kernel=None,
+            )
+        if (tiles_n == 16 and tiles_m == 8 and k == 7168
+                and m_total is not None and m_total >= 65536):
+            # Round-8 rule. DSV3-GateUP-B32-M2048 single-tier
+            # (tiles_n=16 + tiles_m=8 + k=7168 + m_total>=65536). Sibling
+            # to the M=4096 rule above; covers the only M=2048 GateUP
+            # shape with a clean tight-verify signal. B16-M2048
+            # (m_total=32768) is excluded by the m_total bound — its
+            # 50-iter sweep top1 sat at +0.13 % (solid noise), no
+            # tight-verify warranted.
+            #
+            # Tight verify (200-iter × 7-trial p20):
+            #
+            #   DSV3-GateUP-B32-M2048:
+            #     (16,  4)  2756.31 TF  +0.56 pp vs default *winner (spread 0.28 %)
+            #     (32,  4)  2753.87 TF  +0.47 pp                    (spread 0.34 %)
+            #     ( 4,  8)  2741.00 TF  baseline                    (spread 0.87 %)
+            #
+            # ``(gm=16, xcds=4)`` wins by 15 TF (+0.56 pp), 2× the
+            # winner's spread (0.28 %) — clean signal. The (gm=16, xcds=4)
+            # winner mirrors the gpt_oss-Down-B32-M2048 tier-1 rule
+            # above (line 1108) and the Qwen-GateUP-B32-M2048 round-7
+            # rule, suggesting a consistent "B32 M_per=2048 large grid
+            # benefits from gm ∈ {16, 32}" pattern.
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_dsv3_gateup_correctness_round8.py:
+            #   DSV3-GateUP-B32-M2048: max_abs=0.0  bit_eq=True
+            #
+            # Rule scope check: same family as the M=4096 sibling above
+            # (tiles_n=16 + k=7168 uniquely DSV3-GateUP); tiles_m=8 +
+            # m_total>=65536 selects B32-M2048 only (B16-M2048 has
+            # m_total=32768 < 65536, falls through to default).
+            return HipKittenConfig(
+                layout=layout,
+                group_m=16,
+                num_xcds=4,
+                kernel=None,
+            )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
             # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
             # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
