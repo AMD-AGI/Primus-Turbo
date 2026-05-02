@@ -1128,6 +1128,86 @@ def select_default_config(
             )
         if (
             tiles_n == 11
+            and tiles_m == 16
+            and k == 2880
+            and m_total is not None
+            and m_total == 131072
+        ):
+            # Round-50 rule. gpt_oss-Down-B32-M4096 (tiles_n=11 for n=2880,
+            # tiles_m=16 for m_per_group=4096, k=2880, m_total=131072).
+            # R48 audit identified this as the only gpt_oss-Down sibling
+            # without a matching rule — falls to binding default
+            # ``(gm=4, xcd=None=8)``. R49 metric shows this shape at
+            # ratio 1.019 (HK 1804 vs Triton 1770), the WORST FP8 ratio
+            # in the 24-shape suite.
+            #
+            # 11-candidate × 7-trial p20 sweep
+            # (/tmp/sweep_down_b32_m4096_round50.py archived in commit
+            # message). Median TFLOPS across 7 trials of 50-iter p20:
+            #
+            #   cfg            median        spread   Δ vs default
+            #   (4,  4)        1959.77 TF    26.25    +15.96 (+0.82pp)  *winner
+            #   (4,  1)        1945.76 TF    12.75    +1.95  (+0.10pp)
+            #   default(4,8)   1943.81 TF    87.97    baseline
+            #   (8,  4)        1939.01 TF    11.36    -4.80
+            #   (8,  2)        1916.98 TF    16.78    -26.83
+            #   (4,  2)        1913.05 TF   162.45    -30.76 (high spread)
+            #   (3,  4)        1911.02 TF   181.37    -32.79 (high spread)
+            #   (6,  4)        1907.92 TF    29.39    -35.89
+            #   (8,  8)        1901.50 TF    45.34    -42.31
+            #   (5,  4)        1896.49 TF   102.62    -47.32
+            #   (2,  4)        1895.26 TF    17.43    -48.55
+            #
+            # ``(gm=4, xcd=4)`` wins by +15.96 TF (+0.82pp) over default
+            # median AND has 3.4× tighter spread (26.25 vs 87.97). The
+            # default's high spread (4.5% CV across 7 trials) explains
+            # why the metric single-trial timing dipped to 1804 → 1.019
+            # ratio: variance hits the low tail. ``(gm=4, xcd=4)`` is
+            # both faster AND more stable, so the metric should reliably
+            # land closer to 1960 (ratio ~1.107 vs Triton ~1770).
+            #
+            # Why xcd=4 vs default xcd=8: identical pattern to siblings
+            # B=32 M=2048 (round-8: gm=16, xcd=4) and B=4 M=4096
+            # (round-12: gm=32, xcd=4). The xcd=4 partition splits the
+            # tiles_n=11 × tiles_m=16 × B=32 = 5632-tile schedule
+            # (262144 fp32 cells per tile × ~1.4 wave pass on 256 CUs)
+            # cleanly across 4 of 8 XCDs (5632/4 = 1408 per XCD vs 5632/8
+            # = 704 per XCD), avoiding the per-XCD launch / drain
+            # overhead that xcd=8 over-distributes.
+            #
+            # Why gm=4 vs sibling gm=16/32: B=32 M=4096 has m_total=131072
+            # rows = 8x more tiles than B=4 M=4096 (m_total=16384). The
+            # B=4 sibling needed gm=32 to extract L2 reuse from a tiny
+            # grid; B=32 grid already saturates the GPU at any gm, so
+            # SMALL gm=4 lets the schedule walk the N axis (11 N-tiles
+            # < 16 M-tiles) before iterating M, maximising L2 hit rate
+            # on the wider B-side. Swept gm ∈ {2, 3, 4, 5, 6, 8}; gm=4
+            # is the tight peak with monotone falloff in either
+            # direction (gm=3 -50, gm=5 -64, gm=6 -52, gm=8 -21).
+            #
+            # Bit-identical output (group_m / num_xcds are pure
+            # scheduling knobs on the FP8 grouped RCR persistent tile
+            # schedule; arithmetic and FP8 quantization rounding are
+            # invariant — same property documented for all such rules
+            # above; the 24 metric shapes' correctness gate (per-shape
+            # SNR vs torch ref) is preserved).
+            #
+            # Rule scope check: ``tiles_n == 11`` (n=2880, gpt_oss only
+            # in the FP8 metric) + ``tiles_m == 16`` (m_per_group=4096)
+            # + ``k == 2880`` (gpt_oss only) + ``m_total == 131072``
+            # matches B=32 M=4096 ONLY. Sibling B=4 M=4096
+            # (m_total=16384) hits the round-12 rule above (gm=32,
+            # xcd=4); B=32 M=2048 (m_total=65536, tiles_m=8) hits
+            # round-8 below (gm=16, xcd=4). No metric shape regression
+            # expected.
+            return HipKittenConfig(
+                layout=layout,
+                group_m=4,
+                num_xcds=4,
+                kernel=None,
+            )
+        if (
+            tiles_n == 11
             and tiles_m == 8
             and k == 2880
             and m_total is not None
