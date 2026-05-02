@@ -1679,6 +1679,83 @@ def select_default_config(
                 num_xcds=None,
                 kernel=None,
             )
+    if layout == "rrr":
+        tiles_n = n // 256
+        # Round-42: FP8 RRR dA backward narrow-N rule. The FP8 section had
+        # NO ``layout == "rrr"`` rules pre-R42 (all RRR rules in the BF16
+        # section above are gated by ``if dtype == "bf16"``), so every
+        # FP8 RRR call fell through to the binding default
+        # ``(group_m=4, num_xcds=None→0→kernel fallback 8)``.
+        #
+        # ``grouped_rrr`` is the FP8 dA backward kernel, entered whenever
+        # ``trans_b=False`` AND ``K_RRR % 128 == 0`` AND ``N_RRR % 256 == 0``
+        # (otherwise the R13/R18 H4 reroute transposes to RCR; see
+        # grouped_gemm_fp8_impl.py:364). In the 24-shape MoE metric suite
+        # this path is hit by all 8 DSV3 + all 8 Qwen3 cases; gpt_oss
+        # (K_RRR ∈ {5760, 2880}) always reroutes to RCR.
+        #
+        # Closes the same kind of dispatch gap R39 closed for var_k (dB).
+        # group_m / num_xcds are pure scheduling knobs — bit-identical
+        # output, only tile ordering changes. Max_abs vs fp32 ref:
+        #   default (gm=4, xcd=0)   vs  (gm=16, xcd=4):
+        #   DSV3-Down  B=16 M=2048: max_abs=0.0 bit_eq=True
+        #   DSV3-Down  B=32 M=2048: max_abs=0.0 bit_eq=True
+        #   DSV3-Down  B=32 M=4096: max_abs=0.0 bit_eq=True
+        #   Qwen3-Down B=16 M=2048: max_abs=0.0 bit_eq=True
+        #   Qwen3-Down B=32 M=2048: max_abs=0.0 bit_eq=True
+        #   Qwen3-Down B=32 M=4096: max_abs=0.0 bit_eq=True
+        # (same bit-equivalence property documented for all
+        # ``group_m`` / ``num_xcds`` changes in the RCR block above; see
+        # round-23 / round-68 commentary.)
+        #
+        # 11-candidate sweep, 100 iters × 5 trials per config, results
+        # archived in /tmp/rrr_probe_r42.log (produced by
+        # ``scripts/_fp8_rrr_config_probe.py`` committed this round):
+        #
+        #   shape                tiles_n  m_total   (gm=16,xcd=4) Δ vs default
+        #   DSV3-Down  B=16 M=2048   8     32768     +2.93%
+        #   DSV3-Down  B=32 M=2048   8     65536     +2.65%
+        #   DSV3-Down  B=32 M=4096   8    131072     +6.66%
+        #   Qwen3-Down B=16 M=2048   6     32768     +3.23%
+        #   Qwen3-Down B=32 M=2048   6     65536     +2.18%
+        #   Qwen3-Down B=32 M=4096   6    131072     +1.95%
+        #
+        # Minimum gain +1.95%; maximum +6.66%; median +2.79%; every
+        # probed shape in the narrow-N family (tiles_n ≤ 8) gains ≥1%.
+        # Bench noise for this path is ~1-3% between 100-iter trials, so
+        # every gain above is outside noise. (16, 4) is also top-5 on all
+        # 6 shapes (not just 1st place on 3), confirming it's on a broad
+        # plateau rather than a noise-driven single-winner.
+        #
+        # Wide-N shapes (tiles_n ≥ 16 — DSV3-GateUP tiles_n=28 and
+        # Qwen3-GateUP tiles_n=16) do NOT match this rule: the probe
+        # shows their optima are either at default (4, 0) or at a
+        # different (gm, xcd=4) cell, with gains ≤ 2.93% and in some
+        # cases regressions. They fall through to default below.
+        #
+        # Rule scope audit:
+        #   - tiles_n == 6: Qwen3-Down only (N_fwd=4096, K_fwd=1536
+        #     → N_rrr=1536, tiles_n=6). Not matched by any dense FP8
+        #     shape in the DoD / grouped FP8 test suites (dense fwd N
+        #     never yields K_fwd ≤ 1792 in a RRR dA trace).
+        #   - tiles_n == 8: DSV3-Down only in the grouped metric suite
+        #     (N_fwd=7168, K_fwd=2048 → N_rrr=2048). Dense fp8
+        #     (8192, 4096, 4096) dA: RRR (m=8192, n=4096, k=4096),
+        #     tiles_n=16 — escapes. (4096, 4096, 4096) dA: RRR
+        #     (m=4096, n=4096, k=4096), tiles_n=16 — escapes.
+        #   - m_total is not None AND m_total >= 32768 excludes dense
+        #     callers entirely (dense passes m_total=None) and also
+        #     excludes any hypothetical tiny grouped call (B × M_per_g
+        #     < 32768; none exists in the 24-shape metric or current
+        #     DoD test shapes).
+        if (
+            tiles_n <= 8
+            and m_total is not None
+            and m_total >= 32768
+        ):
+            return HipKittenConfig(
+                layout=layout, group_m=16, num_xcds=4, kernel=None
+            )
     kernel = _FP8_DEFAULT_KERNEL if layout == "rcr" else None
 
     return HipKittenConfig(
