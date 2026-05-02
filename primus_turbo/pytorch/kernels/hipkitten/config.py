@@ -1232,6 +1232,83 @@ def select_default_config(
                 num_xcds=None,
                 kernel=None,
             )
+        if tiles_n == 12 and tiles_m == 8 and k == 4096:
+            # Round-7 rule. Qwen3-235B-A22B GateUP M_per_group=2048 family
+            # (B ∈ {16, 32}; tiles_n=12 for n=3072; k=4096; tiles_m=8 for
+            # m_per_group=2048; m_total ∈ {32768, 65536}). Companion to
+            # the round-6 Qwen-Down rule above; was the only Qwen-GateUP
+            # sub-family with a clear (gm, xcds) optimum in the
+            # round-6 28-cell sweep that survived a 200-iter × 7-trial
+            # tight verify (B16-M4096 / B32-M4096 had marginal +0.2..+0.8 pp
+            # candidates with split (gm) winners, kept on default).
+            #
+            # Tight verify (200-iter × 7-trial p20 at
+            # /tmp/verify_qwen_gateup_round7.py):
+            #
+            #   Qwen-GateUP-B16-M2048:
+            #     (16,  4)  2494.94 TF  +0.86 pp vs default *winner
+            #     (32,  4)  2494.63 TF  +0.85 pp
+            #     ( 1,  4)  2488.31 TF  +0.59 pp
+            #     ( 4,  4)  2485.01 TF  +0.46 pp
+            #     ( 4,  8)  2473.68 TF  baseline
+            #
+            #   Qwen-GateUP-B32-M2048:
+            #     (16,  4)  2511.96 TF  +1.05 pp vs default *winner
+            #     (32,  4)  2511.35 TF  +1.03 pp
+            #     ( 1,  4)  2504.48 TF  +0.75 pp
+            #     ( 4,  8)  2485.76 TF  baseline
+            #
+            # ``(gm=16, xcds=4)`` wins both M=2048 shapes by 21 TF
+            # (+0.86 pp on B16, +1.05 pp on B32) — both gaps clear of
+            # the run-to-run spread (B16 spread 0.95 %, B32 0.72 %; the
+            # winner's per-trial min beats the default's max in 6 of
+            # 7 trials per shape). xcds=4 is the consistent half of the
+            # win (xcds=8 → xcds=4 alone gives +0.46 pp B16, +0.49 pp
+            # B32; full (gm=16, xcds=4) adds the gm component for the
+            # remaining +0.4..+0.6 pp).
+            #
+            # Why (gm=16) wins for tiles_m=8: m_per_group=2048 ⇒ 8
+            # M-tiles per group; with tiles_n=12 N-tiles per group, total
+            # 96 tile-steps per group × B ∈ {16, 32} batches gives
+            # 1536 / 3072 tile-steps. NUM_CUS=256 persistent slots ⇒
+            # 6 / 12 wave-steps per slot. (gm=16) groups 16 M-tiles
+            # together (more than per-group M-tiles, so it groups
+            # cross-batch) which improves L2 reuse on the K=4096 long-K
+            # axis where each tile sweeps the same A-pack twice across
+            # the persistent loop.
+            #
+            # Bit-identical output verified at
+            # /tmp/verify_qwen_gateup_correctness_round7.py:
+            #   Qwen-GateUP-B16-M2048: max_abs=0.0  bit_eq=True
+            #   Qwen-GateUP-B32-M2048: max_abs=0.0  bit_eq=True
+            # group_m / num_xcds are pure scheduling knobs on FP8
+            # grouped RCR persistent tile schedule; arithmetic and
+            # quantization rounding invariant.
+            #
+            # Rule scope check: ``tiles_n == 12`` (n=3072) is uniquely
+            # Qwen-GateUP in the metric grouped FP8 suite (DSV3 N ∈
+            # {4096, 7168} → tiles_n ∈ {16, 28}; gpt_oss N ∈ {2880, 5760}
+            # → tiles_n ∈ {11, 22}; Qwen-Down N=4096 → tiles_n=16).
+            # Dense FP8 metric (LLaMA-2-7B / Llama-3.1-8B) has N ∈
+            # {4096, 6144, 12288, 22016, 28672, 4096, 4096} → tiles_n ∈
+            # {16, 24, 48, 86, 112, 16, 16} — no tiles_n=12. ``k == 4096``
+            # is uniquely Qwen-GateUP in the grouped suite (DSV3 k ∈
+            # {2048, 7168}; gpt_oss k=2880; Qwen-Down k=1536) but
+            # matches multiple dense shapes — the tiles_n=12 clause
+            # excludes all of them. ``tiles_m == 8`` (m_per_group=2048)
+            # excludes the M=4096 sibling cases (probed in R7 with
+            # tight verify; (gm=1, xcds=4) winner shows +0.23 pp B16-M4096
+            # / +0.80 pp B32-M4096 — B16 margin sits at the noise floor
+            # (spread 0.64 %), and a 5-trial post-add metric repeat
+            # showed score variance ±2.5 hiding the projected aggregate
+            # +0.04 pp geomean. Rule 2 was REVERTED this round; left
+            # unanchored on default until a stronger signal materialises).
+            return HipKittenConfig(
+                layout=layout,
+                group_m=16,
+                num_xcds=4,
+                kernel=None,
+            )
         if tiles_n == 28 and 8 <= tiles_m <= 16 and k <= 4096:
             # Round-20 rule (refined round-58). DeepSeek-V3-Down grouped
             # FP8 RCR family: per-group GEMM N=7168, K=2048, M_per_group
