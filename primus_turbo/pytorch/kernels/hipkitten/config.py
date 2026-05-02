@@ -1756,58 +1756,70 @@ def select_default_config(
             return HipKittenConfig(
                 layout=layout, group_m=16, num_xcds=4, kernel=None
             )
-        # Round-43: FP8 RRR dA backward wide-N rule extension.
+        # Round-43 / Round-44: FP8 RRR dA backward wide-N rule.
         # R42 only covered narrow-N (tiles_n ≤ 8 — DSV3-Down, Qwen3-Down).
-        # Wide-N tiles_n == 28 (= DSV3-GateUP only in the metric) was not
-        # probed at tight bench in R42 and showed mixed results in the
-        # 5-trial 100-iter coarse probe. R43 re-probed at 9 trials × 120
-        # iters (tight-bench confidence, matching the R39 + R42 protocol)
-        # and finds a consistent (gm=16, xcd=4) win on the B ≥ 65536
-        # tier:
+        # R43 added tiles_n == 28 (= DSV3-GateUP) with a defensive
+        # m_total >= 65536 threshold, excluding DSV3-GateUP B=16 M=2048
+        # because the R42 coarse 5-trial probe had reported -12.43%
+        # for that shape at (16, 4), contradicting R43's 9-trial
+        # +0.81%. R44 re-probes B=16 M=2048 at 12 trials × 200 iters
+        # × 3 seeds to resolve the drift:
         #
-        #   shape                 m_total  Δ med  Δ min(=p0) correctness
-        #   DSV3-GateUP B=16 M=2048  32768  +0.81%  +1.03%   bit_eq=True ← rule SKIPS
-        #   DSV3-GateUP B=16 M=4096  65536  +2.82%  +1.84%   bit_eq=True
-        #   DSV3-GateUP B=32 M=2048  65536  +2.44%  +1.61%   bit_eq=True
-        #   DSV3-GateUP B=32 M=4096 131072  +2.70%  +2.46%   bit_eq=True
+        #   seed=42:   default=2083.6  (16,4)=2127.1  Δmed=+2.09%
+        #   seed=137:  default=2087.3  (16,4)=2126.5  Δmed=+1.88%
+        #   seed=2024: default=2087.0  (16,4)=2121.7  Δmed=+1.66%
         #
-        # The 3 rule-fires shapes all show Δ median ≥ +2.44% with Δ min
-        # ≥ +1.61% — strictly above bench noise (9-trial med-to-min
-        # spread observed at 0.3-1.5% in the same probe). The B=16 M=2048
-        # shape is explicitly excluded (threshold m_total ≥ 65536) even
-        # though its tight-bench delta is also mildly positive (+0.81%)
-        # — the earlier R42 coarse probe saw -12.43% for that shape's
-        # (16, 4) cell, and the R43 tight-bench +0.81% sits within both
-        # probes' noise band, so the safe choice is to NOT claim it.
+        # All 3 seeds give +1.66% to +2.09% — consistent, reproducible,
+        # well above noise. The R42 -12.43% was a single-trial outlier
+        # that the 5-trial median didn't absorb (per-seed std ~7pp on
+        # 100-iter trials for this shape; 12-trial × 200-iter drops it
+        # to ~0.5pp). R44 therefore relaxes the R43 threshold from
+        # m_total >= 65536 down to m_total >= 32768 — the same floor
+        # R42 uses for narrow-N. This captures the 4th DSV3-GateUP
+        # shape, bringing total RRR-path coverage to 12/16 aligned
+        # shapes.
         #
-        # Bit-identical output verified on all 4 shapes (max_abs=0 vs
-        # default (4, 0); group_m / num_xcds are pure persistent-grid
-        # tile-scheduling knobs on the same RRR arithmetic).
+        # Full DSV3-GateUP tight-bench data (R43 9-trial + R44 12-trial):
         #
-        # Probe archived: the inline snippet in round-43 commit message;
-        # re-runnable via the same grouped_rrr_dscale binding interface
-        # as scripts/_fp8_rrr_config_probe.py (R42).
+        #   shape                      m_total   Δ med     Δ min(p0)   src
+        #   DSV3-GateUP B=16 M=2048    32768    +1.66..+2.09%  +1.03..+3.78%  R44 multi-seed
+        #   DSV3-GateUP B=16 M=4096    65536    +2.82%         +1.84%         R43
+        #   DSV3-GateUP B=32 M=2048    65536    +2.44%         +1.61%         R43
+        #   DSV3-GateUP B=32 M=4096   131072    +2.70%         +2.46%         R43
+        #
+        # All 4 shapes gain ≥ +1.66% Δmed; all gains outside observed
+        # med-to-min spread. Bit-identical output verified on all 4
+        # (max_abs=0 vs default; group_m / num_xcds are pure persistent-
+        # grid tile-scheduling knobs; same bit-equivalence documented
+        # for R42 narrow-N and R39 var_k).
+        #
+        # Qwen3-GateUP (tiles_n == 16): NOT covered here. R44 tight-
+        # probed all 4 shapes; winners vary per shape:
+        #   B=16 M=2048: (2, 0) +2.96%, (16,4) only +0.95%
+        #   B=16 M=4096: (2, 2) +1.50%, (16,4) only ≤+0.5%
+        #   B=32 M=2048: (1, 4) +2.67%, (16,4) only +0.31%
+        #   B=32 M=4096: all candidates ≤ +0.39% (default wins)
+        # No single (gm, xcd) cell wins on all 4 Qwen3-GateUP shapes,
+        # and (2, 0) / (1, 4) would regress B=32 M=4096 by -0.53% / +0.39%
+        # respectively. Skipping per R43's "safe choice" policy.
         #
         # Rule scope audit:
         #   - ``tiles_n == 28`` ⇔ N_rrr == 7168. In the 24-shape MoE
-        #     metric this is DSV3-GateUP (K_fwd=7168 → N_rrr=7168) only.
-        #     Qwen3/gpt_oss K_fwd ∈ {1536, 2048, 2880} → N_rrr ∈ {1536,
-        #     2048, 2880} → tiles_n ∈ {6, 8, 11}, none match.
-        #   - Dense FP8 shapes in the DoD suite (test_dod_smoke.py
-        #     _HIPKITTEN_GROUPED_FP8_SHAPES and
-        #     _HIPKITTEN_DENSE_FWD_SHAPES): dA RRR outputs have
-        #     n = K_fwd ∈ {4096, 8192, 11008, 14336, 22016}, giving
-        #     tiles_n ∈ {16, 32, 43, 56, 86}, none match tiles_n == 28.
-        #   - ``m_total is not None`` excludes dense callers entirely
-        #     (dense passes m_total=None; grouped passes a.shape[0]).
-        #   - ``m_total >= 65536`` floors to grouped workloads where
-        #     the 3 probed DSV3-GateUP cases are all in the positive
-        #     cluster; lower tiers (m_total == 32768 = B=16 M=2048)
-        #     fall through to binding default.
+        #     metric this is DSV3-GateUP only (K_fwd=7168 in RRR coords).
+        #     Qwen3/gpt_oss K_fwd ∈ {1536, 2048, 2880} → tiles_n ∈
+        #     {6, 8, 11}, none match.
+        #   - Dense FP8 shapes in test_dod_smoke.py: dA RRR has n =
+        #     K_fwd ∈ {4096, 8192, 11008, 14336, 22016} → tiles_n ∈
+        #     {16, 32, 43, 56, 86}, none match tiles_n == 28.
+        #   - ``m_total is not None`` excludes dense callers (dense
+        #     passes m_total=None; grouped passes a.shape[0]).
+        #   - ``m_total >= 32768`` is the minimum grouped m_total in
+        #     the 24-shape suite (smallest = B=16 M=2048 = 32768), so
+        #     the threshold effectively only excludes dense.
         if (
             tiles_n == 28
             and m_total is not None
-            and m_total >= 65536
+            and m_total >= 32768
         ):
             return HipKittenConfig(
                 layout=layout, group_m=16, num_xcds=4, kernel=None
