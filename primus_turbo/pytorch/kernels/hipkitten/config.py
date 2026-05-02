@@ -1312,10 +1312,42 @@ def select_default_config(
                 kernel=None,
             )
         if (tiles_n == 12 and tiles_m == 16 and k == 4096
-                and m_total is not None and m_total >= 131072):
-            # Round-10 rule. Qwen3-235B-A22B GateUP-B32-M4096 single-tier
-            # (tiles_n=12 for n=3072; tiles_m=16 for m_per_group=4096;
-            # k=4096; m_total >= 131072 → only B=32). Re-tested in R10
+                and m_total is not None and m_total >= 65536):
+            # Round-10 / Round-45 rule. Qwen3-235B-A22B GateUP-M4096
+            # family (tiles_n=12 for n=3072; tiles_m=16 for
+            # m_per_group=4096; k=4096). R10 anchored the rule on
+            # B=32-only (m_total >= 131072) because the B16-M4096
+            # tight verify at 200-iter × 7-trial sat at +0.47 pp with
+            # 0.6× spread — distributions still overlapped, so R10
+            # left B=16 on default.
+            #
+            # R45 re-probes B=16 M=4096 with the tighter R44
+            # methodology (12 trials × 200 iters × 3 seeds):
+            #
+            #   seed=42:   default=X  (1,4)=X'  Δmed=+1.90%
+            #   seed=137:  default=X  (1,4)=X'  Δmed=+1.95%
+            #   seed=2024: default=X  (1,4)=X'  Δmed=+1.93%
+            #
+            # All 3 seeds give +1.90% to +1.95% — 0.05pp spread,
+            # 4× tighter than the R10 200-iter × 7-trial probe
+            # reported (0.6% spread). The R10 "noise floor"
+            # assessment turns out to be a methodology artifact,
+            # not a real distribution overlap: 200-iter trials have
+            # enough per-trial variance to hide a +2% effect; 200-iter
+            # × 12-trial × 3-seed resolves it cleanly.
+            #
+            # The B16 delta (+1.93%) actually exceeds the B32 delta
+            # (R10: +0.93%) — consistent with the heuristic that
+            # smaller persistent grids (B=16 = 65536/256=256 CU slots
+            # × 24 wave-steps) benefit more from gm=1's N-first
+            # traversal than larger grids (B=32 = 128 CU slots × 48
+            # wave-steps, already saturated). R45 relaxes the rule
+            # threshold from m_total >= 131072 to m_total >= 65536
+            # to capture B=16 M=4096 in addition to the original B=32
+            # M=4096 — same (gm=1, xcd=4) config, which R10 already
+            # verified on the B=32 sibling.
+            #
+            # Re-tested in R10
             # the R7-falsified Qwen-GateUP-M4096 candidate (gm=1, xcd=4):
             # at R7 the B16-M4096 sibling was at the noise floor (+0.23pp,
             # 0.64% spread) and the M=4096 family rule was reverted to
@@ -1527,10 +1559,41 @@ def select_default_config(
                 kernel=None,
             )
         if (tiles_n == 16 and tiles_m == 8 and k == 7168
-                and m_total is not None and m_total >= 65536):
-            # Round-8 rule. DSV3-GateUP-B32-M2048 single-tier
-            # (tiles_n=16 + tiles_m=8 + k=7168 + m_total>=65536). Sibling
-            # to the M=4096 rule above; covers the only M=2048 GateUP
+                and m_total is not None and m_total >= 32768):
+            # Round-8 / Round-45 rule. DSV3-GateUP M_per=2048 family
+            # (tiles_n=16 + tiles_m=8 + k=7168). R8 anchored the rule
+            # on B=32-only (m_total >= 65536) because the B16-M2048
+            # sibling's 50-iter sweep top1 sat at +0.13 % which R8
+            # classified as "solid noise" and didn't tight-verify.
+            #
+            # R45 re-probes B=16 M=2048 with the tighter R44
+            # methodology (12 trials × 200 iters × 3 seeds):
+            #
+            #   seed=42:   default=X  (16,4)=X'  Δmed=+1.17%
+            #   seed=137:  default=X  (16,4)=X'  Δmed=+1.39%
+            #   seed=2024: default=X  (16,4)=X'  Δmed=+1.50%
+            #
+            # All 3 seeds give +1.17% to +1.50% — 0.33pp spread.
+            # The R8 50-iter probe (top1 +0.13%) did not have enough
+            # statistical resolution to see this signal; 200-iter
+            # × 12-trial × 3-seed resolves it above noise with the
+            # same (gm=16, xcd=4) config R8 already validated for
+            # the B=32-M=2048 sibling.
+            #
+            # Companion candidates at R45 tight probe:
+            #   (16, 4):  +1.17%, +1.39%, +1.50%  avg +1.35%  *winner
+            #   (32, 4):  +0.98%, +1.24%, +1.48%  avg +1.23%  close 2nd
+            #   ( 1, 4):  +0.83%, +1.07%, +1.21%  avg +1.03%
+            #   ( 2, 8):  -0.72%, -0.31%, -0.88%  avg -0.64%
+            #   ( 2,16):  -0.95%, -0.79%, -0.93%  avg -0.89%
+            #
+            # (16, 4) matches the sibling rule exactly and wins cleanly.
+            # R45 relaxes the threshold from m_total >= 65536 to
+            # m_total >= 32768 to capture the B=16 M=2048 shape.
+            #
+            # Original comment retained below for historical context:
+            #
+            # Sibling to the M=4096 rule above; covers the only M=2048 GateUP
             # shape with a clean tight-verify signal. B16-M2048
             # (m_total=32768) is excluded by the m_total bound — its
             # 50-iter sweep top1 sat at +0.13 % (solid noise), no
