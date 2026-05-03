@@ -894,6 +894,65 @@ def select_default_config(
             # is not anchored well; only K >= 22016 has a clear (8, 2)
             # winner with a +1.4-1.8pp margin.
             return HipKittenConfig(layout=layout, group_m=8, num_xcds=2, kernel=None)
+        if (layout == "rrr"
+                and tiles_n == 6
+                and m_total is not None
+                and m_total >= 32768):
+            # Round-18 rule. BF16 grouped dA RRR — Qwen3-235B-A22B-Down
+            # narrow-N family. Mirrors the FP8 R42 rule at line 2233
+            # (which the BF16 path never received because all BF16 RRR
+            # rules above gate on tiles_m patterns that exclude this
+            # geometry).
+            #
+            # Hits (BF16 metric, exactly 4 shapes):
+            #   Qwen3-Down dA RRR — n=K_fwd=1536 → tiles_n=6, k=N_fwd=4096,
+            #   m_per_g ∈ {2048, 4096}, m_total ∈ {32768, 65536, 131072}.
+            #
+            # Why narrowed to ``tiles_n == 6`` (NOT R42's ``tiles_n <= 8``):
+            # an exploratory broader rule (tiles_n <= 8, including DSV3-Down
+            # tiles_n=8) was tested in this round but showed an asymmetric
+            # outcome on BF16 across two metric runs. Per-shape Δ (run mean
+            # over 2 trials with rule vs single baseline run):
+            #   Qwen3-Down B=16 M=2048   1.112 -> 1.114  +0.2pp ✓
+            #   Qwen3-Down B=16 M=4096   1.115 -> 1.124  +0.9pp ✓
+            #   Qwen3-Down B=32 M=2048   1.101 -> 1.120  +1.8pp ✓
+            #   Qwen3-Down B=32 M=4096   1.108 -> 1.119  +1.1pp ✓
+            #   DSV3-Down  B=16 M=2048   1.133 -> 1.116  -1.7pp ✗
+            #   DSV3-Down  B=16 M=4096   1.104 -> 1.107  +0.3pp tie
+            #   DSV3-Down  B=32 M=2048   1.111 -> 1.110   tie
+            #   DSV3-Down  B=32 M=4096   1.104 -> 1.098  -0.6pp ✗
+            # Qwen3-Down (tiles_n=6) is uniformly +0.2..+1.8pp; DSV3-Down
+            # (tiles_n=8) regresses on 2 of 4 shapes. R42's FP8 sweep
+            # showed both tiles_n=6 and tiles_n=8 winning at +1.95-6.66 %
+            # — the BF16 ↔ FP8 transfer is partial. Restricting to
+            # tiles_n==6 captures only the consistently-positive
+            # subfamily. (DSV3-Down can be revisited with its own rule
+            # once a per-tiles_n=8 BF16 microbench provides clean data.)
+            #
+            # The dA RRR kernel template is shared between BF16 and FP8
+            # grouped paths (only difference: FP8 also reads two scale
+            # factors). Persistent-grid scheduling (gm, xcd) operates on
+            # tile counts, not data values, so a (gm, xcd) cell that wins
+            # for FP8 RRR can win for BF16 RRR at the same tile geometry
+            # — but only if the bandwidth profile change (no dscale on
+            # BF16 side) doesn't tip the optimum. R17 demonstrated FP8
+            # var-K → BF16 var-K does NOT transfer (Qwen3-Down -1.3pp
+            # avg) because var-K's grad_out + x dual-stream changes the
+            # B-side reuse window. Here on dA RRR, the W-tile is static
+            # (single-source HBM read) so the load schedule is closer
+            # to dtype-invariant.
+            #
+            # Rule scope check: tiles_n == 6 in BF16 grouped RRR
+            # restricts to Qwen3-Down dA (n=1536). No dense LLaMA RRR
+            # shape has n=1536 (LLaMA's smallest dense RRR n is 4096 →
+            # tiles_n=16). Dense BF16 RRR uses m_total=None and is
+            # excluded by `m_total is not None`.
+            #
+            # Bit-identical: group_m / num_xcds are pure persistent-grid
+            # scheduling knobs (R42 verified max_abs=0.0 bit_eq=True on
+            # all 6 FP8 narrow-N shapes; same kernel template behavior
+            # for BF16).
+            return HipKittenConfig(layout=layout, group_m=16, num_xcds=4, kernel=None)
         if layout == "crr" and tiles_m >= 64 and tiles_n == 16:
             # Long-N backward dB-after-swap (CRR sees logical (N_fwd,
             # K_fwd, M_fwd) post-swap). Canonical Llama-2-7B
