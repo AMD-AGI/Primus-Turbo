@@ -23,6 +23,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )
+from primus_turbo.triton.utils.fp8_transpose import bf16_transpose_3d
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _HIPKITTEN_SUPPORTED_DTYPES = (torch.bfloat16,)
@@ -281,11 +282,26 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # 7168} and N_RRR ∈ {2048, 4096, 7168} all 64/256-multiples) skip
         # the transpose and run native RRR — saving ~b.numel() * 2 bytes
         # per dA call.
+        # Round-4 (BF16 weighted-wall, Lever D step 1): when H4 fires,
+        # use the Triton ``bf16_transpose_3d`` kernel instead of PyTorch's
+        # generic ``b.transpose(-2,-1).contiguous()`` copy. PyTorch runs
+        # at ~870 GB/s effective on the gpt_oss tier (the transposed-source
+        # stride defeats coalescing in the elementwise copy kernel); the
+        # tile-staged Triton kernel hits ~5 TB/s effective (bit-identical
+        # output verified at /tmp/probe_bf16_triton_transpose.py).
+        # Per-shape wall savings: B=4 GateUP -251 µs, B=32 GateUP -2017 µs,
+        # B=4 Down -127 µs, B=32 Down -934 µs (5.3-5.9x speedup). On the
+        # worst metric shape gpt_oss-GateUP-B32-M2048 (fwd+bwd ~8.5 ms,
+        # transpose was 28 %), this drops the transpose share to ~5 % and
+        # saves ~24 % wall ratio. The kernel is shared with the FP8 H4
+        # path (same ``_fp8_transpose_3d_kernel`` template, just BF16
+        # pointers instead of byte-cast uint8) so no kernel duplication.
         K_BLOCK = 64        # BF16 main-kernel K_BLOCK
         BLOCK_SIZE = 256    # BF16 main-kernel N BLOCK_SIZE
         if not trans_b and ((a.shape[1] % K_BLOCK) != 0
                             or (b.shape[-1] % BLOCK_SIZE) != 0):
-            b = b.transpose(-2, -1).contiguous()
+            b = bf16_transpose_3d(b) if b.is_contiguous() \
+                else b.transpose(-2, -1).contiguous()
             trans_b = True
         # Round-11 host-overhead trim (mirror of FP8 backend trim in
         # grouped_gemm_fp8_impl.py): ``_avg_group_m`` and

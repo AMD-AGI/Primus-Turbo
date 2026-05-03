@@ -154,3 +154,69 @@ def fp8_transpose_3d(b: torch.Tensor) -> torch.Tensor:
         BN=bn,
     )
     return out
+
+
+def bf16_transpose_3d(b: torch.Tensor) -> torch.Tensor:
+    """Fused [B, K, N] -> [B, N, K] transpose for BF16.
+
+    Round-4 (BF16 weighted-wall metric, Lever D step 1): adapted from
+    ``fp8_transpose_3d`` for the BF16 grouped GEMM dA backward H4 reroute
+    (``GroupedGEMMHipKittenBackend.execute``). The PyTorch reference
+    ``b.transpose(-2, -1).contiguous()`` runs at ~870 GB/s effective on
+    the gpt_oss BF16 H4 shapes (2.43 ms on B=32 GateUP w shape
+    [32, 5760, 2880] = 1.06 GB rd+wr = ~30 % of MI355X HBM peak ~3 TB/s
+    achievable for streaming kernels). The Triton tile-staged transpose
+    hits ~5 TB/s effective, **5.3-5.9x speedup** across all 4 gpt_oss
+    H4-reroute B/K/N tiers (probe at /tmp/probe_bf16_triton_transpose.py;
+    bit-identical via ``torch.equal`` on every shape).
+
+    The kernel ``_fp8_transpose_3d_kernel`` is dtype-agnostic — Triton
+    infers element type from the pointer (BF16 here vs uint8 in the FP8
+    wrapper above which byte-casts to handle 3 different fp8 dtypes).
+    Strides remain in element units so the call shape is identical.
+
+    Per-shape wall savings vs PyTorch (gpt_oss):
+       GateUP-B4   shape [4, 5760, 2880]:  306 µs -> 55 µs   (-251 µs)
+       GateUP-B32  shape [32, 5760, 2880]: 2433 µs -> 416 µs (-2017 µs)
+       Down-B4     shape [4, 2880, 2880]:  153 µs -> 26 µs   (-127 µs)
+       Down-B32    shape [32, 2880, 2880]: 1152 µs -> 218 µs (-934 µs)
+
+    On the worst metric shape gpt_oss-GateUP-B32-M2048 (total
+    fwd+bwd ~8.5 ms, dA H4 transpose was 2.4 ms = 28 %), this drops the
+    transpose to 0.4 ms = save ~2 ms / iter = ~23 % wall reduction.
+    Should lift the HK / Triton ratio from ~0.78 to ~1.0+.
+
+    Args:
+        b: Source tensor with shape ``[B, K, N]``. Must be contiguous and
+            ``torch.bfloat16``.
+
+    Returns:
+        A new contiguous tensor with shape ``[B, N, K]``, BF16. Bit-
+        identical to ``b.transpose(-2, -1).contiguous()``.
+    """
+    assert b.dim() == 3, f"expected 3-D tensor, got {b.dim()}-D"
+    assert b.dtype == torch.bfloat16, (
+        f"expected torch.bfloat16, got {b.dtype}"
+    )
+    assert b.is_contiguous(), "bf16_transpose_3d expects a contiguous source"
+    B, K, N = b.shape
+    bk, bn = _select_block_shape(K, N)
+    out = torch.empty((B, N, K), dtype=b.dtype, device=b.device)
+    num_n_blocks = triton.cdiv(N, bn)
+    grid = (B, triton.cdiv(K, bk) * num_n_blocks)
+    _fp8_transpose_3d_kernel[grid](
+        b,
+        out,
+        B,
+        K,
+        N,
+        K * N,
+        N,
+        1,
+        N * K,
+        K,
+        1,
+        BK=bk,
+        BN=bn,
+    )
+    return out
