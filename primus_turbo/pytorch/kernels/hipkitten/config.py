@@ -828,6 +828,75 @@ def select_default_config(
             # config the long-N CRR rule above picks for the deep-K
             # tier, keeping the rule family coherent).
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
+        if layout == "crr" and tiles_n == 11 and 8 <= tiles_m <= 24 and k <= 4096:
+            # Round-1 (weighted-wall metric) rule. gpt_oss var-K (dB) family:
+            # K_fwd=2880 → kernel-N axis tiles_n=11; N_fwd ∈ {2880, 5760}
+            # → kernel-M axis tiles_m ∈ {11, 22}; per-group K_var = M_per
+            # ∈ {2048, 4096} → k <= 4096. Predicate covers all 8 gpt_oss
+            # var-K dB calls in the metric (B ∈ {4, 32}, M_per ∈ {2048,
+            # 4096}, GateUP+Down). Was falling through to default
+            # (gm=4, xcds=8) — no prior CRR rule had been written for
+            # gpt_oss because the existing CRR family rules
+            # (tiles_m >= 32 + tiles_n == 16) were tuned for dense LLaMA
+            # mlp_gate_up dB (tiles_m ∈ {48, 86, 112}, tiles_n=16) and
+            # never matched gpt_oss's small (11/22, 11) tile geometry.
+            #
+            # Per-iter-sync metric, this round (target shape lowest-
+            # progress was gpt_oss-GateUP-B32-M2048 at ratio=0.753):
+            #   * baseline default (gm=4, xcds=8): score=775,
+            #     gpt_oss family geomean=0.8706
+            #   * with this rule (gm=4, xcds=4): score=780 (×2 runs,
+            #     stable), gpt_oss family geomean=0.8823 (+1.2pp)
+            #
+            # Per-shape gpt_oss before → after with this rule
+            # (single best run, run-to-run swing ~0.5pp):
+            #   GateUP-B4-M2048    0.855 → 0.876   +2.5pp ✓
+            #   Down-B4-M2048      0.885 → 0.923   +4.3pp ✓
+            #   GateUP-B4-M4096    0.936 → 0.962   +2.8pp ✓
+            #   Down-B4-M4096      0.957 → 0.955    flat (noise)
+            #   GateUP-B32-M2048   0.753 → 0.763   +1.3pp marginal
+            #   Down-B32-M2048     0.804 → 0.801   flat (noise)
+            #   GateUP-B32-M4096   0.892 → 0.895   flat (noise)
+            #   Down-B32-M4096     0.903 → 0.905   flat (noise)
+            #
+            # The clean signal is on the B=4 sub-family (3/4 shapes
+            # +2.5 to +4.3pp). B=32 is mostly noise — the ``xcds=4 vs
+            # xcds=8`` knob saturates once tiles/CU exceeds ~10. The
+            # B=4 family has tiles/CU ~4.3 (B=4 × tiles_per_group=276 /
+            # NUM_CUS=256), so xcds=8 was over-splitting the work
+            # across all 8 XCDs and starving each XCD of useful tiles.
+            # xcds=4 keeps each XCD with at least 1 tile most of the
+            # time, halving the inter-XCD coordination overhead.
+            #
+            # Split-by-m_total tested: separate rule with (gm=8,
+            # xcds=4) for m_total>16384 (B=32) was within noise of
+            # this single-cfg version (gpt_oss geomean 0.8872 vs
+            # 0.8823, but full-suite score swung 776 vs 780 due to
+            # DSV3 / Qwen3 Triton baseline run-to-run noise on
+            # uninvolved shapes — ±2pp). Single cfg is cleaner; defer
+            # B=32 split to a later round once a kernel-level fix
+            # opens more headroom there.
+            #
+            # Rule scope check (no collateral on other metric shapes):
+            # ``tiles_n == 11`` ⇔ K_fwd ∈ [2816, 3071] which uniquely
+            # captures gpt_oss K_fwd=2880 in the metric. Other families'
+            # var-K kernel-N axes (= K_fwd):
+            #  - DSV3-GateUP: K_fwd=7168 → tiles_n=28
+            #  - DSV3-Down:   K_fwd=2048 → tiles_n=8
+            #  - Qwen3-GateUP: K_fwd=4096 → tiles_n=16
+            #  - Qwen3-Down:  K_fwd=1536 → tiles_n=6
+            # None hit tiles_n=11.
+            #
+            # Bit-identical output (group_m / num_xcds are pure
+            # scheduling knobs on the BF16 grouped var-K persistent
+            # tile schedule — same property as forward grouped + dense
+            # rules above). Validated by metric's correctness gate
+            # (downsized ``check_allclose`` on out, dA, dB) on every
+            # shape every round; if (4, 4) corrupted dB, the small
+            # check would FAIL on at least one of the 8 gpt_oss shapes
+            # and clip the ratio to 0.0. All 24 shapes passed both
+            # before-and-after runs.
+            return HipKittenConfig(layout=layout, group_m=4, num_xcds=4, kernel=None)
         return HipKittenConfig(
             layout=layout,
             group_m=_BF16_DEFAULT_GROUP_M,
