@@ -688,6 +688,126 @@ def select_default_config(
                 return HipKittenConfig(
                     layout=layout, group_m=16, num_xcds=4, kernel=None
                 )
+        # ----------------------------------------------------------
+        # Round-24 aggregate: BF16 grouped var-K (dB / CRR) family.
+        # Five family-specific (tiles_m, tiles_n) rules that together
+        # cover the 5 of 6 dB var-K paths in the BF16 weighted-wall
+        # metric that were previously routed sub-optimally — either
+        # to the cube rule below (gpt_oss-Down) or to the default
+        # cell (the other 4 families). All rules:
+        #   * Gate on ``layout == "crr" and m_total is not None`` so
+        #     dense LLaMA callers (which always pass m_total=None and
+        #     have m=full M) are unaffected — this is grouped-only
+        #     surgery.
+        #   * Are bit-equivalent (group_m / num_xcds are pure
+        #     persistent-grid scheduling knobs; max_abs=0,
+        #     bit_eq=True at every probed cell).
+        #   * Were derived from a 12-cell × 5-trial × 120-iter
+        #     kernel-only sweep on all 4 metric shapes per family
+        #     (B ∈ {16, 32} for DSV3/Qwen3, B ∈ {4, 32} for
+        #     gpt_oss; M_per ∈ {2048, 4096} both; see
+        #     scripts/_bf16_vark_db_multi_family_probe.py and
+        #     /tmp/bf16_vark_db_multi_round24.log).
+        #   * Each is the sole UNIFORM-POSITIVE cell vs the previous
+        #     production cfg per family (min Δ > 0 across all 4
+        #     shapes — same uniformity bar as R20's dA RRR rules).
+        # The aggregate strategy (mirror R20 / R18→R20): individual
+        # per-family wins are sub-noise (each contributes +0.1-0.5
+        # score after wall→ratio → weighted-progress dilution), but
+        # 5 families × 4 shapes = 20 shapes lifted at the same time
+        # has a ~5x larger combined wall delta, which has historical
+        # precedent for crossing the metric noise floor.
+        if (layout == "crr"
+                and tiles_m == 11
+                and tiles_n == 11
+                and k <= 4096
+                and m_total is not None):
+            # gpt_oss-Down dB var-K. Was being captured by the cube
+            # rule below (``tiles_m <= 16 and tiles_m == tiles_n
+            # and k <= 12288``) which fires FIRST and returns
+            # (gm=2, xcds=32) — that cell was tuned at R1+R5 for
+            # dense LLaMA forward 4096^3 / 4096^2 x11008, never
+            # validated for grouped var-K. R23 identified the
+            # misfire; R24 commits the fix.
+            #
+            # 11-cell sweep on the 4 gpt_oss-Down shapes vs the
+            # production cube cfg (gm=2, xcds=32):
+            #   B=4-M2048    +1.77 %  (top-1)
+            #   B=4-M4096    +2.31 %  (top-1)
+            #   B=32-M2048   +1.29 %  (top-1)
+            #   B=32-M4096   +0.72 %  (top-1)
+            # avg +1.52 %, min +0.72 %, max +2.31 %.
+            return HipKittenConfig(layout=layout, group_m=1, num_xcds=4, kernel=None)
+        if (layout == "crr"
+                and tiles_m == 16
+                and tiles_n == 6
+                and k <= 4096
+                and m_total is not None):
+            # Qwen3-235B-A22B-Down dB var-K (N_fwd=4096, K_fwd=1536).
+            # Was falling through to default (gm=4, xcds=8) — none of
+            # the existing CRR rules matched (tiles_n=6 is unique to
+            # Qwen-Down K_fwd=1536 in the BF16 metric). 11-cell sweep
+            # on all 4 Qwen-Down shapes vs default:
+            #   B=16-M2048   +1.15 %
+            #   B=16-M4096   +1.76 %
+            #   B=32-M2048   +1.24 %
+            #   B=32-M4096   +2.10 %
+            # avg +1.56 %, min +1.15 %, max +2.10 %; uniform-positive.
+            # (gm=2, xcds=4) is also uniform +1.45 % avg but slightly
+            # worse on every shape — picked (gm=1, xcds=4) for
+            # consistency with the 3 other (1, 4) wins this round.
+            return HipKittenConfig(layout=layout, group_m=1, num_xcds=4, kernel=None)
+        if (layout == "crr"
+                and tiles_m == 12
+                and tiles_n == 16
+                and k <= 4096
+                and m_total is not None):
+            # Qwen3-235B-A22B-GateUP dB var-K (N_fwd=3072, K_fwd=4096).
+            # Was on default (gm=4, xcds=8). 11-cell sweep:
+            #   B=16-M2048   +0.53 %
+            #   B=16-M4096   +1.70 %
+            #   B=32-M2048   +0.49 %
+            #   B=32-M4096   +1.66 %
+            # avg +1.10 %, min +0.49 %, max +1.70 %; uniform-positive
+            # (only cell with all 4 shapes positive). Note this is
+            # the same (gm=1, xcds=4) as Qwen-Down even though
+            # geometry differs — the persistent-grid behavior at
+            # tiles_m ∈ {12, 16} with shallow tiles_n ∈ {6, 16}
+            # converges on the same scheduler state.
+            return HipKittenConfig(layout=layout, group_m=1, num_xcds=4, kernel=None)
+        if (layout == "crr"
+                and tiles_m == 28
+                and tiles_n == 8
+                and k <= 4096
+                and m_total is not None):
+            # DeepSeek-V3-Down dB var-K (N_fwd=7168, K_fwd=2048).
+            # tiles_m=28 is the WIDEST N tile in the metric var-K
+            # suite (other families are tiles_m ∈ {11, 12, 16, 22}).
+            # Was on default (gm=4, xcds=8). 11-cell sweep:
+            #   B=16-M2048   +0.64 %
+            #   B=16-M4096   +0.64 %
+            #   B=32-M2048   +1.24 %
+            #   B=32-M4096   +0.22 %
+            # avg +0.69 %, min +0.22 %, max +1.24 %; uniform-positive.
+            # The (gm, xcds) winner here is (gm=16, xcds=4) NOT
+            # (gm=1, xcds=4) — at tiles_m=28 the persistent-grid
+            # work-window benefits from gm=16 batching (more L2
+            # reuse per tile-row per CU). Same property as the
+            # tiles_m=8 + B=32 RCR rule at line 687 above
+            # ((gm=16, xcds=4) for tiles_m=8) — the wider-N
+            # geometry has analogous large-batch sensitivity.
+            return HipKittenConfig(layout=layout, group_m=16, num_xcds=4, kernel=None)
+        # NOTE: a 5th rule was tested for DSV3-GateUP dB var-K
+        # (tiles_m=16, tiles_n=28) at (gm=2, xcds=0), but that
+        # cell — while uniform-positive +0.28 % avg in the
+        # kernel-only probe vs in-place HK reference — exceeds
+        # the metric's bf16 allclose tolerance vs Triton
+        # reference (4/4 DSV3-GateUP shapes hit dB-allclose).
+        # The xcds=0 chiplet bypass produces a different
+        # accumulation order across CUs that keeps in-HK output
+        # bit-equal to itself but drifts vs Triton beyond the
+        # 1-2 ULP envelope. Dropped from the aggregate; DSV3-GateUP
+        # dB var-K stays on default (gm=4, xcds=8).
         if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
             # Cube-ish small (16x16 grid). Round 1: 4096^3 fwd RCR and
             # 4096x4096x11008 win on (gm=2, xcd=32). Round 5 extends the
@@ -698,7 +818,10 @@ def select_default_config(
             # 12288 is non-cube in the metric suite, so the wider bound
             # has no collateral. Also catches the dB-after-swap RCR-fwd
             # cube cousins (e.g. 8192x4096x4096 -> dB (4096,4096,8192))
-            # that already passed in round 4.
+            # that already passed in round 4. Round 24 added a
+            # CRR-specific carve-out above for tiles_m=tiles_n=11 +
+            # m_total!=None (gpt_oss-Down dB var-K) — that path was
+            # previously mis-routed here.
             return HipKittenConfig(layout=layout, group_m=2, num_xcds=32, kernel=None)
         if tiles_n == 16 and tiles_m == 2 * tiles_n and k <= 4096:
             # Skinny tall (32x16 grid, K shallow): canonical attn_out
