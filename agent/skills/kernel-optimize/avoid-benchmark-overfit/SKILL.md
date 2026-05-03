@@ -13,13 +13,54 @@ it during ANALYZE / OPTIMIZE / VALIDATE**.
 
 When to invoke this skill:
 
+- **SURVEY_RELATED_WORK phase**, while filling in
+  `<campaign_dir>/related_work.md`. Use Step 1 to tag every shortlisted
+  direction (and every interesting SOTA reference) with its bucket. Do
+  this before the agent commits to a hypothesis ordering, not after.
+  `W2` / `W3` directions are dropped from the shortlist at this point.
 - ANALYZE phase, before proposing any wrapper-level change that involves
   `dict`, `OrderedDict`, `weakref`, `lru_cache`, `id(...)`, or any "skip work
   if we have seen this tensor before" idea.
 - VALIDATE phase, when a round shows benchmark gain larger than ~1% per
   individual operation that the kernel change should produce.
+- **REPORT phase**, while writing `## Final Report` in `logs/optimize.md`.
+  Use Step 7 to re-attribute the campaign's `baseline → final best`
+  delta into structural / bounded / benchmark-only components.
 - Any time the benchmark report shows + step TFLOPS but the same change makes
   no structural difference to a kernel hot path.
+
+---
+
+## Step 0 — SURVEY-time direction filter
+
+This skill is consumed twice during a campaign: once at **SURVEY**
+(before any code change is even proposed) and again at **OPTIMIZE /
+VALIDATE** (when a candidate exists).
+
+At SURVEY time, the agent only has names and SOTA references — not code.
+The job here is cheap: tag every shortlisted direction in
+`<campaign_dir>/related_work.md` with the bucket from Step 1, and use
+that tag to decide whether the direction enters the hypothesis pipeline
+at all.
+
+Concrete rules:
+
+- For each idea in the survey's `Real-training Transfer Audit` table,
+  pick exactly one bucket from Step 1.
+- `K1`–`K4` rows: keep on the shortlist. Their reported gain is taken at
+  face value (subject to local re-measurement at BASELINE).
+- `W1` rows: keep on the shortlist, but rewrite the "Estimated
+  real-training gain" column using the bound formula in Step 4
+  (`quant_time(weight) / step_time`). Do not carry a vendor's benchmark
+  headline forward unbounded.
+- `W2` / `W3` rows: drop from the shortlist. Record them under
+  `Non-Transferable or Misleading Items` so a future agent does not
+  re-discover them, but do **not** promote them to ANALYZE.
+
+If after this filter the shortlist is empty, the correct answer is to
+keep surveying for structural directions (different MFMA family, layout
+specialization, fusion opportunity, persistent kernel, …) — not to
+relax the rule and let a `W2` direction in.
 
 ---
 
@@ -170,6 +211,39 @@ knowledge.
 
 ---
 
+## Step 7 — REPORT-time re-attribution
+
+When the campaign terminates and the agent writes `## Final Report` in
+`logs/optimize.md`, the headline `baseline → final best` number must be
+re-attributed against this skill before it is published.
+
+Procedure:
+
+1. Walk the lineage of accepted rounds (`round-2 → … → round-N_best`).
+2. For each round, read its `Real-training transfer check` section and
+   pull out: `bucket`, `Benchmark gain`, `Estimated real-training gain`,
+   `Decision`.
+3. Sum the `Benchmark gain` values into three buckets:
+   - `S_bench` = sum over rounds with bucket `K1`–`K4` and decision `ACCEPT-as-real`
+   - `W_bench` = sum over rounds with bucket `W1` and decision `ACCEPT-with-asterisk`
+   - `R_bench` = sum over anything else that ended up in the accepted lineage
+4. Sum the `Estimated real-training gain` values the same way:
+   - `S_real` = sum over `K1`–`K4` accepted rounds (should equal `S_bench`)
+   - `W_real` = sum over `W1` accepted rounds (should be `≤ quant_time(weight) / step_time`)
+   - `R_real` = 0 by definition (anything that ends up in `R_bench` cannot defend itself in transfer)
+5. Fill in the `Real-training applicability audit` table in
+   `logs/optimize.md` with these numbers. The "Total benchmark gain"
+   row must equal `S_bench + W_bench + R_bench`. The
+   "Real-training-equivalent gain" row must equal `S_real + W_real`.
+6. If `R_bench > 1%`, the campaign has shipped benchmark-only gain. The
+   correct response is to roll back the offending rounds and re-run
+   the audit, **not** to publish the inflated headline.
+
+This converts a sequence of round-level decisions into one campaign-level
+honest number that survives a real LLM training step.
+
+---
+
 ## Worked example: the cache rollback that motivated this rule
 
 In an earlier campaign for `gemm_fp8_blockwise / Triton / gfx950`, several
@@ -195,6 +269,26 @@ rejected at ANALYZE going forward.
 
 ---
 
+## Checklist (use during SURVEY)
+
+Before declaring `<campaign_dir>/related_work.md` complete, confirm all of
+the following:
+
+- [ ] Every entry under `Transferable Ideas` and `Non-Transferable or
+      Misleading Items` carries a bucket tag (`K1` / `K2` / `K3` / `K4`
+      / `W1` / `W2` / `W3`).
+- [ ] The `Real-training Transfer Audit` table is filled in. Every row
+      has both a `Reported gain` and an `Estimated real-training gain`,
+      and the latter uses the bound formula in Step 4 for `W1` rows.
+- [ ] The `Initial Hypothesis Shortlist` contains only `K1`–`K4` and
+      bounded `W1` directions. Any `W2` / `W3` idea sits in
+      `Non-Transferable` only.
+- [ ] The `Bottom Line` section names the most-relevant idea **and** its
+      bucket.
+
+A survey that fails any of these checks is incomplete. Do not advance to
+BASELINE / ANALYZE — go back and finish the audit.
+
 ## Checklist (use during VALIDATE)
 
 Before recording a round as ACCEPT, confirm all of the following:
@@ -212,3 +306,27 @@ Before recording a round as ACCEPT, confirm all of the following:
 
 A round that fails any of these checks is INVALID and must be rolled back,
 even if its benchmark aggregate score improved.
+
+## Checklist (use during REPORT)
+
+Before publishing `## Final Report` in `logs/optimize.md`, confirm all of
+the following:
+
+- [ ] Every accepted round in the lineage has a `Real-training transfer
+      check` section in its `summary.md` with a concrete `Decision`.
+- [ ] No accepted round has `Decision: REJECT-as-overfit`. (If one does,
+      roll it back first, then re-run the audit on the remaining
+      lineage.)
+- [ ] The `Real-training applicability audit` table in the final report
+      is filled in. The `Real-training-equivalent gain` total is
+      derived per Step 7, not copied from the headline benchmark
+      number.
+- [ ] The inflation gap (`headline benchmark gain` minus
+      `real-training-equivalent gain`) is reported. If the gap exceeds
+      `1%`, the report explicitly attributes that gap to
+      benchmark-loop residual and recommends rollback rather than
+      shipping the inflated headline.
+
+A campaign whose final report fails any of these checks must not be
+declared complete; it must be re-audited and, if necessary, rolled back
+to a clean lineage first.
