@@ -237,6 +237,55 @@ at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 
 //==================================================================
+//  Permute (MoE token (un)permute)
+//==================================================================
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+permute_preprocessing(at::Tensor routing_map, at::Tensor num_dispatched_token_tensor,
+                      int64_t max_num_dispatched_tokens, int64_t num_of_local_experts,
+                      int64_t pad_multiple, int64_t num_permuted_tokens);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+permute_preprocessing_meta(at::Tensor routing_map, at::Tensor num_dispatched_token_tensor,
+                           int64_t max_num_dispatched_tokens, int64_t num_of_local_experts,
+                           int64_t pad_multiple, int64_t num_permuted_tokens);
+
+void permute_launcher(at::Tensor tokens, at::Tensor output_tokens,
+                      c10::optional<at::Tensor> scaling_factor,
+                      c10::optional<at::Tensor> output_scaling_factor,
+                      c10::optional<at::Tensor> probs, c10::optional<at::Tensor> output_probs,
+                      at::Tensor row_id_map, at::Tensor num_dispatched_token_tensor,
+                      int64_t pad_multiple, int64_t num_of_local_experts, int64_t hidden_size,
+                      int64_t scales_per_token, int64_t local_rank, int64_t num_ranks_per_node,
+                      bool use_fp8, bool with_probs, int64_t num_permuted_token,
+                      int64_t num_of_blocks_permute);
+
+void permute_launcher_meta(at::Tensor tokens, at::Tensor output_tokens,
+                           c10::optional<at::Tensor> scaling_factor,
+                           c10::optional<at::Tensor> output_scaling_factor,
+                           c10::optional<at::Tensor> probs, c10::optional<at::Tensor> output_probs,
+                           at::Tensor row_id_map, at::Tensor num_dispatched_token_tensor,
+                           int64_t pad_multiple, int64_t num_of_local_experts, int64_t hidden_size,
+                           int64_t scales_per_token, int64_t local_rank,
+                           int64_t num_ranks_per_node, bool use_fp8, bool with_probs,
+                           int64_t num_permuted_token, int64_t num_of_blocks_permute);
+
+void unpermute_launcher(at::Tensor permuted_tokens, at::Tensor output_tokens,
+                        c10::optional<at::Tensor> permuted_probs,
+                        c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,
+                        at::Tensor num_dispatched_tokens_tensor, int64_t num_of_local_experts,
+                        int64_t hidden_size, int64_t local_rank, int64_t num_ranks_per_node,
+                        bool with_probs, int64_t num_of_blocks_unpermute);
+
+void unpermute_launcher_meta(at::Tensor permuted_tokens, at::Tensor output_tokens,
+                             c10::optional<at::Tensor> permuted_probs,
+                             c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,
+                             at::Tensor num_dispatched_tokens_tensor,
+                             int64_t num_of_local_experts, int64_t hidden_size, int64_t local_rank,
+                             int64_t num_ranks_per_node, bool with_probs,
+                             int64_t num_of_blocks_unpermute);
+
+//==================================================================
 //  Runtime
 //==================================================================
 
