@@ -31,8 +31,6 @@ Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 from __future__ import annotations
 
 import itertools
-import weakref
-from collections import OrderedDict
 
 import torch
 import triton
@@ -48,32 +46,6 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _set_knobs_gfx950,
 )
 
-
-# Cache `scale.T.contiguous()` results so repeated backward calls on the same
-# saved scale tensor (benchmark's 100-iter bwd loop, realistic training reuse)
-# do not keep relaunching the transpose kernel for the 2D blockwise-scale
-# paths (`_blockwise_nn` dgrad and `_blockwise_nt` forward).
-_SCALE_T_CACHE_CAPACITY = 32
-_scale_t_cache = OrderedDict()
-
-
-def _get_scale_t_contiguous(x: torch.Tensor) -> torch.Tensor:
-    if x.is_contiguous() and x.ndim == 2:
-        key = (id(x), getattr(x, "_version", 0), x.shape[0], x.shape[1])
-        entry = _scale_t_cache.get(key)
-        if entry is not None:
-            ref, xt = entry
-            if ref() is x:
-                _scale_t_cache.move_to_end(key)
-                return xt
-            _scale_t_cache.pop(key, None)
-        xt = x.T.contiguous()
-        _scale_t_cache[key] = (weakref.ref(x), xt)
-        _scale_t_cache.move_to_end(key)
-        while len(_scale_t_cache) > _SCALE_T_CACHE_CAPACITY:
-            _scale_t_cache.popitem(last=False)
-        return xt
-    return x.T.contiguous()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -1237,7 +1209,7 @@ def _blockwise_nt(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = _get_scale_t_contiguous(a_scale_inv)  # [K//128, M]
+    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
     B_t = b.T  # view [K, N]
 
     num_m = (M + 127) // 128
@@ -1293,10 +1265,10 @@ def _blockwise_nn(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = _get_scale_t_contiguous(a_scale_inv)  # [K//128, M]
+    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
     # B_scales from quantization: [dim0_blocks, dim1_blocks] for weight stored as [N_fwd, K_fwd].
     # Kernel expects [N_output_blocks, K_inner_blocks] indexing → transpose.
-    b_scale_inv_t = _get_scale_t_contiguous(b_scale_inv)
+    b_scale_inv_t = b_scale_inv.T.contiguous()
 
     num_m = (M + 127) // 128
     num_n = (N + 127) // 128
