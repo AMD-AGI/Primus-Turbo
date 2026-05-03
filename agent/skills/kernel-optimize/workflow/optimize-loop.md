@@ -18,12 +18,17 @@ Therefore, this file is **not responsible for**:
 
 ## Iteration Contract
 
-Before running `ENVIRONMENT_BASELINE`, read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc). Treat it as a hard constraint throughout the loop:
+Before running `ENVIRONMENT_BASELINE`, read both
+[`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc)
+and
+[`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc).
+Treat them as hard constraints throughout the loop:
 
 - one hypothesis and one meaningful kernel change per round
 - correctness before performance
 - benchmark the full active validation set
 - accept or roll back cleanly to the previous accepted baseline
+- **every accepted gain must transfer to real LLM training**; benchmark-only caches keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` are forbidden — see the operational checklist in [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
 
 ## Input Parameters
 
@@ -281,11 +286,20 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 - After modification, be able to clearly answer "what exactly was changed this round"
 - If compiled artifacts are involved, rebuild per project skill instructions
 - Record modified files, key parameters, and expected impact for this round
+- If the proposed change is a wrapper-level cache, memoization, or
+  `id(tensor)` lookup: read [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
+  and complete its Step 1–4 audit **before** writing any code. A cache that
+  fails the audit must not be implemented at all.
 
 **Constraints**:
 - Do not mix unrelated cleanup into optimization attempts
 - Do not introduce multiple orthogonal major changes simultaneously
 - Do not break key interface semantics agreed upon with the upstream project
+- Do not introduce caches keyed on `id(activation)`, `id(grad_out)`, or
+  `id(activation_scale)`. These are forbidden by
+  [`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc)
+  because their gain comes from the benchmark idiom (same Python object
+  reused 100 times) and does not transfer to real LLM training.
 
 **Output**:
 - Candidate diff
@@ -323,6 +337,7 @@ Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (
 - `Check = FAIL` in benchmark → reject immediately
 - Aggregate score regression → default reject
 - Core shape regression > 3% → default reject
+- New wrapper-level cache keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` → reject immediately, regardless of aggregate score. The round's `summary.md` must include a `Real-training transfer check` section showing the cache audit per [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md); if that section says `REJECT-as-overfit`, the round is INVALID and must be rolled back.
 
 **After passing**:
 1. Write this round's detailed results to `rounds/round-N/summary.md`

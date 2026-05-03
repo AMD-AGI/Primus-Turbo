@@ -35,7 +35,9 @@ This skill is **not responsible for**:
 
 After the agent has collected all the above information, return to this file to execute DEFINE_TARGET.
 
-Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, and accept-or-rollback lineage.
+Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) and [`../../rules/no_benchmark_overfitting.mdc`](../../rules/no_benchmark_overfitting.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, accept-or-rollback lineage, and **every accepted gain must transfer to a real LLM training step (no benchmark idiom over-fitting via `id(...)`-keyed activation / grad_out / scale caches)**.
+
+When ANALYZE proposes any wrapper-level cache, memoization, or `id(tensor)` lookup, follow the operational checklist in [`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md) before writing code.
 
 For validation scope, interpret that contract as:
 - **full validation** → run all `target_shapes`
@@ -330,6 +332,8 @@ Read the corresponding skill as needed based on `target_lang`, `target_gpu`, and
 | What you need | Where to find it |
 |---------------|-----------------|
 | Linear iteration contract | [../../rules/iteration_rules.mdc](../../rules/iteration_rules.mdc) |
+| No benchmark over-fitting (hard rule) | [../../rules/no_benchmark_overfitting.mdc](../../rules/no_benchmark_overfitting.mdc) |
+| Cache audit / id-key audit (operational) | [avoid-benchmark-overfit/SKILL.md](avoid-benchmark-overfit/SKILL.md) |
 | Optimization process and gating rules | [workflow/optimize-loop.md](workflow/optimize-loop.md) |
 | General Triton optimization techniques | [triton/SKILL.md](triton/SKILL.md) |
 | General HIP optimization techniques | [hip/SKILL.md](hip/SKILL.md) |
