@@ -162,6 +162,13 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+    # When True, ops that support it (currently HIPKITTEN grouped FP8 forward
+    # on TENSORWISE granularity) fuse the BF16 -> FP8 activation quantize
+    # into the GEMM kernel itself. Saves ~10% E2E wall + the FP8 staging
+    # buffer (M_total * K bytes) on forward; backward still re-quantizes.
+    # Default False so existing call sites are bit-identical. Backends that
+    # don't implement the fused path silently fall back to the un-fused one.
+    fuse_act_quant: bool = False
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
@@ -177,6 +184,11 @@ class Float8QuantConfig:
             assert (
                 self.scale_dtype == mx_support_scale_dtype
             ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+
+        if self.fuse_act_quant and self.granularity != ScalingGranularity.TENSORWISE:
+            raise ValueError(
+                "fuse_act_quant is currently only supported for TENSORWISE granularity"
+            )
 
 
 @dataclass

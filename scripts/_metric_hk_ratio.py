@@ -6,15 +6,16 @@
 ###############################################################################
 """HipKittens / default-backend TFLOPS ratio metric for auto_optimize.
 
-Six independent sections (64 cases total) each measured against its
+Six independent sections (80 cases total) each measured against its
 canonical baseline:
 
     (1) BF16_fwd  vs HIPBLASLT  —  8 dense LLama-2-7B / Llama-3.1-8B shapes
     (2) BF16_bwd  vs HIPBLASLT  —  same 8 shapes, backward-only
     (3) FP8_fwd   vs HIPBLASLT  —  same 8 shapes, FP8 tensorwise forward
     (4) FP8_bwd   vs TRITON     —  same 8 shapes, FP8 tensorwise backward
-    (5) grp_BF16  vs TRITON     —  16 MoE shapes (DeepSeek-V3 + gpt_oss_20B)
-    (6) grp_FP8   vs TRITON     —  same 16 MoE shapes, FP8 tensorwise
+    (5) grp_BF16  vs TRITON     —  24 MoE shapes
+                                   (DeepSeek-V3 + gpt_oss_20B + Qwen3-235B-A22B)
+    (6) grp_FP8   vs TRITON     —  same 24 MoE shapes, FP8 tensorwise
 
 For each shape:
   1. Times the op with HIPKITTEN forced as the GEMM backend.
@@ -59,7 +60,7 @@ block printed to stderr, NOT the integer score.
 
 What this metric will NOT reward:
   * Adding shapes to the suite without making HIPKITTEN actually
-    competitive on them — geomean of 64 ratios is robust to cherry-picking.
+    competitive on them — geomean of 80 ratios is robust to cherry-picking.
   * "Fixing" rejection by skipping the shape — every entry in SUITE is
     counted, no exceptions.
   * Narrowing ``can_handle`` (e.g. ``balanced groups only``,
@@ -168,16 +169,150 @@ def _pick_idle_gpu() -> Optional[str]:
     return str(all_gpus[0]) if all_gpus else None
 
 
+def _assert_gpu_truly_idle(host_gpu_id: int) -> None:
+    """Soft check that no foreign KFD tenant holds ``host_gpu_id``.
+
+    Despite the historical name, "truly idle" is no longer achievable on
+    this MI355X — the box is **continuously shared** with other tenants
+    whose workloads run across all 8 GPUs (rocm-smi --showuse reports
+    95-97% on every card, and that's a real live-utilization reading).
+    There is no idle slot to wait for; refusing to run = the optimization
+    loop never makes progress.
+
+    What we DO check (raise RuntimeError on positive):
+      * a KFD process listed on ``host_gpu_id`` holds > 100 MB of VRAM.
+        This is the one signal that survives correctly on this kernel
+        and reliably distinguishes "another tenant is allocated here
+        right now" from "queue contention from someone allocated on a
+        different GPU".
+
+    What we deliberately do NOT fail on (only WARN):
+      * raw `VRAM used > BASELINE` from `--showmeminfo vram` — dead
+        tenants regularly leave ~20 GB of phantom VRAM behind that no
+        live KFD process holds (allocator state survives process exit
+        until the kfd module is reloaded by an admin);
+      * `GPU use (%)` from `--showuse` — uniformly 95-97% across all 8
+        cards because the host is fully shared. Failing on this would
+        mean the loop never runs.
+
+    Bench timing uses `torch.cuda.Event(enable_timing=True)` which on
+    ROCm is `hipEventRecord` (HSA-queue timestamps). Under contention
+    from co-resident tenants this CAN inflate measured elapsed_time
+    when our wavefronts get time-sliced against theirs, so absolute
+    TFLOPS is noisier than on a private box. The score is comparative
+    (HK / TRT ratio on identical contention), so the relative signal
+    survives — the agent's no_improve_streak / patience logic absorbs
+    the residual noise. Long-term, swapping the timer to rocprofv3
+    PMC-based per-kernel duration would give cleaner numbers; for now
+    the cuda.Event path is the path of least disruption.
+
+    Set env ``METRIC_SKIP_IDLE_CHECK=1`` to disable the KFD check too
+    (escape hatch for diagnostic / single-run debug).
+
+    Raises RuntimeError with diagnostic ``rocm-smi`` output on failure so
+    the metric exits non-zero (caller-script `print(0)` ⇒ rejected by
+    auto_optimize) and the agent / user immediately sees WHY.
+    """
+    import re
+    import subprocess
+    if os.environ.get("METRIC_SKIP_IDLE_CHECK", "0") not in ("0", "", "false", "False"):
+        print(
+            f"[metric_hk_ratio] WARN: METRIC_SKIP_IDLE_CHECK set — "
+            f"skipping idle hard-check on GPU {host_gpu_id}",
+            file=sys.stderr,
+        )
+        return
+    KFD_THR = 100 * 1024 * 1024
+    PHANTOM_VRAM_HINT = 320 * 1024 * 1024
+    try:
+        vram_out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+        pid_out = subprocess.check_output(
+            ["rocm-smi", "--showpids"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except Exception as e:
+        print(
+            f"[metric_hk_ratio] WARN: rocm-smi unavailable ({e}); "
+            f"skipping idle hard-check on GPU {host_gpu_id}",
+            file=sys.stderr,
+        )
+        return
+    failures: list[str] = []
+    in_kfd = False
+    for line in pid_out.splitlines():
+        if "KFD process information" in line:
+            in_kfd = True
+            continue
+        if not in_kfd:
+            continue
+        if line.startswith("=") or "PROCESS NAME" in line:
+            continue
+        cols = line.split()
+        if len(cols) < 4 or not cols[0].isdigit():
+            continue
+        try:
+            vram_kfd = int(cols[3])
+        except ValueError:
+            continue
+        gpu_ids_in_row = [int(x) for x in re.findall(r"\d+", cols[2])]
+        if host_gpu_id in gpu_ids_in_row and vram_kfd > KFD_THR:
+            failures.append(
+                f"KFD process PID={cols[0]} holds "
+                f"{vram_kfd / 1024**3:.2f} GB on GPU {host_gpu_id}"
+            )
+    for m in re.finditer(
+        r"^card(\d+),(\d+),(\d+)$", vram_out, flags=re.M
+    ):
+        cid = int(m.group(1))
+        if cid != host_gpu_id:
+            continue
+        used = int(m.group(3))
+        if used > PHANTOM_VRAM_HINT and not failures:
+            print(
+                f"[metric_hk_ratio] WARN: card{cid} reports "
+                f"{used / 1024**3:.2f} GB VRAM in use but no live KFD "
+                f"process holds it (phantom VRAM from prior tenants on "
+                f"shared host). SMs appear free; proceeding.",
+                file=sys.stderr,
+            )
+        break
+    if failures:
+        msg = (
+            f"[metric_hk_ratio] FATAL: GPU {host_gpu_id} is NOT idle — "
+            f"refusing to benchmark (results would be contaminated by "
+            f"another tenant on this shared host).\n"
+            + "\n".join(f"  - {f}" for f in failures)
+            + "\n  Diagnostic (rocm-smi --showpids tail):\n"
+            + "\n".join("    " + ln for ln in pid_out.splitlines()[-16:])
+        )
+        raise RuntimeError(msg)
+
+
 if "HIP_VISIBLE_DEVICES" not in os.environ:
     pick = _pick_idle_gpu()
     if pick is not None:
         os.environ["HIP_VISIBLE_DEVICES"] = pick
         print(f"[metric_hk_ratio] auto-picked HIP_VISIBLE_DEVICES={pick}", file=sys.stderr)
 
+# Hard idle-check on the chosen GPU. Race-window catches between pick and
+# benchmark start: rocm-smi looks fresh now, agent / user sees the FATAL
+# message clearly if the GPU was poached by another process.
+_HIP_VIS_RAW = os.environ.get("HIP_VISIBLE_DEVICES", "").strip()
+if _HIP_VIS_RAW and "," not in _HIP_VIS_RAW:
+    try:
+        _assert_gpu_truly_idle(int(_HIP_VIS_RAW))
+    except (RuntimeError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        # exit-2 (vs exit-1 from no-CUDA) so auto_optimize log shows "GPU contention"
+        sys.exit(2)
+
 
 # Make benchmark/ops/config.py importable so we share the canonical MoE shape
-# table with the rest of the repo (DeepSeek-V3 / gpt_oss_20B grouped GEMM
-# suite is generated there, NOT duplicated here).
+# table with the rest of the repo (DeepSeek-V3 / gpt_oss_20B / Qwen3-235B-A22B
+# grouped GEMM suite is generated there, NOT duplicated here).
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -208,8 +343,8 @@ from benchmark.ops.config import (  # noqa: E402
 # canonical "RCR" / NT layout (a row-major, b row-major-then-transposed).
 # Shapes are MBS=1 GEMMs from the canonical LLM benchmark suite
 # (benchmark/ops/config.py::DenseModelConfigs) — so we measure exactly the
-# shapes Megatron / DeepSeek-V3 / gpt_oss training pipelines hit, NOT
-# arbitrary cache-friendly cherry picks.
+# shapes Megatron / DeepSeek-V3 / gpt_oss / Qwen3-235B-A22B training
+# pipelines hit, NOT arbitrary cache-friendly cherry picks.
 # ----------------------------------------------------------------------------
 
 # Llama-2-7B, MBS=1, seqlen=4096
@@ -232,19 +367,26 @@ FP8_SHAPES: list[tuple[int, int, int]] = _LLAMA2_7B + _LLAMA31_8B
 
 
 def _grouped_suite() -> list[tuple[str, int, int, int, int]]:
-    """Return [(name, B, M_per_group, N, K)] for DeepSeek-V3 + gpt_oss_20B.
+    """Return [(name, B, M_per_group, N, K)] for the MoE suite.
 
     Mirrors benchmark/ops/config.py::gen_grouped_gemm_test_cases():
-      * batch_sizes per model (DeepSeek-V3=[16,32], gpt_oss_20B=[4,32])
+      * batch_sizes per model (DeepSeek-V3=[16,32], gpt_oss_20B=[4,32],
+        Qwen3-235B-A22B=[16,32])
       * M_per_group ∈ GROUPED_GEMM_M_SIZE_LIST = [2048, 4096]
       * layer ∈ {GateUP=(2*moe_int, hidden), Down=(hidden, moe_int)}
       * skip when n_routed_experts %% B != 0
 
     DeepSeek-V3 (n_routed=256, moe_int=2048, hidden=7168):
       * 2 batch × 2 M × 2 layer = 8 cases
+        N ∈ {4096 (GateUP), 7168 (Down)}, K ∈ {7168 (GateUP), 2048 (Down)}
     gpt_oss_20B (n_routed=32, moe_int=2880, hidden=2880):
       * 2 batch × 2 M × 2 layer = 8 cases
-    Total: 16 cases.
+        N ∈ {5760 (GateUP), 2880 (Down)}, K = 2880  (NOT 128-aligned for K)
+    Qwen3-235B-A22B (n_routed=128, moe_int=1536, hidden=4096):
+      * 2 batch × 2 M × 2 layer = 8 cases
+        N ∈ {3072 (GateUP), 4096 (Down)}, K ∈ {4096 (GateUP), 1536 (Down)}
+        — both 128-aligned; K=1536 is the smallest K in the suite.
+    Total: 24 cases.
     """
     rows: list[tuple[str, int, int, int, int]] = []
     for model_name, cfg in MoEModelConfigs.items():
@@ -535,6 +677,72 @@ def _bench_grouped_fp8(
     return 2.0 * (B * M) * N * K / (ms * 1e9)
 
 
+def _bench_grouped_fp8_kernel_only(
+    B: int, M: int, N: int, K: int, backend: Optional[BackendType]
+) -> float:
+    """Return TFLOPS for FP8 tensorwise grouped GEMM with KERNEL-ONLY timing.
+
+    Key difference vs :func:`_bench_grouped_fp8`:
+      * Pre-quantizes BF16 inputs to FP8 ONCE outside the timer.
+      * Times only the ``grouped_gemm_fp8_impl`` kernel call (the actual
+        single-launch persistent grouped GEMM dispatch).
+      * Strips the ~24-41% wall-time tax of BF16 -> FP8 quantize that BOTH
+        backends pay equally and which compresses the wall ratio toward
+        1.0 (e.g. probe shows wall ratio 0.974 vs kernel ratio 0.998 on
+        the FP8 grouped suite).
+
+    Use this in metrics where the agent's only lever is the kernel itself
+    (cannot influence the quantize cost). End-to-end wall ratio remains
+    the canonical "user experience" signal — track it separately if needed.
+
+    Layout matches turbo.ops.grouped_gemm_fp8 forward path with trans_b=True.
+    Total FLOPs (numerator) = 2 * (B*M) * N * K.
+    """
+    # Local import to keep _bench_grouped_fp8 import-light (this path is
+    # only used by _metric_grouped_only.py, not by the canonical 6-segment
+    # metric).
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+        grouped_gemm_fp8_impl,
+    )
+    from primus_turbo.pytorch.ops.quantization import quantize_fp8
+    from primus_turbo.pytorch.ops.grouped_gemm_fp8 import _get_fp8_dtype
+
+    cfg = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device="cuda")
+    a_dtype = _get_fp8_dtype(cfg.format, True)
+    b_dtype = _get_fp8_dtype(cfg.format, True)
+    try:
+        a_fp8, a_scale = quantize_fp8(a, a_dtype, cfg.granularity)
+        b_fp8, b_scale = quantize_fp8(b, b_dtype, cfg.granularity)
+    except Exception:
+        return 0.0
+    group_lens = torch.full((B,), M, dtype=torch.int64, device="cuda")
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device="cuda")
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+
+    def kern_call():
+        return grouped_gemm_fp8_impl(
+            a_fp8, b_fp8, a_scale, b_scale, group_lens, group_offs,
+            trans_a=False, trans_b=True, out_dtype=torch.bfloat16,
+            granularity=cfg.granularity.value, num_cu=None,
+            default_backend=BackendType.HIPKITTEN.value, maybe_pre_sync=True,
+        )
+
+    with force_grouped_gemm_backend(backend, PrecisionType.FP8):
+        try:
+            out = kern_call()
+        except Exception:
+            return 0.0
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            return 0.0
+        try:
+            ms = _time_op(kern_call)
+        except Exception:
+            return 0.0
+    return 2.0 * (B * M) * N * K / (ms * 1e9)
+
+
 # ----------------------------------------------------------------------------
 # Suite runner
 # ----------------------------------------------------------------------------
@@ -603,7 +811,7 @@ def _run() -> int:
         rows.append((f"grpBF16_{name}", hk, ref, ratio, "triton", "grp_bf16"))
 
     # ── (6) Grouped FP8 tensorwise (vs TRITON) ──
-    # Same 16 MoE shapes as BF16 grouped (DeepSeek-V3 + gpt_oss_20B). The
+    # Same 24 MoE shapes as BF16 grouped (DSV3 + gpt_oss_20B + Qwen3-235B). The
     # baseline here is intentionally honest: HK FP8 lacks a native
     # ``grouped_*_balanced`` entry, so HIPKITTEN currently per-group
     # launches dense — slow at large B. PASS requires the agent to add

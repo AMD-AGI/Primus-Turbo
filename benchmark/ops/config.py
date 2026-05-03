@@ -176,6 +176,27 @@ MoEModelConfigs = {
         "seqlen": 4096,
         "grouped_gemm_batch_sizes": [4, 32],
     },
+    # https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json
+    # Qwen3-MoE 235B (active 22B): n_experts=128, top-k=8, GQA (num_kv=4)
+    # MoE shapes (well-aligned, both 128-divisible):
+    #   GateUP : N=2*1536=3072, K=4096
+    #   Down   : N=4096,        K=1536
+    "Qwen3-235B-A22B": {
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 1536,
+        "hidden_size": 4096,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim_qk": 128,
+        "head_dim_v": 128,
+        "seqlen": 4096,
+        "num_topk": 8,
+        # 128 % {16, 32} == 0 → both pass _generate_moe_test_cases skip-check.
+        # Aligned with DSV3 batch sweep so the 3 models cover EP={4-only,
+        # 16-shared, 32-shared} expert-parallel placements.
+        "grouped_gemm_batch_sizes": [16, 32],
+    },
 }
 
 ###############################################################################

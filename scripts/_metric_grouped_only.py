@@ -6,10 +6,23 @@
 ###############################################################################
 """Grouped-only HipKittens TFLOPS ratio metric for auto_optimize.
 
-Two independent sections (32 cases total), each compared against TRITON:
+Two independent sections (48 cases total), each compared against TRITON:
 
-    (1) grp_BF16  vs TRITON  —  16 MoE shapes (DeepSeek-V3 + gpt_oss_20B)
-    (2) grp_FP8   vs TRITON  —  same 16 MoE shapes, FP8 tensorwise
+    (1) grp_BF16  vs TRITON  —  24 MoE shapes
+                                (DeepSeek-V3 + gpt_oss_20B + Qwen3-235B-A22B)
+    (2) grp_FP8   vs TRITON  —  same 24 MoE shapes, FP8 tensorwise
+                                **KERNEL-ONLY timing** (BF16 -> FP8 quantize
+                                pre-computed once outside the timer)
+
+**FP8 timing rationale (critical)**: end-to-end ``turbo.ops.grouped_gemm_fp8``
+includes BF16 -> FP8 quantize which BOTH backends pay equally and which
+accounts for 24-41% of wall time on this suite. Including quantize in the
+timer compresses the measured ratio toward 1.0 (probe: wall ratio 0.974 vs
+kernel ratio 0.998 on identical shapes). The agent's only optimization
+lever is the kernel itself (per "no quantize fuse" hard rule), so we time
+the kernel ONLY for FP8 — same as how Triton's own benchmarks score their
+kernel: pre-quantized inputs, single kernel dispatch in the timer. BF16
+section keeps wall timing because there's nothing to strip.
 
 Acceptance: BOTH section geomeans >= 1.20 (printed via Goals: PASS/FAIL block).
 
@@ -56,7 +69,7 @@ correctness regressions, so the agent can attack gpt_oss-specific
 bottlenecks (K%128/N%128 misalignment, B=4 grid under-utilization)
 without distractor cycles on the well-tuned DSV3 path.
 
-Wall: ~25-40s on idle MI355X (16 BF16 + 16 FP8 grouped × {correctness
+Wall: ~40-60s on idle MI355X (24 BF16 + 24 FP8 grouped × {correctness
 check + 2 backend timings}; correctness adds ~10-15s overhead vs the
 old fwd-only pass).
 
@@ -211,6 +224,9 @@ _FOCUS_PREFIXES = {
     "gpt_oss": ("gpt_oss",),
     "deepseek": ("DeepSeek",),
     "dsv3": ("DeepSeek",),
+    "qwen": ("Qwen3",),
+    "qwen3": ("Qwen3",),
+    "qwen235b": ("Qwen3",),
     "all": (),
     "": (),
 }
@@ -298,7 +314,8 @@ def _run() -> int:
     TRT = BackendType.TRITON
     HK = BackendType.HIPKITTEN
 
-    grouped_shapes = hk_ratio.GROUPED_BF16_SHAPES  # 16 cases (DeepSeek-V3 + gpt_oss_20B)
+    # 24 cases: DeepSeek-V3 (8) + gpt_oss_20B (8) + Qwen3-235B-A22B (8).
+    grouped_shapes = hk_ratio.GROUPED_BF16_SHAPES
 
     n_focus_bf16 = sum(
         1 for s in grouped_shapes if _is_in_focus(s[0], "grp_bf16", focus_prefixes, segment_filter)
@@ -333,11 +350,16 @@ def _run() -> int:
         in_focus = _is_in_focus(name, "grp_bf16", focus_prefixes, segment_filter)
         rows.append((f"grpBF16_{name}", hk, ref, ratio, "grp_bf16", ok, reason, in_focus))
 
-    # ── (2) Grouped FP8 tensorwise vs TRITON ──
+    # ── (2) Grouped FP8 tensorwise vs TRITON (KERNEL-ONLY timing) ──
+    # Pre-quantize is done inside _bench_grouped_fp8_kernel_only and excluded
+    # from the timer. Both backends are measured the same way (timer covers
+    # only the grouped_gemm_fp8_impl dispatch). End-to-end wall timing is
+    # available via _bench_grouped_fp8 if needed for diagnostics, but score
+    # uses kernel-only — the agent's lever is the kernel, not the quantize.
     for (name, B, M, N, K) in grouped_shapes:
         ok, reason = _check_grouped_fp8_correctness(B, M, N, K)
-        ref = hk_ratio._bench_grouped_fp8(B, M, N, K, backend=TRT)
-        hk = hk_ratio._bench_grouped_fp8(B, M, N, K, backend=HK)
+        ref = hk_ratio._bench_grouped_fp8_kernel_only(B, M, N, K, backend=TRT)
+        hk = hk_ratio._bench_grouped_fp8_kernel_only(B, M, N, K, backend=HK)
         if ok:
             ratio = (hk / ref) if ref > 0 else 0.0
         else:

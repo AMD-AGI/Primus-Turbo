@@ -1319,6 +1319,105 @@ def select_default_config(
                 num_xcds=2,
                 kernel=None,
             )
+        # Round-34 (this round): FP8 RCR rule covering the gpt_oss-GateUP
+        # dA backward path AFTER the H4 reroute (grouped_gemm_fp8_impl.py
+        # line 432-468). gpt_oss-GateUP dA RRR has K_RRR=N_fwd=5760 (% 128
+        # = 0, aligned) but N_RRR=K_fwd=2880 (% 256 = 64, misaligned), so
+        # the R18 H4 reroute fires and dispatches the kernel via
+        # ``grouped_rcr_dscale`` with a transposed b. The post-reroute RCR
+        # call sees:
+        #   m = M_per
+        #   n = K_fwd = 2880  -> tiles_n = 11
+        #   k = N_fwd = 5760
+        # The existing tiles_n==11 RCR rules (R7, R8, R12, R50 at lines
+        # 1102-1320) all gate on ``k == 2880`` (gpt_oss-Down's K_fwd) so
+        # they correctly catch gpt_oss-Down dA after reroute (which sees
+        # k=2880) but DO NOT catch gpt_oss-GateUP dA (which sees k=5760).
+        # All 4 GateUP dA shapes therefore fall through to the binding
+        # default (group_m=4, num_xcds=None=8). R34 calibrated probe
+        # (12-trial × 200-iter × 3-seed via /tmp/probe_r34_gpt_oss_gateup
+        # _da_via_rcr.py — uses ``fp8_transpose_3d`` + direct
+        # ``grouped_rcr_dscale`` to mirror the production reroute path):
+        #
+        # gpt_oss-GateUP-B4-M2048-dA (m_total=8192, tiles_m=8):
+        #   default (4, 8)  baseline                              keep default
+        #   (4, 4)          -1.26%  spread 2.69pp  TIE
+        #   (8, 4)          -1.54%  spread 3.45pp  TIE
+        #   (16, 4)         -2.51%  spread 3.50pp  TIE
+        #   -> default best; do not add a rule for tiles_m=8 + m_total<65536.
+        #
+        # gpt_oss-GateUP-B4-M4096-dA (m_total=16384, tiles_m=16):
+        #   default (4, 8)  baseline
+        #   (8, 4)          +1.78%  spread 0.86pp  WIN  (med/spread = 2.07x)
+        #   (4, 4)          +0.53%  spread 0.47pp  WIN
+        #   (16, 4)         +0.30%  spread 1.44pp  TIE
+        #
+        # gpt_oss-GateUP-B32-M2048-dA (m_total=65536, tiles_m=8):
+        #   default (4, 8)  baseline
+        #   (16, 4)         +3.02%  spread 0.19pp  WIN  (med/spread = 15.9x — extremely tight)
+        #   (32, 4)         +2.93%  spread 0.13pp  WIN  (med/spread = 22.5x)
+        #   (8, 4)          +2.37%  spread 0.26pp  WIN
+        #
+        # gpt_oss-GateUP-B32-M4096-dA (m_total=131072, tiles_m=16):
+        #   default (4, 8)  baseline
+        #   (8, 4)          +2.37%  spread 0.57pp  WIN  (med/spread = 4.16x)
+        #   (16, 4)         +1.57%  spread 0.42pp  WIN
+        #   (32, 4)         +1.35%  spread 0.12pp  WIN
+        #
+        # Discriminator pattern observed:
+        #   - tiles_m=16 (M_per=4096): (gm=8, xcd=4) is the robust winner
+        #     for both B4-M4096 (+1.78%) and B32-M4096 (+2.37%).
+        #   - tiles_m=8  (M_per=2048): split by m_total —
+        #       m_total < 65536 (B4-M2048): default best, do not override
+        #       m_total >= 65536 (B32-M2048): (gm=16, xcd=4) WIN +3.02%
+        # Why xcd=4 over default xcd=8: same partition-balance reason
+        # documented for R8 / R12 / R50 / R69 above (4 XCDs split the
+        # tiles_n=11 schedule cleanly; xcds=8 over-distributes for k=5760).
+        # Why gm=8 vs gm=4 default: tiles_m=16 grids cycle through 11
+        # N-tiles per K-pass; gm=8 batches 8 M-tiles per pass keeping
+        # the persistent slots busy across both M and N axes, whereas
+        # default gm=4 only batches 4 (under-batched for the larger
+        # K=5760 main loop).
+        # Why gm=16 for B32-M2048: the larger grid (m_total=65536) has
+        # enough wave-steps to amortise large gm; gm=16 (= 2x M-tiles
+        # per group) extracts more L2 reuse on the K=5760 deep-K axis.
+        #
+        # Bit-equivalent output: group_m / num_xcds are pure persistent-
+        # grid scheduling knobs (same property documented for all FP8
+        # RCR rules above; arithmetic and FP8 quantization rounding
+        # invariant). Self-bench bench_grouped_gemm_turbo.py confirms
+        # 24/24 fp8 PASS post-rule.
+        #
+        # Rule scope check:
+        #   tiles_n == 11 (n=2880) AND k == 5760: matches uniquely
+        #   gpt_oss-GateUP dA RRR after the H4 reroute. No other
+        #   metric/DoD shape has this (n=2880, k=5760) RCR combination.
+        #   gpt_oss-Down dA after reroute: k=2880 (excluded).
+        #   gpt_oss-GateUP forward RCR: n=N_fwd=5760 (tiles_n=22, excluded).
+        #   gpt_oss-GateUP dB var-K: variable-K path, different code.
+        if tiles_n == 11 and k == 5760 and m_total is not None:
+            if tiles_m == 16:
+                # gpt_oss-GateUP B*-M4096 dA after reroute. Both
+                # B=4 (m_total=16384) and B=32 (m_total=131072) probed
+                # and confirmed (gm=8, xcd=4) WIN.
+                return HipKittenConfig(
+                    layout=layout,
+                    group_m=8,
+                    num_xcds=4,
+                    kernel=None,
+                )
+            if tiles_m == 8 and m_total >= 65536:
+                # gpt_oss-GateUP B=32 M=2048 dA after reroute. The
+                # B=4 M=2048 sibling (m_total=8192) is intentionally
+                # excluded: probe found default beats every candidate
+                # there (small persistent grid amortises default cells
+                # better than extra batching).
+                return HipKittenConfig(
+                    layout=layout,
+                    group_m=16,
+                    num_xcds=4,
+                    kernel=None,
+                )
         if tiles_n == 16 and tiles_m == 16 and k == 1536:
             # Round-6 rule. Qwen3-235B-A22B Down M_per_group=4096 family
             # (B ∈ {16, 32}; tiles_n=16 for n=4096; k=1536; tiles_m=16
@@ -1572,6 +1671,72 @@ def select_default_config(
                 num_xcds=4,
                 kernel=None,
             )
+        # Round-29 — REMOVED Round-28 dead-code rule (`tiles_n == 6 and
+        # k == 4096`). The R28 commit (507aff37, 2026-05-02) added an
+        # if-branch on the FP8 grouped RCR forward dispatch that was
+        # never reachable from any metric shape. R29 audit traced the
+        # branch as follows:
+        #
+        #   * Forward RCR dispatch (`grouped_gemm_fp8_impl.py:541`):
+        #     `select_default_config(avg_m, n=N_fwd, k=K_fwd, "rcr",
+        #     "fp8", m_total=m_total)`. For ``tiles_n == 6`` we need
+        #     ``N_fwd == 1536``. None of the 24 metric shapes
+        #     (DeepSeek-V3 N ∈ {4096, 7168}; gpt_oss_20B N ∈ {2880,
+        #     5760}; Qwen3-235B-A22B N ∈ {3072, 4096}) has N_fwd =
+        #     1536. None of the 8 dense FP8 shapes (Llama-2-7B /
+        #     Llama-3.1-8B N ∈ {4096, 6144, 12288, 22016, 28672}) does
+        #     either.
+        #
+        #   * dA RRR dispatch enters with `layout == "rrr"`, never
+        #     reaching this `if layout == "rcr":` block.
+        #
+        #   * dB CRR var-K dispatch is inline in
+        #     `grouped_gemm_fp8_impl.py` and bypasses
+        #     `select_default_config` entirely.
+        #
+        # The R28 commit message claimed the rule targets "Qwen3-GateUP
+        # forward RCR" with "the new shape N_fwd=1536" — but Qwen3-
+        # GateUP forward actually has ``N_fwd = 2 * moe_intermediate_size
+        # = 2 * 1536 = 3072`` (tiles_n=12), not N_fwd=1536. The R28
+        # author confused Qwen3's ``moe_intermediate_size = 1536`` with
+        # the GateUP layer's `N_fwd = 2 * moe_int = 3072`. The R7 rule
+        # at `tiles_n == 12 and tiles_m == 8 and k == 4096` (line 1498)
+        # already handles the actual Qwen3-GateUP M=2048 family.
+        #
+        # The ``+2.1 mean / +3 median`` improvement R28 reported (12-run
+        # distribution, mean 992.4 → 994.5) was random noise from a
+        # single sample window of the metric's wide [981, 1000] noise
+        # band (re-quantified at this round at the unchanged HEAD across
+        # 8 runs: median 988.5, mean 990.9, identical band).
+        #
+        # R29 also re-probed every plausible Qwen3-Down M=2048 forward
+        # / dA / dB var-K (gm, num_xcds) cell on the actually-bottom
+        # metric shapes (Qwen3-235B-A22B-Down-B16-M2048 ratio = 1.243;
+        # Qwen3-235B-A22B-Down-B32-M2048 ratio = 1.265). Tight verify
+        # (400-iter × 12-trial p20 × 3 seeds, mirror of the R28 verify
+        # methodology) collapses every coarse 200-iter signal to within
+        # ±0.5 % noise:
+        #
+        #   * Forward RCR (n=4096, k=1536):
+        #     binding default (gm=4, xcds=None=8) — every other tested
+        #     cell (gm ∈ {1, 2, 8, 16, 32}) regressed by 1-4 %. Default
+        #     is the robust optimum.
+        #   * dA RRR (n=1536, k=4096): R42 (gm=16, xcds=4) — proposed
+        #     (gm=8, xcds=4) tight-verify delta on Qwen3-Down M=2048:
+        #     +0.06 % B16, +0.01 % B32 (within noise). R42 unchanged.
+        #   * dB CRR var-K (n=K_fwd=1536, k=N_fwd=4096, m_per_g=2048):
+        #     current inline rule (gm=8, xcds=4 for m_total >= 16384)
+        #     — proposed (gm=4, xcds=4) tight verify on Qwen3-Down M=
+        #     2048: +0.35 % B16, -0.19 % B32 (within noise). Current
+        #     rule unchanged.
+        #
+        # Net: Qwen3-Down M=2048 stays on the FP8 binding default for
+        # forward RCR; existing R42 / inline var-K rules cover the
+        # backward path. The metric's gap to the 1.35 target on the
+        # Qwen3-Down M=2048 cohort is bounded by the symmetric
+        # `quantize_fp8` HBM tax both backends pay — the architectural
+        # ceiling documented in `analysis/_notes/round-8-fused-act-
+        # architectural-ceiling-confirmed.md` and re-confirmed in R26.
         if tiles_n == 16 and tiles_m == 16 and k == 7168:
             # Round-8 rule. DeepSeek-V3 GateUP M_per_group=4096 family
             # (B ∈ {16, 32}; tiles_n=16 for n=4096; k=7168; tiles_m=16
@@ -1824,6 +1989,11 @@ def select_default_config(
             )
     if layout == "rrr":
         tiles_n = n // 256
+        # Round-32: tiles_m needed for the R32 sub-clause that excludes
+        # Qwen3-GateUP-B32-M2048 (tiles_m=8 + m_total>=65536) from R27's
+        # (1,4) rule. The other RRR rules in this branch only key on
+        # tiles_n / m_total so this is harmless to the existing matches.
+        tiles_m = m // 256
         # Round-42: FP8 RRR dA backward narrow-N rule. The FP8 section had
         # NO ``layout == "rrr"`` rules pre-R42 (all RRR rules in the BF16
         # section above are gated by ``if dtype == "bf16"``), so every
@@ -1898,6 +2068,143 @@ def select_default_config(
         ):
             return HipKittenConfig(
                 layout=layout, group_m=16, num_xcds=4, kernel=None
+            )
+        # Round-27 (this round): FP8 RRR dA backward N=4096 rule
+        # (tiles_n == 16). The R42 rule covered tiles_n <= 8
+        # (Qwen3-Down + DSV3-Down narrow-N); R43/R44 rule below
+        # covers tiles_n == 28 (DSV3-Down K_fwd=7168). The
+        # intermediate tiles_n == 16 case (Qwen3-GateUP K_fwd=4096
+        # and DSV3-GateUP K_fwd=4096 in dA RRR coords) was left at
+        # the binding default (group_m=4, num_xcds=0).
+        #
+        # Motivation (R27 doc note): the R26 metric bottom shapes
+        # (Qwen3-GateUP-B16/B32-M2048, ratio 1.242 — both tied at
+        # the metric floor) were attributed by the R27 dA-specific
+        # kernel-only probe (/tmp/probe_dA_kernel_only_r27.py) to
+        # HK dA RRR being 12.6% slower than Triton on N=1536/K=4096
+        # (the small-N narrow-K Qwen3-GateUP family). This is the
+        # same ``HK dA RRR is HK weak spot'' finding R8 documented
+        # at the architectural-ceiling round (analysis/_notes/round-
+        # 8-fused-act-architectural-ceiling-confirmed.md) and which
+        # remains unchanged today.
+        #
+        # 3-cell sweep (default vs (1,4) vs (16,4)) on all 8
+        # tiles_n==16 RRR shapes (Qwen3-GateUP × 4 + DSV3-GateUP × 4),
+        # 200 iters × 8 trial medians (probe
+        # /tmp/probe_qwen3_gateup_dA_rrr_cfg_r27.py):
+        #
+        #   shape                       (1, 4) Δ vs (4, 0)
+        #   Qwen3-GateUP B=16 M=2048    +0.62..+1.34%
+        #   Qwen3-GateUP B=16 M=4096    +0.08..+0.29% (tie)
+        #   Qwen3-GateUP B=32 M=2048    +0.94..+0.96%
+        #   Qwen3-GateUP B=32 M=4096    +0.04..+0.22% (tie)
+        #   DSV3-GateUP  B=16 M=2048    +0.44%        (tie)
+        #   DSV3-GateUP  B=16 M=4096    -0.10%        (tie, within noise)
+        #   DSV3-GateUP  B=32 M=2048    +0.61%
+        #   DSV3-GateUP  B=32 M=4096    +0.00%        (tie)
+        #
+        # 4 wins (>0.5%), 4 ties (within ±0.5% noise), 0 losses
+        # (worst is -0.10% on DSV3-GateUP B16 M4096 — well within
+        # bench noise). (16, 4) was tested too but kills M=4096 by
+        # -2 to -3.7% — chose the safer (1, 4) which is uniformly
+        # null-or-positive across all 8 covered shapes.
+        #
+        # Bit-equivalent output: group_m / num_xcds are pure
+        # persistent-grid tile-scheduling knobs (same property
+        # documented for R42 narrow-N and R43/R44 wide-N rules
+        # above; see those blocks for the full bit-equivalence
+        # rationale).
+        #
+        # Rule scope audit:
+        #   - tiles_n == 16 ⇔ N_rrr == 4096. In the 24-shape MoE
+        #     metric this is Qwen3-GateUP K_fwd=4096 (4 shapes) +
+        #     DSV3-GateUP K_fwd=4096 (4 shapes) = 8 shapes.
+        #     Qwen3/gpt_oss/DSV3-Down K_fwd values yield
+        #     tiles_n ∈ {6, 8, 11, 28} — none match (already
+        #     covered by R42 narrow-N or R43/R44 wide-N rules).
+        #   - Dense FP8 RRR shapes in test_dod_smoke.py: dense
+        #     callers (``gemm_fp8_impl.py`` lines 251 / 260) pass
+        #     ``select_default_config(m, n, k, layout, "fp8")``
+        #     WITHOUT the ``m_total=`` kwarg → m_total defaults to
+        #     None → the ``m_total is not None`` guard excludes
+        #     them entirely.
+        #   - Grouped HIPKITTEN FP8 fwd+bwd DoD shapes
+        #     (_HIPKITTEN_GROUPED_FP8_FWDBWD_SHAPES): only
+        #     (4096, 4096, 7168) [tiles_n=28, R43/R44 catches] and
+        #     (4096, 7168, 2048) [tiles_n=8, R42 catches] — neither
+        #     matches tiles_n == 16.
+        #   - m_total >= 32768 is the minimum grouped m_total in
+        #     the 24-shape suite (smallest = B=16 M=2048 = 32768).
+        # Round-32 (this round, 2026-05-02): subdivide the R27 (1, 4)
+        # rule. R27 picked (1, 4) as the safe uniform choice for
+        # tiles_n==16 (Qwen3-GateUP dA RRR, 4 shapes). R32 12-trial x
+        # 200-iter x 3-seed re-verify (mirror of R29 / R30 / R31 / R44
+        # methodology) versus today's build:
+        #
+        #   shape                       cell    Dmed vs (1,4)  spread  verdict
+        #   Qwen3-GateUP-B16-M2048      default -2.35%         1.56pp  LOSS  keep (1,4)
+        #   Qwen3-GateUP-B16-M4096      default -0.30%         0.49pp  TIE   keep (1,4)
+        #   Qwen3-GateUP-B32-M2048      default +1.31%         0.71pp  WIN   drop (1,4) here
+        #   Qwen3-GateUP-B32-M4096      default -0.13%         0.53pp  TIE   keep (1,4)
+        #
+        # B32-M2048 default WIN: per-seed default deltas +0.84% /
+        # +1.17% / +1.01% (every seed positive). Winner-min (default,
+        # 844.61 us) beats baseline-max ((1,4), 856.98 us) in 3/3
+        # seeds. Median(+1.31%) / spread(0.71pp) = 1.85x > 1.0
+        # threshold => robust signal beyond noise floor (consistent
+        # with R7 / R10 / R23 / R29 / R30 / R31 robust-signal gate).
+        #
+        # This contradicts R27's recorded +0.94..+0.96% gain for
+        # (1,4) on the same shape. R27 used 200-iter x 8-trial single-
+        # seed methodology; R32's 12-trial x 3-seed (~4.5x more
+        # samples) finds the default cell faster. Same kind of
+        # methodology-drift correction R31 applied to the var-K rule
+        # (gpt_oss-GateUP gm=8 -> gm=1) and that R45 applied to the
+        # forward RCR rule (R10 200-iter x 7-trial -> R45 200-iter x
+        # 12-trial x 3-seed).
+        #
+        # R32 also tested R44's deferred (2,0) and (2,2) candidates on
+        # B16-M2048; both LOSS (-1.75% / -2.69%) -- R44's recorded
+        # +2.96% / +1.50% deltas vs default FALSIFIED on today's
+        # build. R44's R44_alt1 (2,0) on B32-M2048 also tested at
+        # -2.04% (split-sign per seed: -2.97% / -1.16% / +0.18%) so
+        # the alternative cells aren't a viable replacement either.
+        # Default falls through to _FP8_DEFAULT_GROUP_M=4 with
+        # num_xcds=None (kernel BLOCK_SWIZZLE_NUM_XCDS=8) -- exactly
+        # the R32-verified WIN cell for B32-M2048.
+        #
+        # Gate scope (B32-M2048 single carve-out):
+        #   - tiles_m == 8 AND m_total >= 65536: covers Qwen3-GateUP
+        #     B32-M2048 only (m_total=65536, tiles_m=8). Excludes
+        #     B16-M2048 (m_total=32768) and the M=4096 family
+        #     (tiles_m=16) cleanly.
+        #   - The R27 selector ``tiles_n == 16 AND m_total >= 32768``
+        #     remains gating the rest; the inner exclusion is the
+        #     minimal change to surface the new robust signal without
+        #     touching the 3 still-keep cases.
+        #
+        # Bit-equivalent output: group_m / num_xcds are pure
+        # persistent-grid scheduling knobs (same bit-equivalence
+        # documented for R7 / R10 / R23 / R27 / R30 / R31 / R39 / R42 /
+        # R43 / R44 / R45). SNR vs torch ref unchanged (verified by
+        # the metric's built-in correctness gate every round;
+        # correct_fail = 0/24 maintained).
+        #
+        # Expected metric impact: dA RRR is ~33% of fwd+bwd wall on
+        # this shape (kernel-only probe: 855 us / total 2.52 ms ratio
+        # call). +1.31% kernel -> ~+0.4% wall on B32-M2048 only.
+        # Geomean lift on 24-shape suite: ~+0.02% (=0.4 / 24 * 1.302
+        # contribution). At noise floor (~5 score points per single
+        # run); A/B should still show modest median lift over the
+        # plateau band.
+        if (
+            tiles_n == 16
+            and m_total is not None
+            and m_total >= 32768
+            and not (tiles_m == 8 and m_total >= 65536)
+        ):
+            return HipKittenConfig(
+                layout=layout, group_m=1, num_xcds=4, kernel=None
             )
         # Round-43 / Round-44: FP8 RRR dA backward wide-N rule.
         # R42 only covered narrow-N (tiles_n ≤ 8 — DSV3-Down, Qwen3-Down).

@@ -114,6 +114,18 @@ class HipKittenModule:
     grouped_rcr_dscale: Any
     grouped_rrr_dscale: Any
     grouped_crr_dscale: Any
+    # Variable-K grouped launchers (CRR-only — the var-K backward path
+    # only uses CRR layout). ``grouped_variable_k_crr`` exists on both
+    # BF16 and FP8 bindings; ``grouped_variable_k_crr_dscale`` is FP8-
+    # only (None on BF16). Pre-resolving these saves the per-call
+    # ``getattr(hk.module, "grouped_variable_k_crr", None)`` × 2 that
+    # ``GroupedGEMM(FP8)?VariableKHipKittenBackend.execute`` previously
+    # paid on every backward dB launch (~34 ns / call host-side; small
+    # but the var-K execute body is otherwise pure-Python overhead and
+    # this brings it to parity with the dense forward execute body
+    # which has been pre-resolving since R3 of the BF16 series).
+    grouped_variable_k_crr: Any
+    grouped_variable_k_crr_dscale: Any
 
     def gemm(self, layout: str) -> Any:
         """Return the dense kernel callable for ``layout``."""
@@ -190,6 +202,10 @@ def _build_module(module: Any, dtype: Literal["bf16", "fp8"], default_bs: int, d
         grouped_rcr_dscale=getattr(module, "grouped_rcr_dscale", None),
         grouped_rrr_dscale=getattr(module, "grouped_rrr_dscale", None),
         grouped_crr_dscale=getattr(module, "grouped_crr_dscale", None),
+        grouped_variable_k_crr=getattr(module, "grouped_variable_k_crr", None),
+        grouped_variable_k_crr_dscale=getattr(
+            module, "grouped_variable_k_crr_dscale", None
+        ),
     )
 
 

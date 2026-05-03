@@ -323,10 +323,21 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # uniform group_lens whose ``avg_m`` happens to satisfy the
         # alignment predicate fall back to the scalar tail block-by-
         # block (no host uniform check / branch on group_lens).
-        grouped_fn = hk.grouped(cfg.layout)
+        # Round-18 method-call trim (mirror of FP8 dscale trim landed
+        # this round + R16 var-K trim): ``hk.grouped(cfg.layout)`` runs
+        # an ``if layout == 'rcr': return self.grouped_rcr`` cascade per
+        # call (~36 ns / call, mirror of the FP8 probe at
+        # /tmp/probe_r17_host_overhead.py — same dataclass shape).
+        # Direct attr access via the ternary is ~20 ns / call. 16 ns /
+        # call host-side savings — sub-noise on bench (kernel wall is
+        # 200-1000 µs and Python is async-hidden) but the dispatch path
+        # now mirrors the FP8 grouped execute body. The error message
+        # uses ``layout`` (= ``cfg.layout``) so binding diagnostics are
+        # unchanged.
+        grouped_fn = hk.grouped_rcr if trans_b else hk.grouped_rrr
         if grouped_fn is None:
             raise AttributeError(
-                f"HipKittens {hk.dtype} binding does not expose grouped_{cfg.layout}. "
+                f"HipKittens {hk.dtype} binding does not expose grouped_{layout}. "
                 "Rebuild tk_*_layouts.so with the grouped binding, or use the "
                 "per-group dense_run fallback."
             )
@@ -386,7 +397,11 @@ class GroupedGEMMVariableKHipKittenBackend(KernelBackend):
         # via on-device O(G) scan of ``group_offs``. Host端禁止 uniform
         # 判断、禁止 per-group fallback —— kernel 端的 m/n/k 限制必须
         # 在 HK 仓库修。
-        var_k_fn = getattr(hk.module, "grouped_variable_k_crr", None)
+        # Round-16: callable pre-resolved on ``HipKittenModule`` at module
+        # load time (loader.py), saving the per-call ``getattr`` on every
+        # backward dB launch (~34 ns / call host-side, mirror of the
+        # FP8 var-K trim landed this round).
+        var_k_fn = hk.grouped_variable_k_crr
         if var_k_fn is None:
             raise RuntimeError(
                 "HipKittens BF16 binding lacks grouped_variable_k_crr; "
