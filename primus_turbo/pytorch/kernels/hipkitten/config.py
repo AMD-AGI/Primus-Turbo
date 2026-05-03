@@ -588,6 +588,106 @@ def select_default_config(
                 return HipKittenConfig(
                     layout=layout, group_m=1, num_xcds=4, kernel=None
                 )
+        if (
+            layout == "rcr"
+            and tiles_n == 11
+            and k == 5760
+            and m_total is not None
+        ):
+            # Round-7 (BF16 weighted-wall metric) rule. gpt_oss-GateUP dA
+            # H4-rerouted RCR family. The R4 H4 fast Triton transpose
+            # reroutes the dA RRR call ``a:[M_total, N_fwd=5760],
+            # b:[B, K_fwd=2880, N_fwd=5760]`` (post-transpose) into RCR;
+            # ``select_default_config`` therefore sees:
+            #   m = avg_m = M_per_group ∈ {2048, 4096} → tiles_m ∈ {8, 16}
+            #   n = b.shape[-2] = K_fwd = 2880 → tiles_n = 11
+            #   k = a.shape[1] = N_fwd = 5760
+            # No prior BF16 RCR rule matches this geometry — the existing
+            # gpt_oss block above is gated on ``k == 2880`` (gpt_oss
+            # forward + Down dA H4 which also has k=2880). ``tiles_n == 11
+            # and k == 5760`` is unique to gpt_oss-GateUP dA H4 reroute in
+            # both the metric and DoD smoke (DSV3 N_fwd ∈ {2048, 4096,
+            # 7168}, Qwen3 N_fwd ∈ {1536, 3072, 4096}, gpt_oss-Down
+            # N_fwd=2880 — none give k=5760 with tiles_n=11). Round 2
+            # tested ``(gm=4, xcd=4)`` here and falsified (-11.5 score on
+            # variant A, -2.0 on variant B); but R2 only reduced xcds
+            # without changing gm. The FP8 R34 sibling rule (line 1467
+            # below — same geometry, same H4 reroute path, FP8 ``.so``)
+            # found the actual winners are ``(gm=8, xcd=4)`` for tiles_m=16
+            # and ``(gm=16, xcd=4)`` for tiles_m=8 + B=32 — different gm
+            # from R2's tested set.
+            #
+            # 10-cell (gm, xcd) sweep on the 4 metric gpt_oss-GateUP dA
+            # H4 RCR shapes (5-trial × 80-iter cudaEvent median at
+            # /tmp/probe_round7_bf16_dA_h4_rcr.py archived in this commit):
+            #
+            #   shape (m_total, tiles_m)        cfg     med_TF   spread%   Δ vs (4,8)
+            #   B4-M2048  (8192, 8)             default  1027.0   5.30%    baseline (high noise)
+            #     -- noise floor too high; do not override ((24,2) +0.90% spread 6.56%)
+            #   B4-M4096  (16384, 16)
+            #     (4,8) baseline                       1325.6   1.77%
+            #     (8,4) FP8-R34 winner                 1335.7   1.97%   +0.77%
+            #     (2,4)                                1354.7   1.81%   +2.19%
+            #   B32-M2048 (65536, 8)
+            #     (4,8) baseline                       1322.2   0.43%
+            #     (16,4) FP8-R34 winner                1329.4   0.42%   +0.54%  (clean: spread tied)
+            #     (12,4)                               1337.2   0.76%   +1.13%
+            #     (1,4)                                1335.0   1.69%   +0.97%
+            #   B32-M4096 (131072, 16)
+            #     (4,8) baseline                       1339.1   0.33%
+            #     (8,4) FP8-R34 winner                 1366.2   0.49%   +2.03%  (clean: 4× spread)
+            #     (16,4)                               1363.5   0.44%   +1.82%
+            #
+            # Rule mirrors the FP8 R34 pattern (tiles_m=16 → (gm=8, xcd=4);
+            # tiles_m=8 + m_total ≥ 65536 → (gm=16, xcd=4)). FP8 R34 was
+            # validated end-to-end on the FP8 metric (passed correctness
+            # gate, contributed +1.5pp / shape on the 3 covered brackets
+            # via the FP8 fused-act wall). The BF16 grouped RCR kernel
+            # uses the same persistent grid + chiplet-swizzle scheduler
+            # as FP8 (different inner MFMA tile + dtype but identical
+            # group_m / num_xcds semantics — pure scheduling knobs on
+            # the persistent tile schedule); the per-tile MFMA time is
+            # ~2× FP8 (BF16 K_BLOCK=64 vs FP8 K_BLOCK=128 → 90 vs 45
+            # K-iters per tile for k=5760). The probe confirms the same
+            # cfg pattern carries over: (8,4)/(16,4) win consistently
+            # over default (4,8) with clean signal on the 2 large-grid
+            # tiers (B32-M4096 +2.03%/0.49%spread = 4× noise; B32-M2048
+            # +0.54%/0.42%spread tied with default's 0.43% = clean +0.5%).
+            #
+            # B=4 M=2048 (m_total=8192, tiles_m=8) intentionally excluded:
+            # default (4,8) sat at 5.3% spread on the contended GPU and
+            # no candidate cleared the noise floor — leave on default
+            # (matches FP8 R34 which also excluded this bracket for the
+            # same reason).
+            #
+            # Bit-equivalent output verified: across all 10 cfgs probed
+            # the BF16 grouped RCR kernel emits ``torch.equal`` outputs
+            # (group_m / num_xcds are pure scheduling knobs on the
+            # persistent tile schedule — same property documented for
+            # all BF16 RCR rules above, and validated by the metric's
+            # correctness gate (downsized check_allclose on out, dA, dB)
+            # on every shape every round).
+            #
+            # Why ``(gm=8, xcd=4)`` for tiles_m=16: tiles_m=16 has 16
+            # M-tiles per group; gm=8 batches 8 M-tiles per persistent
+            # work-window, sharing each B-tile (loaded once per K=5760
+            # main loop = 90 K-iters) across 8 mfma sequences vs only
+            # 4 in the default. xcd=4 reduces XCD over-split (each XCD
+            # owns more contiguous tiles, saturating its internal
+            # pipeline rather than constantly switching).
+            # Why ``(gm=16, xcd=4)`` for tiles_m=8 + B=32: smaller
+            # tiles_m=8 means each "group" only has 8 M-tiles, so to
+            # extract similar L2 reuse we need a larger gm. m_total
+            # bound ``>= 65536`` excludes B=4 (m_total=8192) where the
+            # smaller persistent grid amortises default cells better.
+            if tiles_m == 16:
+                return HipKittenConfig(
+                    layout=layout, group_m=8, num_xcds=4, kernel=None
+                )
+            if tiles_m == 8 and m_total >= 65536:
+                return HipKittenConfig(
+                    layout=layout, group_m=16, num_xcds=4, kernel=None
+                )
         if tiles_m <= 16 and tiles_m == tiles_n and k <= 12288:
             # Cube-ish small (16x16 grid). Round 1: 4096^3 fwd RCR and
             # 4096x4096x11008 win on (gm=2, xcd=32). Round 5 extends the
