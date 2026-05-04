@@ -16,8 +16,9 @@ using namespace primus_turbo::dtype;
 // TODO: ASM
 template <typename T, const int N> PRIMUS_TURBO_DEVICE void load_data(const T *src, T *dst) {
     constexpr int BYTES = N * sizeof(T);
-    static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8 || BYTES == 16,
-                  "Only 1/2/4/8/16 bytes are supported.");
+    static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8 || BYTES == 16 ||
+                      BYTES == 32,
+                  "Only 1/2/4/8/16/32 bytes are supported.");
     if constexpr (BYTES == 1) {
         *reinterpret_cast<uint8 *>(dst) = *(reinterpret_cast<const uint8 *>(src));
     } else if constexpr (BYTES == 2) {
@@ -28,13 +29,18 @@ template <typename T, const int N> PRIMUS_TURBO_DEVICE void load_data(const T *s
         *reinterpret_cast<uint64 *>(dst) = *(reinterpret_cast<const uint64 *>(src));
     } else if constexpr (BYTES == 16) {
         *reinterpret_cast<uint4 *>(dst) = *(reinterpret_cast<const uint4 *>(src));
+    } else if constexpr (BYTES == 32) {
+        // Two consecutive 16B vector loads -> dwordx8 on gfx950.
+        reinterpret_cast<uint4 *>(dst)[0] = reinterpret_cast<const uint4 *>(src)[0];
+        reinterpret_cast<uint4 *>(dst)[1] = reinterpret_cast<const uint4 *>(src)[1];
     }
 }
 
 template <typename T, const int N> PRIMUS_TURBO_DEVICE void store_data(T *dst, const T *src) {
     constexpr int BYTES = N * sizeof(T);
-    static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8 || BYTES == 16,
-                  "Only 1/2/4/8/16 bytes are supported.");
+    static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8 || BYTES == 16 ||
+                      BYTES == 32,
+                  "Only 1/2/4/8/16/32 bytes are supported.");
 
     if constexpr (BYTES == 1) {
         *reinterpret_cast<uint8 *>(dst) = *reinterpret_cast<const uint8 *>(src);
@@ -46,6 +52,10 @@ template <typename T, const int N> PRIMUS_TURBO_DEVICE void store_data(T *dst, c
         *reinterpret_cast<uint64 *>(dst) = *reinterpret_cast<const uint64 *>(src);
     } else if constexpr (BYTES == 16) {
         *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(src);
+    } else if constexpr (BYTES == 32) {
+        // Two consecutive 16B vector stores -> dwordx8 on gfx950.
+        reinterpret_cast<uint4 *>(dst)[0] = reinterpret_cast<const uint4 *>(src)[0];
+        reinterpret_cast<uint4 *>(dst)[1] = reinterpret_cast<const uint4 *>(src)[1];
     }
 }
 
