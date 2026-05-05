@@ -4,16 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Benchmark FP8 tensorwise quantization: original 3-kernel vs fused 2-kernel.
+"""Benchmark FP8 tensorwise quantization variants.
 
-The original path (quantize_fp8_tensorwise):
-  1. reduce_row (abs-max)          -> amax       (HIP kernel)
-  2. compute_scale_from_amax       -> scale/inv  (HIP kernel)
-  3. quantize_tensorwise_impl      -> fp8_output (HIP kernel)
-
-The fused path (quantize_fp8_tensorwise_fused):
-  1. reduce_amax_and_compute_scale -> scale/inv  (HIP kernel, fused)
-  2. quantize_tensorwise_impl      -> fp8_output (HIP kernel)
+  1. Original (quantize_fp8_tensorwise):        3 kernels
+  2. Fused (quantize_fp8_tensorwise_fused):      2 kernels
+  3. Fused + separate amax:                      2 + 1 kernels (delayed scaling baseline)
+  4. Fused with amax_out:                        1 kernel  (delayed scaling optimized)
 
 Usage:
     cd benchmark/ops
@@ -54,6 +50,32 @@ def quantize_fused_path(x):
     return quantize_fp8_fused(x, FP8_DTYPE, granularity=ScalingGranularity.TENSORWISE)
 
 
+def quantize_only_with_scale(x, scale):
+    """Quantize-only with pre-computed scale (1 kernel). Lower bound for delayed."""
+    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, FP8_DTYPE, scale
+    )
+    return fp8_out, scale_inv
+
+
+def quantize_fused_plus_separate_amax(x, scale, amax_buf):
+    """Delayed scaling baseline: fused quantize with pre-computed scale + separate amax."""
+    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, FP8_DTYPE, scale
+    )
+    amax_buf.copy_(x.detach().abs().amax())
+    return fp8_out, scale_inv
+
+
+def quantize_fused_with_amax_out(x, scale, amax_buf):
+    """Delayed scaling optimized: fused quantize + amax in a single kernel."""
+    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, FP8_DTYPE, scale, amax_buf
+    )
+    return fp8_out, scale_inv
+
+
+
 def benchmark_fn(fn, warmup, repeat, *args):
     """Return (median_us, min_us) using CUDA events."""
     for _ in range(warmup):
@@ -82,6 +104,8 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {args.warmup}, Repeat: {args.repeat}")
 
+    # --- Section 1: Dynamic scaling comparison (original vs fused) ---
+    print("\n=== Dynamic Scaling: Original (3-kern) vs Fused (2-kern) ===")
     print(
         f"\n{'Shape':>20s}  {'Numel':>12s}  "
         f"{'Original':>12s}  {'Fused':>12s}  "
@@ -113,7 +137,50 @@ def main():
             f"{orig_min:>10.1f}  {fused_min:>10.1f}"
         )
 
-    # Correctness check
+    # --- Section 2: Delayed scaling full comparison ---
+    print("\n=== Delayed Scaling: Full Comparison (all with pre-computed scale) ===")
+    print(
+        f"\n{'Shape':>20s}  {'Numel':>12s}  "
+        f"{'Q-only':>10s}  {'Q+sepAmax':>10s}  {'Q&Amax':>10s}  {'Dynamic':>10s}  "
+        f"{'Amax OH':>8s}  {'vs Dyn':>8s}"
+    )
+    print(
+        f"{'':>20s}  {'':>12s}  "
+        f"{'1kern us':>10s}  {'2+kern us':>10s}  {'1kern us':>10s}  {'2kern us':>10s}  "
+        f"{'us':>8s}  {'us':>8s}"
+    )
+    print("-" * 105)
+
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    for shape in SHAPES:
+        x = torch.randn(*shape, dtype=DTYPE, device=DEVICE)
+        numel = x.numel()
+        scale = torch.tensor(fp8_max / x.abs().amax().item(), dtype=torch.float32, device=DEVICE)
+        amax_buf = torch.zeros((), dtype=torch.float32, device=DEVICE)
+
+        qonly_med, _ = benchmark_fn(
+            quantize_only_with_scale, args.warmup, args.repeat, x, scale
+        )
+        sep_med, _ = benchmark_fn(
+            quantize_fused_plus_separate_amax, args.warmup, args.repeat, x, scale, amax_buf
+        )
+        fused_med, _ = benchmark_fn(
+            quantize_fused_with_amax_out, args.warmup, args.repeat, x, scale, amax_buf
+        )
+        dyn_med, _ = benchmark_fn(
+            quantize_fused_path, args.warmup, args.repeat, x
+        )
+
+        amax_overhead = fused_med - qonly_med
+        vs_dynamic = fused_med - dyn_med
+        shape_str = f"{shape[0]}x{shape[1]}"
+        print(
+            f"{shape_str:>20s}  {numel:>12,d}  "
+            f"{qonly_med:>10.1f}  {sep_med:>10.1f}  {fused_med:>10.1f}  {dyn_med:>10.1f}  "
+            f"{amax_overhead:>8.1f}  {vs_dynamic:>8.1f}"
+        )
+
+    # --- Correctness check ---
     print("\nCorrectness check (largest shape):")
     x = torch.randn(*SHAPES[-1], dtype=DTYPE, device=DEVICE)
     out_orig, si_orig = quantize_original(x)
@@ -123,6 +190,16 @@ def main():
     scale_close = torch.allclose(si_orig, si_fused, rtol=1e-5, atol=1e-8)
     print(f"  Output match:    {match}")
     print(f"  Scale_inv close: {scale_close} " f"(orig={si_orig.item():.8f}, fused={si_fused.item():.8f})")
+
+    scale = torch.tensor(fp8_max / x.abs().amax().item(), dtype=torch.float32, device=DEVICE)
+    amax_buf = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    out_amax, si_amax = quantize_fused_with_amax_out(x, scale, amax_buf)
+    expected_amax = x.float().abs().amax()
+    amax_match = torch.allclose(amax_buf, expected_amax, rtol=1e-5, atol=1e-8)
+    print(f"  Amax_out match:  {amax_match} (got={amax_buf.item():.6f}, expected={expected_amax.item():.6f})")
+
+    print(f"\n  ~114 quantize calls/iter in Flux 12B (57 layers x fwd+bwd)")
+    print(f"  To close 65ms gap, need ~570us savings per call")
 
 
 if __name__ == "__main__":
