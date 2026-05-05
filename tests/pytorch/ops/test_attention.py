@@ -484,3 +484,45 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dq_snr > 15, "query_grad_snr too low"
     assert dk_snr > 15, "key_grad_snr too low"
     assert dv_snr > 15, "value_grad_snr too low"
+
+
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
+def test_attention_fake_kernel_strides(qkv_format):
+    """Verify that torch.compile sees correct output strides for every qkv_format.
+
+    The fake (meta) kernel must produce output tensors whose strides match the
+    eager kernel so that torch.compile's shape/stride propagation is correct.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, seq_q, seq_kv, num_heads, head_dim = 2, 32, 32, 4, 64
+
+    if qkv_format == "sbhd":
+        q = torch.randn(seq_q, batch, num_heads, head_dim, device=device, dtype=dtype).permute(1, 0, 2, 3)
+        k = torch.randn(seq_kv, batch, num_heads, head_dim, device=device, dtype=dtype).permute(1, 0, 2, 3)
+        v = torch.randn(seq_kv, batch, num_heads, head_dim, device=device, dtype=dtype).permute(1, 0, 2, 3)
+    elif qkv_format == "bhsd":
+        q = torch.randn(batch, num_heads, seq_q, head_dim, device=device, dtype=dtype).transpose(1, 2)
+        k = torch.randn(batch, num_heads, seq_kv, head_dim, device=device, dtype=dtype).transpose(1, 2)
+        v = torch.randn(batch, num_heads, seq_kv, head_dim, device=device, dtype=dtype).transpose(1, 2)
+    else:
+        q = torch.randn(batch, seq_q, num_heads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(batch, seq_kv, num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(batch, seq_kv, num_heads, head_dim, device=device, dtype=dtype)
+
+    out_eager = flash_attn_func(q, k, v, causal=True)
+    eager_strides = out_eager.stride()
+
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph=True)
+    def fn(q, k, v):
+        return flash_attn_func(q, k, v, causal=True)
+
+    out_compiled = fn(q, k, v)
+
+    assert out_compiled.stride() == eager_strides, (
+        f"Stride mismatch for qkv_format={qkv_format}: "
+        f"compiled={out_compiled.stride()}, eager={eager_strides}"
+    )
+    assert out_compiled.shape == out_eager.shape
