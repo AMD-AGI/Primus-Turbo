@@ -14,6 +14,9 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
 )
+from primus_turbo.pytorch.kernels.quantization.cast_transpose_fp8 import (
+    cast_transpose_fp8_triton,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -28,7 +31,14 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_mxfp8_impl,
 )
 
-__all__ = ["quantize_fp8", "quantize_fp8_fused", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
+__all__ = [
+    "quantize_fp8",
+    "quantize_fp8_fused",
+    "cast_transpose_fp8",
+    "dequantize_fp8",
+    "quantize_fp4",
+    "dequantize_fp4",
+]
 
 
 def quantize_fp8(
@@ -100,6 +110,31 @@ def quantize_fp8_fused(
     if granularity == ScalingGranularity.TENSORWISE:
         return quantize_fp8_tensorwise_fused_impl(x, out_dtype)
     return quantize_fp8(x, out_dtype, granularity)
+
+
+def cast_transpose_fp8(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale: torch.Tensor,
+    amax_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused FP8 cast + transpose + optional amax in a single kernel pass.
+
+    Given a 2D input [M, N] and a pre-computed scale, produces:
+      - cast_out      [M, N]: FP8 quantized (row-major)
+      - transpose_out [N, M]: FP8 quantized transpose (contiguous)
+      - scale_inv     scalar: 1 / scale
+
+    Uses the Triton backend for torch.compile compatibility.
+
+    Args:
+        x: 2D input tensor (bf16, fp16, or fp32), must be contiguous.
+        out_dtype: Target FP8 dtype (e.g. float8_e4m3fn).
+        scale: Pre-computed scalar float32 quantization scale.
+        amax_out: Optional scalar float32 tensor. If provided, the kernel
+                  writes the abs-max of x into it (for delayed scaling).
+    """
+    return cast_transpose_fp8_triton(x, out_dtype, scale, amax_out)
 
 
 def quantize_fp8_with_trans(
