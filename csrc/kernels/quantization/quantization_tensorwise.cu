@@ -261,6 +261,125 @@ void reduce_amax_and_compute_scale(const InType *input, float *scale, float *sca
 }
 
 // ---------------------------------------------------------------------------
+// Fused tensorwise quantize + abs-max capture (TE-style delayed scaling).
+//
+// Single pass over the input tensor: quantizes each element using a
+// pre-computed scale AND tracks the absolute maximum of the original
+// (un-quantized) values.  The per-block partial abs-maxes are reduced
+// to a single scalar via atomicMax on a global float pointer.
+//
+// This eliminates the separate abs().amax() reduction kernel that
+// delayed scaling otherwise requires for input/gradient amax capture.
+// ---------------------------------------------------------------------------
+
+PRIMUS_TURBO_DEVICE void atomicMaxFloat(float *addr, float val) {
+    if (val <= 0.0f)
+        return;
+    unsigned int *addr_as_uint = reinterpret_cast<unsigned int *>(addr);
+    unsigned int  old          = __float_as_uint(*addr);
+    unsigned int  assumed;
+    do {
+        assumed = old;
+        if (__uint_as_float(assumed) >= val)
+            break;
+        old = atomicCAS(addr_as_uint, assumed, __float_as_uint(val));
+    } while (assumed != old);
+}
+
+template <int BLOCK_SIZE, int UNROLL, typename FType, typename QType, typename ComputeType = float>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void quantize_tensorwise_with_amax_kernel(const FType *__restrict__ x,
+                                              const float *__restrict__ scale_ptr,
+                                              QType *__restrict__ y,
+                                              float *__restrict__ amax_ptr,
+                                              const int64_t n) {
+    const ComputeType scale    = static_cast<ComputeType>(scale_ptr[0]);
+    const ComputeType CLIP_MIN = static_cast<ComputeType>(std::numeric_limits<QType>::lowest());
+    const ComputeType CLIP_MAX = static_cast<ComputeType>(std::numeric_limits<QType>::max());
+
+    const int64_t n_pack   = n / UNROLL;
+    const int64_t tid      = static_cast<int64_t>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+    const int64_t stride   = static_cast<int64_t>(gridDim.x) * BLOCK_SIZE;
+
+    ComputeType local_amax = 0.0f;
+
+    for (int64_t pack_idx = tid; pack_idx < n_pack; pack_idx += stride) {
+        FType  ld_regs[UNROLL];
+        QType  st_regs[UNROLL];
+        load_data<FType, UNROLL>(x + pack_idx * UNROLL, ld_regs);
+#pragma unroll
+        for (int i = 0; i < UNROLL; ++i) {
+            const ComputeType val = static_cast<ComputeType>(ld_regs[i]);
+            local_amax = fmaxf(local_amax, fabsf(val));
+            st_regs[i] = static_cast<QType>(fmaxf(fminf(val * scale, CLIP_MAX), CLIP_MIN));
+        }
+        store_data<QType, UNROLL>(y + pack_idx * UNROLL, st_regs);
+    }
+
+    if (UNROLL > 1) {
+        const int64_t tail_start = n_pack * UNROLL;
+        for (int64_t i = tail_start + tid; i < n; i += stride) {
+            const ComputeType val = static_cast<ComputeType>(x[i]);
+            local_amax = fmaxf(local_amax, fabsf(val));
+            y[i] = static_cast<QType>(fmaxf(fminf(val * scale, CLIP_MAX), CLIP_MIN));
+        }
+    }
+
+    local_amax = BlockReduce<MaxOp, float>(local_amax);
+
+    if (threadIdx.x == 0) {
+        atomicMaxFloat(amax_ptr, local_amax);
+    }
+}
+
+template <int BLOCK_SIZE, int UNROLL_V, typename FType, typename QType, typename ComputeType>
+void launch_quantize_with_amax(const FType *x, const float *scale, QType *y,
+                               float *amax_out, const int64_t n, hipStream_t stream) {
+    constexpr int MAX_BLOCKS = 1024;
+    const int64_t n_pack     = n / UNROLL_V;
+    const int     n_blocks   = static_cast<int>(
+        std::min(std::max(DIVUP<int64_t>(n_pack, BLOCK_SIZE), int64_t{1}), static_cast<int64_t>(MAX_BLOCKS)));
+    quantize_tensorwise_with_amax_kernel<BLOCK_SIZE, UNROLL_V, FType, QType, ComputeType>
+        <<<n_blocks, BLOCK_SIZE, 0, stream>>>(x, scale, y, amax_out, n);
+}
+
+template <typename FType, typename QType, typename ComputeType>
+void quantize_tensorwise_with_amax_impl(const FType *x, const float *scale, QType *y,
+                                        float *amax_out, const int64_t n, hipStream_t stream) {
+    constexpr int BLOCK_SIZE = 512;
+
+    int32_t pack_size = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
+    switch (pack_size) {
+    case 8: {
+        constexpr int U = valid_pack<FType, 8>();
+        launch_quantize_with_amax<BLOCK_SIZE, U, FType, QType, ComputeType>(
+            x, scale, y, amax_out, n, stream);
+        break;
+    }
+    case 4: {
+        constexpr int U = valid_pack<FType, 4>();
+        launch_quantize_with_amax<BLOCK_SIZE, U, FType, QType, ComputeType>(
+            x, scale, y, amax_out, n, stream);
+        break;
+    }
+    case 2: {
+        constexpr int U = valid_pack<FType, 2>();
+        launch_quantize_with_amax<BLOCK_SIZE, U, FType, QType, ComputeType>(
+            x, scale, y, amax_out, n, stream);
+        break;
+    }
+    case 1: {
+        launch_quantize_with_amax<BLOCK_SIZE, 1, FType, QType, ComputeType>(
+            x, scale, y, amax_out, n, stream);
+        break;
+    }
+    default:
+        PRIMUS_TURBO_ERROR("Error Pack Size");
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Explicit instantiations
 // ---------------------------------------------------------------------------
 // Explicit instantiations for reduce_amax_and_compute_scale
@@ -285,7 +404,10 @@ template void compute_scale_from_amax<float>(const float *amax, float q_max, flo
     template void quantize_tensorwise_impl<FType, QType>(                                          \
         const FType *x, const float *scale, QType *y, const int64_t n, hipStream_t stream);        \
     template void dequantize_tensorwise_impl<FType, QType>(                                        \
-        const QType *x, const float *scale_inv, FType *y, const int64_t n, hipStream_t stream);
+        const QType *x, const float *scale_inv, FType *y, const int64_t n, hipStream_t stream);    \
+    template void quantize_tensorwise_with_amax_impl<FType, QType>(                                \
+        const FType *x, const float *scale, QType *y, float *amax_out, const int64_t n,            \
+        hipStream_t stream);
 
 DECL_QUANT_AND_DEQUANT_TENSORWISE_INSTANCE(dtype::float16, dtype::float8_e4m3)
 DECL_QUANT_AND_DEQUANT_TENSORWISE_INSTANCE(dtype::float16, dtype::float8_e5m2)
