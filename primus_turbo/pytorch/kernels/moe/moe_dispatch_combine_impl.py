@@ -1331,6 +1331,7 @@ _BACKEND_REGISTRY: Dict[str, Type[EPBackend]] = {
     "TURBO": TurboEPBackend,
     "DEEP_EP": DeepEPBackend,
     "MORI": MoriEPBackend,
+    "UCCL": UCCLEPBackend,
 }
 
 _backend_instances: Dict[str, EPBackend] = {}
