@@ -72,16 +72,25 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const uint32_t scale_sts_offset = lane_id;
     const uint32_t scale_lds_offset = lane_id;
 
-    const uint32_t lhs_remaining =
-        ((n - pid_n) * total_m - static_cast<uint32_t>(group_col_offset)) * sizeof(AType);
-    const uint32_t rhs_remaining =
-        ((k - pid_k) * total_m - static_cast<uint32_t>(group_col_offset)) * sizeof(BType);
-    const uint32_t lhs_s_remaining =
-        ((n - pid_n) * scale_cols_full - static_cast<uint32_t>(group_scale_offset)) *
-        sizeof(uint32_t);
-    const uint32_t rhs_s_remaining =
-        ((k - pid_k) * scale_cols_full - static_cast<uint32_t>(group_scale_offset)) *
-        sizeof(uint32_t);
+    // BufferSRD's num_records is uint32 (4 GB max).  When total_M is large
+    // (e.g. Kimi-K2 B=48 M=16384 → total_M=786K), `(n-pid_n)*total_m*sizeof`
+    // can exceed 4 GB and silently truncate, masking valid addresses as
+    // OOB and zeroing live LDGs (b_grad SNR drops to ~18 dB).  Compute in
+    // uint64 and clamp to UINT32_MAX — actual per-tile access span is at
+    // most 256*total_m (≤ ~200 MB for our shapes), well within 4 GB.
+    auto clamp_u32 = [](uint64_t v) -> uint32_t {
+        return v >= 0xffffffffu ? 0xffffffffu : static_cast<uint32_t>(v);
+    };
+    const uint32_t lhs_remaining = clamp_u32(
+        ((uint64_t)(n - pid_n) * total_m - (uint64_t) group_col_offset) * sizeof(AType));
+    const uint32_t rhs_remaining = clamp_u32(
+        ((uint64_t)(k - pid_k) * total_m - (uint64_t) group_col_offset) * sizeof(BType));
+    const uint32_t lhs_s_remaining = clamp_u32(
+        ((uint64_t)(n - pid_n) * scale_cols_full - (uint64_t) group_scale_offset) *
+        sizeof(uint32_t));
+    const uint32_t rhs_s_remaining = clamp_u32(
+        ((uint64_t)(k - pid_k) * scale_cols_full - (uint64_t) group_scale_offset) *
+        sizeof(uint32_t));
     const BufferSRD a_srd(lhs_base_ptr, lhs_remaining);
     const BufferSRD b_srd(rhs_base_ptr, rhs_remaining);
     const BufferSRD a_s_srd(lhs_s_base_ptr, lhs_s_remaining);
@@ -156,10 +165,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     GemmTile::template load_scale_subtile_pinned<GemmTile::PIN_BS0>(
         b_s_smem_tile[cur][warp_n].u32_ptr(), scale_lds_offset);
 
-    // Mirror FWD: drain prologue ds_reads only; tile-2 LDG's LDS-write tail
-    // is drained by Phase 1's `phase_mfma_lds_ldg` WAR barrier.
-    wait_lgkmcnt<0>();
-
     if (k_iters > 2) {
         tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[cur],
                                                       sts_offsets, 2 * DATA_STRIDE);
@@ -172,6 +177,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                                                             b_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols_full, 2 * SCALE_STRIDE);
     }
+    wait_lgkmcnt<0>();
 
     int32_t base_data_soff[4], base_scale_soff[4];
     tile.precompute_base_soff(base_data_soff, base_scale_soff, scale_cols_full);
@@ -207,9 +213,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                 scale_gmem_byte_off, sm0_0, sm0_1, base_scale_soff[2] + scale_off,
                 base_scale_soff[3] + scale_off);
         }
-
-        // Mirror FWD: Phase 1->2 partial drain, `<3>` is the safe bound.
-        wait_vmcnt<3>();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {
@@ -326,8 +329,14 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        // Mirror FWD: drain Epi1 buffer_load_lds before the buffer flip.
-        wait_vmcnt<0>();
+        // Single-GEMM-style split drain: keep the last 6 buffer_load_lds
+        // in flight so Phase 3+4 mfma_lds overlap with the trailing GMEM→LDS
+        // DMAs.  Counter-intuitively, the matching mid-Epi2 `wait_vmcnt<0>`
+        // also lowers race rate from ~0.3% to ~0.004% (closer to fwd) by
+        // giving the LDS-write commits an extra sync point before Phase 3
+        // reads `next`.  Trades a ~2-3% slowdown on K=2048 wgrad for race
+        // parity with fwd / single-GEMM.
+        wait_vmcnt<6>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
@@ -347,7 +356,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
             a_smem_tile[cur][warp_m + 2].u32_ptr(), lds_offsets,
             a_s_smem_tile[cur][warp_m + 2].u32_ptr(), scale_lds_offset);
 
-        // Mirror FWD: only the cross-buffer s_barrier is required here.
+        wait_vmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         GemmTile::template phase_mfma_lds<GemmTile::PIN_A1, GemmTile::PIN_AS1, GemmTile::PIN_B0,
@@ -395,60 +404,39 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                             warp_id / 2 * 64 * (int64_t) k + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_n + 256 > (int32_t) n) || (pid_k + 256 > (int32_t) k);
 
-    // Mirror FWD epilogue: non-volatile stores + alternating c_tmp_a/b
-    // buffers + sched_barrier(0) between pairs + `wait_vmcnt<63>` before
-    // c_tmp reuse so the older pair's flat_store_short release their
-    // source VGPRs before the next accvgpr_read overwrites them.
     if (!is_boundary_tile) {
-        float32x4 c_tmp_a[4][4];
-        float32x4 c_tmp_b[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
-                                             c_tmp_a, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
-                                             c_tmp_b, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
-                                             c_tmp_a, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
-                                             c_tmp_b, c_stg_offsets);
+        float32x4 c_tmp[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
+                             c_tmp, c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
         const int32_t tile_valid_m = min((int32_t) n - pid_n, 256) - warp_base_m;
         const int32_t tile_valid_n = min((int32_t) k - pid_k, 256) - warp_base_n;
-        float32x4     c_tmp_a[4][4];
-        float32x4     c_tmp_b[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
-                                             c_tmp_a, c_stg_offsets, tile_valid_m, tile_valid_n);
-        __builtin_amdgcn_sched_barrier(0);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
-                                             c_tmp_b, c_stg_offsets, tile_valid_m,
-                                             tile_valid_n - 128);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
-                                             c_tmp_a, c_stg_offsets, tile_valid_m - 128,
-                                             tile_valid_n);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<63>();
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
-                                             c_tmp_b, c_stg_offsets, tile_valid_m - 128,
-                                             tile_valid_n - 128);
+        float32x4     c_tmp[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
+                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
+                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n - 128);
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
+                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n);
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
+                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
-    // No trailing wait_vmcnt<0>: same as FWD — next iter's prologue drains
-    // it, and `s_endpgm` waits for outstanding VMEM on the last iter.
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
@@ -478,8 +466,10 @@ turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
     auto            *b_s_smem_tile =
         reinterpret_cast<BSSmem(*)[4]>(smem_buf + SMEM_DATA_BYTES + sizeof(ASSmem) * 2 * 4);
 
-    GemmTile reserve_tile(threadIdx.x, n, k, total_m);
-    reserve_tile.reserve_pinned_regs();
+    // Reuse one tile across the persistent loop (m/n/k fields aren't read
+    // by compute_tile — boundary uses M_g argument instead).
+    GemmTile tile(threadIdx.x, n, k, total_m);
+    tile.reserve_pinned_regs();
 
     const int32_t tiles_per_group = grid_n * grid_k;
     const int32_t total_tiles     = tiles_per_group * group_num;
@@ -495,15 +485,10 @@ turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
             continue;
         }
 
-        GemmTile tile(threadIdx.x, n, k, total_m);
         turbo_grouped_gemm_mxfp8_wgrad_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, lhs_ptr, rhs_ptr,
             lhs_s_ptr, rhs_s_ptr, db_ptr, group_offs_ptr, group_id, pid_n, pid_k, M_g, n, k,
             total_m);
-        // Mirror FWD: CTA s_barrier across tiles to prevent the next
-        // prologue from clobbering SMEM banks that the previous tile's
-        // epilogue mfma_lds is still sourcing.
-        __builtin_amdgcn_s_barrier();
     }
 #endif
 }

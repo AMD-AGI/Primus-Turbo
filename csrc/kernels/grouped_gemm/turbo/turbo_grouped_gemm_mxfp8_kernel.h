@@ -122,11 +122,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     GemmTile::template load_scale_subtile_pinned<GemmTile::PIN_BS0>(
         b_s_smem_tile[cur][warp_n].u32_ptr(), scale_lds_offset);
 
-    // Drain the 24 prologue ds_reads only; the tile-2 LDG below targets a
-    // different SMEM half and its LDS-write tail is drained by Phase 1's WAR
-    // barrier inside `phase_mfma_lds_ldg`.
-    wait_lgkmcnt<0>();
-
     if (k_iters > 2) {
         tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[cur],
                                                       sts_offsets, 2 * DATA_STRIDE);
@@ -139,6 +134,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                                                             b_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols, 2 * SCALE_STRIDE);
     }
+    wait_lgkmcnt<0>();
 
     int32_t base_data_soff[4], base_scale_soff[4];
     tile.precompute_base_soff(base_data_soff, base_scale_soff, scale_cols);
@@ -174,12 +170,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
                 scale_gmem_byte_off, sm0_0, sm0_1, base_scale_soff[2] + scale_off,
                 base_scale_soff[3] + scale_off);
         }
-
-        // Phase 1->2 partial vmcnt drain.  `<3>` is the tightest safe bound
-        // (`<4>` leaks): the up-to-3 in-flight Phase 1 LDGs target a
-        // different LDS array than Phase 2's ds_reads, and Phase 2's own
-        // `phase_mfma_lds_ldg` opens with `wait_lgkmcnt<0>; s_barrier`.
-        wait_vmcnt<3>();
 
         // Phase 2: MFMA A0×B1, LDG A1→cur[2,3]
         {
@@ -296,11 +286,13 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        // RACE FIX: drain Epi1 buffer_load_lds (B1+A1 prefetch) before the
-        // buffer flip.  Do NOT weaken to `wait_lgkmcnt<0>`-only: on gfx950
-        // a buffer_load_lds decrements vmcnt at GMEM-read commit, which can
-        // precede the LDS-write commit, opening a cross-tile WAW.
-        wait_vmcnt<0>();
+        // Single-GEMM-style split drain: keep the last 6 buffer_load_lds
+        // (B1 ph2's tail + A1 ph3's tail) in flight so Phase 3+4 mfma_lds
+        // overlap with the trailing GMEM→LDS DMAs; the matching
+        // `wait_vmcnt<0>` lives mid-Epi2 (after its Phase 2).  This trades
+        // bit-exact determinism for a measurable speedup, matching the
+        // single-GEMM kernel's race profile.
+        wait_vmcnt<6>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
         next ^= 1;
@@ -320,9 +312,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
             a_smem_tile[cur][warp_m + 2].u32_ptr(), lds_offsets,
             a_s_smem_tile[cur][warp_m + 2].u32_ptr(), scale_lds_offset);
 
-        // No drain needed here: Epi1 already settled vmcnt and Epi2 phases
-        // 1-2 are LDS-only.  Only the cross-buffer s_barrier is required
-        // before Phase 3 reads `next`.
+        wait_vmcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         GemmTile::template phase_mfma_lds<GemmTile::PIN_A1, GemmTile::PIN_AS1, GemmTile::PIN_B0,
@@ -369,69 +359,39 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         c_ptr + m_global * (int64_t) n + pid_n + warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_m + 256 > M_g) || (pid_n + 256 > (int32_t) n);
 
-    // C-store: non-volatile so the compiler can coalesce stores and skip
-    // per-element vmcnt(0) drains; each tile is owned by one CTA.
-    //
-    // RACE FIX: two alternating c_tmp buffers so pair-(i+1)'s accvgpr_read
-    // cannot clobber pair-i's still-latching flat_store_short, plus a
-    // `wait_vmcnt<0>` at c_tmp_a reuse — `<63>` left a 2-6/100 residual on
-    // G=4 M=1024 N=2048 K=2048 because gfx950's LSU retirement is not
-    // strictly FIFO under cache pressure.
     if (!is_boundary_tile) {
-        float32x4 c_tmp_a[4][4];
-        float32x4 c_tmp_b[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp_a, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp_b, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        // c_tmp_a reuse: `<0>` is the only safe bound — gfx950 LSU is
-        // non-FIFO across pairs, so any `<x>`>0 risks pair-2 clobbering
-        // pair-0's still-pending source VGPRs.
-        wait_vmcnt<0>();
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp_a, c_stg_offsets);
-        __builtin_amdgcn_sched_barrier(0);
-        // c_tmp_b reuse: vmcnt rose only on pair-2's 64 stores after the
-        // drain above; `<32>` is race-free, the cliff sits in (32, 48].
-        wait_vmcnt<32>();
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp_b, c_stg_offsets);
+        float32x4 c_tmp[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
+                             c_tmp, c_stg_offsets);
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
+                             c_tmp, c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
         const int32_t tile_valid_m = min(M_g - pid_m, 256) - warp_base_m;
         const int32_t tile_valid_n = min((int32_t) n - pid_n, 256) - warp_base_n;
-        float32x4     c_tmp_a[4][4];
-        float32x4     c_tmp_b[4][4];
-        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp_a, c_stg_offsets, tile_valid_m, tile_valid_n);
-        __builtin_amdgcn_sched_barrier(0);
-        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp_b, c_stg_offsets, tile_valid_m,
-                                             tile_valid_n - 128);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<0>(); // c_tmp_a reuse — see fast-path note.
-        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp_a);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                                             c_tmp_a, c_stg_offsets, tile_valid_m - 128,
-                                             tile_valid_n);
-        __builtin_amdgcn_sched_barrier(0);
-        wait_vmcnt<32>(); // c_tmp_b reuse — see fast-path note.
-        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp_b);
-        tile.template store_c_subtile<false>(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                                             c_tmp_b, c_stg_offsets, tile_valid_m - 128,
-                                             tile_valid_n - 128);
+        float32x4     c_tmp[4][4];
+        tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
+                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
+        tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
+                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n - 128);
+        tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
+                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n);
+        tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
+                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
-    // No trailing wait_vmcnt<0>: the next iter's prologue drains it before
-    // ds_reads, and `s_endpgm` waits for outstanding VMEM on the last iter.
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
@@ -461,8 +421,11 @@ turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     auto            *b_s_smem_tile =
         reinterpret_cast<BSSmem(*)[4]>(smem_buf + SMEM_DATA_BYTES + sizeof(ASSmem) * 2 * 4);
 
-    GemmTile reserve_tile(threadIdx.x, 0, n, k);
-    reserve_tile.reserve_pinned_regs();
+    // The per-tile m field is unused inside compute_tile (boundary uses M_g
+    // arg), so reuse one tile instance across the persistent loop.  Avoids
+    // re-running its const-init (~lane_id/warp_id mods) per tile.
+    GemmTile tile(threadIdx.x, 0, n, k);
+    tile.reserve_pinned_regs();
 
     const int32_t tiles_per_group = grid_m * grid_n;
     const int32_t total_tiles     = tiles_per_group * group_num;
@@ -478,15 +441,9 @@ turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
             continue;
         }
 
-        GemmTile tile(threadIdx.x, (uint32_t) M_g, n, k);
         turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
             b_s_ptr, c_ptr, group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
-        // CRITICAL CTA-level barrier: the next tile's prologue overwrites
-        // the same SMEM banks the previous tile's final mfma_lds is still
-        // reading.  compute_tile()'s own prologue barrier fires after its
-        // LDGs issue, which is too late.  Removal raised stress to 5-7/100.
-        __builtin_amdgcn_s_barrier();
     }
 #endif
 }

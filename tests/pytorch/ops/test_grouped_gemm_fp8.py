@@ -91,23 +91,10 @@ def _run_grouped_gemm_fp8_test(
     device = "cuda:0"
 
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    # MX_BLOCKWISE wgrad needs M_g % 128 == 0; round and absorb slack
-    # into the last group.
-    if granularity == ScalingGranularity.MX_BLOCKWISE and not balance:
-        lens = group_lens.tolist()
-        rounded = [(int(x) // 128) * 128 for x in lens]
-        if rounded[-1] <= 0:
-            rounded[-1] = 128
-        slack = sum(lens) - sum(rounded)
-        rounded[-1] += slack
-        if rounded[-1] <= 0:
-            pytest.skip("Cannot 128-align group_lens for MX_BLOCKWISE: degenerate distribution.")
-        group_lens = torch.tensor(rounded, dtype=group_lens.dtype, device=device)
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
         f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
-        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}, "
-        f"group_lens={group_lens.tolist() if granularity == ScalingGranularity.MX_BLOCKWISE else '...'}"
+        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
@@ -503,6 +490,12 @@ def test_grouped_gemm_fp8_blockwise(
 
 
 # MX_BLOCKWISE: NT-only, stricter shape constraints, smaller focused sweep.
+# Balance=True only: MX_BLOCKWISE wgrad requires per-group M_g % 128 == 0 to
+# match the preshuffled scale layout (16x4 blocks).  With balance=True every
+# group has M_g == M, which is a 128-multiple via _MX_M_VALUES.  Unbalanced
+# group_lens with non-128-aligned per-group sizes are not a supported
+# configuration for the mxfp8 kernel and should be enforced at the wrapper
+# level, not silently rounded inside the test.
 _MX_NK_VALUES = [
     (512, 384),       # smallest valid (k>=384)
     (2048, 2048),
@@ -518,8 +511,7 @@ _MX_B_VALUES = [1, 2, 4, 8]
 @pytest.mark.parametrize("NK", _MX_NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, balance):
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format):
     """MXFP8 grouped GEMM fwd + dgrad + wgrad on the turbo backend (NT-only)."""
     N, K = NK
     if get_device_compute_capability() != (9, 5):
@@ -533,7 +525,7 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, balance):
         format=format,
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=True,
-        balance=balance,
+        balance=True,
         backend=BackendType.TURBO,
         auto_tune=False,
     )
