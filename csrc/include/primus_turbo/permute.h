@@ -27,25 +27,29 @@ struct PermutePreprocessConfig {
 };
 
 // Build `row_id_map`, `tokens_per_expert` and `overflow_flag` from the routing
-// map using a 4-pass cooperative scan. The kernel uses `grid.sync()` so it
-// must be launched via `hipLaunchCooperativeKernel`; this launcher computes a
-// safe grid size from device occupancy and dispatches it for the caller.
+// map using a single-kernel decoupled-lookback scan. The launcher allocates
+// the per-stream lookback workspace internally (epoch-tagged tile_state +
+// barrier counter, with a vsmem fallback for high-E shapes that overflow
+// the per-block LDS budget); callers no longer need to pass workspace
+// scratch tensors.
 //
 // Shapes (all device pointers):
 //   routing_map               : [num_dispatched_tokens, num_of_local_experts] (bool)
 //   num_dispatched_tokens_ptr : scalar int
-//   workspace_1               : [rows_workspace_1, num_of_local_experts] (int)
-//   workspace_2               : [rows_workspace_2, num_of_local_experts] (int)
 //   tokens_per_expert         : [num_of_local_experts] (int32)
 //   row_id_map                : [num_dispatched_tokens + pad_multiple, num_of_local_experts] (int)
 //   overflow_flag             : scalar int
 //
+// `max_num_dispatched_tokens` is the upper-bound `num_dispatched_tokens` the
+// caller may pass; the launcher uses it (host-side) to size the grid and the
+// per-block tile partition without synchronising on the device-side counter.
+//
 // `num_permuted_tokens < 0` is treated as "no cap".
 void permute_preprocessing_launch(bool *routing_map, int *num_dispatched_tokens_ptr,
-                                  int num_of_local_experts, int *workspace_1, int rows_workspace_1,
-                                  int *workspace_2, int rows_workspace_2, int pad_multiple,
-                                  int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
-                                  int64_t num_permuted_tokens, hipStream_t stream);
+                                  int num_of_local_experts, int max_num_dispatched_tokens,
+                                  int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
+                                  int *overflow_flag, int64_t num_permuted_tokens,
+                                  hipStream_t stream);
 
 // =============================================================================
 // Permute / Unpermute (data movement)
