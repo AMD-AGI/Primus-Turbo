@@ -58,6 +58,7 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     MORI = auto()
+    UCCL = auto()
 
 
 class GlobalBackendManager:

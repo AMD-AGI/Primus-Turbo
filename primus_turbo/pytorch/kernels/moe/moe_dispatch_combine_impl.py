@@ -194,7 +194,7 @@ class EPBufferConfig:
         combine_config: Combine config; ``None`` means use backend default.
     """
 
-    num_sms: int = 32
+    num_sms: int = 64
     dispatch_config: Any = None
     combine_config: Any = None
 
@@ -208,6 +208,11 @@ _DEFAULT_BUFFER_CONFIG_PER_BACKEND: Dict[str, EPBufferConfig] = {
         combine_config=None,
     ),
     "DEEP_EP": EPBufferConfig(
+        num_sms=64,
+        dispatch_config=None,
+        combine_config=None,
+    ),
+    "UCCL_EP": EPBufferConfig(
         num_sms=64,
         dispatch_config=None,
         combine_config=None,
@@ -911,6 +916,35 @@ class DeepEPBackend(_DeepEPLikeBackend):
         import deep_ep
 
         return deep_ep
+
+    def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
+        BufferClass = self._get_module().Buffer
+        try:
+            param = inspect.signature(BufferClass).parameters.get("is_intranode")
+        except (TypeError, ValueError):
+            param = None
+        if param is not None and param.default is False:
+            return {"is_intranode": group.size() <= 8}
+        return {}
+
+
+class UCCLEPBackend(_DeepEPLikeBackend):
+    """UCCL-EP backend (optional)."""
+
+    @staticmethod
+    def is_available() -> bool:
+        try:
+            import uccl.ep  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _get_module():
+        import uccl.ep as uccl_ep
+
+        return uccl_ep
 
     def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
         BufferClass = self._get_module().Buffer

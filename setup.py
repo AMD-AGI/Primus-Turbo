@@ -32,6 +32,7 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # PR: feat: _flash_attn_forward add out args (#2648)
 AITER_COMMIT = "857f4d15775a29af153a2c68a2f8e8a8d696c986"
+UCCL_COMMIT = "9bae94c59229f82efbbd5b78a7f222ce19e74e86"
 
 # -------------------------------------
 
@@ -401,7 +402,7 @@ if __name__ == "__main__":
 
     # Entry points and Install Requires
     entry_points = {}
-    install_requires = []
+    install_requires = [f"uccl @ git+https://github.com/uccl-project/uccl.git@{UCCL_COMMIT}"]
 
     # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
