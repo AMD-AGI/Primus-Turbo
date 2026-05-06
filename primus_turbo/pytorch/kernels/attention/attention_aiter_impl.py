@@ -387,7 +387,18 @@ def _attention_aiter_forward_impl_fake(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, seq_len_q, num_heads_q, _ = q.shape
     _, _, _, head_dim_v = v.shape
-    out = torch.empty((batch_size, seq_len_q, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device)
+    if qkv_format == "sbhd":
+        out = torch.empty(
+            (seq_len_q, batch_size, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device
+        ).permute(1, 0, 2, 3)
+    elif qkv_format == "bhsd":
+        out = torch.empty(
+            (batch_size, num_heads_q, seq_len_q, head_dim_v), dtype=q.dtype, device=q.device
+        ).permute(0, 2, 1, 3)
+    else:
+        out = torch.empty(
+            (batch_size, seq_len_q, num_heads_q, head_dim_v), dtype=q.dtype, device=q.device
+        )
     softmax_lse = torch.empty((batch_size, num_heads_q, seq_len_q), dtype=torch.float32, device=q.device)
     S_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
