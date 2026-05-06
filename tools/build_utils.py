@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sysconfig
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,39 @@ def find_rocshmem_home():
     )
 
 
+def _default_library_search_dirs() -> List[str]:
+    library_dirs = []
+    for env_name in ("LD_LIBRARY_PATH", "LIBRARY_PATH"):
+        library_dirs.extend(path for path in os.getenv(env_name, "").split(os.pathsep) if path)
+
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    if multiarch:
+        library_dirs.extend([f"/usr/lib/{multiarch}", f"/lib/{multiarch}"])
+
+    library_dirs.extend(["/usr/local/lib", "/usr/lib", "/lib"])
+    return library_dirs
+
+
+def _find_linkable_library(name: str, library_dirs: List[str]) -> Optional[Path]:
+    candidates = []
+    for library_dir in [*library_dirs, *_default_library_search_dirs()]:
+        if not library_dir:
+            continue
+        lib_dir = Path(library_dir)
+        candidates.extend(
+            [
+                lib_dir / f"lib{name}.so",
+                lib_dir / f"lib{name}.a",
+            ]
+        )
+        candidates.extend(sorted(lib_dir.glob(f"lib{name}.so.*")))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
 def find_rocshmem_library() -> Library:
     rocshmem_home = find_rocshmem_home()
     mpi_home = find_mpi_home()
@@ -194,23 +228,29 @@ def find_rocshmem_library() -> Library:
     rocshmem_include_dir = str(rocshmem_home / "include")
     mpi_library_dir = str(mpi_home / "lib")
     mpi_include_dir = str(mpi_home / "include")
+    library_dirs = [rocshmem_library_dir, mpi_library_dir]
+    extra_link_args = [
+        f"-Wl,-rpath,{rocshmem_library_dir}",
+        "-l:librocshmem.a",
+        "-fgpu-rdc",
+        "--hip-link",
+        "-lamdhip64",
+        "-lhsa-runtime64",
+        "-l:libmpi.so",
+        f"-Wl,-rpath,{mpi_library_dir}",
+        "-libverbs",
+        "-lmlx5",
+    ]
+    ionic_library = _find_linkable_library("ionic", library_dirs)
+    if ionic_library is not None:
+        extra_link_args.extend([str(ionic_library), f"-Wl,-rpath,{ionic_library.parent}"])
+
     rocshmem_library = Library(
         name="rocshmem",
         libraries=[],
-        library_dirs=[rocshmem_library_dir, mpi_library_dir],
+        library_dirs=library_dirs,
         include_dirs=[rocshmem_include_dir, mpi_include_dir],
-        extra_link_args=[
-            f"-Wl,-rpath,{rocshmem_library_dir}",
-            "-l:librocshmem.a",
-            "-fgpu-rdc",
-            "--hip-link",
-            "-lamdhip64",
-            "-lhsa-runtime64",
-            "-l:libmpi.so",
-            f"-Wl,-rpath,{mpi_library_dir}",
-            "-libverbs",
-            "-lmlx5",
-        ],
+        extra_link_args=extra_link_args,
     )
     return rocshmem_library
 
