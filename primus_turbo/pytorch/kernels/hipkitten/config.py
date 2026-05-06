@@ -139,6 +139,7 @@ backends pass them to :mod:`primus_turbo.pytorch.kernels.hipkitten.dispatch`
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 from primus_turbo.pytorch.kernels.hipkitten.layout import DType, Layout
 
@@ -177,6 +178,29 @@ class HipKittenConfig:
     kernel: str | None
 
 
+# Round-2 (fused-act follow-up to the round-1 quantize cache).
+#
+# ``select_default_config`` runs ~hundreds of if/else branches per call to
+# resolve a frozen HipKittenConfig. Each call costs ~0.5 µs of host time
+# (probe ``/tmp/probe_round_2_combined_cache.py``: 0.535 µs direct vs
+# 0.067 µs lru_cache HIT). The function is pure: same (m, n, k, layout,
+# dtype, m_total) → same HipKittenConfig (deterministic if/else cascade
+# over hashable scalar inputs; no IO, no global state).
+#
+# ``@lru_cache`` is HK-asymmetric: only the HK execute body in
+# grouped_gemm_fp8_impl.py / grouped_gemm_impl.py / dense GEMM HK execute
+# bodies call ``select_default_config``. Triton paths skip this entry
+# point entirely (they go through their own grouped/dense kernel
+# selectors). The 0.5 µs per-call asymmetric saving × 2 grouped GEMM
+# calls per FP8 fwd+bwd (forward RCR + backward dA RRR; var-K dB uses
+# inline (gm, xcds) rules — no select_default_config) = ~0.9 µs / iter
+# HK-only saving on the wall metric.
+#
+# maxsize=1024 covers: ~150 unique (m, n, k, layout, dtype, m_total)
+# tuples in the metric × DoD smoke regression × dense FP8/BF16 metric.
+# Realistic production training has <100 unique GEMM shapes per model;
+# 1024 is comfortably above any expected working set.
+@lru_cache(maxsize=1024)
 def select_default_config(
     m: int,
     n: int,
@@ -1838,12 +1862,113 @@ def select_default_config(
         #   gpt_oss-GateUP dB var-K: variable-K path, different code.
         if tiles_n == 11 and k == 5760 and m_total is not None:
             if tiles_m == 16:
-                # gpt_oss-GateUP B*-M4096 dA after reroute. Both
-                # B=4 (m_total=16384) and B=32 (m_total=131072) probed
-                # and confirmed (gm=8, xcd=4) WIN.
+                # Round-8 (current Primus run; 2026-05-05) re-tune of the
+                # R34 (gm=8, xcd=4) rule above. Same H4-reroute follow-up
+                # class as R6 (Qwen3-GateUP M=4096 dA RCR) and R7
+                # (Qwen3-Down M=4096 dA RCR): the R34 cell was tight-
+                # verified at 12-trial × 200-iter × 3-seed methodology
+                # but only swept ``gm ∈ {4, 8, 16, 32}`` — ``gm == 1`` was
+                # not in the candidate set. Round-8 widened the sweep
+                # (200-iter × 7-trial × p20 × 3 seeds at
+                # /tmp/probe_round_8_gpt_oss_gateup_dA_rcr.py, results
+                # archived in commit message) and found ``(gm=1, xcd=4)``
+                # as a clean robust winner on both M=4096 shapes:
+                #
+                #   shape                       cell      seed42  seed137  seed2024  med Δ vs cur  spread pp  verdict
+                #   gpt_oss-GateUP-B4-M4096-dA  (1, 4)    +1.16%  +1.24%   +1.20%    +1.20%        0.08       WIN  med/spread=15.0×
+                #   gpt_oss-GateUP-B4-M4096-dA  (8, 4)cur baseline                    +0.00%        0.28       (R34)
+                #   gpt_oss-GateUP-B32-M4096-dA (1, 4)    +0.34%  +0.36%   +0.40%    +0.37%        0.06       WIN  med/spread=6.2×
+                #   gpt_oss-GateUP-B32-M4096-dA (8, 4)cur baseline                    +0.00%        0.20       (R34)
+                #
+                # Both shapes: every-seed-positive with 3/3 seeds beating
+                # baseline. spread (pp) is 0.06-0.08 → median > spread by
+                # 6-15× (well above the standard "median > spread" robust-
+                # signal threshold used by R7 / R10 / R23 / R29 / R30 /
+                # R31 / R32 / R33 / R35 / R39 / R6 / R7-current). The
+                # B4-M4096 win (+1.20%) is noticeably larger than R34's
+                # baseline R-old probe lift (+1.78% over default), making
+                # this a +1.20% pure improvement net of R34 — the largest
+                # single-cell lift seen in the H4-reroute follow-up audit
+                # since R3.
+                #
+                # Why (gm=1) wins for tiles_m=16 + k=5760 deep-K dA:
+                # parallel to R23 (gm=1 for gpt_oss-GateUP-B4-M2048 *fwd*
+                # at k=2880 deep-K, tiles_m=8). The persistent loop with
+                # gm=1 walks the entire 11-row N-axis (= 11 K-tile reads
+                # of the per-K B-pack on RCR layout) under each individual
+                # M-tile before advancing M, maximising B-pack L2 reuse.
+                # For the deep-K=5760 main loop (45 K-tiles vs k=2880's
+                # 23 K-tiles for fwd RCR), the per-iteration B-pack L2
+                # footprint is the binding cost; gm=1 lets each M-tile
+                # consume 11×45 = 495 K-tile-loads of the same B-pack
+                # column slab before evicting. R34's gm=8 batches 8
+                # M-tiles together, which is L2-efficient on the A-pack
+                # axis (the M-tile slabs are reused across 8 N-tile rows
+                # = 88 K-tile-loads each) but at deep-K the B-pack L2
+                # pressure dominates because the K-tile is read 8× per
+                # M-tile-batch step; gm=1 inverts that ratio. Same
+                # phenomenon documented for R23 (gm=1 for tiles_m=8 fwd
+                # GateUP at k=2880); current probe extends it to tiles_m=16
+                # at deeper k=5760 — R34's coarse sweep simply omitted
+                # gm=1 from the candidate set.
+                #
+                # Why xcd=4 unchanged from R34: same chiplet-balance
+                # reason documented for R8 / R12 / R23 / R34 / R50 /
+                # R69-current (4 XCDs split the tiles_n=11 schedule
+                # cleanly; xcds=8 over-distributes for k=5760, xcds=2
+                # under-distributes — confirmed by current probe column
+                # data: (8, 2) -0.69% B4-M4096, (8, 8) -1.80% B4-M4096,
+                # (8, 8) -1.84% B32-M4096 vs (8, 4) cur baseline; xcd=4
+                # is robustly best across both candidate gm rows).
+                #
+                # Sibling shape sanity (rule scope unchanged from R34;
+                # tiles_m gating preserved):
+                #   - gpt_oss-GateUP B4-M2048 dA (m_total=8192, tiles_m=8):
+                #     falls through to ``tiles_m == 8 and m_total >=
+                #     65536`` clause below which excludes m_total<65536;
+                #     stays on default. Probe re-verified 2026-05-05:
+                #     default (4, 8) baseline 131.43 us vs (8, 8) +0.78%
+                #     and (8, 2) +0.58% (both within 1pp noise). Default
+                #     remains correct selection.
+                #   - gpt_oss-GateUP B32-M2048 dA (m_total=65536, tiles_m=8):
+                #     hits ``tiles_m == 8 and m_total >= 65536`` clause
+                #     below ((gm=16, xcd=4)). Probe re-verified: (1, 4)
+                #     +0.27% mean but per-seed inconsistent (+0%/+0.83%
+                #     /-0.02% — only 1 of 3 seeds positive); not robust.
+                #     R34's (gm=16, xcd=4) holds.
+                #   - gpt_oss-Down dA RCR (k=2880, excluded by k==5760).
+                #   - gpt_oss-GateUP forward RCR (tiles_n=22, excluded).
+                #   - gpt_oss-GateUP dB var-K (separate dispatch in
+                #     grouped_gemm_fp8_impl.py, not this code path).
+                #   - DSV3/Qwen3 dA RCR (different (n, k) keys, all
+                #     excluded by tiles_n==11 + k==5760 conjunction).
+                #   - Dense FP8 (m_total=None): excluded by outer
+                #     ``m_total is not None`` guard.
+                #   - DoD smoke grouped FP8 fwdbwd shapes per R32 audit:
+                #     ``(4096, 4096, 7168)`` k=7168 → tiles_n=16
+                #     (n=K_fwd=7168), excluded; ``(4096, 7168, 2048)``
+                #     k=2048 → excluded by k==5760.
+                # Rule remains uniquely tied to gpt_oss-GateUP M=4096 dA
+                # post-H4-reroute in the 24-shape MoE suite + DoD universe.
+                #
+                # Bit-equivalent output: (gm, xcds) are pure persistent-
+                # grid tile-scheduling knobs (same property documented for
+                # R34 above and every (gm, xcds) RCR rule in this file).
+                # Round-8 verified at /tmp/probe_round_8_correctness.py:
+                # max_abs_diff=0.0 between (gm=8, xcd=4) and (gm=1, xcd=4)
+                # on both shapes × 3 seeds (0, 42, 137); bit_eq=True 6/6.
+                #
+                # Expected metric impact: dA is ~33% of bwd wall, bwd is
+                # ~70% of total → dA ≈ 23% of total wall. +1.20% kernel
+                # → +0.28% wall on B4-M4096 (current ratio 1.402 → ~1.406).
+                # +0.37% kernel → +0.085% wall on B32-M4096 (current ratio
+                # 1.469 → ~1.471). Geomean (24 shapes): 1.3849 → ~1.3852
+                # (+0.0003). Score is capped at 1000 already, so the gain
+                # is buffer rather than headline — preserves robustness
+                # against future H4-reroute / quantize-cache adjustments.
                 return HipKittenConfig(
                     layout=layout,
-                    group_m=8,
+                    group_m=1,
                     num_xcds=4,
                     kernel=None,
                 )
@@ -2389,6 +2514,236 @@ def select_default_config(
                 num_xcds=2,
                 kernel=None,
             )
+        # Round-3 (FP8 fused-act task, this round's commit): post-R3 dA
+        # backward via H4 reroute (RCR-via-transpose) carve-outs. R3
+        # widened the H4 gate to ALL ``trans_b=False`` callers, which
+        # routed 16 of 24 metric shapes' dA backward through the FP8
+        # RCR kernel for the first time (8 DSV3-Down + 8 Qwen3 — the
+        # 8 gpt_oss shapes already entered RCR pre-R3 via the
+        # K_RRR%128!=0 clause; the 8 DSV3-GateUP shapes now hit the
+        # R8 GateUP-family rule above on their dA RCR-T coords).
+        # Of the 16 newly-RCR-entering shapes, only DSV3-GateUP (8)
+        # had a matching rule (R8 catches their tiles_n=16 + k=4096
+        # dA-T coords); DSV3-Down (4) and Qwen3 (8) all fell through
+        # to ``_FP8_DEFAULT_GROUP_M=4 + num_xcds=None=8`` until this
+        # round.
+        #
+        # Probe ``/tmp/probe_round_4_dA_full_dsv3down.py`` (3 seeds ×
+        # 12 trials × 200 iters × p20 kernel-only) found two clean
+        # robust signals where a single (gm, xcds) cell wins on every
+        # shape in the carve-out family:
+        #
+        #   DSV3-Down dA (n=K_fwd=2048, k=N_fwd=7168, tiles_n=8):
+        #     B16-M2048  med 313.1 → 303.1 us  Δ +3.30 % (3-seed spread 0.10 %)
+        #     B32-M2048  med 619.6 → 596.9 us  Δ +3.81 % (spread 0.11 %)
+        #     B16-M4096  med 606.2 → 595.9 us  Δ +1.73 % (spread 0.06 %)
+        #     B32-M4096  med 1215.7 → 1191.2 us Δ +2.06 % (spread 0.06 %)
+        #   Every-seed delta positive (+1.66 .. +3.81 %); all 4 shapes
+        #   win clear of run-to-run spread (med/spread ratio 19-37×,
+        #   well above the standard "median > spread" robust-signal
+        #   threshold used by R7 / R10 / R23 / R29 / R30 / R31 / R32 /
+        #   R42 / R44 / R45). Spread tighter than 0.15 % on every cell
+        #   (kernel-only timing on the post-R3 build).
+        #
+        #   Qwen3-Down M=2048 dA (n=K_fwd=1536, k=N_fwd=4096,
+        #                         tiles_n=6, tiles_m=8):
+        #     B16-M2048  med 143.4 → 136.5 us  Δ +5.05 % (spread 0.07 %)
+        #     B32-M2048  med 281.2 → 272.0 us  Δ +3.39 % (spread 0.04 %)
+        #   Both shapes clean wins; same probe series. Qwen3-Down
+        #   M=4096 sibling (tiles_m=16) stays on default — every
+        #   probed cell regressed by -0.11 .. -1.85 %, so the rule
+        #   gates on tiles_m=8 to exclude M=4096 cleanly.
+        #
+        # Qwen3-GateUP dA (tiles_n=16, k=3072) was probed too:
+        # default wins on B16-M2048 (-2.95 .. -0.79 %), B32-M4096
+        # (-0.78 .. ~0 %) — every alternative regressed. Default kept.
+        # No DSV3-GateUP dA carve-out needed: those shapes hit R8's
+        # tiles_n=16 + k=4096 rule already (verified by the dA-config
+        # audit in /tmp/probe_round_4_dA_configs.py).
+        #
+        # Rule scope audit:
+        #   * tiles_n == 8 ⇔ n == 2048. In the 24-shape MoE metric
+        #     this matches DSV3-Down dA RCR-T only (n=K_fwd=2048).
+        #     Forward DSV3-Down has tiles_n=28 (n=N_fwd=7168), forward
+        #     DSV3-GateUP has tiles_n=16 (n=N_fwd=4096) — neither
+        #     matches. Forward Qwen3 / gpt_oss N_fwd ∈ {2880, 3072,
+        #     4096, 5760} → tiles_n ∈ {11, 12, 16, 22} — none match.
+        #     dA-T DSV3-GateUP has tiles_n=16, dA-T Qwen3-Down has
+        #     tiles_n=6, dA-T Qwen3-GateUP has tiles_n=16, dA-T
+        #     gpt_oss has tiles_n=11 — none match.
+        #   * k == 7168 narrows further to DSV3-Down dA-T only (only
+        #     dA path with k=N_fwd=7168). Dense FP8 RCR k ∈
+        #     {4096, 12288, ...} per Llama configs — none match k=7168.
+        #   * tiles_n == 6 ⇔ n == 1536. In the 24-shape MoE metric
+        #     this matches Qwen3-Down dA RCR-T only (n=K_fwd=1536).
+        #     No forward shape has N_fwd=1536 (R29 audit confirmed
+        #     this — see comment block below at line ~2150). All
+        #     other dA-T shapes have different tiles_n.
+        #   * k == 4096 + tiles_m == 8 narrows to Qwen3-Down M=2048
+        #     dA-T only (m_per_group=2048 → tiles_m=8;
+        #     n=K_fwd=1536; k=N_fwd=4096).
+        #   * m_total is not None excludes dense FP8 callers
+        #     (``gemm_fp8_impl.py`` lines 251 / 260 pass
+        #     ``select_default_config(m, n, k, layout, "fp8")``
+        #     WITHOUT the ``m_total=`` kwarg → m_total defaults to
+        #     None → guard excludes them).
+        #   * m_total >= 32768 is the minimum grouped m_total in the
+        #     24-shape suite (B=16 M=2048 = 32768).
+        #   * Existing test_dod_smoke FP8 grouped fwd+bwd shapes
+        #     (_HIPKITTEN_GROUPED_FP8_FWDBWD_SHAPES): only
+        #     (4096, 4096, 7168) → fwd tiles_n=16, dA-T tiles_n=28
+        #     (k=4096); (4096, 7168, 2048) → fwd tiles_n=28, dA-T
+        #     tiles_n=8 + k=2048 — the second hits the new
+        #     ``tiles_n == 8`` rule but with k=2048 NOT 7168, so
+        #     excluded. No DoD shape matches either rule.
+        #
+        # Bit-equivalent output: ``group_m`` and ``num_xcds`` are pure
+        # persistent-grid scheduling knobs (same property documented
+        # in every (gm, xcds) rule in this file: R7 / R8 / R10 / R20
+        # / R23 / R27 / R30 / R31 / R32 / R39 / R42 / R43 / R44 / R45
+        # / R50 / R58 / R67 / R68 / R69 / R70). Verified bit-eq on
+        # 4 DSV3-Down + Qwen3-Down probe shapes at
+        # ``/tmp/probe_round_4_correctness.py``: max_abs_diff=0.0,
+        # bit_eq=True for every (default → (4, 4)) pair.
+        #
+        # Expected metric impact: dA backward is ~30 % of fwd+bwd
+        # wall on these shapes (post-R3 kernel breakdown probe
+        # ``/tmp/probe_round_4_overhead.py``: 578 / 1825 us ratio).
+        # Kernel +1.7..+5.0 % → wall +0.5..+1.5 % per shape. 6 of
+        # the 8 shapes below the 1.35 metric target fall in this
+        # carve-out (DSV3-Down B16/B32-M2048: ratio 1.344-1.378;
+        # DSV3-Down B16-M4096: 1.385; Qwen3-Down B16-M2048: 1.328,
+        # B32-M2048: 1.349). Estimated geomean lift on 24-shape
+        # suite: ~+0.005 (= +1.0 % avg × 6 / 24); above the metric's
+        # noise floor (~0.005 spread per single-run geomean across
+        # 5 runs at the unchanged HEAD).
+        if (
+            tiles_n == 8
+            and k == 7168
+            and m_total is not None
+            and m_total >= 32768
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=4,
+                num_xcds=4,
+                kernel=None,
+            )
+        if (
+            tiles_n == 6
+            and tiles_m == 8
+            and k == 4096
+            and m_total is not None
+            and m_total >= 32768
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=4,
+                num_xcds=4,
+                kernel=None,
+            )
+        # Round-7 (current Primus run; 2026-05-05). Sibling of R4 above
+        # for the M_per_group=4096 (tiles_m=16) Qwen3-Down dA family.
+        # R4 covered tiles_m=8 (M=2048) only — the tiles_m=16 family
+        # was falling to the binding default ``(gm=4, xcds=None=kernel
+        # 8)``. Same H4-reroute follow-up class as R6 (Qwen3-GateUP
+        # M=4096 dA): a rule the predecessor configurator didn't reach
+        # because the dispatch path for these dA calls only became RCR
+        # after current Primus run R3 (perf 3ed7a402, 2026-05-04)
+        # extended the H4 reroute to all aligned ``trans_b=False``
+        # callers. Pre-R3, Qwen3-Down dA went through the FP8 RRR
+        # kernel (caught by R42 narrow-N rule at config.py:2657);
+        # post-R3, the RRR rule is dead code for the metric and the
+        # RCR dispatch needs its own per-tile-geometry tuning.
+        #
+        # Round-7 probe (200-iter × 7-trial × p20 × 3 seeds at
+        # /tmp/probe_round_7_qwen_down_dA_rcr.py, results archived in
+        # commit message). Direct call of grouped_rcr_dscale with
+        # post-H4 inputs: a=[B*M, k=N_fwd=4096] (grad_out), b=[B,
+        # n=K_fwd=1536, k=N_fwd=4096] (b_T after H4). Cross-shape
+        # mean Δ vs default (gm=4, xcds=None=kernel 8) on the 2 GAP
+        # shapes (tiles_m=16):
+        #
+        #   cell        B16-M4096       B32-M4096       avg
+        #   (4, 8) def  +0.00%          +0.00%          +0.00%
+        #   (4, 4) R4   +0.51% mixed*   +1.05%          +0.78%
+        #   (8, 4) NEW  +0.77% all-pos  +1.01% all-pos  +0.89%
+        #   (2, 4)      +0.10%          +1.06%          +0.58%
+        #   (1, 4)      +0.35%          +0.25%          +0.30%
+        #   (16, 4)     +0.38%          +0.65%          +0.51%
+        #   (2, 8)      -4.56%          -2.54%          -3.55%
+        #   (1, 8)      -9.21%          -6.67%          -7.94%
+        #
+        #   * (4, 4) per-seed on B16-M4096: -0.23% / +0.78% / +0.99%
+        #     (one negative seed-42 outlier; spread 1.22pp across seeds).
+        #     (8, 4) per-seed on B16-M4096: +0.46% / +1.04% / +0.80%
+        #     (all-positive, 0.58pp spread = 2× tighter than (4, 4)).
+        #
+        # ``(gm=8, xcds=4)`` is the **all-positive per-seed** winner on
+        # both M=4096 shapes:
+        #   B16-M4096 per-seed: +0.46% / +1.04% / +0.80% (mean +0.77%)
+        #   B32-M4096 per-seed: +1.16% / +1.00% / +0.87% (mean +1.01%)
+        # Both seed-min beat default-max in 3/3 seeds. Spread 0.58pp /
+        # 0.29pp = clean signal beyond the 0.5pp run-to-run noise floor.
+        # The xcds=4 column dominates xcds={8,16} (xcds=8 -3..-9% across
+        # both shapes, xcds=16 -3..-5%), confirming the binding default
+        # 8-XCD partition is over-distributing this small persistent
+        # grid (tiles_n=6 × tiles_m=16 × B = 96-192 N×M tiles per group
+        # × B groups). xcds=4 collapses the schedule into 4 of 8 XCDs
+        # per chiplet pair, avoiding cross-chiplet L2 invalidation.
+        #
+        # Why gm=8 for tiles_m=16 vs gm=4 in R4 for tiles_m=8: M=4096
+        # has 16 M-tiles per group (vs 8 in M=2048). gm=8 batches half
+        # the per-group M-tiles together, letting the persistent loop
+        # walk all 6 N-tiles inside one batch step before iterating M.
+        # gm=4 (R4's M=2048 cell) divides 8 M-tiles into 2 groups, but
+        # for 16 M-tiles it would require 4 batch steps per group → less
+        # B-pack L2 reuse. The (8, 4) cell is geometrically right for
+        # the larger per-group M-tile count.
+        #
+        # Sibling shape sanity (rule MUST add `tiles_m == 16` clause):
+        #   - Qwen3-Down dA M=2048 (tiles_m=8): R4 above catches FIRST.
+        #     My probe confirms (8, 4) is sub-optimal there: +1.13% B16
+        #     / +2.65% B32 vs R4's +2.27% / +5.03%. Must NOT extend.
+        #   - Qwen3-Down fwd (n=N_fwd=4096, tiles_n=16): excluded by
+        #     tiles_n==6 clause.
+        #   - DSV3-Down dA after H4 (tiles_n=8): excluded by tiles_n==6.
+        #   - Qwen3-GateUP dA after H4 (tiles_n=16): excluded.
+        #   - DSV3-GateUP dA after H4 (tiles_n=28): excluded.
+        #   - gpt_oss dA after H4 (tiles_n=11): excluded.
+        #   - Dense FP8 (m_total=None): excluded by m_total guard.
+        #   - DoD smoke grouped FP8 fwdbwd shapes (tiles_n in {8, 28}):
+        #     excluded.
+        # The k==4096 clause keeps the rule uniquely tied to Qwen3-Down
+        # dA after H4 reroute (k=N_fwd=4096 unique to this path among
+        # tiles_n=6 shapes in the 24-shape MoE suite).
+        #
+        # Bit-equivalent output: (gm, xcds) are pure persistent-grid
+        # tile-scheduling knobs (same property documented for R4 above
+        # and R6 sibling rule at line 2872 of this file). xcds=4 is
+        # explicit (not None) — kernel BLOCK_SWIZZLE_NUM_XCDS uses the
+        # arg directly, no fallback path involved.
+        #
+        # Expected metric impact: dA is ~30% of bwd wall on Qwen3-Down
+        # M=4096 (per R4's R3-era kernel breakdown probe), bwd is ~70%
+        # of total → dA ≈ 21% of total wall. +0.8-1.0% kernel → +0.17..
+        # +0.21% wall on each affected shape. Geomean (24 shapes) ~+0.0002.
+        # Score is capped at 1000 already, so the gain is buffer rather
+        # than headline; preserves robustness against future H4-reroute
+        # adjustments.
+        if (
+            tiles_n == 6
+            and tiles_m == 16
+            and k == 4096
+            and m_total is not None
+            and m_total >= 32768
+        ):
+            return HipKittenConfig(
+                layout=layout,
+                group_m=8,
+                num_xcds=4,
+                kernel=None,
+            )
         if tiles_m == 16 and 64 <= tiles_n <= 96 and k <= 4096:
             # Round-16 rule. Long-N shallow-K FP8 dense RCR. Anchor:
             # ``(4096, 22016, 4096)`` (tiles_m=16, tiles_n=86, k=4096),
@@ -2638,14 +2993,95 @@ def select_default_config(
         # contribution). At noise floor (~5 score points per single
         # run); A/B should still show modest median lift over the
         # plateau band.
+        # Round-6 (current Primus run; 2026-05-05). The R27/R32 rule
+        # above was tuned on the FP8 RRR dA backward kernel (PRE the
+        # current run's R3 H4 reroute extension). Current Primus run
+        # R3 (perf 3ed7a402, 2026-05-04) extended the ``not trans_b``
+        # H4 reroute to ALL aligned RRR dA calls — so the dA dispatch
+        # now flows through the FP8 RCR kernel (with b transposed to
+        # FP8 first via _FP8_H4_TRANSPOSE_CACHE), not the RRR kernel
+        # that R27/R32 measured. The (gm=1, xcds=4) cell that R27/R32
+        # picked was a RRR-kernel optimum; on the RCR kernel it is
+        # net neutral or sub-noise loss across the 4 Qwen3-GateUP dA
+        # shapes (B16/B32 × M2048/M4096).
+        #
+        # Round-6 re-probe (200-iter × 7-trial × p20 × 3 seeds at
+        # /tmp/probe_round_6_qwen_gateup_dA_rcr.py, results archived
+        # in commit message) calls grouped_rcr_dscale directly with
+        # the post-H4 kernel inputs: a=[B*M, N_fwd=3072] (grad_out
+        # in dA semantics), b=[B, K_fwd=4096, N_fwd=3072] (b_T after
+        # H4). Cross-shape mean Δ vs default (gm=4, xcds=None=kernel 8):
+        #
+        #   cell             B16-M2048  B16-M4096  B32-M2048  B32-M4096
+        #   (1, 4) R32       -0.18%     +0.08%     -0.87%     +0.04%
+        #   (2, 8) NEW       -2.32%     +1.52%     -2.33%     +1.69%
+        #   (16, 4)          -0.61%     -0.87%     -0.88%     -0.96%
+        #   (32, 4)          -0.76%     -0.75%     -0.64%     -0.95%
+        #   (8, 4)           -1.25%     -0.29%     -1.30%     -0.40%
+        #
+        # ``(gm=2, xcds=8)`` wins both M=4096 shapes by +1.5..+1.7% over
+        # the binding default. Per-seed deltas all-positive on both
+        # M=4096 shapes (B16: +1.45%/+1.49%/+1.61%; B32: +1.70%/+1.63%/
+        # +1.73%), well above the 0.5pp run-to-run spread. M=2048
+        # shapes regress -2.3% on (gm=2, xcds=8), so the rule MUST
+        # gate on tiles_m == 16. (16, 4) regresses uniformly across
+        # all 4 shapes (-0.6 to -1.0%) — confirms RCR optimum is
+        # genuinely different from R8's (16, 4) DSV3-GateUP M=2048
+        # fwd RCR optimum (similar grid geometry but k=7168 vs k=3072
+        # flips the per-tile compute / load balance).
+        #
+        # The R32 rule's residual tiles_m=8 coverage (only B16-M2048
+        # in the metric) is dropped: probe shows (1, 4) is -0.18% vs
+        # default on this shape (sub-noise tied; default takes over,
+        # for a hairline +0.18% gain).
+        #
+        # Sibling shape sanity (rule MUST add k==3072 clause):
+        #   - DSV3-GateUP fwd M=4096 (tiles_n=16, tiles_m=16, k=7168,
+        #     m_total ∈ {65536, 131072}): R8 rule at line 2205 catches
+        #     FIRST (k==7168 specific). My new rule's k==3072 clause
+        #     would NOT match anyway — defensive belt-and-suspenders.
+        #   - Qwen3-Down fwd M=4096 (tiles_n=16, tiles_m=16, k=1536,
+        #     m_total ∈ {65536, 131072}): R6 BF16-side rule at line
+        #     1886 (FP8 sibling) catches FIRST (k==1536 specific).
+        #   - Qwen3-GateUP fwd (n=N_fwd=3072, tiles_n=12): excluded
+        #     by tiles_n==16 clause.
+        #   - DSV3-GateUP dA after H4 (n=K_fwd=7168, tiles_n=28):
+        #     excluded by tiles_n==16.
+        #   - Dense FP8 (caller passes m_total=None): excluded by
+        #     m_total is not None guard.
+        #   - DoD smoke grouped FP8 fwdbwd shapes
+        #     (_HIPKITTEN_GROUPED_FP8_FWDBWD_SHAPES per R32 audit
+        #     above): only (4096,4096,7168) [tiles_n=28] and
+        #     (4096,7168,2048) [tiles_n=8] — neither matches.
+        # The k==3072 clause keeps the rule uniquely tied to Qwen3-
+        # GateUP dA after H4 reroute (k=N_fwd=3072 is unique to this
+        # path in the 24-shape MoE suite).
+        #
+        # Bit-equivalent output: (gm, xcds) are pure persistent-grid
+        # tile-scheduling knobs (same property documented for R27/R32
+        # above and R6 sibling Qwen3-Down fwd rule at line 1886).
+        # xcds=None (config) → xcds_arg=0 → kernel BLOCK_SWIZZLE_NUM_
+        # XCDS=8 default ≡ explicit xcds=8 verified at
+        # /tmp/probe_round_6_xcds_equiv.py: max_abs_diff=0.0 on both
+        # M=4096 shapes; perf within 0.2-0.7% (kernel default 8).
+        #
+        # Expected metric impact: dA is ~33% of bwd wall, bwd is ~70%
+        # of total → dA ≈ 23% of total wall on these shapes. +1.5-1.7%
+        # kernel → +0.34..+0.39% wall on each affected shape. Current
+        # ratios (B16-M4096 = 1.363, B32-M4096 = 1.452) lift to
+        # ~(1.367, 1.457). Geomean (24 shapes): 1.3829 → 1.3833 (+0.0004).
+        # Score is capped at 1000 already, so the gain is buffer rather
+        # than headline — preserves robustness against future quantize-
+        # cache / H4-reroute regressions.
         if (
             tiles_n == 16
+            and tiles_m == 16
+            and k == 3072
             and m_total is not None
             and m_total >= 32768
-            and not (tiles_m == 8 and m_total >= 65536)
         ):
             return HipKittenConfig(
-                layout=layout, group_m=1, num_xcds=4, kernel=None
+                layout=layout, group_m=2, num_xcds=None, kernel=None
             )
         # Round-43 / Round-44: FP8 RRR dA backward wide-N rule.
         # R42 only covered narrow-N (tiles_n ≤ 8 — DSV3-Down, Qwen3-Down).

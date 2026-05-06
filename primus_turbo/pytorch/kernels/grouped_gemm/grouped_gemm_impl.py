@@ -296,13 +296,38 @@ class GroupedGEMMHipKittenBackend(KernelBackend):
         # saves ~24 % wall ratio. The kernel is shared with the FP8 H4
         # path (same ``_fp8_transpose_3d_kernel`` template, just BF16
         # pointers instead of byte-cast uint8) so no kernel duplication.
-        K_BLOCK = 64        # BF16 main-kernel K_BLOCK
+        # Round-80 (BF16 weighted-wall): the HK kernel's RRR path now
+        # supports ``bpc = ceil_div(g.n, BLOCK_SIZE)`` + masked C-store
+        # for the partial last col-tile (paired commit on HipKittens
+        # side). MFMA lane→cell mapping confines OOB-lane garbage to
+        # OOB-output lanes only; the existing ``store_c_tile_n_masked``
+        # path drops them. With this in place, the H4 reroute is no
+        # longer needed for shapes where ``N_RRR % BLOCK_SIZE != 0`` AS
+        # LONG AS ``K_RRR % K_TWO_TILE == 0`` (= no K-tail). For shapes
+        # with K_RRR % K_TWO_TILE != 0 (gpt_oss-Down dA), keep H4
+        # reroute: HK's K-tail RMW kernel introduces an extra bf16
+        # round-trip (load existing C, add K-tail acc in fp32, store
+        # bf16) that exceeds ``check_allclose`` tolerance vs Triton
+        # for the metric's downsized correctness gate (verified via
+        # ``/tmp/r80_native_rrr_correctness.py``: GateUP all PASS,
+        # Down all FAIL on dA-allclose due to ~2x mean_abs vs RCR-fuse).
+        # The fuse path (no round-trip) is RCR-only at this stage of
+        # the kernel, so K-tail-inducing shapes still take H4-RCR.
+        K_TWO_TILE = 128    # HK BF16 K-tail boundary (= 2 * K_STEP=64)
         BLOCK_SIZE = 256    # BF16 main-kernel N BLOCK_SIZE
-        if not trans_b and ((a.shape[1] % K_BLOCK) != 0
-                            or (b.shape[-1] % BLOCK_SIZE) != 0):
+        if not trans_b and (a.shape[1] % K_TWO_TILE) != 0:
+            # K_RRR has a K-tail (K%128 != 0) — native RRR's K-tail RMW
+            # introduces bf16 round-trip noise that fails check_allclose.
+            # Fall back to H4 reroute → RCR fuse, which keeps the K-tail
+            # in fp32 within a single kernel (no round-trip).
             b = bf16_transpose_3d(b) if b.is_contiguous() \
                 else b.transpose(-2, -1).contiguous()
             trans_b = True
+        # NOTE: shapes where K_RRR is K_TWO_TILE-aligned but N_RRR is
+        # not (e.g. gpt_oss-GateUP with N_RRR=2880, K_RRR=5760) NOW
+        # take the native RRR path. Saves the H4 transpose call
+        # (~50-786 µs depending on shape; R30/R31 wall-decomp).
+        # gpt_oss-Down stays on H4 (K_RRR=2880 has K%128=64).
         # Round-11 host-overhead trim (mirror of FP8 backend trim in
         # grouped_gemm_fp8_impl.py): ``_avg_group_m`` and
         # ``hipkitten.grouped_run`` inlined into the body. Both removed
