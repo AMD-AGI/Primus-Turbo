@@ -71,22 +71,16 @@ permute_preprocessing(torch::Tensor routing_map,
     auto tokens_per_expert = at::empty({num_of_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
 
-    int rows_workspace_1 =
-        static_cast<int>((max_num_dispatched_tokens + block_size - 1) / block_size);
-    int rows_workspace_2 = (rows_workspace_1 + block_size - 1) / block_size;
-
-    auto workspace1 = at::empty({rows_workspace_1, num_of_local_experts}, int_opts);
-    auto workspace2 = at::empty({rows_workspace_2, num_of_local_experts}, int_opts);
-
     auto stream = at::cuda::getCurrentCUDAStream();
 
+    // The launcher manages its own per-stream lookback scratch + epoch
+    // tagging internally; callers no longer pass workspace tensors.
     permute_preprocessing_launch(
         reinterpret_cast<bool *>(routing_map.data_ptr()),
         num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_of_local_experts),
-        workspace1.data_ptr<int>(), rows_workspace_1, workspace2.data_ptr<int>(), rows_workspace_2,
-        static_cast<int>(pad_multiple), tokens_per_expert.data_ptr<int>(),
-        row_id_map.data_ptr<int>(), overflow_flag.data_ptr<int>(),
-        static_cast<int64_t>(num_permuted_tokens), stream);
+        static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),
+        tokens_per_expert.data_ptr<int>(), row_id_map.data_ptr<int>(),
+        overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens), stream);
 
     return std::make_tuple(row_id_map, tokens_per_expert, overflow_flag);
 }

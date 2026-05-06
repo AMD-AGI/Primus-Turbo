@@ -4,10 +4,10 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Friendly Python API for the v1 MoE permute / unpermute kernels (HIP).
+"""Friendly Python API for the MoE permute / unpermute HIP kernels.
 
 These wrap the raw ``torch.ops.primus_turbo_cpp_extension.*`` ops that live
-in ``csrc/kernels/permute/permute_v1.cu`` + ``csrc/pytorch/permute/permute.cpp``.
+in ``csrc/kernels/permute/permute.cu`` + ``csrc/pytorch/permute/permute.cpp``.
 The goal is to keep the C++ ABI stable (flat, IValue-friendly arguments) while
 giving Python callers a small, opinionated surface.
 """
@@ -19,16 +19,16 @@ from typing import Optional, Tuple
 import torch
 
 __all__ = [
-    "permute_preprocessing_v1",
-    "permute_v1",
-    "unpermute_v1",
+    "permute_preprocessing",
+    "permute",
+    "unpermute",
 ]
 
 
 _OPS = torch.ops.primus_turbo_cpp_extension
 
 
-def permute_preprocessing_v1(
+def permute_preprocessing(
     routing_map: torch.Tensor,                 # bool [num_dispatched, num_local_experts]
     num_dispatched_token_tensor: torch.Tensor, # int32 scalar (device)
     max_num_dispatched_tokens: int,
@@ -50,7 +50,7 @@ def permute_preprocessing_v1(
     )
 
 
-def permute_v1(
+def permute(
     tokens: torch.Tensor,                       # [num_dispatched, hidden]
     output_tokens: torch.Tensor,                # [num_permuted, hidden] (preallocated)
     row_id_map: torch.Tensor,                   # int32 [num_dispatched + pad, num_local_experts]
@@ -103,7 +103,7 @@ def permute_v1(
     return output_tokens
 
 
-def unpermute_v1(
+def unpermute(
     permuted_tokens: torch.Tensor,                # [num_permuted, hidden]   (bf16)
     output_tokens: torch.Tensor,                  # [num_dispatched, hidden] (bf16, preallocated)
     row_id_map: torch.Tensor,                     # int32 [num_dispatched + pad, num_local_experts]
