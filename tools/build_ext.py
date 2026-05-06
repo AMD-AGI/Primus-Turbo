@@ -81,8 +81,6 @@ class BuildExtension(build_ext):
 
     def finalize_options(self) -> None:
         super().finalize_options()
-        if self.use_ninja:
-            self.force = True
 
     def build_extensions(self) -> None:
 
@@ -562,6 +560,7 @@ class TurboBuildExt(BaseBuildExtension):
 
     def finalize_options(self):
         super().finalize_options()
+        self.force = False
         if self.inplace:
             self.build_temp = str(self.PROJECT_ROOT / "build" / "temp")
             self.build_lib = str(self.PROJECT_ROOT / "build" / "lib")
