@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
-import torch.utils.benchmark as benchmark
 from config import (
     BATCH_SIZE_LIST,
     GROUPED_GEMM_EP_SIZE_LIST,
@@ -225,12 +225,42 @@ class BackendResult:
 
 
 def _bench_callable(fn: Callable[[], None], *, warmup: int, iters: int) -> float:
-    """Return the average wall-clock time for ``fn`` in milliseconds."""
+    """Return the average wall-clock time for ``fn`` in milliseconds.
+
+    Modeled on ``benchmark/ops/deep_ep/utils.py::bench``: record each
+    ``fn()`` call inside its own ``(start, end)`` ``cuda.Event`` pair,
+    drop the first measurement as extra warmup margin, and **flush L2
+    before every timed iteration** by zeroing a 256 MB scratch tensor.
+
+    The L2 flush is the load-bearing piece for memory-bound permute /
+    unpermute kernels: without it, the previous iteration leaves the
+    ~33 K * H * 2 byte input/output footprint warm in cache, which biases
+    the next ``fn()`` toward an artificially high bandwidth that is not
+    representative of the steady-state production stream where each
+    permute step sees freshly-arrived dispatch tokens.
+    """
+    torch.cuda.synchronize()
+
+    # Flush cache
+    cache = torch.empty(int(1e7 // 4), dtype=torch.int, device="cuda")
+
     for _ in range(warmup):
         fn()
+
+    n = max(iters, 1) + 1  # +1 so we can drop the first sample
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+
+    for i in range(n):
+        cache.zero_()  # flush L2 before each timed iteration
+        start_events[i].record()
+        fn()
+        end_events[i].record()
     torch.cuda.synchronize()
-    t = benchmark.Timer(stmt="fn()", globals={"fn": fn})
-    return t.timeit(iters).mean * 1e3
+
+    times_ms = np.array([s.elapsed_time(e) for s, e in zip(start_events, end_events)])
+    # Drop the first measurement to avoid any residual warmup spike.
+    return float(times_ms[1:].mean())
 
 
 def _check_close(name: str, ref: torch.Tensor, got: torch.Tensor) -> bool:
