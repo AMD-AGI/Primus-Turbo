@@ -1578,6 +1578,103 @@ def select_default_config(
         # (tiles_n=22, tiles_m=16) hits the round-69 GateUP rule
         # earlier in the function. No metric shape regression
         # expected.
+        #
+        # Round-2 (current Primus run, gpt_oss FP8 kernel-only ceiling
+        # task; 2026-05-07) re-tune. The R12 1500-iter × 7-repeat tight
+        # verify chose (gm=32, xcd=4) over the default (gm=4, xcd=4) by
+        # +1.19pp on a kernel build that has since been replaced; today's
+        # FP8 binding shows the optimum has shifted to (gm=1, xcds=4) —
+        # same kernel-rebuild drift documented for R30/R31/R32/R45/R50
+        # and the R7 sibling re-tune in this file.
+        #
+        # Tight verify (200-iter × 5-trial p20 × 3 seeds × kernel-only
+        # direct call to ``grouped_rcr_dscale``,
+        # /tmp/_probe_round_2_down_b4_m4096.py + /tmp/_probe_round_2_dgrad_verify.py
+        # archived alongside):
+        #
+        #   shape: gpt_oss-Down-B4-M4096 fwd RCR (m_total=16384)
+        #     cell      seed42   seed137  seed2024 med    spread  Δ vs (32,4)
+        #     (1, 4)    2004.9   2003.1   2003.8   2003.8  1.8T   +1.12%  WIN
+        #     (16, 4)   1985.0   1982.1   1984.4   1984.4  2.9T   +0.15%
+        #     (32, 4)R12 1978.6  1981.5   1986.8   1981.5  8.1T   baseline
+        #     (8, 4)    1981.5   1981.5   1981.5   1981.5  0.0T   +0.00%
+        #     (4, 4)    1970.1   1965.5   1970.6   1970.1  5.1T   -0.58%
+        #
+        #   shape: gpt_oss-Down-B4-M4096 dgrad RCR (post-H4, m_total=16384)
+        #     cell      seed42   seed137  seed2024 med    spread  Δ vs (32,4)
+        #     (1, 4)    1962.6   1963.8   1965.5   1963.8  2.9T   +0.95%  WIN
+        #     (16, 4)   1948.0   1948.0   1944.7   1948.0  3.3T   +0.14%
+        #     (8, 4)    1945.8   1947.5   1944.7   1945.8  2.8T   +0.03%
+        #     (32, 4)R12 1945.2  1946.9   1942.5   1945.2  4.5T   baseline
+        #
+        # (gm=1, xcds=4) is the unique top with the tightest spread on
+        # both directions. fwd: +1.12% gain at 1.8T spread → med/spread =
+        # 12.4× (well above the standard "median > spread" robust-signal
+        # threshold). dgrad: +0.95% at 2.9T spread → med/spread = 6.4×.
+        # Per-seed positive on both directions (3/3 fwd, 3/3 dgrad).
+        # winner-min beats baseline-max in 3/3 seeds for fwd; 3/3 for
+        # dgrad. The (gm=32, xcds=4) baseline's fwd spread is 8.1T (4×
+        # the candidate's) — the metric occasionally lands on the slow
+        # tail of the (32, 4) distribution which appears as variance in
+        # the section avg.
+        #
+        # Why (gm=1) wins now where R12 found (gm=32):
+        # B4 M4096 ⇒ tiles_m=16 (16 M-tiles per group) × 4 groups =
+        # 64 M-tile-slots × tiles_n=11 N-tiles = 704 tile-steps over
+        # NUM_CUS=256 persistent slots ≈ 2.75 wave-steps per slot. With
+        # the smaller wave-step count, gm=32 over-batches (2× the
+        # M-tiles-per-group = 32/16 means each batch straddles 2 groups,
+        # forcing a group-boundary stall). gm=1 lets each persistent
+        # slot walk the full 11-row N-axis under one M-tile before
+        # advancing M, maximising B-pack L2 reuse on the deep K=2880
+        # main loop (45 K-tile-loads per pass). Matches the R8 (gm=1
+        # for tiles_m=16 GateUP M4096 dA RCR at k=5760) and the R10
+        # (gm=1 for Qwen3-GateUP B32-M4096 RCR) "small grid + deep K
+        # benefits from gm=1's N-first traversal" pattern, just landed
+        # at this specific (tiles_m=16, k=2880, n=2880) cell after the
+        # post-R12 kernel rebuild shifted the M-batching trade-off back
+        # toward the gm=1 corner.
+        #
+        # Bit-equivalent output: group_m / num_xcds are pure persistent-
+        # grid scheduling knobs on the FP8 grouped RCR kernel (same
+        # property documented for every (gm, xcds) RCR rule in this
+        # file). The /tmp/_probe_round_2_down_b4_m2048_tight.py bit-eq
+        # check on the sibling shape verified max_abs_diff=0.0 between
+        # baseline and candidate cells; same property holds here as
+        # the kernel logic is identical (only the dispatch inputs vary
+        # by m_total).
+        #
+        # dgrad direction sanity: the same (tiles_m=16, tiles_n=11,
+        # k=2880, m_total=16384) dispatcher key fires for dgrad after
+        # the R3/R18 H4 reroute (grouped_gemm_fp8_impl.py:421-503
+        # transposes b for trans_b=False callers). The probe above
+        # confirms the (gm=1, xcds=4) cell wins in dgrad direction
+        # too (+0.95%, 3/3 seeds, 6.4× med/spread) — this rule update
+        # lifts both fwd AND dgrad sections of gpt_oss-Down-B4-M4096
+        # in a single rule edit. Same R3 "single rule, two sections"
+        # leverage pattern as the R7→R2 sibling update above.
+        #
+        # Sibling regression check (probe data + dispatcher trace):
+        #   - gpt_oss-GateUP B4-M4096 (tiles_n=22): excluded by
+        #     tiles_n==11; on the (gm=14, xcds=4) Round-7→10dm rule.
+        #   - gpt_oss-Down B4-M2048 (m_total=8192): excluded by
+        #     m_total==16384; on the R7-updated-to-R2 (gm=16, xcds=2).
+        #   - gpt_oss-Down B32-M2048 (m_total=65536): excluded by
+        #     m_total==16384; on R8.
+        #   - gpt_oss-Down B32-M4096 (m_total=131072): excluded by
+        #     m_total==16384; on R50.
+        #   - DSV3/Qwen3 (k != 2880): excluded by k==2880.
+        #   - DoD smoke FP8 grouped fwdbwd shapes: per R32 audit none
+        #     match (tiles_n=16/28, k=7168/2048, none yields
+        #     tiles_n==11 + k==2880 + m_total==16384 + tiles_m==16).
+        #   - Dense FP8 (m_total=None): excluded by m_total guard.
+        # Rule remains uniquely tied to gpt_oss-Down-B4-M4096 fwd+dgrad
+        # in the 24-shape MoE suite + DoD universe.
+        #
+        # Expected metric impact: +1.12% on fwd (1778 → ~1798 T) and
+        # +0.95% on dgrad (1785 → ~1802 T). Section avg lift: fwd 1845
+        # → ~1847 T; dgrad 2012 → ~2014 T. Combined Δscore ≈ +0.5..+1.0
+        # points at the noise floor — small but robust.
         if (
             tiles_n == 11
             and tiles_m == 16
@@ -1587,7 +1684,7 @@ def select_default_config(
         ):
             return HipKittenConfig(
                 layout=layout,
-                group_m=32,
+                group_m=1,
                 num_xcds=4,
                 kernel=None,
             )
@@ -1773,14 +1870,118 @@ def select_default_config(
             # See analysis/_notes/round-13-config-tuning-saturation.md
             # for the full analysis (B=4 metric/verify divergence).
             #
+            # Round-2 (current Primus run, gpt_oss FP8 kernel-only ceiling
+            # task; 2026-05-07) re-tune. R7's tight verify chose (gm=2,
+            # xcds=2) over (4, 8) by +0.48pp on a kernel build that has
+            # since been replaced. The current FP8 binding shows the
+            # optimum has shifted toward LARGE gm with xcds=2 — same kind
+            # of kernel-rebuild drift documented for R30/R31/R32/R45/R50
+            # elsewhere in this file. Tight verify (200-iter × 7-trial
+            # p20 × 3 seeds × kernel-only direct call to
+            # ``grouped_rcr_dscale``, /tmp/_probe_round_2_down_b4_m2048_tight.py
+            # archived alongside):
+            #
+            #   shape: gpt_oss-Down-B4-M2048 fwd RCR  (m_total=8192)
+            #     cell      seed42   seed137  seed2024 med    spread  Δ vs (2,2)
+            #     (32, 2)   1501.9   1501.3   1501.9   1501.9  0.7T   +1.41%  WIN
+            #     (16, 2)   1500.6   1501.3   1501.3   1501.3  0.7T   +1.37%  WIN
+            #     (2, 2)R7  1484.2   1478.4   1481.0   1481.0  5.8T   baseline
+            #     (4, 8)    1480.3   1479.0   1479.0   1479.0  1.3T   -0.13%
+            #     (16, 4)   1406.2   1402.7   1404.4   1404.4  3.5T   -5.17%
+            #
+            #   shape: gpt_oss-Down-B4-M2048 dgrad RCR (post-H4 reroute,
+            #     m_total=8192 — same dispatcher key as fwd)
+            #     cell      seed42   seed137  seed2024 med    spread  Δ vs (2,2)
+            #     (16, 2)   1508.6   1507.9   1509.3   1508.6  1.3T   +1.47%  WIN
+            #     (32, 2)   1508.6   1507.3   1509.3   1508.6  2.0T   +1.47%  WIN
+            #     (4, 8)    1486.2   1488.1   1490.7   1488.1  4.5T   +0.09%
+            #     (2, 2)R7  1483.6   1486.8   1490.7   1486.8  7.2T   baseline
+            #     (16, 4)   1402.7   1405.0   1407.4   1405.0  4.6T   -5.50%
+            #
+            # (16, 2) and (32, 2) are statistically tied (≤1T med gap in
+            # both directions); (16, 2) has the tightest spread (0.7T fwd /
+            # 1.3T dgrad → 0.7..1.3pp vs the +1.4% gain). med/spread = 14×
+            # (fwd) and 11× (dgrad) — well above the standard "median >
+            # spread" robust-signal threshold used by R7/R10/R11/R23/R29/
+            # R30/R31/R32/R33/R35/R39/R45/R6-current/R8-current. Per-seed
+            # WIN every seed (3/3 fwd, 3/3 dgrad). Picking (16, 2) over
+            # (32, 2) as the slightly tighter-spread cell (and the smaller
+            # gm = lower L2 footprint per pass, defensive against further
+            # kernel rebuilds).
+            #
+            # The dgrad path uses the same dispatcher key (tiles_m=8,
+            # tiles_n=11, k=2880, m_total=8192) AFTER the R3/R18 H4
+            # reroute (grouped_gemm_fp8_impl.py:421-503 transposes b for
+            # all trans_b=False callers since the R9 transpose cache made
+            # the reroute unconditional cheap). So the rule update lifts
+            # both fwd AND dgrad sections of gpt_oss-Down-B4-M2048
+            # simultaneously — the cleanest "single rule, two sections"
+            # win in the FP8 kernel-only track since R3.
+            #
+            # Why (gm=16) wins now where R7 found (gm=2):
+            # B4 M2048 ⇒ tiles_m=8 (8 M-tiles per group) × 4 groups =
+            # 32 M-tile-slots, × tiles_n=11 N-tiles = 352 tile-steps over
+            # NUM_CUS=256 persistent slots ≈ 1.4 wave-steps per slot. With
+            # only 1.4 wave-steps the kernel is grid-light: gm=2's
+            # M-batching cycles 2 M-tiles per pass which under-fills the
+            # persistent traversal (each slot completes its 1.4 wave-step
+            # share in ~5 K-pass roundtrips with gm=2's narrow A-pack).
+            # gm=16 batches 16 M-tiles per pass — overshoot of the 32
+            # available M-tile-slots (16/8=2 batches per group × 4 groups
+            # = 8 passes) — but with xcds=2 confining the schedule to a
+            # single chiplet-pair (4 of 8 XCDs on MI355X), each batch
+            # group completes inside the L2 of one chiplet pair without
+            # cross-chiplet B-pack invalidation. The deeper batching
+            # extracts more A-pack L2 reuse per pass than the small grid
+            # has wave-step amortisation to need from gm=2's narrower
+            # batching. Same R23 (gm=1 for tiles_m=8 GateUP B4-M2048 fwd)
+            # / R8 (gm=1 for tiles_m=16 GateUP M4096 dA RCR) "small grid
+            # benefits from large (or extreme small) gm + xcds=2 chiplet
+            # localisation" pattern, just landed at gm=16 instead of gm=1
+            # for this specific (tiles_m=8, k=2880, n=2880) cell.
+            #
+            # Bit-equivalent output verified at /tmp/_probe_round_2_down_b4_m2048_tight.py:
+            # max_abs_diff=0.0 between (gm=2, xcds=2) and (gm=16, xcds=2)
+            # (and (gm=32, xcds=2)) on Down-B4-M2048 fwd — bit_eq=True.
+            # group_m / num_xcds are pure persistent-grid scheduling knobs
+            # on the FP8 grouped RCR kernel (same property documented for
+            # every (gm, xcds) RCR rule in this file). dgrad direction
+            # inherits bit-equivalence because the kernel call is
+            # identical (just different input data); FP8 rounding is
+            # data-only so SNR vs torch ref unchanged.
+            #
             # Rule scope check: ``tiles_n == 11`` (n=2880) + ``tiles_m == 8``
             # (m_per_group=2048) + ``m_total == 8192`` matches only B=4
             # M_per_group=2048 in the metric. The B=4 M=4096 case (the
             # round-69 rule above) has m_total=16384; B=8 M=2048 (no
             # metric shape) would also have m_total=16384.
+            #
+            # Sibling regression check (probe data + dispatcher trace):
+            #   - gpt_oss-GateUP B4-M2048 fwd (tiles_n=22): excluded by
+            #     tiles_n==11 (separate R23 rule fires).
+            #   - gpt_oss-Down B4-M4096 (m_total=16384): excluded by
+            #     m_total==8192 (R12 rule fires there; updated in same
+            #     R2 commit).
+            #   - gpt_oss-Down B32-M2048 (m_total=65536): excluded by
+            #     m_total==8192 (R8 rule fires).
+            #   - DSV3/Qwen3 (k != 2880): all excluded by k==2880.
+            #   - DoD smoke FP8 grouped fwdbwd: (4096,4096,7168) has
+            #     tiles_n=16, k=7168 → excluded; (4096,7168,2048) has
+            #     tiles_n=28, k=2048 → excluded. Dense FP8 callers pass
+            #     m_total=None → excluded.
+            # Rule remains uniquely tied to gpt_oss-Down-B4-M2048 fwd+dgrad
+            # in the 24-shape MoE suite + DoD universe.
+            #
+            # Expected metric impact (scripts/_metric_gpt_oss_fp8_kernel.py):
+            # +1.41% kernel on fwd shape (1345 T metric → ~1364 T) and
+            # +1.47% on dgrad (1308 T → ~1327 T). Section avg lift:
+            # fwd 1845 → ~1847 T (Δsection_progress ≈ +0.0007); dgrad
+            # 2012 → ~2015 T (Δ ≈ +0.0008). Combined Δscore ≈ +0.5..+1.0
+            # points at the noise floor band — small but the per-cell
+            # win is robust (med/spread > 11×, every-seed-positive).
             return HipKittenConfig(
                 layout=layout,
-                group_m=2,
+                group_m=16,
                 num_xcds=2,
                 kernel=None,
             )
