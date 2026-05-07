@@ -375,7 +375,7 @@ def _moe_combine_impl(
 
     rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
 
-    combined_x, combined_topk_weights, _ = moe_combine_p.bind(
+    combined_x, combined_topk_weights = moe_combine_p.bind(
         x,
         topk_weights,
         bias_0,
