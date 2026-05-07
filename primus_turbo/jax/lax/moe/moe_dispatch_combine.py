@@ -10,20 +10,24 @@ from typing import Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 
+from primus_turbo.jax._C import Config
 from primus_turbo.jax.primitive.moe.moe_combine import moe_combine_p
 from primus_turbo.jax.primitive.moe.moe_dispatch import (
     moe_cached_dispatch_p,
     moe_dispatch_p,
 )
 
-from .moe_utils import Config
-
-__all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_combine"]
+__all__ = [
+    "Config",
+    "get_dispatch_config",
+    "get_combine_config",
+    "set_default_num_sms",
+    "moe_dispatch",
+    "moe_combine",
+]
 
 
 _default_num_sms = 64
-
-P = jax.sharding.PartitionSpec
 
 
 def set_default_num_sms(num_sms: int):
@@ -64,7 +68,7 @@ def get_dispatch_config() -> Config:
 
 def get_combine_config() -> Config:
     """
-    Get a recommended dispatch config.
+    Get a recommended combine config.
     Returns:
         config: the recommended config.
     """

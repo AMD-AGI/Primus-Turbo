@@ -62,7 +62,7 @@ ABSTRACT_EVAL_TABLE[moe_combine_p] = _moe_combine_abstract_eval
 # ----------------------------------------
 # Step-4: JIT Lowering
 # ----------------------------------------
-LOWERING_TABLE[moe_combine_p] = jax.ffi.ffi_lowering("moe_combine")
+LOWERING_TABLE[moe_combine_p] = jax.ffi.ffi_lowering("moe_combine", has_side_effect=True)
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------

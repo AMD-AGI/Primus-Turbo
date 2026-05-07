@@ -245,6 +245,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales,
                       channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
+    BARRIER_SYNC_INIT();
+
     if (is_sender) {
         // Workers for sending
         constexpr int num_send_warps          = kNumThreads / kWarpSize;
@@ -265,7 +267,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
             st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
         }
-        syncwarp();
+        __syncwarp();
 
         // Get tasks
         int token_start_idx, token_end_idx;
@@ -294,7 +296,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     trap();
                 }
             }
-            syncwarp();
+            __syncwarp();
 
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
@@ -359,11 +361,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            if (num_threads_per_rank > kWarpSize) {
-                __syncthreads();
-            } else {
-                syncwarp();
-            }
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       cached_channel_tail_idx);
@@ -431,11 +429,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            if (num_threads_per_rank > kWarpSize) {
-                __syncthreads();
-            } else {
-                syncwarp();
-            }
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -492,11 +486,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            if (num_threads_per_rank > kWarpSize) {
-                __syncthreads();
-            } else {
-                syncwarp();
-            }
+            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -647,6 +637,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto          bias_1_int4   = reinterpret_cast<const int4 *>(bias_1);
     auto          recv_int4     = reinterpret_cast<int4 *>(recv_x);
 
+    BARRIER_SYNC_INIT();
+
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
@@ -721,7 +713,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     trap();
                 }
             }
-            syncwarp();
+            __syncwarp();
 
 // Send by chunk
 #pragma unroll 2
@@ -748,11 +740,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            if (num_threads_per_rank > kWarpSize) {
-                __syncthreads();
-            } else {
-                syncwarp();
-            }
+            BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       current_channel_tail_idx);
@@ -856,7 +844,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = wall_clock64();
-                while (__any(channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
+                while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and
+                                                     expected_head >= 0)) {
                     // Timeout check
                     if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel "
@@ -865,13 +854,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         trap();
                     }
                 }
-                syncwarp();
+                __syncwarp();
 
                 // Broadcast current heads
                 int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++i) {
-                    auto expected_head_i = __shfl(expected_head, i);
+                    auto expected_head_i = __shfl_sync(kFullWarpMask, expected_head, i);
                     if (expected_head_i >= 0) {
                         slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
                         topk_ranks[num_topk_ranks++] = i;
@@ -934,7 +923,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Retired
-            syncwarp();
+            __syncwarp();
             if (lane_id == 0)
                 warp_retired[recv_warp_id] = true;
         }
