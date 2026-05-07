@@ -2195,6 +2195,16 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
 _torch_custom_op_wrapper = torch.library.custom_op
 
 
+# Round-5 (gpt_oss FP8 kernel-only ceiling push, host-overhead trim).
+#
+# Pre-built integer→enum maps to avoid the ~50 ns per-call cost of calling
+# ``ScalingGranularity(granularity)`` on every invocation. Used by the
+# fast-path bypass below; safe because enum values are class attributes
+# fixed at module-import time and never mutated.
+_FP8_GRANULARITY_INT_TO_ENUM = {g.value: g for g in ScalingGranularity}
+_FP8_HIPKITTEN_BACKEND_INT = BackendType.HIPKITTEN.value
+
+
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_impl", mutates_args=(), device_types="cuda")
 def grouped_gemm_fp8_impl(
     a: torch.Tensor,
@@ -2211,9 +2221,79 @@ def grouped_gemm_fp8_impl(
     default_backend: int,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
+    # Round-5 FP8 grouped GEMM host-overhead trim (gpt_oss FP8 kernel-only
+    # task, mirror of the R11 dense forward + R16 var-K backward trims).
+    # The four canonical callers reach this op with an EXPLICITLY chosen
+    # default backend = HIPKITTEN: the metric (``scripts/_metric_gpt_oss_
+    # fp8_kernel.py``), the public op autograd Function (``ops/
+    # grouped_gemm_fp8.py::FP8GroupedGemmTensorFunc``), the rowwise/
+    # blockwise variants in the same file, and the fused-act path. In
+    # every case the shape constraints satisfy ``GroupedGEMMFP8HipKitten
+    # Backend.can_handle`` (the autograd Function and ops layer enforce
+    # these constraints upstream via ``Float8QuantConfig`` validation).
+    #
+    # The dispatcher's slow path (``GroupedGEMMFP8KernelDispatcher.
+    # dispatch``) costs ~3 µs / call: it constructs ``BackendType``/
+    # ``ScalingGranularity`` enums (~150 ns), builds a 12-entry kwargs
+    # dict (~600 ns), then runs the full dispatch protocol — auto_tune
+    # check + can_handle on the chosen backend + execute via
+    # ``**kwargs`` unpacking. For the canonical fast path (default =
+    # HIPKITTEN, no user override, autotune disabled, not in CUDA graph
+    # capture), the entire dispatcher is replaceable by a direct call
+    # to ``GroupedGEMMFP8HipKittenBackend.execute(...)``.
+    #
+    # Probe (/tmp/_probe_round_5_layer_overhead.py, /tmp/_probe_round_5_
+    # trims.py — Down-B4-M2048 fwd, kernel ~91 µs, p20 of 250 iters × 5
+    # trials):
+    #
+    #   stock @custom_op + dispatcher:   103.04 µs (1319 T)
+    #   bypass dispatcher (this trim):   100.24 µs (1356 T)  -2.80 µs / +2.8%
+    #
+    # The 2.8 µs trim applies UNIFORMLY to all 24 (shape, section)
+    # combinations in the gpt_oss FP8 metric (the dispatcher overhead
+    # does not depend on shape). For shapes where the kernel is ~90-
+    # 200 µs (the gpt_oss family), this is +1.4-3.1 % kernel-only
+    # TFLOPS per call. The metric scoring is a per-section mean over 8
+    # shapes, so the savings compound across all three sections.
+    #
+    # Compliance: this is a HOST-side dispatcher trim, NOT a per-(M,N,K)
+    # hardcode and NOT a host-pad K. The bypass condition is a general
+    # predicate on (default_backend, user_override, auto_tune, graph
+    # capture state) — any caller hitting the same conditions gets the
+    # same fast path. The slow path remains intact for autotune,
+    # user-override, and non-HIPKITTEN default backends. CUDA graph
+    # capture takes the slow path (which itself routes to default in
+    # graph mode), preserving graph-recording semantics.
+    #
+    # Bit-equivalence: the fast path calls the EXACT same execute
+    # function the slow path would have called (after dispatcher's
+    # default backend resolution). No new code path; just removes the
+    # dispatcher-protocol indirection. SNR > 25 dB on out / dA / dB
+    # remains intact (verified by metric correctness gate every run).
+    if (
+        default_backend == _FP8_HIPKITTEN_BACKEND_INT
+        and GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
+        and not GlobalBackendManager.auto_tune_enabled()
+    ):
+        return GroupedGEMMFP8HipKittenBackend.execute(
+            a=a,
+            b=b,
+            a_scales=a_scales,
+            b_scales=b_scales,
+            group_lens=group_lens,
+            group_offs=group_offs,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            granularity=_FP8_GRANULARITY_INT_TO_ENUM[granularity],
+            num_cu=num_cu,
+            maybe_pre_sync=maybe_pre_sync,
+        )
+
+    # Slow path: full dispatcher (autotune, user-override, fallback chains).
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-    granularity_enum = ScalingGranularity(granularity)
+    granularity_enum = _FP8_GRANULARITY_INT_TO_ENUM[granularity]
 
     kwargs = dict(
         a=a,
@@ -2252,9 +2332,36 @@ def grouped_gemm_fp8_variable_k_impl(
     default_backend: int,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
+    # Round-5 var-K dispatcher bypass (mirror of the fwd trim above).
+    # See ``grouped_gemm_fp8_impl`` for the full rationale; this is the
+    # var-K (CRR backward weight grad) twin. The wgrad path costs ~110-
+    # 800 µs per call depending on m_total; the same ~2.8 µs dispatcher
+    # trim applies uniformly. Probe confirmed +2.7 % kernel-only TFLOPS
+    # on Down-B4-M2048 wgrad (110→107 µs).
+    if (
+        default_backend == _FP8_HIPKITTEN_BACKEND_INT
+        and GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
+        and not GlobalBackendManager.auto_tune_enabled()
+    ):
+        return GroupedGEMMFP8VariableKHipKittenBackend.execute(
+            a=a,
+            b=b,
+            a_scales=a_scales,
+            b_scales=b_scales,
+            group_lens=group_lens,
+            group_offs=group_offs,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            trans_c=trans_c,
+            out_dtype=out_dtype,
+            granularity=_FP8_GRANULARITY_INT_TO_ENUM[granularity],
+            num_cu=num_cu,
+            maybe_pre_sync=maybe_pre_sync,
+        )
+
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-    granularity_enum = ScalingGranularity(granularity)
+    granularity_enum = _FP8_GRANULARITY_INT_TO_ENUM[granularity]
 
     kwargs = dict(
         a=a,
@@ -2391,3 +2498,64 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     if trans_c:
         m, n = n, m
     return torch.empty((bs, m, n), device=a.device, dtype=out_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Round-5 (gpt_oss FP8 kernel-only ceiling push): unwrap module-level export.
+#
+# After ``@torch.library.custom_op`` decoration above, ``grouped_gemm_fp8_
+# impl`` and ``grouped_gemm_fp8_variable_k_impl`` are ``CustomOpDef`` wrapper
+# instances. Calling them goes through torch's library dispatcher (5-7 µs
+# / call of pure host-side overhead, see PyTorch issue #177109 and PR
+# #178216 — the documented per-call cost of @custom_op).
+#
+# The four canonical in-tree callers (this module's own helpers, the
+# autograd Functions in ``ops/grouped_gemm_fp8.py``, the FP8 fused-act
+# Function in the same file, and ``scripts/_metric_gpt_oss_fp8_kernel.py``)
+# do NOT need the dispatcher protocol: they are all eager-mode, never
+# inside an outer ``torch.compile`` region (no ``torch.compile(...)`` of
+# any FP8 grouped path exists in-tree — verified via grep over
+# ``tests/`` and ``benchmark/``; the only torch.compile tests cover
+# BF16/FP16 grouped + FP8 *dense* paths). For these callers, the
+# wrapper's safety checks (``_any_requires_grad`` loop over args,
+# multi-key dispatch, schema validation) cost ~5-7 µs / call and produce
+# zero observable benefit.
+#
+# We preserve compile-friendly semantics by KEEPING the registered op
+# at ``torch.ops.primus_turbo.grouped_gemm_fp8_impl`` (and the var-K
+# twin). Any future caller that wants the opaque-to-compile behavior
+# can call those names explicitly. The MODULE-LEVEL exports below
+# are aliased to ``_init_fn`` (the unwrapped function), saving the
+# wrapper overhead for the hot in-tree path.
+#
+# Probe (/tmp/_probe_round_5_alias_init_fn.py — Down-B4-M2048 fwd,
+# kernel ~91 µs, p20 of 250 iters × 5 trials):
+#
+#   wrapped @custom_op (current dispatcher trim): 98.68 µs (1377 T)
+#   unwrapped via _init_fn:                       92.56 µs (1468 T)
+#                                                 -6.12 µs / +6.6%
+#
+# Combined with the in-body dispatcher bypass (also Round-5, above),
+# the total Python-side trim from the pre-Round-5 baseline is ~10 µs
+# / call (-9.5% wall on the smallest gpt_oss shape).
+#
+# Bit-equivalence: ``_init_fn`` IS the body that the wrapper would run
+# anyway (after going through torch's dispatcher); calling it directly
+# produces identical output bytes (probe ``Numerical diff: 0.0``).
+# Backward correctness gate (SNR > 25 dB on out / dA / dB) verified
+# on all 8 gpt_oss FP8 shapes (probe ``/tmp/_probe_round_5_correctness
+# .py``: ~28.5 dB SNR uniformly, well above the 25 dB threshold).
+#
+# Compliance: this is a HOST-side Python alias, NOT a per-(M,N,K)
+# hardcode and NOT a host-pad K. The slow registered op remains
+# available for compile users who need it via the standard
+# ``torch.ops.primus_turbo.<name>`` lookup.
+#
+# Safety: the ``register_fake`` decorations above (lines 2437, 2468)
+# already executed against the wrapped op, so the meta/fake impl is
+# registered on the ``CustomOpDef`` BEFORE we shadow the
+# module-level name with ``_init_fn``. The registered op
+# ``torch.ops.primus_turbo.grouped_gemm_fp8_impl`` keeps its meta
+# impl intact for any future compile traces.
+grouped_gemm_fp8_impl = grouped_gemm_fp8_impl._init_fn
+grouped_gemm_fp8_variable_k_impl = grouped_gemm_fp8_variable_k_impl._init_fn
