@@ -9,90 +9,25 @@
 
 namespace primus_turbo {
 
-// =============================================================================
-// Preprocessing
-// =============================================================================
+template <typename expert_map_t>
+void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
+                                int *num_dispatched_tokens_ptr, int num_local_experts,
+                                int max_num_dispatched_tokens, int pad_multiple,
+                                int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
+                                int64_t num_permuted_tokens, hipStream_t stream);
 
-// Pad each per-expert token count up to a multiple of `pad_multiple` and copy
-// from int32 (device) to int64 (device).
-//
-// Inputs / outputs are device pointers of length `num_experts`.
-void pad_tokens_per_expert(const int32_t *src, int64_t *dst, int num_experts, int pad_multiple,
-                           hipStream_t stream);
-
-// Permute preprocessing kernel configuration. The block size is fixed because
-// the kernel template is instantiated with this constant.
-struct PermutePreprocessConfig {
-    static constexpr int kBlockSize = 512;
-};
-
-// Build `row_id_map`, `tokens_per_expert` and `overflow_flag` from the routing
-// map using a single-kernel decoupled-lookback scan. The launcher allocates
-// the per-stream lookback workspace internally (tile_state region zeroed via
-// hipMemsetAsync before each launch, with a vsmem fallback for high-E shapes
-// that overflow the per-block LDS budget); callers no longer need to pass
-// workspace scratch tensors.
-//
-// Shapes (all device pointers):
-//   routing_map               : [num_dispatched_tokens, num_of_local_experts] (bool)
-//   num_dispatched_tokens_ptr : scalar int
-//   tokens_per_expert         : [num_of_local_experts] (int32)
-//   row_id_map                : [num_dispatched_tokens + pad_multiple, num_of_local_experts] (int)
-//   overflow_flag             : scalar int
-//
-// `max_num_dispatched_tokens` is the upper-bound `num_dispatched_tokens` the
-// caller may pass; the launcher uses it (host-side) to size the grid and the
-// per-block tile partition without synchronising on the device-side counter.
-//
-// `num_permuted_tokens < 0` is treated as "no cap".
-void permute_preprocessing_impl(bool *routing_map, int *num_dispatched_tokens_ptr,
-                                int num_of_local_experts, int max_num_dispatched_tokens,
-                                int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
-                                int *overflow_flag, int64_t num_permuted_tokens,
-                                hipStream_t stream);
-
-// =============================================================================
-// Permute / Unpermute (data movement)
-// =============================================================================
-
-// Block configuration shared by permute / unpermute. The kernels are
-// vectorised over `THREADS_PER_TOKEN` lanes and pack `block_size /
-// THREADS_PER_TOKEN` tokens per CTA.
-struct PermuteKernelConfig {
-    static constexpr int kBlockSize       = 512;
-    static constexpr int kThreadsPerToken = 128;
-    static constexpr int kTokensPerBlock  = kBlockSize / kThreadsPerToken;
-};
-
-// Permute tokens into expert-grouped order using `row_id_map` (produced by
-// `permute_preprocessing_impl`).
-//
-//   tokens                   : [num_dispatched_tokens, hidden_size]  (DType)
-//   permuted_tokens          : [num_permuted_tokens,    hidden_size] (DType, output)
-//   scaling_factor           : [num_dispatched_tokens, scales_per_token] or nullptr
-//   permuted_scaling_factor  : [num_permuted_tokens,    scales_per_token] or nullptr
-//   probs                    : [num_dispatched_tokens, num_of_local_experts * num_ranks_per_node]
-//                              or nullptr
-//   permuted_probs           : [num_permuted_tokens]   or nullptr
-//   row_id_map               : [num_dispatched_tokens + pad_multiple, num_of_local_experts] (int)
-//
-// `hidden_size` must be a multiple of `sizeof(float4)/sizeof(DType)` so the
-// kernel can use float4 vectorised loads/stores.
 template <typename DType, typename ProbType, typename ScalarType>
 void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType *scaling_factor,
                   ScalarType *permuted_scaling_factor, const ProbType *probs,
                   ProbType *permuted_probs, const int *row_id_map,
-                  const int *num_dispatched_tokens_ptr, int pad_multiple, int num_of_local_experts,
+                  const int *num_dispatched_tokens_ptr, int pad_multiple, int num_local_experts,
                   int hidden_size, int scales_per_token, int local_rank, int num_ranks_per_node,
-                  int grid_size, hipStream_t stream);
+                  int num_cu, hipStream_t stream);
 
-// Reduce permuted tokens back to per-source rows by accumulating values from
-// all experts a given source token was routed to. `DType` is currently
-// restricted to `bfloat16` (16-bit accum-via-float).
 template <typename DType, typename ProbType>
 void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType *permuted_probs,
                     ProbType *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
-                    int num_of_local_experts, int hidden_size, int local_rank,
-                    int num_ranks_per_node, int grid_size, hipStream_t stream);
+                    int num_local_experts, int hidden_size, int local_rank, int num_ranks_per_node,
+                    int num_cu, hipStream_t stream);
 
 } // namespace primus_turbo
