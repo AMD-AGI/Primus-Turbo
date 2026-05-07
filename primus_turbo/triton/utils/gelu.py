@@ -47,3 +47,18 @@ def gelu_bwd_none(x, dy):
     dydx = scale2 * x_fp32 * exp(-pow(scale1 * x_fp32, 2)) + 0.5 * tl.erf(scale1 * x_fp32) + 0.5
     dx = dydx * dy
     return dx
+
+
+@triton.jit
+def quick_gelu(x):
+    """quick_gelu(x) = x * sigmoid(1.702 * x)"""
+    return x * tl.sigmoid(1.702 * x.to(tl.float32))
+
+
+@triton.jit
+def quick_gelu_bwd(x, dy):
+    """Gradient of quick_gelu: dy * sigmoid(1.702*x) * (1 + 1.702*x*(1 - sigmoid(1.702*x)))"""
+    x_fp32 = x.to(tl.float32)
+    sigmoid_out = tl.sigmoid(1.702 * x_fp32)
+    dydx = sigmoid_out * (1.0 + 1.702 * x_fp32 * (1.0 - sigmoid_out))
+    return dydx * dy

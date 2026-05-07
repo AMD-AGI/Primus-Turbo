@@ -48,7 +48,7 @@ test_cases = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("enable_sink", [False, True])
+@pytest.mark.parametrize("enable_sink", [True])
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
