@@ -21,17 +21,19 @@ namespace {
 // Pick a default grid size when the caller doesn't supply one. We fall back to
 // "one block per CU" so the kernel always has work for every multiprocessor.
 inline int default_grid_size(int64_t num_of_blocks) {
-    if (num_of_blocks > 0) return static_cast<int>(num_of_blocks);
+    if (num_of_blocks > 0)
+        return static_cast<int>(num_of_blocks);
     int device_id = 0;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
     int num_cu = 0;
     PRIMUS_TURBO_CHECK_HIP(
         hipDeviceGetAttribute(&num_cu, hipDeviceAttributeMultiprocessorCount, device_id));
-    return (std::max)(num_cu, 1);
+    return (std::max) (num_cu, 1);
 }
 
 template <typename T> inline T *opt_data_ptr(const c10::optional<torch::Tensor> &opt) {
-    if (!opt.has_value() || !opt->defined()) return nullptr;
+    if (!opt.has_value() || !opt->defined())
+        return nullptr;
     return reinterpret_cast<T *>(opt->data_ptr());
 }
 
@@ -45,8 +47,7 @@ template <typename T> inline T *opt_data_ptr(const c10::optional<torch::Tensor> 
 // -----------------------------------------------------------------------------
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-permute_preprocessing(torch::Tensor routing_map,
-                      torch::Tensor num_dispatched_token_tensor,
+permute_preprocessing(torch::Tensor routing_map, torch::Tensor num_dispatched_token_tensor,
                       // Used to size row_id_map without synchronising on the
                       // pinned-memory copy of num_dispatched_tokens.
                       int64_t max_num_dispatched_tokens, int64_t num_of_local_experts,
@@ -62,12 +63,16 @@ permute_preprocessing(torch::Tensor routing_map,
     PRIMUS_TURBO_CHECK(num_of_local_experts > 0 && num_of_local_experts <= block_size,
                        "num_of_local_experts must be in (0, block_size]");
 
-    auto device     = routing_map.device();
-    auto int_opts   = at::TensorOptions().dtype(at::kInt).device(device);
+    auto device   = routing_map.device();
+    auto int_opts = at::TensorOptions().dtype(at::kInt).device(device);
 
-    auto row_id_map = at::empty(
-        {static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple), num_of_local_experts},
-        int_opts);
+    // row_id_map layout (per token, length 2 * E + 1):
+    //   [0, n_routed)     = signed dst_row (>0 gather, <0 pad-zero)
+    //   [E, E + n_routed) = expert_idx
+    //   [2 * E]           = n_routed
+    auto row_id_map = at::empty({static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple),
+                                 2 * num_of_local_experts + 1},
+                                int_opts);
     auto tokens_per_expert = at::empty({num_of_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
 
@@ -75,7 +80,7 @@ permute_preprocessing(torch::Tensor routing_map,
 
     // The launcher manages its own per-stream lookback scratch + epoch
     // tagging internally; callers no longer pass workspace tensors.
-    permute_preprocessing_launch(
+    permute_preprocessing_impl(
         reinterpret_cast<bool *>(routing_map.data_ptr()),
         num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_of_local_experts),
         static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),
@@ -97,8 +102,7 @@ permute_preprocessing(torch::Tensor routing_map,
 void permute_launcher(torch::Tensor tokens, torch::Tensor output_tokens,
                       c10::optional<torch::Tensor> scaling_factor,
                       c10::optional<torch::Tensor> output_scaling_factor,
-                      c10::optional<torch::Tensor> probs,
-                      c10::optional<torch::Tensor> output_probs,
+                      c10::optional<torch::Tensor> probs, c10::optional<torch::Tensor> output_probs,
                       torch::Tensor row_id_map, torch::Tensor num_dispatched_token_tensor,
                       int64_t pad_multiple, int64_t num_of_local_experts, int64_t hidden_size,
                       int64_t scales_per_token, int64_t local_rank, int64_t num_ranks_per_node,
@@ -132,11 +136,11 @@ void permute_launcher(torch::Tensor tokens, torch::Tensor output_tokens,
             opt_data_ptr<const ScalarType>(scaling_factor),
             opt_data_ptr<ScalarType>(output_scaling_factor),
             with_probs ? opt_data_ptr<const ProbType>(probs) : nullptr,
-            with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr,
-            row_id_map.data_ptr<int>(), num_dispatched_token_tensor.data_ptr<int>(),
-            static_cast<int>(pad_multiple), static_cast<int>(num_of_local_experts),
-            static_cast<int>(hidden_size), static_cast<int>(scales_per_token),
-            static_cast<int>(local_rank), static_cast<int>(num_ranks_per_node), grid, stream);
+            with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
+            num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(pad_multiple),
+            static_cast<int>(num_of_local_experts), static_cast<int>(hidden_size),
+            static_cast<int>(scales_per_token), static_cast<int>(local_rank),
+            static_cast<int>(num_ranks_per_node), grid, stream);
     } else {
         PRIMUS_TURBO_CHECK(hidden_size % 8 == 0,
                            "permute (16-bit): hidden_size must be a multiple of 8");
@@ -145,11 +149,11 @@ void permute_launcher(torch::Tensor tokens, torch::Tensor output_tokens,
             reinterpret_cast<uint16_t *>(output_tokens.data_ptr()),
             /*scaling_factor=*/nullptr, /*permuted_scaling_factor=*/nullptr,
             with_probs ? opt_data_ptr<const ProbType>(probs) : nullptr,
-            with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr,
-            row_id_map.data_ptr<int>(), num_dispatched_token_tensor.data_ptr<int>(),
-            static_cast<int>(pad_multiple), static_cast<int>(num_of_local_experts),
-            static_cast<int>(hidden_size), static_cast<int>(scales_per_token),
-            static_cast<int>(local_rank), static_cast<int>(num_ranks_per_node), grid, stream);
+            with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
+            num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(pad_multiple),
+            static_cast<int>(num_of_local_experts), static_cast<int>(hidden_size),
+            static_cast<int>(scales_per_token), static_cast<int>(local_rank),
+            static_cast<int>(num_ranks_per_node), grid, stream);
     }
 }
 
@@ -177,9 +181,10 @@ void unpermute_launcher(torch::Tensor permuted_tokens, torch::Tensor output_toke
                        "unpermute_launcher: hidden_size must be a multiple of 8");
     PRIMUS_TURBO_CHECK(row_id_map.is_cuda() && row_id_map.scalar_type() == at::kInt,
                        "unpermute_launcher: row_id_map must be int32 CUDA tensor");
-    PRIMUS_TURBO_CHECK(num_dispatched_tokens_tensor.is_cuda() &&
-                           num_dispatched_tokens_tensor.scalar_type() == at::kInt,
-                       "unpermute_launcher: num_dispatched_tokens_tensor must be int32 CUDA tensor");
+    PRIMUS_TURBO_CHECK(
+        num_dispatched_tokens_tensor.is_cuda() &&
+            num_dispatched_tokens_tensor.scalar_type() == at::kInt,
+        "unpermute_launcher: num_dispatched_tokens_tensor must be int32 CUDA tensor");
     if (with_probs) {
         PRIMUS_TURBO_CHECK(permuted_probs.has_value() && permuted_probs->defined(),
                            "unpermute_launcher: with_probs but permuted_probs is empty");
@@ -200,10 +205,10 @@ void unpermute_launcher(torch::Tensor permuted_tokens, torch::Tensor output_toke
         reinterpret_cast<const bfloat16 *>(permuted_tokens.data_ptr()),
         reinterpret_cast<bfloat16 *>(output_tokens.data_ptr()),
         with_probs ? opt_data_ptr<const ProbType>(permuted_probs) : nullptr,
-        with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr,
-        row_id_map.data_ptr<int>(), num_dispatched_tokens_tensor.data_ptr<int>(),
-        static_cast<int>(num_of_local_experts), static_cast<int>(hidden_size),
-        static_cast<int>(local_rank), static_cast<int>(num_ranks_per_node), grid, stream);
+        with_probs ? opt_data_ptr<ProbType>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
+        num_dispatched_tokens_tensor.data_ptr<int>(), static_cast<int>(num_of_local_experts),
+        static_cast<int>(hidden_size), static_cast<int>(local_rank),
+        static_cast<int>(num_ranks_per_node), grid, stream);
 }
 
 } // namespace primus_turbo::pytorch

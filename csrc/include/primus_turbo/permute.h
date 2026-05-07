@@ -28,10 +28,10 @@ struct PermutePreprocessConfig {
 
 // Build `row_id_map`, `tokens_per_expert` and `overflow_flag` from the routing
 // map using a single-kernel decoupled-lookback scan. The launcher allocates
-// the per-stream lookback workspace internally (epoch-tagged tile_state +
-// barrier counter, with a vsmem fallback for high-E shapes that overflow
-// the per-block LDS budget); callers no longer need to pass workspace
-// scratch tensors.
+// the per-stream lookback workspace internally (tile_state region zeroed via
+// hipMemsetAsync before each launch, with a vsmem fallback for high-E shapes
+// that overflow the per-block LDS budget); callers no longer need to pass
+// workspace scratch tensors.
 //
 // Shapes (all device pointers):
 //   routing_map               : [num_dispatched_tokens, num_of_local_experts] (bool)
@@ -45,11 +45,11 @@ struct PermutePreprocessConfig {
 // per-block tile partition without synchronising on the device-side counter.
 //
 // `num_permuted_tokens < 0` is treated as "no cap".
-void permute_preprocessing_launch(bool *routing_map, int *num_dispatched_tokens_ptr,
-                                  int num_of_local_experts, int max_num_dispatched_tokens,
-                                  int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
-                                  int *overflow_flag, int64_t num_permuted_tokens,
-                                  hipStream_t stream);
+void permute_preprocessing_impl(bool *routing_map, int *num_dispatched_tokens_ptr,
+                                int num_of_local_experts, int max_num_dispatched_tokens,
+                                int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
+                                int *overflow_flag, int64_t num_permuted_tokens,
+                                hipStream_t stream);
 
 // =============================================================================
 // Permute / Unpermute (data movement)
@@ -65,7 +65,7 @@ struct PermuteKernelConfig {
 };
 
 // Permute tokens into expert-grouped order using `row_id_map` (produced by
-// `permute_preprocessing_launch`).
+// `permute_preprocessing_impl`).
 //
 //   tokens                   : [num_dispatched_tokens, hidden_size]  (DType)
 //   permuted_tokens          : [num_permuted_tokens,    hidden_size] (DType, output)
