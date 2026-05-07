@@ -1,14 +1,6 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
 // See LICENSE for license information.
-//
-// MoE permute / unpermute kernels.
-//   * permute_preprocessing_kernel — single-kernel decoupled-lookback scan
-//     over the routing map; produces tokens_per_expert and a dense
-//     row_id_map in [dst | idx | n] layout.
-//   * permute_kernel / unpermute_kernel — vectorised int4 data movement
-//     driven by row_id_map. Falls back to a global-memory tile (vsmem)
-//     when per-block scratch exceeds the LDS budget.
 
 #include "permute.cuh"
 #include "primus_turbo/permute.h"
@@ -28,9 +20,61 @@ using ::primus_turbo::deep_ep::st_na_global;
 using ::primus_turbo::dtype::bfloat16;
 
 template <int kBlockSize>
+__device__ __forceinline__ void
+fill_s_tile_from_routing_map(int *s_tile, const bool *routing_map, int tile_offset, int E,
+                             int kNumItemsPerTile, int num_dispatched_tokens) {
+    const int     thread_id    = static_cast<int>(threadIdx.x);
+    const int64_t routing_base = static_cast<int64_t>(tile_offset) * E;
+    for (int i = thread_id; i < kNumItemsPerTile * E; i += kBlockSize) {
+        const int gtoken = tile_offset + i / E;
+        s_tile[i] =
+            (gtoken < num_dispatched_tokens) ? static_cast<int>(routing_map[routing_base + i]) : 0;
+    }
+}
+
+template <int kBlockSize, typename topk_idx_t>
+__device__ __forceinline__ void
+fill_s_tile_from_topk_idx(int *s_tile, const topk_idx_t *topk_idx, int num_topk, int tile_offset,
+                          int E, int kNumItemsPerTile, int num_dispatched_tokens) {
+    const int thread_id = static_cast<int>(threadIdx.x);
+
+    for (int i = thread_id; i < kNumItemsPerTile * E; i += kBlockSize) {
+        s_tile[i] = 0;
+    }
+
+    for (int i = thread_id; i < kNumItemsPerTile * num_topk; i += kBlockSize) {
+        const int t      = i / num_topk;
+        const int k      = i % num_topk;
+        const int gtoken = tile_offset + t;
+        if (gtoken >= num_dispatched_tokens) {
+            continue;
+        }
+        const int e = topk_idx[static_cast<int64_t>(gtoken) * num_topk + k];
+        if (e >= 0 && e < E) {
+            s_tile[t * E + e] = 1;
+        }
+    }
+}
+
+template <int kBlockSize, typename expert_map_t>
+__device__ __forceinline__ void fill_s_tile(int *s_tile, const expert_map_t *expert_map,
+                                            int tile_offset, int num_experts, int num_topk,
+                                            int kNumItemsPerTile, int num_dispatched_tokens) {
+    if constexpr (std::is_same_v<expert_map_t, bool>) {
+        fill_s_tile_from_routing_map<kBlockSize>(s_tile, expert_map, tile_offset, num_experts,
+                                                 kNumItemsPerTile, num_dispatched_tokens);
+    } else {
+        fill_s_tile_from_topk_idx<kBlockSize, expert_map_t>(
+            s_tile, expert_map, num_topk, tile_offset, num_experts, kNumItemsPerTile,
+            num_dispatched_tokens);
+    }
+}
+
+template <int kBlockSize, typename expert_map_t>
 __launch_bounds__(kBlockSize, 1) __global__
-    void permute_preprocessing_kernel(const bool *routing_map, const int *num_dispatched_tokens_ptr,
-                                      int num_experts, int pad_multiple, int32_t *tokens_per_expert,
+    void permute_preprocessing_kernel(const expert_map_t *expert_map,
+                                      const int *num_dispatched_tokens_ptr, int num_experts,
+                                      int num_topk, int pad_multiple, int32_t *tokens_per_expert,
                                       int *row_id_map, int *overflow_flag,
                                       int64_t num_permuted_tokens, TempStorageLayout layout) {
     uint64_t *tile_state = layout.tile_state;
@@ -78,15 +122,10 @@ __launch_bounds__(kBlockSize, 1) __global__
     // Phase 1-2: per-tile InclusiveSum, accumulate into s_acc; multi-tile
     // blocks spill the partial scan to row_id_map for Phase 6 to read back.
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
-        const int     tile_offset  = tile_idx * kNumItemsPerTile;
-        const int64_t routing_base = static_cast<int64_t>(tile_offset) * E;
+        const int tile_offset = tile_idx * kNumItemsPerTile;
 
-        for (int i = thread_id; i < kNumItemsPerTile * E; i += kBlockSize) {
-            const int gtoken = tile_offset + i / E;
-            s_tile[i]        = (gtoken < num_dispatched_tokens)
-                                   ? static_cast<int>(routing_map[routing_base + i])
-                                   : 0;
-        }
+        fill_s_tile<kBlockSize, expert_map_t>(s_tile, expert_map, tile_offset, E, num_topk,
+                                              kNumItemsPerTile, num_dispatched_tokens);
         __syncthreads();
 
         for (int e = 0; e < E; ++e) {
@@ -326,15 +365,20 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
     return layout;
 }
 
-void permute_preprocessing_impl(bool *routing_map, int *num_dispatched_tokens_ptr,
-                                int num_of_local_experts, int max_num_dispatched_tokens,
-                                int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
-                                int *overflow_flag, int64_t num_permuted_tokens,
-                                hipStream_t stream) {
-    constexpr int kBlockSize = PermutePreprocessConfig::kBlockSize;
-    PRIMUS_TURBO_CHECK(num_of_local_experts > 0, "num_of_local_experts must be > 0");
-    PRIMUS_TURBO_CHECK(num_of_local_experts <= kBlockSize,
-                       "num_of_local_experts must fit in a single block");
+// Shared host-side launch path for both routing_map and topk_idx inputs. The
+// only thing that varies is the `expert_map_t` type tag and the `num_topk`
+// parameter (ignored in routing_map mode); everything else (scratch sizing,
+// lookback layout, grid size) is identical.
+template <typename expert_map_t>
+void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
+                                int *num_dispatched_tokens_ptr, int num_local_experts,
+                                int max_num_dispatched_tokens, int pad_multiple,
+                                int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
+                                int64_t num_permuted_tokens, hipStream_t stream) {
+    constexpr int kBlockSize = 512;
+    PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
+    PRIMUS_TURBO_CHECK(num_local_experts <= kBlockSize,
+                       "num_local_experts must fit in a single block");
     PRIMUS_TURBO_CHECK(max_num_dispatched_tokens > 0, "max_num_dispatched_tokens must be > 0");
 
     const auto &caps          = cached_device_caps();
@@ -343,23 +387,23 @@ void permute_preprocessing_impl(bool *routing_map, int *num_dispatched_tokens_pt
 
     const int grid_size = std::min(MAX_NUM_CU, internal_rows);
 
-    const auto required_temp_storage_bytes =
-        (static_cast<size_t>(kBlockSize) * num_of_local_experts +
-         4 * static_cast<size_t>(num_of_local_experts)) *
-        sizeof(int);
+    const auto required_temp_storage_bytes = (static_cast<size_t>(kBlockSize) * num_local_experts +
+                                              4 * static_cast<size_t>(num_local_experts)) *
+                                             sizeof(int);
     // Spill per-block scratch to global memory (vsmem) when LDS is too small.
     const bool use_vsmem =
         required_temp_storage_bytes > static_cast<size_t>(caps.max_shmem_per_block);
     const size_t kernel_lds_bytes         = use_vsmem ? 0 : required_temp_storage_bytes;
     const size_t vshmem_bytes_per_block   = use_vsmem ? required_temp_storage_bytes : 0;
-    const auto   lookback_workspace_bytes = grid_size * num_of_local_experts * sizeof(uint64_t);
+    const auto   lookback_workspace_bytes = grid_size * num_local_experts * sizeof(uint64_t);
 
     auto tmp_layout = get_temp_storage_layout(lookback_workspace_bytes, vshmem_bytes_per_block,
                                               grid_size, stream);
 
-    permute_preprocessing_kernel<kBlockSize><<<grid_size, kBlockSize, kernel_lds_bytes, stream>>>(
-        routing_map, num_dispatched_tokens_ptr, num_of_local_experts, pad_multiple,
-        tokens_per_expert, row_id_map, overflow_flag, num_permuted_tokens, tmp_layout);
+    permute_preprocessing_kernel<kBlockSize, expert_map_t>
+        <<<grid_size, kBlockSize, kernel_lds_bytes, stream>>>(
+            expert_map, num_dispatched_tokens_ptr, num_local_experts, num_topk, pad_multiple,
+            tokens_per_expert, row_id_map, overflow_flag, num_permuted_tokens, tmp_layout);
 
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -383,14 +427,14 @@ __global__ void
 permute_kernel(const int4 *tokens, int4 *permuted_tokens, const ScalarType *scaling_factor,
                ScalarType *permuted_scaling_factor, const ProbType *probs, ProbType *permuted_probs,
                const int *row_id_map, const int *num_dispatched_tokens_ptr, int pad_multiple,
-               int num_of_local_experts, int hidden_int4, int scales_per_token, int local_rank,
+               int num_local_experts, int hidden_int4, int scales_per_token, int local_rank,
                int num_ranks_per_node) {
     constexpr int num_warps = kBlockSize / kWarpSize;
 
     const auto thread_id             = static_cast<int>(threadIdx.x);
     const auto lane_id               = thread_id % kWarpSize;
     const auto warp_id               = thread_id / kWarpSize;
-    const int  E                     = num_of_local_experts;
+    const int  E                     = num_local_experts;
     const int  row_stride            = 2 * E + 1;
     const int  num_dispatched_tokens = *num_dispatched_tokens_ptr + pad_multiple;
 
@@ -570,11 +614,10 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
 // runs depth-2 (j, j2 = j + cooperative_stride) via unpermute_reduce_pack
 // to widen the VMEM fan-out.
 template <int kBlockSize, typename DType, typename ProbType>
-__global__ void unpermute_kernel(const int4 *permuted_tokens, int4 *tokens,
-                                 const ProbType *permuted_probs, ProbType *probs,
-                                 const int *row_id_map, const int *num_dispatched_tokens_ptr,
-                                 int num_of_local_experts, int hidden_int4, int local_rank,
-                                 int num_ranks_per_node) {
+__global__ void
+unpermute_kernel(const int4 *permuted_tokens, int4 *tokens, const ProbType *permuted_probs,
+                 ProbType *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
+                 int num_local_experts, int hidden_int4, int local_rank, int num_ranks_per_node) {
     constexpr int kWarpsPerToken       = kUnpermuteWarpsPerToken;
     constexpr int num_warps            = kBlockSize / kWarpSize;
     constexpr int num_tokens_per_block = num_warps / kWarpsPerToken;
@@ -585,7 +628,7 @@ __global__ void unpermute_kernel(const int4 *permuted_tokens, int4 *tokens,
     const auto warp_id_in_token  = warp_id % kWarpsPerToken;
     const auto token_id_in_block = warp_id / kWarpsPerToken;
 
-    const int E                     = num_of_local_experts;
+    const int E                     = num_local_experts;
     const int row_stride            = 2 * E + 1;
     const int num_dispatched_tokens = *num_dispatched_tokens_ptr;
 
@@ -654,10 +697,10 @@ template <typename DType, typename ProbType, typename ScalarType>
 void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType *scaling_factor,
                   ScalarType *permuted_scaling_factor, const ProbType *probs,
                   ProbType *permuted_probs, const int *row_id_map,
-                  const int *num_dispatched_tokens_ptr, int pad_multiple, int num_of_local_experts,
+                  const int *num_dispatched_tokens_ptr, int pad_multiple, int num_local_experts,
                   int hidden_size, int scales_per_token, int local_rank, int num_ranks_per_node,
                   int grid_size, hipStream_t stream) {
-    constexpr int kBlockSize        = PermuteKernelConfig::kBlockSize;
+    constexpr int kBlockSize        = 512;
     constexpr int num_warps         = kBlockSize / kWarpSize;
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(DType);
 
@@ -667,7 +710,7 @@ void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType 
     PRIMUS_TURBO_CHECK(grid_size > 0, "grid_size must be > 0");
 
     const size_t shmem_bytes =
-        static_cast<size_t>(2 * num_of_local_experts + 1) * num_warps * sizeof(int);
+        static_cast<size_t>(2 * num_local_experts + 1) * num_warps * sizeof(int);
 
     const int   hidden_int4          = hidden_size / num_eles_per_pack;
     const int4 *tokens_int4          = reinterpret_cast<const int4 *>(tokens);
@@ -676,19 +719,19 @@ void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType 
     permute_kernel<kBlockSize, ProbType, ScalarType>
         <<<grid_size, kBlockSize, shmem_bytes, stream>>>(
             tokens_int4, permuted_tokens_int4, scaling_factor, permuted_scaling_factor, probs,
-            permuted_probs, row_id_map, num_dispatched_tokens_ptr, pad_multiple,
-            num_of_local_experts, hidden_int4, scales_per_token, local_rank, num_ranks_per_node);
+            permuted_probs, row_id_map, num_dispatched_tokens_ptr, pad_multiple, num_local_experts,
+            hidden_int4, scales_per_token, local_rank, num_ranks_per_node);
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
 template <typename DType, typename ProbType>
 void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType *permuted_probs,
                     ProbType *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
-                    int num_of_local_experts, int hidden_size, int local_rank,
-                    int num_ranks_per_node, int grid_size, hipStream_t stream) {
+                    int num_local_experts, int hidden_size, int local_rank, int num_ranks_per_node,
+                    int grid_size, hipStream_t stream) {
     // E=1 keeps kBlockSize=512 to mirror permute_kernel; the generic K-reduction
     // path uses kBlockSize=1024 to widen per-CU vmem fan-out.
-    constexpr int kBlockSize           = PermuteKernelConfig::kBlockSize;
+    constexpr int kBlockSize           = 512;
     constexpr int kUnpermuteBlockSize  = 1024;
     constexpr int num_warps            = kUnpermuteBlockSize / kWarpSize;
     constexpr int num_tokens_per_block = num_warps / kUnpermuteWarpsPerToken;
@@ -700,13 +743,13 @@ void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType 
     PRIMUS_TURBO_CHECK(grid_size > 0, "grid_size must be > 0");
 
     const size_t shmem_bytes =
-        static_cast<size_t>(2 * num_of_local_experts + 1) * num_tokens_per_block * sizeof(int);
+        static_cast<size_t>(2 * num_local_experts + 1) * num_tokens_per_block * sizeof(int);
 
     const int   hidden_int4          = hidden_size / num_eles_per_pack;
     const int4 *permuted_tokens_int4 = reinterpret_cast<const int4 *>(permuted_tokens);
     int4       *tokens_int4          = reinterpret_cast<int4 *>(tokens);
 
-    if (num_of_local_experts == 1) {
+    if (num_local_experts == 1) {
         unpermute_kernel_e1<kBlockSize, DType, ProbType>
             <<<grid_size, kBlockSize, /*shmem=*/0, stream>>>(
                 permuted_tokens_int4, tokens_int4, permuted_probs, probs, row_id_map,
@@ -715,7 +758,7 @@ void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType 
         unpermute_kernel<kUnpermuteBlockSize, DType, ProbType>
             <<<grid_size, kUnpermuteBlockSize, shmem_bytes, stream>>>(
                 permuted_tokens_int4, tokens_int4, permuted_probs, probs, row_id_map,
-                num_dispatched_tokens_ptr, num_of_local_experts, hidden_int4, local_rank,
+                num_dispatched_tokens_ptr, num_local_experts, hidden_int4, local_rank,
                 num_ranks_per_node);
     }
 
@@ -725,6 +768,17 @@ void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType 
 // =============================================================================
 // Explicit template instantiations consumed by csrc/pytorch/permute/permute.cpp.
 // =============================================================================
+
+#define INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(expert_map_t)                                       \
+    template void permute_preprocessing_impl<expert_map_t>(                                        \
+        const expert_map_t *expert_map, int num_topk, int *num_dispatched_tokens_ptr,              \
+        int num_local_experts, int max_num_dispatched_tokens, int pad_multiple,                    \
+        int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,                           \
+        int64_t num_permuted_tokens, hipStream_t stream)
+
+INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(bool);
+INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(int);
+INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(int64_t);
 
 template void permute_impl<uint8_t, float, float>(const uint8_t *, uint8_t *, const float *,
                                                   float *, const float *, float *, const int *,
@@ -737,5 +791,7 @@ template void permute_impl<uint16_t, float, float>(const uint16_t *, uint16_t *,
 template void unpermute_impl<bfloat16, float>(const bfloat16 *, bfloat16 *, const float *, float *,
                                               const int *, const int *, int, int, int, int, int,
                                               hipStream_t);
+
+#undef INSTANTIATE_PERMUTE_PREPROCESSING_IMPL
 
 } // namespace primus_turbo
