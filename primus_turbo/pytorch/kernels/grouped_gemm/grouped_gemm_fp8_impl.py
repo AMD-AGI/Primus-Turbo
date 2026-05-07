@@ -914,8 +914,99 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 and b.shape[1] == 2880
                 and m_total >= 65536
             ):
-                vk_group_m = 4
-                vk_num_xcds = 4
+                # Round-1 (current Primus run, kernel-only ceiling-push
+                # task; 2026-05-07) split of the R30 universal
+                # ``(gm=4, xcds=4)`` rule into the two B=32 m_total tiers.
+                # R30 was tight-verified at 12-trial × 400-iter × 3-seed
+                # against R39's universal (gm=8, xcds=4) and reported
+                # +0.73 % / +0.39 % wins on the two B=32 shapes. Today's
+                # FP8 binding (post the R3-fused-act commit ceb7e93,
+                # rebuilt .so) shows the optimum has SPLIT between the
+                # two m_total tiers — same kind of methodology / kernel-
+                # rebuild drift R31 documented for var-K (and R45 / R32
+                # for the RCR / RRR rules).
+                #
+                # Round-1 tight A/B verify (1500-iter × 7-trial p20 ×
+                # 3 seeds × kernel-only direct call to
+                # ``grouped_variable_k_crr_dscale``,
+                # /tmp/_probe_round_1_tight_verify.py archived in commit
+                # message):
+                #
+                #   shape: gpt_oss-Down-B32-M2048 var-K dB
+                #     m_total=65536, N_fwd=2880, K_fwd=2880, B=32
+                #
+                #     cell      seed42 ms_med  seed137 ms_med  seed2024 ms_med   med Δ vs (4,4)  wmin_beats_lmax
+                #     (4, 4)cur 0.6634          0.6652          0.6661           baseline        ---
+                #     (8, 4)    0.6471          0.6480          0.6474           +2.51..+2.89pp  3/3 seeds
+                #
+                #   shape: gpt_oss-Down-B32-M4096 var-K dB
+                #     m_total=131072, N_fwd=2880, K_fwd=2880, B=32
+                #
+                #     cell      seed42 ms_med  seed137 ms_med  seed2024 ms_med   med Δ vs (4,4)  wmin_beats_lmax
+                #     (4, 4)cur 1.0907          1.0909          1.0907           baseline        ---
+                #     (8, 4)    1.0913          1.0923          1.0915           -0.06..-0.13pp  0/3 seeds (tie-loss)
+                #
+                # M=2048: (8, 4) wins +2.51..+2.89 pp on every seed, and
+                # ``hi_new (worst (8,4))`` < ``lo_old (best (4,4))`` on
+                # every seed → wmin_beats_lmax robust signal class
+                # (the cleanest tier in this run series, mirror of R33
+                # / R35 / R10 / R11 patterns). Median > spread by 4-7×.
+                # M=4096: (8, 4) is -0.06..-0.13 pp tie-loss; (4, 4) is
+                # at the local peak. Splitting the rule by m_total
+                # captures the M=2048 win without regressing M=4096.
+                #
+                # Why (gm=8) wins on M=2048 specifically: per-group
+                # output is [N_fwd, K_fwd] = [2880, 2880] ⇒ tiles_n=11,
+                # tiles_k=11 = 121 tile-steps × 32 groups = 3872
+                # tile-steps over NUM_CUS=256 persistent slots ≈ 15
+                # wave-steps. M_per_g=2048 ⇒ K-loop length per tile-step
+                # is ``M_per_g / KBLOCK = 2048 / 128 = 16`` blocks. The
+                # smaller wave-step count amortises (gm=8)'s 8-wide
+                # N-batch better than (gm=4): each wave-step runs through
+                # 8 N-rows × 16 K-blocks (= 128 macc rounds) before
+                # advancing, which fits MI355X's per-XCD MFMA pipeline
+                # depth more cleanly. M_per_g=4096 doubles the K-loop
+                # depth per tile-step (32 K-blocks), shifting the L2 /
+                # MFMA pipeline trade-off back toward (gm=4) — confirmed
+                # by the wmin_beats_lmax tier swap above. Same R30 / R31
+                # / R9 ``wave-step amortisation bifurcates the optimum''
+                # pattern.
+                #
+                # Bit-equivalent output verified at
+                # /tmp/_probe_round_1_correctness.py: max_abs((4,4) -
+                # (8,4)) = 0 across 3 seeds × 2 shapes, SNR vs fp32 ref =
+                # 28.46-28.50 dB on every (cell, seed, shape) — well
+                # above the 25 dB FP8 noise floor (group_m / num_xcds are
+                # pure persistent-grid scheduling knobs, same property
+                # documented for R30 / R31 / R32 / R33 / R35 / R10 / R11
+                # above and every (gm, xcds) RCR / RRR rule in
+                # ``primus_turbo/pytorch/kernels/hipkitten/config.py``).
+                #
+                # Sibling regression check: the rule split keeps R10's
+                # m_total ∈ [16384, 65536) carve-out (gpt_oss-Down B=4
+                # M=4096) untouched — its elif gate still excludes B=32
+                # via the m_total >= 65536 outer if-branch above. R31's
+                # gpt_oss-GateUP rules (b.shape[1]==5760) are unaffected
+                # by the n=k=2880 inner split. R25's DSV3 rule
+                # (a.shape[1] in {2048, 7168}) is unaffected.
+                #
+                # Expected metric impact: +2.51..+2.89 pp kernel on
+                # gpt_oss-Down-B32-M2048 wgrad (one of the 8 metric
+                # shapes feeding the wgrad section average). The shape
+                # currently sits ~1633 TF; +2.6 pp ≈ +42 TF lift to
+                # ~1675 TF. Section average over 8 wgrad shapes lifts
+                # by 42/8 ≈ 5 TF (from ~1408 to ~1413, progress
+                # 0.503 → 0.505); score lift ~+1-2 points. Real signal
+                # but small at the metric's noise floor (single-run
+                # std ≈ 25 score points). The kernel-real every-seed
+                # win + wmin_beats_lmax robust signal is committed
+                # ahead of compounding gains from later round rules.
+                if m_total == 65536:
+                    vk_group_m = 8
+                    vk_num_xcds = 4
+                else:
+                    vk_group_m = 4
+                    vk_num_xcds = 4
             elif a.shape[1] == 2880 and b.shape[1] == 2880:
                 # Round-10 (current Primus run; 2026-05-05) carve-out for
                 # gpt_oss-Down B=4 M=4096 (m_total=16384, the only metric
