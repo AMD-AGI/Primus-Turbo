@@ -5,15 +5,6 @@
 ###############################################################################
 
 """Unit tests for ``moe_permute`` / ``moe_unpermute`` (HIP MoE kernels).
-
-Coverage:
-* forward + backward correctness vs the pure-torch reference
-* ``expert_map`` accepts both bool ``routing_map`` and int ``topk_idx``
-  (``int32`` and ``int64``)
-* ``pad_multiple > 0`` rounds ``tokens_per_expert`` up to the requested
-  alignment
-* ``overflow_flag`` is set iff ``num_permuted_tokens`` underestimates the
-  total
 """
 
 import pytest

@@ -4,50 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 """Benchmark for the MoE permute / unpermute paths in Primus-Turbo.
-
-Compares two backends side-by-side via their **high-level autograd-aware**
-Python APIs in ``primus_turbo.pytorch.ops.moe`` — i.e. the same entry points
-the production token dispatcher hits:
-
-  * ``hip``    – :func:`moe_permute` / :func:`moe_unpermute` from
-                 ``primus_turbo/pytorch/ops/moe/permute.py``. Forward fuses
-                 the HIP single-kernel decoupled-lookback preprocessing with
-                 the vectorised data-movement kernel in
-                 ``csrc/kernels/permute/permute.cu``; backward path uses the
-                 unpermute kernel.
-  * ``triton`` – :func:`token_permute` / :func:`token_unpermute` (with
-                 ``fused=True``) from
-                 ``primus_turbo/pytorch/ops/moe/permutation.py``. Forward
-                 fuses ``make_row_id_map`` with ``permute_with_mask_map``;
-                 backward uses ``unpermute_with_mask_map``.
-
-Test cases are driven by ``benchmark/ops/config.py::MoEModelConfigs``,
-expanded over ``BATCH_SIZE_LIST x GROUPED_GEMM_EP_SIZE_LIST``.
-
-Both backends are driven from the same ``topk_idx`` upstream input — the
-DeepEP-dispatch layout. The HIP kernel reads ``topk_idx`` natively (its
-``permute_preprocessing`` C++ op dispatches on ``expert_map.scalar_type()``
-and handles ``-1`` padding inside ``fill_s_tile_from_topk_idx``). The
-Triton fused path's ``TokenPermuteMaskMap`` only accepts a bool
-``routing_map``, so the Triton backend converts ``topk_idx → routing_map``
-once per case in its setup block (matching what ``IndicesToMultihot`` does
-in ``token_dispatcher.py::_post_dispatch``). That conversion is **not**
-included in the timed sections — those purely exercise the permute /
-unpermute operators themselves.
-
-Permute inputs (``recv_topk_idx`` / ``recv_num_tokens``) simulate the
-receive side of a DeepEP intranode dispatch (see
-``benchmark/ops/deep_ep/test_intranode.py``):
-
-  * Each source rank has ``N`` tokens; each token picks ``K`` experts
-    uniformly without replacement out of ``E`` global experts.
-  * DeepEP deduplicates: a token enters this rank iff at least one of its
-    experts lies in the local range ``[0, E/R)``.
-
-  E[recv_num_tokens] = R * N * (1 - C(E - E/R, K) / C(E, K))
-
-  E.g. ``E=256, R=8, K=8, N=4096`` -> ``~21622`` (~0.66 * R * N).
-
 Usage::
 
     python benchmark/ops/bench_permute.py
