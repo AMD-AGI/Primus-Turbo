@@ -489,30 +489,24 @@ def test_grouped_gemm_fp8_blockwise(
     )
 
 
-# MX_BLOCKWISE: NT-only, stricter shape constraints, smaller focused sweep.
-# Balance=True only: MX_BLOCKWISE wgrad requires per-group M_g % 128 == 0 to
-# match the preshuffled scale layout (16x4 blocks).  With balance=True every
-# group has M_g == M, which is a 128-multiple via _MX_M_VALUES.  Unbalanced
-# group_lens with non-128-aligned per-group sizes are not a supported
-# configuration for the mxfp8 kernel and should be enforced at the wrapper
-# level, not silently rounded inside the test.
-_MX_NK_VALUES = [
-    (512, 384),       # smallest valid (k>=384)
-    (2048, 2048),
-    (8192, 2048),     # representative MoE FFN-down
-    (4096, 7168),
-]
-_MX_M_VALUES = [256, 1024, 2048]
-_MX_B_VALUES = [1, 2, 4, 8]
-
-
-@pytest.mark.parametrize("B", _MX_B_VALUES)
-@pytest.mark.parametrize("M", _MX_M_VALUES)
-@pytest.mark.parametrize("NK", _MX_NK_VALUES)
+# MX_BLOCKWISE turbo backend coverage mirrors tensorwise's full parameter
+# sweep (HYBRID format is intentionally excluded — the mxfp8 kernel itself
+# supports it, but turbo's hybrid path is out of scope for this PR).
+#
+# Constraints handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
+#   - trans_b=False: b is transposed to NT internally; wgrad output is
+#     transposed back to (G, K, N).
+#   - balance=False (per-group M_g not multiple of 128): a / grad_out are
+#     zero-padded along the M axis so wgrad sees 128-aligned per-group sizes.
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format):
-    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the turbo backend (NT-only)."""
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the turbo backend."""
     N, K = NK
     if get_device_compute_capability() != (9, 5):
         pytest.skip("MXFP8 grouped GEMM requires gfx950 (MI350/MI355).")
@@ -524,8 +518,8 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format):
         ori_dtype=ori_dtype,
         format=format,
         granularity=ScalingGranularity.MX_BLOCKWISE,
-        trans_b=True,
-        balance=True,
+        trans_b=trans_b,
+        balance=balance,
         backend=BackendType.TURBO,
         auto_tune=False,
     )

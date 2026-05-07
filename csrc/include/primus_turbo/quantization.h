@@ -103,10 +103,32 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
                               detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
+void quantize_mxfp8_dual_grouped_impl(
+    const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
+    uint8_t *colwise_scale, const int64_t *group_offs, const int64_t *group_offs_padded, int G,
+    int total_M_padded, int N, int N_pad, int rowwise_scale_stride, int colwise_scale_stride,
+    int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
+    int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+    detail::ScalingRecipe rowwise_recipe, detail::ScalingRecipe colwise_recipe,
+    hipStream_t stream);
+
+template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                          detail::QuantizeMode mode, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          detail::ScalingRecipe recipe, hipStream_t stream);
+
+// *************** Grouped Padded Layout (GPU kernel) ***************
+void compute_padded_layout_gpu(const int64_t *group_lens, const int64_t *group_offs,
+                               int64_t *group_lens_padded, int64_t *group_offs_padded,
+                               int G, int64_t align, hipStream_t stream);
+
+// *************** Grouped Row Extract ***************
+void extract_grouped_rows_impl(const void *src, void *dst,
+                               const int64_t *group_offs_orig,
+                               const int64_t *group_offs_padded,
+                               int G, int64_t row_bytes, int64_t total_M_orig,
+                               hipStream_t stream);
 
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>

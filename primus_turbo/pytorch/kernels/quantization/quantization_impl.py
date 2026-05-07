@@ -334,6 +334,68 @@ def quantize_mxfp8_impl(
         )
 
 
+def quantize_mxfp8_dual_grouped_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP8 dual quantization fused with per-group M-axis zero-padding.
+
+    Each per-group region of ``x`` (defined by ``group_lens`` /
+    ``group_offs``) is virtually zero-padded along M to
+    ``MXFP8_PADDING_ALIGN_SIZE`` (=128).  The op:
+
+      1. Computes the padded per-group layout on GPU (single-thread
+         kernel; no D2H sync).
+      2. Allocates outputs at a host-known upper bound
+         ``ceil((total_M + G * align) / align) * align`` so the call
+         is fully async; the kernel skips OOB tiles.
+      3. Materialises the padded layout directly in the output tensors.
+
+    Returns ``(rowwise_fp8, rowwise_scale, colwise_fp8, colwise_scale,
+    group_lens_padded, group_offs_padded)``.  Rowwise has shape
+    ``(M_pad_upper, K_pad)``, colwise has shape ``(K, M_pad_upper)``;
+    only ``[0, group_offs_padded[-1])`` rows hold valid data, the rest
+    are uninitialized but are never touched by GEMM (which iterates
+    per-group via ``group_offs_padded``).
+    """
+    mxfp8_support, reason = check_mxfp8_support()
+    assert mxfp8_support, reason
+
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe_for_trans = (
+        ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+    )
+
+    return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_grouped(
+        x,
+        group_lens,
+        group_offs,
+        out_dtype,
+        scaling_recipe.use_2d_block,
+        scaling_recipe_for_trans.use_2d_block,
+        scaling_recipe.shuffle_scale,
+        scaling_recipe.shuffle_out,
+        scaling_recipe_for_trans.shuffle_scale,
+        scaling_recipe_for_trans.shuffle_out,
+    )
+
+
+def extract_grouped_rows_impl(
+    x_padded: torch.Tensor,
+    group_offs_orig: torch.Tensor,
+    group_offs_padded: torch.Tensor,
+    total_M_orig: int,
+) -> torch.Tensor:
+    """Single-kernel extraction of non-padded rows from a padded 2-D tensor."""
+    return torch.ops.primus_turbo_cpp_extension.extract_grouped_rows(
+        x_padded, group_offs_orig, group_offs_padded, int(total_M_orig)
+    )
+
+
 def dequantize_mxfp8_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
 ) -> torch.Tensor:

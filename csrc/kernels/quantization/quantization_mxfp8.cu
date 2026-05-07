@@ -887,6 +887,499 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
     }
 }
 
+/*
+ * MXFP8 Dual Quantization with per-group M-axis zero-padding (fused).
+ * --------------------------------------------------------------------
+ * Same as ``quantize_mxfp8_dual_kernel`` but each per-group region is
+ * zero-padded along M up to a 128 multiple in the OUTPUT tensors, with no
+ * intermediate padded copy of ``input``.  The kernel grid covers the
+ * already-padded M extent (``M_pad = total_M_padded``); within each
+ * 128-row tile (which by construction is fully contained in a single
+ * group thanks to ``group_offs_padded`` being multiple of BLOCK_M=128):
+ *
+ *   - Real rows (input row index = ``group_offs[g] + (global_row -
+ *     group_offs_padded[g])``) are loaded from ``input``.
+ *   - Padded rows (``global_row >= group_offs_padded[g] + M_g``) are
+ *     treated as zero data; their per-row / per-32 amax becomes 0 so we
+ *     force scale = 1.0 (E8M0_EXPONENT_BIAS) to keep output fp8 = 0
+ *     instead of NaN from a 0/0 conversion.
+ */
+template <typename IType, typename OType, bool ROWWISE_USE_2D_BLOCK = false,
+          bool COLWISE_USE_2D_BLOCK = false>
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grouped_kernel(
+    const IType *__restrict__ input, OType *__restrict__ rowwise_fp8,
+    uint8_t *__restrict__ rowwise_scale, OType *__restrict__ colwise_fp8,
+    uint8_t *__restrict__ colwise_scale, const int64_t *__restrict__ group_offs,
+    const int64_t *__restrict__ group_offs_padded, const int G, const int N, const int M_pad,
+    const int N_pad, const int rowwise_scale_stride, const int colwise_scale_stride,
+    const int rowwise_scale_N, const int rowwise_scale_M_pad, const int rowwise_scale_N_pad,
+    const int colwise_scale_M, const int colwise_scale_N, const int colwise_scale_M_pad,
+    const int colwise_scale_N_pad, const bool shuffle_rowwise, const bool shuffle_colwise,
+    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale) {
+    constexpr bool kIshalf = std::is_same_v<IType, dtype::float16>;
+
+    const int tid           = threadIdx.x;
+    const int warp_id       = tid / WARP_SIZE;
+    const int lane_id       = tid % WARP_SIZE;
+    const int row_in_warp   = lane_id / THREADS_PER_ROW;
+    const int thread_in_row = lane_id % THREADS_PER_ROW;
+
+    const int block_m = blockIdx.x;
+    const int block_n = blockIdx.y;
+    const int base_m  = block_m * BLOCK_M;
+    const int base_n  = block_n * BLOCK_N;
+
+    const int K_packed = N_pad;
+    const int M_packed = M_pad;
+
+    constexpr int ROWS_PER_PASS   = WARP_SIZE / THREADS_PER_ROW;
+    constexpr int PASSES_PER_TILE = MXFP8_BLOCK_SIZE / ROWS_PER_PASS;
+    constexpr int TOTAL_CHUNKS    = NUM_CHUNKS_M * NUM_CHUNKS_N;
+
+    // Per-tile group lookup.  base_m and group_offs_padded are both
+    // multiples of BLOCK_M (=128), so the entire 128-row tile lives in
+    // exactly one group — or *beyond* the last group when the grid is
+    // launched on a host-known upper bound (output tensors are always
+    // sized at the conservative ``M_pad_upper``; only
+    // ``[0, group_offs_padded[G])`` rows correspond to real groups).
+    //
+    // For an OOB tile we still execute the full kernel but force every
+    // row to take the zero-pad branch (``real_end_in_pad <= base_m``).
+    // Outputs end up as all-zero FP8 with scale = 1.0 (the same
+    // convention the kernel already uses for ``amax == 0`` tiles), so
+    // downstream consumers (preshuffle + GEMM) are race-free even
+    // though they read across the over-allocated region.
+    __shared__ int64_t s_group_offs_orig;
+    __shared__ int64_t s_group_offs_pad;
+    __shared__ int64_t s_real_end_in_pad;
+    if (tid == 0) {
+        int g = -1;
+        for (int i = 0; i < G; ++i) {
+            if (base_m >= group_offs_padded[i] && base_m < group_offs_padded[i + 1]) {
+                g = i;
+                break;
+            }
+        }
+        if (g >= 0) {
+            s_group_offs_orig = group_offs[g];
+            s_group_offs_pad  = group_offs_padded[g];
+            s_real_end_in_pad = group_offs_padded[g] + (group_offs[g + 1] - group_offs[g]);
+        } else {
+            s_group_offs_orig = 0;
+            s_group_offs_pad  = base_m;
+            s_real_end_in_pad = base_m;  // every row falls into zero-pad branch
+        }
+    }
+    __syncthreads();
+    const int64_t group_offs_orig = s_group_offs_orig;
+    const int64_t group_offs_pad  = s_group_offs_pad;
+    const int64_t real_end_in_pad = s_real_end_in_pad;
+
+    __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP8_BLOCK_SIZE][MXFP8_BLOCK_SIZE + SMEM_PADDING];
+    __shared__ uint32_t
+        s_colwise_fp8[NUM_CHUNKS_N][MXFP8_BLOCK_SIZE][NUM_CHUNKS_M * THREADS_PER_ROW];
+    __shared__ uint8_t s_colwise_scale[NUM_CHUNKS_N][MXFP8_BLOCK_SIZE][NUM_CHUNKS_M];
+
+    for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
+        const int chunk_idx = round + warp_id;
+        if (chunk_idx >= TOTAL_CHUNKS)
+            break;
+
+        const int chunk_m = chunk_idx / NUM_CHUNKS_N;
+        const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+        const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+        const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+
+        // ---------------- Load tile (input row remap + zero pad) -----------------
+        uint64_t r_tile[PASSES_PER_TILE];
+        {
+            const auto *input_u16  = reinterpret_cast<const uint16_t *>(input);
+            const int   col_base   = thread_in_row * ELEMS_PER_THREAD;
+            const int   global_col = tile_n + col_base;
+
+#pragma unroll
+            for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
+                const int local_row  = pass * ROWS_PER_PASS + row_in_warp;
+                const int global_row = tile_m + local_row;
+
+                uint64_t packed = 0;
+                if (global_row < real_end_in_pad) {
+                    const int64_t input_row =
+                        group_offs_orig + (static_cast<int64_t>(global_row) - group_offs_pad);
+                    const int64_t row_offset = input_row * N + global_col;
+                    if (global_col + ELEMS_PER_THREAD - 1 < N) {
+                        packed = __ldg(reinterpret_cast<const uint64_t *>(&input_u16[row_offset]));
+                    } else {
+                        uint16_t s0 = (global_col < N) ? __ldg(&input_u16[row_offset]) : 0;
+                        uint16_t s1 = (global_col + 1 < N) ? __ldg(&input_u16[row_offset + 1]) : 0;
+                        uint16_t s2 = (global_col + 2 < N) ? __ldg(&input_u16[row_offset + 2]) : 0;
+                        uint16_t s3 = (global_col + 3 < N) ? __ldg(&input_u16[row_offset + 3]) : 0;
+                        packed = (uint64_t) s0 | ((uint64_t) s1 << 16) | ((uint64_t) s2 << 32) |
+                                 ((uint64_t) s3 << 48);
+                    }
+                }
+
+                *reinterpret_cast<uint32_t *>(&s_tile[warp_id][local_row][col_base]) =
+                    (uint32_t) packed;
+                *reinterpret_cast<uint32_t *>(&s_tile[warp_id][local_row][col_base + 2]) =
+                    (uint32_t) (packed >> 32);
+
+                r_tile[pass] = packed;
+            }
+        }
+
+        // ---------------- Rowwise: amax + scale (with zero-amax safe path) -------
+        float r_rowwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
+        float r_rowwise_amax[PASSES_PER_TILE];
+
+#pragma unroll
+        for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
+            r_rowwise_vals[pass][0] = r_rowwise_vals[pass][1] = r_rowwise_vals[pass][2] =
+                r_rowwise_vals[pass][3]                       = 0.f;
+            r_rowwise_amax[pass]                              = 0.f;
+
+            const int global_row = tile_m + pass * ROWS_PER_PASS + row_in_warp;
+            if (global_row < real_end_in_pad) {
+                packed_uint16x4_to_floatx4<kIshalf>(r_tile[pass], r_rowwise_vals[pass][0],
+                                                    r_rowwise_vals[pass][1],
+                                                    r_rowwise_vals[pass][2],
+                                                    r_rowwise_vals[pass][3]);
+                float local_amax =
+                    fmaxf(fmaxf(fabsf(r_rowwise_vals[pass][0]), fabsf(r_rowwise_vals[pass][1])),
+                          fmaxf(fabsf(r_rowwise_vals[pass][2]), fabsf(r_rowwise_vals[pass][3])));
+                r_rowwise_amax[pass] = warp_reduce_max_8_dpp(local_amax);
+            }
+        }
+
+        float   r_rowwise_scale_native[PASSES_PER_TILE];
+        uint8_t r_rowwise_scale_e8m0[PASSES_PER_TILE];
+
+        if constexpr (ROWWISE_USE_2D_BLOCK) {
+            float tile_amax = 0.f;
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++)
+                tile_amax = fmaxf(tile_amax, r_rowwise_amax[p]);
+            tile_amax = warp_reduce_max_64_dpp(tile_amax);
+            float   r_scale_native;
+            uint8_t r_scale_e8m0;
+            if (tile_amax == 0.f) {
+                r_scale_native = 1.0f;
+                r_scale_e8m0   = E8M0_EXPONENT_BIAS;
+            } else {
+                compute_tile_scale<OType>(tile_amax, r_scale_native, r_scale_e8m0);
+            }
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++) {
+                r_rowwise_scale_native[p] = r_scale_native;
+                r_rowwise_scale_e8m0[p]   = r_scale_e8m0;
+            }
+        } else {
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++) {
+                if (r_rowwise_amax[p] == 0.f) {
+                    r_rowwise_scale_native[p] = 1.0f;
+                    r_rowwise_scale_e8m0[p]   = E8M0_EXPONENT_BIAS;
+                } else {
+                    compute_tile_scale<OType>(r_rowwise_amax[p], r_rowwise_scale_native[p],
+                                              r_rowwise_scale_e8m0[p]);
+                }
+            }
+        }
+
+        // ---------------- Rowwise: store FP8 + scale (write all rows up to M_pad) -
+        {
+            const int col_base   = thread_in_row * ELEMS_PER_THREAD;
+            const int global_col = tile_n + col_base;
+
+#pragma unroll
+            for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
+                const int local_row  = pass * ROWS_PER_PASS + row_in_warp;
+                const int global_row = tile_m + local_row;
+
+                if (global_row < M_pad) {
+                    uint32_t fp8x4 = cvt_f32x4_to_fp8x4<OType>(
+                        r_rowwise_vals[pass][0], r_rowwise_vals[pass][1], r_rowwise_vals[pass][2],
+                        r_rowwise_vals[pass][3], r_rowwise_scale_native[pass]);
+
+                    if (global_col < N_pad) {
+                        if (shuffle_rowwise) {
+                            int shuffled_idx =
+                                compute_shuffled_index<OType>(global_row, global_col, K_packed);
+                            *reinterpret_cast<uint32_t *>(rowwise_fp8 + shuffled_idx) = fp8x4;
+                        } else {
+                            *reinterpret_cast<uint32_t *>(
+                                rowwise_fp8 + static_cast<int64_t>(global_row) * K_packed +
+                                global_col) = fp8x4;
+                        }
+                    }
+
+                    if (thread_in_row == 0) {
+                        int scale_col = block_n * NUM_CHUNKS_N + chunk_n;
+                        if (shuffle_rowwise_scale) {
+                            if (scale_col < rowwise_scale_N && global_row < rowwise_scale_M_pad &&
+                                scale_col < rowwise_scale_N_pad) {
+                                int idx = compute_shuffle_scale_index(global_row, scale_col,
+                                                                      rowwise_scale_N_pad);
+                                rowwise_scale[idx] = r_rowwise_scale_e8m0[pass];
+                            }
+                        } else {
+                            if (scale_col < rowwise_scale_N) {
+                                rowwise_scale[global_row * rowwise_scale_stride + scale_col] =
+                                    r_rowwise_scale_e8m0[pass];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // ---------------- Colwise: amax + scale (with zero-amax safe path) -------
+        float r_colwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
+        float r_colwise_amax[PASSES_PER_TILE];
+        {
+            const int row_base = thread_in_row * ELEMS_PER_THREAD;
+#pragma unroll
+            for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
+                const int local_col  = pass * ROWS_PER_PASS + row_in_warp;
+                const int global_col = tile_n + local_col;
+
+                r_colwise_vals[pass][0] = r_colwise_vals[pass][1] = r_colwise_vals[pass][2] =
+                    r_colwise_vals[pass][3]                       = 0.f;
+                r_colwise_amax[pass]                              = 0.f;
+
+                if (global_col < N) {
+                    r_colwise_vals[pass][0] =
+                        uint16_to_float<kIshalf>(s_tile[warp_id][row_base][local_col]);
+                    r_colwise_vals[pass][1] =
+                        uint16_to_float<kIshalf>(s_tile[warp_id][row_base + 1][local_col]);
+                    r_colwise_vals[pass][2] =
+                        uint16_to_float<kIshalf>(s_tile[warp_id][row_base + 2][local_col]);
+                    r_colwise_vals[pass][3] =
+                        uint16_to_float<kIshalf>(s_tile[warp_id][row_base + 3][local_col]);
+
+                    float local_amax = fmaxf(
+                        fmaxf(fabsf(r_colwise_vals[pass][0]), fabsf(r_colwise_vals[pass][1])),
+                        fmaxf(fabsf(r_colwise_vals[pass][2]), fabsf(r_colwise_vals[pass][3])));
+                    r_colwise_amax[pass] = warp_reduce_max_8_dpp(local_amax);
+                }
+            }
+        }
+
+        float   r_colwise_scale_native[PASSES_PER_TILE];
+        uint8_t r_colwise_scale_e8m0[PASSES_PER_TILE];
+
+        if constexpr (COLWISE_USE_2D_BLOCK) {
+            float tile_amax = 0.f;
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++)
+                tile_amax = fmaxf(tile_amax, r_colwise_amax[p]);
+            tile_amax = warp_reduce_max_64_dpp(tile_amax);
+            float   r_scale_native;
+            uint8_t r_scale_e8m0;
+            if (tile_amax == 0.f) {
+                r_scale_native = 1.0f;
+                r_scale_e8m0   = E8M0_EXPONENT_BIAS;
+            } else {
+                compute_tile_scale<OType>(tile_amax, r_scale_native, r_scale_e8m0);
+            }
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++) {
+                r_colwise_scale_native[p] = r_scale_native;
+                r_colwise_scale_e8m0[p]   = r_scale_e8m0;
+            }
+        } else {
+#pragma unroll
+            for (int p = 0; p < PASSES_PER_TILE; p++) {
+                if (r_colwise_amax[p] == 0.f) {
+                    r_colwise_scale_native[p] = 1.0f;
+                    r_colwise_scale_e8m0[p]   = E8M0_EXPONENT_BIAS;
+                } else {
+                    compute_tile_scale<OType>(r_colwise_amax[p], r_colwise_scale_native[p],
+                                              r_colwise_scale_e8m0[p]);
+                }
+            }
+        }
+
+        // ---------------- Colwise: store FP8 + scale ----------------------------
+        {
+            const int row_base        = thread_in_row * ELEMS_PER_THREAD;
+            const int global_row_base = tile_m + row_base;
+
+#pragma unroll
+            for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
+                const int local_col  = pass * ROWS_PER_PASS + row_in_warp;
+                const int global_col = tile_n + local_col;
+
+                if (global_col < N) {
+                    uint32_t fp8x4 = cvt_f32x4_to_fp8x4<OType>(
+                        r_colwise_vals[pass][0], r_colwise_vals[pass][1], r_colwise_vals[pass][2],
+                        r_colwise_vals[pass][3], r_colwise_scale_native[pass]);
+
+                    if (global_row_base < M_pad) {
+                        if (shuffle_colwise) {
+                            int shuffled_idx = compute_shuffled_index<OType>(
+                                global_col, global_row_base, M_packed);
+                            *reinterpret_cast<uint32_t *>(colwise_fp8 + shuffled_idx) = fp8x4;
+                        } else {
+                            s_colwise_fp8[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
+                                         [chunk_m * THREADS_PER_ROW + thread_in_row] = fp8x4;
+                        }
+                    }
+
+                    if (thread_in_row == 0) {
+                        int scale_col = block_m * NUM_CHUNKS_M + chunk_m;
+                        if (shuffle_colwise_scale) {
+                            if (scale_col < colwise_scale_N && global_col < colwise_scale_M_pad &&
+                                scale_col < colwise_scale_N_pad) {
+                                int idx = compute_shuffle_scale_index(global_col, scale_col,
+                                                                      colwise_scale_N_pad);
+                                colwise_scale[idx] = r_colwise_scale_e8m0[pass];
+                            }
+                        } else {
+                            s_colwise_scale[chunk_n][pass * ROWS_PER_PASS + row_in_warp][chunk_m] =
+                                (scale_col < colwise_scale_N) ? r_colwise_scale_e8m0[pass]
+                                                              : E8M0_EXPONENT_BIAS;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Coalesced colwise FP8/scale write-out from LDS (non-shuffle path).
+    {
+        if (!shuffle_colwise || !shuffle_colwise_scale) {
+            __syncthreads();
+        }
+
+        if (!shuffle_colwise_scale) {
+            constexpr int SCALE_ITEMS = NUM_CHUNKS_N * MXFP8_BLOCK_SIZE * NUM_CHUNKS_M;
+            static_assert(SCALE_ITEMS <= THREADS_PER_BLOCK,
+                          "Scale write mapping expects <= one item per thread");
+            if (tid < SCALE_ITEMS) {
+                const int n_chunk      = tid / (MXFP8_BLOCK_SIZE * NUM_CHUNKS_M);
+                const int local_tid    = tid % (MXFP8_BLOCK_SIZE * NUM_CHUNKS_M);
+                const int col_in_chunk = local_tid / NUM_CHUNKS_M;
+                const int m_chunk      = local_tid % NUM_CHUNKS_M;
+
+                const int global_col = base_n + n_chunk * MXFP8_BLOCK_SIZE + col_in_chunk;
+                const int scale_col  = block_m * NUM_CHUNKS_M + m_chunk;
+
+                if (scale_col < colwise_scale_N && global_col < N) {
+                    const uint8_t scale_val = s_colwise_scale[n_chunk][col_in_chunk][m_chunk];
+                    colwise_scale[global_col * colwise_scale_stride + scale_col] = scale_val;
+                }
+            }
+        }
+
+        if (!shuffle_colwise) {
+            constexpr int ITEMS_PER_COL = NUM_CHUNKS_M * THREADS_PER_ROW;
+            constexpr int SEGS_PER_COL  = ITEMS_PER_COL / 4;
+            static_assert(ITEMS_PER_COL % 4 == 0, "ITEMS_PER_COL must be divisible by 4");
+            static_assert(THREADS_PER_BLOCK == NUM_CHUNKS_N * MXFP8_BLOCK_SIZE * SEGS_PER_COL,
+                          "Thread count must exactly cover all colwise FP8 segments");
+
+            const int n_chunk      = tid / (MXFP8_BLOCK_SIZE * SEGS_PER_COL);
+            const int local_tid    = tid % (MXFP8_BLOCK_SIZE * SEGS_PER_COL);
+            const int col_in_chunk = local_tid / SEGS_PER_COL;
+            const int seg          = local_tid % SEGS_PER_COL;
+
+            const int global_col = base_n + n_chunk * MXFP8_BLOCK_SIZE + col_in_chunk;
+            if (global_col < N) {
+                const uint4 data = *reinterpret_cast<const uint4 *>(
+                    &s_colwise_fp8[n_chunk][col_in_chunk][seg * 4]);
+                const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
+                if (row_start < M_pad) {
+                    *reinterpret_cast<uint4 *>(
+                        colwise_fp8 + static_cast<int64_t>(global_col) * M_packed + row_start) =
+                        data;
+                }
+            }
+        }
+    }
+}
+
+template <typename IType, typename OType>
+void quantize_mxfp8_dual_grouped_impl(
+    const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
+    uint8_t *colwise_scale, const int64_t *group_offs, const int64_t *group_offs_padded, int G,
+    int total_M_padded, int N, int N_pad, int rowwise_scale_stride, int colwise_scale_stride,
+    int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
+    int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_sr == false, "MXFP8 not support SR");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_sr == false, "MXFP8 not support SR");
+
+    dim3 grid((total_M_padded + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
+    dim3 block(THREADS_PER_BLOCK);
+
+#define QUANTIZE_MXFP8_DUAL_GROUPED                                                                \
+    input, rowwise_output, rowwise_scale, colwise_output, colwise_scale, group_offs,               \
+        group_offs_padded, G, N, total_M_padded, N_pad, rowwise_scale_stride,                      \
+        colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad,           \
+        colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,                \
+        rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out, rowwise_recipe.shuffle_scale,      \
+        colwise_recipe.shuffle_scale
+
+#define QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)             \
+    quantize_mxfp8_dual_grouped_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>   \
+        <<<grid, block, 0, stream>>>(QUANTIZE_MXFP8_DUAL_GROUPED)
+
+    if (rowwise_recipe.use_2d_block) {
+        if (colwise_recipe.use_2d_block) {
+            QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(true, true);
+        } else {
+            QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(true, false);
+        }
+    } else {
+        if (colwise_recipe.use_2d_block) {
+            QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(false, true);
+        } else {
+            QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(false, false);
+        }
+    }
+
+#undef QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH
+#undef QUANTIZE_MXFP8_DUAL_GROUPED
+}
+
+template void quantize_mxfp8_dual_grouped_impl<dtype::float16, dtype::float8_e5m2>(
+    const dtype::float16 *x, dtype::float8_e5m2 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e5m2 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
+    const int64_t *group_offs_padded, int G, int total_M_padded, int N, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
+    ScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp8_dual_grouped_impl<dtype::bfloat16, dtype::float8_e5m2>(
+    const dtype::bfloat16 *x, dtype::float8_e5m2 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e5m2 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
+    const int64_t *group_offs_padded, int G, int total_M_padded, int N, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
+    ScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp8_dual_grouped_impl<dtype::float16, dtype::float8_e4m3>(
+    const dtype::float16 *x, dtype::float8_e4m3 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e4m3 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
+    const int64_t *group_offs_padded, int G, int total_M_padded, int N, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
+    ScalingRecipe colwise_recipe, hipStream_t stream);
+template void quantize_mxfp8_dual_grouped_impl<dtype::bfloat16, dtype::float8_e4m3>(
+    const dtype::bfloat16 *x, dtype::float8_e4m3 *rowwise_output, uint8_t *rowwise_scale,
+    dtype::float8_e4m3 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
+    const int64_t *group_offs_padded, int G, int total_M_padded, int N, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
+    ScalingRecipe colwise_recipe, hipStream_t stream);
+
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
                               OType *colwise_output, uint8_t *colwise_scale, int M, int N,
@@ -1021,5 +1514,119 @@ template void quantize_mxfp8_impl<dtype::bfloat16, dtype::float8_e4m3>(
     const dtype::bfloat16 *x, dtype::float8_e4m3 *output, uint8_t *scale, QuantizeMode mode, int M,
     int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
     ScalingRecipe recipe, hipStream_t stream);
+
+// ========================================================================
+// compute_padded_layout_kernel: compute padded group lens/offs on GPU
+// ========================================================================
+// Single-thread kernel; G is typically 4–64 so latency is negligible.
+
+__global__ void compute_padded_layout_kernel(
+    const int64_t *__restrict__ group_lens,
+    const int64_t *__restrict__ group_offs,
+    int64_t *__restrict__ group_lens_padded,
+    int64_t *__restrict__ group_offs_padded,
+    int G, int64_t align) {
+    if (threadIdx.x != 0) return;
+    int64_t offset = 0;
+    group_offs_padded[0] = 0;
+    for (int i = 0; i < G; ++i) {
+        int64_t m_pad = (group_lens[i] + align - 1) / align * align;
+        group_lens_padded[i] = m_pad;
+        offset += m_pad;
+        group_offs_padded[i + 1] = offset;
+    }
+}
+
+void compute_padded_layout_gpu(
+    const int64_t *group_lens, const int64_t *group_offs,
+    int64_t *group_lens_padded, int64_t *group_offs_padded,
+    int G, int64_t align, hipStream_t stream) {
+    compute_padded_layout_kernel<<<1, 1, 0, stream>>>(
+        group_lens, group_offs, group_lens_padded, group_offs_padded,
+        G, align);
+}
+
+// ========================================================================
+// extract_grouped_rows: single-kernel replacement for G × .copy_() calls
+// ========================================================================
+//
+// Copies non-padded rows from a (total_M_padded, N) padded tensor to a
+// dense (total_M_orig, N) output tensor, using group_offs_orig /
+// group_offs_padded to map each output row to its source row.
+//
+// Grid:   ((total_M_orig + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK,)
+// Block:  (256) — each block copies ROWS_PER_BLOCK rows; threads stride
+//         over (ROWS_PER_BLOCK × num_vec) float4 elements.
+
+template <int ROWS_PER_BLOCK>
+__global__ void extract_grouped_rows_kernel(
+    const char *__restrict__ src, char *__restrict__ dst,
+    const int64_t *__restrict__ group_offs_orig,
+    const int64_t *__restrict__ group_offs_padded,
+    int G, int64_t num_vec, int64_t total_M_orig) {
+
+    constexpr int MAX_GROUPS = 128;
+    __shared__ int64_t s_orig[MAX_GROUPS + 1];
+    __shared__ int64_t s_pad[MAX_GROUPS + 1];
+
+    for (int i = threadIdx.x; i <= G; i += blockDim.x) {
+        s_orig[i] = group_offs_orig[i];
+        s_pad[i]  = group_offs_padded[i];
+    }
+    __syncthreads();
+
+    const int64_t base_out_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_BLOCK;
+
+    // Map each of the ROWS_PER_BLOCK rows in this CTA to its source row.
+    __shared__ int64_t s_src_row[ROWS_PER_BLOCK];
+    if (threadIdx.x < ROWS_PER_BLOCK) {
+        const int64_t out_row = base_out_row + threadIdx.x;
+        int64_t src_row = -1;
+        if (out_row < total_M_orig) {
+            int g = G - 1;
+            for (int i = 0; i < G; ++i) {
+                if (out_row < s_orig[i + 1]) { g = i; break; }
+            }
+            src_row = s_pad[g] + (out_row - s_orig[g]);
+        }
+        s_src_row[threadIdx.x] = src_row;
+    }
+    __syncthreads();
+
+    const float4 *src_v4 = reinterpret_cast<const float4 *>(src);
+    float4       *dst_v4 = reinterpret_cast<float4 *>(dst);
+
+    // Cooperatively copy ROWS_PER_BLOCK rows × num_vec float4s, striding
+    // across threads.  Memory access is fully coalesced per row.
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
+        const int64_t out_row = base_out_row + r;
+        if (out_row >= total_M_orig) break;
+        const int64_t src_row = s_src_row[r];
+        const float4 *sp = src_v4 + src_row * num_vec;
+        float4       *dp = dst_v4 + out_row * num_vec;
+        for (int64_t idx = threadIdx.x; idx < num_vec; idx += blockDim.x) {
+            dp[idx] = sp[idx];
+        }
+    }
+}
+
+void extract_grouped_rows_impl(
+    const void *src, void *dst,
+    const int64_t *group_offs_orig, const int64_t *group_offs_padded,
+    int G, int64_t row_bytes, int64_t total_M_orig, hipStream_t stream) {
+
+    constexpr int ROWS_PER_BLOCK = 8;
+    constexpr int kBlockX        = 256;
+
+    const int64_t num_vec = row_bytes >> 4;  // row_bytes / 16
+    const dim3    grid(static_cast<int>((total_M_orig + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK));
+    const dim3    block(kBlockX);
+
+    extract_grouped_rows_kernel<ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const char *>(src), static_cast<char *>(dst),
+        group_offs_orig, group_offs_padded,
+        G, num_vec, total_M_orig);
+}
 
 } // namespace primus_turbo

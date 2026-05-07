@@ -51,8 +51,15 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool rowwise_use_2d_block, bool colwise_use_2d_block, "
           "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
           "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
+    m.def("quantize_mxfp8_dual_grouped(Tensor input, Tensor group_lens, Tensor group_offs, "
+          "ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool colwise_use_2d_block, "
+          "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
+          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
     m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
           "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+    m.def("extract_grouped_rows(Tensor x_padded, Tensor group_offs_orig, "
+          "Tensor group_offs_padded, int total_M_orig) -> Tensor");
 
     // ********* Shuffle *********
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
@@ -106,7 +113,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
+    m.impl("quantize_mxfp8_dual_grouped", quantize_mxfp8_dual_grouped);
     m.impl("quantize_mxfp8", quantize_mxfp8);
+    m.impl("extract_grouped_rows", extract_grouped_rows);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl);
@@ -147,7 +156,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
+    m.impl("quantize_mxfp8_dual_grouped", quantize_mxfp8_dual_grouped_meta);
     m.impl("quantize_mxfp8", quantize_mxfp8_meta);
+    m.impl("extract_grouped_rows", extract_grouped_rows_meta);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
