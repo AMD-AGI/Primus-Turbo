@@ -12,15 +12,18 @@
 namespace primus_turbo::pytorch {
 
 // MX_BLOCKWISE NT launch.  Layout:
-//   A:        [total_M, K]              FP8
+//   A:        [total_M_in,  K]          FP8       (per-group-padded along M)
 //   B:        [group_num, N, K]         FP8
-//   C:        [total_M, N]              FP16/BF16
-//   a_scales: [total_M, K/32]           E8M0  (or int32 when preshuffled)
+//   C:        [total_M_out, N]          FP16/BF16 (unpadded; uses c_group_offs)
+//   a_scales: [total_M_in, K/32]        E8M0  (or int32 when preshuffled)
 //   b_scales: [group_num, N, K/32]      E8M0
-//   group_lens [G] / group_offs [G+1]   int64
+//   group_lens [G] / group_offs [G+1]   int64    real per-group M + INPUT-row offsets
+//   c_group_offs (optional) [G+1] int64           OUTPUT-row offsets; default = group_offs
 static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::Tensor &b,
                                        at::Tensor &b_scales, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const at::ScalarType out_dtype,
+                                       at::Tensor &group_offs,
+                                       const c10::optional<at::Tensor> &c_group_offs,
+                                       int64_t total_m_out, const at::ScalarType out_dtype,
                                        bool transA, bool transB, int64_t grid_x_hint,
                                        bool b_scale_preshuffled) {
     PRIMUS_TURBO_CHECK(a_scales.scalar_type() == at::kFloat8_e8m0fnu, "Scale A must be E8M0.");
@@ -31,34 +34,47 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
     } else {
         PRIMUS_TURBO_CHECK(b_scales.scalar_type() == at::kFloat8_e8m0fnu, "Scale B must be E8M0.");
     }
-    PRIMUS_TURBO_CHECK(a_scales.dim() == 2, "Scale A must be 2D [total_M, K/32].");
+    PRIMUS_TURBO_CHECK(a_scales.dim() == 2, "Scale A must be 2D [total_M_in, K/32].");
     PRIMUS_TURBO_CHECK(b_scales.dim() == 3, "Scale B must be 3D [group_num, N, K/32].");
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong, "group_lens must be int64.");
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong, "group_offs must be int64.");
+    if (c_group_offs.has_value()) {
+        PRIMUS_TURBO_CHECK(c_group_offs->scalar_type() == at::kLong,
+                           "c_group_offs must be int64.");
+    }
 
     PRIMUS_TURBO_CHECK(!transA && transB,
                        "turbo_grouped_gemm_fp8 MX_BLOCKWISE only supports NT layout.");
 
-    PRIMUS_TURBO_CHECK(a.dim() == 2, "A must be 2D [total_M, K].");
+    PRIMUS_TURBO_CHECK(a.dim() == 2, "A must be 2D [total_M_in, K].");
     PRIMUS_TURBO_CHECK(b.dim() == 3, "B must be 3D [group_num, N, K].");
 
-    const int64_t total_m   = a.size(0);
-    const int64_t k         = a.size(1);
-    const int64_t group_num = b.size(0);
-    const int64_t n         = b.size(1);
+    const int64_t total_m_in = a.size(0);
+    const int64_t k          = a.size(1);
+    const int64_t group_num  = b.size(0);
+    const int64_t n          = b.size(1);
+    // Default total_m_out to the input size (legacy behaviour: write to
+    // ``[total_m_in, N]``, no per-group padding compression).
+    if (total_m_out <= 0) {
+        total_m_out = total_m_in;
+    }
     PRIMUS_TURBO_CHECK(k == b.size(2), "K dimension mismatch between A and B.");
     PRIMUS_TURBO_CHECK(group_lens.numel() == group_num,
                        "group_lens.numel() must equal group_num (B.size(0)).");
     PRIMUS_TURBO_CHECK(group_offs.numel() == group_num + 1,
                        "group_offs.numel() must equal group_num + 1.");
+    if (c_group_offs.has_value()) {
+        PRIMUS_TURBO_CHECK(c_group_offs->numel() == group_num + 1,
+                           "c_group_offs.numel() must equal group_num + 1.");
+    }
 
     PRIMUS_TURBO_CHECK(n % 16 == 0, "N must be multiple of 16.");
     PRIMUS_TURBO_CHECK(k % 128 == 0, "K must be multiple of 128.");
     PRIMUS_TURBO_CHECK(k >= 384, "K must be >= 384.");
-    PRIMUS_TURBO_CHECK(total_m % 16 == 0,
-                       "total_M must be multiple of 16 (per-group M_g preshuffle alignment).");
+    PRIMUS_TURBO_CHECK(total_m_in % 16 == 0,
+                       "total_M_in must be multiple of 16 (per-group preshuffle alignment).");
 
-    at::Tensor c = at::empty({total_m, n}, torch::dtype(out_dtype).device(a.device()));
+    at::Tensor c = at::empty({total_m_out, n}, torch::dtype(out_dtype).device(a.device()));
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -76,7 +92,7 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
     }
 
     const size_t ws_size = primus_turbo::turbo_grouped_gemm_mxfp8_workspace_size(
-        total_m, group_num, n, k, b_scale_preshuffled);
+        total_m_in, group_num, n, k, b_scale_preshuffled);
     at::Tensor workspace =
         at::empty({(int64_t) ws_size}, torch::dtype(at::kByte).device(a.device()));
 
@@ -96,8 +112,12 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
                     reinterpret_cast<const dtype::float8_e8m0 *>(b_scales.data_ptr());
                 params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
                 params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+                params.c_group_offs_ptr =
+                    c_group_offs.has_value()
+                        ? reinterpret_cast<const int64_t *>(c_group_offs->data_ptr())
+                        : nullptr;
                 params.group_num = (int32_t) group_num;
-                params.total_m   = (int32_t) total_m;
+                params.total_m   = (int32_t) total_m_in;
                 params.n         = (int32_t) n;
                 params.k         = (int32_t) k;
                 params.workspace = workspace.data_ptr();
@@ -186,7 +206,9 @@ static at::Tensor launch_mxfp8_grouped_wgrad(at::Tensor &lhs, at::Tensor &lhs_sc
 
 at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                   at::Tensor &b_scales, at::Tensor &group_lens,
-                                  at::Tensor &group_offs, const bool transA, const bool transB,
+                                  at::Tensor &group_offs,
+                                  const c10::optional<at::Tensor> &c_group_offs,
+                                  int64_t total_m_out, const bool transA, const bool transB,
                                   at::ScalarType out_dtype, const std::string &granularity,
                                   const int64_t grid_x_hint, const bool b_scale_preshuffled) {
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()), "A must be FP8.");
@@ -198,8 +220,9 @@ at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
     PRIMUS_TURBO_CHECK(b_scales.is_contiguous(), "b_scales must be contiguous.");
 
     if (granularity == "MX_BLOCKWISE") {
-        return launch_mxfp8_grouped(a, a_scales, b, b_scales, group_lens, group_offs, out_dtype,
-                                    transA, transB, grid_x_hint, b_scale_preshuffled);
+        return launch_mxfp8_grouped(a, a_scales, b, b_scales, group_lens, group_offs, c_group_offs,
+                                    total_m_out, out_dtype, transA, transB, grid_x_hint,
+                                    b_scale_preshuffled);
     }
 
     PRIMUS_TURBO_ERROR("turbo_grouped_gemm_fp8: unsupported granularity '" + granularity + "'.");
@@ -208,13 +231,16 @@ at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
 
 at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                        at::Tensor &b_scales, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const bool transA, const bool transB,
+                                       at::Tensor &group_offs,
+                                       const c10::optional<at::Tensor> &c_group_offs,
+                                       int64_t total_m_out, const bool transA, const bool transB,
                                        at::ScalarType out_dtype, const std::string &granularity,
                                        const int64_t grid_x_hint,
                                        const bool b_scale_preshuffled) {
     (void) grid_x_hint;
     (void) b_scale_preshuffled;
-    const int64_t total_m = a.size(0);
+    (void) c_group_offs;
+    const int64_t total_m = total_m_out > 0 ? total_m_out : a.size(0);
     const int64_t n       = transB ? b.size(1) : b.size(2);
     return at::empty({total_m, n}, at::dtype(out_dtype).device(at::kMeta));
 }

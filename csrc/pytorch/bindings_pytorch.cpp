@@ -86,7 +86,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, bool pre_sync) -> Tensor");
     m.def("turbo_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
-          "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
+          "Tensor group_lens, Tensor group_offs, Tensor? c_group_offs, "
+          "int total_m_out, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, int grid_x_hint=0, "
           "bool b_scale_preshuffled=False) -> Tensor");
     m.def("turbo_preshuffle_mxfp8_scale_16x4(Tensor scale) -> Tensor");

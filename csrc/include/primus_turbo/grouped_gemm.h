@@ -107,18 +107,33 @@ void ck_grouped_gemm_fp8_variable_k(
 //==================================================================
 
 template <typename AType, typename BType, typename CType> struct TurboGroupedGemmMXFP8Params {
-    const AType *a_ptr = nullptr; // [total_M, K]
+    const AType *a_ptr = nullptr; // [total_M_in,  K]   (input layout: may be padded)
     const BType *b_ptr = nullptr; // [group_num, N, K]
-    CType       *c_ptr = nullptr; // [total_M, N]
+    CType       *c_ptr = nullptr; // [total_M_out, N]   (output layout: c_group_offs_ptr)
 
-    const dtype::float8_e8m0 *a_scale_ptr = nullptr; // [total_M, K/32], E8M0
+    const dtype::float8_e8m0 *a_scale_ptr = nullptr; // [total_M_in, K/32], E8M0
     const dtype::float8_e8m0 *b_scale_ptr = nullptr; // [group_num, N, K/32], E8M0
 
+    // Input layout (real-row count + cumulative offsets, both in the
+    // *INPUT* tensor's row space).  ``group_lens_ptr[g]`` is the number
+    // of *real* rows (used as the compute bound — padding rows are not
+    // visited); ``group_offs_ptr[g]`` is where group g's real rows
+    // start in the input (which may be a per-group-padded layout, in
+    // which case offsets are equal to group_lens_padded prefix sums).
     const int64_t *group_lens_ptr = nullptr; // [group_num]
-    const int64_t *group_offs_ptr = nullptr; // [group_num+1], cumulative row offsets
+    const int64_t *group_offs_ptr = nullptr; // [group_num+1]
+
+    // Optional output-row offsets.  When non-null, the GEMM writes
+    // group g's output rows starting at ``c_group_offs_ptr[g]`` (i.e.
+    // the *original* unpadded layout) instead of ``group_offs_ptr[g]``.
+    // Allows the caller to skip a separate extract pass for grouped
+    // MXFP8 with per-group-padded inputs: balanced+aligned hits the
+    // identity case (zero overhead) and unbalanced cases compress
+    // padding rows away as part of the GEMM store.
+    const int64_t *c_group_offs_ptr = nullptr; // [group_num+1] or null
 
     int32_t group_num = 0;
-    int32_t total_m   = 0;
+    int32_t total_m   = 0; // total INPUT rows (a's first dim).
     int32_t n         = 0;
     int32_t k         = 0;
 

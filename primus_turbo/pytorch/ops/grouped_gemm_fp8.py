@@ -115,14 +115,26 @@ def _mxfp8_grid_x_hint(total_M: int, G: int) -> int:
 
 def _turbo_grouped_gemm_mxfp8(
     a_fp8, b_fp8, a_scales, b_scales,
-    group_lens, group_offs, out_dtype, grid_x_hint=0, b_scale_preshuffled=False,
+    group_lens, group_offs_in, out_dtype, *,
+    c_group_offs=None, total_m_out=0,
+    grid_x_hint=0, b_scale_preshuffled=False,
 ):
     """Direct call to turbo_grouped_gemm_fp8 MX_BLOCKWISE NT, bypassing
     the Python dispatcher (saves ~10-20 µs per call) and passing
     ``grid_x_hint`` so the GEMM op skips its internal
-    ``group_lens.cpu()`` sync."""
+    ``group_lens.cpu()`` sync.
+
+    For per-group-padded inputs, pass ``group_offs_in =
+    group_offs_padded`` (input row offsets), ``c_group_offs =
+    group_offs`` (output row offsets — original/unpadded layout), and
+    ``total_m_out = a.size(0)`` (original total_M).  The kernel writes
+    only real rows directly to the unpadded output, fusing the extract
+    pass.  When the layout is identity (balanced+aligned: ``group_offs
+    == group_offs_padded``) ``c_group_offs`` may be left as ``None``.
+    """
     return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
-        a_fp8, b_fp8, a_scales, b_scales, group_lens, group_offs,
+        a_fp8, b_fp8, a_scales, b_scales, group_lens, group_offs_in,
+        c_group_offs, int(total_m_out),
         False, True, out_dtype, "MX_BLOCKWISE", int(grid_x_hint), bool(b_scale_preshuffled),
     )
 
@@ -527,13 +539,20 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         b_fp8_row = b_fp8_row_2d.reshape(G, N, -1)
         b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, -1)
 
-        # Forward on padded layout, then strip back to (total_M, N).
-        out_padded = _turbo_grouped_gemm_mxfp8(
+        # Forward GEMM writes directly to the unpadded (total_M, N)
+        # output via ``c_group_offs``: the kernel iterates real rows
+        # only (compute bound = ``group_lens``, the *original*
+        # per-group lengths) and stores at row indices given by
+        # ``group_offs``.  Inputs still come from the padded FP8 layout
+        # via ``group_offs_padded``.  When balanced+aligned
+        # ``group_offs == group_offs_padded`` so this is a pure
+        # contiguous write — no extra cost vs the legacy single-layout
+        # call.
+        out = _turbo_grouped_gemm_mxfp8(
             a_fp8_row, b_fp8_row, a_scale_inv_row, b_scale_inv_row,
-            group_lens_padded, group_offs_padded, out_dtype, grid_x_hint=grid_x_hint,
-        )
-        out = extract_grouped_rows_impl(
-            out_padded, group_offs, group_offs_padded, a.size(0)
+            group_lens, group_offs_padded, out_dtype,
+            c_group_offs=group_offs, total_m_out=a.size(0),
+            grid_x_hint=grid_x_hint,
         )
 
         ctx.save_for_backward(
@@ -543,7 +562,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             b_scale_inv_col_2d,
             group_lens,
             group_offs,
-            group_lens_padded,
             group_offs_padded,
         )
         ctx.config = config
@@ -563,19 +581,18 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             b_scale_inv_col_2d,
             group_lens,
             group_offs,
-            group_lens_padded,
             group_offs_padded,
         ) = ctx.saved_tensors
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # Fused grouped quant: same op as fwd, ignores returned layout
-        # (already saved in ctx) by re-deriving on GPU — cost is one
-        # tiny single-thread kernel.
-        grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv, _, _ = (
-            quantize_mxfp8_dual_grouped_impl(
+        # Fused grouped quant: same op as fwd.  ``group_lens_padded``
+        # is recomputed on GPU inside the op (single-thread layout
+        # kernel — sub-µs), so we only need ``group_offs_padded`` from
+        # ctx for the wgrad-side preshuffle bounds.
+        grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv, \
+            group_lens_padded, _ = quantize_mxfp8_dual_grouped_impl(
                 grad_out, grad_out_dtype, group_lens, group_offs,
             )
-        )
 
         # Regroup B's flat col-quant into per-group (G, K, N) for dgrad.
         b_fp8_col, b_scale_inv_col = _regroup_b_colwise_for_dgrad(
@@ -586,17 +603,19 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             b_fp8_col_2d.size(0),
         )
 
-        # dgrad on padded layout, then strip back.
-        grad_a_padded = _turbo_grouped_gemm_mxfp8(
+        # dgrad: same store-side fusion as fwd — kernel writes directly
+        # to (total_M, K) using c_group_offs = group_offs.
+        grad_a = _turbo_grouped_gemm_mxfp8(
             grad_out_fp8_row, b_fp8_col, grad_out_scale_inv_row, b_scale_inv_col,
-            group_lens_padded, group_offs_padded, ctx.out_dtype, grid_x_hint=ctx.grid_x_hint,
-        )
-        grad_a = extract_grouped_rows_impl(
-            grad_a_padded, group_offs, group_offs_padded, grad_out.size(0)
+            group_lens, group_offs_padded, ctx.out_dtype,
+            c_group_offs=group_offs, total_m_out=grad_out.size(0),
+            grid_x_hint=ctx.grid_x_hint,
         )
 
         # wgrad: dB = dC^T @ A via fixed-NT variable-K turbo (direct call).
         # Col-quant tensors are already transposed; padded layout so M_g % 128.
+        # wgrad still uses the padded layout end-to-end (its output is
+        # (G, N, K), no per-group row compression needed).
         grad_b = _turbo_grouped_gemm_variable_k_mxfp8(
             grad_out_t_fp8, grad_out_t_scale_inv, a_fp8_col, a_scale_inv_col,
             group_lens_padded, group_offs_padded, ctx.out_dtype,

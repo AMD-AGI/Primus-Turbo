@@ -14,6 +14,14 @@ namespace turbo {
 // Per-tile compute body for the persistent kernel.  Computes one 256x256
 // output tile for (group_id, pid_m_local, pid_n_idx); SMEM and tile dispatch
 // are owned by the caller.
+//
+// ``group_offs_ptr[group_id]`` is the *input* row base (where group g's
+// real rows start in the per-group-padded input layout); ``M_g`` is the
+// number of *real* rows in group g (compute bound — padding rows are
+// never visited).  When ``c_group_offs_ptr`` is non-null the kernel
+// writes group g's output rows starting at ``c_group_offs_ptr[group_id]``
+// (the original/unpadded layout) instead of ``group_offs_ptr[group_id]``,
+// fusing the per-group-padding extract directly into the GEMM store.
 template <typename GemmTile, typename AType, typename BType, typename CType>
 __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     GemmTile &tile, typename GemmTile::ASmemSubtile (*a_smem_tile)[4],
@@ -21,8 +29,9 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     typename GemmTile::AScaleSmemSubtile (*a_s_smem_tile)[4],
     typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *a_ptr,
     const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr, CType *c_ptr,
-    const int64_t *group_offs_ptr, const int32_t group_id, const int32_t pid_m_local,
-    const int32_t pid_n_idx, const int32_t M_g, const uint32_t n, const uint32_t k) {
+    const int64_t *group_offs_ptr, const int64_t *c_group_offs_ptr, const int32_t group_id,
+    const int32_t pid_m_local, const int32_t pid_n_idx, const int32_t M_g, const uint32_t n,
+    const uint32_t k) {
     const int32_t pid_m = pid_m_local * 256;
     const int32_t pid_n = pid_n_idx * 256;
     if (pid_m >= M_g || pid_n >= (int32_t) n)
@@ -46,6 +55,35 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     const int64_t b_group_off  = (int64_t) group_id * (int64_t) n * (int64_t) k;
     const int64_t bs_group_off = (int64_t) group_id * (int64_t) n * (int64_t) scale_cols;
 
+    // Output row base + per-group input bound.
+    //
+    // ``c_group_offs_ptr`` non-null marks the per-group-padded input
+    // layout: ``M_g`` is the *real* (orig) per-group length used for
+    // compute early-exit and output writes, while the input/scale SRD
+    // bounds need the *padded* length so the preshuffled-scale SRD
+    // covers complete 16-row blocks (else the linear byte bound cuts
+    // mid-block and OOB-zeros real scale data for the last few rows).
+    // The padded length is round-up to MXFP8_PADDING_ALIGN_SIZE (128).
+    int64_t c_m_global;
+    int32_t M_g_in;
+    if (c_group_offs_ptr != nullptr) {
+        const uint32_t c_offset_lo = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(c_group_offs_ptr[group_id] & 0xffffffffULL));
+        const uint32_t c_offset_hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(
+            static_cast<uint64_t>(c_group_offs_ptr[group_id]) >> 32));
+        const int64_t c_group_offset =
+            (static_cast<int64_t>(c_offset_hi) << 32) | static_cast<int64_t>(c_offset_lo);
+        c_m_global = c_group_offset + (int64_t) pid_m;
+        // M_g_padded = ceil(M_g, 128).  Quant kernel pads each
+        // per-group region to 128-aligned, so this matches
+        // group_offs_padded[g+1] - group_offs_padded[g] without an
+        // extra scalar load.
+        M_g_in = (M_g + 127) & ~127;
+    } else {
+        c_m_global = m_global;
+        M_g_in     = M_g;
+    }
+
     const AType    *a_base_ptr   = a_ptr + m_global * k;
     const BType    *b_base_ptr   = b_ptr + b_group_off + (int64_t) pid_n * k;
     const uint32_t *a_s_base_ptr = a_s_ptr + m_global * scale_cols;
@@ -61,9 +99,9 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     const uint32_t scale_sts_offset = lane_id;
     const uint32_t scale_lds_offset = lane_id;
 
-    const uint32_t  a_remaining  = ((uint32_t) M_g - pid_m) * k * sizeof(AType);
+    const uint32_t  a_remaining  = ((uint32_t) M_g_in - pid_m) * k * sizeof(AType);
     const uint32_t  b_remaining  = (n - pid_n) * k * sizeof(BType);
-    const uint32_t  as_remaining = ((uint32_t) M_g - pid_m) * scale_cols * sizeof(uint32_t);
+    const uint32_t  as_remaining = ((uint32_t) M_g_in - pid_m) * scale_cols * sizeof(uint32_t);
     const uint32_t  bs_remaining = (n - pid_n) * scale_cols * sizeof(uint32_t);
     const BufferSRD a_srd(a_base_ptr, a_remaining);
     const BufferSRD b_srd(b_base_ptr, b_remaining);
@@ -356,7 +394,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
     CType *c_stg_base_ptr =
-        c_ptr + m_global * (int64_t) n + pid_n + warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
+        c_ptr + c_m_global * (int64_t) n + pid_n + warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_m + 256 > M_g) || (pid_n + 256 > (int32_t) n);
 
     if (!is_boundary_tile) {
@@ -399,8 +437,8 @@ __global__ __launch_bounds__(256, 1) void
 turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *a_ptr, const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr,
     CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
-    const int32_t group_num, const uint32_t n, const uint32_t k, const int32_t grid_m,
-    const int32_t grid_n) {
+    const int64_t *c_group_offs_ptr, const int32_t group_num, const uint32_t n, const uint32_t k,
+    const int32_t grid_m, const int32_t grid_n) {
 #if !defined(__gfx950__)
     assert(false && "turbo_grouped_gemm_mxfp8 persistent kernel requires gfx950");
     return;
@@ -443,7 +481,7 @@ turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
 
         turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
-            b_s_ptr, c_ptr, group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
+            b_s_ptr, c_ptr, group_offs_ptr, c_group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
     }
 #endif
 }

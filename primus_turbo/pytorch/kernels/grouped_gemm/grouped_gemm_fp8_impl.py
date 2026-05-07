@@ -452,6 +452,8 @@ class GroupedGEMMFP8TurboBackend(KernelBackend):
             b_scales,
             group_lens,
             group_offs,
+            None,
+            0,
             trans_a,
             trans_b,
             out_dtype,

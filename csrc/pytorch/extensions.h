@@ -258,13 +258,17 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
 
 at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                   at::Tensor &b_scales, at::Tensor &group_lens,
-                                  at::Tensor &group_offs, const bool transA, const bool transB,
+                                  at::Tensor &group_offs,
+                                  const c10::optional<at::Tensor> &c_group_offs,
+                                  int64_t total_m_out, const bool transA, const bool transB,
                                   at::ScalarType out_dtype, const std::string &granularity,
                                   const int64_t grid_x_hint, const bool b_scale_preshuffled);
 
 at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                        at::Tensor &b_scales, at::Tensor &group_lens,
-                                       at::Tensor &group_offs, const bool transA, const bool transB,
+                                       at::Tensor &group_offs,
+                                       const c10::optional<at::Tensor> &c_group_offs,
+                                       int64_t total_m_out, const bool transA, const bool transB,
                                        at::ScalarType out_dtype, const std::string &granularity,
                                        const int64_t grid_x_hint,
                                        const bool b_scale_preshuffled);

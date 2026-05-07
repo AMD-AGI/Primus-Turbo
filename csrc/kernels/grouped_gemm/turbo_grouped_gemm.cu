@@ -10,6 +10,127 @@
 
 namespace primus_turbo {
 
+// ────────────────────────────────────────────────────────────────────
+//  Optimised preshuffle (grouped-GEMM path only)
+// ────────────────────────────────────────────────────────────────────
+//
+// The original ``turbo::preshuffle_scale_16x4_kernel`` reads inputs at
+// stride ``cols`` (one 16-row tile is loaded with 64 strided 1-byte
+// reads), which clocks in around 5-10 % of HBM peak.  The grouped-GEMM
+// hot path issues 3 of these per step and they account for ~7 % of the
+// per-step cost on MoE shapes.  The variant below is a drop-in
+// replacement that, for each 16-row tile,
+//   1. cooperatively loads ``CHUNK_COLS``-wide column slabs into LDS
+//      with fully coalesced uint8 reads (one row per warp pass),
+//   2. emits the preshuffled (16x4 col-major, uint32-extended) output
+//      from LDS with coalesced writes,
+//   3. iterates over column chunks so any ``cols`` (e.g. wgrad's
+//      ``scale_cols ≈ total_M/32`` which can exceed 4 K) is handled
+//      without falling back.
+// Numerically bit-for-bit identical to ``turbo::preshuffle_scale_16x4
+// _kernel`` — only the layout of memory accesses changes.  Wired into
+// the grouped MXFP8 fwd / dgrad / wgrad dispatchers; the single-GEMM
+// path (which still calls the original kernel) is untouched.
+template <int BLOCK_THREADS, int CHUNK_COLS>
+__device__ __forceinline__ void preshuffle_one_tile(const uint8_t *__restrict__ in,
+                                                    uint32_t *__restrict__ out, const int cols) {
+    static_assert(CHUNK_COLS % 4 == 0, "CHUNK_COLS must be /4 aligned");
+    static_assert(BLOCK_THREADS >= CHUNK_COLS, "BLOCK_THREADS must be >= CHUNK_COLS");
+
+    __shared__ uint8_t s_tile[16 * CHUNK_COLS];
+
+    const int tid = threadIdx.x;
+
+    for (int col_start = 0; col_start < cols; col_start += CHUNK_COLS) {
+        const int chunk_cols = min(CHUNK_COLS, cols - col_start);
+
+        // Coalesced load: 16 row-major passes, each pass loads one row
+        // of ``chunk_cols`` consecutive bytes (tid → col within the
+        // chunk).  Threads beyond ``chunk_cols`` are idle for the load.
+#pragma unroll
+        for (int row = 0; row < 16; ++row) {
+            if (tid < chunk_cols) {
+                s_tile[row * CHUNK_COLS + tid] = in[row * cols + col_start + tid];
+            }
+        }
+        __syncthreads();
+
+        // Output for this chunk: ``chunk_cols/4`` 16x4 blocks, 64
+        // uint32 each; coalesced write from shared memory.
+        const int chunk_blocks = chunk_cols / 4;
+        const int total_out    = chunk_blocks * 64;
+        const int out_base     = (col_start / 4) * 64;
+        for (int idx = tid; idx < total_out; idx += BLOCK_THREADS) {
+            const int       col_block = idx >> 6; // / 64
+            const int       sub       = idx & 63; // % 64
+            const int       row       = sub & 15; // % 16
+            const int       col       = sub >> 4; // / 16
+            const uint8_t   v         = s_tile[row * CHUNK_COLS + col_block * 4 + col];
+            out[out_base + idx]       = static_cast<uint32_t>(v);
+        }
+        __syncthreads();
+    }
+}
+
+template <int BLOCK_THREADS, int CHUNK_COLS>
+__global__ __launch_bounds__(BLOCK_THREADS, 4) void preshuffle_scale_16x4_dual_v2_kernel(
+    const uint8_t *__restrict__ in0, uint32_t *__restrict__ out0, const int rows0,
+    const uint8_t *__restrict__ in1, uint32_t *__restrict__ out1, const int cols) {
+
+    const int      blocks0 = rows0 / 16;
+    const int      bid     = blockIdx.x;
+    const uint8_t *in;
+    uint32_t      *out;
+    if (bid < blocks0) {
+        in  = in0 + (size_t) bid * 16 * cols;
+        out = out0 + (size_t) bid * 16 * cols;
+    } else {
+        const int sb = bid - blocks0;
+        in           = in1 + (size_t) sb * 16 * cols;
+        out          = out1 + (size_t) sb * 16 * cols;
+    }
+    preshuffle_one_tile<BLOCK_THREADS, CHUNK_COLS>(in, out, cols);
+}
+
+template <int BLOCK_THREADS, int CHUNK_COLS>
+__global__ __launch_bounds__(BLOCK_THREADS, 4) void preshuffle_scale_16x4_v2_kernel(
+    const uint8_t *__restrict__ in, uint32_t *__restrict__ out, const int cols) {
+
+    const int      bid    = blockIdx.x;
+    const uint8_t *in_blk = in + (size_t) bid * 16 * cols;
+    uint32_t      *out_blk = out + (size_t) bid * 16 * cols;
+    preshuffle_one_tile<BLOCK_THREADS, CHUNK_COLS>(in_blk, out_blk, cols);
+}
+
+static constexpr int PRESHUFFLE_BLOCK_THREADS_V2 = 256;
+static constexpr int PRESHUFFLE_CHUNK_COLS_V2    = 256;
+
+static inline void preshuffle_dual_v2_launch(const uint8_t *in0, uint32_t *out0, int rows0,
+                                             const uint8_t *in1, uint32_t *out1, int rows1,
+                                             int cols, hipStream_t stream) {
+    if ((rows0 % 16 == 0) && (rows1 % 16 == 0) && (cols % 4 == 0)) {
+        const int grid = (rows0 + rows1) / 16;
+        preshuffle_scale_16x4_dual_v2_kernel<PRESHUFFLE_BLOCK_THREADS_V2,
+                                             PRESHUFFLE_CHUNK_COLS_V2>
+            <<<grid, PRESHUFFLE_BLOCK_THREADS_V2, 0, stream>>>(in0, out0, rows0, in1, out1, cols);
+    } else {
+        turbo::preshuffle_scale_16x4_dual_kernel<uint8_t, uint32_t>
+            <<<(rows0 + rows1) / 16, 64, 0, stream>>>(in0, out0, rows0, in1, out1, cols);
+    }
+}
+
+static inline void preshuffle_v2_launch(const uint8_t *in, uint32_t *out, int rows, int cols,
+                                         hipStream_t stream) {
+    if ((rows % 16 == 0) && (cols % 4 == 0)) {
+        const int grid = rows / 16;
+        preshuffle_scale_16x4_v2_kernel<PRESHUFFLE_BLOCK_THREADS_V2, PRESHUFFLE_CHUNK_COLS_V2>
+            <<<grid, PRESHUFFLE_BLOCK_THREADS_V2, 0, stream>>>(in, out, cols);
+    } else {
+        turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
+            <<<rows / 16, 64, 0, stream>>>(in, out, rows, cols);
+    }
+}
+
 // Workspace layout:
 //   [ A_scale_preshuf : total_M * scale_cols * uint32 ]
 //   [ B_scale_preshuf : group_num * N * scale_cols * uint32 ]  (skipped when
@@ -51,17 +172,14 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
     const uint32_t *b_scale_preshuf;
     if (params.b_scale_preshuffled) {
         b_scale_preshuf = reinterpret_cast<const uint32_t *>(params.b_scale_ptr);
-        turbo::preshuffle_scale_16x4_kernel<uint8_t, uint32_t>
-            <<<total_m / 16, 64, 0, params.stream>>>(a_scale_raw, a_scale_preshuf, total_m,
-                                                     scale_cols);
+        preshuffle_v2_launch(a_scale_raw, a_scale_preshuf, total_m, scale_cols, params.stream);
     } else {
         auto *b_scale_preshuf_workspace = reinterpret_cast<uint32_t *>(
             reinterpret_cast<uint8_t *>(params.workspace) + a_scale_bytes);
         auto *b_scale_raw = reinterpret_cast<const uint8_t *>(params.b_scale_ptr);
-        turbo::preshuffle_scale_16x4_dual_kernel<uint8_t, uint32_t>
-            <<<(total_m + group_num * n) / 16, 64, 0, params.stream>>>(
-                a_scale_raw, a_scale_preshuf, total_m, b_scale_raw, b_scale_preshuf_workspace,
-                scale_cols);
+        preshuffle_dual_v2_launch(a_scale_raw, a_scale_preshuf, total_m, b_scale_raw,
+                                  b_scale_preshuf_workspace, group_num * n, scale_cols,
+                                  params.stream);
         b_scale_preshuf = b_scale_preshuf_workspace;
     }
 
@@ -73,8 +191,8 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
                                                                                    CType>
         <<<grid, block, 0, params.stream>>>(
             params.a_ptr, params.b_ptr, a_scale_preshuf, b_scale_preshuf, params.c_ptr,
-            params.group_lens_ptr, params.group_offs_ptr, group_num, (uint32_t) n, (uint32_t) k,
-            grid_m, grid_n);
+            params.group_lens_ptr, params.group_offs_ptr, params.c_group_offs_ptr, group_num,
+            (uint32_t) n, (uint32_t) k, grid_m, grid_n);
 }
 
 // ── Explicit instantiations ──
@@ -127,9 +245,8 @@ void turbo_grouped_gemm_mxfp8_wgrad_impl(
     // Fused LHS+RHS preshuffle (both share scale_cols).
     auto *lhs_scale_raw = reinterpret_cast<const uint8_t *>(params.lhs_scale_ptr);
     auto *rhs_scale_raw = reinterpret_cast<const uint8_t *>(params.rhs_scale_ptr);
-    turbo::preshuffle_scale_16x4_dual_kernel<uint8_t, uint32_t>
-        <<<(n + k) / 16, 64, 0, params.stream>>>(lhs_scale_raw, lhs_scale_preshuf, n,
-                                                  rhs_scale_raw, rhs_scale_preshuf, scale_cols);
+    preshuffle_dual_v2_launch(lhs_scale_raw, lhs_scale_preshuf, n, rhs_scale_raw,
+                              rhs_scale_preshuf, k, scale_cols, params.stream);
 
     const int32_t grid_n = (n + 255) / 256;
     const int32_t grid_k = (k + 255) / 256;
