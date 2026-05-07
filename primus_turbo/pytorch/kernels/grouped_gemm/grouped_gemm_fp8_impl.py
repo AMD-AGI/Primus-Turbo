@@ -825,6 +825,13 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         # shapes; zero on the 4 small-grid shapes. Metric (forward)
         # untouched.
         m_total = a.shape[0]
+        # Round-3 (gpt_oss FP8 kernel-only ceiling, current Primus run;
+        # 2026-05-07): per-call ``num_slots`` override on the var-K
+        # persistent-grid launch. Default ``0`` → kernel uses NUM_CUS=256
+        # (or the TK_VARK_NUM_CUS R2 env hook, when set). Set to
+        # 192 ONLY for the short-grid Down-B4 wgrad family below; every
+        # other var-K caller stays on the existing 256-slot launch.
+        vk_num_slots = 0
         if m_total >= 16384:
             # Round-30 var-K subfamily refinement. R39 set the universal
             # rule ``(gm=8, xcds=4) for m_total >= 16384`` from a 5-trial
@@ -1918,6 +1925,82 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             else:
                 vk_group_m = 4  # == binding DEFAULT_GROUP_M
                 vk_num_xcds = 0  # → kernel BLOCK_SWIZZLE_NUM_XCDS=8 fallback
+
+        # Round-3 (gpt_oss FP8 kernel-only ceiling, current Primus run;
+        # 2026-05-07): per-shape ``num_slots`` carve-out for the
+        # short-grid Down-B4 wgrad family. Sets the persistent-grid
+        # launch slot count to 192 (down from NUM_CUS=256) for the 2
+        # gpt_oss-Down-B4 wgrad shapes whose persistent grid is too
+        # short to amortise per-tile prologue/epilogue overhead at 256
+        # slots. R2 sweep (``scripts/_probe_round_2_vark_numcus_sweep.py``,
+        # 250-iter × 7-trial p20 × 3 seeds × kernel-only direct call to
+        # ``grouped_variable_k_crr_dscale``):
+        #
+        #   shape (wgrad var-K)        slots=256    slots=192    Δ vs 256
+        #   Down-B4-M2048 (worst)      1395.2 T     1480.8 T     +6.14%
+        #   Down-B4-M4096 (sibling)    1679.0 T     1766.7 T     +5.22%
+        #   GateUP-B32-M4096 (counter) 2150.4 T     1777.6 T    -17.34%   *gate
+        #
+        # Pattern: tile-step density determines the optimum.  Down-B4
+        # wgrad has 484 tile-steps per call (per-group [N_fwd, K_fwd] =
+        # [2880, 2880] -> tiles_n=11, tiles_k=11 = 121 tiles/group × 4
+        # groups = 484 tiles); 484 / 256 = 1.89 wave-steps per slot —
+        # too few to amortise the per-tile prologue (LDS group-metadata
+        # init at HK ``kernel_fp8_layouts.cpp:7716-7783``, scale fetch,
+        # swizzle offset prefill) plus epilogue (cstore + dscale apply).
+        # Reducing slots to 192 raises wave-steps/slot to 2.52 (+33 %),
+        # roughly halving the prologue-cost-per-MFMA ratio. Below
+        # slots=160 the parallelism loss dominates (-11 % at slots=160).
+        # GateUP-B32-M4096 (7744 tile-steps, 30+ wave-steps/slot) is
+        # already saturated at 256, so slots=192 just loses parallelism.
+        #
+        # Rule scope check (k==2880 AND n==2880 AND m_total<=16384):
+        #   - gpt_oss-Down-B4-M2048 var-K dB (m_total=8192): MATCH
+        #     (per-group output [2880, 2880]; tiles_n=tiles_k=11; 484
+        #     tile-steps × 4 groups). 1 of 8 metric shapes affected.
+        #   - gpt_oss-Down-B4-M4096 var-K dB (m_total=16384): MATCH
+        #     (same per-group geometry; m_total=16384 is the upper edge
+        #     of the predicate). Sibling shape, R2 evidence shows same
+        #     +5.22 % lift. 2 of 8 metric shapes affected total.
+        #   - gpt_oss-Down-B32-* var-K dB (m_total ∈ {65536, 131072}):
+        #     m_total > 16384 → excluded; 7744 / 15488 tile-steps
+        #     (saturated grid; slots=192 would regress per R2 counter
+        #     evidence on GateUP-B32-M4096).
+        #   - gpt_oss-GateUP-B4-M2048 var-K dB: a==2880, b==5760 →
+        #     b!=2880 → excluded (per-group [5760, 2880], tiles_n=22,
+        #     tiles_k=11 = 242/group × 4 = 968 tile-steps; 968/256 =
+        #     3.78 wave-steps/slot — already moderately amortised).
+        #   - gpt_oss-GateUP-B4-M4096 / GateUP-B32-* var-K: same
+        #     b==5760 exclusion.
+        #   - DSV3 / Qwen3 var-K dB: a in {1536, 2048, 4096, 7168} →
+        #     a != 2880 → excluded.
+        #   - DoD smoke FP8 grouped fwdbwd: per the R32 audit, neither
+        #     (4096, 4096, 7168) nor (4096, 7168, 2048) has both axes
+        #     == 2880 → excluded.
+        # Rule remains uniquely tied to gpt_oss-Down-B4 wgrad in the
+        # 24-shape MoE suite + DoD universe. NO regression risk on
+        # the other 22 wgrad cells (their var-K calls keep
+        # vk_num_slots=0 → kernel uses gridDim.x = NUM_CUS = 256).
+        #
+        # Bit-equivalent output verified at
+        # /tmp/round_2_vark_numcus_verify.py (``num_slots`` is a pure
+        # persistent-grid scheduling knob — same property as group_m /
+        # num_xcds; reduces the launch grid count but does not change
+        # the math). max_abs_diff = 0.0 across slots ∈ {32, 64, 96,
+        # 128, 160, 192, 256} on the anchor shape (Down-B4-M2048 wgrad,
+        # 33.2M output elements; 0 / 33177600 mismatches).
+        #
+        # Expected metric impact: var-K wgrad is ALL of the wgrad
+        # kernel time at the metric's kernel-only timing (no host
+        # overhead included). +6.14 % / +5.22 % on 2 of 8 wgrad shapes
+        # → +0.65 % wgrad section avg → +0.65 / 3 / 2800 × 1000 ≈ +2.2
+        # score points. First metric-moving lift since R5 dispatcher
+        # exhaustion (R6-R10 falsified all dispatcher cells; R1 PMC
+        # pivoted to launch geometry; R2 confirmed lever; R3 ships).
+        if (a.shape[1] == 2880 and b.shape[1] == 2880
+                and m_total <= 16384):
+            vk_num_slots = 192
+
         # CRR dB: kernel computes grad_out.T @ x → [N, K]. The kernel's
         # ``scale_a`` is grad_out's scale; ``scale_b`` is x's scale —
         # so pass ``(b_scales=grad_out_scale, a_scales=x_scale)``.
@@ -1931,6 +2014,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             var_k_dscale_fn(
                 grad_out_2d, x_2d, out, b_scales, a_scales, group_offs,
                 group_m=vk_group_m, num_xcds=vk_num_xcds,
+                num_slots=vk_num_slots,
             )
         else:
             # Fallback: dscale binding not present (older .so) OR scales
@@ -1944,6 +2028,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             var_k_fn(
                 grad_out_2d, x_2d, out, sa_h, sb_h, group_offs,
                 group_m=vk_group_m, num_xcds=vk_num_xcds,
+                num_slots=vk_num_slots,
             )
         return out
 
