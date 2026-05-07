@@ -51,6 +51,25 @@ struct BufferSRD {
 };
 
 // ════════════════════════════════════════════════════════════════
+//  GMEM -> VGPR via buffer_load (SRD-based, 32-bit voffset)
+// ════════════════════════════════════════════════════════════════
+
+__device__ int32x4_t
+llvm_amdgcn_raw_buffer_load_b128(int32x4_t srd, int32_t voffset, int32_t soffset,
+                                 int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
+// 16-byte buffer_load: emits `buffer_load_dwordx4`. `voffset` is a 32-bit
+// per-lane byte offset; `soffset` is a uniform (SGPR) byte offset added to
+// the SRD base. Caller is responsible for keeping `voffset` < 4 GB and the
+// final `base + voffset + soffset` inside the SRD's NUM_RECORDS window.
+__device__ __forceinline__ int4 buffer_load_b128(const BufferSRD &srd, uint32_t voffset,
+                                                 uint32_t soffset = 0) {
+    int32x4_t v = llvm_amdgcn_raw_buffer_load_b128(srd.srd, static_cast<int32_t>(voffset),
+                                                   static_cast<int32_t>(soffset), 0);
+    return *reinterpret_cast<const int4 *>(&v);
+}
+
+// ════════════════════════════════════════════════════════════════
 //  GMEM -> SMEM via buffer_load_lds (bypasses VGPRs)
 // ════════════════════════════════════════════════════════════════
 
