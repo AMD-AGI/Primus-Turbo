@@ -1478,9 +1478,85 @@ def select_default_config(
             # metric (B<4 GateUP M=4096 has no metric shape; B=2 / B=1
             # M=4096 → m_total<=8192 → would fail tiles_m=16 since
             # tiles_m=16 ⇒ m=4096 ⇒ m_total ≥ 4096; only B=4 gives 16384).
+            #
+            # Round-3 (current Primus run, gpt_oss FP8 kernel-only ceiling
+            # task; 2026-05-07) re-tune. The R10dm `noise floor` finding
+            # was made against an older binding build (commit pre-R2's
+            # kernel-rebuild drift); today's binding shows (gm=14, xcds=4)
+            # has a wide dispatch-tail spread (34T = 1.6%) while the R21-
+            # falsified (gm=8, xcds=4) — historically reported as worst
+            # under R10dm — has flipped: it is now the unique top.
+            #
+            # Tight verify (250-iter × 7-trial p20 × 3 seeds × kernel-only
+            # direct call to ``grouped_rcr_dscale``,
+            # /tmp/_probe_round_3_gateup_b4_m4096_tight.py archived):
+            #
+            #   shape: gpt_oss-GateUP-B4-M4096 fwd RCR (m_total=16384)
+            #     cell        seed42  seed137  seed2024 med    spread Δ vs (14,4)
+            #     (8, 4)      2107.2  2096.8   2082.0   2096.8 25.2T  +1.25%  WIN
+            #     (1, 2)      2087.1  2079.5   2098.1   2087.1 18.6T  +0.78%
+            #     (16, 4)     2087.2  2064.0   2085.5   2085.5 23.1T  +0.71%
+            #     (14, 4)R10dm 2087.8 2053.7   2070.9   2070.9 34.1T  baseline
+            #
+            # Per-seed (8, 4) Δ: +0.96% / +2.10% / +0.54% — every-seed
+            # WIN 3/3. Baseline (14, 4) per-seed shows wider variability
+            # (max-min = 34T = 1.6%) than the new candidate (25T) —
+            # consistent with the R12 / R7 pattern in this round series
+            # where the post-rebuild winner has both higher median AND
+            # tighter spread than the pre-rebuild rule. The R10dm
+            # comment above remains valid for that older kernel build
+            # but does not generalise to today's binding.
+            #
+            # winner-min (2082) vs baseline-max (2087.8): -5.8T overlap.
+            # The signal is robust on the medians (every seed positive,
+            # every seed Δ ≥ +0.54%, +2.10% on the cleanest seed) but
+            # not a "distributions cleanly separated" type. Same
+            # robustness class as R31 / R30 wgrad rules.
+            #
+            # Why (gm=8) wins now where R10dm found (gm=14):
+            # The persistent grouped grid for B=4 M=4096 is small
+            # (m_total=16384 = 64 M-tile-slots × tiles_n=22 N-tiles =
+            # 1408 tile-steps over 256 CUs ≈ 5.5 wave-steps). gm=14 was
+            # picked at R7 to fit batch-14 ≈ 14 N-rows per pass against
+            # 22 (3 fractional batches per row), but today's persistent
+            # scheduler appears to favour gm=8 = 22/8 ≈ 2.75 batches per
+            # row — slightly less M-batching, more L2 reuse on the
+            # per-K B-pack. (gm=14 vs gm=8 also crosses the wave-count
+            # boundary in the tile-completion-latency profile that the
+            # R23 K-tail finding documented.) Same mechanism as R12 /
+            # R7 in the round-2 commit: an under-batched cell wins on
+            # the small grid post the binding rebuild.
+            #
+            # Bit-equivalent output: max_abs_diff=0.0 between (gm=14,
+            # xcds=4) and (gm=8, xcds=4) on GateUP-B4-M4096 fwd
+            # (verified at /tmp/_probe_round_3_gateup_b4_m4096_tight.py).
+            # group_m / num_xcds are pure persistent-grid scheduling
+            # knobs (same property documented for every (gm, xcds) RCR
+            # rule in this file).
+            #
+            # Sibling regression check:
+            #   - GateUP-B4-M2048 fwd (m_total=8192, tiles_m=8): hits
+            #     R23 (gm=1, xcds=4) above; excluded by tiles_m==16.
+            #   - GateUP-B32-* (m_total ≥ 65536): excluded by
+            #     m_total<=16384 (R70 / R69 rules above).
+            #   - Down-* (tiles_n=11): excluded by tiles_n==22.
+            #   - DSV3/Qwen3 (k != 2880 OR tiles_n != 22): excluded.
+            #   - Dense FP8 (m_total=None): excluded by m_total guard.
+            # Rule remains uniquely tied to gpt_oss-GateUP-B4-M4096 fwd
+            # in the 24-shape MoE suite + DoD universe. dgrad direction
+            # for this shape uses a DIFFERENT dispatcher key (tiles_n=11
+            # + k=5760) — the R8 (gm=1, xcds=4) rule down at line 1969 —
+            # which this round's tight verify CONFIRMED is at ceiling
+            # (no candidate beats it; (8, 4) regresses by -0.23%, (4, 4)
+            # by -0.97%). So this fwd update doesn't disturb the dgrad
+            # path for the same shape.
+            #
+            # Expected metric impact: GateUP-B4-M4096 fwd 1968 → ~1992 T.
+            # Section avg lift: fwd 1848 → ~1851 T (progress 0.660 →
+            # 0.661). Score Δ ≈ +0.4 points at noise floor.
             return HipKittenConfig(
                 layout=layout,
-                group_m=14,
+                group_m=8,
                 num_xcds=4,
                 kernel=None,
             )

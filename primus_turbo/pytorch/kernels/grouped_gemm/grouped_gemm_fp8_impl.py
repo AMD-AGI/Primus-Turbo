@@ -1820,8 +1820,101 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             elif a.shape[1] == 2880 and b.shape[1] == 5760:
                 # R35 gpt_oss-GateUP-B4-M2048 carve-out (the only
                 # m_total<16384 metric shape still on default after R33).
-                vk_group_m = 2
-                vk_num_xcds = 2
+                #
+                # Round-3 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-07) re-tune. Same kernel-rebuild
+                # drift class as the R7→R2 / R12→R2 / R10dm→R3 RCR rules
+                # in config.py — R35's (gm=2, xcds=2) was tuned on a
+                # prior FP8 binding build whose persistent var-K
+                # scheduler has since shifted toward (gm=1, xcds=4) for
+                # this geometry. R35 had selected (2, 2) over (1, 2) and
+                # (1, 4) by +0.42pp / +1.02pp under that older build;
+                # today's binding flips the ranking.
+                #
+                # Tight verify (250-iter × 7-trial p20 × 3 seeds × kernel-
+                # only direct call to ``grouped_variable_k_crr_dscale``,
+                # /tmp/_probe_round_3_remaining.py archived):
+                #
+                #   shape: gpt_oss-GateUP-B4-M2048 wgrad var-K dB
+                #     m_total=8192, N_fwd=5760, K_fwd=2880, B=4
+                #
+                #     cell      seed42  seed137  seed2024 med    spread Δ vs (2,2)
+                #     (1, 4)    1671.5  1671.5   1671.9   1671.5  0.4T   +0.52%  WIN
+                #     (2, 4)    1667.4  1666.2   1665.0   1666.2  2.4T   +0.20%
+                #     (2, 2)R35 1660.5  1662.9   1669.5   1662.9  9.0T   baseline
+                #     (4, 2)    1660.5  1662.1   1663.3   1662.1  2.8T   -0.05%
+                #     (4, 4)    1661.7  1660.5   1661.3   1661.3  1.2T   -0.10%
+                #     (1, 2)    1660.1  1659.7   1658.5   1659.7  1.6T   -0.19%
+                #
+                # (gm=1, xcds=4) is the unique top with EXTREMELY tight
+                # spread (0.4T = 0.024%) → med/spread = 21.7× — well
+                # above the standard "median > spread" robust-signal
+                # threshold used by R7/R10/R23/R29-31/R45/R10dm/R6-R8
+                # current series and by R2 in this run. Per-seed (1, 4)
+                # values: 1671.5 / 1671.5 / 1671.9 — essentially
+                # deterministic timing. winner-min (1671.5) beats
+                # baseline-max (1669.5) by 2.0T → 3/3 seeds clean
+                # separation. The (2, 2)R35 baseline by contrast has
+                # 9.0T spread (0.54%, the cell with the loosest
+                # distribution in this sweep) — same R2 / R10dm
+                # pattern of post-rebuild flip with the new winner
+                # also having a tighter dispatch tail.
+                #
+                # Bit-equivalent output verified at the same probe
+                # (max_abs_diff=0.0 between (gm=2, xcds=2) and (gm=1,
+                # xcds=4) on GateUP-B4-M2048 wgrad in seed 42, bit_eq
+                # =True). group_m / num_xcds are pure persistent-grid
+                # scheduling knobs on the var-K CRR kernel — same
+                # property documented for R31/R32/R33/R35-R39/R10/R11
+                # var-K rules above.
+                #
+                # Why (gm=1) wins now where R35 found (gm=2):
+                # var-K CRR per-group output for GateUP is [N_fwd,
+                # K_fwd] = [5760, 2880] ⇒ tiles_n=22, tiles_k=11 = 242
+                # tile-steps per group × 4 groups = 968 tile-steps over
+                # 256 CUs ≈ 3.8 wave-steps per slot. R35's (gm=2, xcds=
+                # 2) batched 2 N-rows per pass against 22 (11 batches,
+                # cleanly fitting); today's binding favours gm=1 which
+                # walks the entire 22-row N-axis under each individual
+                # K-tile before advancing K, maximising B-pack L2 reuse
+                # on the per-K column slab (one slab serves 22 N-rows
+                # back-to-back). xcds=4 splits the 3.8-wave-step grid
+                # across 4 of 8 XCDs — a cleaner partition than xcds=2
+                # which over-localises (only 2 of 8 XCDs sees work
+                # which leaves 6 XCDs idle on the small grid). This is
+                # also the same (gm=1, xcds=4) cell that R31 picked for
+                # GateUP-B32 var-K wgrad — rule symmetry restored
+                # across the GateUP B=4/B=32 family.
+                #
+                # Sibling regression check (rule scope unchanged — gate
+                # remains a.shape[1]==2880 AND b.shape[1]==5760 within
+                # the m_total<16384 branch):
+                #   - GateUP-B4-M2048 (m_total=8192): MATCHES (the
+                #     rule target). 1 of 8 metric shapes affected.
+                #   - GateUP-B4-M4096 (m_total=16384): hits the
+                #     m_total>=16384 branch (R9-A: gm=4, xcds=4 for
+                #     m_total<32768).
+                #   - GateUP-B32-* (m_total ≥ 65536): hits R31
+                #     ((1, 4)) — same cell as the R35→R3 update,
+                #     consistent with the rule symmetry note above.
+                #   - Down-* (b.shape[1]==2880): excluded by b!=5760.
+                #   - DSV3/Qwen3 (a!=2880): excluded by a==2880.
+                #   - DoD smoke FP8 grouped fwdbwd (per R32 audit):
+                #     (4096, 4096, 7168) and (4096, 7168, 2048) —
+                #     neither has a==2880, b==5760; excluded.
+                #   - Dense FP8: doesn't enter var-K path.
+                # Rule remains uniquely tied to gpt_oss-GateUP-B4-M2048
+                # var-K dB in the 24-shape MoE suite + DoD universe.
+                #
+                # Expected metric impact: var-K dB is ~25% of bwd wall
+                # on B=4 shapes. +0.52% kernel → ~+0.13% bwd wall →
+                # ~+0.06% fwd+bwd wall on this shape (current ratio
+                # 1.88x vs Triton). Section avg lift: wgrad 1727 →
+                # ~1728 T (progress 0.617 → 0.617 — same to 3 dp);
+                # score Δ ≈ +0.1 points at noise floor. Small but
+                # real and trivially landed (no risk to siblings).
+                vk_group_m = 1
+                vk_num_xcds = 4
             else:
                 vk_group_m = 4  # == binding DEFAULT_GROUP_M
                 vk_num_xcds = 0  # → kernel BLOCK_SWIZZLE_NUM_XCDS=8 fallback
