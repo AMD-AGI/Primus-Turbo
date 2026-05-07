@@ -10,6 +10,30 @@
 #include "primus_turbo/common.h"
 #include "primus_turbo/deep_ep/configs.h"
 
+#define NUM_MAX_BARRIERS 16
+
+#define BARRIER_SYNC_INIT()                                                                        \
+    __shared__ int ___bar_sync_wg_state[NUM_MAX_BARRIERS];                                         \
+    if (threadIdx.x < NUM_MAX_BARRIERS)                                                            \
+        ___bar_sync_wg_state[threadIdx.x] = 0;                                                     \
+    int ___bar_sync_wg_expected_reg = 0;                                                           \
+    __syncthreads();
+
+#define BARRIER_SYNC(__fence, ___bar_id, ___num_threads_per_group)                                 \
+    {                                                                                              \
+        auto ___num_wave_per_group = ___num_threads_per_group / kWarpSize;                         \
+        ___bar_sync_wg_expected_reg += ___num_wave_per_group;                                      \
+        __fence;                                                                                   \
+        if (__lane_id() == 0) {                                                                    \
+            __hip_atomic_fetch_add(___bar_sync_wg_state + ___bar_id, 1, __ATOMIC_RELAXED,          \
+                                   __HIP_MEMORY_SCOPE_WORKGROUP);                                  \
+            while (__hip_atomic_load(___bar_sync_wg_state + ___bar_id, __ATOMIC_RELAXED,           \
+                                     __HIP_MEMORY_SCOPE_WORKGROUP) < ___bar_sync_wg_expected_reg)  \
+                __builtin_amdgcn_s_sleep(1);                                                       \
+        }                                                                                          \
+        __syncwarp();                                                                              \
+    }
+
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                  \
     {                                                                                              \
         constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR);                                   \
