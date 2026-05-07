@@ -863,8 +863,10 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
 #endif // __gfx950__
 }
 
-// Pre-shuffle E8M0 scale into 16x4 column-major blocks for MFMA consumption
-// (also zero-extends uint8 -> uint32).
+// ── Pre-shuffle E8M0 scale for MFMA consumption ──
+// Reorders scale data into 16x4 column-major blocks to match the MFMA scale input layout.
+// Also performs type conversion (e.g., E8M0 uint8 -> uint32 zero-extension).
+
 template <typename InT, typename OutT>
 __global__ void preshuffle_scale_16x4_kernel(const InT *in_scale_ptr, OutT *out_scale_ptr,
                                              const int rows, const int cols) {
@@ -882,41 +884,6 @@ __global__ void preshuffle_scale_16x4_kernel(const InT *in_scale_ptr, OutT *out_
         out_scale_ptr[tid] = val;
         in_scale_ptr += 4;
         out_scale_ptr += BLOCK_SIZE_ROW * BLOCK_SIZE_COL;
-    }
-}
-
-// Fused dual preshuffle: two independent (rows, cols) tensors sharing the
-// same `cols` in a single launch (grid = (rows0+rows1)/16 blocks; first
-// rows0/16 blocks handle tensor 0, the rest handle tensor 1).
-template <typename InT, typename OutT>
-__global__ void preshuffle_scale_16x4_dual_kernel(const InT *in_scale_ptr0,
-                                                  OutT      *out_scale_ptr0,
-                                                  const int  rows0,
-                                                  const InT *in_scale_ptr1,
-                                                  OutT      *out_scale_ptr1,
-                                                  const int  cols) {
-    const int BLOCK_SIZE_ROW = 16;
-    const int BLOCK_SIZE_COL = 4;
-    const int tid            = threadIdx.x;
-    const int bid            = blockIdx.x;
-    const int blocks0        = rows0 / BLOCK_SIZE_ROW;
-
-    const InT *in_ptr;
-    OutT      *out_ptr;
-    if (bid < blocks0) {
-        in_ptr  = in_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
-        out_ptr = out_scale_ptr0 + bid * BLOCK_SIZE_ROW * cols;
-    } else {
-        const int sub_bid = bid - blocks0;
-        in_ptr  = in_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
-        out_ptr = out_scale_ptr1 + sub_bid * BLOCK_SIZE_ROW * cols;
-    }
-
-    for (int i = 0; i < (cols / BLOCK_SIZE_COL); ++i) {
-        const OutT val = static_cast<OutT>(in_ptr[tid % 16 * cols + tid / 16]);
-        out_ptr[tid]   = val;
-        in_ptr += 4;
-        out_ptr += BLOCK_SIZE_ROW * BLOCK_SIZE_COL;
     }
 }
 

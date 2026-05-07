@@ -107,81 +107,61 @@ void ck_grouped_gemm_fp8_variable_k(
 //==================================================================
 
 template <typename AType, typename BType, typename CType> struct TurboGroupedGemmMXFP8Params {
-    const AType *a_ptr = nullptr; // [total_M_in,  K]   (input layout: may be padded)
+    const AType *a_ptr = nullptr; // [total_M_in,  K] (input layout: may be per-group padded)
     const BType *b_ptr = nullptr; // [group_num, N, K]
-    CType       *c_ptr = nullptr; // [total_M_out, N]   (output layout: c_group_offs_ptr)
+    CType       *c_ptr = nullptr; // [total_M_out, N] (output layout: c_group_offs_ptr)
 
-    const dtype::float8_e8m0 *a_scale_ptr = nullptr; // [total_M_in, K/32], E8M0
-    const dtype::float8_e8m0 *b_scale_ptr = nullptr; // [group_num, N, K/32], E8M0
+    const dtype::float8_e8m0 *a_scale_ptr = nullptr; // [total_M_in, K/32]
+    const dtype::float8_e8m0 *b_scale_ptr = nullptr; // [group_num, N, K/32]
 
-    // Input layout (real-row count + cumulative offsets, both in the
-    // *INPUT* tensor's row space).  ``group_lens_ptr[g]`` is the number
-    // of *real* rows (used as the compute bound — padding rows are not
-    // visited); ``group_offs_ptr[g]`` is where group g's real rows
-    // start in the input (which may be a per-group-padded layout, in
-    // which case offsets are equal to group_lens_padded prefix sums).
+    // Per-group real-row count and starting offset in the input layout.
+    // Padding rows beyond ``group_lens_ptr[g]`` are not visited.
     const int64_t *group_lens_ptr = nullptr; // [group_num]
     const int64_t *group_offs_ptr = nullptr; // [group_num+1]
 
-    // Optional output-row offsets.  When non-null, the GEMM writes
-    // group g's output rows starting at ``c_group_offs_ptr[g]`` (i.e.
-    // the *original* unpadded layout) instead of ``group_offs_ptr[g]``.
-    // Allows the caller to skip a separate extract pass for grouped
-    // MXFP8 with per-group-padded inputs: balanced+aligned hits the
-    // identity case (zero overhead) and unbalanced cases compress
-    // padding rows away as part of the GEMM store.
+    // Optional output-row offsets.  When non-null, the GEMM writes group g
+    // starting at ``c_group_offs_ptr[g]`` (unpadded layout), allowing
+    // padded inputs to be compressed away as part of the store.
     const int64_t *c_group_offs_ptr = nullptr; // [group_num+1] or null
 
     int32_t group_num = 0;
-    int32_t total_m   = 0; // total INPUT rows (a's first dim).
+    int32_t total_m   = 0; // total INPUT rows (a's first dim)
     int32_t n         = 0;
     int32_t k         = 0;
 
-    // Per-group tile-M upper bound = max_g ceil(M_g / 256).  Padding tiles
-    // are not safe (~0.025% intermittent race), so this must be tight.
+    // Tight per-group tile-M upper bound: max_g ceil(M_g / 256).  Padding
+    // tiles are not safe (~0.025% intermittent race), so this must match.
     int32_t grid_x = 0;
-
-    // True when the caller has already preshuffled `b_scale_ptr` into the
-    // 16x4 layout (via `turbo_preshuffle_mxfp8_scale_16x4`); the launch
-    // then skips the per-call B-scale preshuffle.
-    bool b_scale_preshuffled = false;
 
     void       *workspace      = nullptr;
     size_t      workspace_size = 0;
     hipStream_t stream         = nullptr;
 };
 
-// b_scale_preshuffled=true skips the workspace's B-scale slot.
 size_t turbo_grouped_gemm_mxfp8_workspace_size(int32_t total_m, int32_t group_num, int32_t n,
-                                               int32_t k, bool b_scale_preshuffled = false);
+                                               int32_t k);
 
 template <typename AType, typename BType, typename CType>
 void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BType, CType> &params);
-
-// Standalone launcher for the 16x4 E8M0 preshuffle kernel.  Used by the
-// PyTorch op so callers don't need to include the kernel header.  Grid:
-// rows/16 workgroups of 64 threads.
-void turbo_preshuffle_mxfp8_scale_16x4_launch(const uint8_t *in_ptr, uint32_t *out_ptr,
-                                              int rows, int cols, hipStream_t stream);
 
 //==================================================================
 //  Turbo Grouped GEMM (MXFP8) — variable-K wgrad path
 //==================================================================
 //
-// Per-group dB[g] = LHS[g] @ RHS[g]^T with LHS shape (N, total_M),
-// RHS shape (K, total_M), dB shape (group_num, N, K); reduction along
-// total_M.  Constraints: n % 16 == 0, k % 16 == 0, M_g % 32 == 0.
+// Per-group dB[g] = LHS[g] @ RHS[g]^T, with LHS (N, total_M), RHS
+// (K, total_M), dB (group_num, N, K); reduction is over total_M.
+// Constraints: n % 16 == 0, k % 16 == 0, M_g % 32 == 0.
 
 template <typename AType, typename BType, typename CType> struct TurboGroupedGemmMXFP8WgradParams {
-    const AType *lhs_ptr = nullptr;  // dC^T fp8: (N, total_M)
-    const BType *rhs_ptr = nullptr;  // A^T  fp8: (K, total_M)
-    CType       *db_ptr  = nullptr;  // dB:       (group_num, N, K)
+    const AType *lhs_ptr = nullptr; // (N, total_M)
+    const BType *rhs_ptr = nullptr; // (K, total_M)
+    CType       *db_ptr  = nullptr; // (group_num, N, K)
 
-    const dtype::float8_e8m0 *lhs_scale_ptr = nullptr;  // (N, total_M/32) E8M0
-    const dtype::float8_e8m0 *rhs_scale_ptr = nullptr;  // (K, total_M/32) E8M0
+    const dtype::float8_e8m0 *lhs_scale_ptr = nullptr; // (N, total_M/32)
+    const dtype::float8_e8m0 *rhs_scale_ptr = nullptr; // (K, total_M/32)
 
-    const int64_t *group_lens_ptr = nullptr;  // [group_num]
-    const int64_t *group_offs_ptr = nullptr;  // [group_num+1]
+    const int64_t *group_lens_ptr = nullptr; // [group_num]
+    const int64_t *group_offs_ptr = nullptr; // [group_num+1]
 
     int32_t group_num = 0;
     int32_t total_m   = 0;

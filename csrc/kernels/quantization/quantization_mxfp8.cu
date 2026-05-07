@@ -151,12 +151,12 @@ __device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float
         result = tmp1;
         result = (result << 16) | tmp0;
     } else if constexpr (std::is_same_v<DType, dtype::float8_e5m2>) {
-        const float lim = FP8E5M2_MAX * scale;
-        const float v0c = fminf(fmaxf(v0, -lim), lim);
-        const float v1c = fminf(fmaxf(v1, -lim), lim);
-        const float v2c = fminf(fmaxf(v2, -lim), lim);
-        const float v3c = fminf(fmaxf(v3, -lim), lim);
-        uint16_t tmp0 = 0;
+        const float lim  = FP8E5M2_MAX * scale;
+        const float v0c  = fminf(fmaxf(v0, -lim), lim);
+        const float v1c  = fminf(fmaxf(v1, -lim), lim);
+        const float v2c  = fminf(fmaxf(v2, -lim), lim);
+        const float v3c  = fminf(fmaxf(v3, -lim), lim);
+        uint16_t    tmp0 = 0;
         // Convert first pair (v0, v1) to 16-bit packed BF8 (E5M2)
         asm volatile("v_cvt_scalef32_pk_bf8_f32 %0, %1, %2, %3"
                      : "+v"(tmp0)
@@ -495,17 +495,36 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
  *   OType:                                       Data type of output
  *   ROWWISE_USE_2D_BLOCK / COLWISE_USE_2D_BLOCK: Use 2D block for r_amax reduction
  */
+// ``per_group_*_stride`` (in *elements*, not bytes) let the same kernel
+// service per-group inputs (``(G, M, N)`` reshape) by offsetting all I/O
+// pointers by ``blockIdx.z * <stride>``.  When the launcher uses
+// ``grid_z == 1`` (default single-tensor mode) ``blockIdx.z == 0`` so the
+// added arithmetic is dead-code-eliminated by the compiler at the call
+// site that passes 0 for the strides.  This avoids duplicating the ~700
+// LOC kernel body for the per-group variant.
 template <typename IType, typename OType, bool ROWWISE_USE_2D_BLOCK = false,
           bool COLWISE_USE_2D_BLOCK = false>
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kernel(
-    const IType *__restrict__ input, OType *__restrict__ rowwise_fp8,
-    uint8_t *__restrict__ rowwise_scale, OType *__restrict__ colwise_fp8,
-    uint8_t *__restrict__ colwise_scale, const int M, const int N, const int M_pad, const int N_pad,
-    const int rowwise_scale_stride, const int colwise_scale_stride, const int rowwise_scale_N,
-    const int rowwise_scale_M_pad, const int rowwise_scale_N_pad, const int colwise_scale_M,
-    const int colwise_scale_N, const int colwise_scale_M_pad, const int colwise_scale_N_pad,
-    const bool shuffle_rowwise, const bool shuffle_colwise, const bool shuffle_rowwise_scale,
-    const bool shuffle_colwise_scale) {
+    const IType *__restrict__ input_base, OType *__restrict__ rowwise_fp8_base,
+    uint8_t *__restrict__ rowwise_scale_base, OType *__restrict__ colwise_fp8_base,
+    uint8_t *__restrict__ colwise_scale_base, const int M, const int N, const int M_pad,
+    const int N_pad, const int rowwise_scale_stride, const int colwise_scale_stride,
+    const int rowwise_scale_N, const int rowwise_scale_M_pad, const int rowwise_scale_N_pad,
+    const int colwise_scale_M, const int colwise_scale_N, const int colwise_scale_M_pad,
+    const int colwise_scale_N_pad, const bool shuffle_rowwise, const bool shuffle_colwise,
+    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale,
+    const int64_t input_per_group_stride = 0, const int64_t rowwise_fp8_per_group_stride = 0,
+    const int64_t rowwise_scale_per_group_stride = 0,
+    const int64_t colwise_fp8_per_group_stride   = 0,
+    const int64_t colwise_scale_per_group_stride = 0) {
+    // Per-group offsets (no-op when launched with grid_z == 1).
+    const int    g             = blockIdx.z;
+    const IType *input         = input_base + (int64_t) g * input_per_group_stride;
+    OType       *rowwise_fp8   = rowwise_fp8_base + (int64_t) g * rowwise_fp8_per_group_stride;
+    uint8_t     *rowwise_scale = rowwise_scale_base + (int64_t) g * rowwise_scale_per_group_stride;
+    OType       *colwise_fp8   = colwise_fp8_base + (int64_t) g * colwise_fp8_per_group_stride;
+    uint8_t     *colwise_scale = colwise_scale_base + (int64_t) g * colwise_scale_per_group_stride;
+
     // ========================================================================
     // Thread and Block Identification
     // ========================================================================
@@ -967,7 +986,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grou
         } else {
             s_group_offs_orig = 0;
             s_group_offs_pad  = base_m;
-            s_real_end_in_pad = base_m;  // every row falls into zero-pad branch
+            s_real_end_in_pad = base_m; // every row falls into zero-pad branch
         }
     }
     __syncthreads();
@@ -1040,10 +1059,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grou
 
             const int global_row = tile_m + pass * ROWS_PER_PASS + row_in_warp;
             if (global_row < real_end_in_pad) {
-                packed_uint16x4_to_floatx4<kIshalf>(r_tile[pass], r_rowwise_vals[pass][0],
-                                                    r_rowwise_vals[pass][1],
-                                                    r_rowwise_vals[pass][2],
-                                                    r_rowwise_vals[pass][3]);
+                packed_uint16x4_to_floatx4<kIshalf>(
+                    r_tile[pass], r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
+                    r_rowwise_vals[pass][2], r_rowwise_vals[pass][3]);
                 float local_amax =
                     fmaxf(fmaxf(fabsf(r_rowwise_vals[pass][0]), fabsf(r_rowwise_vals[pass][1])),
                           fmaxf(fabsf(r_rowwise_vals[pass][2]), fabsf(r_rowwise_vals[pass][3])));
@@ -1459,6 +1477,102 @@ template void quantize_mxfp8_dual_impl<dtype::bfloat16, dtype::float8_e4m3>(
     int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
     ScalingRecipe colwise_recipe, hipStream_t stream);
 
+// Per-group dual quant for the MXFP8 grouped GEMM B-side: writes the
+// rowwise output as ``(G, M_pad, N_pad)`` and the colwise output as
+// ``(G, N, M_pad)`` directly, eliminating the ``regroup_b_colwise``
+// kernel that the dgrad path used to need.  Per-group dimensions
+// ``M`` / ``N`` / ``M_pad`` / ``N_pad`` are the same for every group.
+template <typename IType, typename OType>
+void quantize_mxfp8_dual_perg_impl(
+    const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
+    uint8_t *colwise_scale, int G, int M, int N, int M_pad, int N_pad, int rowwise_scale_stride,
+    int colwise_scale_stride, int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
+    int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, hipStream_t stream) {
+    dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
+    dim3 block(THREADS_PER_BLOCK);
+
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_rht == false, "MXFP8 not support RHT");
+    PRIMUS_TURBO_CHECK(rowwise_recipe.use_sr == false, "MXFP8 not support SR");
+    PRIMUS_TURBO_CHECK(colwise_recipe.use_sr == false, "MXFP8 not support SR");
+    // The shuffle paths use per-call M-aligned scale layouts that are
+    // not trivially per-group offsetable (and the grouped-GEMM B-side
+    // currently passes use_2d_block=True with shuffle_out=False/
+    // shuffle_scale=False), so we restrict the per-group launcher to
+    // non-shuffled output.  The kernel body still runs the same code
+    // path; we just don't expose shuffle here.
+    PRIMUS_TURBO_CHECK(
+        rowwise_recipe.shuffle_out == false && rowwise_recipe.shuffle_scale == false &&
+            colwise_recipe.shuffle_out == false && colwise_recipe.shuffle_scale == false,
+        "quantize_mxfp8_dual_perg does not support shuffle modes");
+
+    // Per-group strides (in elements).
+    //
+    // Rowwise outputs are buffer-shaped ``(G, M, N_pad)`` (only M real
+    // rows; the kernel guards rowwise writes with ``global_row < M`` so
+    // it never writes the M_pad-M padding rows).  This matches the
+    // grouped GEMM's per-group offset assumption ``g * N * K`` exactly,
+    // letting the GEMM consume the buffer without slicing.
+    //
+    // Colwise outputs are buffer-shaped ``(G, N, M_pad)`` because the
+    // colwise stride is ``M_pad`` and the kernel writes the full
+    // ``[0, M_pad)`` range (with zero-quant for the M_pad-M padding
+    // rows, matching the GEMM kernel's unread region).
+    const int64_t input_per_g_stride         = (int64_t) M * N;
+    const int64_t rowwise_fp8_per_g_stride   = (int64_t) M * N_pad;
+    const int64_t rowwise_scale_per_g_stride = (int64_t) M * rowwise_scale_stride;
+    const int64_t colwise_fp8_per_g_stride   = (int64_t) N * M_pad;
+    const int64_t colwise_scale_per_g_stride = (int64_t) N * colwise_scale_stride;
+
+#define QUANTIZE_MXFP8_DUAL_PERG_ARGS                                                              \
+    input, rowwise_output, rowwise_scale, colwise_output, colwise_scale, M, N, M_pad, N_pad,       \
+        rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
+        rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
+        colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale, input_per_g_stride,            \
+        rowwise_fp8_per_g_stride, rowwise_scale_per_g_stride, colwise_fp8_per_g_stride,            \
+        colwise_scale_per_g_stride
+
+#define QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)                \
+    quantize_mxfp8_dual_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>           \
+        <<<grid, block, 0, stream>>>(QUANTIZE_MXFP8_DUAL_PERG_ARGS)
+
+    if (rowwise_recipe.use_2d_block) {
+        if (colwise_recipe.use_2d_block) {
+            QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(true, true);
+        } else {
+            QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(true, false);
+        }
+    } else {
+        if (colwise_recipe.use_2d_block) {
+            QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(false, true);
+        } else {
+            QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(false, false);
+        }
+    }
+
+#undef QUANTIZE_MXFP8_DUAL_PERG_LAUNCH
+#undef QUANTIZE_MXFP8_DUAL_PERG_ARGS
+}
+
+template void quantize_mxfp8_dual_perg_impl<dtype::float16, dtype::float8_e5m2>(
+    const dtype::float16 *, dtype::float8_e5m2 *, uint8_t *, dtype::float8_e5m2 *, uint8_t *, int,
+    int, int, int, int, int, int, int, int, int, int, int, int, int, ScalingRecipe, ScalingRecipe,
+    hipStream_t);
+template void quantize_mxfp8_dual_perg_impl<dtype::bfloat16, dtype::float8_e5m2>(
+    const dtype::bfloat16 *, dtype::float8_e5m2 *, uint8_t *, dtype::float8_e5m2 *, uint8_t *, int,
+    int, int, int, int, int, int, int, int, int, int, int, int, int, ScalingRecipe, ScalingRecipe,
+    hipStream_t);
+template void quantize_mxfp8_dual_perg_impl<dtype::float16, dtype::float8_e4m3>(
+    const dtype::float16 *, dtype::float8_e4m3 *, uint8_t *, dtype::float8_e4m3 *, uint8_t *, int,
+    int, int, int, int, int, int, int, int, int, int, int, int, int, ScalingRecipe, ScalingRecipe,
+    hipStream_t);
+template void quantize_mxfp8_dual_perg_impl<dtype::bfloat16, dtype::float8_e4m3>(
+    const dtype::bfloat16 *, dtype::float8_e4m3 *, uint8_t *, dtype::float8_e4m3 *, uint8_t *, int,
+    int, int, int, int, int, int, int, int, int, int, int, int, int, ScalingRecipe, ScalingRecipe,
+    hipStream_t);
+
 template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale, QuantizeMode mode,
                          int M, int N, int M_pad, int N_pad, int scale_stride, int scale_N,
@@ -1516,117 +1630,34 @@ template void quantize_mxfp8_impl<dtype::bfloat16, dtype::float8_e4m3>(
     ScalingRecipe recipe, hipStream_t stream);
 
 // ========================================================================
-// compute_padded_layout_kernel: compute padded group lens/offs on GPU
+// Grouped Padded Layout
 // ========================================================================
-// Single-thread kernel; G is typically 4–64 so latency is negligible.
+//
+// Compute per-group padded lens/offs on the GPU.  Single-thread kernel:
+// G is typically 4–64 so the serial loop is negligible relative to the
+// avoided D2H sync.
 
-__global__ void compute_padded_layout_kernel(
-    const int64_t *__restrict__ group_lens,
-    const int64_t *__restrict__ group_offs,
-    int64_t *__restrict__ group_lens_padded,
-    int64_t *__restrict__ group_offs_padded,
-    int G, int64_t align) {
-    if (threadIdx.x != 0) return;
-    int64_t offset = 0;
+__global__ void compute_padded_layout_kernel(const int64_t *__restrict__ group_lens,
+                                             int64_t *__restrict__ group_lens_padded,
+                                             int64_t *__restrict__ group_offs_padded, int G,
+                                             int64_t align) {
+    if (threadIdx.x != 0)
+        return;
+    int64_t offset       = 0;
     group_offs_padded[0] = 0;
     for (int i = 0; i < G; ++i) {
-        int64_t m_pad = (group_lens[i] + align - 1) / align * align;
+        int64_t m_pad        = (group_lens[i] + align - 1) / align * align;
         group_lens_padded[i] = m_pad;
         offset += m_pad;
         group_offs_padded[i + 1] = offset;
     }
 }
 
-void compute_padded_layout_gpu(
-    const int64_t *group_lens, const int64_t *group_offs,
-    int64_t *group_lens_padded, int64_t *group_offs_padded,
-    int G, int64_t align, hipStream_t stream) {
-    compute_padded_layout_kernel<<<1, 1, 0, stream>>>(
-        group_lens, group_offs, group_lens_padded, group_offs_padded,
-        G, align);
-}
-
-// ========================================================================
-// extract_grouped_rows: single-kernel replacement for G × .copy_() calls
-// ========================================================================
-//
-// Copies non-padded rows from a (total_M_padded, N) padded tensor to a
-// dense (total_M_orig, N) output tensor, using group_offs_orig /
-// group_offs_padded to map each output row to its source row.
-//
-// Grid:   ((total_M_orig + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK,)
-// Block:  (256) — each block copies ROWS_PER_BLOCK rows; threads stride
-//         over (ROWS_PER_BLOCK × num_vec) float4 elements.
-
-template <int ROWS_PER_BLOCK>
-__global__ void extract_grouped_rows_kernel(
-    const char *__restrict__ src, char *__restrict__ dst,
-    const int64_t *__restrict__ group_offs_orig,
-    const int64_t *__restrict__ group_offs_padded,
-    int G, int64_t num_vec, int64_t total_M_orig) {
-
-    constexpr int MAX_GROUPS = 128;
-    __shared__ int64_t s_orig[MAX_GROUPS + 1];
-    __shared__ int64_t s_pad[MAX_GROUPS + 1];
-
-    for (int i = threadIdx.x; i <= G; i += blockDim.x) {
-        s_orig[i] = group_offs_orig[i];
-        s_pad[i]  = group_offs_padded[i];
-    }
-    __syncthreads();
-
-    const int64_t base_out_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_BLOCK;
-
-    // Map each of the ROWS_PER_BLOCK rows in this CTA to its source row.
-    __shared__ int64_t s_src_row[ROWS_PER_BLOCK];
-    if (threadIdx.x < ROWS_PER_BLOCK) {
-        const int64_t out_row = base_out_row + threadIdx.x;
-        int64_t src_row = -1;
-        if (out_row < total_M_orig) {
-            int g = G - 1;
-            for (int i = 0; i < G; ++i) {
-                if (out_row < s_orig[i + 1]) { g = i; break; }
-            }
-            src_row = s_pad[g] + (out_row - s_orig[g]);
-        }
-        s_src_row[threadIdx.x] = src_row;
-    }
-    __syncthreads();
-
-    const float4 *src_v4 = reinterpret_cast<const float4 *>(src);
-    float4       *dst_v4 = reinterpret_cast<float4 *>(dst);
-
-    // Cooperatively copy ROWS_PER_BLOCK rows × num_vec float4s, striding
-    // across threads.  Memory access is fully coalesced per row.
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
-        const int64_t out_row = base_out_row + r;
-        if (out_row >= total_M_orig) break;
-        const int64_t src_row = s_src_row[r];
-        const float4 *sp = src_v4 + src_row * num_vec;
-        float4       *dp = dst_v4 + out_row * num_vec;
-        for (int64_t idx = threadIdx.x; idx < num_vec; idx += blockDim.x) {
-            dp[idx] = sp[idx];
-        }
-    }
-}
-
-void extract_grouped_rows_impl(
-    const void *src, void *dst,
-    const int64_t *group_offs_orig, const int64_t *group_offs_padded,
-    int G, int64_t row_bytes, int64_t total_M_orig, hipStream_t stream) {
-
-    constexpr int ROWS_PER_BLOCK = 8;
-    constexpr int kBlockX        = 256;
-
-    const int64_t num_vec = row_bytes >> 4;  // row_bytes / 16
-    const dim3    grid(static_cast<int>((total_M_orig + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK));
-    const dim3    block(kBlockX);
-
-    extract_grouped_rows_kernel<ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const char *>(src), static_cast<char *>(dst),
-        group_offs_orig, group_offs_padded,
-        G, num_vec, total_M_orig);
+void compute_padded_layout_gpu(const int64_t *group_lens, int64_t *group_lens_padded,
+                               int64_t *group_offs_padded, int G, int64_t align,
+                               hipStream_t stream) {
+    compute_padded_layout_kernel<<<1, 1, 0, stream>>>(group_lens, group_lens_padded,
+                                                      group_offs_padded, G, align);
 }
 
 } // namespace primus_turbo

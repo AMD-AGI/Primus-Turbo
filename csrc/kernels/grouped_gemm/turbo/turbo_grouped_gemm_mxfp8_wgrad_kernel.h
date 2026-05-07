@@ -33,17 +33,18 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const int64_t *group_offs_ptr, const int32_t group_id, const int32_t pid_n_local,
     const int32_t pid_k_local, const int32_t M_g, const uint32_t n, const uint32_t k,
     const uint32_t total_m) {
-    const int32_t pid_n = pid_n_local * 256;  // along N (output dim 0)
-    const int32_t pid_k = pid_k_local * 256;  // along K (output dim 1)
+    const int32_t pid_n = pid_n_local * 256; // along N (output dim 0)
+    const int32_t pid_k = pid_k_local * 256; // along K (output dim 1)
     if (pid_n >= (int32_t) n || pid_k >= (int32_t) k)
         return;
 
     const uint32_t lane_id = tile.lane_id;
     const uint32_t warp_id = tile.warp_id;
-    const uint32_t warp_m  = tile.warp_m;  // along output dim 0 (N here)
-    const uint32_t warp_n  = tile.warp_n;  // along output dim 1 (K here)
+    const uint32_t warp_m  = tile.warp_m; // along output dim 0 (N here)
+    const uint32_t warp_n  = tile.warp_n; // along output dim 1 (K here)
 
-    const uint32_t scale_cols_full = (total_m + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
+    const uint32_t scale_cols_full =
+        (total_m + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
 
     // Mirror FWD: scalar (s_load) of group_offs_ptr[group_id].
     const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
@@ -57,13 +58,15 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     // preshuffled elements.  Requires M_g % 128 == 0 (wrapper-enforced).
     const int64_t group_scale_offset = group_col_offset / 2;
 
-    const AType    *lhs_base_ptr   = lhs_ptr + (int64_t) pid_n * total_m + group_col_offset;
-    const BType    *rhs_base_ptr   = rhs_ptr + (int64_t) pid_k * total_m + group_col_offset;
-    const uint32_t *lhs_s_base_ptr = lhs_s_ptr + (int64_t) pid_n * scale_cols_full + group_scale_offset;
-    const uint32_t *rhs_s_base_ptr = rhs_s_ptr + (int64_t) pid_k * scale_cols_full + group_scale_offset;
+    const AType    *lhs_base_ptr = lhs_ptr + (int64_t) pid_n * total_m + group_col_offset;
+    const BType    *rhs_base_ptr = rhs_ptr + (int64_t) pid_k * total_m + group_col_offset;
+    const uint32_t *lhs_s_base_ptr =
+        lhs_s_ptr + (int64_t) pid_n * scale_cols_full + group_scale_offset;
+    const uint32_t *rhs_s_base_ptr =
+        rhs_s_ptr + (int64_t) pid_k * scale_cols_full + group_scale_offset;
 
     uint32_t ldg_offsets[2];
-    tile.compute_ldg_offsets(ldg_offsets, total_m);  // stride = total_m
+    tile.compute_ldg_offsets(ldg_offsets, total_m); // stride = total_m
     uint32_t sts_offsets[2];
     tile.compute_sts_offsets(sts_offsets);
     uint32_t lds_offsets[2];
@@ -81,22 +84,22 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     auto clamp_u32 = [](uint64_t v) -> uint32_t {
         return v >= 0xffffffffu ? 0xffffffffu : static_cast<uint32_t>(v);
     };
-    const uint32_t lhs_remaining = clamp_u32(
-        ((uint64_t)(n - pid_n) * total_m - (uint64_t) group_col_offset) * sizeof(AType));
-    const uint32_t rhs_remaining = clamp_u32(
-        ((uint64_t)(k - pid_k) * total_m - (uint64_t) group_col_offset) * sizeof(BType));
-    const uint32_t lhs_s_remaining = clamp_u32(
-        ((uint64_t)(n - pid_n) * scale_cols_full - (uint64_t) group_scale_offset) *
-        sizeof(uint32_t));
-    const uint32_t rhs_s_remaining = clamp_u32(
-        ((uint64_t)(k - pid_k) * scale_cols_full - (uint64_t) group_scale_offset) *
-        sizeof(uint32_t));
+    const uint32_t lhs_remaining =
+        clamp_u32(((uint64_t) (n - pid_n) * total_m - (uint64_t) group_col_offset) * sizeof(AType));
+    const uint32_t rhs_remaining =
+        clamp_u32(((uint64_t) (k - pid_k) * total_m - (uint64_t) group_col_offset) * sizeof(BType));
+    const uint32_t lhs_s_remaining =
+        clamp_u32(((uint64_t) (n - pid_n) * scale_cols_full - (uint64_t) group_scale_offset) *
+                  sizeof(uint32_t));
+    const uint32_t rhs_s_remaining =
+        clamp_u32(((uint64_t) (k - pid_k) * scale_cols_full - (uint64_t) group_scale_offset) *
+                  sizeof(uint32_t));
     const BufferSRD a_srd(lhs_base_ptr, lhs_remaining);
     const BufferSRD b_srd(rhs_base_ptr, rhs_remaining);
     const BufferSRD a_s_srd(lhs_s_base_ptr, lhs_s_remaining);
     const BufferSRD b_s_srd(rhs_s_base_ptr, rhs_s_remaining);
 
-    constexpr int32_t DATA_STRIDE  = GemmTile::BLOCK_SIZE_K;  // 128
+    constexpr int32_t DATA_STRIDE  = GemmTile::BLOCK_SIZE_K; // 128
     constexpr int32_t SCALE_STRIDE = GemmTile::SCALE_FRAG_SIZE * sizeof(uint32_t);
 
     // CORRECTNESS FIX (M_g == 128, k_iters == 1): the tile-1 prologue LDG
@@ -107,9 +110,9 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     // forces zero MFMA result regardless of scale).  k_iters >= 2 path is
     // bit-identical.
     // K-loop iterates over M_g (the reduction dim), not total_m.
-    const uint32_t k_iters = (M_g + GemmTile::BLOCK_SIZE_K - 1) / GemmTile::BLOCK_SIZE_K;
-    const uint32_t a_t1_remaining = (k_iters >= 2) ? lhs_remaining : 0u;
-    const uint32_t b_t1_remaining = (k_iters >= 2) ? rhs_remaining : 0u;
+    const uint32_t  k_iters        = (M_g + GemmTile::BLOCK_SIZE_K - 1) / GemmTile::BLOCK_SIZE_K;
+    const uint32_t  a_t1_remaining = (k_iters >= 2) ? lhs_remaining : 0u;
+    const uint32_t  b_t1_remaining = (k_iters >= 2) ? rhs_remaining : 0u;
     const BufferSRD a_srd_t1(lhs_base_ptr, a_t1_remaining);
     const BufferSRD b_srd_t1(rhs_base_ptr, b_t1_remaining);
 
@@ -152,8 +155,8 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     wait_vmcnt<0>();
     __builtin_amdgcn_s_barrier();
 
-    uint32_t       cur     = 0;
-    uint32_t       next    = 1;
+    uint32_t cur  = 0;
+    uint32_t next = 1;
 
     // ── Prologue: issue LDS for A0/B0 ──
     GemmTile::template load_data_subtile_pinned<GemmTile::PIN_A0>(
@@ -399,7 +402,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     __builtin_amdgcn_sched_barrier(0);
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
-    CType *db_group_ptr = db_ptr + (int64_t) group_id * n * k;
+    CType *db_group_ptr   = db_ptr + (int64_t) group_id * n * k;
     CType *c_stg_base_ptr = db_group_ptr + (int64_t) pid_n * k + pid_k +
                             warp_id / 2 * 64 * (int64_t) k + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_n + 256 > (int32_t) n) || (pid_k + 256 > (int32_t) k);
@@ -407,17 +410,17 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     if (!is_boundary_tile) {
         float32x4 c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k, c_tmp,
+                             c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
@@ -425,23 +428,23 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
         const int32_t tile_valid_n = min((int32_t) k - pid_k, 256) - warp_base_n;
         float32x4     c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k,
-                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 0 * 128, k, c_tmp,
+                             c_stg_offsets, tile_valid_m, tile_valid_n);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k,
-                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n - 128);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) k + 1 * 128, k, c_tmp,
+                             c_stg_offsets, tile_valid_m, tile_valid_n - 128);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k,
-                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 0 * 128, k, c_tmp,
+                             c_stg_offsets, tile_valid_m - 128, tile_valid_n);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k,
-                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) k + 1 * 128, k, c_tmp,
+                             c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
-__global__ __launch_bounds__(256, 1) void
-turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
+__global__
+__launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *lhs_ptr, const BType *rhs_ptr, const uint32_t *lhs_s_ptr,
     const uint32_t *rhs_s_ptr, CType *db_ptr, const int64_t *group_lens_ptr,
     const int64_t *group_offs_ptr, const int32_t group_num, const uint32_t total_m,
@@ -473,7 +476,8 @@ turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
 
     const int32_t tiles_per_group = grid_n * grid_k;
     const int32_t total_tiles     = tiles_per_group * group_num;
-    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles; tile_id += (int32_t) gridDim.x) {
+    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles;
+         tile_id += (int32_t) gridDim.x) {
         const int32_t group_id = tile_id / tiles_per_group;
         const int32_t rem      = tile_id - group_id * tiles_per_group;
         const int32_t pid_k    = rem / grid_n;

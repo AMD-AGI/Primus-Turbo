@@ -20,19 +20,13 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.core.low_precision import ScalingRecipe
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-    extract_grouped_rows_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
     quantize_mxfp8_dual_grouped_impl,
 )
-from primus_turbo.pytorch.ops.quantization import (
-    MX_BLOCK_SIZE,
-    quantize_fp8,
-    quantize_fp8_with_trans,
-)
+from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 MXFP8_PADDING_ALIGN_SIZE = 128
 
@@ -52,49 +46,9 @@ def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
         raise ValueError(f"Unsupported FP8 format: {format}")
 
 
-def _regroup_b_colwise_for_dgrad(
-    b_fp8_col_2d: torch.Tensor,
-    b_scale_inv_col_2d: torch.Tensor,
-    group_num: int,
-    n: int,
-    k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert flattened B^T quantization to grouped (G, K, N) layout for dgrad."""
-    assert b_fp8_col_2d.size(1) >= group_num * n
-    assert n % MX_BLOCK_SIZE == 0
-
-    scale_cols = n // MX_BLOCK_SIZE
-    assert b_scale_inv_col_2d.size(0) == k
-    assert b_scale_inv_col_2d.size(1) >= group_num * scale_cols
-
-    # Transposed view; the transpose is folded into the .contiguous() / copy_().
-    b_fp8_col_view = (
-        b_fp8_col_2d[:, : group_num * n]
-        .reshape(k, group_num, n)
-        .transpose(0, 1)
-    )
-    b_scale_inv_col_view = (
-        b_scale_inv_col_2d[:, : group_num * scale_cols]
-        .reshape(k, group_num, scale_cols)
-        .transpose(0, 1)
-    )
-    if n % MXFP8_PADDING_ALIGN_SIZE == 0:
-        return b_fp8_col_view.contiguous(), b_scale_inv_col_view.contiguous()
-
-    # Tail-pad N to MXFP8_PADDING_ALIGN_SIZE (e.g. N=2880 -> 2944).
-    n_padded = (
-        (n + MXFP8_PADDING_ALIGN_SIZE - 1) // MXFP8_PADDING_ALIGN_SIZE
-    ) * MXFP8_PADDING_ALIGN_SIZE
-    scale_cols_padded = n_padded // MX_BLOCK_SIZE
-    b_fp8_col_padded = b_fp8_col_view.new_zeros((group_num, k, n_padded))
-    b_fp8_col_padded[:, :, :n].copy_(b_fp8_col_view)
-    b_scale_inv_col_padded = b_scale_inv_col_view.new_zeros((group_num, k, scale_cols_padded))
-    b_scale_inv_col_padded[:, :, :scale_cols].copy_(b_scale_inv_col_view)
-    return b_fp8_col_padded, b_scale_inv_col_padded
-
-
 def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
-    # Upstream reductions sometimes produce expanded zero-stride views.
+    # Some upstream reductions can produce expanded zero-stride grad_out views.
+    # Custom grouped GEMM kernels expect dense layouts.
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
 
 
@@ -102,40 +56,36 @@ def _mxfp8_grid_x_hint(total_M: int, G: int) -> int:
     """Pessimistic ``grid_x`` upper bound for the turbo grouped GEMM.
 
     Each per-group M_g is at most ``ceil((total_M + G*align)/align)*align``
-    rows after padding; ``grid_x`` must be at least
-    ``ceil(max_M_g / 256)``.  Without a D2H sync we don't know the
-    exact max, so we pass the absolute upper bound — empirically free
-    on M >= 8k workloads, ~1.5x scheduler overhead on tiny shapes.
+    rows after padding; ``grid_x`` must be at least ``ceil(max_M_g / 256)``.
+    Passing the upper bound here lets the GEMM op skip its internal
+    ``group_lens.cpu()`` sync.
     """
-    total_M_upper = ((total_M + G * MXFP8_PADDING_ALIGN_SIZE)
-                     + (MXFP8_PADDING_ALIGN_SIZE - 1)) // MXFP8_PADDING_ALIGN_SIZE \
-                     * MXFP8_PADDING_ALIGN_SIZE
+    total_M_upper = (
+        (total_M + G * MXFP8_PADDING_ALIGN_SIZE + MXFP8_PADDING_ALIGN_SIZE - 1)
+        // MXFP8_PADDING_ALIGN_SIZE
+        * MXFP8_PADDING_ALIGN_SIZE
+    )
     return (total_M_upper + 255) // 256
 
 
 def _turbo_grouped_gemm_mxfp8(
     a_fp8, b_fp8, a_scales, b_scales,
     group_lens, group_offs_in, out_dtype, *,
-    c_group_offs=None, total_m_out=0,
-    grid_x_hint=0, b_scale_preshuffled=False,
+    c_group_offs=None, total_m_out=0, grid_x_hint=0,
 ):
-    """Direct call to turbo_grouped_gemm_fp8 MX_BLOCKWISE NT, bypassing
-    the Python dispatcher (saves ~10-20 µs per call) and passing
-    ``grid_x_hint`` so the GEMM op skips its internal
-    ``group_lens.cpu()`` sync.
+    """MX_BLOCKWISE NT grouped GEMM with optional fused unpad-on-store.
 
     For per-group-padded inputs, pass ``group_offs_in =
     group_offs_padded`` (input row offsets), ``c_group_offs =
-    group_offs`` (output row offsets — original/unpadded layout), and
-    ``total_m_out = a.size(0)`` (original total_M).  The kernel writes
-    only real rows directly to the unpadded output, fusing the extract
-    pass.  When the layout is identity (balanced+aligned: ``group_offs
-    == group_offs_padded``) ``c_group_offs`` may be left as ``None``.
+    group_offs`` (output row offsets in the original/unpadded layout),
+    and ``total_m_out = a.size(0)`` (original total_M).  When the
+    layout is identity (balanced + aligned) ``c_group_offs`` may be
+    left as ``None``.
     """
     return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
         a_fp8, b_fp8, a_scales, b_scales, group_lens, group_offs_in,
         c_group_offs, int(total_m_out),
-        False, True, out_dtype, "MX_BLOCKWISE", int(grid_x_hint), bool(b_scale_preshuffled),
+        False, True, out_dtype, "MX_BLOCKWISE", int(grid_x_hint),
     )
 
 
@@ -143,7 +93,6 @@ def _turbo_grouped_gemm_variable_k_mxfp8(
     lhs_fp8, lhs_scales, rhs_fp8, rhs_scales,
     group_lens, group_offs, out_dtype,
 ):
-    """Direct call to turbo_grouped_gemm_variable_k_fp8 MX_BLOCKWISE."""
     return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
         lhs_fp8, lhs_scales, rhs_fp8, rhs_scales,
         group_lens, group_offs, out_dtype, "MX_BLOCKWISE",
@@ -510,44 +459,32 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         out_dtype = a.dtype
         assert out_dtype in [torch.float16, torch.bfloat16]
 
-        # Materialise b in NT layout (G, N, K); kernel only supports NT.
+        # Kernel only supports NT, so materialise b in (G, N, K).
         b_internal = b if trans_b else b.transpose(-1, -2).contiguous()
-        G, N, K = b_internal.shape
+        G, _, _ = b_internal.shape
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        # Fused grouped quant: produces row + col MXFP8 outputs in the
-        # padded layout AND computes ``group_lens_padded`` /
-        # ``group_offs_padded`` on GPU in one op (no D2H sync).
-        # ``grid_x_hint`` is the pessimistic but safe ceil bound for
-        # the GEMM scheduler.
+        # Fused grouped quant for A: produces row + col MXFP8 outputs
+        # in the padded layout AND computes the padded per-group layout
+        # on GPU (no D2H sync).
         a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col, \
-            group_lens_padded, group_offs_padded = quantize_mxfp8_dual_grouped_impl(
+            _, group_offs_padded = quantize_mxfp8_dual_grouped_impl(
                 a, a_dtype, group_lens, group_offs,
             )
         grid_x_hint = _mxfp8_grid_x_hint(a.size(0), G)
 
-        # B row-wise (fwd) + col-wise (dgrad).
-        weight_2d_block_recipe = ScalingRecipe(use_2d_block=True)
-        b_fp8_row_2d, b_scale_inv_row_2d, b_fp8_col_2d, b_scale_inv_col_2d = quantize_fp8_with_trans(
-            b_internal.reshape(G * N, K),
-            b_dtype,
-            config.granularity,
-            block_size=MX_BLOCK_SIZE,
-            scaling_recipe=weight_2d_block_recipe,
-            scaling_recipe_for_trans=weight_2d_block_recipe,
+        # Per-group dual quant for B: rowwise (G, N, K_pad) for fwd,
+        # colwise (G, K, N_pad) for dgrad, both ready for GEMM.
+        b_fp8_row, b_scale_inv_row, b_fp8_col, b_scale_inv_col = (
+            torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_perg(
+                b_internal, b_dtype, True, True
+            )
         )
-        b_fp8_row = b_fp8_row_2d.reshape(G, N, -1)
-        b_scale_inv_row = b_scale_inv_row_2d.reshape(G, N, -1)
 
-        # Forward GEMM writes directly to the unpadded (total_M, N)
-        # output via ``c_group_offs``: the kernel iterates real rows
-        # only (compute bound = ``group_lens``, the *original*
-        # per-group lengths) and stores at row indices given by
-        # ``group_offs``.  Inputs still come from the padded FP8 layout
-        # via ``group_offs_padded``.  When balanced+aligned
-        # ``group_offs == group_offs_padded`` so this is a pure
-        # contiguous write — no extra cost vs the legacy single-layout
-        # call.
+        # Inputs read from the padded layout via ``group_offs_padded``;
+        # output is written directly to the unpadded (total_M, N) buffer
+        # via ``c_group_offs``.  When balanced + aligned the two layouts
+        # match and the write is a pure contiguous store.
         out = _turbo_grouped_gemm_mxfp8(
             a_fp8_row, b_fp8_row, a_scale_inv_row, b_scale_inv_row,
             group_lens, group_offs_padded, out_dtype,
@@ -558,8 +495,8 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.save_for_backward(
             a_fp8_col,
             a_scale_inv_col,
-            b_fp8_col_2d,
-            b_scale_inv_col_2d,
+            b_fp8_col,
+            b_scale_inv_col,
             group_lens,
             group_offs,
             group_offs_padded,
@@ -577,34 +514,21 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         (
             a_fp8_col,
             a_scale_inv_col,
-            b_fp8_col_2d,
-            b_scale_inv_col_2d,
+            b_fp8_col,
+            b_scale_inv_col,
             group_lens,
             group_offs,
             group_offs_padded,
         ) = ctx.saved_tensors
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # Fused grouped quant: same op as fwd.  ``group_lens_padded``
-        # is recomputed on GPU inside the op (single-thread layout
-        # kernel — sub-µs), so we only need ``group_offs_padded`` from
-        # ctx for the wgrad-side preshuffle bounds.
+        # Fused grouped quant for grad_out (same op as fwd).
         grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv, \
             group_lens_padded, _ = quantize_mxfp8_dual_grouped_impl(
                 grad_out, grad_out_dtype, group_lens, group_offs,
             )
 
-        # Regroup B's flat col-quant into per-group (G, K, N) for dgrad.
-        b_fp8_col, b_scale_inv_col = _regroup_b_colwise_for_dgrad(
-            b_fp8_col_2d,
-            b_scale_inv_col_2d,
-            group_lens.size(0),
-            grad_out.size(1),
-            b_fp8_col_2d.size(0),
-        )
-
-        # dgrad: same store-side fusion as fwd — kernel writes directly
-        # to (total_M, K) using c_group_offs = group_offs.
+        # dgrad: store-side unpad fused like fwd.
         grad_a = _turbo_grouped_gemm_mxfp8(
             grad_out_fp8_row, b_fp8_col, grad_out_scale_inv_row, b_scale_inv_col,
             group_lens, group_offs_padded, ctx.out_dtype,
@@ -612,17 +536,16 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             grid_x_hint=ctx.grid_x_hint,
         )
 
-        # wgrad: dB = dC^T @ A via fixed-NT variable-K turbo (direct call).
-        # Col-quant tensors are already transposed; padded layout so M_g % 128.
-        # wgrad still uses the padded layout end-to-end (its output is
-        # (G, N, K), no per-group row compression needed).
+        # wgrad: dB = dC^T @ A via fixed-NT variable-K turbo.  Operates
+        # on the padded layout end-to-end (output is (G, N, K), no row
+        # compression needed).
         grad_b = _turbo_grouped_gemm_variable_k_mxfp8(
             grad_out_t_fp8, grad_out_t_scale_inv, a_fp8_col, a_scale_inv_col,
             group_lens_padded, group_offs_padded, ctx.out_dtype,
         )
 
-        # Kernel output is always (G, N, K) (NT-internal); transpose back
-        # to (G, K, N) when the user supplied b in TT layout.
+        # Transpose back to (G, K, N) when the user originally supplied
+        # b in TT layout.
         if not ctx.trans_b_orig:
             grad_b = grad_b.transpose(-1, -2).contiguous()
 

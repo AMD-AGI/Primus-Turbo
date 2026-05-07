@@ -69,8 +69,8 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     if (c_group_offs_ptr != nullptr) {
         const uint32_t c_offset_lo = __builtin_amdgcn_readfirstlane(
             static_cast<uint32_t>(c_group_offs_ptr[group_id] & 0xffffffffULL));
-        const uint32_t c_offset_hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(
-            static_cast<uint64_t>(c_group_offs_ptr[group_id]) >> 32));
+        const uint32_t c_offset_hi = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(static_cast<uint64_t>(c_group_offs_ptr[group_id]) >> 32));
         const int64_t c_group_offset =
             (static_cast<int64_t>(c_offset_hi) << 32) | static_cast<int64_t>(c_offset_lo);
         c_m_global = c_group_offset + (int64_t) pid_m;
@@ -393,24 +393,24 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     __builtin_amdgcn_sched_barrier(0);
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
-    CType *c_stg_base_ptr =
-        c_ptr + c_m_global * (int64_t) n + pid_n + warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
+    CType *c_stg_base_ptr = c_ptr + c_m_global * (int64_t) n + pid_n +
+                            warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_m + 256 > M_g) || (pid_n + 256 > (int32_t) n);
 
     if (!is_boundary_tile) {
         float32x4 c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
+                             c_stg_offsets);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                             c_tmp, c_stg_offsets);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
+                             c_stg_offsets);
     } else {
         const int32_t warp_base_m  = warp_id / 2 * 64;
         const int32_t warp_base_n  = warp_id % 2 * 64;
@@ -418,23 +418,23 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         const int32_t tile_valid_n = min((int32_t) n - pid_n, 256) - warp_base_n;
         float32x4     c_tmp[4][4];
         tile.template read_c_subtile_from_agpr<0, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n,
-                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
+                             c_stg_offsets, tile_valid_m, tile_valid_n);
         tile.template read_c_subtile_from_agpr<0, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n,
-                             c_tmp, c_stg_offsets, tile_valid_m, tile_valid_n - 128);
+        tile.store_c_subtile(c_stg_base_ptr + 0 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
+                             c_stg_offsets, tile_valid_m, tile_valid_n - 128);
         tile.template read_c_subtile_from_agpr<1, 0>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n,
-                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 0 * 128, n, c_tmp,
+                             c_stg_offsets, tile_valid_m - 128, tile_valid_n);
         tile.template read_c_subtile_from_agpr<1, 1>(c_tmp);
-        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n,
-                             c_tmp, c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
+        tile.store_c_subtile(c_stg_base_ptr + 1 * 128 * (int64_t) n + 1 * 128, n, c_tmp,
+                             c_stg_offsets, tile_valid_m - 128, tile_valid_n - 128);
     }
 }
 
 template <typename AType, typename BType, typename CType, typename AccType = float>
-__global__ __launch_bounds__(256, 1) void
-turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
+__global__
+__launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *a_ptr, const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr,
     CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
     const int64_t *c_group_offs_ptr, const int32_t group_num, const uint32_t n, const uint32_t k,
@@ -467,7 +467,8 @@ turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
 
     const int32_t tiles_per_group = grid_m * grid_n;
     const int32_t total_tiles     = tiles_per_group * group_num;
-    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles; tile_id += (int32_t) gridDim.x) {
+    for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles;
+         tile_id += (int32_t) gridDim.x) {
         const int32_t group_id = tile_id / tiles_per_group;
         const int32_t rem      = tile_id - group_id * tiles_per_group;
         const int32_t pid_n    = rem / grid_m;

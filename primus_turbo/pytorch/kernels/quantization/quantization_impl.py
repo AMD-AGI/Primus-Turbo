@@ -345,22 +345,14 @@ def quantize_mxfp8_dual_grouped_impl(
     """MXFP8 dual quantization fused with per-group M-axis zero-padding.
 
     Each per-group region of ``x`` (defined by ``group_lens`` /
-    ``group_offs``) is virtually zero-padded along M to
-    ``MXFP8_PADDING_ALIGN_SIZE`` (=128).  The op:
-
-      1. Computes the padded per-group layout on GPU (single-thread
-         kernel; no D2H sync).
-      2. Allocates outputs at a host-known upper bound
-         ``ceil((total_M + G * align) / align) * align`` so the call
-         is fully async; the kernel skips OOB tiles.
-      3. Materialises the padded layout directly in the output tensors.
+    ``group_offs``) is virtually zero-padded along M to 128.  The padded
+    per-group layout is computed on GPU (no D2H sync); outputs are
+    allocated at the host-known upper bound
+    ``ceil((total_M + G * 128) / 128) * 128`` so the call is fully async.
 
     Returns ``(rowwise_fp8, rowwise_scale, colwise_fp8, colwise_scale,
-    group_lens_padded, group_offs_padded)``.  Rowwise has shape
-    ``(M_pad_upper, K_pad)``, colwise has shape ``(K, M_pad_upper)``;
-    only ``[0, group_offs_padded[-1])`` rows hold valid data, the rest
-    are uninitialized but are never touched by GEMM (which iterates
-    per-group via ``group_offs_padded``).
+    group_lens_padded, group_offs_padded)``.  Only
+    ``[0, group_offs_padded[-1])`` rows of the outputs hold valid data.
     """
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
@@ -381,18 +373,6 @@ def quantize_mxfp8_dual_grouped_impl(
         scaling_recipe.shuffle_out,
         scaling_recipe_for_trans.shuffle_scale,
         scaling_recipe_for_trans.shuffle_out,
-    )
-
-
-def extract_grouped_rows_impl(
-    x_padded: torch.Tensor,
-    group_offs_orig: torch.Tensor,
-    group_offs_padded: torch.Tensor,
-    total_M_orig: int,
-) -> torch.Tensor:
-    """Single-kernel extraction of non-padded rows from a padded 2-D tensor."""
-    return torch.ops.primus_turbo_cpp_extension.extract_grouped_rows(
-        x_padded, group_offs_orig, group_offs_padded, int(total_M_orig)
     )
 
 

@@ -58,8 +58,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
     m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
           "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
-    m.def("extract_grouped_rows(Tensor x_padded, Tensor group_offs_orig, "
-          "Tensor group_offs_padded, int total_M_orig) -> Tensor");
+    m.def("quantize_mxfp8_dual_perg(Tensor input, ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool colwise_use_2d_block) -> Tensor[]");
 
     // ********* Shuffle *********
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
@@ -88,10 +88,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("turbo_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, Tensor? c_group_offs, "
           "int total_m_out, bool transA, bool transB, "
-          "ScalarType out_dtype, str granularity, int grid_x_hint=0, "
-          "bool b_scale_preshuffled=False) -> Tensor");
-    m.def("turbo_preshuffle_mxfp8_scale_16x4(Tensor scale) -> Tensor");
-    m.def("turbo_grouped_gemm_variable_k_fp8(Tensor lhs, Tensor lhs_scales, Tensor rhs, Tensor rhs_scales, "
+          "ScalarType out_dtype, str granularity, int grid_x_hint=0) -> Tensor");
+    m.def("turbo_grouped_gemm_variable_k_fp8(Tensor lhs, Tensor lhs_scales, Tensor rhs, Tensor "
+          "rhs_scales, "
           "Tensor group_lens, Tensor group_offs, ScalarType out_dtype, str granularity) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 }
@@ -116,7 +115,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
     m.impl("quantize_mxfp8_dual_grouped", quantize_mxfp8_dual_grouped);
     m.impl("quantize_mxfp8", quantize_mxfp8);
-    m.impl("extract_grouped_rows", extract_grouped_rows);
+    m.impl("quantize_mxfp8_dual_perg", quantize_mxfp8_dual_perg);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl);
@@ -136,7 +135,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
     m.impl("turbo_grouped_gemm_fp8", turbo_grouped_gemm_fp8);
     m.impl("turbo_grouped_gemm_variable_k_fp8", turbo_grouped_gemm_variable_k_fp8);
-    m.impl("turbo_preshuffle_mxfp8_scale_16x4", turbo_preshuffle_mxfp8_scale_16x4);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -159,7 +157,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
     m.impl("quantize_mxfp8_dual_grouped", quantize_mxfp8_dual_grouped_meta);
     m.impl("quantize_mxfp8", quantize_mxfp8_meta);
-    m.impl("extract_grouped_rows", extract_grouped_rows_meta);
+    m.impl("quantize_mxfp8_dual_perg", quantize_mxfp8_dual_perg_meta);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
@@ -179,7 +177,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
     m.impl("turbo_grouped_gemm_fp8", turbo_grouped_gemm_fp8_meta);
     m.impl("turbo_grouped_gemm_variable_k_fp8", turbo_grouped_gemm_variable_k_fp8_meta);
-    m.impl("turbo_preshuffle_mxfp8_scale_16x4", turbo_preshuffle_mxfp8_scale_16x4_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

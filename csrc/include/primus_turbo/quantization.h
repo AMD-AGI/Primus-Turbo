@@ -55,10 +55,10 @@ constexpr int FP4_MANTISSA_BITS   = 1;
 constexpr int FP4_EXPONENT_BITS   = 2;
 constexpr int FP4_TARGET_MAX_POW2 = 2;
 
-constexpr int FP8E5M2_MANTISSA_BITS   = 2;
-constexpr int FP8E5M2_EXPONENT_BITS   = 5;
-constexpr float FP8E5M2_MAX           = 57344.0;
-constexpr int FP8E5M2_TARGET_MAX_POW2 = 15;
+constexpr int   FP8E5M2_MANTISSA_BITS   = 2;
+constexpr int   FP8E5M2_EXPONENT_BITS   = 5;
+constexpr float FP8E5M2_MAX             = 57344.0;
+constexpr int   FP8E5M2_TARGET_MAX_POW2 = 15;
 
 constexpr int FP8E4M3_MANTISSA_BITS = 3;
 constexpr int FP8E4M3_EXPONENT_BITS = 4;
@@ -102,6 +102,19 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
                               detail::ScalingRecipe rowwise_recipe,
                               detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
+// Per-group dual quant with uniform per-group (M, N): input (G, M, N) ->
+// rowwise (G, M_pad, N_pad), colwise (G, N, M_pad).  Used by the grouped
+// GEMM B-side feed; restricted to non-shuffled output.
+template <typename IType, typename OType>
+void quantize_mxfp8_dual_perg_impl(
+    const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
+    uint8_t *colwise_scale, int G, int M, int N, int M_pad, int N_pad, int rowwise_scale_stride,
+    int colwise_scale_stride, int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
+    int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
+    detail::ScalingRecipe rowwise_recipe, detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+
+// Per-group dual quant with variable per-group M (group_offs / group_offs_padded
+// describe the input/output row layouts).  Used by the grouped GEMM A-side feed.
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_grouped_impl(
     const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
@@ -109,8 +122,7 @@ void quantize_mxfp8_dual_grouped_impl(
     int total_M_padded, int N, int N_pad, int rowwise_scale_stride, int colwise_scale_stride,
     int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
     int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
-    detail::ScalingRecipe rowwise_recipe, detail::ScalingRecipe colwise_recipe,
-    hipStream_t stream);
+    detail::ScalingRecipe rowwise_recipe, detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
@@ -118,16 +130,12 @@ void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          detail::ScalingRecipe recipe, hipStream_t stream);
 
-// *************** Grouped Padded Layout (GPU kernel) ***************
-void compute_padded_layout_gpu(const int64_t *group_lens, const int64_t *group_offs,
-                               int64_t *group_lens_padded, int64_t *group_offs_padded,
-                               int G, int64_t align, hipStream_t stream);
-
-// *************** Grouped Row Extract ***************
-void extract_grouped_rows_impl(const void *src, void *dst,
-                               const int64_t *group_offs_orig,
-                               const int64_t *group_offs_padded,
-                               int G, int64_t row_bytes, int64_t total_M_orig,
+// *************** Grouped Padded Layout ***************
+//
+// Computes per-group padded lengths/offsets (rounded up to ``align``) on
+// the GPU; results live in device memory so no D2H sync is required.
+void compute_padded_layout_gpu(const int64_t *group_lens, int64_t *group_lens_padded,
+                               int64_t *group_offs_padded, int G, int64_t align,
                                hipStream_t stream);
 
 // *************** DeQuantize ***************
