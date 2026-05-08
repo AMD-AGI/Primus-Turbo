@@ -180,6 +180,25 @@ class HipKittenConfig:
             legacy R4 ``TK_RCR_NUM_CUS`` env hook resolved to". Only the
             FP8 grouped RCR / RRR-via-H4-reroute paths consume this
             field; other paths (BF16 grouped, dense, var-K) ignore it.
+        chunk_size: Round-14 (current Primus run, gpt_oss FP8 kernel-only
+            ceiling task; 2026-05-08): per-call ``chunk_size`` override for
+            the chiplet swizzle ``chiplet_transform_chunked`` call inside
+            the FP8 grouped RCR kernel body (HK kernel surgery this round
+            adds the per-call lever, mirroring R13's var-K ``chunk_size``
+            field). Default 0 → kernel uses historical baseline 64.
+            Critical observation: at the prevailing default cell
+            (xcds=8 + slots=NUM_CUS=256) the swizzle is a NO-OP at
+            chunk_size=64 (block=512 > slots → early-exit fires for ALL
+            workgroup_id > 0). For non-default cells with smaller xcds /
+            slots (e.g. Down-B4-M2048 fwd at xcds=2 + slots=196), the
+            R13 cliff-alignment math finds a chunk_size that produces a
+            CLEAN 1-chunk partition: ``block = num_xcds * chunk_size =
+            slots`` → all workgroups participate. Down-B4-M2048 cell
+            (xcds=2, slots=196) finds chunk_size=96 → block=192 → 192
+            chunked + 4 unchanged → +4.06% kernel TFLOPS (R14 probe
+            evidence; see scripts/_probe_round_14_down_b4_extended.py).
+            Only the FP8 grouped RCR / RRR-via-H4-reroute paths consume
+            this field; other paths ignore it.
     """
 
     layout: Layout
@@ -187,6 +206,7 @@ class HipKittenConfig:
     num_xcds: int | None
     kernel: str | None
     num_slots: int = 0
+    chunk_size: int = 0
 
 
 # Round-2 (fused-act follow-up to the round-1 quantize cache).
@@ -2215,12 +2235,92 @@ def select_default_config(
             # R3-original Down-B4 var-K wgrad rule; same family + same
             # 192 boundary in two unrelated kernels is suggestive of
             # a CU-partition resonance not a coincidence).
+            #
+            # Round-14 (current Primus run, gpt_oss FP8 kernel-only
+            # ceiling task; 2026-05-08): ADD ``chunk_size=96`` to this
+            # rule via the R14 per-call chunk_size HK surgery (HK
+            # companion commit this round). R14 mirrors R13's var-K
+            # chunk_size lever for the RCR forward kernel.
+            #
+            # Mechanism: the R11 num_slots=196 + num_xcds=2 cell drives
+            # the chiplet swizzle ``chiplet_transform_chunked(blockIdx
+            # .x, slots=196, xcds=2, chunk_size)`` (HK kernel
+            # kernel_fp8_layouts.cpp:~2734). The swizzle math is:
+            #
+            #   block = num_xcds * chunk_size
+            #   limit = (slots / block) * block
+            #   if (workgroup_id > limit) return workgroup_id  (NO swizzle)
+            #
+            # At default chunk_size=64 (with xcds=2 + slots=196):
+            #   block=128, limit=(196/128)*128=128
+            #   → workgroups 0..127 chunked + 128..195 round-robin
+            # 68 of 196 workgroups (34.7%) escape the swizzle and the
+            # B-pack reuse the chunk_size=64 was supposed to give is
+            # LOST for that fraction → mixed L2 traffic.
+            #
+            # At chunk_size=96 (this rule's choice):
+            #   block=192, limit=(196/192)*192=192
+            #   → workgroups 0..191 chunked + 192..195 round-robin
+            # 192 of 196 workgroups (98.0%) participate in 1 clean
+            # chunked partition (96 PIDs / XCD); only 4 workgroups go
+            # round-robin (negligible). The B-pack is reused across
+            # the 96 PIDs landing on each XCD — exactly the scheduling
+            # pattern the chiplet swizzle was designed to enable.
+            #
+            # Why not chunk_size=98 (the "ideal" 1-chunk partition,
+            # block=196=slots, limit=196 → all 196 chunked)? Probe
+            # below shows cs=96 wins cs=98 by +0.3pp (likely 96
+            # better aligns with kernel-internal vec/cell strides;
+            # 96 = 3 × 32 = 6 × 16 maps to ``rt_16x16_s`` lane cells
+            # while 98 = 2 × 49 doesn't factor as nicely).
+            #
+            # R14 probe data (1500-iter × 5-trial p20 × 5 seeds per
+            # cell, scripts/_probe_round_14_down_b4_extended.py):
+            #
+            #   cell                 Down-B4-M2048 fwd     Down-B4-M2048 dgrad-via-H4
+            #   chunk_size=64 (def)  1499.3 T  baseline    1494.7 T  baseline
+            #   chunk_size=16        1522.1 T  +1.50%      1520.8 T  +1.72%
+            #   chunk_size=32        1537.3 T  +2.47%      1535.9 T  +2.68%
+            #   chunk_size=48        1542.8 T  +2.82%      1542.2 T  +3.08%
+            #   chunk_size=49        1522.8 T  +1.54%      1514.7 T  +1.32%
+            #   chunk_size=96 *win*  1562.7 T  +4.06%      1557.7 T  +4.05%   * 5/5 robust
+            #   chunk_size=98        1557.7 T  +3.75%      1555.6 T  +3.92%
+            #   chunk_size=128       1489.4 T  -0.66%      1485.5 T  -0.62%
+            #
+            # Both fwd and dgrad-via-H4 share THIS rule (same predicate
+            # — H4 reroute swaps trans_b=False → True before dispatch
+            # so n_post = K_orig = 2880, k_post = N_orig = 2880, same
+            # cell key); both lift +4.06% / +4.05% at cs=96. Same
+            # mechanism (same swizzle math, same persistent-grid layout).
+            #
+            # Bit-equivalence: ``g.chunk_size`` is a pure scheduling
+            # knob (only blockIdx → tile_id mapping changes; same
+            # property as group_m / num_xcds / num_slots). Verified at
+            # the probe path: max_abs_diff = 0 across cs ∈ {16, 24,
+            # 32, 48, 49, 64, 96, 98, 128} on this fwd shape; no
+            # NaN/Inf. The metric's built-in correctness gate
+            # (SNR > 25 dB on out / dA / dB) serves as the integration
+            # check.
+            #
+            # Rule scope unchanged from R11: ``tiles_n==11 AND
+            # tiles_m==8 AND k==2880 AND m_total==8192`` matches only
+            # gpt_oss-Down-B4-M2048 fwd+dgrad-via-H4 in the 24-shape
+            # MoE suite + DoD universe. Sibling shapes inherit
+            # chunk_size=0 (default → kernel cs=64) from their
+            # respective dispatcher rules.
+            #
+            # Score impact estimate: +60T on fwd + +59T on dgrad-via-H4
+            # → fwd avg +60/8 = +7.5T (~+0.9 score points), dgrad avg
+            # +59/8 = +7.4T (~+0.9 score points). Total ~+1.8 score
+            # points (above the ±5 noise floor; visible in 8-shape
+            # average of 30+ shape calls per metric run).
             return HipKittenConfig(
                 layout=layout,
                 group_m=16,
                 num_xcds=2,
                 kernel=None,
                 num_slots=196,
+                chunk_size=96,
             )
         # Round-34 (this round): FP8 RCR rule covering the gpt_oss-GateUP
         # dA backward path AFTER the H4 reroute (grouped_gemm_fp8_impl.py

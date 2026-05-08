@@ -610,10 +610,25 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # ``analysis/_notes/round-9-fp8-grouped-rcr-num-slots-per-call-
         # surgery.md``).
         slots_arg = cfg.num_slots
+        # Round-14 (current Primus run, gpt_oss FP8 kernel-only ceiling
+        # task; 2026-05-08): wire ``cfg.chunk_size`` through to the FP8
+        # grouped RCR / RRR binding's new per-call chunk_size arg (HK
+        # commit this round mirrors R13's var-K chunk_size lever).
+        # Default 0 → kernel uses historical baseline 64. Per-shape
+        # rules set non-zero values for cells where the swizzle is
+        # currently a NO-OP at cs=64 and a cleaner partition exists at
+        # a smaller chunk_size. Down-B4-M2048 fwd+dgrad-via-H4 cell
+        # (xcds=2, slots=196) finds chunk_size=96 → block=192=slots-4
+        # → 192 of 196 workgroups in 1 clean partition (96 PIDs/XCD)
+        # → +4.06% / +4.05% kernel TFLOPS (R14 probe; see
+        # scripts/_probe_round_14_down_b4_extended.py and the rule
+        # comment block in hipkitten/config.py at the matching cell).
+        chunk_arg = cfg.chunk_size
         if use_dscale:
             grouped_dscale_fn(
                 a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
                 m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
+                chunk_size=chunk_arg,
             )
         else:
             # Fallback: dscale binding not present (older .so without the
@@ -636,6 +651,7 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             grouped_fn(
                 a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m,
                 m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
+                chunk_size=chunk_arg,
             )
         return out
 
