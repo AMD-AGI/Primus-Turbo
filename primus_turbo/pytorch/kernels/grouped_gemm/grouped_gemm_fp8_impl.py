@@ -845,6 +845,21 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         # 192 ONLY for the short-grid Down-B4 wgrad family below; every
         # other var-K caller stays on the existing 256-slot launch.
         vk_num_slots = 0
+        # Round-13 (gpt_oss FP8 kernel-only ceiling, current Primus run;
+        # 2026-05-08): per-call ``chunk_size`` override on the var-K
+        # ``chiplet_transform_chunked`` swizzle (HK kernel side). Default
+        # ``0`` → kernel uses the historical baseline 64. Set to 96 ONLY
+        # for the same Down-B4 wgrad family that already uses
+        # vk_num_slots=192 + vk_num_xcds=2 (paired R3 cell): at that
+        # cell, chunk_size=96 makes block = num_xcds * chunk_size = 192
+        # = exactly slots, so all 192 workgroups participate in one
+        # clean chiplet-pair partition. The default chunk_size=64 leaves
+        # the trailing 64 workgroups (192 - 128 chunked) as round-robin,
+        # which mixes the chiplet partition (R12 falsification note
+        # observation; the cliff-alignment hypothesis was not testable
+        # without this lever). See R13 evidence block at the predicate
+        # site below.
+        vk_chunk_size = 0
         if m_total >= 16384:
             # Round-30 var-K subfamily refinement. R39 set the universal
             # rule ``(gm=8, xcds=4) for m_total >= 16384`` from a 5-trial
@@ -2013,6 +2028,69 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         if (a.shape[1] == 2880 and b.shape[1] == 2880
                 and m_total <= 16384):
             vk_num_slots = 192
+            # Round-13 (gpt_oss FP8 kernel-only ceiling, current Primus run;
+            # 2026-05-08): paired ``chunk_size=96`` lever for the Down-B4
+            # wgrad family (same predicate as the R3 num_slots=192 +
+            # vk_num_xcds=2 cell above). HK kernel surgery added a
+            # per-call ``chunk_size`` arg to ``grouped_variable_k_crr*``
+            # so the dispatcher can override the chiplet swizzle's
+            # historical baseline 64 (hardcoded at
+            # ``HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp``
+            # line ~7833 prior to this round; now reads ``g.chunk_size``).
+            #
+            # Why 96: with vk_num_xcds=2 + vk_num_slots=192, the swizzle
+            # math is ``block = num_xcds * chunk_size``, ``limit = (slots
+            # / block) * block``. At chunk_size=64 → block=128 → limit=128
+            # so the early-exit ``if (workgroup_id > limit) return
+            # workgroup_id`` leaves the trailing 64 of 192 workgroups
+            # un-chunked (round-robin, splitting them across both
+            # chiplets — bad for L2). At chunk_size=96 → block=192 →
+            # limit=192 so ALL 192 workgroups participate in one clean
+            # chiplet-pair partition: workgroups 0..95 → XCD0; 96..191 →
+            # XCD1. R12 falsification note observation: the cliff
+            # alignment was untestable without this lever; this round
+            # ships the lever and observes the win.
+            #
+            # R13 sweep (``scripts/_probe_round_13_vark_chunk_size.py``,
+            # 1500-iter × 7-trial p20 × 5 seeds × kernel-only direct
+            # call to ``grouped_variable_k_crr_dscale``, bit-eq
+            # verified across {16, 32, 48, 64, 96, 128, 192, 256}):
+            #
+            #   shape (wgrad var-K)        cs=64 (base)  cs=96      Δ vs 64
+            #   Down-B4-M2048 (anchor)     1442.0 T      1463.7 T   +1.49 %
+            #   Down-B4-M4096 (sibling)    1793.7 T      1818.2 T   +1.35 %
+            #
+            # Spread (max-min across 5 seeds × 7 trials) is < 0.005 ms
+            # = ~0.3% per cell, well under the +1.49% / +1.35% lift —
+            # signal is robust. Other chunk_size values: 48 also wins
+            # (+1.06% / +1.24%) because block=96 makes 192/96=2 full
+            # chunks = also clean partition, but 96 dominates by ~0.2pp;
+            # 16/32 break-even (block too small, swizzle becomes
+            # near-no-op); 128/192/256 mildly regress (block too large,
+            # all workgroups fall through to round-robin).
+            #
+            # Rule scope (k==2880 AND n==2880 AND m_total<=16384):
+            #   - gpt_oss-Down-B4-M2048 var-K dB (m_total=8192): MATCH,
+            #     1 of 8 metric shapes.
+            #   - gpt_oss-Down-B4-M4096 var-K dB (m_total=16384): MATCH,
+            #     2 of 8 metric shapes.
+            #   - All other 6 gpt_oss shapes: m_total > 16384 OR
+            #     b.shape[1] != 2880 → excluded; var_k_chunk_size stays
+            #     0 → kernel uses default 64 (existing behaviour).
+            #   - DSV3 / Qwen3 var-K dB: a.shape[1] in {1536, 2048,
+            #     4096, 7168} → excluded.
+            #
+            # Bit-equivalent output verified by the R13 probe: max_abs
+            # = 0.0 across all chunk_size values on the anchor shape
+            # (chunk_size only changes pid → tile_id mapping; same
+            # property documented for group_m / num_xcds / num_slots).
+            #
+            # Expected metric impact: var-K wgrad is ALL of the wgrad
+            # kernel time at the metric's kernel-only timing. +1.49 %
+            # / +1.35 % on 2 of 8 wgrad shapes → ~+0.35 % wgrad section
+            # avg → ~+0.35 / 3 / 2800 × 1000 ≈ +1.2 score points
+            # (small but real, monotonic with R3's slots=192 win).
+            vk_chunk_size = 96
 
         # CRR dB: kernel computes grad_out.T @ x → [N, K]. The kernel's
         # ``scale_a`` is grad_out's scale; ``scale_b`` is x's scale —
@@ -2028,6 +2106,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 grad_out_2d, x_2d, out, b_scales, a_scales, group_offs,
                 group_m=vk_group_m, num_xcds=vk_num_xcds,
                 num_slots=vk_num_slots,
+                chunk_size=vk_chunk_size,
             )
         else:
             # Fallback: dscale binding not present (older .so) OR scales
@@ -2042,6 +2121,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 grad_out_2d, x_2d, out, sa_h, sb_h, group_offs,
                 group_m=vk_group_m, num_xcds=vk_num_xcds,
                 num_slots=vk_num_slots,
+                chunk_size=vk_chunk_size,
             )
         return out
 
