@@ -24,7 +24,6 @@ from config import (
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -32,10 +31,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
-    grouped_gemm_fp8_variable_k_impl,
-)
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
+from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+    grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+)
 
 GRANULARITY_CONFIG_MAP = {
     "tensorwise": Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE),
@@ -126,6 +125,24 @@ def check_grouped_gemm_fp8_wgrad_correctness(a, b, out, group_lens, fp8_format):
     return correct
 
 
+def check_grouped_gemm_fp8_fused_wgrad_correctness(a, b, out, group_lens, fp8_format, accum_init):
+    """Check fused FP8 wgrad accumulation against main_grad += A^T @ B."""
+    snr_threshold = 25 if fp8_format == Format.E4M3 else 20
+    group_lens_cpu = group_lens.cpu().tolist()
+    out_ref = []
+    start = 0
+    for size in group_lens_cpu:
+        ref = a[start : start + size, :].detach().T @ b[start : start + size, :].detach()
+        out_ref.append(ref + accum_init)
+        start += size
+    out_ref = torch.stack(out_ref)
+    out_snr = compute_snr(out_ref, out.detach())
+    correct = out_snr > snr_threshold
+    status = "PASS" if correct else "FAIL"
+    print(f"Correctness Check: {status} (fused_wgrad={out_snr:.1f}) threshold={snr_threshold}")
+    return correct
+
+
 def _fp8_dtype(fp8_format):
     return float8_e4m3 if fp8_format == Format.E4M3 else float8_e5m2
 
@@ -137,6 +154,14 @@ def _compute_group_offs(group_lens):
             torch.cumsum(group_lens, dim=0),
         ]
     )
+
+
+def _wgrad_accum_dtype(dtype_name):
+    if dtype_name == "bf16":
+        return torch.bfloat16
+    if dtype_name == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported wgrad accumulation dtype: {dtype_name}")
 
 
 def profile_grouped_gemm(B, M, N, K, dtype, trans_b=True):
@@ -219,7 +244,17 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config, trans_b=True):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def profile_grouped_gemm_fp8_operation(B, M, N, K, dtype, config, op_type, trans_b=True):
+def profile_grouped_gemm_fp8_operation(
+    B,
+    M,
+    N,
+    K,
+    dtype,
+    config,
+    op_type,
+    trans_b=True,
+    wgrad_accum_dtype_name="bf16",
+):
     """Profile one GPT-OSS FP8 grouped GEMM operation."""
     device = "cuda"
     group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
@@ -232,24 +267,24 @@ def profile_grouped_gemm_fp8_operation(B, M, N, K, dtype, config, op_type, trans
         a_fp8, a_scale_inv = quantize_fp8(a, fp8_dtype, config.granularity)
         b_fp8, b_scale_inv = quantize_fp8(b, fp8_dtype, config.granularity)
         group_offs = _compute_group_offs(group_lens)
+        accum_init = 0.0
+        accum_dtype = _wgrad_accum_dtype(wgrad_accum_dtype_name)
+        main_grad = torch.full((B, K, N), accum_init, dtype=accum_dtype, device=device)
 
-        op_func = lambda: grouped_gemm_fp8_variable_k_impl(
+        op_func = lambda: grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             a_fp8,
             b_fp8,
             a_scale_inv,
             b_scale_inv,
-            group_lens,
             group_offs,
-            trans_a=True,
-            trans_b=False,
-            trans_c=False,
-            out_dtype=dtype,
-            granularity=config.granularity.value,
-            num_cu=None,
-            default_backend=BackendType.CK.value,
+            out=main_grad,
+            beta=1.0,
         )
         out = op_func()
-        correct = check_grouped_gemm_fp8_wgrad_correctness(a, b, out, group_lens, config.format)
+        print(f"Fused WGrad Accumulation: beta=1.0, main_grad_dtype={main_grad.dtype}")
+        correct = check_grouped_gemm_fp8_fused_wgrad_correctness(
+            a, b, out, group_lens, config.format, accum_init
+        )
     else:
         b_shape = (B, N, K) if trans_b else (B, K, N)
         a = torch.randn((B * M, K), dtype=dtype, device=device)
@@ -271,7 +306,13 @@ def profile_grouped_gemm_fp8_operation(B, M, N, K, dtype, config, op_type, trans
     return op_mean_time_ms, op_tflops, correct
 
 
-def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None, profile_name="default"):
+def benchmark_grouped_gemm_turbo(
+    dtype_name="bf16",
+    granularity_name="tensorwise",
+    output_csv=None,
+    profile_name="default",
+    wgrad_accum_dtype_name="bf16",
+):
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
@@ -319,6 +360,7 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                     config=config,
                     op_type=op_type,
                     trans_b=trans_b,
+                    wgrad_accum_dtype_name=wgrad_accum_dtype_name,
                 )
                 fwd_time_ms = op_time_ms if op_type == "forward" else 0.0
                 fwd_tflops = op_tflops if op_type == "forward" else 0.0
@@ -352,6 +394,8 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
             if op_time_ms is not None and op_tflops is not None:
                 row["Operation Time (ms)"] = f"{op_time_ms:.2f}"
                 row["Operation TFLOPS"] = f"{op_tflops:.2f}"
+            if is_fp8 and profile_name == "gpt-oss" and op_type == "wgrad":
+                row["WGrad Accumulation"] = f"fused_beta1_{wgrad_accum_dtype_name}"
             row.update(
                 {
                     "Check": "PASS" if correct else "FAIL",
@@ -446,10 +490,18 @@ if __name__ == "__main__":
         default="default",
         help="Benchmark shape profile (default: default)",
     )
+    parser.add_argument(
+        "--wgrad-accum-dtype",
+        type=str,
+        choices=["bf16", "fp32"],
+        default="bf16",
+        help="main_grad dtype for GPT-OSS fused wgrad accumulation (default: bf16)",
+    )
     args = parser.parse_args()
     benchmark_grouped_gemm_turbo(
         dtype_name=args.dtype,
         granularity_name=args.granularity,
         output_csv=args.output,
         profile_name=args.profile,
+        wgrad_accum_dtype_name=args.wgrad_accum_dtype,
     )

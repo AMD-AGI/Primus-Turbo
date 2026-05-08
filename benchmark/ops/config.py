@@ -403,8 +403,8 @@ def gen_grouped_gemm_test_cases():
 
 
 def gen_gpt_oss_grouped_gemm_test_cases():
-    """Generate GPT-OSS grouped GEMM profile from gpt_oss_shape.txt."""
-    total_tokens = 65536
+    """Generate GPT-OSS grouped GEMM profile from 20260428 perf trace."""
+    total_tokens = 131072
     num_experts = 32
     hidden_size = 2880
     gate_up_size = 5760
