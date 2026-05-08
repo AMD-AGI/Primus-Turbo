@@ -2179,12 +2179,48 @@ def select_default_config(
             # points. First per-shape metric-moving lift since R7's
             # GateUP-B4-M2048 dgrad rule (commit 1d526e2). The lever
             # is brand-new (HK surgery this round) so first-of-series.
+            #
+            # Round-11 (current Primus run, gpt_oss FP8 kernel-only
+            # ceiling task; 2026-05-08): finer scan around R9's chosen
+            # slots=200. R9 only tested slot values ∈ {196, 200, 204,
+            # 208, 212, 216, 220, 256} and picked ns=200 as the
+            # "cleanest spread" cell at +4.99% med. R11 re-tested with
+            # an extended grid {184, 188, 192, 196, 200, 256} on the
+            # same shape + same methodology (1500-iter × 7-trial × 5-
+            # seed p20 in-process via the new num_slots arg,
+            # ``scripts/_probe_round_11_num_slots_extension.py``):
+            #
+            #   slots   med Δ      spread   pos    per-seed              verdict
+            #   184     -18.82%    0.38pp   0/5    [-18.72..-19.10]      LOSS  (cliff below 196)
+            #   188     -18.62%    0.60pp   0/5    [-18.32..-18.92]      LOSS  (still below cliff)
+            #   192     +2.25%     0.72pp   5/5    [+2.02..+2.74]        WIN-ROBUST
+            #   196     +5.84%     0.82pp   5/5    [+5.61..+6.44]        WIN-ROBUST  *higher than R9's ns=200
+            #   200     +5.21%     1.05pp   5/5    [+4.95..+6.00]        WIN-ROBUST  (R9 baseline)
+            #   256     baseline (NUM_CUS default)
+            #
+            # ns=196 emerges as +0.6pp higher than R9's ns=200 (both 5/5
+            # positive; ns=196 has med/spread = 7.1× vs ns=200's 5.0×).
+            # The kernel rebuild between R9 (commit b00082d) and R11
+            # (commit b7db0d9) appears to have shifted the optimum
+            # slightly upward in slot count — same kind of "kernel-
+            # rebuild drift" documented for R30/R31/R32/R45/R50 elsewhere
+            # in this file. Update slots=200 → slots=196.
+            #
+            # CLIFF NOTE: ns=192 wins LIGHTLY (+2.25%) but ns=188/184
+            # lose CATASTROPHICALLY (-18%). The transition is sharp at
+            # the slot count boundary — likely the persistent loop's
+            # tile-modulo-CU partition crosses an alignment threshold.
+            # Stay in the 196-220 plateau where every cell wins +2..+6%.
+            # 192 is the LOWER boundary (slots=192 also matches the
+            # R3-original Down-B4 var-K wgrad rule; same family + same
+            # 192 boundary in two unrelated kernels is suggestive of
+            # a CU-partition resonance not a coincidence).
             return HipKittenConfig(
                 layout=layout,
                 group_m=16,
                 num_xcds=2,
                 kernel=None,
-                num_slots=200,
+                num_slots=196,
             )
         # Round-34 (this round): FP8 RCR rule covering the gpt_oss-GateUP
         # dA backward path AFTER the H4 reroute (grouped_gemm_fp8_impl.py
