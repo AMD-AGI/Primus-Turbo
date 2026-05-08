@@ -15,6 +15,7 @@ import torch.utils.benchmark as benchmark
 from config import (
     check_allclose,
     compute_snr,
+    gen_gpt_oss_grouped_gemm_test_cases,
     gen_grouped_gemm_group_lens,
     gen_grouped_gemm_test_cases,
     get_platform_info,
@@ -23,11 +24,18 @@ from config import (
 from tabulate import tabulate
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    float8_e4m3,
+    float8_e5m2,
 )
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+    grouped_gemm_fp8_variable_k_impl,
+)
+from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 GRANULARITY_CONFIG_MAP = {
     "tensorwise": Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE),
@@ -40,14 +48,14 @@ GRANULARITY_CONFIG_MAP = {
 }
 
 
-def check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype):
+def check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype, trans_b=True):
     """Check correctness of BF16 grouped GEMM forward and backward."""
-    out_ref = grouped_gemm_ref(x.detach(), w.detach(), group_lens, trans_b=True)
+    out_ref = grouped_gemm_ref(x.detach(), w.detach(), group_lens, trans_b=trans_b)
     fwd_correct = check_allclose(out.detach(), out_ref, dtype)
 
     x_ref = x.detach().clone().requires_grad_()
     w_ref = w.detach().clone().requires_grad_()
-    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens, trans_b=True)
+    out_ref = grouped_gemm_ref(x_ref, w_ref, group_lens, trans_b=trans_b)
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
     bwd_x_correct = check_allclose(x.grad, x_ref.grad, dtype)
@@ -63,16 +71,16 @@ def check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype):
     return correct
 
 
-def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, fp8_format):
+def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, fp8_format, trans_b=True):
     """Check correctness of FP8 grouped GEMM forward and backward using SNR."""
     snr_threshold = 25 if fp8_format == Format.E4M3 else 20
 
-    out_ref = grouped_gemm_ref(a.detach(), b.detach(), group_lens, trans_b=True)
+    out_ref = grouped_gemm_ref(a.detach(), b.detach(), group_lens, trans_b=trans_b)
     out_snr = compute_snr(out_ref, out.detach())
 
     a_ref = a.detach().clone().requires_grad_()
     b_ref = b.detach().clone().requires_grad_()
-    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=trans_b)
     out_ref.backward(grad_out)
     out.backward(grad_out, retain_graph=True)
     da_snr = compute_snr(a_ref.grad, a.grad)
@@ -90,18 +98,60 @@ def check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, fp8_form
     return correct
 
 
-def profile_grouped_gemm(B, M, N, K, dtype):
+def check_grouped_gemm_fp8_forward_correctness(a, b, out, group_lens, fp8_format, trans_b=True):
+    """Check one FP8 grouped GEMM operation using SNR."""
+    snr_threshold = 25 if fp8_format == Format.E4M3 else 20
+    out_ref = grouped_gemm_ref(a.detach(), b.detach(), group_lens, trans_b=trans_b)
+    out_snr = compute_snr(out_ref, out.detach())
+    correct = out_snr > snr_threshold
+    status = "PASS" if correct else "FAIL"
+    print(f"Correctness Check: {status} (out={out_snr:.1f}) threshold={snr_threshold}")
+    return correct
+
+
+def check_grouped_gemm_fp8_wgrad_correctness(a, b, out, group_lens, fp8_format):
+    """Check one FP8 grouped GEMM weight-gradient operation using SNR."""
+    snr_threshold = 25 if fp8_format == Format.E4M3 else 20
+    group_lens_cpu = group_lens.cpu().tolist()
+    out_ref = []
+    start = 0
+    for size in group_lens_cpu:
+        out_ref.append(a[start : start + size, :].detach().T @ b[start : start + size, :].detach())
+        start += size
+    out_ref = torch.stack(out_ref)
+    out_snr = compute_snr(out_ref, out.detach())
+    correct = out_snr > snr_threshold
+    status = "PASS" if correct else "FAIL"
+    print(f"Correctness Check: {status} (wgrad={out_snr:.1f}) threshold={snr_threshold}")
+    return correct
+
+
+def _fp8_dtype(fp8_format):
+    return float8_e4m3 if fp8_format == Format.E4M3 else float8_e5m2
+
+
+def _compute_group_offs(group_lens):
+    return torch.cat(
+        [
+            torch.zeros((1,), dtype=group_lens.dtype, device=group_lens.device),
+            torch.cumsum(group_lens, dim=0),
+        ]
+    )
+
+
+def profile_grouped_gemm(B, M, N, K, dtype, trans_b=True):
     """Profile BF16 Grouped GEMM."""
     device = "cuda"
+    b_shape = (B, N, K) if trans_b else (B, K, N)
     x = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
-    w = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
+    w = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
     group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
 
-    out = turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
+    out = turbo.ops.grouped_gemm(x, w, group_lens, trans_b=trans_b)
     grad_out = torch.randn_like(out)
-    correct = check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype)
+    correct = check_grouped_gemm_correctness(x, w, group_lens, out, grad_out, dtype, trans_b=trans_b)
 
-    fwd_func = lambda: turbo.ops.grouped_gemm(x, w, group_lens, trans_b=True)
+    fwd_func = lambda: turbo.ops.grouped_gemm(x, w, group_lens, trans_b=trans_b)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -129,18 +179,19 @@ def profile_grouped_gemm(B, M, N, K, dtype):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
+def profile_grouped_gemm_fp8(B, M, N, K, dtype, config, trans_b=True):
     """Profile FP8 Grouped GEMM."""
     device = "cuda"
     group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
+    b_shape = (B, N, K) if trans_b else (B, K, N)
     a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
 
-    out = turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+    out = turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     grad_out = torch.randn_like(out)
-    correct = check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, config.format)
+    correct = check_grouped_gemm_fp8_correctness(a, b, out, grad_out, group_lens, config.format, trans_b=trans_b)
 
-    fwd_func = lambda: turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+    fwd_func = lambda: turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     bwd_func = lambda: out.backward(grad_out, retain_graph=True)
     out = fwd_func()
     bwd_func()
@@ -168,13 +219,69 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+def profile_grouped_gemm_fp8_operation(B, M, N, K, dtype, config, op_type, trans_b=True):
+    """Profile one GPT-OSS FP8 grouped GEMM operation."""
+    device = "cuda"
+    group_lens = gen_grouped_gemm_group_lens(B, M, balance=True).to(device)
+    total_flops = 2 * B * M * N * K
+
+    if op_type == "wgrad":
+        a = torch.randn((B * M, K), dtype=dtype, device=device)
+        b = torch.randn((B * M, N), dtype=dtype, device=device)
+        fp8_dtype = _fp8_dtype(config.format)
+        a_fp8, a_scale_inv = quantize_fp8(a, fp8_dtype, config.granularity)
+        b_fp8, b_scale_inv = quantize_fp8(b, fp8_dtype, config.granularity)
+        group_offs = _compute_group_offs(group_lens)
+
+        op_func = lambda: grouped_gemm_fp8_variable_k_impl(
+            a_fp8,
+            b_fp8,
+            a_scale_inv,
+            b_scale_inv,
+            group_lens,
+            group_offs,
+            trans_a=True,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=dtype,
+            granularity=config.granularity.value,
+            num_cu=None,
+            default_backend=BackendType.CK.value,
+        )
+        out = op_func()
+        correct = check_grouped_gemm_fp8_wgrad_correctness(a, b, out, group_lens, config.format)
+    else:
+        b_shape = (B, N, K) if trans_b else (B, K, N)
+        a = torch.randn((B * M, K), dtype=dtype, device=device)
+        b = torch.randn(b_shape, dtype=dtype, device=device)
+        op_func = lambda: turbo.ops.grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+        out = op_func()
+        correct = check_grouped_gemm_fp8_forward_correctness(a, b, out, group_lens, config.format, trans_b=trans_b)
+
+    for _ in range(20):
+        op_func()
+    torch.cuda.synchronize()
+
+    op_timer = benchmark.Timer(stmt="fn()", globals={"fn": op_func})
+    op_measurement = op_timer.timeit(100)
+    op_mean_time_ms = op_measurement.mean * 1e3
+    op_tflops = total_flops / (op_mean_time_ms * 1e-3) / 1e12
+    print(f"Operation Mean time: {op_mean_time_ms:.3f} ms | TFLOPS: {op_tflops:.2f}")
+
+    return op_mean_time_ms, op_tflops, correct
+
+
+def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None, profile_name="default"):
     platform, gpu_name = get_platform_info()
 
     is_fp8 = dtype_name == "fp8"
     config = GRANULARITY_CONFIG_MAP[granularity_name] if is_fp8 else None
 
-    test_cases = gen_grouped_gemm_test_cases()
+    profile_generators = {
+        "default": gen_grouped_gemm_test_cases,
+        "gpt-oss": gen_gpt_oss_grouped_gemm_test_cases,
+    }
+    test_cases = profile_generators[profile_name]()
 
     rows = []
     test_id = 0
@@ -182,25 +289,48 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
         test_id += 1
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
         dtype = case["dtype"]
+        trans_b = case.get("trans_b", True)
+        op_type = case.get("op_type", "forward_backward")
 
         print(f"\n{'='*60}")
         if is_fp8:
             print(
                 f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, "
-                f"dtype: fp8, granularity: {granularity_name}"
+                f"dtype: fp8, granularity: {granularity_name}, profile: {profile_name}, "
+                f"op_type: {op_type}, trans_b: {trans_b}"
             )
         else:
-            print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16")
+            print(
+                f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, "
+                f"dtype: bf16, profile: {profile_name}, op_type: {op_type}, trans_b: {trans_b}"
+            )
         print(f"{'='*60}")
 
         try:
-            if is_fp8:
+            op_time_ms = None
+            op_tflops = None
+            if is_fp8 and profile_name == "gpt-oss":
+                op_time_ms, op_tflops, correct = profile_grouped_gemm_fp8_operation(
+                    B=B,
+                    M=M,
+                    N=N,
+                    K=K,
+                    dtype=dtype,
+                    config=config,
+                    op_type=op_type,
+                    trans_b=trans_b,
+                )
+                fwd_time_ms = op_time_ms if op_type == "forward" else 0.0
+                fwd_tflops = op_tflops if op_type == "forward" else 0.0
+                bwd_time_ms = op_time_ms if op_type != "forward" else 0.0
+                bwd_tflops = op_tflops if op_type != "forward" else 0.0
+            elif is_fp8:
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm_fp8(
-                    B=B, M=M, N=N, K=K, dtype=dtype, config=config
+                    B=B, M=M, N=N, K=K, dtype=dtype, config=config, trans_b=trans_b
                 )
             else:
                 fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm(
-                    B=B, M=M, N=N, K=K, dtype=dtype
+                    B=B, M=M, N=N, K=K, dtype=dtype, trans_b=trans_b
                 )
 
             row = {
@@ -208,14 +338,20 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 "Platform": platform,
                 "GPU": gpu_name,
                 "Case": case["Case"],
+                "Profile": profile_name,
+                "OpType": op_type,
                 "B": B,
                 "M": M,
                 "N": N,
                 "K": K,
+                "TransB": trans_b,
                 "Dtype": dtype_name,
             }
             if is_fp8:
                 row["Granularity"] = granularity_name
+            if op_time_ms is not None and op_tflops is not None:
+                row["Operation Time (ms)"] = f"{op_time_ms:.2f}"
+                row["Operation TFLOPS"] = f"{op_tflops:.2f}"
             row.update(
                 {
                     "Check": "PASS" if correct else "FAIL",
@@ -234,10 +370,13 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
                 "Platform": platform,
                 "GPU": gpu_name,
                 "Case": case["Case"],
+                "Profile": profile_name,
+                "OpType": op_type,
                 "B": B,
                 "M": M,
                 "N": N,
                 "K": K,
+                "TransB": trans_b,
                 "Dtype": dtype_name,
             }
             if is_fp8:
@@ -261,6 +400,9 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
     avg_bwd_tflops = results["Backward TFLOPS"].astype(float).mean()
     print(f"\nAverage Forward TFLOPS: {avg_fwd_tflops:.2f}")
     print(f"Average Backward TFLOPS: {avg_bwd_tflops:.2f}")
+    if "Operation TFLOPS" in results.columns:
+        avg_op_tflops = results["Operation TFLOPS"].astype(float).mean()
+        print(f"Average Operation TFLOPS: {avg_op_tflops:.2f}")
 
     if output_csv:
         filename = output_csv
@@ -297,7 +439,17 @@ if __name__ == "__main__":
         default=None,
         help="Output CSV filename",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["default", "gpt-oss"],
+        default="default",
+        help="Benchmark shape profile (default: default)",
+    )
     args = parser.parse_args()
     benchmark_grouped_gemm_turbo(
-        dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output
+        dtype_name=args.dtype,
+        granularity_name=args.granularity,
+        output_csv=args.output,
+        profile_name=args.profile,
     )

@@ -211,6 +211,12 @@ tasks:
     env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
     output: grouped_gemm_fp8_tensorwise_autotune_benchmark.csv
 
+  - label: grouped_gemm_fp8_tensorwise_gpt_oss
+    group: grouped_gemm_fp8_gpt_oss
+    script: bench_grouped_gemm_turbo.py
+    args: [--dtype, fp8, --granularity, tensorwise, --profile, gpt-oss]
+    output: grouped_gemm_fp8_tensorwise_gpt_oss_benchmark.csv
+
   # ── Grouped GEMM FP8 Rowwise ─────────────────────────────
   - label: grouped_gemm_fp8_rowwise_ck
     group: grouped_gemm_fp8

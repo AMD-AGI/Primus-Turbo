@@ -70,6 +70,9 @@ AMD_BENCHMARK_OPS = {
         "Turbo(CK)": "grouped_gemm_fp8_tensorwise_ck_benchmark.csv",
         "Turbo(AutoTune)": "grouped_gemm_fp8_tensorwise_autotune_benchmark.csv",
     },
+    "Grouped-GEMM-FP8-Tensorwise-GPT-OSS": {
+        "Turbo": "grouped_gemm_fp8_tensorwise_gpt_oss_benchmark.csv",
+    },
     "Grouped-GEMM-FP8-Rowwise": {
         "Turbo(CK)": "grouped_gemm_fp8_rowwise_ck_benchmark.csv",
         "Turbo(Triton)": "grouped_gemm_fp8_rowwise_triton_benchmark.csv",
@@ -151,6 +154,10 @@ def get_avg_metric(data_dir, csv_filename, expected_gpu=None, expected_platform=
             "Combine",
             combine_bw if not pd.isna(combine_bw) else 0,
         )
+
+    if "Operation TFLOPS" in df.columns:
+        op_tflops = pd.to_numeric(df["Operation TFLOPS"], errors="coerce").mean()
+        return ("Op", op_tflops if not pd.isna(op_tflops) else 0), ("-", 0)
 
     fw_tflops = pd.to_numeric(df["Forward TFLOPS"], errors="coerce").mean()
     bw_tflops = pd.to_numeric(df["Backward TFLOPS"], errors="coerce").mean()
