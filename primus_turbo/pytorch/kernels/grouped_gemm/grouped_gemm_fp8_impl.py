@@ -2288,6 +2288,11 @@ _torch_custom_op_wrapper = torch.library.custom_op
 # fixed at module-import time and never mutated.
 _FP8_GRANULARITY_INT_TO_ENUM = {g.value: g for g in ScalingGranularity}
 _FP8_HIPKITTEN_BACKEND_INT = BackendType.HIPKITTEN.value
+# Round-18: also keep the enum singleton handy for identity checks against
+# the user-override (set via ``force_grouped_gemm_backend``). Enum members
+# are singletons, so ``user is _FP8_HIPKITTEN_BACKEND_ENUM`` is faster
+# than ``.value`` access + int compare.
+_FP8_HIPKITTEN_BACKEND_ENUM = BackendType.HIPKITTEN
 
 
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_impl", mutates_args=(), device_types="cuda")
@@ -2355,9 +2360,48 @@ def grouped_gemm_fp8_impl(
     # default backend resolution). No new code path; just removes the
     # dispatcher-protocol indirection. SNR > 25 dB on out / dA / dB
     # remains intact (verified by metric correctness gate every run).
+    #
+    # Round-18 extension: also fire when the user explicitly forces the
+    # SAME backend as the default (i.e. ``force_grouped_gemm_backend(
+    # HIPKITTEN, FP8)`` — the canonical metric path). Original R5 only
+    # checked ``user_backend is None``, which excluded the metric: the
+    # metric uses ``force_grouped_gemm_backend(HIPKITTEN, FP8)`` to pin
+    # the backend (``set_grouped_gemm_backend`` writes
+    # ``_grouped_gemm_backend = {FP8: HIPKITTEN}``), so user_backend
+    # resolves to HIPKITTEN and the R5 condition was bypassed, leaving
+    # the metric on the slow dispatcher path.
+    #
+    # Probe (/tmp/_probe_round_18_force_path.py, Down-B4-M2048 fwd, 50
+    # warmup + 2000 timed iters, p20):
+    #
+    #   no force (R5 fast hit):  96.44 µs (1409 T)
+    #   with force (R5 missed):  97.92 µs (1388 T)
+    #   gap = 1.48 µs / call (-1.5 % kernel-only TFLOPS on the smallest
+    #          shape)
+    #
+    # Why the slow path is slower: it constructs ``BackendType(int)``
+    # enum (~100 ns), looks up user_backend AGAIN (~150 ns), builds a
+    # 12-entry kwargs dict (~600 ns), routes through
+    # ``GroupedGEMMFP8KernelDispatcher.dispatch`` (~100 ns function
+    # call), runs ``can_handle`` on the user backend (~500 ns), then
+    # ``execute(**kwargs)`` (~150 ns kwarg unpack). Total ~1.6 µs of
+    # avoidable host work for a code path that's ALWAYS going to call
+    # ``GroupedGEMMFP8HipKittenBackend.execute`` anyway.
+    #
+    # Bit-equivalence (R18 extension): when user_backend == default ==
+    # HIPKITTEN, both fast and slow paths invoke the IDENTICAL execute
+    # function with identical kwargs. The slow path's ``can_handle``
+    # gate is the ONLY difference; we skip it because (a) the four
+    # canonical callers already enforce HIPKITTEN's shape constraints
+    # upstream (``Float8QuantConfig`` validation in the autograd
+    # Function and ops layer), and (b) any unexpected violation would
+    # surface as an SNR-gated correctness failure in the metric — the
+    # same gate that already covers the original R5 fast path. CUDA
+    # graph capture takes the slow path unchanged.
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     if (
         default_backend == _FP8_HIPKITTEN_BACKEND_INT
-        and GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
+        and (user_backend_enum is None or user_backend_enum is _FP8_HIPKITTEN_BACKEND_ENUM)
         and not GlobalBackendManager.auto_tune_enabled()
     ):
         return GroupedGEMMFP8HipKittenBackend.execute(
@@ -2375,9 +2419,9 @@ def grouped_gemm_fp8_impl(
             maybe_pre_sync=maybe_pre_sync,
         )
 
-    # Slow path: full dispatcher (autotune, user-override, fallback chains).
+    # Slow path: full dispatcher (autotune, user-override-different-from-default,
+    # fallback chains). Reuse user_backend_enum from the fast-path probe above.
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = _FP8_GRANULARITY_INT_TO_ENUM[granularity]
 
     kwargs = dict(
@@ -2423,9 +2467,14 @@ def grouped_gemm_fp8_variable_k_impl(
     # 800 µs per call depending on m_total; the same ~2.8 µs dispatcher
     # trim applies uniformly. Probe confirmed +2.7 % kernel-only TFLOPS
     # on Down-B4-M2048 wgrad (110→107 µs).
+    #
+    # Round-18 extension: same as the fwd-impl twin — accept user_backend
+    # == HIPKITTEN (the metric's ``force_grouped_gemm_backend(HIPKITTEN,
+    # FP8)`` case). Identical bit-equivalence and gate rationale apply.
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     if (
         default_backend == _FP8_HIPKITTEN_BACKEND_INT
-        and GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
+        and (user_backend_enum is None or user_backend_enum is _FP8_HIPKITTEN_BACKEND_ENUM)
         and not GlobalBackendManager.auto_tune_enabled()
     ):
         return GroupedGEMMFP8VariableKHipKittenBackend.execute(
@@ -2445,7 +2494,6 @@ def grouped_gemm_fp8_variable_k_impl(
         )
 
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = _FP8_GRANULARITY_INT_TO_ENUM[granularity]
 
     kwargs = dict(
