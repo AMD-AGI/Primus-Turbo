@@ -2720,12 +2720,108 @@ def select_default_config(
                 # epilogue against, so the relative gain is slightly
                 # smaller (+3% here vs +5% on Down) — but the lever
                 # is real and robust on every seed.
+                #
+                # Round-15 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-08): ADD ``chunk_size=24`` to
+                # this rule via the R14 per-call chunk_size HK surgery
+                # (HipKittens commit 823700a0). The R14 chunk_size lever
+                # was originally shipped only for Down-B4-M2048 fwd cell
+                # (xcds=2 + slots=196 → cs=96 cleanly fills the
+                # partition); R15 audit extends it to the GateUP-B4-
+                # M2048 dA post-H4 reroute cell which also has a non-
+                # clean default partition because of the R10 num_slots
+                # =200 reduction.
+                #
+                # Default chiplet swizzle math at this cell:
+                #   xcds=8 (default), slots=200, chunk_size=64 (kernel
+                #   baseline) → block = num_xcds * chunk_size = 512 >
+                #   slots → limit = (200 / 512) * 512 = 0. The early-
+                #   exit ``if (workgroup_id > limit) return workgroup_id``
+                #   leaves ALL 200 workgroups un-chunked → falls through
+                #   to round-robin assignment across XCDs. The chiplet
+                #   swizzle's L2-locality benefit (consecutive PIDs land
+                #   on consecutive XCDs in a chunk) is COMPLETELY LOST.
+                #
+                # cs=24 chiplet swizzle math:
+                #   block = 8 * 24 = 192, num_chunks = limit/block = 1,
+                #   limit = 192. 192 of 200 workgroups participate in 1
+                #   clean chiplet partition (24 PIDs/XCD × 8 XCDs = 192;
+                #   trailing 8 PIDs round-robin = 1/XCD extra). Restores
+                #   the L2-locality benefit on the bulk 96% of work.
+                #
+                # cs=25 (the "perfect" 1-chunk partition: block=200=slots
+                # → all 200 chunked, 25/XCD) WINS +1.38 % but cs=24 wins
+                # +1.82 %. Counter-intuitive — the 8 trailing round-robin
+                # PIDs at cs=24 actually help by providing tail-overlap
+                # bubbles for the bulk 192 to drain into. cs=32 +0.50 %,
+                # cs=50 +0.65 %, cs=16 -0.91 %.
+                #
+                # R15 tight A/B verify (in-process direct
+                # ``grouped_rcr_dscale(..., num_slots=200, chunk_size=N)``
+                # call, 2500-iter × p20 × 7 seeds,
+                # ``scripts/_probe_round_15_gateup_b4_dg_tight.py``):
+                #
+                #   cs       med ms     spread   med Δ vs cs=64    pos/n   verdict
+                #   def(64)  0.13612    0.294 %  baseline (R10)    --      base
+                #     16     0.13736    0.350 %  -0.91 %           0/7     LOSS
+                #     24     0.13364    0.329 %  +1.82 %           7/7     WIN-CLEANEST  *ship
+                #     25     0.13424    0.209 %  +1.38 %           7/7     WIN-ROBUST
+                #     32     0.13544    0.502 %  +0.50 %           7/7     small WIN
+                #     50     0.13524    0.502 %  +0.65 %           7/7     small WIN
+                #
+                # cs=24 is wmin_beats_lmax: max(cs=24) = 0.13384 < min(cs=64)
+                # = 0.13592 → every seed of cs=24 beats every seed of
+                # baseline. Cleanest signal class, mirror of R12 / R13 /
+                # R14 / R3 / R8 / R10 / R11 patterns. +1.82% on a tile
+                # that lives at 1996.7 T → 2033.7 T direct probe.
+                #
+                # Bit-equivalent output verified at
+                # ``scripts/_probe_round_15_biteq.py`` across 5 seeds
+                # ({42, 137, 2024, 99, 100}): max_abs_diff = 0,
+                # bit_eq=True every seed. ``g.chunk_size`` controls the
+                # chiplet-swizzle ``chiplet_transform_chunked`` workgroup
+                # reorder ONLY (data-flow), no FP8 quantization or MFMA
+                # accumulation order changes — same property documented
+                # for R13's var-K chunk_size and R14's RCR chunk_size
+                # ships above.
+                #
+                # Sibling regression check (rule scope unchanged — gate
+                # remains tiles_n==11 AND k==5760 AND tiles_m==8 AND
+                # m_total==8192):
+                #   - GateUP-B4-M2048 dA post-H4 (this rule's target):
+                #     MATCH. 1 of 8 metric shapes affected.
+                #   - GateUP-B4-M4096 dA post-H4 (tiles_m=16): hits the
+                #     R8 (gm=1, xcds=4, slots=NUM_CUS=256) cell above;
+                #     R15 audit 4 (``scripts/_probe_round_15_gateup_b4_
+                #     m4096_dg.py``) found NO chunk_size win there
+                #     (cs=64 default unique optimum) → not a candidate
+                #     for the same lever; excluded by tiles_m guard.
+                #   - GateUP-B32-* dA post-H4 (m_total > 8192): excluded
+                #     by m_total==8192 guard; R34/R8 rules unchanged.
+                #   - Down-* dA: k=2880 not 5760; excluded.
+                #   - DSV3/Qwen3 dA: different (n, k); excluded.
+                #   - Dense FP8: m_total None; excluded.
+                # Rule remains uniquely tied to gpt_oss-GateUP-B4-M2048
+                # dA in the 24-shape MoE suite + DoD universe.
+                #
+                # Expected metric impact: dA is ~33% of bwd wall, kernel-
+                # only timing is dA-component. +1.82% kernel on this
+                # shape (1996.7 → 2033.7 T direct probe; metric tonight
+                # shows the shape at ~1940 T due to the metric's lower-
+                # iter timing methodology). Section avg lift: dgrad
+                # 2106 → ~2110 T (+4 T from ~37 T kernel cell lift / 8
+                # shapes). Section progress: 0.752 → 0.754 (+0.002).
+                # Score Δ ≈ +0.6 points at the metric's noise floor
+                # (single-run std ≈ 5 score points across 691-693 band
+                # this run series), same robustness/sub-noise pattern as
+                # R3 / R10 / R11 / R12 / R13 / R14 ships in this run.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=8,
                     num_xcds=None,
                     kernel=None,
                     num_slots=200,
+                    chunk_size=24,
                 )
         if tiles_n == 16 and tiles_m == 16 and k == 1536:
             # Round-6 rule. Qwen3-235B-A22B Down M_per_group=4096 family
