@@ -69,9 +69,17 @@ def _mxfp8_grid_x_hint(total_M: int, G: int) -> int:
 
 
 def _turbo_grouped_gemm_mxfp8(
-    a_fp8, b_fp8, a_scales, b_scales,
-    group_lens, group_offs_in, out_dtype, *,
-    c_group_offs=None, total_m_out=0, grid_x_hint=0,
+    a_fp8,
+    b_fp8,
+    a_scales,
+    b_scales,
+    group_lens,
+    group_offs_in,
+    out_dtype,
+    *,
+    c_group_offs=None,
+    total_m_out=0,
+    grid_x_hint=0,
 ):
     """MX_BLOCKWISE NT grouped GEMM with optional fused unpad-on-store.
 
@@ -83,19 +91,40 @@ def _turbo_grouped_gemm_mxfp8(
     left as ``None``.
     """
     return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
-        a_fp8, b_fp8, a_scales, b_scales, group_lens, group_offs_in,
-        c_group_offs, int(total_m_out),
-        False, True, out_dtype, "MX_BLOCKWISE", int(grid_x_hint),
+        a_fp8,
+        b_fp8,
+        a_scales,
+        b_scales,
+        group_lens,
+        group_offs_in,
+        c_group_offs,
+        int(total_m_out),
+        False,
+        True,
+        out_dtype,
+        "MX_BLOCKWISE",
+        int(grid_x_hint),
     )
 
 
 def _turbo_grouped_gemm_variable_k_mxfp8(
-    lhs_fp8, lhs_scales, rhs_fp8, rhs_scales,
-    group_lens, group_offs, out_dtype,
+    lhs_fp8,
+    lhs_scales,
+    rhs_fp8,
+    rhs_scales,
+    group_lens,
+    group_offs,
+    out_dtype,
 ):
     return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
-        lhs_fp8, lhs_scales, rhs_fp8, rhs_scales,
-        group_lens, group_offs, out_dtype, "MX_BLOCKWISE",
+        lhs_fp8,
+        lhs_scales,
+        rhs_fp8,
+        rhs_scales,
+        group_lens,
+        group_offs,
+        out_dtype,
+        "MX_BLOCKWISE",
     )
 
 
@@ -467,18 +496,20 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # Fused grouped quant for A: produces row + col MXFP8 outputs
         # in the padded layout AND computes the padded per-group layout
         # on GPU (no D2H sync).
-        a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col, \
-            _, group_offs_padded = quantize_mxfp8_dual_grouped_impl(
-                a, a_dtype, group_lens, group_offs,
+        a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col, _, group_offs_padded = (
+            quantize_mxfp8_dual_grouped_impl(
+                a,
+                a_dtype,
+                group_lens,
+                group_offs,
             )
+        )
         grid_x_hint = _mxfp8_grid_x_hint(a.size(0), G)
 
         # Per-group dual quant for B: rowwise (G, N, K_pad) for fwd,
         # colwise (G, K, N_pad) for dgrad, both ready for GEMM.
         b_fp8_row, b_scale_inv_row, b_fp8_col, b_scale_inv_col = (
-            torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_perg(
-                b_internal, b_dtype, True, True
-            )
+            torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_perg(b_internal, b_dtype, True, True)
         )
 
         # Inputs read from the padded layout via ``group_offs_padded``;
@@ -486,9 +517,15 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # via ``c_group_offs``.  When balanced + aligned the two layouts
         # match and the write is a pure contiguous store.
         out = _turbo_grouped_gemm_mxfp8(
-            a_fp8_row, b_fp8_row, a_scale_inv_row, b_scale_inv_row,
-            group_lens, group_offs_padded, out_dtype,
-            c_group_offs=group_offs, total_m_out=a.size(0),
+            a_fp8_row,
+            b_fp8_row,
+            a_scale_inv_row,
+            b_scale_inv_row,
+            group_lens,
+            group_offs_padded,
+            out_dtype,
+            c_group_offs=group_offs,
+            total_m_out=a.size(0),
             grid_x_hint=grid_x_hint,
         )
 
@@ -523,16 +560,31 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         # Fused grouped quant for grad_out (same op as fwd).
-        grad_out_fp8_row, grad_out_scale_inv_row, grad_out_t_fp8, grad_out_t_scale_inv, \
-            group_lens_padded, _ = quantize_mxfp8_dual_grouped_impl(
-                grad_out, grad_out_dtype, group_lens, group_offs,
-            )
+        (
+            grad_out_fp8_row,
+            grad_out_scale_inv_row,
+            grad_out_t_fp8,
+            grad_out_t_scale_inv,
+            group_lens_padded,
+            _,
+        ) = quantize_mxfp8_dual_grouped_impl(
+            grad_out,
+            grad_out_dtype,
+            group_lens,
+            group_offs,
+        )
 
         # dgrad: store-side unpad fused like fwd.
         grad_a = _turbo_grouped_gemm_mxfp8(
-            grad_out_fp8_row, b_fp8_col, grad_out_scale_inv_row, b_scale_inv_col,
-            group_lens, group_offs_padded, ctx.out_dtype,
-            c_group_offs=group_offs, total_m_out=grad_out.size(0),
+            grad_out_fp8_row,
+            b_fp8_col,
+            grad_out_scale_inv_row,
+            b_scale_inv_col,
+            group_lens,
+            group_offs_padded,
+            ctx.out_dtype,
+            c_group_offs=group_offs,
+            total_m_out=grad_out.size(0),
             grid_x_hint=ctx.grid_x_hint,
         )
 
@@ -540,8 +592,13 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         # on the padded layout end-to-end (output is (G, N, K), no row
         # compression needed).
         grad_b = _turbo_grouped_gemm_variable_k_mxfp8(
-            grad_out_t_fp8, grad_out_t_scale_inv, a_fp8_col, a_scale_inv_col,
-            group_lens_padded, group_offs_padded, ctx.out_dtype,
+            grad_out_t_fp8,
+            grad_out_t_scale_inv,
+            a_fp8_col,
+            a_scale_inv_col,
+            group_lens_padded,
+            group_offs_padded,
+            ctx.out_dtype,
         )
 
         # Transpose back to (G, K, N) when the user originally supplied
