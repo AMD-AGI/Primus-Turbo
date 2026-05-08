@@ -2519,11 +2519,77 @@ def select_default_config(
                 # R34 "ship narrow carve-out when probe shows clean
                 # WIN even if metric noise floor swallows the geomean
                 # lift" pattern).
+                #
+                # Round-10 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-08): ADD ``num_slots=200`` to
+                # this rule via the R9 per-call num_slots HK surgery
+                # (HipKittens commit 4ef05b03). R9's next-round
+                # suggestion #1 was to extend the lever audit to the
+                # GateUP family at the same ~1.4 ws/CU sparsity
+                # (Down-B4-M2048 fwd/dgrad sit at 1.4 ws/CU and won
+                # +5% at slots=200; this dA cell post-H4 reroute also
+                # sits at 1.4-1.5 ws/CU thanks to identical tile-step
+                # density: 8×11 per group × 4 groups = 352 tile-steps
+                # over 256 CUs).
+                #
+                # R10 tight A/B verify (in-process direct
+                # ``grouped_rcr_dscale(..., num_slots=N)`` call,
+                # 1500-iter × 7-trial × 5-seed p20,
+                # ``scripts/_probe_round_10_gateup_b4_m2048_num_slots.py``)
+                # on commit b00082d (R9 HEAD with the new per-call
+                # num_slots wired through):
+                #
+                #   slots   med Δ      spread   verdict
+                #   196     +3.34%     0.84pp   WIN-ROBUST
+                #   200     +3.08%     0.49pp   WIN-ROBUST  *cleanest top
+                #   208     +2.49%     0.75pp   WIN-ROBUST
+                #   220     +2.15%     0.94pp   WIN-ROBUST
+                #   256     baseline (NUM_CUS default)
+                #
+                # ALL slot reductions in {196, 200, 208, 220} land
+                # WIN-ROBUST: 5/5 seeds positive, every cell.
+                # ns=196 has the highest seed-med (+3.34%) but
+                # ns=200 has the tightest spread (0.49pp; med/spread
+                # ≈ 6.3× vs 4.0× for ns=196). Pick ns=200 as the
+                # cleanest signal and the same value already shipped
+                # for the Down-B4-M2048 R2 sibling rule at the same
+                # 1.4 ws/CU sparsity tier (uniform pattern across the
+                # run; defensive against future kernel rebuild drift).
+                #
+                # Sibling: GateUP_B4_M2048 *fwd* RCR (R23 rule, gm=1
+                # xcds=4, k=2880, tiles_n=22) was probed in the same
+                # script and FALSIFIED — every slot reduction LOSES
+                # -12 to -16% there. The fwd shape sits at 2.88 ws/CU
+                # (2× denser than dgrad post-H4 reroute) and the
+                # persistent grid is already saturated; reducing
+                # slots only steals parallelism. Same ws/CU > 2.5
+                # ceiling pattern documented for R4's earlier var-K
+                # wgrad falsification.
+                #
+                # Bit-equivalent output: g.num_slots is a pure
+                # persistent-grid scheduling knob (same property
+                # documented for the R9 Down-B4-M2048 sibling rule
+                # and the var-K R3 num_slots field). Bit-eq verified
+                # at the same probe path: max_abs_diff = 0 across
+                # ns ∈ {0, 196, 200, 208, 220, 256} on this dgrad
+                # shape; no NaN/Inf.
+                #
+                # Why ns=200 wins for tiles_m=8 + tiles_n=11 + k=5760
+                # B=4 (m_total=8192, 1.5 ws/CU): 352 tile-steps over
+                # 200 slots = 1.76 ws/slot (+25%) — exactly the same
+                # mechanism as R9's Down-B4-M2048 win. The deep
+                # k=5760 main loop (45 K-tiles per pass vs Down's 23
+                # K-tiles per pass for k=2880 fwd) means each tile
+                # has 2× more compute to amortise the per-tile
+                # epilogue against, so the relative gain is slightly
+                # smaller (+3% here vs +5% on Down) — but the lever
+                # is real and robust on every seed.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=8,
                     num_xcds=None,
                     kernel=None,
+                    num_slots=200,
                 )
         if tiles_n == 16 and tiles_m == 16 and k == 1536:
             # Round-6 rule. Qwen3-235B-A22B Down M_per_group=4096 family
