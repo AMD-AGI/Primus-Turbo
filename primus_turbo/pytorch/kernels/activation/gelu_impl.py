@@ -25,8 +25,7 @@ def bias_gelu_fwd(
     row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.size()
-    alloc_fn = torch.zeros_like if row_mask is not None else torch.empty_like
-    out = alloc_fn(x)
+    out = torch.empty_like(x)
     has_bias = bias is not None
     load_width = triton.next_power_of_2(hidden_size)
 
@@ -67,8 +66,7 @@ def bias_gelu_bwd(
     row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = grad_out.size()
-    alloc_fn = torch.zeros_like if row_mask is not None else torch.empty_like
-    grad_x = alloc_fn(x)
+    grad_x = torch.empty_like(x)
     has_bias = bias is not None
     load_width = triton.next_power_of_2(hidden_size)
 

@@ -88,6 +88,15 @@ def make_row_mask(num_tokens: int, device: str):
     return mask
 
 
+def masked_assert_close(actual, expected, row_mask, **kwargs):
+    """assert_close only on rows where row_mask != 0, ignoring masked-out rows."""
+    if row_mask is None:
+        torch.testing.assert_close(actual, expected, **kwargs)
+        return
+    bool_mask = row_mask.bool()
+    torch.testing.assert_close(actual[bool_mask], expected[bool_mask], **kwargs)
+
+
 # ── Tests: bias_gelu_impl ────────────────────────────────────────────────────
 
 
@@ -113,12 +122,14 @@ def test_bias_gelu_impl(num_tokens, hidden_size, dtype, has_bias, has_row_mask):
     if has_row_mask:
         out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
 
-    torch.testing.assert_close(out, out_ref, **get_fwd_tolerances(dtype))
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
 
     grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
     out.backward(grad_out)
     out_ref.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad.to(dtype), **get_bwd_tolerances(dtype))
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
 
 
 # ── Tests: bias_geglu_impl / bias_swiglu_impl ────────────────────────────────
@@ -154,12 +165,14 @@ def test_bias_glu_impl(num_tokens, hidden_size, dtype, has_bias, has_row_mask, a
     if has_row_mask:
         out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
 
-    torch.testing.assert_close(out, out_ref, **get_fwd_tolerances(dtype))
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
 
     grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
     out.backward(grad_out)
     out_ref.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad.to(dtype), **get_bwd_tolerances(dtype))
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
 
 
 # ── Tests: weighted_bias_swiglu_impl / weighted_bias_geglu_impl ──────────────
@@ -198,13 +211,15 @@ def test_weighted_bias_glu_impl(num_tokens, hidden_size, dtype, has_bias, has_ro
     if has_row_mask:
         out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
 
-    torch.testing.assert_close(out, out_ref, **get_fwd_tolerances(dtype))
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
 
     grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
     out.backward(grad_out)
     out_ref.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad.to(dtype), **get_bwd_tolerances(dtype))
-    torch.testing.assert_close(weights.grad, w_ref.grad, **get_bwd_tolerances(dtype))
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
+    masked_assert_close(weights.grad, w_ref.grad, row_mask, **get_bwd_tolerances(dtype))
 
 
 # ── Tests: weighted_bias_quick_geglu_impl ────────────────────────────────────
@@ -238,10 +253,12 @@ def test_weighted_bias_quick_geglu_impl(
     if has_row_mask:
         out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
 
-    torch.testing.assert_close(out, out_ref, **get_fwd_tolerances(dtype))
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
 
     grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
     out.backward(grad_out)
     out_ref.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad.to(dtype), **get_bwd_tolerances(dtype))
-    torch.testing.assert_close(weights.grad, w_ref.grad, **get_bwd_tolerances(dtype))
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
+    masked_assert_close(weights.grad, w_ref.grad, row_mask, **get_bwd_tolerances(dtype))

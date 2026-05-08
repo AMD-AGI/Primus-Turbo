@@ -27,8 +27,7 @@ def quick_geglu_fwd(
     row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens, double_hidden_size = x.size()
-    alloc_fn = torch.zeros if row_mask is not None else torch.empty
-    out = alloc_fn(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
+    out = torch.empty(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
     has_bias = bias is not None
     has_weights = weights is not None
     load_width = triton.next_power_of_2(double_hidden_size // 2)

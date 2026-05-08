@@ -31,8 +31,7 @@ MASK_BLOCK_SIZE = 8192
 def swiglu_fwd(x: torch.Tensor, probs: torch.Tensor, row_mask: Optional[torch.Tensor] = None):
     num_tokens, double_hidden_size = x.size()
     probs = probs.unsqueeze(-1)
-    alloc_fn = torch.zeros if row_mask is not None else torch.empty
-    out = alloc_fn(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
+    out = torch.empty(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
     load_width = triton.next_power_of_2(double_hidden_size // 2)
 
     if row_mask is None:
@@ -73,9 +72,8 @@ def swiglu_bwd(
     row_mask: Optional[torch.Tensor] = None,
 ):
     num_tokens, hidden_size = grad_out.size()
-    alloc_fn = torch.zeros_like if row_mask is not None else torch.empty_like
-    grad_x = alloc_fn(x)
-    grad_probs = alloc_fn(probs)
+    grad_x = torch.empty_like(x)
+    grad_probs = torch.empty_like(probs)
     load_width = triton.next_power_of_2(hidden_size)
 
     if row_mask is None:
@@ -126,8 +124,7 @@ def bias_swiglu_fwd(
     row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens, double_hidden_size = x.size()
-    alloc_fn = torch.zeros if row_mask is not None else torch.empty
-    out = alloc_fn(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
+    out = torch.empty(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
     has_bias = bias is not None
     load_width = triton.next_power_of_2(double_hidden_size // 2)
 
@@ -168,8 +165,7 @@ def bias_swiglu_bwd(
     row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = grad_out.size()
-    alloc_fn = torch.zeros_like if row_mask is not None else torch.empty_like
-    grad_x = alloc_fn(x)
+    grad_x = torch.empty_like(x)
     has_bias = bias is not None
     load_width = triton.next_power_of_2(hidden_size)
 
