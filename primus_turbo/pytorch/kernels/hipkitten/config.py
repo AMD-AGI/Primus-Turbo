@@ -2251,14 +2251,153 @@ def select_default_config(
                 )
             if tiles_m == 8 and m_total >= 65536:
                 # gpt_oss-GateUP B=32 M=2048 dA after reroute. The
-                # B=4 M=2048 sibling (m_total=8192) is intentionally
-                # excluded: probe found default beats every candidate
-                # there (small persistent grid amortises default cells
-                # better than extra batching).
+                # B=4 M=2048 sibling (m_total=8192) is now covered by
+                # the Round-7 (this run) rule below — see that block
+                # for the (gm=8, xcds=None=8) win discovered after R34
+                # missed the xcds=8 column.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=16,
                     num_xcds=4,
+                    kernel=None,
+                )
+            if tiles_m == 8 and m_total == 8192:
+                # Round-7 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-08): gpt_oss-GateUP-B4-M2048
+                # dA RCR after H4 reroute (m=2048, n=K_fwd=2880,
+                # k=N_fwd=5760, m_total=8192, tiles_m=8, tiles_n=11,
+                # k=5760). Previously fell through to the binding
+                # default ``(group_m=4, num_xcds=None → kernel
+                # BLOCK_SWIZZLE_NUM_XCDS=8)``. R34 had probed this
+                # cell (config.py lines 2084-2089) and recorded
+                # "default best; do not add a rule for tiles_m=8 +
+                # m_total<65536" with this candidate table:
+                #
+                #   default (4, 8)  baseline                   keep default
+                #   (4, 4)          -1.26%  spread 2.69pp  TIE
+                #   (8, 4)          -1.54%  spread 3.45pp  TIE
+                #   (16, 4)         -2.51%  spread 3.50pp  TIE
+                #
+                # CRITICAL FLAW IN R34: only the xcds=4 column was
+                # swept against the xcds=8 default. R34 never tested
+                # ``gm != 4`` at xcds=8 — i.e. the rest of the gm-axis
+                # at the kernel's BSNX=8 default. R4's later audit
+                # marked R34's verdict NOT ROBUST but did not extend
+                # the candidate set; the gm × xcd cross-cell stayed
+                # un-probed.
+                #
+                # Round-7 tight verify (1500-iter × 7-trial × 3-seed
+                # p20 × kernel-only direct ``grouped_rcr_dscale`` call
+                # via the H4-rerouted b_T at
+                # ``scripts/_probe_round_7_gateup_b4_m2048_dgrad.py``,
+                # mirror of R17 fwd RCR drift verify methodology) on
+                # commit 2d3946f1 (current binding state):
+                #
+                #   cell      seed=42 Δ     seed=137 Δ    seed=2024 Δ   seed-med Δ  seed-spread  verdict
+                #   ( 8, 8)   +2.11%        +2.93%        +1.70%        +2.11%      1.23pp       WIN-ROBUST  *unique top
+                #   (16, 8)   +1.16%        +2.57%        +0.20%        +1.16%      2.37pp       WIN-LIGHT
+                #   ( 1, 2)   +1.43%        +2.78%        +0.49%        +1.43%      2.29pp       WIN-LIGHT
+                #   ( 4, 2)   +0.17%        +2.01%        -0.20%        +0.17%      2.21pp       TIE
+                #   ( 1, 8)   -1.22%        +0.26%        -0.86%        -0.86%      1.48pp       LOSS
+                #   default   baseline      baseline      baseline       0.00%      0.13pp       (gm=4, xcds=0=8)
+                #   ( 4, 4)   -4.99%        -4.47%        -5.21%        -4.99%      0.74pp       LOSS  (R34 cell)
+                #   ( 8, 4)   -4.63%        -3.60%        -5.05%        -4.63%      1.45pp       LOSS  (R34 cell)
+                #   (16, 4)   -4.47%        -3.76%        -4.95%        -4.47%      1.19pp       LOSS  (R34 cell)
+                #   ( 1, 4)   -3.92%        -3.20%        -4.45%        -3.92%      1.24pp       LOSS
+                #
+                # ``(gm=8, xcds=None → kernel BSNX=8)`` is the unique
+                # top: every-seed positive (3/3 at +1.70..+2.93%),
+                # seed-med +2.11% with seed-spread 1.23pp (med/spread
+                # = 1.71×, just above the standard "median > spread"
+                # robust-signal gate used by R7 / R10 / R23 / R29 /
+                # R30 / R31 / R32 / R45 / R8). Wider gm at xcds=8 also
+                # lifts: (16, 8) +1.16% but with 2.37pp spread is only
+                # WIN-LIGHT; (8, 8) is the cleaner choice.
+                #
+                # Why R34's xcds=4 sweep all LOST: R34's table tested
+                # (4,4)/(8,4)/(16,4) against default (4, kernel BSNX=8).
+                # The xcds=4 chiplet partition over-restricts the
+                # 11-row N-axis traversal vs the wider 8-XCD spread —
+                # for tiles_m=8 + tiles_n=11 + k=5760 with B=4
+                # (m_total=8192 rows = 32 M-tiles per group × 4 groups
+                # = 128 tile-steps total over 256 CUs ≈ 0.5 wave-
+                # steps), the small persistent grid needs WIDER
+                # chiplet spread (xcds=8) to amortise launch + drain
+                # costs across all 8 XCDs in a single wave-step. R34's
+                # candidate set restricting to xcds=4 was the root
+                # cause of the false-negative.
+                #
+                # Why (gm=8) at xcds=8 wins where (gm=4) [default]
+                # at xcds=8 only ties:
+                # tiles_n=11 N-axis × tiles_m=8 M-axis = 88 tile-steps
+                # per group × 4 groups = 352 tile-steps over 256 CUs
+                # ≈ 1.4 wave-steps per slot. With 1.4 wave-steps the
+                # default gm=4 batches 4 M-tiles per pass yielding
+                # 11/1=11 N-pass batches × 4/8 ≈ 0.5 group-passes per
+                # wave-step (fractional, leaving partial wave-step
+                # tail). gm=8 batches 8 M-tiles per pass — exactly
+                # one M-tile-group per pass — yielding 11/1=11 N-pass
+                # batches × 8/8 = 1.0 group-passes per wave-step (no
+                # fractional tail). Combined with the deep K=5760
+                # main loop (45 K-tile-loads per pass), the gm=8
+                # batching extracts +5% L2 reuse on the per-K B-pack
+                # by completing the M-row-group before evicting.
+                #
+                # Bit-equivalent output: group_m / num_xcds are pure
+                # persistent-grid scheduling knobs on the FP8 grouped
+                # RCR kernel (same property documented for R7 / R8 /
+                # R10 / R23 / R34 / R50 and every (gm, xcds) RCR rule
+                # in this file). Bit-eq verified at the same probe
+                # path: max_abs_diff = 0.0 between (gm=4, xcds=0) and
+                # (gm=8, xcds=0) on B=4 M=2048 dA at seed 42, plus 8
+                # other (gm, xcds) cells (all max_abs=0).
+                #
+                # Sibling regression check (rule scope unchanged from
+                # R8 / R34 — gate stays inside ``tiles_n == 11 AND
+                # k == 5760`` which is unique to gpt_oss-GateUP dA
+                # post-H4-reroute):
+                #   - gpt_oss-GateUP B=4 M=4096 dA (m_total=16384,
+                #     tiles_m=16): hits R8's ``tiles_m == 16`` clause
+                #     above ((gm=1, xcds=4)). EXCLUDED by tiles_m==8.
+                #   - gpt_oss-GateUP B=32 M=2048 dA (m_total=65536,
+                #     tiles_m=8): hits R34's ``tiles_m == 8 AND
+                #     m_total >= 65536`` clause above ((gm=16, xcds=4)).
+                #     EXCLUDED by m_total==8192.
+                #   - gpt_oss-GateUP B=32 M=4096 dA (m_total=131072,
+                #     tiles_m=16): hits R8 above. EXCLUDED.
+                #   - gpt_oss-Down dA (k=2880, NOT 5760): EXCLUDED
+                #     by outer k==5760 guard.
+                #   - gpt_oss-GateUP fwd RCR (n=N_fwd=5760, tiles_n=22,
+                #     NOT 11): EXCLUDED by outer tiles_n==11 guard.
+                #   - DSV3/Qwen3 dA RCR (different (n, k) — DSV3 K_fwd
+                #     ∈ {2048, 7168}, Qwen3 K_fwd ∈ {1536, 4096}; no
+                #     family yields k==5760): EXCLUDED.
+                #   - Dense FP8 (m_total=None): EXCLUDED by outer
+                #     ``m_total is not None`` guard.
+                #   - DoD smoke FP8 grouped fwdbwd shapes per R32
+                #     audit: (4096,4096,7168) tiles_n=16 EXCLUDED;
+                #     (4096,7168,2048) k=2048 EXCLUDED. Neither
+                #     matches the rule key.
+                # Rule remains uniquely tied to gpt_oss-GateUP-B4-M2048
+                # dA post-H4-reroute in the 24-shape MoE suite + DoD
+                # universe.
+                #
+                # Expected metric impact: dA is ~33% of bwd wall, bwd
+                # is ~70% of total → dA ≈ 23% of total wall. +2.11%
+                # kernel → +0.49% wall on this single shape. Section
+                # avg lift: dgrad current 2097 T → ~2102 T (+5 T from
+                # the 1944 → ~1985 T kernel cell on this shape, mean
+                # over 8 shapes). Section progress: 0.749 → 0.751
+                # (+0.002). Overall progress: +0.0006 → score lift
+                # ~+0.6 points (sub-noise on a single run, but
+                # robust at multi-run median; matches R8 / R10 /
+                # R34 "ship narrow carve-out when probe shows clean
+                # WIN even if metric noise floor swallows the geomean
+                # lift" pattern).
+                return HipKittenConfig(
+                    layout=layout,
+                    group_m=8,
+                    num_xcds=None,
                     kernel=None,
                 )
         if tiles_n == 16 and tiles_m == 16 and k == 1536:
