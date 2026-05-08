@@ -597,10 +597,23 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # overrides for shapes where a non-default xcds is empirically
         # better (mirrors BF16 grouped's tunable num_xcds path).
         xcds_arg = cfg.num_xcds if cfg.num_xcds is not None else 0
+        # Round-9 (current Primus run, gpt_oss FP8 kernel-only ceiling
+        # task; 2026-05-08): wire ``cfg.num_slots`` through to the FP8
+        # grouped RCR / RRR binding's new per-call num_slots arg (HK
+        # commit this round). Default 0 keeps the kernel on its NUM_CUS
+        # = 256 default (or legacy ``TK_RCR_NUM_CUS`` env hook); per-
+        # shape rules in ``hipkitten/config.py`` set non-zero values
+        # for shapes where probe evidence shows the persistent grid
+        # benefits from a smaller slot count (e.g. Down-B4-M2048 fwd+
+        # dgrad at ~1.5 wave-steps/CU sees +5% kernel TFLOPS at slots=
+        # 200 — see ``scripts/_probe_round_9_*.py`` and
+        # ``analysis/_notes/round-9-fp8-grouped-rcr-num-slots-per-call-
+        # surgery.md``).
+        slots_arg = cfg.num_slots
         if use_dscale:
             grouped_dscale_fn(
                 a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
-                m_per_group=avg_m, num_xcds=xcds_arg,
+                m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
             )
         else:
             # Fallback: dscale binding not present (older .so without the
@@ -622,7 +635,7 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             )
             grouped_fn(
                 a_in, b_in, out, sa_h, sb_h, group_offs, cfg.group_m,
-                m_per_group=avg_m, num_xcds=xcds_arg,
+                m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
             )
         return out
 

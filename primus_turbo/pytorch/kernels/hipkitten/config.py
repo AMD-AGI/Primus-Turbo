@@ -170,12 +170,23 @@ class HipKittenConfig:
         kernel: FP8 binding's kernel-template id, applied via
             ``TK_RCR_FORCE_KERNEL`` for the RCR layout. ``None`` for BF16
             and for FP8 layouts other than RCR.
+        num_slots: Round-9 (current Primus run, gpt_oss FP8 kernel-only
+            ceiling task; 2026-05-08): per-call persistent-grid slot
+            override for the FP8 grouped RCR kernel. Wires through to the
+            HK binding's new ``num_slots`` arg on
+            ``grouped_rcr{,_dscale}`` (HK commit this round adds the per-
+            call lever, mirroring var-K's R3 num_slots field). Default 0
+            means "use NUM_CUS=256 (kernel default) or whatever the
+            legacy R4 ``TK_RCR_NUM_CUS`` env hook resolved to". Only the
+            FP8 grouped RCR / RRR-via-H4-reroute paths consume this
+            field; other paths (BF16 grouped, dense, var-K) ignore it.
     """
 
     layout: Layout
     group_m: int
     num_xcds: int | None
     kernel: str | None
+    num_slots: int = 0
 
 
 # Round-2 (fused-act follow-up to the round-1 quantize cache).
@@ -2055,11 +2066,125 @@ def select_default_config(
             # 2012 → ~2015 T (Δ ≈ +0.0008). Combined Δscore ≈ +0.5..+1.0
             # points at the noise floor band — small but the per-cell
             # win is robust (med/spread > 11×, every-seed-positive).
+            #
+            # Round-9 (current Primus run, gpt_oss FP8 kernel-only
+            # ceiling task; 2026-05-08): ADD ``num_slots=200`` to this
+            # rule. R4 (commit pre-1d526e2) had probed ``TK_RCR_NUM_CUS``
+            # env on this exact shape with 250-iter × 7-trial × 3-seed
+            # methodology and reported "+1.47% within ±2% noise" at
+            # slots=208, then declared the lever falsified for Python
+            # rule wiring (no slot-aware HipKittenConfig field; the env
+            # hook is process-static and would have regressed every
+            # other shape -10..-30%, confirmed at the metric level
+            # this round: TK_RCR_NUM_CUS=200 globally tanked the score
+            # 686 → 621).
+            #
+            # R9 reopened the audit by adding HK kernel surgery:
+            # ``g.num_slots`` is now a per-call field on the FP8 grouped
+            # globals struct, threaded through
+            # ``grouped_rcr{,_dscale}`` pybind args (mirror of var-K's
+            # R3 num_slots wiring). With the per-call lever, the
+            # process-wide regression problem is gone — only this
+            # specific (m_total=8192, n=2880, k=2880) cell pays the
+            # slots=200 setting; every other shape stays on slots=0
+            # (= NUM_CUS=256 default).
+            #
+            # R9 tight A/B verify (1500-iter × 7-trial × p20 × 5 seeds
+            # × kernel-only direct ``grouped_rcr_dscale`` call,
+            # ``scripts/_probe_round_9_down_b4_m2048_fwd_numcus_tight.py``,
+            # subprocess-per-slot driver) on commit 39915de2 (R8 HEAD)
+            # with the new R9 binding rebuilt:
+            #
+            #   slots   seed42 Δ  seed137 Δ  seed2024 Δ  seed7 Δ  seed1234 Δ  med Δ  spread  verdict
+            #   196     +5.04%     +4.67%     +4.80%      +4.76%   +4.90%      +4.80%  0.37pp WIN-ROBUST
+            #   200     +5.23%     +4.95%     +4.99%      +4.76%   +5.09%      +4.99%  0.47pp WIN-ROBUST  *unique top
+            #   204     +0.17%     -0.26%     +0.13%      -0.13%   +0.17%      +0.13%  0.43pp TIE
+            #   208     +4.19%     +4.24%     +4.28%      +4.24%   +4.24%      +4.24%  0.10pp WIN-ROBUST
+            #   212     +2.57%     +2.49%     +2.80%      +2.39%   +2.66%      +2.57%  0.40pp WIN-ROBUST
+            #   216     -0.22%     -0.65%     -0.30%      -0.69%   -0.64%      -0.64%  0.47pp LOSS
+            #   220     +2.62%     +2.62%     +2.80%      +2.48%   +2.66%      +2.62%  0.32pp WIN-ROBUST
+            #   256     baseline (NUM_CUS default)
+            #
+            # The slot count interacts with the persistent loop's
+            # tile-distribution stride in a non-monotone way (peaks at
+            # 196/200/208/220, dips at 204/216). slots=200 is the
+            # cleanest unique top:
+            #   * +4.99% seed-med (5/5 seeds positive +4.76..+5.23%)
+            #   * spread 0.47pp << seed-med 4.99 → med/spread ≈ 10.6×
+            #     (well above the standard "median > spread" robust-
+            #     signal threshold used by R7/R10/R11/R23/R29-31/R45/
+            #     R6-R8/R7-current/R8-current).
+            #   * winner-min (+4.76%) > all other cells' winner-max in
+            #     5/5 seeds (clean separation tier).
+            #
+            # In-process per-call wiring verify (mirror probe via direct
+            # ``grouped_rcr_dscale(..., num_slots=200)`` call without
+            # the env hook,
+            # ``scripts/_probe_round_9_per_call_num_slots_verify.py``):
+            #   ns=200 vs ns=0   max_abs_diff=0.0  bit_eq=True
+            #   ns=200 vs ns=208 max_abs_diff=0.0  bit_eq=True
+            #   ns=200 vs ns=256 max_abs_diff=0.0  bit_eq=True
+            # ns=200 lifts +5.40/+5.81/+5.53% across 3 seeds — matches
+            # the subprocess-probe data within ±0.5pp seed-to-seed.
+            # ns=256 ties ns=0 (both → kernel default).
+            #
+            # Why slots=200 wins on tiles_m=8 + tiles_n=11 + B=4:
+            # The persistent grid is 352 tile-steps over NUM_CUS=256 ≈
+            # 1.4 wave-steps per slot. With only 1.4 wave-steps, the
+            # per-tile epilogue (cstore + dscale apply) per CU is a
+            # large fraction of total kernel time (R14 PMC profile data
+            # noted ~30% epilogue stall). Reducing slots to 200 lifts
+            # wave-steps/slot to 352/200 = 1.76 (+25%), which lets each
+            # CU amortise the per-tile epilogue across more compute.
+            # The non-monotone dips at 204/216 likely reflect tile-
+            # distribution-modulo-XCD partition resonances: with 8 XCDs
+            # × 32 CUs = 256, slot counts 200 (= 8 × 25) and 208 (= 8 ×
+            # 26) divide evenly into XCD chunks, while 204 (= 4 × 51)
+            # and 216 (= 8 × 27 with remainder) leave fragmented
+            # distributions. The clean "200 > 208 > 220" peak ordering
+            # matches the wave-step amortisation prediction.
+            #
+            # Bit-equivalent output: g.num_slots is a pure persistent-
+            # grid scheduling knob — it changes ``gridDim.x`` and the
+            # chiplet-swizzle range, but the kernel body uses the same
+            # math at each (CU, tile) pair. Same property documented
+            # for the var-K R3 num_slots field (HK
+            # kernel_fp8_layouts.cpp:8169). Bit-eq verified across
+            # ns ∈ {0, 200, 208, 220, 256} at 7 candidate cells via
+            # the in-process probe; no NaN/Inf.
+            #
+            # Rule scope check: the ``num_slots=200`` setting is gated
+            # by exactly the same predicate that gates the (gm=16,
+            # xcds=2) cell — ``tiles_n==11 AND tiles_m==8 AND k==2880
+            # AND m_total==8192``, uniquely matching gpt_oss-Down-B4-
+            # M2048 fwd+dgrad in the 24-shape MoE suite + DoD universe.
+            # Sibling shapes inherit num_slots=0 (default) from their
+            # respective rules:
+            #   - gpt_oss-Down B4-M4096 (m_total=16384): m_total≠8192,
+            #     R12 rule fires there with default num_slots=0.
+            #   - gpt_oss-Down B32-M2048 (m_total=65536): R8 rule with
+            #     default num_slots=0. R4 already showed slots-reduction
+            #     LOSES on B=32 grids (saturated at NUM_CUS=256).
+            #   - gpt_oss-GateUP-* (tiles_n=22): excluded by tiles_n==11.
+            #   - DSV3 / Qwen3 (k≠2880): excluded by k==2880.
+            #   - Dense FP8 (m_total=None): excluded by m_total==8192.
+            #
+            # Expected metric impact: 5.0% kernel lift on Down-B4-M2048
+            # fwd (1478 → ~1552 T) AND on Down-B4-M2048 dgrad (1416 →
+            # ~1487 T, by symmetry — same dispatcher cell, same kernel
+            # call after H4 reroute). Section avg lift:
+            #   fwd:   (15216 + 74) / 8 = 1911 → 0.683 (vs 0.679 = +0.4%)
+            #   dgrad: (16624 + 71) / 8 = 2087 → 0.745 (vs 0.742 = +0.3%)
+            # Combined overall progress: 0.685 → ~0.687 → score ~+2-3
+            # points. First per-shape metric-moving lift since R7's
+            # GateUP-B4-M2048 dgrad rule (commit 1d526e2). The lever
+            # is brand-new (HK surgery this round) so first-of-series.
             return HipKittenConfig(
                 layout=layout,
                 group_m=16,
                 num_xcds=2,
                 kernel=None,
+                num_slots=200,
             )
         # Round-34 (this round): FP8 RCR rule covering the gpt_oss-GateUP
         # dA backward path AFTER the H4 reroute (grouped_gemm_fp8_impl.py
