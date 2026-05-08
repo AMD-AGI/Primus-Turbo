@@ -18,12 +18,17 @@ Therefore, this file is **not responsible for**:
 
 ## Iteration Contract
 
-Before running `ENVIRONMENT_BASELINE`, read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc). Treat it as a hard constraint throughout the loop:
+Before running `ENVIRONMENT_BASELINE`, read both
+[`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc)
+and
+[`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc).
+Treat them as hard constraints throughout the loop:
 
 - one hypothesis and one meaningful kernel change per round
 - correctness before performance
 - benchmark the full active validation set
 - accept or roll back cleanly to the previous accepted baseline
+- **every accepted gain must transfer to real LLM training**; benchmark-only caches keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` are forbidden — see the operational checklist in [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
 
 ## Input Parameters
 
@@ -267,10 +272,19 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 - What is the expected benefit
 - What are the risks
 - What signal will verify success or failure
+- **Real-training transfer assessment** (mandatory, no exceptions):
+  - Which bucket from [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md) does this direction belong to (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`)?
+  - For `K1`–`K4`: the change rewrites kernel work that runs on every real iteration; the expected real-training gain equals the expected benchmark gain. State this explicitly.
+  - For `W1`: cite the per-step bound `quant_time(weight) / step_time` for the project's representative shape, derived in numbers, and use this — not the benchmark headline — as the expected real-training gain.
+  - For `W2` or `W3`: **the direction is not eligible**. Drop it from the candidate list at ANALYZE. Do not advance it to OPTIMIZE under any circumstance, even if it would visibly improve the benchmark aggregate score.
+
+**Promotion rule for the primary hypothesis**:
+- Only directions tagged `K1`–`K4`, or `W1` with a bounded gain, may be promoted to the round's primary hypothesis.
+- If only `W2` / `W3` directions look attractive, the correct outcome is to **skip the round and re-survey for new structural directions**, not to land an overfit cache.
 
 **Output**:
-- Prioritized hypothesis list
-- Primary hypothesis for this round
+- Prioritized hypothesis list with the bucket and expected real-training gain on each entry
+- Primary hypothesis for this round (must satisfy the promotion rule above)
 
 ### 3. OPTIMIZE
 
@@ -281,11 +295,20 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 - After modification, be able to clearly answer "what exactly was changed this round"
 - If compiled artifacts are involved, rebuild per project skill instructions
 - Record modified files, key parameters, and expected impact for this round
+- If the proposed change is a wrapper-level cache, memoization, or
+  `id(tensor)` lookup: read [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
+  and complete its Step 1–4 audit **before** writing any code. A cache that
+  fails the audit must not be implemented at all.
 
 **Constraints**:
 - Do not mix unrelated cleanup into optimization attempts
 - Do not introduce multiple orthogonal major changes simultaneously
 - Do not break key interface semantics agreed upon with the upstream project
+- Do not introduce caches keyed on `id(activation)`, `id(grad_out)`, or
+  `id(activation_scale)`. These are forbidden by
+  [`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc)
+  because their gain comes from the benchmark idiom (same Python object
+  reused 100 times) and does not transfer to real LLM training.
 
 **Output**:
 - Candidate diff
@@ -323,6 +346,7 @@ Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (
 - `Check = FAIL` in benchmark → reject immediately
 - Aggregate score regression → default reject
 - Core shape regression > 3% → default reject
+- New wrapper-level cache keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` → reject immediately, regardless of aggregate score. The round's `summary.md` must include a `Real-training transfer check` section showing the cache audit per [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md); if that section says `REJECT-as-overfit`, the round is INVALID and must be rolled back.
 
 **After passing**:
 1. Write this round's detailed results to `rounds/round-N/summary.md`
@@ -356,6 +380,12 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 - Record cumulative improvement relative to baseline
 - Mark which directions were effective, ineffective, or need revisiting
 - Produce candidate directions for the next round
+- For every accepted round in this campaign so far, confirm that
+  `rounds/round-N/summary.md` carries a `Real-training transfer check`
+  section whose `Decision` is `ACCEPT-as-real` or `ACCEPT-with-asterisk`.
+  Any round whose `Decision` is `REJECT-as-overfit` and yet sits in the
+  accepted lineage must be rolled back at this point — it is not
+  legitimate cumulative gain.
 
 **REPORT** (output when campaign terminates, written to the `## Final Report` section at the end of `logs/optimize.md`):
 - Baseline vs final best comparison (with full validation data)
@@ -364,6 +394,22 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 - List of verified ineffective directions
 - If continuing optimization, top three recommended next steps
 - Detailed data references to the corresponding `rounds/round-N/summary.md` files
+- **Real-training applicability audit** (mandatory): a single section that
+  re-attributes the campaign's `baseline → final best` delta into three
+  numbers, derived from each round's `Real-training transfer check`:
+  - structural gain (sum of `K1`–`K4` accepted rounds, expected to
+    transfer to real training 1:1)
+  - bounded gain (sum of `W1` accepted rounds, capped by
+    `quant_time(weight) / step_time`)
+  - benchmark-only residual (anything that VALIDATE accepted but the
+    transfer audit later cannot defend; this number must be `0` for a
+    clean campaign)
+  Report the campaign's real-training-equivalent improvement as
+  `structural + bounded`, separately from the benchmark aggregate gain.
+  If `benchmark_aggregate_gain - (structural + bounded) > 1%`, treat that
+  delta as benchmark-only inflation and call it out explicitly. The user
+  reading the final report must be able to tell, in one sentence, how
+  much of the headline number will survive a real LLM training step.
 
 ## Rollback Rules
 
@@ -508,6 +554,19 @@ Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can
 - Key effective optimizations: ...
 - Verified ineffective directions: ...
 - If continuing optimization, recommended next three steps: ...
+
+### Real-training applicability audit
+| Source | Buckets | Benchmark gain | Real-training-equivalent gain |
+|--------|---------|----------------|-------------------------------|
+| Structural kernel work | K1 / K2 / K3 / K4 rounds | +<S_bench>% | +<S_real>% (= +<S_bench>%, transfers 1:1) |
+| Bounded weight cache | W1 rounds | +<W_bench>% | +<W_real>% (capped by quant_time(weight) / step_time = <derivation>) |
+| Benchmark-only residual | (must be 0 for a clean campaign) | +<R_bench>% | +0% |
+| **Total** | — | +<Z>% | +<S_real + W_real>% |
+
+- Headline benchmark improvement: +<Z>%
+- Real-training-equivalent improvement: +<S_real + W_real>%
+- Inflation gap (`headline - real-training-equivalent`): <gap>%
+- Verdict: <"clean — gap < 1%, headline transfers" | "inflated — call out residual W_bench" | "rolled-back — see round-N">
 ```
 
 ## Round Summary Template
