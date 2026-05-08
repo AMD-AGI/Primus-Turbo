@@ -525,8 +525,10 @@ def _grouped_variable_k_gemm_kernel(
         M_g = (tl.load(group_offs_ptr + group_idx + 1) - m_start).to(tl.int32)
 
         # ── Output indices ──
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % OUT_M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % OUT_N
+        rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rm = rm_s % OUT_M
+        rn = rn_s % OUT_N
         rk = tl.arange(0, BLOCK_SIZE_K)
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
@@ -585,9 +587,7 @@ def _grouped_variable_k_gemm_kernel(
         # ── Apply scaling and store ──
         if IS_FP8:
             acc *= scale
-        rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         # Cast group_idx to int64 to prevent overflow in C group offset
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn

@@ -402,6 +402,79 @@ def gen_grouped_gemm_test_cases():
     return all_test_cases
 
 
+def gen_gpt_oss_grouped_gemm_test_cases():
+    """Generate GPT-OSS grouped GEMM profile from 20260428 perf trace."""
+    total_tokens = 131072
+    num_experts = 32
+    hidden_size = 2880
+    gate_up_size = 5760
+    intermediate_size = 2880
+    tokens_per_expert = total_tokens // num_experts
+
+    return [
+        {
+            "Case": "GPT-OSS-Forward-UP",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": gate_up_size,
+            "K": hidden_size,
+            "dtype": torch.bfloat16,
+            "trans_b": False,
+            "op_type": "forward",
+        },
+        {
+            "Case": "GPT-OSS-Forward-DOWN",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": hidden_size,
+            "K": intermediate_size,
+            "dtype": torch.bfloat16,
+            "trans_b": False,
+            "op_type": "forward",
+        },
+        {
+            "Case": "GPT-OSS-Backward-UP",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": hidden_size,
+            "K": gate_up_size,
+            "dtype": torch.bfloat16,
+            "trans_b": True,
+            "op_type": "backward",
+        },
+        {
+            "Case": "GPT-OSS-Backward-DOWN",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": intermediate_size,
+            "K": hidden_size,
+            "dtype": torch.bfloat16,
+            "trans_b": True,
+            "op_type": "backward",
+        },
+        {
+            "Case": "GPT-OSS-Backward-UP-Weight",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": gate_up_size,
+            "K": hidden_size,
+            "dtype": torch.bfloat16,
+            "trans_b": False,
+            "op_type": "wgrad",
+        },
+        {
+            "Case": "GPT-OSS-Backward-DOWN-Weight",
+            "B": num_experts,
+            "M": tokens_per_expert,
+            "N": hidden_size,
+            "K": intermediate_size,
+            "dtype": torch.bfloat16,
+            "trans_b": False,
+            "op_type": "wgrad",
+        }
+    ]
+
+
 def gen_attention_test_cases():
     """Generate attention test cases from model configs (deduplicated)."""
     seen = set()
