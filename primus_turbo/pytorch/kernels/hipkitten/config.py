@@ -2815,9 +2815,93 @@ def select_default_config(
                 # (single-run std ≈ 5 score points across 691-693 band
                 # this run series), same robustness/sub-noise pattern as
                 # R3 / R10 / R11 / R12 / R13 / R14 ships in this run.
+                #
+                # Round-16 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-08): UPDATE group_m from 8 → 1.
+                # R10's gm=8 was selected as a sibling-pattern match to
+                # the Down-B4-M2048 wgrad cell at the same 1.5 ws/CU
+                # tier (intentional rule consistency), tested WITHOUT
+                # chunk_size override (the chunk_size lever for RCR
+                # didn't exist until R14's HK surgery). After R15 added
+                # chunk_size=24 to this cell, the optimum (gm) shifts
+                # to gm=1 — the chunk_size=24 1-clean-chiplet partition
+                # changes the per-tile L2 reuse profile, and the gm=8
+                # M-batching mechanism R10 documented no longer aligns
+                # with the new 24-PIDs/XCD chunk boundary.
+                #
+                # R16 retune A/B verify (in-process direct
+                # ``grouped_rcr_dscale(..., group_m=N, num_slots=200,
+                # chunk_size=24)`` call, 3000-iter × p20 × 7 seeds,
+                # ``scripts/_probe_round_16_gateup_b4_dg_tight.py``):
+                #
+                #   gm    med ms     spread   med Δ vs gm=8    pos/n   verdict
+                #     8   0.13208    0.303 %  baseline (R15)   --      base
+                #     1   0.12748    0.250 %  +3.48 %          7/7     WIN-CLEANEST  *ship
+                #
+                # gm=1 is wmin_beats_lmax: max(gm=1) = 0.12768 < min(gm=8)
+                # = 0.13184 → every seed of gm=1 beats every seed of
+                # baseline by ≥ 3.1 %. Cleanest signal class. Compounding
+                # win on top of R10 (slots=200, +3.08 %) and R15
+                # (chunk_size=24, +1.82 %) — total kernel lift since R8
+                # (gm=8, slots=256, cs=64 baseline) is now +8.4 %.
+                #
+                # Initial wide sweep (5-seed × 2000-iter) at
+                # ``scripts/_probe_round_16_gateup_b4_dg_gm_retune.py``
+                # confirmed gm=1 is the unique top across {1, 2, 4, 8,
+                # 12, 16, 24}; gm ∈ {12, 16, 24} all win marginally
+                # (+1.20..+1.33 %), gm=2 +0.60 %, gm=4 +0.42 % — gm=1
+                # dominates at +3.44 %. The wide candidate set rules
+                # out a "gm=1 is noise" interpretation: the per-gm
+                # ranking is monotone-ish around the gm=1 peak.
+                #
+                # Why gm=1 wins here at chunk_size=24:
+                # Per-group output post-H4 = [N=2880, K_post=5760] →
+                # tiles_n=11, tiles_m=8 (M=2048/256), 88 tile-steps per
+                # group × 4 groups = 352 tile-steps over 200 slots =
+                # 1.76 ws/CU. With chunk_size=24 + xcds=8 the chiplet
+                # partition is 24 PIDs/XCD per chunk × 1 chunk = 192
+                # workgroups (8 trailing round-robin). Each XCD's 24
+                # PIDs see consecutive tile-IDs, so the L2-reuse benefit
+                # is on the per-K B-pack column-slab (one slab serves
+                # all 11 N-rows of a tile-cluster on a single XCD).
+                # gm=1 walks the entire 11-row N-axis under each
+                # individual K-tile column before advancing K — perfect
+                # alignment with the 24-PID chunk's L2 footprint
+                # (24 tiles × 1 N-row each = 24 unique N tiles, fully
+                # absorbed by the XCD's L2 slice). gm=8 instead batches
+                # 8 M-tiles per pass against 11 N-tiles (8/11 ≈ 73 %,
+                # fractional batch on the second pass) which forces a
+                # group-boundary stall under the chunk_size=24 partition.
+                # Same R23 mechanism (gm=1 wins for tiles_m << tiles_n
+                # shapes) but only EXPRESSIBLE after the chunk_size
+                # lever was wired in R14/R15 — R10 had no way to test
+                # this geometry.
+                #
+                # Bit-equivalent output verified at
+                # ``scripts/_probe_round_16_gateup_b4_dg_tight.py``
+                # across 3 seeds ({42, 137, 2024}): max_abs_diff = 0,
+                # bit_eq=True every seed. group_m is a pure persistent-
+                # grid scheduling knob — same property documented for
+                # every (gm, xcds) RCR / RRR / var-K rule above.
+                #
+                # Sibling regression check: rule scope unchanged (gate
+                # remains tiles_n==11 AND k==5760 AND tiles_m==8 AND
+                # m_total==8192). Only this gpt_oss-GateUP-B4-M2048 dA
+                # cell hit; siblings audited in R15 commit's "Sibling
+                # regression check" section all unchanged.
+                #
+                # Expected metric impact: this shape was 2012 T in R16
+                # entry metric (post R15 chunk_size=24). +3.48 % kernel
+                # → +70 T → 2082 T direct probe. dgrad section avg
+                # lift: 2100 → ~2109 T (+9 T / 8 shapes). Section
+                # progress: 0.750 → 0.753 (+0.003). Score Δ ≈ +1 point.
+                # Same sub-noise robustness pattern as R10/R11/R15
+                # ships — kernel-real every-seed wmin_beats_lmax win
+                # committed ahead of compounding gains from later round
+                # rules.
                 return HipKittenConfig(
                     layout=layout,
-                    group_m=8,
+                    group_m=1,
                     num_xcds=None,
                     kernel=None,
                     num_slots=200,
