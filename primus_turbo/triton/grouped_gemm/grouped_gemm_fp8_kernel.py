@@ -20,7 +20,7 @@ Contains:
     - grouped_gemm_fp8_rowwise_variable_k_triton_kernel: Backward public API
 
   Blockwise scaling:
-    - _grouped_blockwise_fp8_persistent_gemm_kernel: Forward
+    - _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned: Forward
     - _grouped_blockwise_fp8_variable_k_gemm_kernel: Backward variable-K
     - grouped_gemm_fp8_blockwise_triton_kernel: Forward public API
     - grouped_gemm_fp8_blockwise_variable_k_triton_kernel: Backward public API
@@ -1196,10 +1196,9 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-# v1 autotune: 2 cfgs. v1 is only used for K % 128 != 0 (masked tail path).
-# Otherwise wrapper routes to v2. BK=128 forced (scale block matches), num_stages=1
-# forced (LDS budget for BM=256). Just vary GM.
-def _v1_autotune_configs():
+# v1 only used for K % 128 != 0 (masked-tail path); wrapper routes to v2 otherwise.
+# BK=128 (matches scale block) and num_stages=1 (BM=256 LDS budget) are pinned.
+def _get_grouped_blockwise_autotune_configs_unaligned():
     return [
         triton.Config(
             {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
@@ -1214,9 +1213,9 @@ def _v1_autotune_configs():
     ]
 
 
-@triton.autotune(configs=_v1_autotune_configs(), key=["G", "N", "K"])
+@triton.autotune(configs=_get_grouped_blockwise_autotune_configs_unaligned(), key=["G", "N", "K"])
 @triton.jit()
-def _grouped_blockwise_fp8_persistent_gemm_kernel(
+def _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned(
     # Pointers
     A,  # [M_total, K] FP8
     B,  # [G, ?, ?] FP8
@@ -1381,31 +1380,11 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise FP8 Forward Kernel V2 — BK=64 with shared scale across 2 inner iters
-#
-# Same math as v1; difference is the K-loop is split into:
-#   outer: kb in range(K / SCALE_BLOCK_K)   — one (a_s, b_s) pair per outer iter
-#   inner: sub in static_range(SUB_K_ITERS) — SCALE_BLOCK_K / BLOCK_SIZE_K dots
-# When BLOCK_SIZE_K = SCALE_BLOCK_K (e.g., 128), SUB_K_ITERS=1 collapses to v1.
-# When BLOCK_SIZE_K = 64 with SCALE_BLOCK_K=128, we get 2 sub-dots per scale, which
-# allows BM=BN=256 with num_stages=2 (LDS = 2*(256*64+64*256) = 64KB exact).
-#
-# Requires K % SCALE_BLOCK_K == 0 (no masked tail in v2 — use v1 for unaligned K).
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-# Autotune grid for v2. waves_per_eu/kpack/matrix_instr_nonkdim hardcoded at
-# launch (Triton.Config does not accept AMD-specific kwargs).
-#
-# Numerical safety (verified by sweep on G=8 N=K=4096 fwd, FP8 e4m3fnuz):
-#   BLOCK_N MUST equal 128. BN=64 → ~33% rel err, BN=256 → ~10% rel err
-#   (deterministic Triton/MFMA layout bugs on MI300X).
-#   BLOCK_M ∈ {64, 128, 256}. BM=256 only with BK=128 (BM=256 BK=64 also bug).
-#
-# Grid covers: small-M (BM=64), std (BM=128 with BK=64 or 128), large-M (BM=256
-# with BK=128). Mirrors the non-grouped v2 grid expansion for consistency.
-def _v2_autotune_configs():
+# Blockwise FP8 forward v2: K-loop split into outer (scale block, SCALE_BLOCK_K=128)
+# × inner (compute block, BLOCK_SIZE_K). Requires K % SCALE_BLOCK_K == 0.
+# BLOCK_N pinned to 128 (BN=64/256 have an MFMA layout bug on MI300X FP8 e4m3fnuz).
+# BLOCK_M=256 must use BLOCK_K=128 (same bug otherwise).
+def _get_grouped_blockwise_autotune_configs():
     cfgs = []
     # Small M: BM=64
     for GM in (2, 8):
@@ -1431,12 +1410,12 @@ def _v2_autotune_configs():
             {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
              "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
             num_warps=8, num_stages=1))
-    return cfgs  # 8 cfgs total
+    return cfgs
 
 
-@triton.autotune(configs=_v2_autotune_configs(), key=["G", "N", "K"])
+@triton.autotune(configs=_get_grouped_blockwise_autotune_configs(), key=["G", "N", "K"])
 @triton.jit()
-def _grouped_blockwise_fp8_persistent_gemm_kernel_v2(
+def _grouped_blockwise_fp8_persistent_gemm_kernel(
     A,
     B,
     C,
@@ -1460,17 +1439,15 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel_v2(
     stride_bk: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,        # compute granularity (32, 64, or 128)
-    SCALE_BLOCK_K: tl.constexpr,       # blockwise scale granularity (locked 128)
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     NUM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
 ):
-    """Grouped block-wise FP8 GEMM v2 with BK / SCALE_BLOCK_K split.
-    Requires K % SCALE_BLOCK_K == 0.
-    """
+    """Grouped blockwise FP8 v2; needs K % SCALE_BLOCK_K == 0."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -1532,9 +1509,7 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel_v2(
         as_ptrs_base = A_scales_ptr + (m_start_g + rm.to(tl.int64)) * stride_as_m
         bs_ptr_base = B_scales_ptr + group_idx.to(tl.int64) * stride_bs_g + pid_n * stride_bs_n
 
-        # Outer loop over scale blocks (size SCALE_BLOCK_K = 128).
-        # Inner loop runs SUB_K_ITERS dots, all sharing one (a_s, b_s) pair.
-        # For SUB_K_ITERS=1 this collapses to v1 behavior.
+        # Outer = scale blocks; inner = SUB_K_ITERS dots sharing one (a_s, b_s).
         loop_kb = K // SCALE_BLOCK_K
         tl.assume(loop_kb > 1)
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -1567,16 +1542,9 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel_v2(
         tl.store(C_, c, c_mask)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise FP8 Variable-K Backward Kernel (persistent, CPU-sync-free)
-#
-# Computes: C[g] = LHS[g]^T @ RHS[g] with 1D+1D block-wise scales
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-# Tight autotune grid for variable-K bwd — 2 cfgs. Cannot key on per-group M
-# (group_lens varies per call in unbalanced MoE) — only key on shape-stable
-# (G, OUT_M, OUT_N). BK=128 fixed (segment-padding aligns M_g to 128).
+# Blockwise FP8 variable-K backward (persistent, CPU-sync-free):
+#   C[g] = LHS[g]^T @ RHS[g] with 1D+1D blockwise scales.
+# Autotune is keyed on shape-stable (G, OUT_M, OUT_N) only — per-group M varies.
 def _bwd_autotune_configs():
     return [
         triton.Config(
@@ -1598,35 +1566,28 @@ def _bwd_autotune_configs():
 )
 @triton.jit()
 def _grouped_blockwise_fp8_variable_k_gemm_kernel(
-    # C[g] = LHS_g^T @ RHS_g * block_scales
-    LHS,  # [M_padded_total, OUT_M] FP8 (or [OUT_M, M_padded_max] when A_K_CONTIGUOUS)
-    RHS,  # [M_padded_total, OUT_N] FP8 (or [OUT_N, M_padded_max] when B_K_CONTIGUOUS)
-    C,  # [G, OUT_M, OUT_N]
-    LHS_scales_ptr,  # [ceil(M_padded/128), OUT_M] float32
-    RHS_scales_ptr,  # [ceil(M_padded/128), OUT_N] float32
-    group_offs_ptr,  # [G+1] int64 (padded segment offsets, each aligned to 128)
-    G,  # number of groups
+    LHS,
+    RHS,
+    C,
+    LHS_scales_ptr,
+    RHS_scales_ptr,
+    group_offs_ptr,
+    G,
     OUT_M,
     OUT_N,
-    # Strides
-    stride_lhs_m,    # K-axis stride: OUT_M (strided) or 1 (K-contig). Constexpr-1 if A_K_CONTIGUOUS.
-    stride_rhs_m,    # K-axis stride: OUT_N (strided) or 1 (K-contig). Constexpr-1 if B_K_CONTIGUOUS.
+    stride_lhs_m,
+    stride_rhs_m,
     stride_cg,
     stride_cm,
     stride_cn,
-    # LHS_scales strides
     stride_ls_0,
     stride_ls_1,
-    # RHS_scales strides
     stride_rs_0,
     stride_rs_1,
-    # Constexpr strides
-    stride_lhs_n: tl.constexpr,    # output-row stride: 1 (strided) or M_padded_max (K-contig)
+    stride_lhs_n: tl.constexpr,
     stride_rhs_n: tl.constexpr,
-    # Layout flags
     A_K_CONTIGUOUS: tl.constexpr,
     B_K_CONTIGUOUS: tl.constexpr,
-    # Tile config
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -1636,15 +1597,8 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
 ):
-    """Persistent grouped block-wise FP8 variable-K GEMM kernel (backward, CPU-sync-free).
-
-    All groups share the same output dims (OUT_M × OUT_N), only the inner product
-    dimension M_g varies per group. 1D+1D scale pattern for TN/CRR layout.
-
-    NOTE: Data is segment-padded to BLOCK_SIZE_K (128) boundaries by
-    quant_fp8_blockwise_segment_m_impl, so M_g is always a multiple of
-    BLOCK_SIZE_K. No masking is needed in the K-loop.
-    """
+    """Variable-K BWD: C[g] = LHS_g^T @ RHS_g. M_g is segment-padded to BLOCK_SIZE_K
+    by quant_fp8_blockwise_segment_m_impl, so no K-loop masking is needed."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -1749,133 +1703,6 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise FP8 Variable-K Backward Kernel V2 — BK<128 with shared scale
-# Same idea as forward v2: split inner-K loop into outer (over scale blocks
-# size SCALE_BLOCK_K=128) + inner (over BLOCK_SIZE_K compute tiles, sharing
-# one scale row). Lets BM=128 BN=256 BK=64 stages=2 fit LDS for better pipelining.
-# Requires M_g % SCALE_BLOCK_K == 0 (same as v1, since segment-padding ensures it).
-# Note: BM=256 BN=128 BK<128 BLACKLISTED — same Triton-level numerical bug as v2 fwd.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@triton.jit()
-def _grouped_blockwise_fp8_variable_k_gemm_kernel_v2(
-    LHS,
-    RHS,
-    C,
-    LHS_scales_ptr,
-    RHS_scales_ptr,
-    group_offs_ptr,
-    G,
-    OUT_M,
-    OUT_N,
-    stride_lhs_m,
-    stride_rhs_m,
-    stride_cg,
-    stride_cm,
-    stride_cn,
-    stride_ls_0,
-    stride_ls_1,
-    stride_rs_0,
-    stride_rs_1,
-    stride_lhs_n: tl.constexpr,
-    stride_rhs_n: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,        # compute granularity (32, 64, or 128)
-    SCALE_BLOCK_K: tl.constexpr,       # blockwise scale granularity (locked 128)
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    CHUNK_SIZE: tl.constexpr,
-    CACHE_MODIFIER: tl.constexpr,
-):
-    """Variable-K BWD blockwise FP8 GEMM v2.
-    Requires M_g % SCALE_BLOCK_K == 0 (segment-padding ensures this for our pipeline).
-    """
-    pid = tl.program_id(0)
-    if NUM_XCDS != 1:
-        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
-
-    SUB_K_ITERS: tl.constexpr = SCALE_BLOCK_K // BLOCK_SIZE_K
-
-    tiles_m = tl.cdiv(OUT_M, BLOCK_SIZE_M)
-    tiles_n = tl.cdiv(OUT_N, BLOCK_SIZE_N)
-    tiles_per_group = tiles_m * tiles_n
-    total_tiles = G * tiles_per_group
-
-    tl.assume(stride_lhs_m > 0)
-    tl.assume(stride_lhs_n > 0)
-    tl.assume(stride_rhs_m > 0)
-    tl.assume(stride_rhs_n > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-
-    acc_dtype = tl.float32
-
-    for global_tile in range(pid, total_tiles, NUM_SMS):
-        group_idx = global_tile // tiles_per_group
-        local_tile = global_tile - group_idx * tiles_per_group
-
-        num_pid_in_group = GROUP_SIZE_M * tiles_n
-        swizzle_group = local_tile // num_pid_in_group
-        first_pid_m = swizzle_group * GROUP_SIZE_M
-        group_size_m = min(tiles_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
-        pid_n = (local_tile % num_pid_in_group) // group_size_m
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
-
-        m_start = tl.load(group_offs_ptr + group_idx)
-        M_g = (tl.load(group_offs_ptr + group_idx + 1) - m_start).to(tl.int32)
-
-        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % OUT_M
-        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % OUT_N
-        rk = tl.arange(0, BLOCK_SIZE_K)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-
-        LHS_BASE = LHS + m_start * stride_lhs_m + rm[:, None] * stride_lhs_n + rk[None, :] * stride_lhs_m
-        RHS_BASE = RHS + m_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :] * stride_rhs_n
-
-        # Scale row index advances by 1 per outer (scale block) iteration.
-        scale_row_start = m_start // SCALE_BLOCK_K
-
-        # Outer loop over scale blocks (SCALE_BLOCK_K=128).
-        # Inner loop runs SUB_K_ITERS dots sharing the same (a_s, b_s) scale pair.
-        # SUB_K_ITERS=1 collapses to v1 behavior; SUB_K_ITERS>1 enables BK<128 + stages>1.
-        loop_kb = M_g // SCALE_BLOCK_K
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-
-        for kb in range(loop_kb):
-            partial = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-            for sub in tl.static_range(SUB_K_ITERS):
-                if stride_lhs_n == 1:
-                    a = tl.load(tl.multiple_of(LHS_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
-                else:
-                    a = tl.load(tl.multiple_of(LHS_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
-                if stride_rhs_n == 1:
-                    b = tl.load(tl.multiple_of(RHS_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
-                else:
-                    b = tl.load(tl.multiple_of(RHS_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
-                partial += tl.dot(a, b, input_precision="ieee")
-                LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
-                RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
-
-            scale_row = scale_row_start + kb
-            a_s = tl.load(LHS_scales_ptr + scale_row * stride_ls_0 + rm * stride_ls_1)
-            b_s = tl.load(RHS_scales_ptr + scale_row * stride_rs_0 + rn * stride_rs_1)
-            acc += partial * a_s[:, None] * b_s[None, :]
-
-        c = acc.to(C.type.element_ty)
-        rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
-        C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
-        tl.store(C_, c, c_mask)
-
-
 # ── Blockwise FP8 Forward Public API ──
 
 
@@ -1937,13 +1764,11 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     A_scales_t = a_scales.T.contiguous()
     num_sms = _get_num_cus()
 
-    # Pick v1 (BK=128, masked-tail safe) or v2 (BK=64, requires K aligned).
-    # autotune fills BLOCK_SIZE_*/GROUP_SIZE_M/CHUNK_SIZE at runtime per (G,N,K).
     if K % 128 == 0:
-        # v2 is tuned with num_stages=2; async_copy doubles LDS → must disable
+        # v2 num_stages=2 needs async_copy off (else LDS doubles).
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
-        _grouped_blockwise_fp8_persistent_gemm_kernel_v2[(num_sms,)](
+        _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
             a, b, out, A_scales_t, b_scales, group_offs,
             G, N, K,
             a.stride(0), stride_bg, stride_bn,
@@ -1957,8 +1782,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
         )
     else:
-        even_k = False  # only enter this branch when K%128 != 0
-        _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
+        _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
             a, b, out, A_scales_t, b_scales, group_offs,
             G, N, K,
             a.stride(0), stride_bg, stride_bn,
@@ -1967,7 +1791,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
             b_scales.stride(0), stride_bs_n, stride_bs_k,
             stride_ak=stride_ak, stride_bk=stride_bk,
             NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
-            EVEN_K=even_k, CACHE_MODIFIER=".ca",
+            EVEN_K=False, CACHE_MODIFIER=".ca",
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
         )
     return out

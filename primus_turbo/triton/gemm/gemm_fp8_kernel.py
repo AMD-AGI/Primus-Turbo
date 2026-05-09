@@ -1156,7 +1156,13 @@ def _blockwise_nt(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
+    # A scales: kernel needs [K//128, M] (M-contig). If caller already provided
+    # the pre-shuffled layout (from quant_fp8_blockwise_pshuffle_impl), shape
+    # will be (K//128, M) — skip the runtime .T.contiguous() copy.
+    if a_scale_inv.shape == (num_k, M):
+        A_scales_t = a_scale_inv
+    else:
+        A_scales_t = a_scale_inv.T.contiguous()
     B_t = b.T  # view [K, N]
 
     num_m = (M + 127) // 128
@@ -1323,5 +1329,74 @@ def _blockwise_tn(
             b_scale_inv.stride(1), b_scale_inv.stride(0),
             NUM_SMS, num_k,
             A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False, SCALE_2D_B=False,
+        )
+    return out
+
+
+def gemm_fp8_blockwise_wgrad_kc_triton_kernel(
+    a_T: torch.Tensor,           # [K_out, M_red] FP8 — col-wise+xpose quant of A [M_red, K_out]
+    a_scale_inv: torch.Tensor,   # [ceil(M_red/128), K_out] fp32
+    grad_T: torch.Tensor,        # [N_out, M_red] FP8 — col-wise+xpose quant of grad [M_red, N_out]
+    grad_scale_inv: torch.Tensor,# [ceil(M_red/128), N_out] fp32
+    out_dtype: torch.dtype = torch.bfloat16,
+    trans_c: bool = False,
+) -> torch.Tensor:
+    """K-contiguous wgrad: C[K_out, N_out] = A.T[K_out, M_red] @ grad[M_red, N_out].
+
+    Inputs are pre-transposed (M_red contig) via quant_fp8_blockwise_with_xpose_impl
+    so the kernel can read them with K_CONTIGUOUS=True hints — replaces the strided
+    A.T view in _blockwise_tn. Probe shows +30-40% wgrad TFLOPS.
+
+    For trans_c=True the output is [N_out, K_out] (matches the existing _blockwise_tn
+    trans_c contract that autograd uses to avoid an extra transpose).
+    """
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    else:
+        _set_amd_knobs(enable=True)
+
+    K_out, M_red = a_T.shape
+    N_out, M_red_b = grad_T.shape
+    assert M_red == M_red_b, f"reduction-dim mismatch: a_T={a_T.shape}, grad_T={grad_T.shape}"
+    num_k = (M_red + 127) // 128
+
+    if trans_c:
+        out = torch.empty((N_out, K_out), device=a_T.device, dtype=out_dtype)
+        stride_cm, stride_cn = out.stride(1), out.stride(0)
+    else:
+        out = torch.empty((K_out, N_out), device=a_T.device, dtype=out_dtype)
+        stride_cm, stride_cn = out.stride(0), out.stride(1)
+
+    num_m = (K_out + 127) // 128
+    num_n = (N_out + 127) // 128
+    NUM_SMS = num_m * num_n
+
+    if M_red % 128 == 0:
+        if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+            triton.knobs.amd.use_async_copy = False
+        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+            a_T, grad_T, out, a_scale_inv, grad_scale_inv,
+            K_out, N_out, M_red,
+            a_T.stride(0), a_T.stride(1),
+            1, grad_T.stride(0),
+            stride_cm, stride_cn,
+            a_scale_inv.stride(0), a_scale_inv.stride(1),
+            grad_scale_inv.stride(1), grad_scale_inv.stride(0),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=False,
+            SCALE_BLOCK_K=128,
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+            a_T, grad_T, out, a_scale_inv, grad_scale_inv,
+            K_out, N_out, M_red,
+            a_T.stride(0), a_T.stride(1),
+            1, grad_T.stride(0),
+            stride_cm, stride_cn,
+            a_scale_inv.stride(0), a_scale_inv.stride(1),
+            grad_scale_inv.stride(1), grad_scale_inv.stride(0),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=False,
         )
     return out

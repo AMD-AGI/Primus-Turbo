@@ -29,7 +29,18 @@ def quant_fp8_blockwise_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
+    PSHUFFLE_SCALES: tl.constexpr = False,  # if True, write scales in transposed-block layout
 ):
+    """Quant FP8 blockwise. PSHUFFLE_SCALES: when True, write scales already
+    in the layout the GEMM kernel needs (saves a runtime .T.contiguous()):
+
+      AXIS=1 (row-wise): default scales layout [M, K//block]; pre-shuffled is [K//block, M]
+      AXIS=0 (col-wise): default scales layout [M//block, N]; pre-shuffled is [N, M//block]
+
+    For AXIS=1 the GEMM wrappers already do A_scales.T.contiguous() — pre-shuffle
+    eliminates that runtime transpose. AXIS=0 is unaffected by current GEMM
+    wrappers, but we keep the symmetry for future use.
+    """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
@@ -49,10 +60,20 @@ def quant_fp8_blockwise_kernel(
 
     # Store scale
     if AXIS == 1:
-        scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+        if PSHUFFLE_SCALES:
+            # Layout [K//block, M]: row index = pid_n, col index = offs_m
+            scale_offs = pid_n * M + offs_m
+        else:
+            # Layout [M, K//block]: row index = offs_m, col index = pid_n
+            scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
         scale_mask = offs_m < M
     else:
-        scale_offs = pid_m * N + offs_n
+        if PSHUFFLE_SCALES:
+            # Layout [N, M//block]: row index = offs_n, col index = pid_m
+            scale_offs = offs_n * tl.cdiv(M, BLOCK_SIZE) + pid_m
+        else:
+            # Layout [M//block, N]: row index = pid_m, col index = offs_n
+            scale_offs = pid_m * N + offs_n
         scale_mask = offs_n < N
     x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
     tl.store(
@@ -71,11 +92,12 @@ def quant_fp8_blockwise_with_xpose_kernel(
     x_ptr,        # bf16/fp16 input  [M, N]
     x_fp8_ptr,    # fp8 output       [M, N]  (regular layout)
     x_fp8_T_ptr,  # fp8 output       [N, M]  (transposed layout)
-    x_scales_ptr, # fp32 scales      same shape as quant_fp8_blockwise_kernel
+    x_scales_ptr, # fp32 scales — see PSHUFFLE_SCALES for layout
     M, N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
+    PSHUFFLE_SCALES: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -99,12 +121,19 @@ def quant_fp8_blockwise_with_xpose_kernel(
     x_fp8_T_ptrs = x_fp8_T_ptr + offs_n[:, None] * M + offs_m[None, :]
     tl.store(x_fp8_T_ptrs, x_fp8_tile_t.T, mask=mask.T)
 
-    # Single scales write (same as base quant_fp8_blockwise_kernel)
+    # Scales — pre-shuffled layout when PSHUFFLE_SCALES=True (saves a runtime
+    # .T.contiguous() in the GEMM wrapper)
     if AXIS == 1:
-        scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+        if PSHUFFLE_SCALES:
+            scale_offs = pid_n * M + offs_m
+        else:
+            scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
         scale_mask = offs_m < M
     else:
-        scale_offs = pid_m * N + offs_n
+        if PSHUFFLE_SCALES:
+            scale_offs = offs_n * tl.cdiv(M, BLOCK_SIZE) + pid_m
+        else:
+            scale_offs = pid_m * N + offs_n
         scale_mask = offs_n < N
     x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
     tl.store(x_scales_ptr + scale_offs, x_scales_tile_inv, mask=scale_mask)

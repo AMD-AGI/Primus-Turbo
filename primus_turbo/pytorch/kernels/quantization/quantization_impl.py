@@ -132,6 +132,61 @@ def quant_fp8_blockwise_impl_meta(
     return x_fp8, x_scales
 
 
+@triton_op("primus_turbo::quant_fp8_blockwise_pshuffle_impl", mutates_args=())
+def quant_fp8_blockwise_pshuffle_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Same as quant_fp8_blockwise_impl, but writes scales pre-shuffled into the
+    layout the GEMM kernel needs (saves a runtime .T.contiguous() in the wrapper).
+
+    Returns:
+        x_fp8:    [M, N] FP8 (same as base)
+        x_scales: AXIS=1 → [K//block, M]   (i.e., already transposed)
+                  AXIS=0 → [N, M//block]
+    """
+    assert x.is_contiguous() and x.dim() == 2
+    assert axis in (-2, -1, 0, 1)
+    axis = axis % 2
+
+    M, N = x.shape
+    x_fp8 = torch.zeros((M, N), dtype=dtype, device=x.device)
+    if axis == 1:
+        scales_shape = (triton.cdiv(N, block_size), M)
+    else:
+        scales_shape = (N, triton.cdiv(M, block_size))
+    x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
+
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_kernel)[grid](
+        x, x_fp8, x_scales, M, N,
+        block_size, torch.finfo(dtype).max, axis,
+        PSHUFFLE_SCALES=True,
+    )
+    return x_fp8, x_scales
+
+
+@quant_fp8_blockwise_pshuffle_impl.register_fake
+def quant_fp8_blockwise_pshuffle_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    axis = axis % 2
+    M, N = x.shape
+    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
+    if axis == 1:
+        scales_shape = (triton.cdiv(N, block_size), M)
+    else:
+        scales_shape = (N, triton.cdiv(M, block_size))
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+    return x_fp8, x_scales
+
+
 @triton_op("primus_turbo::quant_fp8_blockwise_with_xpose_impl", mutates_args=())
 def quant_fp8_blockwise_with_xpose_impl(
     x: torch.Tensor,

@@ -22,6 +22,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
+    quant_fp8_blockwise_for_weight_with_xpose_impl,
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
 )
@@ -77,7 +78,19 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             a, a_dtype, axis=1, block_size=config.block_size
         )
 
-        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+        # Fused weight quant + transpose: gives both b_fp8 (NT fwd) and b_fp8_T
+        # (NT dgrad). The transposed write is near-free since the quant kernel
+        # is bound by the bf16 read. Enables DGRAD-NT in backward (faster than
+        # the NN path by ~5-10% — non-grouped probe-validated, pattern carries
+        # to grouped since it uses the same per-group fwd kernel).
+        # Only meaningful when fwd is NT (trans_b=True); skip otherwise.
+        if trans_b:
+            b_fp8, b_fp8_T, b_scale_inv = quant_fp8_blockwise_for_weight_with_xpose_impl(
+                b, b_dtype, block_size=config.block_size
+            )
+        else:
+            b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+            b_fp8_T = None
 
         out = grouped_gemm_fp8_impl(
             a_fp8_row,
@@ -98,14 +111,19 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             a, a_dtype, config.block_size, group_lens, group_offs
         )
 
-        ctx.save_for_backward(
-            a_fp8_col,
-            a_scale_inv_col,
-            b_fp8,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-        )
+        if b_fp8_T is not None:
+            ctx.save_for_backward(
+                a_fp8_col, a_scale_inv_col,
+                b_fp8, b_fp8_T, b_scale_inv,
+                group_lens, group_offs,
+            )
+        else:
+            ctx.save_for_backward(
+                a_fp8_col, a_scale_inv_col,
+                b_fp8, b_scale_inv,
+                group_lens, group_offs,
+            )
+        ctx.use_dgrad_nt = b_fp8_T is not None
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
@@ -118,14 +136,15 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
 
-        (
-            a_fp8_col,
-            a_scale_inv_col,
-            b_fp8,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-        ) = ctx.saved_tensors
+        if ctx.use_dgrad_nt:
+            (a_fp8_col, a_scale_inv_col,
+             b_fp8, b_fp8_T, b_scale_inv,
+             group_lens, group_offs) = ctx.saved_tensors
+        else:
+            (a_fp8_col, a_scale_inv_col,
+             b_fp8, b_scale_inv,
+             group_lens, group_offs) = ctx.saved_tensors
+            b_fp8_T = None
         block_size = ctx.config.block_size
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
@@ -134,21 +153,39 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             grad_out, grad_out_dtype, axis=1, block_size=block_size
         )
 
-        # grad_a: grad_out @ b^T
-        grad_a = grouped_gemm_fp8_impl(
-            grad_out_fp8_row,
-            b_fp8,
-            grad_out_scale_inv_row,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-        )
+        # grad_a: grad_out @ W (per-group). DGRAD-NT path uses the pre-transposed
+        # b_fp8_T [G, K_orig, N_orig] with trans_b=True so the kernel routes to
+        # the NT layout (faster than NN). Scales need a permute(0, 2, 1) view.
+        if ctx.use_dgrad_nt:
+            grad_a = grouped_gemm_fp8_impl(
+                grad_out_fp8_row,
+                b_fp8_T,
+                grad_out_scale_inv_row,
+                b_scale_inv.permute(0, 2, 1).contiguous(),
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
+        else:
+            grad_a = grouped_gemm_fp8_impl(
+                grad_out_fp8_row,
+                b_fp8,
+                grad_out_scale_inv_row,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
 
         # Quantize grad_out with segment padding for wgrad (colwise quantization)
         grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
