@@ -31,16 +31,7 @@ def quant_fp8_blockwise_kernel(
     AXIS: tl.constexpr,
     PSHUFFLE_SCALES: tl.constexpr = False,  # if True, write scales in transposed-block layout
 ):
-    """Quant FP8 blockwise. PSHUFFLE_SCALES: when True, write scales already
-    in the layout the GEMM kernel needs (saves a runtime .T.contiguous()):
-
-      AXIS=1 (row-wise): default scales layout [M, K//block]; pre-shuffled is [K//block, M]
-      AXIS=0 (col-wise): default scales layout [M//block, N]; pre-shuffled is [N, M//block]
-
-    For AXIS=1 the GEMM wrappers already do A_scales.T.contiguous() — pre-shuffle
-    eliminates that runtime transpose. AXIS=0 is unaffected by current GEMM
-    wrappers, but we keep the symmetry for future use.
-    """
+    """Blockwise FP8 quant. PSHUFFLE_SCALES=True writes scales pre-transposed to the GEMM layout."""
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
@@ -83,21 +74,17 @@ def quant_fp8_blockwise_kernel(
     )
 
 
-# Blockwise quantize with fused transpose: single bf16 read, dual fp8 write.
-# Useful for wgrad, where the col-wise quantized inputs (axis=0) need to be
-# read along the M dim by the kernel; pre-transposing makes M-dim contiguous
-# → kernel can use the K_CONTIGUOUS=True path → avoids strided FP8 loads.
+# Fused row + col-xpose blockwise quant for grad_out: one bf16 read serves dgrad-NT and K-contig wgrad.
 @triton.jit
-def quant_fp8_blockwise_with_xpose_kernel(
-    x_ptr,        # bf16/fp16 input  [M, N]
-    x_fp8_ptr,    # fp8 output       [M, N]  (regular layout)
-    x_fp8_T_ptr,  # fp8 output       [N, M]  (transposed layout)
-    x_scales_ptr, # fp32 scales — see PSHUFFLE_SCALES for layout
+def quant_fp8_blockwise_row_col_xpose_kernel(
+    x_ptr,
+    x_fp8_row_ptr,
+    x_fp8_col_T_ptr,
+    x_scales_row_ptr,
+    x_scales_col_ptr,
     M, N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    AXIS: tl.constexpr,
-    PSHUFFLE_SCALES: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -105,38 +92,26 @@ def quant_fp8_blockwise_with_xpose_kernel(
     offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-    # Single bf16 read
-    x_ptrs = x_ptr + offs_m[:, None] * N + offs_n[None, :]
-    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-    x_tile_abs = tl.abs(x_tile)
+    x = tl.load(x_ptr + offs_m[:, None] * N + offs_n[None, :], mask=mask, other=0.0).to(tl.float32)
+    x_abs = tl.abs(x)
 
-    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX)
-    x_fp8_tile_t = x_fp8_tile.to(x_fp8_ptr.dtype.element_ty)
+    row_max = tl.maximum(tl.max(x_abs, axis=1, keep_dims=True), 1e-4)
+    row_scale = FP8_MAX / row_max
+    x_fp8_row = tl.clamp(x * row_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_row_ptr.dtype.element_ty)
 
-    # Write 1: regular [M, N]
-    x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(x_fp8_ptrs, x_fp8_tile_t, mask=mask)
+    col_max = tl.maximum(tl.max(x_abs, axis=0, keep_dims=True), 1e-4)
+    col_scale = FP8_MAX / col_max
+    x_fp8_col = tl.clamp(x * col_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_col_T_ptr.dtype.element_ty)
 
-    # Write 2: transposed [N, M]
-    x_fp8_T_ptrs = x_fp8_T_ptr + offs_n[:, None] * M + offs_m[None, :]
-    tl.store(x_fp8_T_ptrs, x_fp8_tile_t.T, mask=mask.T)
+    tl.store(x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :], x_fp8_row, mask=mask)
+    tl.store(x_fp8_col_T_ptr + offs_n[:, None] * M + offs_m[None, :], x_fp8_col.T, mask=mask.T)
 
-    # Scales — pre-shuffled layout when PSHUFFLE_SCALES=True (saves a runtime
-    # .T.contiguous() in the GEMM wrapper)
-    if AXIS == 1:
-        if PSHUFFLE_SCALES:
-            scale_offs = pid_n * M + offs_m
-        else:
-            scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
-        scale_mask = offs_m < M
-    else:
-        if PSHUFFLE_SCALES:
-            scale_offs = offs_n * tl.cdiv(M, BLOCK_SIZE) + pid_m
-        else:
-            scale_offs = pid_m * N + offs_n
-        scale_mask = offs_n < N
-    x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
-    tl.store(x_scales_ptr + scale_offs, x_scales_tile_inv, mask=scale_mask)
+    # Row scales pre-shuffled to [N//block, M].
+    row_scale_inv = tl.reshape(1.0 / row_scale, BLOCK_SIZE)
+    tl.store(x_scales_row_ptr + pid_n * M + offs_m, row_scale_inv, mask=offs_m < M)
+
+    col_scale_inv = tl.reshape(1.0 / col_scale, BLOCK_SIZE)
+    tl.store(x_scales_col_ptr + pid_m * N + offs_n, col_scale_inv, mask=offs_n < N)
 
 
 # Blockwise quantize with segment padding
@@ -220,129 +195,100 @@ def quant_fp8_blockwise_segment_m_kernel(
     )
 
 
-# Same as quant_fp8_blockwise_segment_m_kernel but ALSO writes the FP8 transposed
-# output [N, M_padded_max] in the same bf16-read pass. The transposed layout has
-# the M_padded dim contiguous → the variable-K bwd kernel can use A_K_CONTIGUOUS=True
-# path, replacing strided loads.
+# Fused row + segment-padded-col quant of grouped grad_out: one bf16 read
+# serves dgrad (row-wise) and variable-K wgrad (col-wise, segment-padded).
 @triton.jit
-def quant_fp8_blockwise_segment_m_with_xpose_kernel(
+def quant_fp8_blockwise_segment_m_row_col_kernel(
     x_ptr,
-    x_fp8_ptr,
-    x_fp8_T_ptr,    # [N, M_padded_max] transposed FP8 output
-    x_scales_ptr,
+    x_fp8_row_ptr,
+    x_fp8_col_padded_ptr,
+    x_scales_row_ptr,
+    x_scales_col_padded_ptr,
     group_offs_ptr,
     padded_group_offs_ptr,
+    M_in,
     N,
-    M_padded_max,    # constant for transpose stride
     num_groups,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
+    """Each program handles one [BLOCK, BLOCK] tile in padded output space; row
+    outputs are emitted only for valid input rows."""
+    pid_m = tl.program_id(axis=0)   # padded M index
     pid_n = tl.program_id(axis=1)
 
     M_padded = tl.load(padded_group_offs_ptr + num_groups)
-
     block_start = pid_m * BLOCK_SIZE
     if block_start >= M_padded:
         return
 
+    # Find group containing this padded tile
     group_id = 0
     for g in range(num_groups):
-        padded_start = tl.load(padded_group_offs_ptr + g)
-        padded_end = tl.load(padded_group_offs_ptr + g + 1)
-        if block_start >= padded_start and block_start < padded_end:
+        ps = tl.load(padded_group_offs_ptr + g)
+        pe = tl.load(padded_group_offs_ptr + g + 1)
+        if block_start >= ps and block_start < pe:
             group_id = g
 
-    orig_group_start = tl.load(group_offs_ptr + group_id)
-    orig_group_end = tl.load(group_offs_ptr + group_id + 1)
-    padded_group_start = tl.load(padded_group_offs_ptr + group_id)
+    orig_start = tl.load(group_offs_ptr + group_id)
+    orig_end = tl.load(group_offs_ptr + group_id + 1)
+    pad_start = tl.load(padded_group_offs_ptr + group_id)
 
     offs_m_out = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
     offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
-    offs_m_in = orig_group_start + (offs_m_out - padded_group_start)
+    offs_m_in = orig_start + (offs_m_out - pad_start)
 
-    mask = (
-        (offs_m_in[:, None] >= orig_group_start)
-        & (offs_m_in[:, None] < orig_group_end)
+    mask_in = (
+        (offs_m_in[:, None] >= orig_start)
+        & (offs_m_in[:, None] < orig_end)
         & (offs_n[None, :] < N)
     )
 
-    x_ptrs = x_ptr + offs_m_in[:, None] * N + offs_n[None, :]
-    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-    x_tile_abs = tl.abs(x_tile)
+    x = tl.load(
+        x_ptr + offs_m_in[:, None] * N + offs_n[None, :], mask=mask_in, other=0.0
+    ).to(tl.float32)
+    x_abs = tl.abs(x)
 
-    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
-    x_fp8_tile_t = x_fp8_tile.to(x_fp8_ptr.dtype.element_ty)
+    col_max = tl.maximum(tl.max(x_abs, axis=0, keep_dims=True), 1e-4)
+    col_scale = FP8_MAX / col_max
+    x_fp8_col = tl.clamp(x * col_scale, min=-FP8_MAX, max=FP8_MAX).to(
+        x_fp8_col_padded_ptr.dtype.element_ty
+    )
 
-    # Write 1: regular [M_padded_max, N]
-    x_fp8_ptrs = x_fp8_ptr + offs_m_out[:, None] * N + offs_n[None, :]
-    out_mask = (offs_m_out[:, None] < M_padded) & (offs_n[None, :] < N)
-    tl.store(x_fp8_ptrs, x_fp8_tile_t, mask=out_mask)
+    row_max = tl.maximum(tl.max(x_abs, axis=1, keep_dims=True), 1e-4)
+    row_scale = FP8_MAX / row_max
+    x_fp8_row = tl.clamp(x * row_scale, min=-FP8_MAX, max=FP8_MAX).to(
+        x_fp8_row_ptr.dtype.element_ty
+    )
 
-    # Write 2: transposed [N, M_padded_max] — M_padded dim contiguous
-    x_fp8_T_ptrs = x_fp8_T_ptr + offs_n[:, None] * M_padded_max + offs_m_out[None, :]
-    tl.store(x_fp8_T_ptrs, x_fp8_tile_t.T, mask=out_mask.T)
+    out_mask_pad = (offs_m_out[:, None] < M_padded) & (offs_n[None, :] < N)
+    tl.store(
+        x_fp8_col_padded_ptr + offs_m_out[:, None] * N + offs_n[None, :],
+        x_fp8_col,
+        mask=out_mask_pad,
+    )
 
-    scale_offs = pid_m * N + offs_n
-    scale_mask = (pid_m < tl.cdiv(M_padded, BLOCK_SIZE)) & (offs_n < N)
-    x_scales_tile_inv = tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE)
-    tl.store(x_scales_ptr + scale_offs, x_scales_tile_inv, mask=scale_mask)
+    tl.store(
+        x_fp8_row_ptr + offs_m_in[:, None] * N + offs_n[None, :],
+        x_fp8_row,
+        mask=mask_in,
+    )
 
+    col_scale_inv = tl.reshape(1.0 / col_scale, BLOCK_SIZE)
+    col_scale_mask = (pid_m < tl.cdiv(M_padded, BLOCK_SIZE)) & (offs_n < N)
+    tl.store(
+        x_scales_col_padded_ptr + pid_m * N + offs_n,
+        col_scale_inv,
+        mask=col_scale_mask,
+    )
 
-# w_ptr         [B, M, N]
-# w_fp8_ptr     [B, M, N] FP8
-# w_scales_ptr  [B, M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
-@triton.jit
-def quant_fp8_blockwise_for_weight_with_xpose_kernel(
-    w_ptr,            # bf16/fp16 input  [B, M, N]
-    w_fp8_ptr,        # fp8 output       [B, M, N]
-    w_fp8_T_ptr,      # fp8 transposed   [B, N, M]
-    w_scales_ptr,     # fp32 scales      [B, ceil(M/BLOCK), ceil(N/BLOCK)]
-    M, N,
-    BLOCK_SIZE: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-):
-    """Fused weight quant + transpose. Single bf16 read, dual fp8 write.
-
-    Produces both [B, M, N] and [B, N, M] FP8 layouts so the caller can
-    use the regular layout for FWD (B @ A^T pattern) and the transposed
-    for DGRAD (grad_out @ B pattern, TN/RCR layout). Scales are produced
-    once in [B, M_blocks, N_blocks] layout; the transposed view is just
-    `w_scales.permute(0, 2, 1)` (zero-copy) on the caller side.
-    """
-    bid = tl.program_id(axis=0)
-    pid_m = tl.program_id(axis=1)
-    pid_n = tl.program_id(axis=2)
-
-    batch_offset_w = bid * M * N
-    batch_offset_scales = bid * tl.cdiv(M, BLOCK_SIZE) * tl.cdiv(N, BLOCK_SIZE)
-
-    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-
-    # Single bf16 read
-    w_ptrs = w_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
-    w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    # One scale per [BLOCK_SIZE, BLOCK_SIZE] tile
-    w_tile_max = tl.maximum(tl.max(tl.abs(w_tile)), 1e-4)
-    w_scales = FP8_MAX / w_tile_max
-    w_fp8_tile = tl.clamp(w_tile * w_scales, min=-FP8_MAX, max=FP8_MAX)
-    w_fp8_tile_t = w_fp8_tile.to(w_fp8_ptr.dtype.element_ty)
-
-    # Write 1: original layout [B, M, N]
-    w_fp8_ptrs = w_fp8_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(w_fp8_ptrs, w_fp8_tile_t, mask=mask)
-
-    # Write 2: transposed layout [B, N, M] — same data, swap (m, n) → (n, m)
-    w_fp8_T_ptrs = w_fp8_T_ptr + batch_offset_w + offs_n[:, None] * M + offs_m[None, :]
-    tl.store(w_fp8_T_ptrs, w_fp8_tile_t.T, mask=mask.T)
-
-    # Single scales write
-    scale_offs = batch_offset_scales + pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
-    tl.store(w_scales_ptr + scale_offs, 1.0 / w_scales)
+    row_scale_inv = tl.reshape(1.0 / row_scale, BLOCK_SIZE)
+    row_scale_mask = (offs_m_in >= orig_start) & (offs_m_in < orig_end) & (offs_m_in < M_in)
+    tl.store(
+        x_scales_row_ptr + offs_m_in * tl.cdiv(N, BLOCK_SIZE) + pid_n,
+        row_scale_inv,
+        mask=row_scale_mask,
+    )
 
 
 @triton.jit
