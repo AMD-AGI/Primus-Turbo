@@ -117,7 +117,7 @@ def _get_gg_fp8_tw_fwd_config(
         blk_m, blk_n = 256, 256
         blk_k = 128
         num_stages_val = 2
-        group_m = 4
+        group_m = 8
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
         grid_sms = num_sms
@@ -179,7 +179,7 @@ def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
         blk_m, blk_n = 256, 256
         blk_k, num_stages_val = 64, 3
         group_m = 4
-        cache_a, cache_b = ".ca", ".ca"
+        cache_a, cache_b = ".cg", ".ca"
         chunk_size = 32
 
         origami_params = _select_params_origami(
@@ -207,6 +207,10 @@ def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
                     num_stages_val = proposed_stages
+        blk_k, num_stages_val = 128, 2
+        if OUT_N == OUT_M:
+            # Square wgrad keeps the B working set inside the per-XCD L2 with a shorter row group.
+            group_m = 4
     else:
         blk_m, blk_n, blk_k = 256, 256, 64
         group_m = 4
@@ -434,6 +438,11 @@ def _grouped_fp8_persistent_gemm_kernel(
     tl.assume(stride_bk > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
+    # Contiguous-tensor invariants for FP8 grouped GEMM (A and C are row-major with no padding):
+    # stride_am == K (A row stride), stride_cm == N (C row stride). Telling the compiler
+    # explicitly may unlock a tighter address-gen sequence.
+    tl.assume(stride_am == K)
+    tl.assume(stride_cm == N)
 
     # Load per-tensor scales once (scalar)
     scale_a = tl.load(A_scale_ptr)
@@ -463,8 +472,6 @@ def _grouped_fp8_persistent_gemm_kernel(
         group_size_m = min(tiles_m_g - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
         pid_n = (local_tile % num_pid_in_group) // group_size_m
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
 
         # ── Address computation ──
         rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
@@ -482,7 +489,6 @@ def _grouped_fp8_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -647,7 +653,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         MAX_G_NEXT_POW2=max_g_next_pow2,
         num_warps=8,
         num_stages=num_stages_val,
-        waves_per_eu=2,
+        waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
     )

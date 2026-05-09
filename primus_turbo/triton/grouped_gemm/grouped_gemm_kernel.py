@@ -517,8 +517,6 @@ def _grouped_variable_k_gemm_kernel(
         group_size_m = min(tiles_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
         pid_n = (local_tile % num_pid_in_group) // group_size_m
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
 
         # ── Group boundaries ──
         m_start = tl.load(group_offs_ptr + group_idx)  # int64 to avoid overflow
