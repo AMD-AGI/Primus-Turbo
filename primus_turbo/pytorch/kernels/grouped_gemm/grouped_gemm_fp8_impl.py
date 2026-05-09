@@ -624,11 +624,35 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # scripts/_probe_round_14_down_b4_extended.py and the rule
         # comment block in hipkitten/config.py at the matching cell).
         chunk_arg = cfg.chunk_size
+        # Round-16 (current Primus run, gpt_oss FP8 kernel-only ceiling
+        # task; 2026-05-08): wire ``cfg.fuse_ktail_off`` through to the
+        # FP8 grouped RCR / RRR-via-H4 binding's new per-call
+        # ``fuse_ktail_off`` arg (HK commit this round converts R14's
+        # process-static ``TK_GROUPED_RCR_FUSE_OFF`` env hook into a
+        # per-call kwarg). Default 0 → kernel uses R34-dm FUSED_KTAIL=
+        # true codegen-driven default (load-bearing on the entire suite
+        # per R14). Per-shape rules in ``hipkitten/config.py`` set
+        # ``fuse_ktail_off=1`` only for the GateUP B=32 dgrad-via-H4
+        # cells (tiles_n==11, k==5760, m_total>=65536) where R14's
+        # per-shape probe found a +1-2% win. Only the FP8 grouped RCR
+        # binding consumes this kwarg; the RRR (non-rerouted) and
+        # var-K paths leave it un-passed (default 0 in the C++ wrapper).
+        fuse_off_arg = cfg.fuse_ktail_off
         if use_dscale:
-            grouped_dscale_fn(
-                a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
+            grouped_dscale_kwargs = dict(
                 m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
                 chunk_size=chunk_arg,
+            )
+            # Only the RCR variant consumes ``fuse_ktail_off`` (the gate
+            # lives in ``dispatch_grouped_rcr``; ``dispatch_grouped_rrr``
+            # has no fuse_ktail_eligible path). Pass conditionally to
+            # avoid TypeError on the RRR binding which doesn't expose
+            # the kwarg.
+            if trans_b and fuse_off_arg:
+                grouped_dscale_kwargs["fuse_ktail_off"] = fuse_off_arg
+            grouped_dscale_fn(
+                a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
+                **grouped_dscale_kwargs,
             )
         else:
             # Fallback: dscale binding not present (older .so without the
@@ -1168,7 +1192,16 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 # rather than headline. Same R8/R9 "ship narrow carve-
                 # out when probe shows clean WIN" pattern.
                 vk_group_m = 1
-                vk_num_xcds = 2
+                # Round-4 (gpt_oss_fp8_local_20260508_074546): R10 above
+                # selected ``xcds=2`` at default ``slots=256/cs=64``. R4
+                # re-tunes at the JOINT (slots=192, cs=48, xcds=4) cell —
+                # see the full evidence block at the ``vk_chunk_size = 48``
+                # ship site below (line ~2109). Cell #2 (Down-B4-M4096):
+                # +1.084% kernel (med over 7 seeds × 2500 iter), 7/7 seeds
+                # positive, wmin_beats_lmax=True. Mirror of R1 lesson on
+                # GateUP-B4 (cells #5/#6) — the slots×cs joint sweep
+                # at xcds=4 was untested when R10 picked xcds=2.
+                vk_num_xcds = 4
             elif False and (a.shape[1] == 2880 and b.shape[1] == 2880):
                 if False:
                     # R38 (this round) carve-out for gpt_oss-Down B=4 M=4096
@@ -1867,7 +1900,16 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 # clean WIN even if metric noise floor swallows the
                 # geomean lift" pattern.
                 vk_group_m = 1
-                vk_num_xcds = 2
+                # Round-4 (gpt_oss_fp8_local_20260508_074546): R11 above
+                # selected ``xcds=2`` at default ``slots=256/cs=64``. R4
+                # re-tunes at the JOINT (slots=192, cs=48, xcds=4) cell —
+                # see the full evidence block at the ``vk_chunk_size = 48``
+                # ship site below (line ~2109). Cell #1 (Down-B4-M2048):
+                # +0.976% kernel (med over 7 seeds × 2500 iter), 7/7 seeds
+                # positive, wmin_beats_lmax=True. Mirror of R1 lesson on
+                # GateUP-B4 (cells #5/#6) — the slots×cs joint sweep
+                # at xcds=4 was untested when R11 picked xcds=2.
+                vk_num_xcds = 4
             elif a.shape[1] == 2880 and b.shape[1] == 5760:
                 # R35 gpt_oss-GateUP-B4-M2048 carve-out (the only
                 # m_total<16384 metric shape still on default after R33).
@@ -2106,7 +2148,237 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             # / +1.35 % on 2 of 8 wgrad shapes → ~+0.35 % wgrad section
             # avg → ~+0.35 / 3 / 2800 × 1000 ≈ +1.2 score points
             # (small but real, monotonic with R3's slots=192 win).
-            vk_chunk_size = 96
+            #
+            # Round-4 (gpt_oss_fp8_local_20260508_074546 run; 2026-05-08):
+            # JOINT re-tune of (xcds, chunk_size) on the same predicate.
+            # R11 (M=2048) / R10 (M=4096) selected ``xcds=2`` at default
+            # slots=256/cs=64; R3 then ramped slots=192 at xcds=2; R13
+            # paired cs=96 to make block=2*96=192=slots a clean partition.
+            # The xcds was never re-tested at the slots=192 cell, and the
+            # cs was never re-tested at xcds=4 — exactly the R1 lesson
+            # ("when adding a new lever to an existing rule, also re-sweep
+            # OTHER per-cell levers; the new lever may have changed the
+            # optimum"). R4 sweeps the joint (xcds, slots, cs) cell on
+            # both Down-B4 cells (#1 M=2048, #2 M=4096) and finds a clean
+            # winner at (xcds=4, slots=192, cs=48) — block=4*48=192=slots
+            # is STILL a clean partition, but spread across all 8 XCDs
+            # (4 chiplets × 2 XCDs) with 48-PID chunks per XCD instead of
+            # the R3+R13 (xcds=2 → 4 of 8 XCDs idle on 2-XCD partition).
+            #
+            # # R4 wide sweep (scripts/_probe_round_4_down_b4_wgrad_xcds_
+            # slots_cs.py, 3-seed × 1500-iter p20, 16 cells = 8 cells per
+            # xcds column × 2 xcds values; gm=1 fixed per R10/R11):
+            #
+            #   shape: Down-B4-M2048 wgrad var-K (cell #1)
+            #     (xcds, slots, cs)  TFLOPS  Δ vs (2,192,96)  partition
+            #     (4, 192, 48)       1419.1   +0.91%          clean(block=192) ★
+            #     (2, 192, 96)R3+R13 1406.2    base           clean(block=192) *base
+            #     (4, 200, 50)       1402.7   -0.25%          clean(block=200)
+            #     (2, 192, 48)       1402.1   -0.29%          clean(block=96)
+            #     (4, 208, 52)       1387.2   -1.37%          clean(block=208)
+            #     (2, 192, 64)       1378.8   -1.99%          part(block=128,lim=128)
+            #     (4, 192, 64)       1361.1   -3.31%          no-op(block=256>slots)
+            #     (4, 224, 56)       1359.5   -3.44%          clean(block=224) ← R1 GateUP winner cell
+            #     ... other reduced-slot/no-op rows -4.22..-22.10%
+            #
+            #   shape: Down-B4-M4096 wgrad var-K (cell #2, sibling)
+            #     (4, 192, 48)       1790.0   +0.91%          clean(block=192) ★
+            #     (2, 192, 96)R3+R13 1773.6    base           clean(block=192) *base
+            #     (4, 224, 56)       1673.6   -5.98%          clean(block=224) ← R1 GateUP winner LOSES here
+            #     ... other rows -0.08..-21.56%
+            #
+            # Critical cross-shape observation: R1's GateUP winner cell
+            # (xcds=4, slots=224, cs=56) LOSES -3.44% / -5.98% on Down-B4
+            # cells. Per-shape sibling probe IS required for cross-section
+            # transfer (echoes R3 lesson). Each cell has its own unique
+            # sweet spot at the slots×cs boundary — Down-B4 (484 tile-steps,
+            # 1.89 ws/CU LOW density) wants tighter slots=192 to amortise
+            # per-tile prologue; GateUP-B4 (968 tile-steps, 3.78 ws/CU
+            # intermediate density) tolerates slots=224.
+            #
+            # # R4 tight A/B verify (scripts/_probe_round_4_down_b4_wgrad_
+            # tight.py, 7-seed × 2500-iter p20):
+            #
+            #   shape (wgrad var-K)        med Δ    spread (b/c)  pos/n  wmin_beats_lmax
+            #   Down-B4-M2048 (cell #1)    +0.976%  0.024%/0.021% 7/7    True
+            #   Down-B4-M4096 (cell #2)    +1.084%  0.026%/0.031% 7/7    True
+            #
+            # Cleanest signal class — every seed of (xcds=4, slots=192,
+            # cs=48) beats every seed of baseline (xcds=2, slots=192,
+            # cs=96). Mirror of R1 / R10 / R11 / R13 / R15 / R16
+            # wmin_beats_lmax ships. Spread is much tighter than the
+            # +0.976% / +1.084% lift (med/spread ≈ 32×–40×).
+            #
+            # # Bit-equivalence
+            # max_abs_diff = 0.0 between (xcds=2, slots=192, cs=96)
+            # baseline and (xcds=4, slots=192, cs=48) candidate across
+            # {42, 137, 2024} on Down-B4-M2048 (33.18M output elements,
+            # 0/33177600 mismatches per seed). num_xcds, num_slots, and
+            # chunk_size are pure persistent-grid scheduling knobs (same
+            # property documented for every prior gm/xcds/slots/cs ship).
+            #
+            # # Why (xcds=4) wins now where R10/R11 found (xcds=2):
+            # R10/R11 reasoned: "with only 2 wave-steps, cross-chiplet L2
+            # invalidation dominates over the parallelism benefit of a
+            # wider distribution". That reasoning held at slots=256: 256
+            # CUs / 2 wave-steps means each CU sees ~2 tile-steps and L2
+            # invalidation between chiplet pairs hurts. At slots=192 with
+            # cs=48 and xcds=4, the geometry is different: block=4*48=192
+            # =slots, so all 192 workgroups fit in ONE clean chunk, with
+            # 48 PIDs per XCD across 4 of 8 XCDs. The chunk is small
+            # enough (48 PIDs) that L2-invalidation cost is amortised by
+            # the per-tile compute density (M_per_g=2048 → 16 K-blocks
+            # per tile-step → ~80% of L2 footprint stays per-XCD), while
+            # the doubled XCD count (4 vs 2) recaptures the parallelism
+            # the slots reduction gave up. Same R1 "joint cell may flip
+            # the optimum" lesson on a different lever pair.
+            #
+            # # Rule scope (a==2880 AND b==2880 AND m_total<=16384)
+            #   - gpt_oss-Down-B4-M2048 wgrad (m_total=8192): MATCH (cell
+            #     #1, 1 of 8 metric shapes). Updated xcds=4 at line ~1882.
+            #   - gpt_oss-Down-B4-M4096 wgrad (m_total=16384): MATCH (cell
+            #     #2, 2 of 8 metric shapes). Updated xcds=4 at line ~1174.
+            #   - gpt_oss-Down-B32-* wgrad (m_total >= 65536): excluded
+            #     (m_total<=16384). Cells #3/#4 keep R1-current (gm=8/4,
+            #     xcds=4) at default slots/cs (R15 audit #1 confirmed
+            #     unique optimum on the saturated grid).
+            #   - gpt_oss-GateUP-* wgrad: b.shape[1]==5760, NOT 2880 →
+            #     excluded; the R1 (xcds=4, slots=224, cs=56) GateUP-B4
+            #     elif preserved (a different per-cell sweet spot, see
+            #     elif at line 2128 below).
+            #   - DSV3 / Qwen3 var-K dB: a.shape[1] in {1536, 2048, 4096,
+            #     7168} → excluded by a==2880.
+            #   - DoD smoke FP8 grouped fwdbwd shapes (R32 audit):
+            #     (4096, 4096, 7168) and (4096, 7168, 2048) — neither
+            #     has both a==2880 and b==2880; excluded.
+            # Rule remains uniquely tied to gpt_oss-Down-B4 wgrad in
+            # the 24-shape MoE suite + DoD universe.
+            #
+            # # Expected metric impact
+            # var-K wgrad is ALL of the wgrad kernel time at metric's
+            # kernel-only timing. +0.976% / +1.084% on 2 of 8 wgrad
+            # shapes → +1.03% × 2/8 = +0.26% wgrad section avg → +0.26 /
+            # 2800 / 3 ≈ +0.31 / 1000 score points (~+1 score point at
+            # the metric's noise floor). Smaller than R1's +1.6 because
+            # the Down-B4 cells started at a higher TFLOPS baseline
+            # (1406 vs 1668) — same percentage gain on a smaller fraction
+            # of the section avg. Robust signal regardless of metric
+            # noise; same wmin_beats_lmax + bit-eq class as R1.
+            vk_chunk_size = 48
+        elif (a.shape[1] == 2880 and b.shape[1] == 5760
+                and m_total <= 16384):
+            # Round-1 (gpt_oss_fp8_local_20260508_074546 run; 2026-05-08):
+            # paired ``(num_slots=224, chunk_size=56)`` lever for the
+            # GateUP-B4 wgrad family — cells #5/#6 of the gpt_oss_20B
+            # Balanced 8-shape suite (per-group output [N_fwd=5760,
+            # K_fwd=2880] → tiles_n=22, tiles_k=11; per-group tile-step
+            # = 242 × B groups; ws/CU = 968/256 = 3.78 for B=4 / =
+            # 1936/256 = 7.56 for the analogous B=8 if it existed).
+            # The current cell uses (gm=1, xcds=4) per the R3 (a==2880
+            # AND b==5760) elif at line 1869-1968 above.
+            #
+            # # Audit gap closed
+            # The 5dffe7f6 audit doc flagged cells #5/#6 as the only
+            # intermediate-density wgrad band where the slots × cs JOINT
+            # cross had not been swept. R15 audit #1 tested slots-solo
+            # ({160, 192, 200, 208, 220, 240}) at default cs=64 — every
+            # reduction lost -2.7..-19.5% because (xcds=4 + cs=64) →
+            # block=256 > slots → swizzle NO-OP, costing the chiplet
+            # locality benefit on top of the parallelism loss. R15 audit
+            # #2 tested cs-solo at default slots=256 (xcds=4 + slots=256
+            # → block=256=slots already-clean partition) — every cs
+            # change lost because the default partition was already
+            # optimal at slots=256. The MISSING combination: at reduced
+            # slots, an aligned cs that re-creates a clean partition
+            # (block = xcds * cs == slots).
+            #
+            # # R1 wide sweep (scripts/_probe_round_1_gateup_b4_wgrad_
+            # slots_cs_joint.py, 3-seed × 1500-iter p20):
+            #
+            #   shape: GateUP-B4-M2048 wgrad var-K (cell #5)
+            #     (slots, cs)  TFLOPS  Δ vs (256, 64)  partition
+            #     (224, 56)    1719.3   +3.00%         clean(block=224)  ★ unique top
+            #     (240, 60)    1686.9   +1.13%         clean(block=240)
+            #     (256, 64)    1667.8    base          clean(block=256)
+            #     (256, 32)    1656.0   -0.71%         clean(block=128)
+            #     (256, 48)    1642.4   -1.55%         part(block=192,lim=192)
+            #     (224,def=64) 1632.9   -2.14%         no-op(block=256>slots)
+            #     (240,def=64) 1594.2   -4.61%         no-op
+            #     (192, 48)    1549.2   -7.66%         clean(block=192)
+            #     (200, 50)    1537.6   -8.47%         clean(block=200)
+            #     (208, 52)    1529.3   -9.06%         clean(block=208)
+            #     (192,def=64) 1497.6  -11.36%         no-op
+            #     (208,def=64) 1470.4  -13.43%         no-op
+            #
+            #   shape: GateUP-B4-M4096 wgrad var-K (cell #6, sibling)
+            #     (224, 56)    2076.0   +2.62%   ★ unique top
+            #     (224,def=64) 2043.5   +1.07%
+            #     (240,def=64) 2032.8   +0.55%
+            #     (256, 64)    2021.6    base
+            #     all other reduced-slot cells -0.31..-9.97%
+            #
+            # # Density-sweet-spot pattern
+            # (slots=224, cs=56) is the unique sweet spot. Tighter slots
+            # (192/200/208) lose because the parallelism loss (-25/-22/
+            # -19%) dominates the chiplet-locality recapture. Looser
+            # slots (240/256) win less because the per-tile epilogue
+            # amortisation gain shrinks. At slots=224 the trade is
+            # exactly balanced: parallelism loss = -12.5% (224/256) →
+            # +14% wave-step amortisation lift × the chiplet-locality
+            # recapture from cs=56 clean partition (56 PIDs/XCD × 4 XCDs
+            # = 224 of 224 workgroups in 1 clean chunk).
+            #
+            # # R1 tight A/B verify (scripts/_probe_round_1_gateup_b4_
+            # wgrad_tight.py, 7-seed × 2500-iter p20, in-process direct
+            # ``grouped_variable_k_crr_dscale(..., num_slots=N,
+            # chunk_size=N)`` call):
+            #
+            #   shape (wgrad var-K)        med Δ    spread (b/c)  pos/n  wmin_beats_lmax
+            #   GateUP-B4-M2048 (cell #5)  +2.776%  0.122%/0.075% 7/7    True (cand_max < base_min)
+            #   GateUP-B4-M4096 (cell #6)  +2.911%  0.104%/0.429% 7/7    True
+            #
+            # Cleanest signal class — every seed of (224, 56) beats
+            # every seed of baseline (256, 64). Mirror of R10 / R11 /
+            # R13 / R15 / R16 wmin_beats_lmax ships.
+            #
+            # # Bit-equivalence
+            # max_abs_diff = 0.0 between (slots=256, cs=64) baseline
+            # and (slots=224, cs=56) candidate across {42, 137, 2024} ×
+            # 2 shapes (M=2048, M=4096); bit_eq=True 6/6, no NaN/Inf.
+            # ``num_slots`` and ``chunk_size`` are pure persistent-grid
+            # scheduling knobs (same property documented for R3 / R10 /
+            # R11 / R13 / R15 / R16 ships above).
+            #
+            # # Rule scope (a==2880 AND b==5760 AND m_total<=16384)
+            #   - gpt_oss-GateUP-B4-M2048 var-K dB (m_total=8192): MATCH
+            #     (cell #5, 1 of 8 metric shapes).
+            #   - gpt_oss-GateUP-B4-M4096 var-K dB (m_total=16384): MATCH
+            #     (cell #6, 2 of 8 metric shapes).
+            #   - gpt_oss-GateUP-B32-* var-K dB (m_total ∈ {65536,
+            #     131072}): excluded by m_total<=16384. Cells #7/#8
+            #     stay on default slots=256, cs=64 (R31 (gm=1, xcds=4))
+            #     which R15 audit #1 confirmed as unique optimum at
+            #     ws/CU=30+ (R2 counter-evidence: -17% at slots=192).
+            #   - gpt_oss-Down-* var-K dB: b.shape[1]==2880, NOT 5760
+            #     → excluded; the R3+R13 (slots=192, cs=96) Down-B4
+            #     rule above is preserved.
+            #   - DSV3 / Qwen3 var-K dB: a.shape[1] in {1536, 2048,
+            #     4096, 7168} → excluded by a==2880.
+            #   - DoD smoke FP8 grouped fwdbwd shapes (R32 audit):
+            #     (4096, 4096, 7168) and (4096, 7168, 2048) — neither
+            #     has both a==2880 and b==5760; excluded.
+            # Rule remains uniquely tied to gpt_oss-GateUP-B4 wgrad in
+            # the 24-shape MoE suite + DoD universe.
+            #
+            # # Expected metric impact
+            # var-K wgrad is ALL of the wgrad kernel time at metric's
+            # kernel-only timing. +2.78%/+2.91% on 2 of 8 wgrad shapes
+            # → ~(47.6 + 60.6)/8 = +13.5 T wgrad section avg lift →
+            # +13.5/2800 / 3 ≈ +0.0016 overall_progress → ~+1.6
+            # score points at the metric's noise floor. Same robustness
+            # /sub-noise pattern as R3/R10/R11/R13/R15 ships.
+            vk_num_slots = 224
+            vk_chunk_size = 56
 
         # CRR dB: kernel computes grad_out.T @ x → [N, K]. The kernel's
         # ``scale_a`` is grad_out's scale; ``scale_b`` is x's scale —

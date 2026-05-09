@@ -199,6 +199,23 @@ class HipKittenConfig:
             evidence; see scripts/_probe_round_14_down_b4_extended.py).
             Only the FP8 grouped RCR / RRR-via-H4-reroute paths consume
             this field; other paths ignore it.
+        fuse_ktail_off: Round-16 (current Primus run, gpt_oss FP8 kernel-
+            only ceiling task; 2026-05-08): per-call FUSED_KTAIL=true
+            bypass on the FP8 grouped RCR dispatcher. R14 introduced the
+            process-static ``TK_GROUPED_RCR_FUSE_OFF`` env hook (HK
+            commit 0905c56f) and FALSIFIED a global flip (-99 score on
+            the 8-shape suite); its per-shape breakdown identified
+            GateUP B=32 dgrad-via-H4 RCR as a positive cluster (+1-2 %,
+            +28-41 T at M=2048/4096), while every fwd shape and 4 of
+            8 dgrad shapes regressed 20-37 %. R16 HK commit converts
+            the env hook to a per-call ``fuse_ktail_off`` pybind kwarg
+            so the dispatcher can pick fuse=OFF for that exact cluster
+            (rule guard: tiles_n==11, k==5760, m_total>=65536) while
+            keeping fuse=ON (R34-dm load-bearing default) for every
+            other call. Default 0 → kernel uses its existing fuse=ON
+            logic (R34-dm codegen-driven default). Only the FP8 grouped
+            RCR / RRR-via-H4-reroute paths consume this field; other
+            paths ignore it.
     """
 
     layout: Layout
@@ -207,6 +224,7 @@ class HipKittenConfig:
     kernel: str | None
     num_slots: int = 0
     chunk_size: int = 0
+    fuse_ktail_off: int = 0
 
 
 # Round-2 (fused-act follow-up to the round-1 quantize cache).
@@ -2504,11 +2522,61 @@ def select_default_config(
                 # (+0.0003). Score is capped at 1000 already, so the gain
                 # is buffer rather than headline — preserves robustness
                 # against future H4-reroute / quantize-cache adjustments.
+                #
+                # Round-16 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-08): per-shape FUSED_KTAIL bypass
+                # gating ON for the m_total>=65536 (B=32) sub-cell only.
+                # R14 (df4555ca + HK 0905c56f) introduced the process-
+                # static ``TK_GROUPED_RCR_FUSE_OFF`` env hook and
+                # FALSIFIED a global flip (-99 score on the 8-shape
+                # suite). Per-shape breakdown from R14 dgrad-via-H4 RRR
+                # column:
+                #   GateUP_B4_M2048    2113 → 2099  (-1  %)
+                #   GateUP_B4_M4096    2545 → 2541  (-0  %)  TIE
+                #   Down_B4_M2048      1569 → 1252  (-20 %)
+                #   Down_B4_M4096      1938 → 1486  (-23 %)
+                #   GateUP_B32_M2048   2496 → 2537  (+2  %)  WIN
+                #   GateUP_B32_M4096   2551 → 2579  (+1  %)  WIN
+                #   Down_B32_M2048     1886 → 1277  (-32 %)
+                #   Down_B32_M4096     1974 → 1316  (-33 %)
+                # Only GateUP B=32 dgrad-via-H4 (both M tiers) gain;
+                # every other shape ties or regresses. R16 HK commit
+                # converts the env hook to a per-call ``fuse_ktail_off``
+                # kwarg on ``grouped_rcr{,_dscale}`` so the dispatcher
+                # can mix fuse=ON (R34-dm load-bearing default) on every
+                # other call with fuse=OFF on this exact cluster.
+                #
+                # Rule scope: ``tiles_m == 16`` (M_per=4096) catches
+                # both GateUP_B4_M4096 (m_total=16384) and GateUP_B32_
+                # M4096 (m_total=131072) at this branch. Per the R14
+                # column above only the B=32 tier benefits (B=4 ties at
+                # -0%, within noise). Gate ``fuse_ktail_off`` ON only
+                # for m_total >= 65536 (excludes B=4); preserves R8
+                # (gm=1, xcds=4) for both. No fwd RCR call reaches
+                # this branch (fwd has tiles_n=22 → outer guard rejects
+                # it); no Down dgrad reaches it (Down has k=2880 →
+                # outer guard rejects it). Bit-equivalent: both
+                # FUSED_KTAIL=true and FUSED_KTAIL=false branches in
+                # ``dispatch_grouped_rcr`` are R34-dm verified at
+                # SNR > 25 dB / max_abs_diff <= 0 across 8 shapes (R14
+                # probe data; the only difference is in-kernel epilog
+                # K-tail accumulation vs standalone mfma32x32_M2N2
+                # K-tail launch — same arithmetic, different scheduler
+                # ordering).
+                #
+                # Expected metric impact: +28-41 T on 2 of 8 dgrad
+                # shapes → dgrad section avg +(28+41)/8 = +8.6 T →
+                # section_progress +8.6/2800 = +0.0031 → score
+                # +0.0031/3 * 1000 = ~+1.0 score. Within ±5 noise
+                # floor; primary value is closing R15's forward-
+                # pointer (the last un-audited template-class lever
+                # on the suite, see commit e481c1c5 commit message).
                 return HipKittenConfig(
                     layout=layout,
                     group_m=1,
                     num_xcds=4,
                     kernel=None,
+                    fuse_ktail_off=0,  # round-16 disabled (HK shipped .so lacks pybind kwarg; re-enable after HK rebuild)
                 )
             if tiles_m == 8 and m_total >= 65536:
                 # gpt_oss-GateUP B=32 M=2048 dA after reroute. The
@@ -2516,11 +2584,20 @@ def select_default_config(
                 # the Round-7 (this run) rule below — see that block
                 # for the (gm=8, xcds=None=8) win discovered after R34
                 # missed the xcds=8 column.
+                #
+                # Round-16: per-shape FUSED_KTAIL bypass gating ON for
+                # this cell. R14 column: GateUP_B32_M2048 dgrad-via-H4
+                # 2496 → 2537 (+2 % / +41 T) on fuse=OFF. Cell catches
+                # uniquely GateUP_B32_M2048 dA (no other suite shape
+                # has tiles_n==11, k==5760, tiles_m==8, m_total>=65536).
+                # Same R34-dm bit-equivalence + R15 forward-pointer
+                # rationale as the tiles_m==16 branch above.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=16,
                     num_xcds=4,
                     kernel=None,
+                    fuse_ktail_off=0,  # round-16 disabled (HK shipped .so lacks pybind kwarg; re-enable after HK rebuild)
                 )
             if tiles_m == 8 and m_total == 8192:
                 # Round-7 (current Primus run, gpt_oss FP8 kernel-only
