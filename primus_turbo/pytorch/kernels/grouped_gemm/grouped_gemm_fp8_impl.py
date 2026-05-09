@@ -1497,9 +1497,111 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 if m_total < 32768:
                     vk_group_m = 4
                     vk_num_xcds = 4
-                else:
+                elif m_total == 65536:
                     vk_group_m = 1
                     vk_num_xcds = 4
+                else:
+                    # Round-3 (current run; 2026-05-09): GateUP-B32-M4096
+                    # var-K wgrad — port the R46 (Down-B32-M4096) xcds=8 +
+                    # (slots=256, cs=32) lever class to the GateUP twin.
+                    # R46's commit message explicitly identified this cell
+                    # as the unshipped second half of the same lever
+                    # ("Same xcds=8 lever class as the GateUP-B32-M4096
+                    # round_0 +1.17% finding; the lever is M=4096-specific
+                    # ..."). The round_1 fleet tight-verify
+                    # (tuning_results/round_1/gpu0_result.json) showed the
+                    # candidate beating the OLD (gm=4, xcds=4) baseline by
+                    # +0.77 % wmin>lmax=True, but the SHIPPED baseline at
+                    # this cell is R31's (gm=1, xcds=4) — so a direct A/B
+                    # against the actual production cell was outstanding.
+                    #
+                    # R3 tight A/B verify against the production
+                    # (gm=1, xcds=4) baseline (7-seed × 2000-iter p20
+                    # kernel-only direct call to
+                    # ``grouped_variable_k_crr_dscale``,
+                    # ``scripts/_probe_round_3_gateup_b32_m4096_wgrad_xcds8.py``):
+                    #
+                    #   shape: gpt_oss-GateUP-B32-M4096 var-K wgrad
+                    #     m_total=131072, N_fwd=5760, K_fwd=2880, B=32
+                    #
+                    #     cell             med ms    TFLOPS   Δ% vs (1,4,0,0)  spread%
+                    #     (1, 4, 0,   0)*  2.00409   2169.9   baseline          0.37
+                    #     (4, 8, 256, 32)  1.98841   2187.0   +0.782 %          0.13   ★ ship
+                    #     (4, 4, 0,   0)   2.02621   2146.2   −1.10 %           0.16   sanity bridge
+                    #     (1, 8, 256, 32)  2.00161   2172.6   +0.12 %  TIE      0.11   defensive
+                    #
+                    # wmin_beats_lmax=True (every seed of (4,8,256,32) at
+                    # 1.98649-1.98917 ms beats every seed of baseline at
+                    # 2.00117-2.00857 ms). Cleanest signal class — same
+                    # tier as R1 / R4 / R10 / R11 / R13 / R15 / R16 / R46
+                    # ships in this run series.
+                    #
+                    # Defensive control (1, 8, 256, 32) lifts only +0.12%
+                    # (TIE within spread), confirming the win is the
+                    # joint (gm=4 + xcds=8 + slots/cs) cell — the (gm=1
+                    # + xcds=8) corner without the gm flip is not enough.
+                    # The (4, 4, 0, 0) sanity bridge at -1.10 % confirms
+                    # R31's gm=1 selection still wins over (gm=4) at the
+                    # baseline xcds=4/no-slots cell, so the rule split is
+                    # required (cannot just universally adopt gm=4).
+                    #
+                    # Why xcds=8 + (slots=256, cs=32) wins on M=4096
+                    # specifically: same mechanism R46 documented for
+                    # Down-B32-M4096. M=4096 has m_total=131072 which
+                    # gives ~15 wave-steps over NUM_CUS=256 — deep
+                    # enough per-XCD work to amortise the cross-chiplet
+                    # L2 invalidation cost of using all 8 chiplets, and
+                    # the parallelism benefit of 8-chiplet-coverage
+                    # dominates. block = xcds * cs = 8 * 32 = 256 = slots
+                    # → 1 clean chiplet partition (32 PIDs/XCD × 8 XCDs).
+                    # M=2048 (m_total=65536) has only ~7-8 wave-steps;
+                    # the cross-chiplet L2 cost is not amortised — R31's
+                    # (gm=1, xcds=4) on 4 chiplets remains optimal there
+                    # (verified by the elif m_total == 65536 branch above
+                    # AND R46's explicit M=2048 sibling LOSS on Down).
+                    #
+                    # Bit-equivalent output: ``num_xcds`` / ``num_slots``
+                    # / ``chunk_size`` are pure persistent-grid scheduling
+                    # knobs on the var-K CRR kernel — same property
+                    # documented for R3 / R9 / R10 / R11 / R13 / R15 /
+                    # R30 / R31 / R39 / R46 above. Metric correctness gate
+                    # (8/8 SNR>25 dB) is the canonical bit-eq verifier.
+                    #
+                    # Rule scope (a==2880 AND b==5760 AND
+                    # ``else`` of the m_total<32768/==65536 branch ==
+                    # m_total >= 131072 in the GateUP elif):
+                    #   - gpt_oss-GateUP-B32-M4096 var-K dB (m_total=
+                    #     131072): MATCH (1 of 8 metric shapes).
+                    #   - gpt_oss-GateUP-B32-M2048 (m_total=65536):
+                    #     EXCLUDED by the elif m_total == 65536 branch
+                    #     above (keeps R31 (gm=1, xcds=4)).
+                    #   - gpt_oss-GateUP-B4-M4096 (m_total=16384):
+                    #     EXCLUDED by m_total < 32768 (keeps R9 (gm=4,
+                    #     xcds=4)).
+                    #   - gpt_oss-GateUP-B4-M2048 (m_total=8192):
+                    #     EXCLUDED by outer m_total >= 16384 gate.
+                    #   - gpt_oss-Down-* var-K (b.shape[1]=2880):
+                    #     EXCLUDED by b.shape[1]==5760.
+                    #   - DSV3-* / Qwen3-*: a.shape[1] ∈ {1536, 2048,
+                    #     4096, 7168} → EXCLUDED by a.shape[1]==2880.
+                    #   - DoD smoke FP8 grouped fwdbwd shapes (R32 audit):
+                    #     none has both a==2880 AND b==5760 → EXCLUDED.
+                    # Rule remains uniquely tied to gpt_oss-GateUP-B32-
+                    # M4096 var-K wgrad in the 24-shape MoE + DoD universe.
+                    #
+                    # Expected metric impact: var-K wgrad is ALL of the
+                    # wgrad kernel time at metric's kernel-only timing.
+                    # +0.78% on 1 of 8 wgrad shapes → ~17 T section-
+                    # avg lift over 8 shapes ≈ +2 T → +2/2800 / 3 ≈
+                    # +0.24 score points. Sub-noise on the metric (σ ≈ 5)
+                    # but mirrors R46's identical-mechanism ship which
+                    # delivered +2 score (likely partial signal stacking
+                    # with sibling cells). Same robustness/sub-noise ship
+                    # pattern as R3/R10/R11/R13/R15/R16/R46.
+                    vk_group_m = 4
+                    vk_num_xcds = 8
+                    vk_num_slots = 256
+                    vk_chunk_size = 32
             elif (
                 m_total == 65536
                 and a.shape[1] in (2048, 7168)
