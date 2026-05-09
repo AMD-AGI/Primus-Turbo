@@ -43,6 +43,9 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _select_params_origami,
     _set_knobs_gfx950,
 )
+_grouped_blockwise_warmed: set = set()
+_grouped_blockwise_vk_warmed: set = set()
+
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
@@ -1196,21 +1199,36 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-# v1 only used for K % 128 != 0 (masked-tail path); wrapper routes to v2 otherwise.
-# BK=128 (matches scale block) and num_stages=1 (BM=256 LDS budget) are pinned.
-def _get_grouped_blockwise_autotune_configs_unaligned():
+# 8-config curated set covering small/medium/large M and N-major/M-major reductions.
+# All BK=128 (winners). Trimmed from a 32-config sweep that always picked one of these.
+def _get_grouped_blockwise_autotune_configs():
     return [
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32},
-            num_warps=8, num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32},
-            num_warps=8, num_stages=1,
-        ),
+        # small/medium fallback
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        # large-M, M-major
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        # large-N, N-major
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 2, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
     ]
+
+
+# Used for K % 128 != 0 (masked-tail path); shares the same config sweep as the aligned
+# kernel so unaligned shapes (e.g. GPT-OSS K=2880) are not artificially restricted.
+def _get_grouped_blockwise_autotune_configs_unaligned():
+    return _get_grouped_blockwise_autotune_configs()
 
 
 @triton.autotune(configs=_get_grouped_blockwise_autotune_configs_unaligned(), key=["G", "N", "K"])
@@ -1384,35 +1402,6 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned(
 # × inner (compute block, BLOCK_SIZE_K). Requires K % SCALE_BLOCK_K == 0.
 # BLOCK_N pinned to 128 (BN=64/256 have an MFMA layout bug on MI300X FP8 e4m3fnuz).
 # BLOCK_M=256 must use BLOCK_K=128 (same bug otherwise).
-def _get_grouped_blockwise_autotune_configs():
-    cfgs = []
-    # Small M: BM=64
-    for GM in (2, 8):
-        cfgs.append(triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
-             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
-            num_warps=4, num_stages=2))
-    # Standard: BM=128 BK=64 (original v2 sweet-spot)
-    for GM in (2, 8):
-        cfgs.append(triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
-             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
-            num_warps=4, num_stages=2))
-    # BM=128 BK=128 (collapses to v1-style for shapes that prefer larger BK)
-    for GM in (2, 8):
-        cfgs.append(triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
-            num_warps=4, num_stages=2))
-    # Large M: BM=256 BK=128 (wins on large K shapes — DSV3 K=7168 etc.)
-    for GM in (2, 8):
-        cfgs.append(triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
-            num_warps=8, num_stages=1))
-    return cfgs
-
-
 @triton.autotune(configs=_get_grouped_blockwise_autotune_configs(), key=["G", "N", "K"])
 @triton.jit()
 def _grouped_blockwise_fp8_persistent_gemm_kernel(
@@ -1546,17 +1535,24 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
 #   C[g] = LHS[g]^T @ RHS[g] with 1D+1D blockwise scales.
 # Autotune is keyed on shape-stable (G, OUT_M, OUT_N) only — per-group M varies.
 def _bwd_autotune_configs():
+    # 8-config curated set for variable-K wgrad. BK=128 always wins; covers M-major and N-major.
     return [
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32},
-            num_warps=8, num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-             "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32},
-            num_warps=8, num_stages=2,
-        ),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
     ]
 
 
@@ -1764,8 +1760,51 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     A_scales_t = a_scales.T.contiguous()
     num_sms = _get_num_cus()
 
-    if K % 128 == 0:
-        # v2 num_stages=2 needs async_copy off (else LDS doubles).
+    aligned = K % 128 == 0
+    # First call for this (G, N, K, aligned) shape: prime autotune with a balanced
+    # group_offs distribution. Triton's autotune key is (G, N, K) only — group_lens
+    # is not part of the key, so whichever distribution happens to drive the first
+    # call gets baked into the cached config. In MoE training, per-step routing is
+    # uneven and varies, so without this warm-up we'd cache a config tuned to one
+    # accidental imbalance. Run a synthetic balanced-offs trial into a scratch out
+    # so the chosen config generalizes across the lifetime of the process.
+    if (G, N, K, aligned) not in _grouped_blockwise_warmed:
+        _grouped_blockwise_warmed.add((G, N, K, aligned))
+        per = M_total // G
+        bal_offs = torch.arange(G + 1, device=group_offs.device, dtype=group_offs.dtype) * per
+        bal_offs[-1] = M_total
+        out_warm = torch.empty_like(out)
+        if aligned:
+            if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+                triton.knobs.amd.use_async_copy = False
+            _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
+                a, b, out_warm, A_scales_t, b_scales, bal_offs,
+                G, N, K,
+                a.stride(0), stride_bg, stride_bn,
+                out_warm.stride(0), out_warm.stride(1),
+                A_scales_t.stride(0), A_scales_t.stride(1),
+                b_scales.stride(0), stride_bs_n, stride_bs_k,
+                stride_ak=stride_ak, stride_bk=stride_bk,
+                SCALE_BLOCK_K=128,
+                NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+                CACHE_MODIFIER=".ca",
+                waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+            )
+        else:
+            _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
+                a, b, out_warm, A_scales_t, b_scales, bal_offs,
+                G, N, K,
+                a.stride(0), stride_bg, stride_bn,
+                out_warm.stride(0), out_warm.stride(1),
+                A_scales_t.stride(0), A_scales_t.stride(1),
+                b_scales.stride(0), stride_bs_n, stride_bs_k,
+                stride_ak=stride_ak, stride_bk=stride_bk,
+                NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+                EVEN_K=False, CACHE_MODIFIER=".ca",
+                waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
+            )
+
+    if aligned:
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
         _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
@@ -1865,6 +1904,34 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     # Output-row stride: for K-contig, dim 0 = M_padded_max. For strided, dim 1 = 1.
     stride_lhs_n = lhs.stride(0) if a_k_contig else lhs.stride(1)
     stride_rhs_n = rhs.stride(0) if b_k_contig else rhs.stride(1)
+
+    # Same balanced-warmup logic as the fwd kernel: autotune key is
+    # (G, OUT_M, OUT_N, A_K_CONTIGUOUS, B_K_CONTIGUOUS) — group_offs is not part
+    # of the key, so prime the cache once with a balanced distribution so the
+    # chosen config generalizes across MoE per-step routing variation.
+    warm_key = (G, OUT_M, OUT_N, a_k_contig, b_k_contig)
+    if warm_key not in _grouped_blockwise_vk_warmed:
+        _grouped_blockwise_vk_warmed.add(warm_key)
+        # Padded segment lens for variable-K need to respect BLOCK_K alignment;
+        # use M_padded // G rounded down to BLOCK_K (=128) granularity.
+        M_padded = lhs.shape[1] if a_k_contig else lhs.shape[0]
+        per = max((M_padded // G) // 128 * 128, 128)
+        bal_offs = torch.arange(G + 1, device=group_offs.device, dtype=group_offs.dtype) * per
+        bal_offs[-1] = M_padded
+        out_warm = torch.empty_like(out)
+        _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
+            lhs, rhs, out_warm, lhs_scales, rhs_scales, bal_offs,
+            G, OUT_M, OUT_N,
+            stride_lhs_m, stride_rhs_m,
+            out_warm.stride(0), out_warm.stride(1), out_warm.stride(2),
+            lhs_scales.stride(0), lhs_scales.stride(1),
+            rhs_scales.stride(0), rhs_scales.stride(1),
+            stride_lhs_n=stride_lhs_n, stride_rhs_n=stride_rhs_n,
+            A_K_CONTIGUOUS=a_k_contig, B_K_CONTIGUOUS=b_k_contig,
+            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+            CACHE_MODIFIER=".ca",
+            waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2,
+        )
 
     _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
         lhs, rhs, out, lhs_scales, rhs_scales, group_offs,

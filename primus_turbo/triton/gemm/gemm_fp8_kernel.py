@@ -22,7 +22,7 @@ Contains:
     - gemm_fp8_rowwise_triton_kernel: Public API
 
   Blockwise scaling:
-    - _blockwise_fp8_autotune_kernel: Core autotuned persistent kernel
+    - _blockwise_fp8_autotune_kernel_unaligned: Core autotuned persistent kernel
     - gemm_fp8_blockwise_triton_kernel: Unified public API (NT/NN/TN)
 
 Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
@@ -723,29 +723,17 @@ def gemm_fp8_rowwise_triton_kernel(
 # Fixed: BLOCK_N=128, BLOCK_K=128, wpe=2, mfma=16
 # Variable: BLOCK_M, kpack, GROUP_M, CHUNK, num_stages
 # ═══════════════════════════════════════════════════════════════════════════════
-def _get_blockwise_autotune_configs():
+def _get_blockwise_autotune_configs_unaligned():
+    # 8-config curated set. NS pinned per BM (LDS budget): NS=2 for BM=128, NS=1 for BM=256.
     configs = []
-    for block_m, kp, gm, chunk, ns in itertools.product(
-        [128, 256],
-        [1, 2],
-        [4, 8],
-        [32, 64],
-        [1, 2],
-    ):
+    for block_m, gm, chunk in itertools.product([128, 256], [4, 8], [32, 64]):
         nw = 4 if block_m == 128 else 8
+        ns = 2 if block_m == 128 else 1
         configs.append(
             triton.Config(
-                {
-                    "BLOCK_M": block_m,
-                    "BLOCK_N": 128,
-                    "BLOCK_K": 128,
-                    "GROUP_M": gm,
-                    "NUM_XCDS": 8,
-                    "CHUNK": chunk,
-                },
-                num_warps=nw,
-                num_stages=ns,
-                pre_hook=None,
+                {"BLOCK_M": block_m, "BLOCK_N": 128, "BLOCK_K": 128,
+                 "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": chunk},
+                num_warps=nw, num_stages=ns,
             )
         )
     return configs
@@ -755,11 +743,11 @@ def _get_blockwise_autotune_configs():
 # Autotuned block-wise FP8 GEMM kernel
 # ═══════════════════════════════════════════════════════════════════════════════
 @triton.autotune(
-    configs=_get_blockwise_autotune_configs(),
+    configs=_get_blockwise_autotune_configs_unaligned(),
     key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
 )
 @triton.jit
-def _blockwise_fp8_autotune_kernel(
+def _blockwise_fp8_autotune_kernel_unaligned(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -889,58 +877,40 @@ def _blockwise_fp8_autotune_kernel(
         tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Block-wise v2: BLOCK_K=64 + shared-scale (SCALE_BLOCK_K=128).
-# Outer K-loop over scale blocks, inner static SUB_K_ITERS=2 dots share one
-# (a_s, b_s) load. Halving BK lets num_stages=2 fit MI300X 64KB LDS budget,
-# enabling 2-stage pipelining of the FP8 loads. Requires K % 128 == 0.
-#
-# Numerical safety (verified by sweep, FP8 e4m3fnuz on MI300X MFMA):
-#   BLOCK_N must equal 128. BN=64 → ~33% rel err. BN=256 → ~10% rel err.
-#   Both are deterministic Triton/MFMA layout bugs. ALL configs in this grid
-#   pin BLOCK_N=128.
-#   BLOCK_M ∈ {64, 128, 256}. BLOCK_M=256 only with BLOCK_K=128 (BM=256 BK=64
-#   triggers the same layout bug).
-#
-# Grid covers 4 regimes: small-M / std / large-M / large-K. autotune key
-# already includes (M, N, K, *_K_CONTIGUOUS, SCALE_2D_B) so it picks per shape.
-# ═══════════════════════════════════════════════════════════════════════════════
-def _get_blockwise_v2_autotune_configs():
+# Blockwise v2: BLOCK_K=64 + shared scale (SCALE_BLOCK_K=128). Requires K % 128 == 0.
+# BLOCK_N is pinned to 128 — BN=64/256 trigger MFMA layout bugs on MI300X FP8 e4m3fnuz.
+# BLOCK_M=256 must use BLOCK_K=128 (BM=256/BK=64 hits the same layout bug).
+def _get_blockwise_autotune_configs():
     cfgs = []
-    # Small M (BM=64): good for small batch / mbs1 / few rows of M_total.
     for gm in (4, 8):
         cfgs.append(triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
              "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
             num_warps=4, num_stages=2))
-    # Standard BM=128 with BK=64 (the original v2 sweet-spot).
     for gm in (4, 8):
         cfgs.append(triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,
              "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
             num_warps=4, num_stages=2))
-    # BM=128 BK=128 (no shared-scale benefit, but useful when v1-shape wins).
     for gm in (4, 8):
         cfgs.append(triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128,
              "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
             num_warps=4, num_stages=2))
-    # Large M (BM=256, BK=128 only — BK=64 has the layout bug here).
-    # Wins on large K shapes (K>=8K) where v1 was previously beating v2.
     for gm in (4, 8):
         cfgs.append(triton.Config(
             {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128,
              "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
             num_warps=8, num_stages=1))
-    return cfgs  # 8 cfgs total
+    return cfgs
 
 
 @triton.autotune(
-    configs=_get_blockwise_v2_autotune_configs(),
+    configs=_get_blockwise_autotune_configs(),
     key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
 )
 @triton.jit
-def _blockwise_fp8_autotune_kernel_v2(
+def _blockwise_fp8_autotune_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -1028,7 +998,15 @@ def _blockwise_fp8_autotune_kernel_v2(
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         # Outer loop iterates scale blocks; inner SUB_K_ITERS dots share a_s/b_s.
+        # Scale loads issued BEFORE the inner sub-loop so the compiler can hide
+        # their latency behind the FP8 MFMA dots (independent dataflow).
         for ki in range(NUM_K_BLOCKS):
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+
             partial = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for sub in tl.static_range(SUB_K_ITERS):
                 if A_K_CONTIGUOUS:
@@ -1039,7 +1017,7 @@ def _blockwise_fp8_autotune_kernel_v2(
                 if B_K_CONTIGUOUS:
                     b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), cache_modifier=".ca")
                 else:
-                    b = tl.load(tl.multiple_of(b_ptrs, (1, 16)), cache_modifier=".ca")
+                    b = tl.load(tl.multiple_of(b_ptrs, (1, BLOCK_N)), cache_modifier=".ca")
 
                 partial += tl.dot(a, b, input_precision="ieee")
 
@@ -1053,13 +1031,9 @@ def _blockwise_fp8_autotune_kernel_v2(
                 else:
                     b_ptrs += BLOCK_K * stride_bk_val
 
-            a_s = tl.load(as_ptrs + ki * stride_as_k)
-
             if SCALE_2D_B:
-                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
                 acc += partial * (a_s * b_s)[:, None]
             else:
-                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
                 acc += partial * a_s[:, None] * b_s[None, :]
 
         offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1156,24 +1130,22 @@ def _blockwise_nt(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    # A scales: kernel needs [K//128, M] (M-contig). If caller already provided
-    # the pre-shuffled layout (from quant_fp8_blockwise_pshuffle_impl), shape
-    # will be (K//128, M) — skip the runtime .T.contiguous() copy.
+    # Skip runtime .T.contiguous() if caller passed the pre-shuffled layout.
     if a_scale_inv.shape == (num_k, M):
         A_scales_t = a_scale_inv
     else:
         A_scales_t = a_scale_inv.T.contiguous()
-    B_t = b.T  # view [K, N]
+    B_t = b.T
 
     num_m = (M + 127) // 128
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
     if K % 128 == 0:
-        # v2: BK=64 + shared-scale + num_stages=2 (async_copy doubles LDS → off)
+        # v2 num_stages=2 needs async_copy off (else LDS doubles).
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
-        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
             a, B_t, out, A_scales_t, b_scale_inv,
             M, N, K,
             a.stride(0), a.stride(1),
@@ -1187,7 +1159,7 @@ def _blockwise_nt(
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
         )
     else:
-        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel_unaligned[(NUM_SMS,)](
             a, B_t, out, A_scales_t, b_scale_inv,
             M, N, K,
             a.stride(0), a.stride(1),
@@ -1226,10 +1198,13 @@ def _blockwise_nn(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
-    # B_scales from quantization: [dim0_blocks, dim1_blocks] for weight stored as [N_fwd, K_fwd].
-    # Kernel expects [N_output_blocks, K_inner_blocks] indexing → transpose.
-    b_scale_inv_t = b_scale_inv.T.contiguous()
+    # Skip runtime .T.contiguous() if caller passed the pre-shuffled layout.
+    if a_scale_inv.shape == (num_k, M):
+        A_scales_t = a_scale_inv
+    else:
+        A_scales_t = a_scale_inv.T.contiguous()
+    # Kernel reads scales by stride; pass the .T view to skip the copy.
+    b_scale_inv_t = b_scale_inv.T
 
     num_m = (M + 127) // 128
     num_n = (N + 127) // 128
@@ -1238,7 +1213,7 @@ def _blockwise_nn(
     if K % 128 == 0:
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
-        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
             a, b, out, A_scales_t, b_scale_inv_t,
             M, N, K,
             a.stride(0), a.stride(1),
@@ -1252,7 +1227,7 @@ def _blockwise_nn(
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
         )
     else:
-        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel_unaligned[(NUM_SMS,)](
             a, b, out, A_scales_t, b_scale_inv_t,
             M, N, K,
             a.stride(0), a.stride(1),
@@ -1305,7 +1280,7 @@ def _blockwise_tn(
     if K % 128 == 0:
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
-        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
             A_view, b, out, a_scale_inv, b_scale_inv,
             M, N, K,
             A_view.stride(0), A_view.stride(1),
@@ -1319,7 +1294,7 @@ def _blockwise_tn(
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
         )
     else:
-        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel_unaligned[(NUM_SMS,)](
             A_view, b, out, a_scale_inv, b_scale_inv,
             M, N, K,
             A_view.stride(0), A_view.stride(1),
@@ -1334,21 +1309,17 @@ def _blockwise_tn(
 
 
 def gemm_fp8_blockwise_wgrad_kc_triton_kernel(
-    a_T: torch.Tensor,           # [K_out, M_red] FP8 — col-wise+xpose quant of A [M_red, K_out]
-    a_scale_inv: torch.Tensor,   # [ceil(M_red/128), K_out] fp32
-    grad_T: torch.Tensor,        # [N_out, M_red] FP8 — col-wise+xpose quant of grad [M_red, N_out]
-    grad_scale_inv: torch.Tensor,# [ceil(M_red/128), N_out] fp32
+    a_T: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    grad_T: torch.Tensor,
+    grad_scale_inv: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
 ) -> torch.Tensor:
-    """K-contiguous wgrad: C[K_out, N_out] = A.T[K_out, M_red] @ grad[M_red, N_out].
+    """K-contig wgrad: C[K_out, N_out] = A.T @ grad.
 
-    Inputs are pre-transposed (M_red contig) via quant_fp8_blockwise_with_xpose_impl
-    so the kernel can read them with K_CONTIGUOUS=True hints — replaces the strided
-    A.T view in _blockwise_tn. Probe shows +30-40% wgrad TFLOPS.
-
-    For trans_c=True the output is [N_out, K_out] (matches the existing _blockwise_tn
-    trans_c contract that autograd uses to avoid an extra transpose).
+    Inputs come from quant_fp8_blockwise_with_xpose_impl with M_red contiguous,
+    so the kernel uses K_CONTIGUOUS hints (vs strided A.T view in _blockwise_tn).
     """
     if _is_gfx950():
         _set_knobs_gfx950()
@@ -1374,7 +1345,7 @@ def gemm_fp8_blockwise_wgrad_kc_triton_kernel(
     if M_red % 128 == 0:
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
-        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
             a_T, grad_T, out, a_scale_inv, grad_scale_inv,
             K_out, N_out, M_red,
             a_T.stride(0), a_T.stride(1),
@@ -1388,7 +1359,7 @@ def gemm_fp8_blockwise_wgrad_kc_triton_kernel(
             waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
         )
     else:
-        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+        _blockwise_fp8_autotune_kernel_unaligned[(NUM_SMS,)](
             a_T, grad_T, out, a_scale_inv, grad_scale_inv,
             K_out, N_out, M_red,
             a_T.stride(0), a_T.stride(1),
