@@ -103,6 +103,102 @@ class _FP8TransposeCache:
 
 _FP8_H4_TRANSPOSE_CACHE = _FP8TransposeCache(max_entries=2)
 
+
+# ---------------------------------------------------------------------------
+# Round-17 (gpt_oss FP8 kernel-only ceiling, current Primus run; 2026-05-09).
+#
+# Caller-allocated K-split workspace cache (Stream-K variant-2 / R11 plan).
+#
+# R14 falsified the per-call hipMallocAsync path inside HK's
+# dispatch_grouped_rcr at 2.9-9.1 ms / call (vs the R11 cost-decomp
+# assumption of ~3 µs). Per the R14 forward-pointer, the workspace must
+# be allocated once per cell on the caller side and passed in via the
+# new HK pybind kwarg ``sk_workspace_ptr`` (R17 HK commit). This cache
+# amortizes the alloc cost to ~0 after the first dispatch per cell.
+#
+# Cache key: ``(buf_bytes, device_index)`` — the buffer is dtype-agnostic
+# (uint8 byte slab; HK reads it as fp32 partials via reinterpret). Same
+# key on subsequent dispatches HITs and reuses the existing slab.
+#
+# Storage: ``torch.empty(buf_bytes, dtype=torch.uint8, device=cuda:i)``.
+# The PyTorch caching allocator owns the underlying VRAM; we just hold
+# a strong ref so the slab survives across iters. Eviction: bounded LRU
+# at ``max_entries=8`` (covers the 8 gpt_oss shapes in the metric, two
+# devices, with headroom). For the gpt_oss B=4 cells T_max yields
+# 44-88 MiB per slab; max steady-state VRAM ≤ 8 * 88 MiB = 704 MiB.
+#
+# Production NEUTRAL gate: this cache is touched ONLY when the dispatcher
+# returns ``cfg.sk_split_n > 0``. R17 ships no rule that sets that field;
+# the field stays at its dataclass default 0 on every shape until R18+
+# lands the kernel-side K-split branch and a per-cell rule turns it on.
+# So R17's metric impact is the empty path: WorkspaceCache exists but
+# is never consulted, no extra VRAM allocated, no kwarg passed to HK.
+# ---------------------------------------------------------------------------
+
+
+class _FP8WorkspaceCache:
+    """Once-per-cell device-buffer cache for HK K-split partial accumulators.
+
+    ``get_or_alloc(buf_bytes, device)`` returns a 1-D ``uint8`` cuda tensor
+    of length >= ``buf_bytes`` whose ``data_ptr()`` is passed to HK via
+    the ``sk_workspace_ptr`` pybind kwarg (R17). Cache key:
+    ``(buf_bytes, device.index)``. Bounded LRU (``max_entries`` slabs);
+    eviction drops the strong ref so PyTorch's caching allocator can
+    reclaim the slab.
+    """
+
+    def __init__(self, max_entries: int = 8):
+        self._slabs: dict[tuple[int, int], torch.Tensor] = {}
+        self._lru: list[tuple[int, int]] = []
+        self._max = max_entries
+
+    def get_or_alloc(self, buf_bytes: int, device: torch.device) -> torch.Tensor:
+        key = (int(buf_bytes), int(device.index) if device.index is not None else 0)
+        slab = self._slabs.get(key)
+        if slab is not None:
+            # Bump LRU.
+            try:
+                self._lru.remove(key)
+            except ValueError:
+                pass
+            self._lru.append(key)
+            return slab
+        slab = torch.empty(buf_bytes, dtype=torch.uint8, device=device)
+        # R17 NEUTRAL infra: the kernel does not yet read sk_partial_buf
+        # (R18 lands the kernel branch). Until then the buffer's contents
+        # never affect math; we still zero it once at allocation to mirror
+        # the HK R13a hipMemsetAsync(0) contract for when R18+ does start
+        # reading partial accumulators.
+        slab.zero_()
+        self._slabs[key] = slab
+        self._lru.append(key)
+        while len(self._lru) > self._max:
+            evicted = self._lru.pop(0)
+            self._slabs.pop(evicted, None)
+        return slab
+
+
+_FP8_SK_WORKSPACE_CACHE = _FP8WorkspaceCache(max_entries=8)
+
+
+def _fp8_sk_workspace_bytes(m_total: int, n: int, sk_block: int = 256) -> int:
+    """Mirror of HK's per-call buf size formula at
+    ``HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp:7884-7886``:
+    ``T_max = ceil_div(M_total, BLOCK_SIZE) * bpc`` then
+    ``buf_bytes = T_max * BLOCK_SIZE * BLOCK_SIZE * sizeof(float)``.
+
+    BLOCK_SIZE is fixed at 256 for the FP8 grouped RCR kernel (matches
+    the R12-R14 scaffold + R11 cost-decomp); ``bpc = ceil_div(N, BLOCK_SIZE)``.
+    Returning a strict upper bound is OK — over-allocation by at most
+    (num_groups - 1) M-tiles per cell (~0.1-1 % over-alloc per the R13a
+    note). Used by the R17 WorkspaceCache to size the slab.
+    """
+    block = sk_block
+    t_m = (m_total + block - 1) // block
+    t_n = (n + block - 1) // block
+    t_max = t_m * t_n
+    return t_max * block * block * 4  # sizeof(float) = 4
+
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
     (float8_e4m3, float8_e4m3, torch.bfloat16),
@@ -638,6 +734,24 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # binding consumes this kwarg; the RRR (non-rerouted) and
         # var-K paths leave it un-passed (default 0 in the C++ wrapper).
         fuse_off_arg = cfg.fuse_ktail_off
+        # Round-17 (gpt_oss FP8 kernel-only ceiling, current Primus run;
+        # 2026-05-09): caller-allocated K-split workspace plumbing. R14
+        # falsified the per-call hipMallocAsync inside HK at 2.9-9.1 ms
+        # / call. R17 caches the workspace once per (M_total, N, device)
+        # in ``_FP8_SK_WORKSPACE_CACHE`` and passes its data_ptr through
+        # the new HK ``sk_workspace_ptr`` kwarg. Gated strictly on
+        # ``cfg.sk_split_n > 0``: production rules all default to 0 →
+        # branch never entered → no extra VRAM, no kwarg passed, the
+        # HK call is byte-for-byte identical to pre-R17. Only the FP8
+        # grouped RCR binding consumes the kwarg; RRR/var-K bindings
+        # would TypeError on it, so the kwarg is conditional on
+        # ``trans_b`` (RCR-only call site).
+        sk_split_arg = cfg.sk_split_n
+        sk_workspace_ptr_arg = 0
+        if trans_b and sk_split_arg > 0:
+            buf_bytes = _fp8_sk_workspace_bytes(int(m_total), int(n))
+            slab = _FP8_SK_WORKSPACE_CACHE.get_or_alloc(buf_bytes, a.device)
+            sk_workspace_ptr_arg = int(slab.data_ptr())
         if use_dscale:
             grouped_dscale_kwargs = dict(
                 m_per_group=avg_m, num_xcds=xcds_arg, num_slots=slots_arg,
@@ -650,6 +764,13 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             # the kwarg.
             if trans_b and fuse_off_arg:
                 grouped_dscale_kwargs["fuse_ktail_off"] = fuse_off_arg
+            # R17: K-split kwargs are RCR-only and gated on sk_split_n>0.
+            # Default branch (sk_split_n==0) skips both kwargs, which keeps
+            # production calls bit-identical to pre-R17 (HK pybind defaults
+            # cover both kwargs back at 0 / nullptr).
+            if trans_b and sk_split_arg > 0:
+                grouped_dscale_kwargs["sk_split_n"] = sk_split_arg
+                grouped_dscale_kwargs["sk_workspace_ptr"] = sk_workspace_ptr_arg
             grouped_dscale_fn(
                 a_in, b_in, out, a_scales, b_scales, group_offs, cfg.group_m,
                 **grouped_dscale_kwargs,

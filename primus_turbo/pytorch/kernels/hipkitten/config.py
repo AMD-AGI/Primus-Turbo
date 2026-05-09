@@ -225,6 +225,18 @@ class HipKittenConfig:
     num_slots: int = 0
     chunk_size: int = 0
     fuse_ktail_off: int = 0
+    # Round-17 (gpt_oss FP8 kernel-only ceiling, current Primus run; 2026-05-09):
+    # K-split (Stream-K variant-2) request count for the FP8 grouped RCR
+    # dispatcher. R12 added the HK struct field; R13a wired per-call
+    # hipMallocAsync; R14 falsified that primitive at 2.9-9.1 ms/call; R17
+    # ships the caller-allocated workspace path that amortizes alloc cost
+    # via the WorkspaceCache singleton in grouped_gemm_fp8_impl.py. Default
+    # 0 → kernel control-flow K-split branch never entered → bit-identical
+    # production. The kernel branch itself lands in R18; until then,
+    # setting >0 only exercises the alloc/workspace plumbing (no math
+    # change, no SNR risk, but no perf lift either). Only the FP8 grouped
+    # RCR path consumes this field.
+    sk_split_n: int = 0
 
 
 # Round-2 (fused-act follow-up to the round-1 quantize cache).
