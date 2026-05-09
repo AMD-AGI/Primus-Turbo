@@ -76,6 +76,11 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        # CK BLOCKWISE requires N,K aligned to block size; Triton masks the tail.
+        if granularity == ScalingGranularity.BLOCKWISE:
+            k = a.shape[1]
+            n = b.shape[1] if trans_b else b.shape[2]
+            supported &= (k % 128 == 0) and (n % 128 == 0)
         return supported
 
     @staticmethod
@@ -138,6 +143,11 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
+        # CK variable-K BLOCKWISE requires OUT_M,OUT_N aligned; Triton masks the tail.
+        if granularity == ScalingGranularity.BLOCKWISE:
+            out_m = a.shape[1]
+            out_n = b.shape[1]
+            supported &= (out_m % 128 == 0) and (out_n % 128 == 0)
         return supported
 
     @staticmethod
