@@ -890,6 +890,186 @@ def _blockwise_fp8_autotune_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Block-wise v2: BLOCK_K=64 + shared-scale (SCALE_BLOCK_K=128).
+# Outer K-loop over scale blocks, inner static SUB_K_ITERS=2 dots share one
+# (a_s, b_s) load. Halving BK lets num_stages=2 fit MI300X 64KB LDS budget,
+# enabling 2-stage pipelining of the FP8 loads. Requires K % 128 == 0.
+#
+# Numerical safety (verified by sweep, FP8 e4m3fnuz on MI300X MFMA):
+#   BLOCK_N must equal 128. BN=64 → ~33% rel err. BN=256 → ~10% rel err.
+#   Both are deterministic Triton/MFMA layout bugs. ALL configs in this grid
+#   pin BLOCK_N=128.
+#   BLOCK_M ∈ {64, 128, 256}. BLOCK_M=256 only with BLOCK_K=128 (BM=256 BK=64
+#   triggers the same layout bug).
+#
+# Grid covers 4 regimes: small-M / std / large-M / large-K. autotune key
+# already includes (M, N, K, *_K_CONTIGUOUS, SCALE_2D_B) so it picks per shape.
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_blockwise_v2_autotune_configs():
+    cfgs = []
+    # Small M (BM=64): good for small batch / mbs1 / few rows of M_total.
+    for gm in (4, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+             "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
+            num_warps=4, num_stages=2))
+    # Standard BM=128 with BK=64 (the original v2 sweet-spot).
+    for gm in (4, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,
+             "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
+            num_warps=4, num_stages=2))
+    # BM=128 BK=128 (no shared-scale benefit, but useful when v1-shape wins).
+    for gm in (4, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128,
+             "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
+            num_warps=4, num_stages=2))
+    # Large M (BM=256, BK=128 only — BK=64 has the layout bug here).
+    # Wins on large K shapes (K>=8K) where v1 was previously beating v2.
+    for gm in (4, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128,
+             "GROUP_M": gm, "NUM_XCDS": 8, "CHUNK": 64},
+            num_warps=8, num_stages=1))
+    return cfgs  # 8 cfgs total
+
+
+@triton.autotune(
+    configs=_get_blockwise_v2_autotune_configs(),
+    key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
+)
+@triton.jit
+def _blockwise_fp8_autotune_kernel_v2(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    A_scales_ptr,
+    B_scales_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak_val,
+    stride_bk_val,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_as_k,
+    stride_as_m,
+    stride_bs_0,
+    stride_bs_1,
+    NUM_SMS,
+    NUM_K_BLOCKS,  # outer scale-block count = K // SCALE_BLOCK_K
+    A_K_CONTIGUOUS: tl.constexpr,
+    B_K_CONTIGUOUS: tl.constexpr,
+    SCALE_2D_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,            # inner compute tile (=64)
+    GROUP_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    SCALE_BLOCK_K: tl.constexpr,
+):
+    SUB_K_ITERS: tl.constexpr = SCALE_BLOCK_K // BLOCK_K  # = 2 when BLOCK_K=64
+
+    pid = tl.program_id(0)
+
+    if NUM_XCDS != 1:
+        full_chunk_pids = (NUM_SMS // (NUM_XCDS * CHUNK)) * (NUM_XCDS * CHUNK)
+        if pid <= full_chunk_pids:
+            local_pid = pid // NUM_XCDS
+            chunk_idx = local_pid // CHUNK
+            pos_in_chunk = local_pid % CHUNK
+            xcd = pid % NUM_XCDS
+            pid = chunk_idx * NUM_XCDS * CHUNK + xcd * CHUNK + pos_in_chunk
+
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    total = num_m * num_n
+    grp = GROUP_M * num_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for tid in range(pid, total, NUM_SMS):
+        gid = tid // grp
+        fm = gid * GROUP_M
+        gs = min(num_m - fm, GROUP_M)
+        pm = fm + (tid % grp) % gs
+        pn = (tid % grp) // gs
+        tl.assume(pm >= 0)
+        tl.assume(pn >= 0)
+
+        rm = tl.max_contiguous(tl.multiple_of((pm * BLOCK_M + tl.arange(0, BLOCK_M)) % M, BLOCK_M), BLOCK_M)
+        rn = tl.max_contiguous(tl.multiple_of((pn * BLOCK_N + tl.arange(0, BLOCK_N)) % N, BLOCK_N), BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+
+        if A_K_CONTIGUOUS:
+            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :]
+        else:
+            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak_val
+
+        if B_K_CONTIGUOUS:
+            b_ptrs = B_ptr + rk[:, None] + rn[None, :] * stride_bn
+        else:
+            b_ptrs = B_ptr + rk[:, None] * stride_bk_val + rn[None, :] * stride_bn
+
+        as_ptrs = A_scales_ptr + rm * stride_as_m
+
+        if SCALE_2D_B:
+            bs_ptr_base = B_scales_ptr + pn * stride_bs_0
+        else:
+            bs_ptrs = B_scales_ptr + rn * stride_bs_0
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # Outer loop iterates scale blocks; inner SUB_K_ITERS dots share a_s/b_s.
+        for ki in range(NUM_K_BLOCKS):
+            partial = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for sub in tl.static_range(SUB_K_ITERS):
+                if A_K_CONTIGUOUS:
+                    a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), cache_modifier=".ca")
+                else:
+                    a = tl.load(tl.multiple_of(a_ptrs, (16, 1)), cache_modifier=".ca")
+
+                if B_K_CONTIGUOUS:
+                    b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), cache_modifier=".ca")
+                else:
+                    b = tl.load(tl.multiple_of(b_ptrs, (1, 16)), cache_modifier=".ca")
+
+                partial += tl.dot(a, b, input_precision="ieee")
+
+                if A_K_CONTIGUOUS:
+                    a_ptrs += BLOCK_K
+                else:
+                    a_ptrs += BLOCK_K * stride_ak_val
+
+                if B_K_CONTIGUOUS:
+                    b_ptrs += BLOCK_K
+                else:
+                    b_ptrs += BLOCK_K * stride_bk_val
+
+            a_s = tl.load(as_ptrs + ki * stride_as_k)
+
+            if SCALE_2D_B:
+                b_s = tl.load(bs_ptr_base + ki * stride_bs_1)
+                acc += partial * (a_s * b_s)[:, None]
+            else:
+                b_s = tl.load(bs_ptrs + ki * stride_bs_1)
+                acc += partial * a_s[:, None] * b_s[None, :]
+
+        offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Unified Public API — Block-wise FP8 GEMM
 # Interface consistent with CK blockwise backend.
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -983,31 +1163,35 @@ def _blockwise_nt(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
-        a,
-        B_t,
-        out,
-        A_scales_t,
-        b_scale_inv,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        B_t.stride(0),
-        B_t.stride(1),
-        stride_cm,
-        stride_cn,
-        A_scales_t.stride(0),
-        A_scales_t.stride(1),
-        b_scale_inv.stride(0),
-        b_scale_inv.stride(1),
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=True,
-        SCALE_2D_B=True,
-    )
+    if K % 128 == 0:
+        # v2: BK=64 + shared-scale + num_stages=2 (async_copy doubles LDS → off)
+        if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+            triton.knobs.amd.use_async_copy = False
+        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+            a, B_t, out, A_scales_t, b_scale_inv,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            B_t.stride(0), B_t.stride(1),
+            stride_cm, stride_cn,
+            A_scales_t.stride(0), A_scales_t.stride(1),
+            b_scale_inv.stride(0), b_scale_inv.stride(1),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=True,
+            SCALE_BLOCK_K=128,
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+            a, B_t, out, A_scales_t, b_scale_inv,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            B_t.stride(0), B_t.stride(1),
+            stride_cm, stride_cn,
+            A_scales_t.stride(0), A_scales_t.stride(1),
+            b_scale_inv.stride(0), b_scale_inv.stride(1),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=True, SCALE_2D_B=True,
+        )
     return out
 
 
@@ -1045,31 +1229,34 @@ def _blockwise_nn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
-        a,
-        b,
-        out,
-        A_scales_t,
-        b_scale_inv_t,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        stride_cm,
-        stride_cn,
-        A_scales_t.stride(0),
-        A_scales_t.stride(1),
-        b_scale_inv_t.stride(0),
-        b_scale_inv_t.stride(1),
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=True,
-    )
+    if K % 128 == 0:
+        if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+            triton.knobs.amd.use_async_copy = False
+        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+            a, b, out, A_scales_t, b_scale_inv_t,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            stride_cm, stride_cn,
+            A_scales_t.stride(0), A_scales_t.stride(1),
+            b_scale_inv_t.stride(0), b_scale_inv_t.stride(1),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=False, SCALE_2D_B=True,
+            SCALE_BLOCK_K=128,
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+            a, b, out, A_scales_t, b_scale_inv_t,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            stride_cm, stride_cn,
+            A_scales_t.stride(0), A_scales_t.stride(1),
+            b_scale_inv_t.stride(0), b_scale_inv_t.stride(1),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=True, B_K_CONTIGUOUS=False, SCALE_2D_B=True,
+        )
     return out
 
 
@@ -1109,29 +1296,32 @@ def _blockwise_tn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
-        A_view,
-        b,
-        out,
-        a_scale_inv,
-        b_scale_inv,
-        M,
-        N,
-        K,
-        A_view.stride(0),
-        A_view.stride(1),
-        b.stride(0),
-        b.stride(1),
-        stride_cm,
-        stride_cn,
-        a_scale_inv.stride(0),
-        a_scale_inv.stride(1),  # [K//128, M]: stride_as_k=M, stride_as_m=1
-        b_scale_inv.stride(1),
-        b_scale_inv.stride(0),  # [K//128, N]: stride_bs_0=1(rn), stride_bs_1=N(ki)
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=False,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=False,
-    )
+    if K % 128 == 0:
+        if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+            triton.knobs.amd.use_async_copy = False
+        _blockwise_fp8_autotune_kernel_v2[(NUM_SMS,)](
+            A_view, b, out, a_scale_inv, b_scale_inv,
+            M, N, K,
+            A_view.stride(0), A_view.stride(1),
+            b.stride(0), b.stride(1),
+            stride_cm, stride_cn,
+            a_scale_inv.stride(0), a_scale_inv.stride(1),
+            b_scale_inv.stride(1), b_scale_inv.stride(0),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False, SCALE_2D_B=False,
+            SCALE_BLOCK_K=128,
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        )
+    else:
+        _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+            A_view, b, out, a_scale_inv, b_scale_inv,
+            M, N, K,
+            A_view.stride(0), A_view.stride(1),
+            b.stride(0), b.stride(1),
+            stride_cm, stride_cn,
+            a_scale_inv.stride(0), a_scale_inv.stride(1),
+            b_scale_inv.stride(1), b_scale_inv.stride(0),
+            NUM_SMS, num_k,
+            A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False, SCALE_2D_B=False,
+        )
     return out

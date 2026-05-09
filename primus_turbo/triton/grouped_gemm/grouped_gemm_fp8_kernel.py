@@ -1395,21 +1395,43 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-# Tight autotune grid for v2 — 6 cfgs covering the BM/BN orientations + GM
-# choices that won across 32 tuned shapes. waves_per_eu/kpack/matrix_instr_nonkdim
-# are hardcoded at launch (not in Config — Triton.Config doesn't accept AMD-
-# specific kwargs anyway). num_stages=2, BK=64 fixed (the point of v2).
-# BM=256 BN=128 BK<128 BLACKLISTED (deterministic ~9% rel error from MFMA bug).
+# Autotune grid for v2. waves_per_eu/kpack/matrix_instr_nonkdim hardcoded at
+# launch (Triton.Config does not accept AMD-specific kwargs).
+#
+# Numerical safety (verified by sweep on G=8 N=K=4096 fwd, FP8 e4m3fnuz):
+#   BLOCK_N MUST equal 128. BN=64 → ~33% rel err, BN=256 → ~10% rel err
+#   (deterministic Triton/MFMA layout bugs on MI300X).
+#   BLOCK_M ∈ {64, 128, 256}. BM=256 only with BK=128 (BM=256 BK=64 also bug).
+#
+# Grid covers: small-M (BM=64), std (BM=128 with BK=64 or 128), large-M (BM=256
+# with BK=128). Mirrors the non-grouped v2 grid expansion for consistency.
 def _v2_autotune_configs():
     cfgs = []
-    for BM, BN in [(128, 256), (128, 128), (256, 256)]:
-        for GM in (2, 8):
-            cfgs.append(triton.Config(
-                {"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN, "BLOCK_SIZE_K": 64,
-                 "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
-                num_warps=8, num_stages=2,
-            ))
-    return cfgs  # 6 cfgs
+    # Small M: BM=64
+    for GM in (2, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
+            num_warps=4, num_stages=2))
+    # Standard: BM=128 BK=64 (original v2 sweet-spot)
+    for GM in (2, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
+            num_warps=4, num_stages=2))
+    # BM=128 BK=128 (collapses to v1-style for shapes that prefer larger BK)
+    for GM in (2, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
+            num_warps=4, num_stages=2))
+    # Large M: BM=256 BK=128 (wins on large K shapes — DSV3 K=7168 etc.)
+    for GM in (2, 8):
+        cfgs.append(triton.Config(
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+             "GROUP_SIZE_M": GM, "CHUNK_SIZE": 64},
+            num_warps=8, num_stages=1))
+    return cfgs  # 8 cfgs total
 
 
 @triton.autotune(configs=_v2_autotune_configs(), key=["G", "N", "K"])
