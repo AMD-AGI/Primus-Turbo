@@ -17,8 +17,11 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
+    quant_fp8_blockwise_for_weight_with_xpose_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_kernel,
+    quant_fp8_blockwise_segment_m_with_xpose_kernel,
+    quant_fp8_blockwise_with_xpose_kernel,
 )
 from primus_turbo.triton.quantization.quantization_mxfp4 import dequantize_mxfp4_kernel
 from primus_turbo.triton.quantization.quantization_mxfp8 import dequantize_mxfp8_kernel
@@ -129,6 +132,58 @@ def quant_fp8_blockwise_impl_meta(
     return x_fp8, x_scales
 
 
+@triton_op("primus_turbo::quant_fp8_blockwise_with_xpose_impl", mutates_args=())
+def quant_fp8_blockwise_with_xpose_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int = 1,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Like quant_fp8_blockwise_impl, but also produces the FP8 transposed
+    output [N, M] in the same bf16-read pass.
+
+    Returns:
+        x_fp8:   [M, N] FP8
+        x_fp8_T: [N, M] FP8  (transposed; same data, different memory order)
+        x_scales: same shape as quant_fp8_blockwise_impl (axis-dependent)
+
+    Use case: wgrad/dgrad paths where the kernel benefits from K-axis
+    contiguous loads. Without this, the kernel must do strided loads on
+    a `.T` view.
+    """
+    assert x.is_contiguous(), "Input must be contiguous"
+    assert x.ndim == 2
+    M, N = x.shape
+    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
+    x_fp8_T = torch.empty((N, M), dtype=dtype, device=x.device)
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_with_xpose_kernel)[grid](
+        x, x_fp8, x_fp8_T, x_scales,
+        M, N,
+        block_size,
+        torch.finfo(dtype).max,
+        axis,
+    )
+    return x_fp8, x_fp8_T, x_scales
+
+
+@quant_fp8_blockwise_with_xpose_impl.register_fake
+def quant_fp8_blockwise_with_xpose_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    axis: int = 1,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    x_fp8 = torch.empty((M, N), dtype=dtype, device=x.device)
+    x_fp8_T = torch.empty((N, M), dtype=dtype, device=x.device)
+    scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
+    x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
+    return x_fp8, x_fp8_T, x_scales
+
+
 @triton_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
 def quant_fp8_blockwise_segment_m_impl(
     x: torch.Tensor,
@@ -211,6 +266,77 @@ def quant_fp8_blockwise_segment_m_impl_meta(
     return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
 
 
+@triton_op("primus_turbo::quant_fp8_blockwise_segment_m_with_xpose_impl", mutates_args=())
+def quant_fp8_blockwise_segment_m_with_xpose_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same as quant_fp8_blockwise_segment_m_impl but also produces a transposed
+    FP8 view [N, M_padded_max] in the same bf16-read pass. The transposed layout
+    has M_padded contiguous along the inner dim, so the variable-K bwd kernel
+    can use A_K_CONTIGUOUS=True on it (replaces strided A loads).
+
+    Returns:
+        x_fp8:            [M_padded_max, N] FP8 (same as segment_m_impl)
+        x_fp8_T:          [N, M_padded_max] FP8 (transposed view of the data)
+        x_scales:         [M_padded_max // block_size, N] fp32
+        var_k_group_lens: [B] padded segment lengths
+        var_k_group_offs: [B+1] padded segment offsets
+    """
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+
+    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
+    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+
+    M_padded_max = M + num_groups * block_size
+
+    x_fp8 = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
+    x_fp8_T = torch.zeros((N, M_padded_max), dtype=dtype, device=x.device)
+    x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+
+    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_segment_m_with_xpose_kernel)[grid](
+        x,
+        x_fp8,
+        x_fp8_T,
+        x_scales,
+        group_offs,
+        var_k_group_offs,
+        N,
+        M_padded_max,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return x_fp8, x_fp8_T, x_scales, var_k_group_lens, var_k_group_offs
+
+
+@quant_fp8_blockwise_segment_m_with_xpose_impl.register_fake
+def quant_fp8_blockwise_segment_m_with_xpose_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+    M_padded_max = M + num_groups * block_size
+    x_fp8 = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_fp8_T = torch.empty((N, M_padded_max), dtype=dtype, device=x.device)
+    x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
+    var_k_group_lens = torch.empty(num_groups, dtype=torch.int64, device=x.device)
+    var_k_group_offs = torch.empty(num_groups + 1, dtype=torch.int64, device=x.device)
+    return x_fp8, x_fp8_T, x_scales, var_k_group_lens, var_k_group_offs
+
+
 @triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
 def quant_fp8_blockwise_for_weight_impl(
     w: torch.Tensor,
@@ -259,6 +385,87 @@ def quant_fp8_blockwise_for_weight_impl(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
+
+
+@triton_op("primus_turbo::quant_fp8_blockwise_for_weight_with_xpose_impl", mutates_args=())
+def quant_fp8_blockwise_for_weight_with_xpose_impl(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same as quant_fp8_blockwise_for_weight_impl, but additionally produces
+    a transposed FP8 view in a single bf16-read pass.
+
+    Returns:
+        w_fp8:   [B, M, N] FP8  (used by FWD path, trans_b=True)
+        w_fp8_T: [B, N, M] FP8  (used by DGRAD path, trans_b=True via TN)
+        w_scales: [B, ceil(M/block_size), ceil(N/block_size)] fp32
+                  (caller passes w_scales.permute(0, 2, 1) for DGRAD; zero-copy view)
+
+    The transposed FP8 write is essentially free here because the kernel is
+    memory-bound on the bf16 read (2x bytes vs the additional 1x byte fp8
+    write). Avoids a separate post-quant transpose pass for DGRAD.
+    """
+    assert w.dim() in (2, 3)
+    if not w.is_contiguous():
+        w = w.contiguous()
+
+    ori_dims = w.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w.shape
+        w = w.unsqueeze(0)
+    else:
+        B, M, N = w.shape
+    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+    w_fp8_T = torch.empty((B, N, M), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (B, ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    grid = (B, triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    wrap_triton(quant_fp8_blockwise_for_weight_with_xpose_kernel)[grid](
+        w,
+        w_fp8,
+        w_fp8_T,
+        w_scales,
+        M,
+        N,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+
+    if ori_dims == 2:
+        w_fp8 = w_fp8.squeeze(0)
+        w_fp8_T = w_fp8_T.squeeze(0)
+        w_scales = w_scales.squeeze(0)
+    return w_fp8, w_fp8_T, w_scales
+
+
+@quant_fp8_blockwise_for_weight_with_xpose_impl.register_fake
+def quant_fp8_blockwise_for_weight_with_xpose_impl_meta(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert w.dim() in (2, 3)
+    ori_dims = w.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w.shape
+    else:
+        B, M, N = w.shape
+    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+    w_fp8_T = torch.empty((B, N, M), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (B, ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    if ori_dims == 2:
+        w_fp8 = w_fp8.squeeze(0)
+        w_fp8_T = w_fp8_T.squeeze(0)
+        w_scales = w_scales.squeeze(0)
+    return w_fp8, w_fp8_T, w_scales
 
 
 @quant_fp8_blockwise_for_weight_impl.register_fake
