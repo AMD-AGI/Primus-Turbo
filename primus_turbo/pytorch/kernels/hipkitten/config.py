@@ -2571,12 +2571,37 @@ def select_default_config(
                 # floor; primary value is closing R15's forward-
                 # pointer (the last un-audited template-class lever
                 # on the suite, see commit e481c1c5 commit message).
+                # Round-15 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-09): re-enable the round-16
+                # FUSED_KTAIL gating for the B=32 sub-cell. Daemon
+                # rebuilds HipKittens before each metric run
+                # (auto_optimize_gpt_oss_fp8.py:339 build_hipkittens_remote);
+                # HK source tree has the ``fuse_ktail_off`` pybind kwarg
+                # since SHA 3bcd248a (kernel_fp8_layouts.cpp:9812+9830),
+                # so the .so available at metric time accepts the kwarg.
+                # The "HK shipped .so lacks pybind kwarg" disable from
+                # round-16 reflected an out-of-band ABI mismatch that no
+                # longer applies in this auto_optimize regime.
+                #
+                # Per the R14 column above only the m_total>=65536
+                # (B=32) sub-cell gains (+1 %); the m_total<=16384 (B=4)
+                # sibling ties at -0 %. Inner gate keeps B=4 on the
+                # FUSED_KTAIL=true default to avoid the noise-band
+                # regression risk.
+                if m_total >= 65536:
+                    return HipKittenConfig(
+                        layout=layout,
+                        group_m=1,
+                        num_xcds=4,
+                        kernel=None,
+                        fuse_ktail_off=1,
+                    )
                 return HipKittenConfig(
                     layout=layout,
                     group_m=1,
                     num_xcds=4,
                     kernel=None,
-                    fuse_ktail_off=0,  # round-16 disabled (HK shipped .so lacks pybind kwarg; re-enable after HK rebuild)
+                    fuse_ktail_off=0,
                 )
             if tiles_m == 8 and m_total >= 65536:
                 # gpt_oss-GateUP B=32 M=2048 dA after reroute. The
@@ -2592,12 +2617,18 @@ def select_default_config(
                 # has tiles_n==11, k==5760, tiles_m==8, m_total>=65536).
                 # Same R34-dm bit-equivalence + R15 forward-pointer
                 # rationale as the tiles_m==16 branch above.
+                #
+                # Round-15 (current Primus run; 2026-05-09): re-enabled
+                # alongside the tiles_m==16 sibling above. See that
+                # block's R15 comment for the daemon-HK-rebuild
+                # rationale. Outer guard already restricts to
+                # m_total>=65536 (B=32 only); no inner split needed.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=16,
                     num_xcds=4,
                     kernel=None,
-                    fuse_ktail_off=0,  # round-16 disabled (HK shipped .so lacks pybind kwarg; re-enable after HK rebuild)
+                    fuse_ktail_off=1,
                 )
             if tiles_m == 8 and m_total == 8192:
                 # Round-7 (current Primus run, gpt_oss FP8 kernel-only
