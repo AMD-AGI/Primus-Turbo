@@ -216,7 +216,7 @@ class GroupedGEMMTritonBackend(KernelBackend):
 
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
-    BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
+    BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
 }
 
@@ -263,7 +263,7 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
 
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
-    BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
+    BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
 }
 
@@ -278,7 +278,6 @@ class GroupedGEMMKernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         m = a.shape[1] if trans_a else a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[0] if trans_a else a.shape[1]
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c
         return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, False)
 
 

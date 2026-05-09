@@ -295,6 +295,29 @@ MoEModelConfigs = {
     #     "head_dim": 128,
     #     "seqlen": 4096,
     # },
+    # # https://huggingface.co/LiquidAI/LFM2-8B-A1B
+    # "LFM2-8B-A1B": {
+    #     "n_routed_experts": 32,
+    #     "moe_intermediate_size": 1792,
+    #     "hidden_size": 2048,
+    #     # GQA attention config
+    #     "num_attention_heads": 32,
+    #     "num_key_value_heads": 8,
+    #     "head_dim": 128,  # kv_channels
+    #     "seqlen": 4096,
+    # },
+    # # /shared_nfs/kyle/test/Primus/examples/megatron/configs/MI300X/gpt_oss_20B-BF16-pretrain.yaml
+    # "gpt_oss_20B": {
+    #     "n_routed_experts": 32,
+    #     "moe_intermediate_size": 2880,
+    #     "hidden_size": 2880,
+    #     # GQA attention config
+    #     "num_attention_heads": 64,
+    #     "num_key_value_heads": 8,
+    #     "head_dim_qk": 128,  # qk_head_dim
+    #     "head_dim_v": 64,    # kv_channels
+    #     "seqlen": 4096,
+    # },
 }
 
 ###############################################################################
