@@ -30,8 +30,8 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-# PR: fix(mha_bwd): pass independent strides for do in _bwd_preprocess (#2808)
-AITER_COMMIT = "059c778739fa1a85b7d8469bcd3df9fb07e3ba5b"
+# PR: Fix dsink bf16 noise in Triton MHA one-kernel backward (#3070)
+AITER_COMMIT = "b5e03ed191fca11ee423226537ef8d9435e432a6"
 
 # -------------------------------------
 
