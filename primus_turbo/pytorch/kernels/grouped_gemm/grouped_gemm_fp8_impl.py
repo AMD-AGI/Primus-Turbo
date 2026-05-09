@@ -1080,8 +1080,20 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                     vk_group_m = 8
                     vk_num_xcds = 4
                 else:
+                    # Round-46 (current run; 2026-05-09) — Down-B32-M4096
+                    # var-K wgrad: xcds=8 + (slots=256, cs=32) clean-256
+                    # partition. Fleet probe round_0/round_1 cross-shape
+                    # verified +0.71% (round_1 7-seed wmin>lmax=True) at
+                    # cell (gm=4, xcds=8, slots=256, cs=32) over the
+                    # baseline (gm=4, xcds=4) selected here. Same xcds=8
+                    # lever class as the GateUP-B32-M4096 round_0 +1.17%
+                    # finding; the lever is M=4096-specific (M=2048 sibling
+                    # tests on Down/GateUP both LOSS at same cell, so it
+                    # is gated to `else` branch only).
                     vk_group_m = 4
-                    vk_num_xcds = 4
+                    vk_num_xcds = 8
+                    vk_num_slots = 256
+                    vk_chunk_size = 32
             elif a.shape[1] == 2880 and b.shape[1] == 2880:
                 # Round-10 (current Primus run; 2026-05-05) carve-out for
                 # gpt_oss-Down B=4 M=4096 (m_total=16384, the only metric
