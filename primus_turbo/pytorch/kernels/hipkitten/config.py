@@ -3019,10 +3019,96 @@ def select_default_config(
                 # ships — kernel-real every-seed wmin_beats_lmax win
                 # committed ahead of compounding gains from later round
                 # rules.
+                #
+                # Round-46 (current Primus run, gpt_oss FP8 kernel-only
+                # ceiling task; 2026-05-10): UPDATE num_xcds from None
+                # (kernel default = BLOCK_SWIZZLE_NUM_XCDS = 8) → 4.
+                # R34's 2026-05-08 comment above defended xcds=8 as the
+                # correct chiplet partition for tiles_m=8 + tiles_n=11
+                # + k=5760 + B=4, but that argument was made BEFORE
+                # R10's slots=200, R15's chunk_size=24, and R16's gm=1
+                # were stacked. With the R10/R15/R16 levers FIXED at
+                # production, the chiplet partition optimum has shifted
+                # to xcds=4 — the chunk_size=24 swizzle math changes
+                # the per-XCD L2 footprint depth:
+                #   xcds=8 + slots=200 + cs=24:
+                #     block = 8 * 24 = 192, 1 chunk, 192/200 PIDs
+                #     partitioned (8 round-robin tail) → 24 PIDs/XCD.
+                #   xcds=4 + slots=200 + cs=24:
+                #     block = 4 * 24 = 96, 2 chunks, 192/200 PIDs
+                #     partitioned (8 round-robin tail) → 48 PIDs/XCD
+                #     (24 per chunk × 2 chunks).
+                # The 2× deeper per-XCD slice (48 vs 24 PIDs) lets each
+                # XCD's L2 absorb a longer K-tile-column reuse window
+                # on the deep k=5760 main loop (45 K-tile-loads per
+                # K-pass × consecutive N-tile rows on the same A-pack
+                # column) — same per-K B-pack L2 reuse mechanism as
+                # R16's gm=1 win on the M-axis, now compounded on the
+                # XCD-partition axis. R34's "xcds=8 needed for wider
+                # spread" argument no longer holds because the cs=24
+                # 1-chunk (xcds=8) → 2-chunk (xcds=4) flip preserves
+                # full 192/200 chiplet coverage while doubling the
+                # per-XCD reuse depth.
+                #
+                # R46 tight A/B verify (in-process direct
+                # ``grouped_rcr_dscale(..., group_m=1, num_xcds=N,
+                # num_slots=200, chunk_size=24)`` call, 5 seeds × 2000-
+                # iter p20, ``scripts/_probe_round_46_gateup_b4_m2048_
+                # dgradH4_drift.py``) — load-bearing R10/R15/R16 levers
+                # held FIXED:
+                #
+                #   cell      run-1 (med ms / TF / Δ%)        run-2 (med ms / TF / Δ%)
+                #   (1, 8)*   0.1312 / 2070.9 / +0.00 base    0.1296 / 2097.8 / +0.00 base
+                #   (1, 4)    0.1299 / 2092.0 / +1.01         0.1270 / 2139.4 / +1.95  *ship
+                #   (1, 2)    0.1320 / 2058.4 / -0.61         0.1297 / 2095.2 / -0.12
+                #   (1, 1)    0.1364 / 1992.6 / -3.93         0.1342 / 2025.9 / -3.55
+                #   (2, 8)    0.1345 / 2021.1 / -2.47         0.1329 / 2045.4 / -2.56
+                #   (4, 8)    0.1346 / 2019.8 / -2.53         0.1327 / 2048.5 / -2.41
+                #   (8, 8)    0.1352 / 2010.9 / -2.99         0.1334 / 2038.0 / -2.93
+                #
+                # Both runs: (1, 4) wins by +1.01 % then +1.95 %, signal
+                # robustly > spread (0.25-0.38 % spread). wmin_beats_lmax
+                # holds in BOTH runs:
+                #   run-1: max(1,4)=0.1300 < min(1,8)=0.1311 ✓
+                #   run-2: max(1,4)=0.1273 < min(1,8)=0.1294 ✓
+                # Cleanest signal class — every seed of (1, 4) beats
+                # every seed of baseline. Mirrors R7/R10/R11/R12/R15/R16
+                # robust-win pattern. Other neighbouring cells uniformly
+                # lose, ruling out a "noise alias" interpretation.
+                #
+                # Bit-equivalent output: num_xcds is a pure persistent-
+                # grid scheduling knob (``chiplet_transform_chunked``
+                # workgroup reorder ONLY, no FP8 quantization or MFMA
+                # accumulation order changes — same property documented
+                # for R34/R10/R12/R23/R69/R8 above and every (gm, xcds)
+                # RCR rule in this file). Daemon canonical metric will
+                # re-verify SNR > 25 dB on out / dA / dB across all 8
+                # gpt_oss FP8 shapes via correctness gate.
+                #
+                # Sibling regression check: rule scope unchanged — gate
+                # remains tiles_n==11 AND k==5760 AND tiles_m==8 AND
+                # m_total==8192 (the m_total==8192 outer guard at the
+                # `if tiles_m == 8 and m_total <= 16384` branch above).
+                # Only this gpt_oss-GateUP-B4-M2048 dA cell hit; siblings
+                # audited in R15/R16 commit's "Sibling regression check"
+                # section all unchanged (each sits behind a different
+                # tiles_m / m_total / k clause).
+                #
+                # Expected metric impact: dgrad section avg lift this
+                # shape 2070 → 2110 T (+40 T from ~50 T cell lift / 8
+                # shapes within the metric's own re-bench). Section
+                # progress: ~0.749 → ~0.751 (+0.002). Overall: +0.0007
+                # → +0.7 score median; sub-noise on a single run, but
+                # a clean every-seed wmin_beats_lmax win that compounds
+                # with R10/R15/R16 in the per-rule build over time.
+                # Same R10/R11/R15 "ship narrow carve-out when probe
+                # shows wmin_beats_lmax even if metric noise floor
+                # swallows the geomean lift" pattern. Closes the R45
+                # forward-pointer (PRIMARY) item.
                 return HipKittenConfig(
                     layout=layout,
                     group_m=1,
-                    num_xcds=None,
+                    num_xcds=4,
                     kernel=None,
                     num_slots=200,
                     chunk_size=24,
