@@ -301,3 +301,76 @@ def test_use_gradient_sr_false():
 
     assert torch.equal(a_grad1, a_grad2), "A gradients should be identical without stochastic rounding"
     assert torch.equal(b_grad1, b_grad2), "B gradients should be identical without stochastic rounding"
+
+
+@pytest.mark.parametrize("m", [256])
+@pytest.mark.parametrize("n", [256])
+@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
+    """Regression: FP4 GEMM forward+backward must trace and run under torch.compile.
+
+    Covers the Inductor-traced backward path that the ``FP4GemmMXFunction`` backward
+    compile-compatibility fix targets (contiguous ``grad_out`` + ``shuffle_scale=False``
+    on the gradient scaling recipe). Verifies the compiled path traces end-to-end and
+    produces finite, correctly shaped gradients matching a high-precision reference (SNR).
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "Assume m, n and k are multiples of 16."
+
+    device = "cuda:0"
+    torch.manual_seed(42)
+
+    # NT layout (a: [m, k], b: [n, k]); matches the production FP4 GEMM usage.
+    trans_a, trans_b = False, True
+
+    # Pin a concrete backend so the test is deterministic and independent of the
+    # PRIMUS_TURBO_GEMM_BACKEND environment variable; the compile-backward fix is
+    # backend-independent (it concerns grad_out quantization, not the GEMM impl).
+    GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT)
+    GlobalBackendManager.set_auto_tune(False)
+
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+
+    a = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((n, k), dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+    torch.cuda.synchronize()
+
+    # High-precision reference.
+    c_ref = a_ref @ b_ref.T
+    c_ref.backward(torch.ones_like(c_ref))
+    torch.cuda.synchronize()
+
+    def fp4_gemm(x, w):
+        return gemm_fp4(x, w, trans_a, trans_b, dtype, config)
+
+    compiled = torch.compile(fp4_gemm)
+    c = compiled(a, b)
+    c.backward(torch.ones_like(c))
+    torch.cuda.synchronize()
+
+    assert c.shape == c_ref.shape
+    assert a.grad is not None and a.grad.shape == a_ref.grad.shape
+    assert b.grad is not None and b.grad.shape == b_ref.grad.shape
+    assert torch.isfinite(c).all(), "compiled forward produced non-finite values"
+    assert torch.isfinite(a.grad).all(), "compiled a.grad is non-finite"
+    assert torch.isfinite(b.grad).all(), "compiled b.grad is non-finite"
+
+    snr_threshold = 10
+    assert compute_snr(c_ref, c) > snr_threshold, "compiled c_snr too low"
+    assert compute_snr(a_ref.grad, a.grad) > snr_threshold, "compiled a_grad_snr too low"
+    assert compute_snr(b_ref.grad, b.grad) > snr_threshold, "compiled b_grad_snr too low"
+
+    GlobalBackendManager.reset()
