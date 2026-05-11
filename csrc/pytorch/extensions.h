@@ -49,12 +49,17 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
                                           const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor>
-quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
-                    const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-                    const bool rowwise_use_rht, const bool colwise_use_2d_block,
-                    const bool colwise_use_sr, const bool colwise_use_rht,
-                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
-                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+           quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
+                               const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+                               const bool rowwise_use_rht, const bool colwise_use_2d_block,
+                               const bool colwise_use_sr, const bool colwise_use_rht,
+                               const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+                               const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,
+                                  const int64_t axis, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                       const int64_t axis, const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,

@@ -112,4 +112,18 @@ template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,
                                 hipStream_t stream);
 
+// Rowwise dequantize when the per-row dim is the innermost (last) dim.
+// scale_inv has shape [outer_len] (one scalar per row).
+template <typename FType, typename QType, typename ComputeType = float>
+void dequantize_rowwise_row_major_impl(const QType *x, const float *scale_inv, FType *y,
+                                       const int64_t outer_len, const int64_t inner_len,
+                                       hipStream_t stream);
+
+// Rowwise dequantize when the per-row dim is a middle dim.
+// Input is viewed as [B, M, N], scale_inv has shape [B, N] (broadcast across M).
+template <typename FType, typename QType, typename ComputeType = float>
+void dequantize_rowwise_col_major_impl(const QType *x, const float *scale_inv, FType *y,
+                                       const int64_t batch, const int64_t m, const int64_t n,
+                                       hipStream_t stream);
+
 } // namespace primus_turbo

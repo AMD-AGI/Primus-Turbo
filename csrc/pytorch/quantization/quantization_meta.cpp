@@ -37,6 +37,14 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
     return output;
 }
 
+at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                       const int64_t axis, const at::ScalarType dest_dtype) {
+    const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
+    PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
+    at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    return output;
+}
+
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
     const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,

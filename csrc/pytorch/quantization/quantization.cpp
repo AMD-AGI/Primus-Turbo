@@ -222,6 +222,58 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
     return output;
 }
 
+at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,
+                                  const int64_t axis, const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                       dest_dtype == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()));
+    PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat,
+                       "rowwise scale_inv must be float32 tensor");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "input must be contiguous");
+    PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
+
+    const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
+    PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim(),
+                       "rowwise dequantize axis out of range");
+
+    std::vector<int64_t> expected_scale_shape(input.sizes().begin(), input.sizes().end());
+    expected_scale_shape[valid_axis] = 1;
+    PRIMUS_TURBO_CHECK(scale_inv.sizes() == at::IntArrayRef(expected_scale_shape),
+                       "scale_inv shape must match input shape with size 1 along axis");
+
+    const bool is_row_major = valid_axis == (input.dim() - 1);
+
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+
+    if (is_row_major) {
+        const int64_t inner_len = input.sizes()[valid_axis];
+        const int64_t outer_len = input.numel() / inner_len;
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+            TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+                dequantize_rowwise_row_major_impl<FType, QType, float>(
+                    reinterpret_cast<const QType *>(input.data_ptr()),
+                    reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                    reinterpret_cast<FType *>(output.data_ptr()), outer_len, inner_len, stream);
+            });
+        });
+    } else {
+        int64_t              B, M, N;
+        std::vector<int64_t> input_shape(input.sizes().begin(), input.sizes().end());
+        compute_quantize_fp8_rowwise_bmn(input_shape, valid_axis, B, M, N);
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+            TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+                dequantize_rowwise_col_major_impl<FType, QType, float>(
+                    reinterpret_cast<const QType *>(input.data_ptr()),
+                    reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                    reinterpret_cast<FType *>(output.data_ptr()), B, M, N, stream);
+            });
+        });
+    }
+
+    return output;
+}
+
 // Quantize MXFP4 with dual mode
 std::vector<at::Tensor> quantize_mxfp4_dual(
     const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,

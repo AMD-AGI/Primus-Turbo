@@ -35,6 +35,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
           "Tensor");
+    m.def("dequantize_fp8_rowwise(Tensor input, Tensor scale_inv, int axis, "
+          "ScalarType dest_dtype) -> Tensor");
 
     // ********* MXFP4 Quantization *********
     m.def("quantize_mxfp4_dual(Tensor input, ScalarType dest_dtype, "
@@ -92,6 +94,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
+    m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise);
 
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
@@ -130,6 +133,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
+    m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise_meta);
 
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
