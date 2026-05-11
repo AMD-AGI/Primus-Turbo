@@ -723,11 +723,25 @@ def gemm_fp8_rowwise_triton_kernel(
 # Blockwise autotune configs
 # Fixed: BLOCK_N=128, BLOCK_K=128, wpe=2, mfma=16
 # Variable: BLOCK_M, kpack, GROUP_M, CHUNK, num_stages
+#
+# ``allow_num_stages_3`` is a per-kernel switch. The shared/wgrad kernel
+# (`_blockwise_fp8_autotune_kernel`) uses dual strided-K loads
+# (A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False); on triton 3.7.0 the AMD
+# backend hits ``llvm/ADT/Sequence.h:275: Assertion `Begin <= End`'' (SIGABRT,
+# uncatchable by autotune) when ``num_stages=3`` is combined with that load
+# pattern. The contiguous-K NT/NN kernels do not exercise that backend path,
+# so they keep the full ns=[1,2,3] space on gfx950. This matches the historic
+# TN-wgrad-only fragility noted in tips.md (R57: dual-strided loads need
+# different code-gen guards than the other two layouts).
 # ═══════════════════════════════════════════════════════════════════════════════
-def _get_blockwise_autotune_configs():
+def _get_blockwise_autotune_configs(allow_num_stages_3: bool = True):
     configs = []
-    num_stage_values = [1, 2, 3] if _is_gfx950() else [1, 2]
-    block_n_values = [64, 128] if _is_gfx950() else [128]
+    if _is_gfx950():
+        num_stage_values = [1, 2, 3] if allow_num_stages_3 else [1, 2]
+        block_n_values = [64, 128]
+    else:
+        num_stage_values = [1, 2]
+        block_n_values = [128]
     for block_m, block_n, kp, gm, chunk, ns in itertools.product(
         [128, 256],
         block_n_values,
@@ -757,9 +771,15 @@ def _get_blockwise_autotune_configs():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Autotuned block-wise FP8 GEMM kernel
+#
+# ``allow_num_stages_3=False`` here drops 32 configs (96 → 64 on gfx950) that
+# trigger the triton 3.7.0 LLVM-backend assertion in the dual strided-K
+# (A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False) load path used by TN/wgrad.
+# Removing only this kernel's ns=3 candidates keeps the forward/dgrad search
+# spaces fully intact.
 # ═══════════════════════════════════════════════════════════════════════════════
 @triton.autotune(
-    configs=_get_blockwise_autotune_configs(),
+    configs=_get_blockwise_autotune_configs(allow_num_stages_3=False),
     key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
 )
 @triton.jit
