@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import lru_cache
 from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
@@ -82,9 +81,9 @@ class GlobalBackendManager:
     _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _auto_tune: Optional[bool] = None
+    _env_cache: Dict[str, Dict["PrecisionType", "BackendType"]] = {}
 
     @classmethod
-    @lru_cache(maxsize=32)
     def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendType]:
         """
         Extract the backend from the environment variable.
@@ -95,6 +94,9 @@ class GlobalBackendManager:
 
         Precision types are defined in the _PRECISION_TYPE_MAPPING.
         """
+        if env_value in cls._env_cache:
+            return cls._env_cache[env_value]
+
         precision_backend_dict = {}
 
         # Parse format 2 & 3
@@ -122,6 +124,7 @@ class GlobalBackendManager:
             for value in _PRECISION_TYPE_MAPPING.values():
                 precision_backend_dict[value] = BackendType[env_value.upper()]
 
+        cls._env_cache[env_value] = precision_backend_dict
         return precision_backend_dict
 
     @classmethod
@@ -248,6 +251,7 @@ class GlobalBackendManager:
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
         cls._auto_tune = None
+        cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
         clear_origami_caches()
 

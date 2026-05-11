@@ -130,7 +130,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.format,
         )
 
-        grad_out = grad_out.view(grad_out.shape[0], -1)
+        grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
 
         grad_out_fp4, grad_out_scale_inv, grad_out_t_fp4, grad_out_t_scale_inv = quantize_fp4_with_trans(
             grad_out,
@@ -148,6 +148,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 use_sr=False,
                 use_rht=True,
                 shuffle_scale=enable_preshuffle(),
+                shuffle_out=False,
             ),
         )
 
