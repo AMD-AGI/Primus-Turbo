@@ -161,13 +161,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.format,
         )
 
-        grad_out = grad_out.view(grad_out.shape[0], -1)
-
-        grad_out_scaling_recipe = ScalingRecipe(
-            use_2d_block=False,
-            use_sr=False,
-            use_rht=True,
-        )
+        grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
 
         quantized_grad_out = QuantizedTensor.quantize(
             grad_out,
@@ -175,7 +169,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             axis=1,
             block_size=ctx.config.block_size,
-            scaling_recipe=grad_out_scaling_recipe,
+            scaling_recipe=ScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+                shuffle_scale=False,
+            ),
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
