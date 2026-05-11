@@ -129,6 +129,45 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
     return output
 
 
+def attention_varlen_forward_pytorch_ref_impl(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    sm_scale,
+    causal,
+):
+    """Reference varlen attention; Loops per sequence using cu_seqlens."""
+    total_q, nheads_q, _ = q.shape
+    head_dim_v = v.shape[-1]
+    out = torch.empty((total_q, nheads_q, head_dim_v), dtype=q.dtype, device=q.device)
+
+    n_kv_heads = k.shape[1]
+    n_rep = nheads_q // n_kv_heads
+
+    cu_q = cu_seqlens_q.tolist()
+    cu_k = cu_seqlens_k.tolist()
+    batch = len(cu_q) - 1
+
+    for i in range(batch):
+        q_start, q_end = cu_q[i], cu_q[i + 1]
+        k_start, k_end = cu_k[i], cu_k[i + 1]
+        if q_end == q_start:
+            continue
+        # (s, h, d) -> (1, h, s, d) for SDPA, then back.
+        qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0).contiguous()
+        ki = k[k_start:k_end].transpose(0, 1).unsqueeze(0).contiguous()
+        vi = v[k_start:k_end].transpose(0, 1).unsqueeze(0).contiguous()
+        with sdpa_kernel(ATTN_BACKENDS):
+            oi = torch.nn.functional.scaled_dot_product_attention(
+                qi, ki, vi, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
+            )
+        out[q_start:q_end] = oi.squeeze(0).transpose(0, 1).contiguous()
+
+    return out
+
+
 class TurboAttentionRef(torch.nn.Module):
     def __init__(
         self,
