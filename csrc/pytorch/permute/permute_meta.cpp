@@ -11,8 +11,8 @@ permute_preprocessing_meta(torch::Tensor expert_map, torch::Tensor num_dispatche
                            int64_t max_num_dispatched_tokens, int64_t num_local_experts,
                            int64_t num_topk, int64_t pad_multiple, int64_t num_permuted_tokens) {
     auto int_opts = at::TensorOptions().dtype(at::kInt).device(at::kMeta);
-    auto row_id_map =
-        at::empty({max_num_dispatched_tokens + pad_multiple, num_local_experts}, int_opts);
+    auto row_id_map = at::empty(
+        {max_num_dispatched_tokens + pad_multiple, 2 * num_local_experts + 1}, int_opts);
     auto tokens_per_expert = at::empty({num_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
     return {row_id_map, tokens_per_expert, overflow_flag};
