@@ -160,6 +160,137 @@ def test_quantize_fp8_tensorwise_fused_amax_correctness(
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("numel", [8192, 8193, 6 * 1 * 7168 * 8192])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+def test_quantize_fp8_tensorwise_fused_amax_out(orig_dtype, dest_dtype, numel, granularity):
+    """Test fused quantize with amax_out: output matches without amax_out, amax is correct."""
+    torch.manual_seed(42)
+
+    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    x_ref = x.detach().clone()
+
+    x_fp8_ref, x_scale_inv_ref = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x_ref, dest_dtype
+    )
+
+    amax_out = torch.zeros((), dtype=torch.float32, device="cuda")
+    x_fp8, x_scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, dest_dtype, None, amax_out
+    )
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(x_fp8_ref, x_fp8, atol=0, rtol=0)
+
+    expected_amax = x.detach().float().abs().amax()
+    torch.testing.assert_close(amax_out, expected_amax, **get_tolerances(torch.float32))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+@pytest.mark.parametrize(
+    "shape,spike_pos",
+    [
+        ((1, 100), -1),
+        ((1, 8193), -1),
+        ((512, 3072), 8300),
+        ((512, 3072), -1),
+        ((1024, 4096), -1),
+    ],
+)
+def test_quantize_fp8_tensorwise_fused_amax_out_correctness(
+    orig_dtype, dest_dtype, granularity, shape, spike_pos
+):
+    """Regression test: fused quantize+amax captures spikes at partial-tile boundaries."""
+    x = torch.ones(shape, device="cuda", dtype=orig_dtype) * 0.5
+    x.view(-1)[spike_pos] = 100.0
+
+    amax_out = torch.zeros((), dtype=torch.float32, device="cuda")
+    x_fp8, x_scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, dest_dtype, None, amax_out
+    )
+
+    expected_amax = x.detach().float().abs().amax()
+    torch.testing.assert_close(amax_out, expected_amax, **get_tolerances(torch.float32))
+
+    x_ref = x.detach().clone()
+    x_fp8_ref, _, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(
+        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
+        x_fp8.to(torch.float32) * x_scale_inv,
+        **get_tolerances(dest_dtype),
+    )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("numel", [8192, 8193, 512 * 3072])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+def test_quantize_fp8_tensorwise_fused_amax_out_with_scale(
+    orig_dtype, dest_dtype, numel, granularity
+):
+    """Test delayed-scaling path: pre-computed scale + amax_out capture."""
+    torch.manual_seed(42)
+
+    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    fp8_max = torch.finfo(dest_dtype).max
+    scale = torch.tensor(fp8_max / 2.0, dtype=torch.float32, device="cuda")
+
+    x_fp8_ref, x_scale_inv_ref = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, dest_dtype, scale
+    )
+
+    amax_out = torch.zeros((), dtype=torch.float32, device="cuda")
+    x_fp8, x_scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, dest_dtype, scale, amax_out
+    )
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(x_fp8_ref, x_fp8, atol=0, rtol=0)
+
+    expected_amax = x.detach().float().abs().amax()
+    torch.testing.assert_close(amax_out, expected_amax, **get_tolerances(torch.float32))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize(
+    "numel",
+    [
+        8192,   # divisible by 8: pack_size=8, no tail
+        8195,   # remainder 3: exercises tail loop
+        8193,   # remainder 1: exercises tail loop
+        15,     # small, forces smaller pack or scalar path
+        7,      # smaller than any pack size > 1
+        1021,   # prime: likely pack_size=1 fallback
+    ],
+)
+def test_quantize_fp8_tensorwise_fused_amax_out_alignment(orig_dtype, dest_dtype, numel):
+    """Test vectorized quantize_with_amax across different UNROLL pack_size paths and tail loops."""
+    torch.manual_seed(42)
+
+    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    x_ref = x.detach().clone()
+
+    x_fp8_ref, x_scale_inv_ref = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x_ref, dest_dtype
+    )
+
+    amax_out = torch.zeros((), dtype=torch.float32, device="cuda")
+    x_fp8, x_scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+        x, dest_dtype, None, amax_out
+    )
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(x_fp8_ref, x_fp8, atol=0, rtol=0)
+
+    expected_amax = x.detach().float().abs().amax()
+    torch.testing.assert_close(amax_out, expected_amax, **get_tolerances(torch.float32))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("axis", [-1, -2, -3, 0, 1, 2])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [1, 111, 7168])
