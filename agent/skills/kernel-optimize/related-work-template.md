@@ -54,7 +54,8 @@ Use this as the default structure for `<campaign_dir>/related_work.md`.
 ## Real-training Transfer Audit
 
 Tag every entry from the two sections above using the buckets defined in
-[`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md):
+[`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) Rule 11
+(operational guidance is in `SKILL.md` under "Avoiding Benchmark Over-Fitting"):
 
 - `K1` kernel-internal (autotune / mfma / tile / `EVEN_K` / `tl.dot_scaled` / pipeline depth)
 - `K2` layout-duplicated kernels

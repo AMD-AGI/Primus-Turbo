@@ -9,11 +9,9 @@ Use this skill for AMD ROCm Triton kernels.
 
 ## Start Here
 
-1. Read `../../../rules/iteration_rules.mdc`.
-2. Read `../../../rules/no_benchmark_overfitting.mdc` and the operational
-   checklist `../avoid-benchmark-overfit/SKILL.md`.
-3. Read `../../tool-rocprof/SKILL.md`.
-4. Read the matching hardware guide:
+1. Read `../../../rules/iteration_rules.mdc` (all 11 rules, including Rule 11 — no benchmark over-fitting).
+2. Read `../../tool-rocprof/SKILL.md`.
+3. Read the matching hardware guide:
    - `../../hardware/gfx942/SKILL.md`
    - `../../hardware/gfx950/SKILL.md`
 

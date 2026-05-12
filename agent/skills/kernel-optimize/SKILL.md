@@ -5,18 +5,9 @@ description: AI-driven operator performance optimization framework. Defines the 
 
 # Operator Performance Optimization Framework
 
-This skill defines the **general-purpose operator optimization loop**, driving the agent to autonomously iterate toward hardware limits.
+This skill defines the **general-purpose operator optimization loop**, driving the agent to autonomously iterate toward hardware limits. It covers the prerequisite interface contract, campaign directory layout, the high-level loop, knowledge routing, and general principles for logging and stagnation handling.
 
-This skill is responsible for defining:
-- Prerequisites needed for optimization (interface contract)
-- Parameter confirmation and directory structure for optimization campaigns
-- High-level optimization loop (reference: AVO — Agentic Variation Operators)
-- Knowledge routing approach
-- General principles for logging, lineage, and stagnation handling
-
-This skill is **not responsible for**:
-- Hardcoding source paths, test commands, or benchmark commands for any specific project (provided by the project skill)
-- Replacing language-specific, hardware-specific, or profiling-specific documentation
+Project-specific source paths, build/test/benchmark commands, and language- or hardware-specific tuning details live in the corresponding project, language, hardware, and profiling skills — not here.
 
 ## Prerequisite Information
 
@@ -35,9 +26,7 @@ This skill is **not responsible for**:
 
 After the agent has collected all the above information, return to this file to execute DEFINE_TARGET.
 
-Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) and [`../../rules/no_benchmark_overfitting.mdc`](../../rules/no_benchmark_overfitting.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, accept-or-rollback lineage, and **every accepted gain must transfer to a real LLM training step (no benchmark idiom over-fitting via `id(...)`-keyed activation / grad_out / scale caches)**.
-
-When ANALYZE proposes any wrapper-level cache, memoization, or `id(tensor)` lookup, follow the operational checklist in [`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md) before writing code.
+Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc). It is a hard constraint for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, accept-or-rollback lineage, and **every accepted gain must transfer to a real LLM training step (Rule 11 — no benchmark idiom over-fitting via `id(...)`-keyed activation / grad_out / scale caches)**. The operational layer for Rule 11 lives in the "Avoiding Benchmark Over-Fitting" section below.
 
 For validation scope, interpret that contract as:
 - **full validation** → run all `target_shapes`
@@ -232,26 +221,78 @@ After PREPARE_ENVIRONMENT creates the campaign directory, perform a short relate
   - transferable implementation ideas worth trying in this campaign
   - caveats about reproducibility, hidden fusion, datatype mismatch, or incompatible hardware assumptions
   - a short shortlist of concrete optimization directions to test locally
-  - a `Real-training transfer audit` table that tags every shortlisted direction with its bucket from [`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md) (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`) and an explicit reason why the direction will or will not survive a real LLM training step
+  - a `Real-training transfer audit` table that tags every shortlisted direction with its bucket (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`, see Rule 11 and the "Avoiding Benchmark Over-Fitting" section below) and an explicit reason why the direction will or will not survive a real LLM training step
 
 **Constraints**:
 
 - Treat `agent/tmp/<campaign_name>/related-work/` as ephemeral scratch space, not part of the accepted optimization lineage.
 - Do not allow the survey to turn into open-ended browsing; stop once the agent has enough information to guide early hypotheses.
 - The survey informs the campaign, but it does not replace the local baseline and validation loop.
-- A direction tagged `W2` or `W3` in the survey is **not** a candidate hypothesis. The agent must drop it from the shortlist at SURVEY time, not at VALIDATE time. Recording the direction as a known anti-pattern in the survey is fine; promoting it into ANALYZE is not.
+- A direction tagged `W2` or `W3` is **not** a candidate hypothesis. Drop it from the shortlist at SURVEY time, not at VALIDATE time. Recording it as a known anti-pattern is fine; promoting it into ANALYZE is not.
 
-**Real-training transfer audit at survey time**:
-
-When a SOTA reference reports a large gain, separate the gain into:
-
-- structural kernel/algorithm work (almost always transfers): `tl.dot_scaled`, MFMA selection, layout-specialized kernels, prefetch / pipeline depth, single-launch fusion, persistent kernels.
-- benchmark-loop / inference-graph work (transfer is conditional): KV-cache reuse for inference, weight pre-quant cached on the module, capture-graph / CUDA-graph reuse.
-- benchmark-only artifacts (do not transfer): caches keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)`, or any "we already saw this Python tensor object" trick.
-
-The survey must call this out per source. If a SOTA blog post reports `+15%` from a generic "activation cache", the survey must record both numbers: the headline `+15%` and a sober estimate of how much of that is benchmark-loop artifact vs. structural gain. Otherwise the campaign starts with an inflated ceiling and the agent will keep chasing it for the rest of the rounds.
+When a SOTA reference reports a large gain, separate it into structural kernel/algorithm work (transfers 1:1), bounded weight-cache work (transfers per Rule 11's bound), and benchmark-only artifacts (does not transfer). Record both the headline number and the structural-vs-residual split. Otherwise the campaign starts with an inflated ceiling.
 
 Use `related-work-template.md` as the default output structure for `<campaign_dir>/related_work.md`.
+
+## Avoiding Benchmark Over-Fitting
+
+This section is the operational layer for [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) Rule 11. The rule defines the hard constraints — bucket classification (K1–K4, W1–W3), forbidden patterns, the W1 gain bound, the workload-distribution constraint for GroupGemm / MoE, the required `Real-training transfer check` summary section, and REPORT re-attribution. This section says **when** to apply them and gives the lightweight procedures the agent runs during each phase.
+
+### When to invoke
+
+- **SURVEY**: while filling `<campaign_dir>/related_work.md`, tag every shortlisted direction with a bucket. Drop `W2` / `W3` rows from the shortlist; only `K1`–`K4` and bounded `W1` rows may advance. For GroupGemm / MoE campaigns, ensure the planned `representative_shapes` include skewed expert distributions, not just the uniform default.
+- **ANALYZE**: before proposing any wrapper-level change involving `dict`, `OrderedDict`, `weakref`, `lru_cache`, `id(...)`, or any "skip work if we have seen this tensor before" idea, run the id-audit from Rule 11. For GroupGemm work, also check whether the change assumes `M_per_group` is constant, divisible by a tile dim, or that every expert is non-empty.
+- **VALIDATE**: whenever a round shows benchmark gain larger than what the kernel change can structurally produce, re-check the bucket and the 4-step trace before accepting. For GroupGemm rounds, re-run the validation on at least one skewed shape and confirm the gain holds.
+- **REPORT**: while writing `## Final Report` in `logs/optimize.md`, re-attribute the campaign's `baseline → final best` delta into `S_real`, `W_real`, `R_real` per Rule 11.
+
+### Pen-and-paper hit-rate trace
+
+For any cache that survives the bucket / id-audit gates, trace its hit rate across a hypothetical 4-step real-training loop:
+
+```
+step 1: a1, w, grad_out_1   ->  fwd(a1, w),   bwd(grad_out_1)
+step 2: a2, w, grad_out_2   ->  fwd(a2, w),   bwd(grad_out_2)
+step 3: a3, w, grad_out_3   ->  fwd(a3, w),   bwd(grad_out_3)
+step 4: a4, w, grad_out_4   ->  fwd(a4, w),   bwd(grad_out_4)
+```
+
+Expected hit rates:
+
+- W1 weight cache keyed on `(id(w), w._version)`: 1 hit per step (backward reuses forward-time entry; `optim.step()` invalidates before next forward).
+- W2 activation cache keyed on `(id(a), a._version)`: 0 hits (`a` differs across steps).
+- W2 grad_out cache: 0 hits.
+
+If the real-training hit rate falls below 50%, the round MUST be rolled back even if the benchmark accepted it.
+
+### Checklist — SURVEY
+
+Before `<campaign_dir>/related_work.md` is complete:
+
+- Every `Transferable Ideas` and `Non-Transferable or Misleading Items` entry carries a bucket tag.
+- The `Real-training Transfer Audit` table fills `Reported gain` and `Estimated real-training gain` per row; `W1` rows use the bound `quant_time(weight) / step_time` instead of the vendor headline.
+- The `Initial Hypothesis Shortlist` contains only `K1`–`K4` and bounded `W1` directions; `W2` / `W3` ideas sit only under `Non-Transferable`.
+- For GroupGemm / MoE campaigns, the planned `representative_shapes` include at least one skewed expert distribution (e.g. `top_k=1 cf=1.25` and a near-degenerate case), not only the uniform layout.
+- The `Bottom Line` section names the most-relevant idea **and** its bucket.
+
+### Checklist — VALIDATE
+
+Before recording a round as ACCEPT:
+
+- No new `dict` / `OrderedDict` / `lru_cache` keyed on `id(t)` for any non-weight `t`.
+- No new code path uses `weakref.ref(activation)` or `weakref.ref(grad_out)`.
+- If the round adds a weight cache: the `_version` invalidation is tested (mutate a clone of the weight in-place, expect cache miss).
+- For GroupGemm rounds: no `tl.constexpr` / compile-time constant `M_per_group`, no static assumption that every expert is non-empty, and the benchmark gain reproduces on at least one skewed-distribution shape.
+- The summary's `Real-training transfer check` section is filled in and explicitly states the estimated real-training gain, plus (for GroupGemm) the skew robustness line.
+- Any reusable tip appended does not advertise an `id(activation)` / `id(grad_out)` pattern or a "fixed `M_per_group`" GroupGemm shortcut as a useful technique.
+
+### Checklist — REPORT
+
+Before publishing `## Final Report` in `logs/optimize.md`:
+
+- Every accepted round has a `Real-training transfer check` section in its `summary.md` with a concrete `Decision`.
+- No accepted round has `Decision: REJECT-as-overfit`; if one does, roll it back first, then re-run the audit on the remaining lineage.
+- The `Real-training applicability audit` table is filled per Rule 11's re-attribution procedure (`S_real`, `W_real`, `R_real`), not copied from the headline benchmark number.
+- The inflation gap (`headline benchmark gain` minus `real-training-equivalent gain`) is reported. If the gap exceeds 1%, the report attributes it to benchmark-loop residual and recommends rollback rather than shipping the inflated headline.
 
 ## READ_HISTORICAL_TIPS
 
@@ -286,56 +327,19 @@ The project skill provides a recommendation, but the agent makes the final decis
 
 ### workspace-mode Minimal Development Environment
 
-When the agent selects `workspace-mode`, set up a minimal development environment within the campaign directory, containing at least:
+When the agent selects `workspace-mode`, extend the campaign directory from PREPARE_ENVIRONMENT with three additional subdirectories for the minimal local stack:
 
-```text
-agent/workspace/<campaign_name>/
-├── src/                   # Minimal kernel implementation extracted from upstream
-├── tests/                 # Targeted correctness tests
-├── bench/                 # Targeted benchmarks
-├── logs/
-│   ├── optimize.md
-│   └── performance_trend.md
-├── profiles/
-├── related_work.md
-├── rounds/
-│   ├── round-1/
-│   │   ├── summary.md
-│   │   ├── kernel_snapshot/
-│   │   └── artifacts/
-│   └── round-N/
-│       ├── summary.md
-│       ├── kernel_snapshot/
-│       └── artifacts/
-└── manifest.yaml
-```
+- `src/` — minimal kernel implementation extracted from upstream
+- `tests/` — targeted correctness tests equivalent to their upstream counterparts
+- `bench/` — targeted benchmarks equivalent to their upstream counterparts
 
 Setup principles:
-- **Minimal**: Extract only the target kernel and its direct dependencies, not the entire project
-- **Reproducible**: Record which commit the code was extracted from and which files were extracted
-- **Faithful**: Tests and benchmarks must be equivalent to their upstream counterparts, ensuring trustworthy results
-- **Clear integration path**: After optimization targets are met, only sync core kernel changes back to upstream — do not carry over scaffolding or temporary code
+- **Minimal**: extract only the target kernel and its direct dependencies, not the entire project.
+- **Reproducible**: record which upstream commit and files were extracted.
+- **Faithful**: local tests/benchmarks must match their upstream counterparts so results are trustworthy.
+- **Clear integration path**: after targets are met, sync only core kernel changes back upstream — never the scaffolding.
 
-How to extract code from a specific project, build minimal tests, and benchmarks is guided by the corresponding project skill.
-
-Regardless of mode, optimization artifacts (logs, profiles, benchmark results) are uniformly stored in the campaign directory.
-
-## Workflow
-
-The agent's full path: **project skill → this file (understand requirements) → project skill (collect information) → this file (DEFINE_TARGET / PREPARE_ENVIRONMENT / SURVEY_RELATED_WORK) → `../../rules/iteration_rules.mdc` → `workflow/optimize-loop.md` → project skill (acceptance)**.
-
-Typical interaction sequence:
-
-1. Agent is directed to this file from the project skill.
-2. Read "Prerequisite Information" to understand what the optimization framework needs.
-3. Return to the project skill and collect project information per the requirement checklist.
-4. Return to this file with the information, execute DEFINE_TARGET → PREPARE_ENVIRONMENT.
-5. Run `SURVEY_RELATED_WORK`: create `<campaign_dir>/related_work.md`, using `agent/tmp/<campaign_name>/related-work/` for any temporary repo clones or downloaded notes.
-6. If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, read it before the first round.
-7. Read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) before the first BASELINE / VALIDATE round.
-8. Read [`workflow/optimize-loop.md`](workflow/optimize-loop.md) and execute the BASELINE → ANALYZE → OPTIMIZE → VALIDATE loop.
-9. Read language, hardware, profiling, related-work survey outputs, and historical tips as needed during ANALYZE / OPTIMIZE phases.
-10. Output REPORT and hand back to the project skill for final acceptance.
+The project skill provides how-to for extraction and minimal-stack construction. Regardless of mode, all optimization artifacts (logs, profiles, benchmark results) live in the campaign directory.
 
 ## Knowledge Reference Table
 
@@ -343,9 +347,7 @@ Read the corresponding skill as needed based on `target_lang`, `target_gpu`, and
 
 | What you need | Where to find it |
 |---------------|-----------------|
-| Linear iteration contract | [../../rules/iteration_rules.mdc](../../rules/iteration_rules.mdc) |
-| No benchmark over-fitting (hard rule) | [../../rules/no_benchmark_overfitting.mdc](../../rules/no_benchmark_overfitting.mdc) |
-| Cache audit / id-key audit (operational) | [avoid-benchmark-overfit/SKILL.md](avoid-benchmark-overfit/SKILL.md) |
+| Linear iteration contract + no benchmark over-fitting (hard rules) | [../../rules/iteration_rules.mdc](../../rules/iteration_rules.mdc) |
 | Optimization process and gating rules | [workflow/optimize-loop.md](workflow/optimize-loop.md) |
 | General Triton optimization techniques | [triton/SKILL.md](triton/SKILL.md) |
 | General HIP optimization techniques | [hip/SKILL.md](hip/SKILL.md) |
@@ -390,75 +392,11 @@ For detailed stagnation detection and direction-switching rules, see [`workflow/
 
 **User instruction**: "Please optimize the blockwise FP8 GEMM Triton implementation in Primus-Turbo, target GPU is MI300X."
 
-**Step 1: Understand requirements**
-
-Agent is directed from `primus-turbo-develop/SKILL.md` to this file. Reads "Prerequisite Information" and learns the optimization framework needs: kernel source file, focused test, focused benchmark, quick validation script template, benchmark output format, scoring rules, execution_mode recommendation, and rebuild requirements.
-
-**Step 2: Collect project information**
-
-Agent returns to `primus-turbo-develop/SKILL.md` and collects per the requirement checklist:
-- Kernel: `primus_turbo/triton/gemm/gemm_fp8_kernel.py`
-- Focused test: `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`
-- Focused benchmark: `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`
-- Quick validation template: generate `quick_test_bench.py` during PREPARE_ENVIRONMENT, then fill representative shapes after BASELINE
-- Scoring: `Forward TFLOPS` geometric mean, `Check` as correctness gate
-- Environment recommendation: Triton → `repo-mode`, no rebuild needed
-
-**Step 3: DEFINE_TARGET**
-
-Organize parameters: `target_op=gemm_fp8_blockwise`, `target_backend=TRITON`, `target_gpu=gfx942`, `execution_mode=repo`, `performance_target=null`. Verify completeness against the prerequisite information checklist.
-
-Confirm with user:
-
-> Confirm optimization target:
-> - Operator: blockwise FP8 GEMM, backend: TRITON, GPU: MI300X (gfx942)
-> - Primary metric: Forward TFLOPS (do you also want to optimize Backward?)
-> - Performance target: `null` unless you want to set a concrete target
-> - Execution mode: repo-mode, git_commit=true, git_branch=auto
-> - Please confirm or adjust.
-
-Proceed to PREPARE_ENVIRONMENT after user confirmation.
-
-**Step 4: PREPARE_ENVIRONMENT**
-
-1. Create optimization branch: `git checkout -b optimize/gemm_fp8_blockwise_triton_gfx942_20260412`
-2. Create `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/`
-3. Create subdirectories `logs/`, `profiles/`, `rounds/`
-4. Write `manifest.yaml`
-5. Create `rounds/round-1/` as the baseline round scaffold
-6. Generate `quick_test_bench.py` with placeholder `SHAPES`; fill it after BASELINE selects representative shapes
-
-**Step 5: SURVEY_RELATED_WORK**
-
-1. Review local project implementations and AMD / ROCm references
-2. Search external related work and competitor baselines as needed
-3. If code inspection is useful, clone temporary repos into `agent/tmp/gemm_fp8_blockwise_triton_gfx942_20260412/related-work/repos/`
-4. Write `agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/related_work.md` using `related-work-template.md`
-
-**Step 6: READ_HISTORICAL_TIPS**
-
-Read `agent/historical_experience/gfx942/gemm_fp8_blockwise/triton/tips.md` if it exists, carrying forward only reusable lessons that still need to be validated in the current environment.
-
-**Step 7: Enter optimization loop**
-
-Read `workflow/optimize-loop.md` and execute as defined:
-1. BASELINE (`round-1`): Run focused test (confirm PASS) → run focused benchmark → write `rounds/round-1/summary.md` → select representative shapes and update `quick_test_bench.py`
-2. ANALYZE: Read `related_work.md`, kernel source, consult `triton/SKILL.md` and `hardware/gfx942/`, generate optimization hypotheses
-3. OPTIMIZE → VALIDATE loop (`round-2+`): Modify kernel → run test → run benchmark → write `rounds/round-N/summary.md` → compare → accept or rollback → append a reusable tip if the round taught something worth preserving
-4. After reaching target or exhausting directions, output REPORT
-
-**Step 8: Acceptance** (return to project skill)
-
-Project skill runs full tests, reviews report, confirms commits.
-
-## Related Skills
-
-| Skill | Description |
-|-------|-------------|
-| `workflow/optimize-loop` | Detailed optimization process, gating, rollback, stagnation handling |
-| `triton` | General Triton optimization techniques |
-| `hip` | General HIP/CK optimization techniques |
-| `hardware/gfx942` | MI300X/MI325X hardware parameters and optimization strategies |
-| `hardware/gfx950` | MI350X/MI355X hardware parameters and optimization strategies |
-| `tool-rocprof` | rocprof profiling tool usage |
-| `primus-turbo-develop` | Code structure, build, test, benchmark, and integration for the Primus-Turbo project |
+1. **Understand requirements** — from the project skill, learn the framework needs: kernel source, focused test/benchmark commands, quick validation template, benchmark output format, scoring rules, execution mode, rebuild requirements.
+2. **Collect project information** — kernel `primus_turbo/triton/gemm/gemm_fp8_kernel.py`; focused test `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"`; focused benchmark `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise`; scoring is `Forward TFLOPS` geomean with `Check` as the correctness gate; Triton → `repo-mode`, no rebuild.
+3. **DEFINE_TARGET** — `target_op=gemm_fp8_blockwise`, `target_backend=TRITON`, `target_gpu=gfx942`, `execution_mode=repo`, `performance_target=null`. Confirm key parameters with the user before starting.
+4. **PREPARE_ENVIRONMENT** — `git checkout -b optimize/gemm_fp8_blockwise_triton_gfx942_<date>`; create `agent/workspace/<campaign_name>/` with `logs/`, `profiles/`, `rounds/round-1/`; write `manifest.yaml`; generate `quick_test_bench.py` with placeholder `SHAPES`.
+5. **SURVEY_RELATED_WORK** — write `<campaign_dir>/related_work.md` using `related-work-template.md`, tagging every shortlisted direction with its bucket (K1–K4 / W1 / W2 / W3).
+6. **READ_HISTORICAL_TIPS** — read `agent/historical_experience/gfx942/gemm_fp8_blockwise/triton/tips.md` if present.
+7. **Optimization loop** — follow `workflow/optimize-loop.md`: BASELINE (`round-1`, full validation, select representative shapes, fill `quick_test_bench.py`), then ANALYZE → OPTIMIZE → VALIDATE rounds, each with `summary.md`, kernel snapshot, and trend update.
+8. **Acceptance** — hand back to the project skill for full tests, report review, and commit confirmation.

@@ -239,6 +239,164 @@ To verify chain integrity, the `performance_trend.md` must show monotonically no
 - Above Turbo baseline: continue, document the techniques that worked
 - Only stop at the requested round count, or when hitting theoretical hardware peak
 
+## Rule 11: Every Accepted Gain Must Transfer to Real LLM Training
+
+A round whose only measurable gain comes from exploiting the benchmark idiom is INVALID and MUST be rolled back, even if its aggregate score improved. Every accepted optimization must produce the same gain in a real LLM training step as in `bench_gemm_turbo.py`'s 100-iter inner loop.
+
+### Why the benchmark idiom is not real training
+
+The campaign benchmarks reuse the same Python tensor objects across the timing loop:
+
+```python
+a = torch.randn(M, K, ...)
+grad_out = torch.randn_like(out)
+for _ in range(100):
+    out = turbo.ops.gemm_fp8(a, b, ...)         # same a, b objects
+    out.backward(grad_out, retain_graph=True)   # same grad_out
+```
+
+So `id(a)`, `id(b)`, `id(grad_out)` and their `_version` are stable across all 100 iters. Real training does not have this property — activations and `grad_out` are fresh objects every iteration (allocated by the dataloader and by autograd), and only `weight` keeps stable identity inside one fwd+bwd pair, with `_version` advancing after `optim.step()`.
+
+Two classes of optimization look free in the benchmark but vanish in real training:
+
+1. **Identity-keyed caches** — cache lookups keyed on `id(t)` for any `t` other than a module weight. Covered by the bucket table and forbidden patterns below.
+2. **Uniform workload assumptions** — kernels or schedulers built around the single shape distribution the benchmark happens to use. Covered by "Workload distribution assumptions" below; especially relevant for GroupGemm / MoE.
+
+### Bucket classification (identity-keyed caches)
+
+| Bucket | Examples | Verdict |
+|---|---|---|
+| K1 Kernel-internal | autotune config, mfma variant, tile shape, `EVEN_K`, swizzle, pipelining, `tl.dot_scaled` | Always allowed |
+| K2 Layout duplication | NT-only, NN-only, TN-only kernel variants | Always allowed |
+| K3 Single-launch fusion | `quant_fp8_blockwise_dual_impl`, fused dequant+matmul, fused softmax+drop | Always allowed |
+| K4 Same-call data flow | `ctx.save_for_backward` carrying a forward-side intermediate to backward | Always allowed |
+| W1 Weight quant cache | cache keyed on `id(weight) + _version + shape` | Allowed but bounded; see "Bounding W1" |
+| W2 Activation quant cache | cache keyed on `id(activation)`, `id(grad_out)`, or `id(activation_scale)` | **FORBIDDEN** |
+| W3 Generic wrapper memoization | any `lru_cache`/`dict` wrapping `forward`/`backward` whose key contains a non-weight tensor `id` | **FORBIDDEN** |
+
+Adding `_version`, shape, stride, or dtype to a W2/W3 key does not rescue the pattern — those qualifiers make the cache correctness-safe, not transfer-safe.
+
+### Forbidden code patterns (W2 / W3)
+
+Any wrapper-level cache whose key includes `id(t)` for a `t` other than a module weight is forbidden. The canonical anti-pattern:
+
+```python
+# FORBIDDEN — activation / grad_out / activation_scale cache
+_cache: dict = OrderedDict()
+def forward(ctx, a, ...):
+    key = (id(a), getattr(a, "_version", 0), tuple(a.shape), ...)
+    if key in _cache:
+        a_fp8, a_scale = _cache[key]
+    else:
+        a_fp8, a_scale = quant_fp8_blockwise_impl(a, ...)
+        _cache[key] = (a_fp8, a_scale)
+```
+
+Real-training miss rate is ~100% because `a` is a fresh tensor each iteration; benchmark miss rate is 1/100. The same failure mode applies to caching `grad_out`, caching `scale.T.contiguous()` of activation scales (chained on the activation cache), and any `lru_cache` over `forward`/`backward` keyed on a non-weight tensor.
+
+### Allowed code patterns
+
+| Pattern | Why it is safe |
+|---|---|
+| Single-launch fusion (one read of `a`, multiple outputs — e.g. `quant_fp8_blockwise_dual_impl`) | Kernel-side; no cross-iteration identity assumption |
+| `ctx.save_for_backward` of a forward-side intermediate consumed by its own backward | `ctx` is unique per `apply()` invocation; data flow is per-call |
+| Weight cache keyed on `id(weight) + _version`, invalidated after `optim.step()` | Weights are long-lived; identity is stable inside one fwd+bwd pair; per-step gain is bounded (next section) |
+| `@triton.autotune`'s per-key compiled-kernel cache | Part of Triton itself; unaffected by this rule |
+
+### Bounding W1
+
+W1's per-step real-training gain is bounded by `gain_per_step = quant_time(weight) / step_time`. For a `[N, K] = [4096, 4096]` weight on MI355X this is roughly `30 µs / 1.5-2 ms ≈ +1.5%` per step. A benchmark reporting +5% from a weight cache alone means about +3.5% is benchmark-loop residual that will not transfer. Report the bounded per-step number in the round summary, not the benchmark headline.
+
+### Workload distribution assumptions (GroupGemm / MoE / batched ops)
+
+In Grouped GEMM and other MoE-style ops, benchmarks commonly use a **static, evenly-distributed group layout** — every expert receives `total_tokens / num_experts` tokens, padded to a multiple of 128. Real MoE training does not match this:
+
+- Top-k routing with a capacity factor produces a **skewed `tokens_per_expert` histogram** that varies batch by batch. Some experts may receive 0 tokens; others saturate capacity.
+- `tokens_per_expert` is **not constant** across iterations and generally **not a clean multiple of any tile dimension**.
+- Capacity-factor dropping changes the visible per-expert count from step to step; early-training skew is especially severe.
+
+A kernel or scheduler that monetizes the benchmark's even layout is benchmark over-fitting. **Forbidden assumptions in committed GroupGemm code paths:**
+
+- Compile-time constants for `M_per_group` (e.g. `M_per_group: tl.constexpr`), or `assert M_per_group % BLOCK_M == 0` baked into the kernel.
+- Persistent-kernel or static work partitioning that assumes each expert receives a fixed token count.
+- Padding strategies whose overhead is small only because the benchmark hits a tile boundary.
+- Single-pass schedules that assume every group is non-empty, or that the largest group is bounded by a benchmark-only number.
+
+**Acceptable practice:**
+
+- Treat `tokens_per_expert` as a runtime tensor (host- or device-resident), not a layout constant. Handle the empty-group case explicitly (skip launch or branch on zero rows).
+- The campaign's `representative_shapes` for any GroupGemm-class op MUST include skewed distributions alongside the uniform one. A reasonable starter set: `uniform`, `top_k=2 cf=1.0`, `top_k=1 cf=1.25`, and a near-degenerate case where one expert receives ≥ 50% of all tokens.
+- For each GroupGemm round, the `Real-training transfer check` in `summary.md` must state whether the change holds under skew. If a benchmark gain vanishes or regresses on the skewed shapes, the round is benchmark-over-fit and must be rolled back.
+
+### id(...) audit
+
+Before adding any cache, walk through each component of the proposed key:
+
+| Key component | Stable across real-training iterations? |
+|---|---|
+| `id(weight)` (module parameter) | Yes, until the parameter is reassigned (rare) |
+| `getattr(weight, "_version", 0)` | Bumps once per `optim.step()`; `(id, version)` is stable inside one fwd+bwd |
+| `id(activation)` | **No** — fresh tensor each iteration |
+| `id(grad_out)` | **No** — autograd allocates fresh objects |
+| `id(activation_scale)` | **No** — produced fresh by the quant kernel each call |
+| `tuple(t.shape)`, `tuple(t.stride())`, `t.dtype` | Stable, but they alone do not authorize a cache |
+
+If the cache key relies on any "No" row for its hit rate, the cache will miss in real training. Reject the round at ANALYZE — do not start implementing.
+
+### Required round summary section
+
+Every round's `<campaign_dir>/rounds/round-N/summary.md` MUST include:
+
+```markdown
+## Real-training transfer check
+- Bucket: <K1 / K2 / K3 / K4 / W1 / W2 / W3>
+- Cache key (if any): <(id(t), t._version, …) or "no cache">
+- id(...) audit: <which key components are stable across real-training iterations>
+- 4-step pen-and-paper trace hit rate: <hits/total>
+- Workload distribution robustness (GroupGemm / MoE only): <"holds under skew" with skewed-shape data, or "uniform-only — REJECTED">
+- Benchmark gain on this round: +X.XX% combined-step
+- Estimated real-training gain: +Y.YY% combined-step (with derivation)
+- Decision: ACCEPT-as-real / ACCEPT-with-asterisk / REJECT-as-overfit
+```
+
+`ACCEPT-as-real` is reserved for K1-K4 rounds that pass both the id-audit and (for GroupGemm) the skew check. `ACCEPT-with-asterisk` is reserved for W1 rounds with the bounded gain explicitly documented. `REJECT-as-overfit` is the only valid outcome for W2/W3 and for any GroupGemm round whose gain depends on uniform distribution.
+
+### Mandatory regression check for any candidate cache
+
+If a round adds a cache (even a W1 weight cache), the summary MUST include a mini real-training simulation:
+
+```python
+for step in range(8):
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)   # fresh
+    out = turbo.ops.gemm_fp8(a, weight, trans_b=True, config=cfg)
+    grad_out = torch.randn_like(out)                              # fresh
+    out.backward(grad_out)
+    optim_like_step(weight)  # bumps weight._version
+    record_cache_hit_rate()
+```
+
+Acceptance: weight-cache hit rate ≥ 1 per (fwd + bwd) per step; activation/grad_out cache hit rate must be 0. If the simulation cannot be run (e.g. no GPU available), the round CANNOT add a new cache.
+
+### REPORT-time re-attribution
+
+When the campaign terminates, walk the accepted lineage and sum the round-level numbers:
+
+- `S_real` = K1-K4 accepted rounds (= benchmark gain, transfers 1:1)
+- `W_real` = W1 accepted rounds (capped by `quant_time(weight) / step_time`)
+- `R_real` = 0 (anything in the accepted lineage that cannot defend its transfer — id-keyed cache OR uniform-only GroupGemm gain — must be rolled back before publishing)
+
+The headline real-training improvement is `S_real + W_real`. If `headline_benchmark_gain - (S_real + W_real) > 1%`, that delta is benchmark-only inflation; call it out, do not ship it as the real-training number.
+
+### Tips file hygiene
+
+In `agent/historical_experience/<gpu>/<op>/<backend>/tips.md`:
+
+- Never describe a W2/W3 cache or a uniform-distribution GroupGemm trick as a useful technique. Record it as a known anti-pattern with "benchmark over-fit; do not retry."
+- For W1 tips, state the per-step real-training gain bound, not the benchmark number.
+- Delete any previously-recorded tip that celebrates an `id(activation)` / `id(grad_out)` cache or a "fixed `M_per_group`" GroupGemm shortcut.
+
+When in doubt, prefer kernel-side optimizations (autotune space, mfma variant, tile shape, pipelining, scheduling, dynamic group dispatch) over wrapper-level caches and over schedulers that hardcode a benchmark-specific shape distribution.
+
 ## Summary: The Linear Iteration Loop
 
 ```

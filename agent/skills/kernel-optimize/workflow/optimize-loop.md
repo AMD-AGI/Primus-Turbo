@@ -1,90 +1,29 @@
 # Optimization Process Specification
 
-This file defines the **detailed optimization process** for `kernel-optimize`.
+Detailed optimization process for `kernel-optimize`. Enter this file after `../SKILL.md` has finished DEFINE_TARGET, PREPARE_ENVIRONMENT, SURVEY_RELATED_WORK, and READ_HISTORICAL_TIPS — the campaign directory, `manifest.yaml`, `quick_test_bench.py`, and `related_work.md` are already in place.
 
-The default prerequisite is (agent proceeds through: project skill → `../SKILL.md` (understand requirements) → project skill (collect information) → `../SKILL.md` (execute) → this file):
-- All required information has been collected from the project skill per `../SKILL.md`'s "Prerequisite Information"
-- DEFINE_TARGET (parameter structuring) and PREPARE_ENVIRONMENT (campaign directory setup) have been completed in `../SKILL.md`
-- The campaign directory for this round has been established, `manifest.yaml` has been filled in, and `quick_test_bench.py` has been generated
-- `related_work.md` has been created by the `SURVEY_RELATED_WORK` step in `../SKILL.md`
-- If `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` exists, it has been read after `related_work.md` and before `round-1`
-- `target_op`, `target_backend`, `target_lang`, `target_gpu`, and `execution_mode` are clearly defined
-
-Therefore, this file is **not responsible for**:
-- Explaining how to extract parameters from user instructions (see DEFINE_TARGET in [`../SKILL.md`](../SKILL.md))
-- Specifying campaign directory structure (see PREPARE_ENVIRONMENT in [`../SKILL.md`](../SKILL.md))
-- Running the related-work / SOTA survey itself (done in `../SKILL.md` before this file starts)
-- Providing build, test, or benchmark commands for any specific project (provided by the project skill)
+Parameter extraction, campaign directory structure, the related-work survey itself, and project-specific build/test/benchmark commands live in `../SKILL.md` and the project skill, not here.
 
 ## Iteration Contract
 
-Before running `ENVIRONMENT_BASELINE`, read both
-[`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc)
-and
-[`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc).
-Treat them as hard constraints throughout the loop:
+Before running `ENVIRONMENT_BASELINE`, read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc). Treat all 11 rules as hard constraints throughout the loop:
 
 - one hypothesis and one meaningful kernel change per round
 - correctness before performance
 - benchmark the full active validation set
 - accept or roll back cleanly to the previous accepted baseline
-- **every accepted gain must transfer to real LLM training**; benchmark-only caches keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` are forbidden — see the operational checklist in [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
+- **every accepted gain must transfer to real LLM training** (Rule 11); the operational layer — when to apply the bucket audit and the per-phase checklists — lives in [`../SKILL.md`](../SKILL.md) under "Avoiding Benchmark Over-Fitting"
 
-## Input Parameters
+## Pre-loop Sanity Check
 
-Before starting the optimization process, at minimum define:
+Before `ENVIRONMENT_BASELINE`, confirm the campaign state set up in `../SKILL.md`:
 
-| Parameter | Meaning |
-|-----------|---------|
-| `target_op` | Target operator |
-| `target_backend` | Target backend |
-| `target_lang` | Implementation language |
-| `target_gpu` | Target GPU architecture |
-| `execution_mode` | `repo` / `workspace` |
-| `campaign_dir` | Campaign directory for this round |
-| `target_shapes` | Full shape set of interest for this round; quick validation uses `representative_shapes` as the active subset |
-| `performance_target` | Target performance; `null` means there is no explicit numeric target |
-| `primary_metric` | Primary comparison metric(s); depends on operator type (e.g., GEMM: `Forward TFLOPS`, elementwise: `Forward GB/s`) |
-| `git_commit` | Whether to git commit accepted versions |
-| `git_branch` | Current optimization branch (or `none`) |
-| `max_iterations` | Maximum iteration count (optional) |
-| `max_duration` | Maximum runtime budget (optional, e.g. `"4h"`) |
-| `project_skill` | Corresponding project skill |
+- All `Input Parameters` (see `../SKILL.md`) are populated and recorded in `manifest.yaml`.
+- All `Prerequisite Information` (kernel source path, focused test/benchmark commands, quick command, benchmark output column names, rebuild requirements, related-work report) is on hand or referenceable.
+- `<campaign_dir>/related_work.md` exists with its bucket-tagged shortlist.
+- `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` has been read once if it exists (lowercase the backend directory name).
 
-## Confirm Previously Obtained Information
-
-The following information should have been obtained during the project skill phase and DEFINE_TARGET phase. Do a final confirmation before starting the optimization loop:
-
-| Information | Purpose | Example |
-|-------------|---------|---------|
-| **Kernel source file path** | Read code during ANALYZE | `primus_turbo/triton/gemm/gemm_fp8_kernel.py` |
-| **Focused test command** | Full correctness validation | `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` |
-| **Focused benchmark command** | Full performance evaluation | `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
-| **Quick validation command** | Fast correctness + benchmark each round | `python <campaign_dir>/quick_test_bench.py` (generated in PREPARE_ENVIRONMENT, filled with `representative_shapes` after BASELINE) |
-| **Benchmark output column names** | Parse results, compute scores | `Forward TFLOPS`, `Backward TFLOPS` (primary_metric), `Check` (correctness gate) |
-| **Rebuild requirements** | Whether rebuild is needed after code changes | Triton: no rebuild needed; HIP: incremental rebuild required |
-| **Related-work report** | Seed early hypotheses with external and internal baselines | `<campaign_dir>/related_work.md` |
-
-If anything is missing, refer back to the project skill or `../SKILL.md`'s manifest to fill in the gaps.
-
-## Historical Tips Bootstrap
-
-After `related_work.md` is written and before `round-1` / `ENVIRONMENT_BASELINE` starts, check whether a reusable tips file already exists for this hardware / op / backend combination.
-
-Path convention:
-
-`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
-
-Example:
-
-`agent/historical_experience/gfx950/gemm_fp8_blockwise/triton/tips.md`
-
-Rules:
-
-- Normalize the backend directory to lowercase, e.g. `TRITON -> triton`, `CK -> ck`
-- If the file exists, read it once before the first round
-- Treat it as prior experience, not as permission to skip measurement, profiling, or validation
-- Revisit it later only when the round history suggests a related pattern may apply again
+If anything is missing, return to `../SKILL.md` or the project skill to fill the gap before starting `round-1`.
 
 ## Two-Level Validation
 
@@ -107,8 +46,6 @@ Quick validation is for small-step iteration within one direction. When a direct
 
 ## Overall Flow
 
-Before `ENVIRONMENT_BASELINE`, if the corresponding historical tips file exists, read it.
-
 ```text
 ENVIRONMENT_BASELINE
   -> [ANALYZE -> OPTIMIZE -> VALIDATE -> ACCEPT/ROLLBACK] (iteration loop)
@@ -116,12 +53,9 @@ ENVIRONMENT_BASELINE
   -> REPORT
 ```
 
-Round numbering is strict: `round-1` is BASELINE, and optimization attempts start at `round-2`.
+Round numbering is strict: `round-1` is BASELINE; optimization attempts start at `round-2`. ACCEPT and ROLLBACK both return to ANALYZE; do not jump to REPORT unless TERMINATION_CHECK passes.
 
-ACCEPT and ROLLBACK both return to ANALYZE for the next round. Do not jump directly to REPORT unless TERMINATION_CHECK passes.
-
-In `repo-mode`, VALIDATE validates directly in the main repo with no SYNC_BACK step.
-In `workspace-mode`, VALIDATE is split into a local gate and an integration gate, with SYNC_BACK in between.
+In `repo-mode`, VALIDATE runs directly in the main repo with no SYNC_BACK step. In `workspace-mode`, VALIDATE is split into a local gate and an integration gate, with SYNC_BACK in between.
 
 ## Scoring Operations Specification
 
@@ -272,19 +206,11 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 - What is the expected benefit
 - What are the risks
 - What signal will verify success or failure
-- **Real-training transfer assessment** (mandatory, no exceptions):
-  - Which bucket from [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md) does this direction belong to (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`)?
-  - For `K1`–`K4`: the change rewrites kernel work that runs on every real iteration; the expected real-training gain equals the expected benchmark gain. State this explicitly.
-  - For `W1`: cite the per-step bound `quant_time(weight) / step_time` for the project's representative shape, derived in numbers, and use this — not the benchmark headline — as the expected real-training gain.
-  - For `W2` or `W3`: **the direction is not eligible**. Drop it from the candidate list at ANALYZE. Do not advance it to OPTIMIZE under any circumstance, even if it would visibly improve the benchmark aggregate score.
-
-**Promotion rule for the primary hypothesis**:
-- Only directions tagged `K1`–`K4`, or `W1` with a bounded gain, may be promoted to the round's primary hypothesis.
-- If only `W2` / `W3` directions look attractive, the correct outcome is to **skip the round and re-survey for new structural directions**, not to land an overfit cache.
+- Rule 11 bucket (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`) and the expected real-training gain: for `K1`–`K4` it equals the expected benchmark gain; for `W1` cite the bound `quant_time(weight) / step_time` instead of the benchmark headline; `W2` / `W3` directions are ineligible and must be dropped, not advanced
 
 **Output**:
 - Prioritized hypothesis list with the bucket and expected real-training gain on each entry
-- Primary hypothesis for this round (must satisfy the promotion rule above)
+- Primary hypothesis for this round (`K1`–`K4` or bounded `W1`; never `W2` / `W3`)
 
 ### 3. OPTIMIZE
 
@@ -295,20 +221,13 @@ When profiler data is unavailable, infer indirectly from benchmark results:
 - After modification, be able to clearly answer "what exactly was changed this round"
 - If compiled artifacts are involved, rebuild per project skill instructions
 - Record modified files, key parameters, and expected impact for this round
-- If the proposed change is a wrapper-level cache, memoization, or
-  `id(tensor)` lookup: read [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md)
-  and complete its Step 1–4 audit **before** writing any code. A cache that
-  fails the audit must not be implemented at all.
+- If the proposed change is a wrapper-level cache, memoization, or `id(tensor)` lookup: complete the bucket / id-audit / hit-rate trace in [`../SKILL.md`](../SKILL.md) "Avoiding Benchmark Over-Fitting" **before** writing any code. A cache that fails the audit must not be implemented at all.
 
 **Constraints**:
 - Do not mix unrelated cleanup into optimization attempts
 - Do not introduce multiple orthogonal major changes simultaneously
 - Do not break key interface semantics agreed upon with the upstream project
-- Do not introduce caches keyed on `id(activation)`, `id(grad_out)`, or
-  `id(activation_scale)`. These are forbidden by
-  [`../../../rules/no_benchmark_overfitting.mdc`](../../../rules/no_benchmark_overfitting.mdc)
-  because their gain comes from the benchmark idiom (same Python object
-  reused 100 times) and does not transfer to real LLM training.
+- Do not introduce caches keyed on `id(activation)`, `id(grad_out)`, or `id(activation_scale)` (Rule 11 forbidden patterns F1–F4)
 
 **Output**:
 - Candidate diff
@@ -346,7 +265,7 @@ Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (
 - `Check = FAIL` in benchmark → reject immediately
 - Aggregate score regression → default reject
 - Core shape regression > 3% → default reject
-- New wrapper-level cache keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)` → reject immediately, regardless of aggregate score. The round's `summary.md` must include a `Real-training transfer check` section showing the cache audit per [`../avoid-benchmark-overfit/SKILL.md`](../avoid-benchmark-overfit/SKILL.md); if that section says `REJECT-as-overfit`, the round is INVALID and must be rolled back.
+- Rule 11 violation: new wrapper-level cache keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)`, OR the round's `Real-training transfer check` decision is `REJECT-as-overfit` → reject immediately regardless of aggregate score
 
 **After passing**:
 1. Write this round's detailed results to `rounds/round-N/summary.md`
@@ -380,12 +299,7 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 - Record cumulative improvement relative to baseline
 - Mark which directions were effective, ineffective, or need revisiting
 - Produce candidate directions for the next round
-- For every accepted round in this campaign so far, confirm that
-  `rounds/round-N/summary.md` carries a `Real-training transfer check`
-  section whose `Decision` is `ACCEPT-as-real` or `ACCEPT-with-asterisk`.
-  Any round whose `Decision` is `REJECT-as-overfit` and yet sits in the
-  accepted lineage must be rolled back at this point — it is not
-  legitimate cumulative gain.
+- For every accepted round so far, confirm `rounds/round-N/summary.md` carries a `Real-training transfer check` section whose `Decision` is `ACCEPT-as-real` or `ACCEPT-with-asterisk`. Any `REJECT-as-overfit` round sitting in the accepted lineage must be rolled back here — it is not legitimate cumulative gain.
 
 **REPORT** (output when campaign terminates, written to the `## Final Report` section at the end of `logs/optimize.md`):
 - Baseline vs final best comparison (with full validation data)
@@ -394,22 +308,7 @@ SYNC_BACK step: only sync accepted core changes — do not carry over scaffoldin
 - List of verified ineffective directions
 - If continuing optimization, top three recommended next steps
 - Detailed data references to the corresponding `rounds/round-N/summary.md` files
-- **Real-training applicability audit** (mandatory): a single section that
-  re-attributes the campaign's `baseline → final best` delta into three
-  numbers, derived from each round's `Real-training transfer check`:
-  - structural gain (sum of `K1`–`K4` accepted rounds, expected to
-    transfer to real training 1:1)
-  - bounded gain (sum of `W1` accepted rounds, capped by
-    `quant_time(weight) / step_time`)
-  - benchmark-only residual (anything that VALIDATE accepted but the
-    transfer audit later cannot defend; this number must be `0` for a
-    clean campaign)
-  Report the campaign's real-training-equivalent improvement as
-  `structural + bounded`, separately from the benchmark aggregate gain.
-  If `benchmark_aggregate_gain - (structural + bounded) > 1%`, treat that
-  delta as benchmark-only inflation and call it out explicitly. The user
-  reading the final report must be able to tell, in one sentence, how
-  much of the headline number will survive a real LLM training step.
+- **Real-training applicability audit** (mandatory): re-attribute the campaign's `baseline → final best` delta into `S_real` (K1–K4, transfers 1:1), `W_real` (W1, capped by `quant_time(weight) / step_time`), and `R_real` (must be 0 for a clean campaign) per Rule 11's REPORT-time procedure. Report `headline benchmark gain` and `real-training-equivalent gain = S_real + W_real` separately; if the inflation gap exceeds 1%, call it out.
 
 ## Rollback Rules
 
@@ -429,21 +328,7 @@ Rollback operations:
 
 ## Historical Experience Capture
 
-After every completed round, whether accepted or rolled back, evaluate whether the round is worth recording in the long-lived tips store:
-
-`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
-
-If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
-
-Append only when the round yielded reusable knowledge beyond the local campaign, such as:
-
-- a hardware-specific constraint or backend/compiler quirk
-- a config or parameter pattern that consistently helps or hurts
-- a failure signature with a clear root cause
-- a profiler signal that maps cleanly to an actionable next step
-- a validation / measurement trick that avoids wasted rounds
-
-Do not copy the whole round summary into `tips.md`. Append only the reusable takeaway.
+After every completed round, follow iteration_rules.mdc Rule 4's "Reusable Technical Tips Capture" to decide whether to append a takeaway to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`. Create missing directories on first use.
 
 Recommended append format:
 
@@ -682,32 +567,11 @@ If none of the conditions are satisfied, the campaign must return to ANALYZE ins
 
 A REPORT must be output upon termination (see ACCEPT / REPORT phase).
 
-## Cross-Skill Reference Paths
-
-| Phase | What you need | Where to read |
-|-------|---------------|---------------|
-| Full workflow entry point | Project information collection → DEFINE_TARGET → PREPARE_ENVIRONMENT | Project skill → [`../SKILL.md`](../SKILL.md) |
-| ENVIRONMENT_BASELINE / VALIDATE | Project test commands, benchmark commands | Corresponding project skill |
-| ANALYZE | Profiling methods | [`../../tool-rocprof/SKILL.md`](../../tool-rocprof/SKILL.md) |
-| ANALYZE | Architecture constraints | `../../hardware/<arch>/SKILL.md` + `optimization-guide.md` |
-| ANALYZE / OPTIMIZE | Language-level optimization techniques | [`../triton/SKILL.md`](../triton/SKILL.md) or [`../hip/SKILL.md`](../hip/SKILL.md) |
-| ANALYZE / OPTIMIZE | CK template and pipeline tuning | [`../hip/ck.md`](../hip/ck.md) |
-| ANALYZE | Historical examples and cross-generation comparison | [`../examples.md`](../examples.md) and [`../../hardware/hardware-comparison.md`](../../hardware/hardware-comparison.md) |
-| Before round-1 / after each round | Historical reusable tips | `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` (if present) |
-
 ## Execution Reminders
 
-- Read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc) before the first round and keep it active for the whole campaign.
-- Correctness first, then performance.
-- Advance only one primary hypothesis per round.
-- When `git_commit=true`, accepted versions must be git committed, forming a traceable lineage.
-- When stagnated, switch directions — do not endlessly fine-tune in the same direction.
-- Keep logs updated in real-time so humans can check current progress and historical decisions at any time.
-- `logs/optimize.md` and `logs/performance_trend.md` are append-only; never delete old content, only append new entries or correction notes.
-- Every round, including the baseline, must keep `rounds/round-N/summary.md` up to date; every VALIDATE round must update that summary and `logs/optimize.md` together.
-- After `related_work.md` is done and before the first round starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists.
-- After every accepted or rolled-back round, append a reusable lesson to that tips file when the round is worth preserving.
-- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`. **Always obtain the current time by running `date '+%Y-%m-%d %H:%M'` in the shell**; do not rely on the system prompt date or any other source, as they may lack time-of-day precision.
-- **Never pipe benchmark or test commands through `| tail`, `| head`, `| grep`, or any filter.** Piping changes stdout from line-buffered to fully-buffered, hiding all intermediate output. This makes it look like the command is hung, leading to premature kills and lost data. If you need to inspect a subset of the output, redirect the full output to a file first (`> out.txt 2>&1`), then read or search the file after the command completes.
+Operational guardrails not covered by `iteration_rules.mdc` (read the iteration rules for the per-round contract — single hypothesis, correctness before performance, append-only logs, tips file hygiene):
+
+- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`. **Always obtain the current time by running `date '+%Y-%m-%d %H:%M'`** in the shell; do not rely on the system prompt date.
+- **Never pipe benchmark or test commands through `| tail`, `| head`, `| grep`, or any filter.** Piping forces stdout into fully-buffered mode, hiding intermediate output and making running commands look hung. Redirect to a file (`> out.txt 2>&1`) first, then read/search after the command completes.
 - **Never treat a backgrounded command as a completed round.** If a shell command times out and continues in the background, that is an unfinished round-state, not a result.
-- **Never leave a round half-closed.** If `summary.md`, `kernel_snapshot/`, `logs/optimize.md`, or `logs/performance_trend.md` are missing for the current round, the agent must finish that bookkeeping before any new optimization action.
+- **Never leave a round half-closed.** If `summary.md`, `kernel_snapshot/`, `logs/optimize.md`, or `logs/performance_trend.md` are missing for the current round, finish that bookkeeping before any new optimization action.
