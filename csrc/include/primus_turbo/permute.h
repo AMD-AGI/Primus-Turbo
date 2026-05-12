@@ -5,7 +5,7 @@
 #pragma once
 
 #include "primus_turbo/common.h"
-#include "primus_turbo/dtype.h"
+#include "primus_turbo/dtype_t.h"
 
 namespace primus_turbo {
 
@@ -16,17 +16,16 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
                                 int64_t num_permuted_tokens, hipStream_t stream);
 
-template <typename DType, typename ProbType, typename ScalarType>
-void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType *scaling_factor,
-                  ScalarType *permuted_scaling_factor, const ProbType *probs,
-                  ProbType *permuted_probs, const int *row_id_map,
-                  const int *num_dispatched_tokens_ptr, int pad_multiple, int num_local_experts,
-                  int hidden_size, int scales_per_token, int num_dispatched_max,
-                  hipStream_t stream);
+template <typename dtype_t, typename prob_t, typename scalar_t>
+void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_t *scaling_factor,
+                  scalar_t *permuted_scaling_factor, const prob_t *probs, prob_t *permuted_probs,
+                  const int *row_id_map, const int *num_dispatched_tokens_ptr, int pad_multiple,
+                  int num_local_experts, int hidden_size, int scales_per_token,
+                  int num_dispatched_max, hipStream_t stream);
 
-template <typename DType, typename ProbType>
-void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType *permuted_probs,
-                    ProbType *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
+template <typename dtype_t, typename prob_t>
+void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_t *permuted_probs,
+                    prob_t *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
                     int num_local_experts, int hidden_size, int num_dispatched_max,
                     hipStream_t stream);
 
