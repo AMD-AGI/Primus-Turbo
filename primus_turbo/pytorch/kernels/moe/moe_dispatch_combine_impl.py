@@ -78,51 +78,55 @@ def _compute_expert_token_info_configs() -> List[triton.Config]:
 @triton.jit
 def compute_expert_token_info_kernel(
     recv_topk_idx_ptr,
+    deepep_topk_idx_ptr,
     num_recv_tokens_per_expert_ptr,
+    total_recv_ptr,
     num_tokens: tl.int32,
     num_topk: tl.int32,
     num_local_experts: tl.int32,
-    INVALID_VALUE: tl.constexpr,
+    expert_base: tl.int32,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    HAS_TOTAL_RECV: tl.constexpr,
 ):
-    """Count per-expert received tokens from a ``[num_tokens, num_topk]`` tile."""
+    """Count per-expert received tokens and emit a DeepEP-format topk_idx. will be removed in the future."""
     pid = tl.program_id(0)
     row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     col_offs = tl.arange(0, BLOCK_SIZE_K)
     bin_offs = tl.arange(0, BLOCK_SIZE_N)
 
-    row_mask = row_offs < num_tokens
-    col_mask = col_offs < num_topk
-    load_mask = row_mask[:, None] & col_mask[None, :]
+    if HAS_TOTAL_RECV:
+        total_recv = tl.load(total_recv_ptr)
+        row_limit = tl.minimum(total_recv, num_tokens)
+    else:
+        row_limit = num_tokens
 
-    # Clamp OOB rows so the computed offset stays in-range; ``load_mask``
-    # guarantees these lanes don't contribute.
-    safe_row = tl.where(row_mask, row_offs, 0)
+    in_footprint = row_offs < num_tokens
+    in_valid_rows = row_offs < row_limit
+    col_mask = col_offs < num_topk
+
+    footprint_mask = in_footprint[:, None] & col_mask[None, :]
+    load_mask = in_valid_rows[:, None] & col_mask[None, :]
+
+    safe_row = tl.where(in_footprint, row_offs, 0)
     expert_offs = safe_row[:, None] * num_topk + col_offs[None, :]
 
     topk_experts = tl.load(
         recv_topk_idx_ptr + expert_offs,
         mask=load_mask,
-        other=INVALID_VALUE,
+        other=0,
     )
 
-    valid = (
-        load_mask & (topk_experts != INVALID_VALUE) & (topk_experts >= 0) & (topk_experts < num_local_experts)
-    )
+    local_experts = topk_experts - expert_base
+    valid = load_mask & (local_experts >= 0) & (local_experts < num_local_experts)
     # Clamp the experts of invalid lanes so they land on a legal bin; the
     # ``mask`` passed to ``tl.histogram`` makes sure they are not counted.
-    safe_experts = tl.where(valid, topk_experts, 0)
+    safe_experts = tl.where(valid, local_experts, 0)
 
     # ``tl.histogram`` requires a flat 1D input; reshape the 2D tile.
     flat_experts = tl.reshape(safe_experts, [BLOCK_SIZE_M * BLOCK_SIZE_K])
     flat_mask = tl.reshape(valid, [BLOCK_SIZE_M * BLOCK_SIZE_K])
-
-    # CTA-local 1D accumulator of size BLOCK_SIZE_N, initialised to 0 by
-    # ``tl.histogram``; bins ``[num_local_experts, BLOCK_SIZE_N)`` are the
-    # power-of-two padding and stay zero because ``safe_experts`` is clamped
-    # into ``[0, num_local_experts)`` for valid lanes.
     local_counts = tl.histogram(flat_experts, BLOCK_SIZE_N, mask=flat_mask)
 
     # Flush CTA-local accumulator to global memory with one atomic per bin.
@@ -135,25 +139,19 @@ def compute_expert_token_info_kernel(
         mask=bin_mask,
     )
 
+    deepep_experts = tl.where(valid, local_experts, -1).to(topk_experts.dtype)
+    tl.store(deepep_topk_idx_ptr + expert_offs, deepep_experts, mask=footprint_mask)
+
 
 def compute_expert_token_info(
     recv_topk_idx: torch.Tensor,
     num_local_experts: int,
-    invalid_value: int = -1,
-) -> torch.Tensor:
-    """Count per-expert received tokens from ``recv_topk_idx``.
-
-    Args:
-        recv_topk_idx: ``[num_tokens, num_topk]`` tensor of (local) expert
-            indices; entries equal to ``invalid_value`` (or outside
-            ``[0, num_local_experts)``) are treated as padding and excluded.
-        num_local_experts: Number of local expert bins.
-        invalid_value: Sentinel marking padded/invalid slots (default ``-1``).
-
-    Returns:
-        ``num_recv_tokens_per_expert`` of shape ``[num_local_experts]`` with
-        the same dtype as ``recv_topk_idx``; entry ``e`` holds the count of
-        valid ``(token, slot)`` pairs whose expert id equals ``e``.
+    *,
+    expert_base: int = 0,
+    total_recv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Count per-expert received tokens and emit ``recv_topk_idx`` in DeepEP
+    layout (as a new tensor).
     """
     assert recv_topk_idx.is_cuda, "recv_topk_idx must be a CUDA tensor"
     assert recv_topk_idx.dim() == 2, "recv_topk_idx must be 2D [num_tokens, num_topk]"
@@ -162,26 +160,50 @@ def compute_expert_token_info(
     num_tokens, num_topk = recv_topk_idx.shape
 
     num_recv_tokens_per_expert = torch.zeros(num_local_experts, dtype=recv_topk_idx.dtype, device=device)
+    deepep_like_topk_idx = torch.empty_like(recv_topk_idx)
 
     if num_tokens == 0 or num_topk == 0 or num_local_experts == 0:
-        return num_recv_tokens_per_expert
+        # Nothing to count; fill the output with the DeepEP padding sentinel
+        # so callers can rely on a uniform layout.
+        if deepep_like_topk_idx.numel() > 0:
+            deepep_like_topk_idx.fill_(-1)
+        return num_recv_tokens_per_expert, deepep_like_topk_idx
+
+    has_total_recv = total_recv is not None
+    if has_total_recv:
+        assert total_recv.is_cuda, "total_recv must be a CUDA tensor"
+        assert total_recv.numel() >= 1, "total_recv must have at least 1 element"
+        # Triton expects an int32 pointer; coerce silently if the caller
+        # passed (e.g.) int64.
+        if total_recv.dtype != torch.int32:
+            total_recv = total_recv.to(torch.int32)
+        total_recv_ptr = total_recv
+    else:
+        # Triton requires a real pointer; reuse ``recv_topk_idx`` as a dummy
+        # (the kernel won't dereference it because ``HAS_TOTAL_RECV=False``).
+        total_recv_ptr = recv_topk_idx
 
     # ``tl.histogram`` requires ``num_bins`` to be a power of 2 on AMD Triton.
     block_size_n = triton.next_power_of_2(num_local_experts)
 
     # ``BLOCK_SIZE_M`` is picked by the autotuner; the grid size depends on it.
-    grid = lambda META: (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
+    def grid(META):
+        return (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
+
     compute_expert_token_info_kernel[grid](
         recv_topk_idx,
+        deepep_like_topk_idx,
         num_recv_tokens_per_expert,
+        total_recv_ptr,
         num_tokens,
         num_topk,
         num_local_experts,
-        INVALID_VALUE=invalid_value,
+        expert_base,
         BLOCK_SIZE_K=triton.next_power_of_2(num_topk),
         BLOCK_SIZE_N=block_size_n,
+        HAS_TOTAL_RECV=has_total_recv,
     )
-    return num_recv_tokens_per_expert
+    return num_recv_tokens_per_expert, deepep_like_topk_idx
 
 
 @dataclass
@@ -1258,22 +1280,31 @@ class MoriEPBackend:
 
         if handle is None:
             assert topk_idx is not None
-            recv_topk_idx_i32 = topk_idx.to(torch.int32)
+            topk_idx_i32 = topk_idx.to(torch.int32)
         else:
-            (recv_topk_idx_i32,) = handle
+            assert topk_idx is None, token_weights is None
+            (topk_idx_i32, token_weights, _) = handle
 
-        recv_x, recv_topk_weights, recv_x_scales, recv_topk_idx, _ = self._op.dispatch(
+        recv_x, recv_topk_weights, recv_x_scales, recv_topk_idx, total_recv = self._op.dispatch(
             x,
             token_weights,
             scale,
-            recv_topk_idx_i32,
+            topk_idx_i32,
         )
-        num_recv_tokens_per_expert = compute_expert_token_info(
-            recv_topk_idx, self._num_local_experts, invalid_value=self._num_local_experts
+        expert_base = self._group.rank() * self._num_local_experts
+        num_recv_tokens_per_expert, deepep_like_recv_topk_idx = compute_expert_token_info(
+            recv_topk_idx,
+            self._num_local_experts,
+            expert_base=expert_base,
+            total_recv=total_recv,
         )
         if not non_blocking:
             num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
-        return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert, (recv_topk_idx_i32,)
+
+        # hold token_weights for dispatch weights in backward
+        # it's a workaround to aviod illegal access when token_weights is None
+        handle = (topk_idx_i32, token_weights, recv_topk_idx)
+        return (recv_x, deepep_like_recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert, handle)
 
     def combine(
         self,
@@ -1286,12 +1317,11 @@ class MoriEPBackend:
     ):
         assert self.is_initialized(), "Backend is not initialized"
 
-        (topk_idx_i32,) = handle
-
+        (_, _, recv_topk_idx) = handle
         combined_x, combined_topk_weights = self._op.combine(
             x.contiguous(),
             topk_weights,
-            topk_idx_i32,
+            recv_topk_idx,
         )
         return combined_x, combined_topk_weights
 
