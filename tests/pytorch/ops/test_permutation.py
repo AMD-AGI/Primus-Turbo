@@ -50,9 +50,7 @@ def expected_permuted_layout(routing_map: torch.Tensor, pad_multiple: int):
     num_tokens, num_experts = routing_map.shape
     real_per_expert = routing_map.sum(dim=0).tolist()
     if pad_multiple > 0:
-        padded_per_expert = [
-            ((r + pad_multiple - 1) // pad_multiple) * pad_multiple for r in real_per_expert
-        ]
+        padded_per_expert = [((r + pad_multiple - 1) // pad_multiple) * pad_multiple for r in real_per_expert]
     else:
         padded_per_expert = list(real_per_expert)
     total = sum(padded_per_expert)
@@ -228,6 +226,7 @@ def test_overflow_flag(pad_multiple, cap_kind, expected):
 
     assert int(overflow_flag.item()) == expected
 
+
 # -----------------------------------------------------------------------------
 # Fast path: num_tokens = 0 must short-circuit forward AND backward without
 # touching the preprocessing kernel (which hard-asserts max_num_dispatched > 0).
@@ -272,9 +271,7 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
     grad_perm = torch.zeros_like(permuted_tokens)
     if with_probs:
         grad_pp = torch.zeros_like(permuted_probs)
-        torch.autograd.backward(
-            [permuted_tokens, permuted_probs], [grad_perm, grad_pp]
-        )
+        torch.autograd.backward([permuted_tokens, permuted_probs], [grad_perm, grad_pp])
     else:
         permuted_tokens.backward(grad_perm)
 
@@ -393,9 +390,7 @@ def test_moe_unpermute_with_probs_fwd_bwd():
 
     grad_unp = torch.randn_like(unpermuted_tokens)
     grad_unp_probs = torch.randn_like(unpermuted_probs)
-    torch.autograd.backward(
-        [unpermuted_tokens, unpermuted_probs], [grad_unp, grad_unp_probs]
-    )
+    torch.autograd.backward([unpermuted_tokens, unpermuted_probs], [grad_unp, grad_unp_probs])
 
     assert permuted_in.grad is not None and permuted_in.grad.shape == permuted_tokens.shape
     assert permuted_probs.grad is not None and permuted_probs.grad.shape == permuted_probs.shape
@@ -516,9 +511,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
     )
-    src_token_pad, _src_expert_pad, total_pad = expected_permuted_layout(
-        routing_map, pad_multiple
-    )
+    src_token_pad, _src_expert_pad, total_pad = expected_permuted_layout(routing_map, pad_multiple)
     real_mask_pad = src_token_pad >= 0
     real_total = perm_ref.shape[0]
     assert perm_pad.shape[0] == total_pad
