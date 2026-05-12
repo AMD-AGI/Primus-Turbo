@@ -28,8 +28,6 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
-MXFP8_PADDING_ALIGN_SIZE = 128
-
 __all__ = [
     "grouped_gemm_fp8",
 ]
@@ -50,22 +48,6 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     # Some upstream reductions can produce expanded zero-stride grad_out views.
     # Custom grouped GEMM kernels expect dense layouts.
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
-
-
-def _mxfp8_grid_x_hint(total_M: int, G: int) -> int:
-    """Pessimistic ``grid_x`` upper bound for the turbo grouped GEMM.
-
-    Each per-group M_g is at most ``ceil((total_M + G*align)/align)*align``
-    rows after padding; ``grid_x`` must be at least ``ceil(max_M_g / 256)``.
-    Passing the upper bound here lets the GEMM op skip its internal
-    ``group_lens.cpu()`` sync.
-    """
-    total_M_upper = (
-        (total_M + G * MXFP8_PADDING_ALIGN_SIZE + MXFP8_PADDING_ALIGN_SIZE - 1)
-        // MXFP8_PADDING_ALIGN_SIZE
-        * MXFP8_PADDING_ALIGN_SIZE
-    )
-    return (total_M_upper + 255) // 256
 
 
 def _turbo_grouped_gemm_mxfp8(
@@ -504,8 +486,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
                 group_offs,
             )
         )
-        grid_x_hint = _mxfp8_grid_x_hint(a.size(0), G)
-
         # Per-group dual quant for B: rowwise (G, N, K_pad) for fwd,
         # colwise (G, K, N_pad) for dgrad, both ready for GEMM.
         b_fp8_row, b_scale_inv_row, b_fp8_col, b_scale_inv_col = (
@@ -526,7 +506,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             out_dtype,
             c_group_offs=group_offs,
             total_m_out=a.size(0),
-            grid_x_hint=grid_x_hint,
         )
 
         ctx.save_for_backward(
@@ -541,8 +520,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.trans_b_orig = trans_b
-        ctx.grid_x_hint = grid_x_hint
+        ctx.trans_b = trans_b
         return out
 
     @staticmethod
@@ -585,7 +563,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             ctx.out_dtype,
             c_group_offs=group_offs,
             total_m_out=grad_out.size(0),
-            grid_x_hint=ctx.grid_x_hint,
         )
 
         # wgrad: dB = dC^T @ A via fixed-NT variable-K turbo.  Operates
@@ -603,7 +580,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
 
         # Transpose back to (G, K, N) when the user originally supplied
         # b in TT layout.
-        if not ctx.trans_b_orig:
+        if not ctx.trans_b:
             grad_b = grad_b.transpose(-1, -2).contiguous()
 
         return grad_a, grad_b, None, None, None, None, None

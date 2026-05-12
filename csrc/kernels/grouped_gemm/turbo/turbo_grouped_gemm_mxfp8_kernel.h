@@ -7,6 +7,7 @@
 // Reuse GEMM_Tile_MXFP8_NT_*, preshuffle_scale_16x4_kernel, and BufferSRD helpers
 // from the single-GEMM kernel.
 #include "../../gemm/turbo/turbo_gemm_mxfp8_kernel.h"
+#include "primus_turbo/quantization.h"
 
 namespace primus_turbo {
 namespace turbo {
@@ -15,12 +16,12 @@ namespace turbo {
 // output tile for (group_id, pid_m_local, pid_n_idx); SMEM and tile dispatch
 // are owned by the caller.
 //
-// ``group_offs_ptr[group_id]`` is the *input* row base (where group g's
+// ``a_group_offs_ptr[group_id]`` is the *input* row base (where group g's
 // real rows start in the per-group-padded input layout); ``M_g`` is the
 // number of *real* rows in group g (compute bound — padding rows are
 // never visited).  When ``c_group_offs_ptr`` is non-null the kernel
 // writes group g's output rows starting at ``c_group_offs_ptr[group_id]``
-// (the original/unpadded layout) instead of ``group_offs_ptr[group_id]``,
+// (the original/unpadded layout) instead of ``a_group_offs_ptr[group_id]``,
 // fusing the per-group-padding extract directly into the GEMM store.
 template <typename GemmTile, typename AType, typename BType, typename CType>
 __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
@@ -29,7 +30,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     typename GemmTile::AScaleSmemSubtile (*a_s_smem_tile)[4],
     typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *a_ptr,
     const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr, CType *c_ptr,
-    const int64_t *group_offs_ptr, const int64_t *c_group_offs_ptr, const int32_t group_id,
+    const int64_t *a_group_offs_ptr, const int64_t *c_group_offs_ptr, const int32_t group_id,
     const int32_t pid_m_local, const int32_t pid_n_idx, const int32_t M_g, const uint32_t n,
     const uint32_t k) {
     const int32_t pid_m = pid_m_local * 256;
@@ -43,12 +44,12 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     const uint32_t warp_n  = tile.warp_n;
 
     const uint32_t scale_cols = (k + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
-    // Force a scalar (s_load, lgkmcnt-tracked) load of group_offs_ptr[group_id]
+    // Force a scalar (s_load, lgkmcnt-tracked) load of a_group_offs_ptr[group_id]
     // so it does not get vmcnt-tracked alongside data LDGs.
     const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(group_offs_ptr[group_id] & 0xffffffffULL));
+        static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
     const uint32_t group_offset_hi = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(static_cast<uint64_t>(group_offs_ptr[group_id]) >> 32));
+        static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
     const int64_t group_offset =
         (static_cast<int64_t>(group_offset_hi) << 32) | static_cast<int64_t>(group_offset_lo);
     const int64_t m_global     = group_offset + (int64_t) pid_m;
@@ -74,11 +75,12 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
         const int64_t c_group_offset =
             (static_cast<int64_t>(c_offset_hi) << 32) | static_cast<int64_t>(c_offset_lo);
         c_m_global = c_group_offset + (int64_t) pid_m;
-        // M_g_padded = ceil(M_g, 128).  Quant kernel pads each
-        // per-group region to 128-aligned, so this matches
-        // group_offs_padded[g+1] - group_offs_padded[g] without an
-        // extra scalar load.
-        M_g_in = (M_g + 127) & ~127;
+        // M_g_padded = ceil(M_g, MXFP8_PADDING_ALIGN_SIZE).  Quant kernel
+        // pads each per-group region to ALIGN-aligned, so this matches
+        // group_offs_padded[g+1] - group_offs_padded[g] without an extra
+        // scalar load.
+        M_g_in = (M_g + detail::MXFP8_PADDING_ALIGN_SIZE - 1) &
+                 ~(detail::MXFP8_PADDING_ALIGN_SIZE - 1);
     } else {
         c_m_global = m_global;
         M_g_in     = M_g;
@@ -436,7 +438,7 @@ template <typename AType, typename BType, typename CType, typename AccType = flo
 __global__
 __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *a_ptr, const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr,
-    CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
+    CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *a_group_offs_ptr,
     const int64_t *c_group_offs_ptr, const int32_t group_num, const uint32_t n, const uint32_t k,
     const int32_t grid_m, const int32_t grid_n) {
 #if !defined(__gfx950__)
@@ -482,7 +484,7 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4w
 
         turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
-            b_s_ptr, c_ptr, group_offs_ptr, c_group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
+            b_s_ptr, c_ptr, a_group_offs_ptr, c_group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
     }
 #endif
 }

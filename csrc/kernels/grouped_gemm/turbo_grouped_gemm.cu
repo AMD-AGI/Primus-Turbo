@@ -128,7 +128,7 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
                                                                                   CType>
         <<<grid, block, 0, params.stream>>>(params.a_ptr, params.b_ptr, a_scale_preshuf,
                                             b_scale_preshuf, params.c_ptr, params.group_lens_ptr,
-                                            params.group_offs_ptr, params.c_group_offs_ptr,
+                                            params.a_group_offs_ptr, params.c_group_offs_ptr,
                                             group_num, (uint32_t) n, (uint32_t) k, grid_m, grid_n);
 }
 
@@ -189,7 +189,7 @@ void turbo_grouped_gemm_mxfp8_wgrad_impl(
     turbo::turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel<
         AType, BType, CType><<<grid, block, 0, params.stream>>>(
         params.lhs_ptr, params.rhs_ptr, lhs_scale_preshuf, rhs_scale_preshuf, params.db_ptr,
-        params.group_lens_ptr, params.group_offs_ptr, group_num, (uint32_t) total_m, (uint32_t) n,
+        params.group_lens_ptr, params.a_group_offs_ptr, group_num, (uint32_t) total_m, (uint32_t) n,
         (uint32_t) k, grid_n, grid_k);
 }
 

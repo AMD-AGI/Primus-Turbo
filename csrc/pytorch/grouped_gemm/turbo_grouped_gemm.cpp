@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/grouped_gemm.h"
+#include "primus_turbo/quantization.h"
 
 #include "../extensions.h"
 #include "../type_traits.h"
@@ -69,17 +70,20 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // grid_x = max_g ceil(M_g / 256).  A loose bound costs 2-10x on MoE
-    // shapes; hot loops should pass `grid_x_hint`, else we D2H-sync once.
-    int32_t grid_x = 0;
+    // grid_x = max_g ceil(M_g / 256).  When the caller supplies a tight
+    // hint we use it; otherwise fall back to the pessimistic upper bound
+    // derivable from input metadata alone (no D2H sync of group_lens).
+    // Worst case: a single group holds all real rows, then per-group
+    // padding to MXFP8_PADDING_ALIGN_SIZE adds (group_num - 1)*ALIGN
+    // padding rows on top.
+    int32_t grid_x;
     if (grid_x_hint > 0) {
         grid_x = (int32_t) grid_x_hint;
     } else {
-        at::Tensor     lens_cpu  = group_lens.cpu();
-        const int64_t *lens_data = lens_cpu.data_ptr<int64_t>();
-        for (int g = 0; g < group_num; ++g) {
-            grid_x = std::max(grid_x, (int32_t) ((lens_data[g] + 255) / 256));
-        }
+        constexpr int64_t ALIGN = primus_turbo::detail::MXFP8_PADDING_ALIGN_SIZE;
+        const int64_t total_m_upper =
+            ((int64_t) total_m_in + group_num * ALIGN + ALIGN - 1) / ALIGN * ALIGN;
+        grid_x = (int32_t) ((total_m_upper + 255) / 256);
     }
 
     const size_t ws_size =
@@ -102,7 +106,7 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
                 params.b_scale_ptr =
                     reinterpret_cast<const dtype::float8_e8m0 *>(b_scales.data_ptr());
                 params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-                params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+                params.a_group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
                 params.c_group_offs_ptr =
                     c_group_offs.has_value()
                         ? reinterpret_cast<const int64_t *>(c_group_offs->data_ptr())
@@ -171,7 +175,7 @@ static at::Tensor launch_mxfp8_grouped_wgrad(at::Tensor &lhs, at::Tensor &lhs_sc
                 params.rhs_scale_ptr =
                     reinterpret_cast<const dtype::float8_e8m0 *>(rhs_scales.data_ptr());
                 params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
-                params.group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+                params.a_group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
                 params.group_num = (int32_t) group_num; params.total_m = (int32_t) total_m;
                 params.n = (int32_t) n; params.k = (int32_t) k;
                 params.workspace = workspace.data_ptr(); params.workspace_size = ws_size;

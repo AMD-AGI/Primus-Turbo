@@ -619,6 +619,12 @@ class GroupedGEMMFP8VariableKTurboBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKTurboBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKTurboBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a and not trans_b and not trans_c
+        # MFMA tile = 16x16; output axes (N_fwd, K_fwd) must clear that.
+        if a.dim() == 2 and b.dim() == 2:
+            n_fwd = a.shape[0]
+            k_fwd = b.shape[1]
+            supported &= n_fwd % 16 == 0 and k_fwd % 16 == 0
+            supported &= a.shape[1] == b.shape[0]
         return supported
 
     @staticmethod

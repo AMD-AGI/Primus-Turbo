@@ -117,7 +117,7 @@ template <typename AType, typename BType, typename CType> struct TurboGroupedGem
     // Per-group real-row count and starting offset in the input layout.
     // Padding rows beyond ``group_lens_ptr[g]`` are not visited.
     const int64_t *group_lens_ptr = nullptr; // [group_num]
-    const int64_t *group_offs_ptr = nullptr; // [group_num+1]
+    const int64_t *a_group_offs_ptr = nullptr; // [group_num+1]
 
     // Optional output-row offsets.  When non-null, the GEMM writes group g
     // starting at ``c_group_offs_ptr[g]`` (unpadded layout), allowing
@@ -161,7 +161,7 @@ template <typename AType, typename BType, typename CType> struct TurboGroupedGem
     const dtype::float8_e8m0 *rhs_scale_ptr = nullptr; // (K, total_M/32)
 
     const int64_t *group_lens_ptr = nullptr; // [group_num]
-    const int64_t *group_offs_ptr = nullptr; // [group_num+1]
+    const int64_t *a_group_offs_ptr = nullptr; // [group_num+1]
 
     int32_t group_num = 0;
     int32_t total_m   = 0;

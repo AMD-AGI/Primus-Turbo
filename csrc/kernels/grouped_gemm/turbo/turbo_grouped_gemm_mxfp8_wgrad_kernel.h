@@ -30,7 +30,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     typename GemmTile::AScaleSmemSubtile (*a_s_smem_tile)[4],
     typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *lhs_ptr,
     const BType *rhs_ptr, const uint32_t *lhs_s_ptr, const uint32_t *rhs_s_ptr, CType *db_ptr,
-    const int64_t *group_offs_ptr, const int32_t group_id, const int32_t pid_n_local,
+    const int64_t *a_group_offs_ptr, const int32_t group_id, const int32_t pid_n_local,
     const int32_t pid_k_local, const int32_t M_g, const uint32_t n, const uint32_t k,
     const uint32_t total_m) {
     const int32_t pid_n = pid_n_local * 256; // along N (output dim 0)
@@ -46,11 +46,11 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const uint32_t scale_cols_full =
         (total_m + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
 
-    // Mirror FWD: scalar (s_load) of group_offs_ptr[group_id].
+    // Mirror FWD: scalar (s_load) of a_group_offs_ptr[group_id].
     const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(group_offs_ptr[group_id] & 0xffffffffULL));
+        static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
     const uint32_t group_offset_hi = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(static_cast<uint64_t>(group_offs_ptr[group_id]) >> 32));
+        static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
     const int64_t group_col_offset =
         (static_cast<int64_t>(group_offset_hi) << 32) | static_cast<int64_t>(group_offset_lo);
     // Scales are preshuffled into 16x4 blocks of 64 uint32; skipping
@@ -447,7 +447,7 @@ __global__
 __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *lhs_ptr, const BType *rhs_ptr, const uint32_t *lhs_s_ptr,
     const uint32_t *rhs_s_ptr, CType *db_ptr, const int64_t *group_lens_ptr,
-    const int64_t *group_offs_ptr, const int32_t group_num, const uint32_t total_m,
+    const int64_t *a_group_offs_ptr, const int32_t group_num, const uint32_t total_m,
     const uint32_t n, const uint32_t k, const int32_t grid_n, const int32_t grid_k) {
 #if !defined(__gfx950__)
     assert(false && "turbo_grouped_gemm_mxfp8_wgrad persistent kernel requires gfx950");
@@ -491,7 +491,7 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x
 
         turbo_grouped_gemm_mxfp8_wgrad_compute_tile<GemmTile, AType, BType, CType>(
             tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, lhs_ptr, rhs_ptr,
-            lhs_s_ptr, rhs_s_ptr, db_ptr, group_offs_ptr, group_id, pid_n, pid_k, M_g, n, k,
+            lhs_s_ptr, rhs_s_ptr, db_ptr, a_group_offs_ptr, group_id, pid_n, pid_k, M_g, n, k,
             total_m);
     }
 #endif
