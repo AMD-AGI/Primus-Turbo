@@ -152,9 +152,19 @@ Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy_) {
         Destroy();
     } else if (not destroyed_) {
-        printf("WARNING: Destroy() was not called before DeepEP buffer destruction, which can leak "
-               "resources.\n");
-        fflush(stdout);
+        // Caller forgot to call Destroy() before the buffer went out of scope.
+        // Run cleanup as a fallback so we don't leak NVL/RDMA resources, and
+        // swallow any exception so the destructor itself stays well-behaved.
+        try {
+            Destroy();
+        } catch (const std::exception &e) {
+            printf("WARNING: Destroy() failed during DeepEP buffer destruction: %s\n", e.what());
+            fflush(stdout);
+        } catch (...) {
+            printf("WARNING: Destroy() failed during DeepEP buffer destruction with an unknown "
+                   "exception.\n");
+            fflush(stdout);
+        }
     }
 }
 
@@ -168,17 +178,23 @@ void Buffer::Destroy() {
         // handles. In-process buffers are destroyed via local static/object lifetime and may not
         // enter Destroy() collectively, so only run the device-side peer barrier for IPC-synced
         // per-process buffers.
-        if (ipc_synced_ && is_available()) {
-            primus_turbo::deep_ep::intranode::barrier(
-                barrier_signal_ptrs_gpu_, nvl_rank_, num_nvl_ranks_, nullptr);
-            PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+        if (ipc_synced_) {
+            // Fully available buffers need a peer barrier before closing IPC
+            // handles. Partially initialized buffers (e.g. rocSHMEM init failed
+            // after IPC sync) never became visible to kernels, so close the
+            // handles without the collective barrier.
+            if (is_available()) {
+                primus_turbo::deep_ep::intranode::barrier(
+                    barrier_signal_ptrs_gpu_, nvl_rank_, num_nvl_ranks_, nullptr);
+                PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+            }
 
             // Close remote IPC handles opened by SyncFromIPCHandles.
             for (int i = 0; i < num_nvl_ranks_; ++i) {
                 if (i != nvl_rank_)
                     PRIMUS_TURBO_CHECK_HIP(hipIpcCloseMemHandle(buffer_ptrs_[i]));
             }
-            ipc_synced_   = false;
+            ipc_synced_ = false;
         }
         PRIMUS_TURBO_CHECK_HIP(hipFree(buffer_ptrs_[nvl_rank_]));
     }
@@ -946,6 +962,9 @@ void Buffer::SyncFromIPCHandles(
 
         rdma_buffer_ptr_ =
             primus_turbo::deep_ep::internode::alloc(num_rdma_bytes_, NUM_BUFFER_ALIGNMENT_BYTES);
+        PRIMUS_TURBO_CHECK(rdma_buffer_ptr_ != nullptr &&
+                           "rocshmem_malloc returned NULL: symmetric heap exhausted or not "
+                           "initialised on this PE");
         PRIMUS_TURBO_CHECK_HIP(hipMemset(rdma_buffer_ptr_, 0, num_rdma_bytes_));
         primus_turbo::deep_ep::internode::barrier();
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
