@@ -64,19 +64,17 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     // ********* Permute (MoE token (un)permute) *********
     m.def("permute_preprocessing(Tensor expert_map, Tensor num_dispatched_token_tensor, "
-          "int max_num_dispatched_tokens, int num_local_experts, int num_topk, int pad_multiple, "
+          "int num_local_experts, int num_topk, int pad_multiple, "
           "int num_permuted_tokens) -> (Tensor, Tensor, Tensor)");
     m.def("permute(Tensor tokens, Tensor output_tokens, Tensor? scaling_factor, "
           "Tensor? output_scaling_factor, Tensor? probs, Tensor? output_probs, "
           "Tensor row_id_map, Tensor num_dispatched_token_tensor, "
           "int pad_multiple, int num_local_experts, int hidden_size, int scales_per_token, "
-          "int local_rank, int num_ranks_per_node, bool use_fp8, bool with_probs, "
-          "int num_permuted_token, int num_blocks_permute) -> ()");
+          "bool use_fp8, bool with_probs, int num_permuted_token) -> ()");
     m.def("unpermute(Tensor permuted_tokens, Tensor output_tokens, "
           "Tensor? permuted_probs, Tensor? output_probs, Tensor row_id_map, "
           "Tensor num_dispatched_tokens_tensor, int num_local_experts, int hidden_size, "
-          "int local_rank, int num_ranks_per_node, bool with_probs, "
-          "int num_blocks_unpermute) -> ()");
+          "bool with_probs) -> ()");
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "

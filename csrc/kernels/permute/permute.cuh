@@ -5,7 +5,22 @@
 #pragma once
 #include "../deep_ep/utils.cuh"
 
-#define MAX_NUM_CU 304
+static inline constexpr size_t kVsmemCacheLineSize = 128;
+
+#define DISPATCH_PERMUTE_UNPERMUTE(hidden, launch_macro)                                           \
+    do {                                                                                           \
+        switch (hidden) {                                                                          \
+        case 4096:                                                                                 \
+            launch_macro(512);                                                                     \
+            break;                                                                                 \
+        case 7168:                                                                                 \
+            launch_macro(512);                                                                     \
+            break;                                                                                 \
+        default:                                                                                   \
+            launch_macro(256);                                                                     \
+            break;                                                                                 \
+        }                                                                                          \
+    } while (false)
 
 struct vsmem_t {
     void  *gmem_ptr;
@@ -37,9 +52,6 @@ struct TileState {
     int32_t  value;
 };
 
-inline size_t align_up(size_t x, size_t a) {
-    return (x + a - 1) / a * a;
-}
 __device__ __forceinline__ TileState load_tile_state(uint64_t *p) {
     const uint64_t raw = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     return {static_cast<uint32_t>(raw), static_cast<int32_t>(static_cast<uint32_t>(raw >> 32))};
@@ -50,8 +62,6 @@ __device__ __forceinline__ void store_tile_state(uint64_t *p, uint32_t flag, int
         static_cast<uint64_t>(flag) | (static_cast<uint64_t>(static_cast<uint32_t>(value)) << 32);
     __hip_atomic_store(p, raw, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
-
-inline constexpr size_t kVsmemCacheLineSize = 128;
 
 template <typename T>
 __device__ __forceinline__ T *get_temp_storage(T *static_temp_storage, vsmem_t vsmem) {
