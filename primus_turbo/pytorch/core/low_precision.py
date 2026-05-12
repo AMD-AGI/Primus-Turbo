@@ -90,6 +90,14 @@ except AttributeError:
 
 ###################################################
 
+MXFP4_BLOCK_SIZE = 32
+
+MXFP8_BLOCK_SIZE = 32
+
+MXFP4_PADDING_ALIGN_SIZE = 128
+
+MXFP8_PADDING_ALIGN_SIZE = 128
+
 
 class Format(Enum):
     """
@@ -132,11 +140,11 @@ class ScalingStrategy(Enum):
 
 
 @dataclass
-class MXScalingRecipe:
+class ScalingRecipe:
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
-    - use_2d_block: Whether to use 2D block in quantization. Available in MXFP8 and MXFP4.
+    - use_2d_block: Whether to use 2D block in quantization. Available in blockwise, MXFP8 and MXFP4.
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.
@@ -165,7 +173,7 @@ class Float8QuantConfig:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
-            mx_support_block_size = [32]
+            mx_support_block_size = [MXFP8_BLOCK_SIZE]
             assert (
                 self.block_size in mx_support_block_size
             ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
@@ -189,7 +197,7 @@ class Float4QuantConfig:
             self.granularity == ScalingGranularity.MX_BLOCKWISE
         ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
 
-        mx_support_block_size = [32]
+        mx_support_block_size = [MXFP4_BLOCK_SIZE]
         assert (
             self.block_size in mx_support_block_size
         ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"

@@ -10,8 +10,8 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
-    MXScalingRecipe,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
 )
@@ -171,7 +171,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     else:
         x_2d_ref = x_2d
 
-    scaling_recipe = MXScalingRecipe(
+    scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
 
@@ -213,7 +213,7 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     if not mxfp8_supported:
         pytest.skip(reason)
 
-    scaling_recipe = MXScalingRecipe(
+    scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
 
@@ -310,7 +310,7 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    scaling_recipe = MXScalingRecipe(
+    scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
 
@@ -391,7 +391,7 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    scaling_recipe = MXScalingRecipe(
+    scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
 
@@ -491,7 +491,7 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     row_length = x.size(-1)
     x_2d = x.view(-1, row_length)
 
-    scaling_recipe = MXScalingRecipe(
+    scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
     rowwise_out, rowwise_scale, colwise_out, colwise_scale = quantize_fp4_with_trans(
@@ -508,7 +508,7 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     colwise_out_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_weight(colwise_out, [16, 16])
     colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale, [16, 16])
 
-    scaling_recipe_with_shuffle = MXScalingRecipe(
+    scaling_recipe_with_shuffle = ScalingRecipe(
         use_2d_block=use_2d_block,
         shuffle_scale=True,
         shuffle_out=True,

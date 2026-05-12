@@ -8,12 +8,12 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
-    grouped_gemm_compute_offs,
-)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_impl,
     grouped_gemm_variable_k_impl,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    group_offs_from_lens,
 )
 
 __all__ = ["grouped_gemm"]
@@ -26,10 +26,11 @@ class GroupedGemmFunc(torch.autograd.Function):
         a: torch.Tensor,
         b: torch.Tensor,
         group_lens: torch.Tensor,  # [B,] int64
-        group_offs: torch.Tensor,  # [B+1,] int64
         trans_b: bool,
         num_cu: int | None,
     ):
+        group_offs = group_offs_from_lens(group_lens)
+
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)
@@ -45,7 +46,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=trans_b,
                 num_cu=num_cu,
-                default_backend=BackendType.CK.value,
+                default_backend=BackendType.TRITON.value,
                 maybe_pre_sync=True,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
@@ -90,7 +91,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_a=False,
                 trans_b=not ctx.trans_b,
                 num_cu=ctx.num_cu,
-                default_backend=BackendType.CK.value,
+                default_backend=BackendType.TRITON.value,
             )
             grad_b = grouped_gemm_variable_k_impl(
                 a,
@@ -101,16 +102,15 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_b=False,
                 trans_c=ctx.trans_b,
                 num_cu=ctx.num_cu,
-                default_backend=BackendType.CK.value,
+                default_backend=BackendType.TRITON.value,
             )
-        return grad_a, grad_b, None, None, None, None
+        return grad_a, grad_b, None, None, None
 
 
 def grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     group_lens: torch.Tensor,
-    group_offs: torch.Tensor | None = None,
     trans_b: bool = False,
     num_cu: int | None = None,
 ) -> torch.Tensor:
@@ -121,8 +121,6 @@ def grouped_gemm(
         a (torch.Tensor): Shape [sum(group_lens), K], DType float16/bfloat16.
         b (torch.Tensor): Shape [G, K, N] (or [G, N, K] if trans_b=True), DType float16/bfloat16.
         group_lens (torch.Tensor): Rows per expert of shape [G], int64. sum(group_lens) == a.size(0).
-        group_offs (torch.Tensor | None): Exclusive prefix-sum of group_lens, shape [G+1].
-                                          If None, it will be computed internally.
         trans_b (bool): If True, treat each b[g] as transposed.
         num_cu (int | None): Limit the number of CUs to use. None = default.
 
@@ -138,7 +136,5 @@ def grouped_gemm(
         >>> out.shape
         torch.Size([96, 64])
     """
-    if group_offs is None:
-        group_offs = grouped_gemm_compute_offs(group_lens)
 
-    return GroupedGemmFunc.apply(a, b, group_lens, group_offs, trans_b, num_cu)
+    return GroupedGemmFunc.apply(a, b, group_lens, trans_b, num_cu)
