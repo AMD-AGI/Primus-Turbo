@@ -53,7 +53,7 @@ def geglu_with_mask_fwd_kernel(
         up = gelu_none(up)
         out = up * down
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask)
         out = out * probs
 
         tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
@@ -119,12 +119,11 @@ def geglu_with_mask_bwd_kernel(
             mask=row_mask,
         )
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token).to(compute_type)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask).to(compute_type)
 
         grad_out_with_probs = grad_out * probs
         grad_down = grad_out_with_probs * gelu
-        grad_gelu = gelu_bwd_none(up, grad_out)
-        grad_up = grad_out_with_probs * down * grad_gelu
+        grad_up = gelu_bwd_none(up, grad_out_with_probs * down)
 
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask
@@ -237,8 +236,7 @@ def geglu_bwd_kernel(
 
     grad_out_with_probs = grad_out * probs
     grad_down = grad_out_with_probs * gelu
-    grad_gelu = gelu_bwd_none(up, grad_out)
-    grad_up = grad_out_with_probs * down * grad_gelu
+    grad_up = gelu_bwd_none(up, grad_out_with_probs * down)
 
     tl.store(grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask)
     tl.store(

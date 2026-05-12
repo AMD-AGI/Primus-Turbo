@@ -51,7 +51,7 @@ def swiglu_with_mask_fwd_kernel(
         up = tl.fdiv(up, (1.0 + tl.exp(-up)))
         out = up * down
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask)
         out = out * probs
 
         tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
@@ -118,7 +118,7 @@ def swiglu_with_mask_bwd_kernel(
             mask=row_mask,
         )
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token).to(compute_type)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask).to(compute_type)
 
         grad_out_with_probs = grad_out * probs
         grad_down = grad_out_with_probs * silu
