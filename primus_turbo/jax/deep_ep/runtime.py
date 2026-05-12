@@ -150,6 +150,35 @@ def is_internode(*, lock: bool = False) -> bool:
     return True
 
 
+_kv_allgather_call_id: int = 0
+
+
+def _kv_allgather_bytes(label: str, payload, num_ranks: int, my_rank: int) -> list[bytearray]:
+    """Bytes-level allgather via JAX distributed KV-store.
+
+    Bypasses a known ``jax.experimental.multihost_utils.process_allgather`` bug
+    under XLA/RCCL where one random rank's slot in the gathered output is
+    silently zero-filled.
+
+    Each call uses a fresh, monotonically increasing call ID so concurrent
+    allgathers under different labels don't collide on the same key prefix.
+    """
+    global _kv_allgather_call_id
+
+    from jax._src.distributed import global_state as _gs
+
+    client = _gs.client
+    _kv_allgather_call_id += 1
+    cid = _kv_allgather_call_id
+    prefix = f"primus_turbo_kvgather:{label}:c{cid}"
+    client.key_value_set(f"{prefix}:{my_rank}", bytes(payload).hex())
+    out: list[bytearray] = []
+    for r in range(num_ranks):
+        hexstr = client.blocking_key_value_get(f"{prefix}:{r}", 60_000)
+        out.append(bytearray.fromhex(hexstr))
+    return out
+
+
 def _check_internode_rank_count(num_ranks: int) -> None:
     if num_ranks % NUM_MAX_NVL_PEERS != 0:
         raise ValueError(
@@ -161,7 +190,7 @@ def _check_internode_rank_count(num_ranks: int) -> None:
 def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
     """Collect and return the root rocSHMEM unique ID for this rank's NVL slot.
 
-    Every process generates a same-sized ID for JAX array allgather, but only
+    Every process generates a same-sized ID for KV-store allgather, but only
     the ID from ``rdma_rank == 0`` for the same NVL slot is passed to C++.
     """
     if not dep.has_rocshmem():
@@ -170,23 +199,17 @@ def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
             "Set ROCSHMEM_HOME / MPI_HOME and reinstall."
         )
 
-    import numpy as np
-    import jax.numpy as jnp
-    from jax.experimental import multihost_utils
-
     rdma_rank = rank // NUM_MAX_NVL_PEERS
 
-    # Every process generates a fixed-size rocSHMEM unique ID so JAX's array allgather can use a
-    # uniform shape. Only the ID from the root RDMA rank of each NVL slot is used below.
-    uid_bytes = dep.get_unique_id()
+    uid_bytes = bytes(dep.get_unique_id())
 
-    uid_np = np.frombuffer(uid_bytes, dtype=np.uint8).copy()
-    all_uids_jax = multihost_utils.process_allgather(jnp.array(uid_np))
-    all_uids_np = np.asarray(all_uids_jax).reshape(num_ranks, -1)
+    # KV-store allgather, not multihost_utils.process_allgather: the latter has
+    # been observed to silently zero-fill one rank's slot under XLA/RCCL.
+    all_uids = _kv_allgather_bytes("rocshmem_uid", uid_bytes, num_ranks, rank)
 
     nvl_rank = rank % NUM_MAX_NVL_PEERS
     root_global_rank = nvl_rank  # rdma_rank==0 on same NVL slot
-    root_uid = bytes(all_uids_np[root_global_rank])
+    root_uid = bytes(all_uids[root_global_rank])
     log.info(
         "rocSHMEM root unique ID gathered: rank=%d, rdma_rank=%d",
         rank, rdma_rank,
@@ -201,10 +224,6 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     an implicit barrier.
     """
     global _per_process_nvl_bytes, _per_process_rdma_bytes
-
-    import numpy as np
-    import jax.numpy as jnp
-    from jax.experimental import multihost_utils
 
     dep = _get_c_deep_ep()
     rank = jax.process_index()
@@ -259,22 +278,32 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     if internode:
         root_uid = _get_root_rocshmem_unique_id(dep, rank, num_ranks)
 
-    local_ipc_handle: bytearray = dep.create_per_process_buffer(
-        rank, num_ranks, num_nvl_bytes, num_rdma_bytes
-    )
+    try:
+        local_ipc_handle: bytearray = dep.create_per_process_buffer(
+            rank, num_ranks, num_nvl_bytes, num_rdma_bytes
+        )
 
-    local_ipc_handle_np = np.frombuffer(local_ipc_handle, dtype=np.uint8).copy()
-    all_ipc_handles_jax = multihost_utils.process_allgather(jnp.array(local_ipc_handle_np))
+        # KV-store allgather, not multihost_utils.process_allgather: see
+        # _kv_allgather_bytes docstring for the XLA/RCCL zero-fill bug.
+        ipc_handles_list = _kv_allgather_bytes(
+            "ipc_handle", bytes(local_ipc_handle), num_ranks, rank
+        )
 
-    all_ipc_handles_np = np.asarray(all_ipc_handles_jax).reshape(num_ranks, -1)
-    ipc_handles_list = [bytearray(all_ipc_handles_np[i]) for i in range(num_ranks)]
-
-    if root_uid is None:
-        dep.sync_per_process_buffer(ipc_handles_list)
-    else:
-        dep.sync_per_process_buffer(ipc_handles_list, root_uid)
-    _per_process_nvl_bytes = num_nvl_bytes
-    _per_process_rdma_bytes = num_rdma_bytes
+        if root_uid is None:
+            dep.sync_per_process_buffer(ipc_handles_list)
+        else:
+            dep.sync_per_process_buffer(ipc_handles_list, root_uid)
+        _per_process_nvl_bytes = num_nvl_bytes
+        _per_process_rdma_bytes = num_rdma_bytes
+    except BaseException:
+        # If bootstrap fails after the local IPC buffer is created, leave the C++
+        # singleton in a clean state instead of relying on process teardown.
+        try:
+            dep.destroy_per_process_buffer()
+        finally:
+            _per_process_nvl_bytes = 0
+            _per_process_rdma_bytes = 0
+        raise
 
     log.info(
         "Per-process DeepEP buffer ready: rank=%d, num_ranks=%d, "
