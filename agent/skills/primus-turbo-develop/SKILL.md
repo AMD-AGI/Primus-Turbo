@@ -348,27 +348,54 @@ The selected shape list is recorded in the `representative_shapes` field of `man
 
 **Implementation pattern**: During PREPARE_ENVIRONMENT, generate `quick_test_bench.py` in the campaign directory while the project API context is still fresh. Leave `SHAPES` empty at first, then fill it after BASELINE chooses `representative_shapes`.
 
-The FP8 blockwise GEMM template below is the default reference. Adapt it for other operators as needed:
+**Measurement-consistency contract**: BASELINE (round-1) and every subsequent VALIDATE read the same authoritative CSV produced by this script via `--summary-csv`. The CSV schema MUST match the canonical Primus-Turbo columns so `mcp__turbo__parse_bench_csv` parses round-1 and round-N identically. The mandatory columns are:
+
+```
+label,B,M,N,K,Check,Forward TFLOPS,Forward TFLOPS_stddev,Backward TFLOPS,Backward TFLOPS_stddev,Forward Time (ms),Backward Time (ms),out_snr,da_snr,db_snr
+```
+
+`Check` uses the strings `PASS` / `FAIL`; `*_stddev` values are absolute stddev in the metric's own unit (the scorer converts to %).
+
+The FP8 blockwise GEMM template below is the default reference. Adapt it for other operators as needed — but keep the `--summary-csv` writer and column schema verbatim:
 
 ```python
 """Quick correctness + benchmark for representative shapes.
-Auto-generated during PREPARE_ENVIRONMENT. Run: python quick_test_bench.py
+Auto-generated during PREPARE_ENVIRONMENT.
+
+Usage:
+    python quick_test_bench.py [--repeats N] [--iters-per-repeat M]
+        [--summary-csv PATH] [--csv PATH]
+
+`--summary-csv` is the authoritative per-round CSV consumed by BASELINE
+and every VALIDATE via `mcp__turbo__parse_bench_csv`. Its schema MUST
+match the canonical Primus-Turbo columns so round-1 and round-N are
+directly comparable. See the project skill's "Measurement-consistency
+contract" for the column list.
 """
+from __future__ import annotations
+
+import argparse
+import csv
+import math
 import os
+import statistics
+import sys
+import time
+from typing import Any, Dict, List
 
-import torch
-import torch.utils.benchmark as benchmark
+os.environ.setdefault("PRIMUS_TURBO_GEMM_BACKEND", "<target_backend>")
 
-os.environ["PRIMUS_TURBO_GEMM_BACKEND"] = "<target_backend>"
+import torch  # noqa: E402
 
-import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.low_precision import (
+import primus_turbo.pytorch as turbo  # noqa: E402
+from primus_turbo.pytorch.core.low_precision import (  # noqa: E402
     Float8QuantConfig,
     Format,
     ScalingGranularity,
 )
 
-SHAPES = [
+
+SHAPES: List[Dict[str, Any]] = [
     # Fill from representative_shapes in manifest after BASELINE
 ]
 
@@ -377,62 +404,160 @@ CONFIG = Float8QuantConfig(
     granularity=ScalingGranularity.BLOCKWISE,
     block_size=128,
 )
+SNR_THRESHOLD = 25.0
+
+# Canonical CSV header used by BASELINE and every VALIDATE. Do NOT
+# reorder or rename — mcp__turbo__parse_bench_csv reads these columns
+# verbatim and any drift silently disables the per-shape regression
+# gate between rounds.
+SUMMARY_CSV_HEADER: List[str] = [
+    "label", "B", "M", "N", "K", "Check",
+    "Forward TFLOPS", "Forward TFLOPS_stddev",
+    "Backward TFLOPS", "Backward TFLOPS_stddev",
+    "Forward Time (ms)", "Backward Time (ms)",
+    "out_snr", "da_snr", "db_snr",
+]
 
 
-def compute_snr(ref, test):
+def compute_snr(ref: torch.Tensor, test: torch.Tensor) -> float:
     noise = test.float() - ref.float()
     signal_power = ref.float().norm() ** 2
     noise_power = noise.norm() ** 2
-    if noise_power == 0:
+    if noise_power.item() == 0.0:
         return float("inf")
-    return 10 * torch.log10(signal_power / noise_power).item()
+    return float(10 * torch.log10(signal_power / noise_power).item())
 
 
-def run_one(M, N, K):
+def _timed_ms(fn, iters: int) -> float:
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def run_one(shape: Dict[str, Any], repeats: int, iters_per_repeat: int) -> Dict[str, Any]:
+    torch.manual_seed(0)  # stable inputs across rounds
+    M = int(shape["M"]); N = int(shape["N"]); K = int(shape["K"])
+    dtype = shape.get("dtype", torch.bfloat16)
+    label = str(shape.get("label", f"M{M}_N{N}_K{K}"))
     device = "cuda"
-    a = torch.randn(M, K, dtype=torch.bfloat16, device=device, requires_grad=True)
-    b = torch.randn(N, K, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    a = torch.randn(M, K, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(N, K, dtype=dtype, device=device, requires_grad=True)
 
     out = turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
-    ref = a.detach().float() @ b.detach().float().T
-    ok = compute_snr(ref.to(torch.bfloat16), out.detach()) >= 25.0
-
     grad_out = torch.randn_like(out)
+    with torch.no_grad():
+        ref = a.detach().float() @ b.detach().float().T
+    out_snr = compute_snr(ref.to(dtype), out.detach())
+    a_ref = a.detach().clone().requires_grad_(); b_ref = b.detach().clone().requires_grad_()
+    (a_ref.float() @ b_ref.float().T).backward(grad_out.float())
+    out.backward(grad_out, retain_graph=True)
+    da_snr = compute_snr(a_ref.grad, a.grad); db_snr = compute_snr(b_ref.grad, b.grad)
+    a.grad = None; b.grad = None
+    correct = all(s > SNR_THRESHOLD for s in (out_snr, da_snr, db_snr))
+
     fwd_fn = lambda: turbo.ops.gemm_fp8(a, b, trans_b=True, config=CONFIG)
-    bwd_fn = lambda: out.backward(grad_out, retain_graph=True)
-    out = fwd_fn()
-    bwd_fn()
+    out_for_bwd = fwd_fn()
+    bwd_fn = lambda: out_for_bwd.backward(grad_out, retain_graph=True)
 
-    for _ in range(20):
-        out = fwd_fn()
-        out.backward(grad_out, retain_graph=True)
-    torch.cuda.synchronize()
+    fwd_ms_samples, bwd_ms_samples = [], []
+    total_repeats = max(2, repeats + 1)  # always have >=1 warm-up + >=1 timed
+    for r in range(total_repeats):
+        fwd_ms = _timed_ms(fwd_fn, iters_per_repeat)
+        bwd_ms = _timed_ms(bwd_fn, iters_per_repeat)
+        if r == 0:
+            continue  # warm-up
+        fwd_ms_samples.append(fwd_ms); bwd_ms_samples.append(bwd_ms)
 
-    fwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": fwd_fn}).timeit(100).mean * 1e3
-    bwd_ms = benchmark.Timer(stmt="fn()", globals={"fn": bwd_fn}).timeit(100).mean * 1e3
-    flops = 2 * M * N * K
-    fwd_tflops = flops / fwd_ms / 1e9
-    bwd_tflops = 2 * flops / bwd_ms / 1e9
+    fwd_flops = 2.0 * M * N * K; bwd_flops = 2.0 * fwd_flops
+    fwd_tflops_samples = [fwd_flops / (t * 1e-3) / 1e12 for t in fwd_ms_samples]
+    bwd_tflops_samples = [bwd_flops / (t * 1e-3) / 1e12 for t in bwd_ms_samples]
+    def mean_std(xs):
+        m = statistics.fmean(xs); s = statistics.pstdev(xs) if len(xs) > 1 else 0.0
+        return m, s
+    fwd_ms_mean, _ = mean_std(fwd_ms_samples)
+    bwd_ms_mean, _ = mean_std(bwd_ms_samples)
+    fwd_tflops_mean, fwd_tflops_std = mean_std(fwd_tflops_samples)
+    bwd_tflops_mean, bwd_tflops_std = mean_std(bwd_tflops_samples)
+    return {
+        "label": label, "B": 1, "M": M, "N": N, "K": K,
+        "Check": "PASS" if correct else "FAIL",
+        "Forward TFLOPS": fwd_tflops_mean,
+        "Forward TFLOPS_stddev": fwd_tflops_std,
+        "Backward TFLOPS": bwd_tflops_mean,
+        "Backward TFLOPS_stddev": bwd_tflops_std,
+        "Forward Time (ms)": fwd_ms_mean,
+        "Backward Time (ms)": bwd_ms_mean,
+        "out_snr": out_snr, "da_snr": da_snr, "db_snr": db_snr,
+    }
 
-    return ok, fwd_tflops, bwd_tflops
+
+def _failed_row(shape: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """Emit a canonical-schema FAIL row so BASELINE still sees the shape."""
+    return {
+        "label": str(shape.get("label", "?")),
+        "B": int(shape.get("B", 1)), "M": int(shape.get("M", 0)),
+        "N": int(shape.get("N", 0)), "K": int(shape.get("K", 0)),
+        "Check": "FAIL",
+        "Forward TFLOPS": float("nan"), "Forward TFLOPS_stddev": float("nan"),
+        "Backward TFLOPS": float("nan"), "Backward TFLOPS_stddev": float("nan"),
+        "Forward Time (ms)": float("nan"), "Backward Time (ms)": float("nan"),
+        "out_snr": float("nan"), "da_snr": float("nan"), "db_snr": float("nan"),
+    }
 
 
-print(f"{'Label':<12} {'Shape':<25} {'Check':<6} {'Fwd TFLOPS':>11} {'Bwd TFLOPS':>11}")
-print("-" * 68)
-all_pass = True
-for s in SHAPES:
-    ok, fwd, bwd = run_one(s["M"], s["N"], s["K"])
-    if not ok:
-        all_pass = False
-    print(
-        f"{s['label']:<12} {s['M']}x{s['N']}x{s['K']:<15} "
-        f"{'PASS' if ok else 'FAIL':<6} {fwd:>11.2f} {bwd:>11.2f}"
-    )
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--iters-per-repeat", type=int, default=50)
+    ap.add_argument("--summary-csv", type=str, default=None)
+    ap.add_argument("--csv", type=str, default=None)
+    args = ap.parse_args()
 
-print(f"\nOverall: {'ALL PASS' if all_pass else 'HAS FAILURES'}")
+    if not torch.cuda.is_available():
+        print("CUDA / ROCm device required.", file=sys.stderr); return 2
+
+    rows: List[Dict[str, Any]] = []
+    for s in SHAPES:
+        try:
+            rows.append(run_one(s, args.repeats, args.iters_per_repeat))
+        except Exception as e:  # noqa: BLE001
+            print(f"{s.get('label', str(s))}: ERROR {e}", file=sys.stderr)
+            rows.append(_failed_row(s, str(e)))
+
+    print(f"{'label':<22} {'Check':<5} {'Fwd TFLOPS':>12} {'Bwd TFLOPS':>12}")
+    for r in rows:
+        print(f"{r['label']:<22} {r['Check']:<5} "
+              f"{r['Forward TFLOPS']:>12.2f} {r['Backward TFLOPS']:>12.2f}")
+
+    pass_fwd = [r["Forward TFLOPS"] for r in rows if r["Check"] == "PASS"]
+    pass_bwd = [r["Backward TFLOPS"] for r in rows if r["Check"] == "PASS"]
+    def geomean(xs):
+        xs = [x for x in xs if x > 0 and not math.isnan(x)]
+        return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else 0.0
+    print(f"Geomean Fwd TFLOPS: {geomean(pass_fwd):.2f}")
+    print(f"Geomean Bwd TFLOPS: {geomean(pass_bwd):.2f}")
+
+    if args.summary_csv:
+        with open(args.summary_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=SUMMARY_CSV_HEADER)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in SUMMARY_CSV_HEADER})
+        print(f"Summary CSV: {args.summary_csv}")
+
+    all_pass = all(r["Check"] == "PASS" for r in rows)
+    return 0 if all_pass else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
-Record the script invocation in the manifest as `quick_command: "python <campaign_dir>/quick_test_bench.py"`.
+Record the script invocation in the manifest as `quick_command: "python <campaign_dir>/quick_test_bench.py"`. BASELINE and every VALIDATE round append `--summary-csv <round_dir>/artifacts/benchmark.csv` at call time.
 
 ### Demo: Optimizing blockwise FP8 GEMM Triton on MI300X
 

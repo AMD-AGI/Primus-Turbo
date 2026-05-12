@@ -6,12 +6,15 @@ Use these examples as routing hints, not as literal commands.
 
 1. Read `SKILL.md` and gather project-specific test / benchmark commands.
 2. Read `../../rules/iteration_rules.mdc`.
-3. Read `triton/SKILL.md`.
-4. Read `../hardware/gfx942/SKILL.md`.
-5. Read `../tool-rocprof/SKILL.md`.
-6. Create `<campaign_dir>/related_work.md` using `related-work-template.md`, cloning any temporary comparison repos into `agent/tmp/<campaign_name>/related-work/repos/`.
-7. Run baseline correctness + benchmark.
-8. Make one change, validate, and accept or roll back.
+3. Read `../../rules/no_benchmark_overfitting.mdc` and `avoid-benchmark-overfit/SKILL.md`.
+4. Read `triton/SKILL.md`.
+5. Read `../hardware/gfx942/SKILL.md`.
+6. Read `../tool-rocprof/SKILL.md`.
+7. Create `<campaign_dir>/related_work.md` using `related-work-template.md`, cloning any temporary comparison repos into `agent/tmp/<campaign_name>/related-work/repos/`.
+8. Run baseline correctness + benchmark.
+9. Make one change, validate, and accept or roll back. If the change is a
+   wrapper-level cache, run the `avoid-benchmark-overfit` audit before
+   implementation; reject any cache keyed on `id(activation)` / `id(grad_out)`.
 
 ## Example 2: HIP MFMA Kernel on MI355X
 

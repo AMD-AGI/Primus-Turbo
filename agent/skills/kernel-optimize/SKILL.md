@@ -35,7 +35,9 @@ This skill is **not responsible for**:
 
 After the agent has collected all the above information, return to this file to execute DEFINE_TARGET.
 
-Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, and accept-or-rollback lineage.
+Before entering the optimization loop, read [`../../rules/iteration_rules.mdc`](../../rules/iteration_rules.mdc) and [`../../rules/no_benchmark_overfitting.mdc`](../../rules/no_benchmark_overfitting.mdc). Those rules are hard constraints for every backend: one hypothesis per round, correctness before performance, benchmark the full active validation set, accept-or-rollback lineage, and **every accepted gain must transfer to a real LLM training step (no benchmark idiom over-fitting via `id(...)`-keyed activation / grad_out / scale caches)**.
+
+When ANALYZE proposes any wrapper-level cache, memoization, or `id(tensor)` lookup, follow the operational checklist in [`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md) before writing code.
 
 For validation scope, interpret that contract as:
 - **full validation** → run all `target_shapes`
@@ -230,12 +232,24 @@ After PREPARE_ENVIRONMENT creates the campaign directory, perform a short relate
   - transferable implementation ideas worth trying in this campaign
   - caveats about reproducibility, hidden fusion, datatype mismatch, or incompatible hardware assumptions
   - a short shortlist of concrete optimization directions to test locally
+  - a `Real-training transfer audit` table that tags every shortlisted direction with its bucket from [`avoid-benchmark-overfit/SKILL.md`](avoid-benchmark-overfit/SKILL.md) (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`) and an explicit reason why the direction will or will not survive a real LLM training step
 
 **Constraints**:
 
 - Treat `agent/tmp/<campaign_name>/related-work/` as ephemeral scratch space, not part of the accepted optimization lineage.
 - Do not allow the survey to turn into open-ended browsing; stop once the agent has enough information to guide early hypotheses.
 - The survey informs the campaign, but it does not replace the local baseline and validation loop.
+- A direction tagged `W2` or `W3` in the survey is **not** a candidate hypothesis. The agent must drop it from the shortlist at SURVEY time, not at VALIDATE time. Recording the direction as a known anti-pattern in the survey is fine; promoting it into ANALYZE is not.
+
+**Real-training transfer audit at survey time**:
+
+When a SOTA reference reports a large gain, separate the gain into:
+
+- structural kernel/algorithm work (almost always transfers): `tl.dot_scaled`, MFMA selection, layout-specialized kernels, prefetch / pipeline depth, single-launch fusion, persistent kernels.
+- benchmark-loop / inference-graph work (transfer is conditional): KV-cache reuse for inference, weight pre-quant cached on the module, capture-graph / CUDA-graph reuse.
+- benchmark-only artifacts (do not transfer): caches keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)`, or any "we already saw this Python tensor object" trick.
+
+The survey must call this out per source. If a SOTA blog post reports `+15%` from a generic "activation cache", the survey must record both numbers: the headline `+15%` and a sober estimate of how much of that is benchmark-loop artifact vs. structural gain. Otherwise the campaign starts with an inflated ceiling and the agent will keep chasing it for the rest of the rounds.
 
 Use `related-work-template.md` as the default output structure for `<campaign_dir>/related_work.md`.
 
@@ -330,6 +344,8 @@ Read the corresponding skill as needed based on `target_lang`, `target_gpu`, and
 | What you need | Where to find it |
 |---------------|-----------------|
 | Linear iteration contract | [../../rules/iteration_rules.mdc](../../rules/iteration_rules.mdc) |
+| No benchmark over-fitting (hard rule) | [../../rules/no_benchmark_overfitting.mdc](../../rules/no_benchmark_overfitting.mdc) |
+| Cache audit / id-key audit (operational) | [avoid-benchmark-overfit/SKILL.md](avoid-benchmark-overfit/SKILL.md) |
 | Optimization process and gating rules | [workflow/optimize-loop.md](workflow/optimize-loop.md) |
 | General Triton optimization techniques | [triton/SKILL.md](triton/SKILL.md) |
 | General HIP optimization techniques | [hip/SKILL.md](hip/SKILL.md) |
