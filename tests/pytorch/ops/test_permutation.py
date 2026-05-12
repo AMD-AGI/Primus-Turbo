@@ -119,6 +119,7 @@ def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hid
         turbo_unp_in,
         row_id_map,
         ndtt,
+        restore_shape=tokens_turbo.shape,
         num_local_experts=num_experts,
     )
     turbo_unp_out.backward(grad_unp, retain_graph=True)
@@ -287,8 +288,8 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
         permuted,
         row_id_map,
         ndtt,
+        restore_shape=tokens.shape,
         num_local_experts=num_experts,
-        pad_multiple=pad_multiple,
     )
     assert unpermuted.shape == (0, hidden_size)
     unpermuted.backward(torch.zeros_like(unpermuted))
@@ -381,6 +382,7 @@ def test_moe_unpermute_with_probs_fwd_bwd():
         permuted_in,
         row_id_map,
         ndtt,
+        restore_shape=tokens.shape,
         num_local_experts=num_experts,
         permuted_probs=permuted_probs,
     )
@@ -444,6 +446,7 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
         turbo_unp_in,
         row_id_map,
         ndtt,
+        restore_shape=tokens_turbo.shape,
         num_local_experts=num_experts,
     )
     assert turbo_unp_out.dtype == torch.float16
@@ -494,8 +497,8 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
         unp_in_ref,
         row_id_map_ref,
         ndtt,
+        restore_shape=tokens_ref.shape,
         num_local_experts=num_experts,
-        pad_multiple=0,
     )
     grad_unp_ref = torch.randn_like(unp_out_ref)
     unp_out_ref.backward(grad_unp_ref, retain_graph=True)
@@ -532,14 +535,15 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     tol = get_tolerances(torch.bfloat16)
     torch.testing.assert_close(tokens_pad.grad, tokens_ref.grad, **tol)
 
-    # Unpermute with pad_multiple: output collapses to [num_tokens, hidden].
+    # Unpermute strips padding via ``restore_shape``; output collapses to
+    # [num_tokens, hidden].
     unp_in_pad = perm_pad.detach().clone().requires_grad_(True)
     unp_out_pad, _ = moe_unpermute(
         unp_in_pad,
         row_id_map_pad,
         ndtt,
+        restore_shape=tokens_pad.shape,
         num_local_experts=num_experts,
-        pad_multiple=pad_multiple,
     )
     assert unp_out_pad.shape == (num_tokens, hidden_size)
     torch.testing.assert_close(unp_out_pad, unp_out_ref, **tol)
