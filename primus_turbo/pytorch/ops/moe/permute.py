@@ -87,29 +87,22 @@ class _MoEPermute(torch.autograd.Function):
         # Triton ``TokenPermuteMaskMap`` empty-input behavior.
         if num_dispatched == 0 or max_num_dispatched_tokens == 0:
             int_opts = dict(dtype=torch.int32, device=device)
-            row_id_map_rows = max(
-                0, max_num_dispatched_tokens + int(pad_multiple))
+            row_id_map_rows = max(0, max_num_dispatched_tokens + int(pad_multiple))
             # Zero-fill so an unrelated consumer that inspects the map without
             # going through ``_MoEUnpermute`` doesn't observe garbage. The map
             # is small so the cost is negligible.
-            row_id_map = torch.zeros(
-                (row_id_map_rows, 2 * num_local_experts + 1), **int_opts
-            )
+            row_id_map = torch.zeros((row_id_map_rows, 2 * num_local_experts + 1), **int_opts)
             tokens_per_expert = torch.zeros((num_local_experts,), **int_opts)
             overflow_flag = torch.zeros((1,), **int_opts)
             permuted_tokens = tokens.new_empty((0, hidden_size))
             if use_fp8 and scaling_factor is not None:
-                assert (
-                    scales_per_token > 0
-                ), "_MoEPermute: scales_per_token must be > 0 when use_fp8=True"
+                assert scales_per_token > 0, "_MoEPermute: scales_per_token must be > 0 when use_fp8=True"
                 permuted_scaling_factor: Optional[torch.Tensor] = scaling_factor.new_empty(
                     (0, scales_per_token)
                 )
             else:
                 permuted_scaling_factor = None
-            permuted_probs: Optional[torch.Tensor] = (
-                probs.new_zeros((0,)) if probs is not None else None
-            )
+            permuted_probs: Optional[torch.Tensor] = probs.new_zeros((0,)) if probs is not None else None
 
             ctx.save_for_backward(row_id_map, num_dispatched_token_tensor)
             return (
@@ -142,8 +135,7 @@ class _MoEPermute(torch.autograd.Function):
             num_permuted_alloc = int(tokens_per_expert.sum().item())
 
         # 3) Allocate outputs.
-        permuted_tokens = torch.empty(
-            (num_permuted_alloc, hidden_size), dtype=tokens.dtype, device=device)
+        permuted_tokens = torch.empty((num_permuted_alloc, hidden_size), dtype=tokens.dtype, device=device)
         if use_fp8 and scaling_factor is not None:
             assert scales_per_token > 0, "_MoEPermute: scales_per_token must be > 0 when use_fp8=True"
             permuted_scaling_factor = torch.empty(
@@ -157,9 +149,7 @@ class _MoEPermute(torch.autograd.Function):
             # ``torch.zeros`` so the trailing ``[Σ real + pad, num_permuted_alloc)``
             # range — which the kernel never writes when the caller-provided cap
             # over-allocates — stays at 0 instead of holding undefined memory.
-            permuted_probs = torch.zeros(
-                (num_permuted_alloc,), dtype=probs.dtype, device=device
-            )
+            permuted_probs = torch.zeros((num_permuted_alloc,), dtype=probs.dtype, device=device)
         else:
             permuted_probs = None
         with_probs = (probs is not None) and (permuted_probs is not None)
@@ -332,8 +322,7 @@ class _MoEUnpermute(torch.autograd.Function):
             ctx.save_for_backward(row_id_map, num_dispatched_tokens_tensor)
             return unpermuted_tokens, unpermuted_probs
 
-        with_probs = (permuted_probs is not None) and (
-            unpermuted_probs is not None)
+        with_probs = (permuted_probs is not None) and (unpermuted_probs is not None)
         torch.ops.primus_turbo_cpp_extension.unpermute(
             permuted_tokens,
             unpermuted_tokens,
