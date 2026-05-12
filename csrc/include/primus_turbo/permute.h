@@ -21,13 +21,13 @@ void permute_impl(const DType *tokens, DType *permuted_tokens, const ScalarType 
                   ScalarType *permuted_scaling_factor, const ProbType *probs,
                   ProbType *permuted_probs, const int *row_id_map,
                   const int *num_dispatched_tokens_ptr, int pad_multiple, int num_local_experts,
-                  int hidden_size, int scales_per_token, int local_rank, int num_ranks_per_node,
-                  int num_cu, hipStream_t stream);
+                  int hidden_size, int scales_per_token, int num_dispatched_max,
+                  hipStream_t stream);
 
 template <typename DType, typename ProbType>
 void unpermute_impl(const DType *permuted_tokens, DType *tokens, const ProbType *permuted_probs,
                     ProbType *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
-                    int num_local_experts, int hidden_size, int local_rank, int num_ranks_per_node,
-                    int num_cu, hipStream_t stream);
+                    int num_local_experts, int hidden_size, int num_dispatched_max,
+                    hipStream_t stream);
 
 } // namespace primus_turbo

@@ -281,7 +281,6 @@ def run_hip_backend(
     tokens: torch.Tensor,
     num_dispatched: int,
     num_dispatched_t: torch.Tensor,
-    max_num_dispatched_tokens: int,
     ref_perm: torch.Tensor,
     ref_unperm: torch.Tensor,
     warmup: int,
@@ -298,7 +297,6 @@ def run_hip_backend(
         tokens,
         topk_idx,
         num_dispatched_t,
-        max_num_dispatched_tokens,
         num_local_experts=E,
         num_topk=K,  # topk_idx path
         pad_multiple=0,
@@ -314,9 +312,7 @@ def run_hip_backend(
         permuted_tokens,
         row_id_map,
         num_dispatched_t,
-        num_dispatched=num_dispatched,
         num_local_experts=E,
-        pad_multiple=0,
     )
     torch.cuda.synchronize()
     ok_u = _check_close("hip/unpermute", ref_unperm, recovered)
@@ -333,7 +329,6 @@ def run_hip_backend(
         cpp_ext.permute_preprocessing(
             topk_idx,
             num_dispatched_t,
-            max_num_dispatched_tokens,
             E,
             K,
             0,  # pad_multiple
@@ -354,12 +349,9 @@ def run_hip_backend(
             E,
             H,
             0,  # scales_per_token
-            0,
-            1,  # local_rank, num_ranks_per_node
             False,  # use_fp8
             False,  # with_probs
             num_permuted,
-            0,  # num_blocks_permute → default num_cu
         )
 
     def bwd_call():
@@ -372,10 +364,7 @@ def run_hip_backend(
             num_dispatched_t,
             E,
             H,
-            0,
-            1,  # local_rank, num_ranks_per_node
             False,  # with_probs
-            0,  # num_blocks_unpermute → default num_cu
         )
 
     preproc_ms = _bench_callable(preproc_call, warmup=warmup, iters=iters)
@@ -517,7 +506,6 @@ def run_one(
     topk_idx = recv_topk_idx.to(dtype=torch.int32)
     num_dispatched = recv_num_tokens
     num_dispatched_t = torch.tensor([num_dispatched], dtype=torch.int32, device=device)
-    max_num_dispatched_tokens = case.num_tokens_per_rank * case.ep
 
     tokens = torch.randn((num_dispatched, case.hidden_size), dtype=torch.bfloat16, device=device)
 
@@ -536,7 +524,6 @@ def run_one(
                     tokens=tokens,
                     num_dispatched=num_dispatched,
                     num_dispatched_t=num_dispatched_t,
-                    max_num_dispatched_tokens=max_num_dispatched_tokens,
                     ref_perm=ref_perm,
                     ref_unperm=ref_unperm,
                     warmup=warmup,
