@@ -395,10 +395,6 @@ def test_grouped_gemm_fp8_blockwise_triton_deterministic(
 @pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
-    # FIXME(ruibin): CK backend has numerical issues.
-    if backend == BackendType.CK or backend == None:
-        pytest.skip("CK backend has numerical issues currently")
-
     if backend == BackendType.TRITON and format == Format.HYBRID:
         pytest.skip("TRITON backend not support HYBRID format currently")
 
