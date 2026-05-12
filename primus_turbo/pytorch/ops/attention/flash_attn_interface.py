@@ -16,6 +16,8 @@ from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
+    attention_aiter_varlen_backward_impl,
+    attention_aiter_varlen_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -28,7 +30,7 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
     get_p_scale,
 )
 
-__all__ = ["flash_attn_func", "flash_attn_fp8_func"]
+__all__ = ["flash_attn_func", "flash_attn_fp8_func", "flash_attn_varlen_func"]
 
 
 class AiterFlashAttnFunc(torch.autograd.Function):
@@ -104,9 +106,14 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             qkv_format=qkv_format if not enable_sink else "bshd",
         )
 
-        if enable_sink and qkv_format == "sbhd":
-            # permute back to SBHD
-            out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
+        if enable_sink:
+            if qkv_format == "sbhd":
+                # permute back to SBHD
+                out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
+            elif qkv_format == "bhsd":
+                out_padded = out_padded.permute(0, 2, 1, 3).contiguous()
+            else:
+                assert qkv_format == "bshd"
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -144,7 +151,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         enable_sink = ctx.sink is not None
         qkv_format = ctx.qkv_format
 
-        if enable_sink and qkv_format == "sbhd":
+        if enable_sink and qkv_format in ("sbhd", "bhsd"):
             dout = dout.contiguous()
 
         dout_padded = dout
@@ -166,6 +173,16 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             dv_padded = torch.empty(
                 (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
+        elif bwd_qkv_format == "bhsd":
+            dq = torch.ones(
+                (batch_size, num_heads_q, seq_len, head_dim_qk), dtype=q.dtype, device=q.device
+            ).permute(0, 2, 1, 3)
+            dk = torch.empty(
+                (batch_size, num_heads_k, seq_len, head_dim_k), dtype=k.dtype, device=k.device
+            ).permute(0, 2, 1, 3)
+            dv_padded = torch.empty(
+                (batch_size, num_heads_v, seq_len, head_dim_v), dtype=v.dtype, device=v.device
+            ).permute(0, 2, 1, 3)
         else:
             dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
             dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
@@ -202,10 +219,17 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             qkv_format=bwd_qkv_format,
         )
 
-        if enable_sink and qkv_format == "sbhd":
-            dq = dq.permute(1, 0, 2, 3).contiguous()
-            dk = dk.permute(1, 0, 2, 3).contiguous()
-            dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
+        if enable_sink:
+            if qkv_format == "sbhd":
+                dq = dq.permute(1, 0, 2, 3).contiguous()
+                dk = dk.permute(1, 0, 2, 3).contiguous()
+                dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
+            elif qkv_format == "bhsd":
+                dq = dq.permute(0, 2, 1, 3).contiguous()
+                dk = dk.permute(0, 2, 1, 3).contiguous()
+                dv_padded = dv_padded.permute(0, 2, 1, 3).contiguous()
+            else:
+                assert qkv_format == "bshd"
 
         dq = dq[..., :head_size_q_og]
         dk = dk[..., :head_size_q_og]
@@ -351,7 +375,7 @@ def flash_attn_func(
 ):
     qkv_format = _infer_qkv_format(q, k, v)
 
-    return AiterFlashAttnFunc.apply(
+    result = AiterFlashAttnFunc.apply(
         q,
         k,
         v,
@@ -369,6 +393,8 @@ def flash_attn_func(
         sink,
         qkv_format,
     )
+
+    return result
 
 
 def flash_attn_fp8_func(
@@ -388,7 +414,11 @@ def flash_attn_fp8_func(
 ):
     qkv_format = _infer_qkv_format(q, k, v)
 
-    if qkv_format == "sbhd":
+    if qkv_format == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+    elif qkv_format == "sbhd":
         q = q.permute(1, 0, 2, 3).contiguous()
         k = k.permute(1, 0, 2, 3).contiguous()
         v = v.permute(1, 0, 2, 3).contiguous()
@@ -428,5 +458,223 @@ def flash_attn_fp8_func(
 
     if qkv_format == "sbhd":
         o = o.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        o = o.permute(0, 2, 1, 3).contiguous()
 
     return o
+
+
+# =============================================================================
+# Varlen Attention (thd layout)
+# =============================================================================
+
+
+class AiterFlashAttnVarlenFunc(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_softmax,
+        is_grad_enabled,
+    ):
+        is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        how_v3_bf16_cvt = 0 if get_device_compute_capability() >= (9, 5) else 1
+
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        head_size_q_og = q.size(-1)
+        head_size_v_og = v.size(-1)
+        if head_size_q_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+        if head_size_v_og % 8 != 0:
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_varlen_forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+            return_softmax=return_softmax and dropout_p > 0,
+        )
+
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state)
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.bias = bias
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+            ctx.head_size_q_og = head_size_q_og
+            ctx.head_size_v_og = head_size_v_og
+            ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
+            ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
+
+        out = out_padded[..., :head_size_v_og]
+
+        result = [out]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(S_dmask)
+        return result[0] if len(result) == 1 else tuple(result)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        head_size_q_og = ctx.head_size_q_og
+        head_size_v_og = ctx.head_size_v_og
+
+        dout_padded = dout
+        if head_size_v_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv_padded = torch.empty_like(v)
+
+        attention_aiter_varlen_backward_impl(
+            dout=dout_padded,
+            q=q,
+            k=k,
+            v=v,
+            out=out_padded,
+            softmax_lse=softmax_lse,
+            dq=dq,
+            dk=dk,
+            dv=dv_padded,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            dropout_p=ctx.dropout_p,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            alibi_slopes=ctx.alibi_slopes,
+            deterministic=ctx.deterministic,
+            rng_state=rng_state,
+            is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
+            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+        )
+
+        dq = dq[..., :head_size_q_og]
+        dk = dk[..., :head_size_q_og]
+        dv = dv_padded[..., :head_size_v_og]
+
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    return_attn_probs=False,
+):
+    """Variable-length flash attention (THD layout).
+
+    Mirrors flash-attention's `flash_attn_varlen_func` API. Sequences are
+    packed back-to-back along dim 0.
+
+    Arguments:
+        q: (total_q, nheads_q, headdim_q)
+        k: (total_k, nheads_k, headdim_q)
+        v: (total_k, nheads_k, headdim_v)
+        cu_seqlens_q: (batch + 1,) int32 cumulative query lengths
+        cu_seqlens_k: (batch + 1,) int32 cumulative key lengths
+        max_seqlen_q: maximum query sequence length in the batch
+        max_seqlen_k: maximum key sequence length in the batch
+        dropout_p: dropout probability (set 0.0 during eval).
+        softmax_scale: QK^T scale; defaults to 1 / sqrt(headdim_q).
+        causal: bottom-right aligned causal mask.
+        window_size: (left, right) sliding window. (-1, -1) = full attention.
+        bias: optional attention bias.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+        deterministic: use the deterministic backward (slower, more memory).
+        return_lse: also return softmax_lse of shape (nheads, total_q).
+        return_attn_probs: testing-only; return the dropout-encoded softmax output.
+    """
+    return AiterFlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        torch.is_grad_enabled(),
+    )

@@ -14,7 +14,16 @@ int64_t get_hipblaslt_workspace_size_in_byte() {
         return 67108864; // 64 MiB
     case GPUArch::GFX942:
     case GPUArch::UNKNOWN:
-        return 33554432; // 32 MiB
+        // 128 MiB. Some FP8 mixed-precision shapes on MI300X (gfx942) -- e.g.
+        // the (M=3072, N=3072, K=8192) E4M3 x E5M2 -> BF16 grad_weight GEMM
+        // emitted by the FLUX-12B backward graph -- cause hipBLASLt's
+        // heuristic to return an algorithm whose required workspace exceeds
+        // the previous 32 MiB cap (~72 MiB observed). hipblasLtMatmul then
+        // returns HIPBLAS_STATUS_INVALID_VALUE at execution time (logged by
+        // hipBLASLt as "Input workspace size ... is less than the required
+        // workspace size ..."). Bumping to 128 MiB covers that case with
+        // comfortable headroom for similar-sized algos.
+        return 134217728; // 128 MiB
     }
 }
 

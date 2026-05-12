@@ -9,7 +9,8 @@ import os
 import sys
 from enum import Enum
 
-_LOG_LEVEL_ENV = "PRIMUS_TURBO_LOG_LEVEL"
+from primus_turbo.common.constants import ENV_LOG_LEVEL
+
 _DEFAULT_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 _DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -57,7 +58,7 @@ class PrimusTurboLogger:
 
     @staticmethod
     def _resolve_log_level() -> int:
-        level_str = os.environ.get(_LOG_LEVEL_ENV, LogLevelEnum.WARNING.value).upper()
+        level_str = os.environ.get(ENV_LOG_LEVEL, LogLevelEnum.WARNING.value).upper()
         numeric = getattr(logging, level_str, None)
         if not isinstance(numeric, int):
             numeric = logging.WARNING

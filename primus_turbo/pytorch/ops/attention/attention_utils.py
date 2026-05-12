@@ -8,16 +8,15 @@ import os
 
 import torch
 
+from primus_turbo.common.constants import ENV_ATTN_V3_ATOMIC_FP32
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     get_f8_fwd_dtype,
 )
 from primus_turbo.triton.attention.attention_kernel import FIXED_BLOCK_M
 
-PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32_ENV_KEY = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
-
 
 def _resolve_is_v3_atomic_fp32_from_env() -> bool:
-    val = os.getenv(PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32_ENV_KEY, "1")
+    val = os.getenv(ENV_ATTN_V3_ATOMIC_FP32, "1")
     return val == "1" if val in ("0", "1") else True
 
 
@@ -60,6 +59,9 @@ def _infer_qkv_format(
         # sbhd: sequence outermost → s1 > s0 > s2
         if s1 >= s0 >= s2:
             return "sbhd"
+        # bhsd: transposed bshd (e.g. bshd.transpose(1,2)) → s0 > s2 > s1
+        if s0 >= s2 >= s1:
+            return "bhsd"
 
         assert False, (
             f"Cannot infer qkv layout from shape {tuple(t.size())} " f"and strides {tuple(t.stride())}"

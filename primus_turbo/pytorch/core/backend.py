@@ -14,6 +14,12 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
+from primus_turbo.common.constants import (
+    ENV_AUTO_TUNE,
+    ENV_GEMM_BACKEND,
+    ENV_GROUPED_GEMM_BACKEND,
+    ENV_MOE_DISPATCH_COMBINE_BACKEND,
+)
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.gemm.gemm_kernel import clear_origami_caches
 
@@ -32,11 +38,6 @@ __all__ = [
     "TuneCache",
     "AutoKernelDispatcher",
 ]
-
-_ENV_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GEMM_BACKEND"
-_ENV_GROUPED_GEMM_BACKEND_KEY = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
-_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
-_ENV_AUTO_TUNE_KEY = "PRIMUS_TURBO_AUTO_TUNE"
 
 
 class PrecisionType(Enum):
@@ -171,12 +172,12 @@ class GlobalBackendManager:
         """Get the GEMM backend configuration. Returns None if not set."""
         if cls._gemm_backend is not None:
             return cls._gemm_backend[precision]
-        env_value = os.environ.get(_ENV_GEMM_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_GEMM_BACKEND, None)
         if env_value is not None:
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
-                    f"Precision {precision.name} not found in the environment variable {_ENV_GEMM_BACKEND_KEY}. "
+                    f"Precision {precision.name} not found in the environment variable {ENV_GEMM_BACKEND}. "
                     f"Using default backend.",
                     once=True,
                 )
@@ -189,13 +190,13 @@ class GlobalBackendManager:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend[precision]
-        env_value = os.environ.get(_ENV_GROUPED_GEMM_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_GROUPED_GEMM_BACKEND, None)
         if env_value is not None:
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
-                    f"{_ENV_GROUPED_GEMM_BACKEND_KEY}. Using default backend.",
+                    f"{ENV_GROUPED_GEMM_BACKEND}. Using default backend.",
                     once=True,
                 )
             return backend
@@ -212,7 +213,7 @@ class GlobalBackendManager:
         """
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend[precision]
-        env_value = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY, None)
+        env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
         if env_value is not None:
             try:
                 backend = cls._extract_backend_from_env(env_value).get(precision, None)
@@ -222,7 +223,7 @@ class GlobalBackendManager:
             if backend is None:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
-                    f"{_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY}. Using default backend.",
+                    f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}. Using default backend.",
                     once=True,
                 )
 
@@ -239,7 +240,7 @@ class GlobalBackendManager:
         """Check if auto-tune is enabled."""
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get(_ENV_AUTO_TUNE_KEY, "0") == "1"
+        return os.environ.get(ENV_AUTO_TUNE, "0") == "1"
 
     @classmethod
     def reset(cls) -> None:
@@ -312,6 +313,18 @@ class TuneCache:
 
     def __contains__(self, key: Hashable) -> bool:
         return key in self._cache
+
+
+def _format_kwargs(kwargs: Dict[str, Any]) -> str:
+
+    def _format_value(v):
+        if isinstance(v, torch.Tensor):
+            return f"Tensor(shape={v.shape}, dtype={v.dtype})"
+        if isinstance(v, Enum):
+            return f"{type(v).__name__}.{v.name}"
+        return repr(v)
+
+    return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
 class AutoKernelDispatcher(ABC):
@@ -410,6 +423,7 @@ class AutoKernelDispatcher(ABC):
         cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
+
         if user_backend_enum is not None:
             if user_backend_enum not in cls._backends:
                 raise ValueError(
@@ -419,7 +433,7 @@ class AutoKernelDispatcher(ABC):
             entry = cls._backends[user_backend_enum]
             if not entry.impl.can_handle(**kwargs):
                 raise ValueError(
-                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs. "
+                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
             return entry.impl.execute(**kwargs)
@@ -440,9 +454,11 @@ class AutoKernelDispatcher(ABC):
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
                 logger.warning(
-                    f"Fallback backend {fallback_backend_enum.name} selected. The fallback backend may hurt performance!",
+                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
                     once=True,
                 )
                 return fallback_backend_entry.impl.execute(**kwargs)
 
-        raise ValueError(f"No compatible backend found for {cls.__name__} with kwargs: {kwargs}")
+        raise ValueError(
+            f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
+        )

@@ -54,13 +54,43 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
     torch.testing.assert_close(
         x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
         x_fp8.to(torch.float32) * x_scale_inv,
-        **get_tolerances(dest_dtype)
+        **get_tolerances(dest_dtype),
     )
 
     # DeQuantize
     x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, scale_inv=x_scale_inv)
     x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, scale_inv=x_scale_inv_ref)
     torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+@pytest.mark.parametrize(
+    "shape,spike_pos",
+    [
+        ((1, 100), -1),
+        ((1, 8193), -1),
+        ((512, 3072), 8300),
+        ((512, 3072), -1),
+        ((1024, 4096), -1),
+    ],
+)
+def test_quantize_fp8_tensorwise_amax_correctness(orig_dtype, dest_dtype, granularity, shape, spike_pos):
+    """Regression test for partial-tile amax reduction bug in reduce_row_kernel."""
+    x = torch.ones(shape, device="cuda", dtype=orig_dtype) * 0.5
+    x.view(-1)[spike_pos] = 100.0
+    x_ref = x.detach().clone()
+
+    x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
+    x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(
+        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
+        x_fp8.to(torch.float32) * x_scale_inv,
+        **get_tolerances(dest_dtype),
+    )
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -94,7 +124,7 @@ def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N, torch_compi
     torch.testing.assert_close(
         x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
         x_fp8.to(torch.float32) * x_scale_inv,
-        **get_tolerances(dest_dtype)
+        **get_tolerances(dest_dtype),
     )
 
 

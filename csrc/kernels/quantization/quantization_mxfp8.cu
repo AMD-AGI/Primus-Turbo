@@ -256,25 +256,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
 
                 uint64_t packed = 0;
                 if (global_row < M) {
+                    const int64_t row_offset = static_cast<int64_t>(global_row) * N + global_col;
                     if (global_col + ELEMS_PER_THREAD - 1 < N) {
-                        packed = __ldg(reinterpret_cast<const uint64_t *>(
-                            &input_as_uint16[global_row * N + global_col]));
+                        packed =
+                            __ldg(reinterpret_cast<const uint64_t *>(&input_as_uint16[row_offset]));
                     } else {
-                        uint16_t elem0 = (global_col < N)
-                                             ? __ldg(&input_as_uint16[global_row * N + global_col])
-                                             : 0;
+                        uint16_t elem0 = (global_col < N) ? __ldg(&input_as_uint16[row_offset]) : 0;
                         uint16_t elem1 =
-                            (global_col + 1 < N)
-                                ? __ldg(&input_as_uint16[global_row * N + global_col + 1])
-                                : 0;
+                            (global_col + 1 < N) ? __ldg(&input_as_uint16[row_offset + 1]) : 0;
                         uint16_t elem2 =
-                            (global_col + 2 < N)
-                                ? __ldg(&input_as_uint16[global_row * N + global_col + 2])
-                                : 0;
+                            (global_col + 2 < N) ? __ldg(&input_as_uint16[row_offset + 2]) : 0;
                         uint16_t elem3 =
-                            (global_col + 3 < N)
-                                ? __ldg(&input_as_uint16[global_row * N + global_col + 3])
-                                : 0;
+                            (global_col + 3 < N) ? __ldg(&input_as_uint16[row_offset + 3]) : 0;
                         packed = (uint64_t) elem0 | ((uint64_t) elem1 << 16) |
                                  ((uint64_t) elem2 << 32) | ((uint64_t) elem3 << 48);
                     }
@@ -398,9 +391,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
                                     global_row, global_col, output_packed_stride);
                                 *reinterpret_cast<uint32_t *>(out_fp8 + shuffled_index) = fp8x4;
                             } else {
-                                *reinterpret_cast<uint32_t *>(
-                                    out_fp8 + global_row * output_packed_stride + global_col) =
-                                    fp8x4;
+                                *reinterpret_cast<uint32_t *>(out_fp8 +
+                                                              static_cast<int64_t>(global_row) *
+                                                                  output_packed_stride +
+                                                              global_col) = fp8x4;
                             }
                         }
 
@@ -447,9 +441,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
                                     global_col, global_row_base, output_packed_stride);
                                 *reinterpret_cast<uint32_t *>(out_fp8 + shuffled_index) = fp8x4;
                             } else {
-                                *reinterpret_cast<uint32_t *>(
-                                    out_fp8 + global_col * output_packed_stride + global_row_base) =
-                                    fp8x4;
+                                *reinterpret_cast<uint32_t *>(out_fp8 +
+                                                              static_cast<int64_t>(global_col) *
+                                                                  output_packed_stride +
+                                                              global_row_base) = fp8x4;
                             }
                         }
 
@@ -580,21 +575,14 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
 
                 uint64_t packed = 0;
                 if (global_row < M) {
+                    const int64_t row_offset = static_cast<int64_t>(global_row) * N + global_col;
                     if (global_col + ELEMS_PER_THREAD - 1 < N) {
-                        packed = __ldg(reinterpret_cast<const uint64_t *>(
-                            &input_u16[global_row * N + global_col]));
+                        packed = __ldg(reinterpret_cast<const uint64_t *>(&input_u16[row_offset]));
                     } else {
-                        uint16_t s0 =
-                            (global_col < N) ? __ldg(&input_u16[global_row * N + global_col]) : 0;
-                        uint16_t s1 = (global_col + 1 < N)
-                                          ? __ldg(&input_u16[global_row * N + global_col + 1])
-                                          : 0;
-                        uint16_t s2 = (global_col + 2 < N)
-                                          ? __ldg(&input_u16[global_row * N + global_col + 2])
-                                          : 0;
-                        uint16_t s3 = (global_col + 3 < N)
-                                          ? __ldg(&input_u16[global_row * N + global_col + 3])
-                                          : 0;
+                        uint16_t s0 = (global_col < N) ? __ldg(&input_u16[row_offset]) : 0;
+                        uint16_t s1 = (global_col + 1 < N) ? __ldg(&input_u16[row_offset + 1]) : 0;
+                        uint16_t s2 = (global_col + 2 < N) ? __ldg(&input_u16[row_offset + 2]) : 0;
+                        uint16_t s3 = (global_col + 3 < N) ? __ldg(&input_u16[row_offset + 3]) : 0;
                         packed = (uint64_t) s0 | ((uint64_t) s1 << 16) | ((uint64_t) s2 << 32) |
                                  ((uint64_t) s3 << 48);
                     }
@@ -693,8 +681,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                                 compute_shuffled_index<OType>(global_row, global_col, K_packed);
                             *reinterpret_cast<uint32_t *>(rowwise_fp8 + shuffled_idx) = fp8x4;
                         } else {
-                            *reinterpret_cast<uint32_t *>(rowwise_fp8 + global_row * K_packed +
-                                                          global_col) = fp8x4;
+                            *reinterpret_cast<uint32_t *>(
+                                rowwise_fp8 + static_cast<int64_t>(global_row) * K_packed +
+                                global_col) = fp8x4;
                         }
                     }
 
@@ -884,7 +873,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                     &s_colwise_fp8[n_chunk][col_in_chunk][seg * 4]);
                 const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
                 if (row_start < M_pad) {
-                    *reinterpret_cast<uint4 *>(colwise_fp8 + global_col * M_packed + row_start) =
+                    *reinterpret_cast<uint4 *>(
+                        colwise_fp8 + static_cast<int64_t>(global_col) * M_packed + row_start) =
                         data;
                 }
             }

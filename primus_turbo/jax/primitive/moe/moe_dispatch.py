@@ -259,14 +259,14 @@ ABSTRACT_EVAL_TABLE[moe_internode_cached_dispatch_p] = _moe_internode_cached_dis
 # ----------------------------------------
 def _moe_dispatch_lowering(ctx, *args, **kwargs):
     target = deep_ep_runtime.get_target_name("moe_dispatch", launch_mode=kwargs.get("launch_mode"))
-    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering(target, has_side_effect=True)(ctx, *args, **kwargs)
 
 
 def _moe_cached_dispatch_lowering(ctx, *args, **kwargs):
     target = deep_ep_runtime.get_target_name(
         "moe_cached_dispatch", launch_mode=kwargs.get("launch_mode")
     )
-    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering(target, has_side_effect=True)(ctx, *args, **kwargs)
 
 
 LOWERING_TABLE[moe_dispatch_p] = _moe_dispatch_lowering
@@ -277,11 +277,11 @@ def _moe_internode_dispatch_lowering(ctx, *args, **kwargs):
     kwargs = dict(kwargs)
     # Used only by abstract eval to shape recv_src_meta; C++ derives the size itself.
     kwargs.pop("source_meta_bytes", None)
-    return jax.ffi.ffi_lowering("moe_internode_dispatch_per_process")(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_dispatch_per_process", has_side_effect=True)(ctx, *args, **kwargs)
 
 
 def _moe_internode_cached_dispatch_lowering(ctx, *args, **kwargs):
-    return jax.ffi.ffi_lowering("moe_internode_cached_dispatch_per_process")(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_cached_dispatch_per_process", has_side_effect=True)(ctx, *args, **kwargs)
 
 
 LOWERING_TABLE[moe_internode_dispatch_p] = _moe_internode_dispatch_lowering

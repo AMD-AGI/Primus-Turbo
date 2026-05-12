@@ -73,10 +73,9 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
 
         Note:
-            Whether dispatch/combine kernels run on the caller's current CUDA
-            stream or on a dedicated async communication stream is controlled
-            by the environment variable ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM``
-            (default ``1``: current-stream, CUDA-graph friendly).
+            Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
+            When set to ``1``, dispatch/combine kernels run on the caller's
+            current CUDA stream.
         """
         check_nvlink_connections(group)
 

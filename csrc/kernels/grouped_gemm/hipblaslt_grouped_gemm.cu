@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 
 #include "primus_turbo/gemm.h"
@@ -13,7 +14,15 @@
 
 namespace primus_turbo {
 
+// Number of streams actively used by `run()` (1 caller stream + 3 internal).
 static constexpr size_t kMaxNumStreams = 4;
+// Number of internal handle / stream / event slots actually pre-allocated at
+// construction time. Mirrors upstream `grouped-gemm-ck::HipBlasLt`'s
+// `kDefaultInitKmaxNumStream = 8`. With only `kMaxNumStreams = 4` slots
+// pre-allocated, BF16 multi-stream grouped GEMM stalls intermittently on
+// MI355X after a few dozen fwd+bwd iterations; over-provisioning the slot
+// pool empirically eliminates the stall (see PR description for traces).
+static constexpr size_t kInitNumStreams = 8;
 
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size() {
     return kMaxNumStreams * get_hipblaslt_workspace_size_in_byte();
@@ -24,10 +33,24 @@ public:
     HipblasltGroupedGemm() {
         PRIMUS_TURBO_CHECK_HIP(hipEventCreateWithFlags(&sync_event_, hipEventDisableTiming));
 
-        for (size_t i = 0; i < kMaxNumStreams; ++i) {
-            PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
-            PRIMUS_TURBO_CHECK_HIP(
-                hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
+        // Slot 0 is the PyTorch current stream (fetched per-call inside
+        // `run(...)`); only slots 1..kInitNumStreams-1 own internal compute
+        // streams + dedicated hipBLASLt handles. Creating a "ghost" handle
+        // for slot 0 was empirically observed to push hipBLASLt past an
+        // internal resource limit on MI355X and re-trigger the BF16 stall.
+        handles_[0]         = nullptr;
+        compute_streams_[0] = nullptr;
+        for (size_t i = 0; i < kInitNumStreams; ++i) {
+            if (i > 0) {
+                PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtCreate(&handles_[i]));
+                PRIMUS_TURBO_CHECK_HIP(
+                    hipStreamCreateWithPriority(&compute_streams_[i], hipStreamNonBlocking, -1));
+                // Bind each handle to its dedicated compute stream. hipBLASLt's
+                // internal state (heuristic cache, workspace accounting) is
+                // per-handle and assumes a one-to-one handle<->stream association.
+                PRIMUS_TURBO_CHECK_HIPBLAS(hipblasSetStream(
+                    reinterpret_cast<hipblasHandle_t>(handles_[i]), compute_streams_[i]));
+            }
             PRIMUS_TURBO_CHECK_HIP(
                 hipEventCreateWithFlags(&hipblaslt_events_[i], hipEventDisableTiming));
         }
@@ -39,7 +62,7 @@ public:
             (void) hipEventDestroy(sync_event_);
         }
 
-        for (size_t i = 0; i < kMaxNumStreams; ++i) {
+        for (size_t i = 0; i < kInitNumStreams; ++i) {
             if (compute_streams_[i] != nullptr) {
                 (void) hipStreamDestroy(compute_streams_[i]);
             }
@@ -85,17 +108,26 @@ public:
         const size_t num_stream_used{std::min<size_t>(kMaxNumStreams, num_gemms)};
 
         if (num_gemms > 0) {
-            // wait for current stream to finish
-            PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
-
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
+            // Slot 0 runs on params.stream directly; only extra slots need
+            // fan-out from params.stream via sync_event_.
+            if (num_stream_used > 1) {
+                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
+                }
             }
 
             for (size_t idx = 0; idx < num_gemms; ++idx) {
                 const auto stream_idx = idx % kMaxNumStreams;
-                auto       stream     = compute_streams_[stream_idx];
-                auto       handle     = handles_[stream_idx];
+                // Slot 0 uses the caller's stream and hipBLASLt handle (the
+                // PyTorch current stream/handle, which is already bound
+                // one-to-one). Extra slots use our internal streams bound via
+                // hipblasSetStream above.
+                auto       stream     = (stream_idx == 0) ? params.stream
+                                                          : compute_streams_[stream_idx];
+                auto       handle     = (stream_idx == 0) ? params.handle
+                                                          : handles_[stream_idx];
                 auto       workspace  = workspaces_[stream_idx];
                 // clang-format off
                 hipblaslt_gemm_impl(
@@ -115,14 +147,17 @@ public:
                 // clang-format on
             }
 
-            // record events on compute streams
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
-            }
-
-            // wait for all compute streams to finish
-            for (size_t s = 0; s < num_stream_used; ++s) {
-                PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
+            if (num_stream_used > 1) {
+                // Slot 0 already runs on params.stream; fan extra slots back
+                // into params.stream.
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipEventRecord(hipblaslt_events_[s], compute_streams_[s]));
+                }
+                for (size_t s = 1; s < num_stream_used; ++s) {
+                    PRIMUS_TURBO_CHECK_HIP(
+                        hipStreamWaitEvent(params.stream, hipblaslt_events_[s], 0));
+                }
             }
         }
     }
@@ -217,11 +252,13 @@ private:
         return shape.at(idx);
     }
 
-    // Handles, events, streams, heuristic, epilogue
-    hipblasLtHandle_t   handles_[kMaxNumStreams]{};
+    // Handles, events, streams, heuristic, epilogue. Sized to
+    // `kInitNumStreams` even though only `kMaxNumStreams` are actually
+    // used by `run(...)`; see the constant declaration for the rationale.
+    hipblasLtHandle_t   handles_[kInitNumStreams]{};
     hipEvent_t          sync_event_{nullptr};
-    hipStream_t         compute_streams_[kMaxNumStreams]{};
-    hipEvent_t          hipblaslt_events_[kMaxNumStreams]{};
+    hipStream_t         compute_streams_[kInitNumStreams]{};
+    hipEvent_t          hipblaslt_events_[kInitNumStreams]{};
     hipblasLtEpilogue_t epilogue_{HIPBLASLT_EPILOGUE_DEFAULT};
 
     // Gemm Pointers
@@ -245,7 +282,13 @@ private:
 };
 
 void hipblaslt_grouped_gemm(const HipblasltGroupedGemmParams &params, const bool pre_sync) {
-    static thread_local HipblasltGroupedGemm instance;
+    // Process-wide singleton (NOT `thread_local`), mirroring upstream
+    // `grouped-gemm-ck::HipBlasLt`. With `thread_local` the autograd worker
+    // thread allocated its own pool of internal streams, so the process
+    // ended up running on >=7 distinct hipBLASLt streams (3 per thread +
+    // PyTorch's default), which appears to push hipBLASLt past an implicit
+    // resource limit on MI355X and triggers BF16 multi-stream stalls.
+    static HipblasltGroupedGemm instance;
     instance.run(params, pre_sync);
 }
 

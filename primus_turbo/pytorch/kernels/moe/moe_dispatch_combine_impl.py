@@ -23,6 +23,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 
+from primus_turbo.common.constants import ENV_MOE_DISPATCH_COMBINE_BACKEND
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -404,6 +405,12 @@ _BACKEND_REGISTRY: Dict[str, Type[EPBackend]] = {
 _backend_instances: Dict[str, EPBackend] = {}
 
 
+def clear_backend_instances():
+    global _backend_instances
+
+    _backend_instances.clear()
+
+
 def register_ep_backend(name: str, cls: Type[EPBackend]) -> None:
     """Register a new EP backend class (e.g. ``UCCL_EP``)."""
     _BACKEND_REGISTRY[name] = cls
@@ -428,8 +435,6 @@ def _get_backend_instance(name: str) -> EPBackend:
 # Backend selection
 # =========================================================================
 
-_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
-
 _BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
     BackendType.TURBO: "TURBO",
     BackendType.DEEP_EP: "DEEP_EP",
@@ -448,7 +453,7 @@ def _resolve_backend_name() -> str:
     if user_backend is not None:
         return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
 
-    env_val = os.environ.get(_ENV_MOE_DISPATCH_COMBINE_BACKEND_KEY)
+    env_val = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND)
     if env_val is not None:
         return env_val.strip().upper()
 

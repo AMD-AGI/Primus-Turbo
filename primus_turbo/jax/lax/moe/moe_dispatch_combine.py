@@ -30,8 +30,6 @@ __all__ = ["get_dispatch_config", "moe_dispatch", "get_combine_config", "moe_com
 
 _default_num_sms = 64
 
-P = jax.sharding.PartitionSpec
-
 
 def warmup(hidden_bytes: int, *, config: Optional[Config] = None) -> None:
     """Eagerly bootstrap DeepEP runtime outside any JAX tracing context.

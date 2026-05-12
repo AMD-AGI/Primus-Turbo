@@ -118,14 +118,14 @@ ABSTRACT_EVAL_TABLE[moe_internode_combine_p] = _moe_internode_combine_abstract_e
 # ----------------------------------------
 def _moe_combine_lowering(ctx, *args, **kwargs):
     target = deep_ep_runtime.get_target_name("moe_combine", launch_mode=kwargs.get("launch_mode"))
-    return jax.ffi.ffi_lowering(target)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering(target, has_side_effect=True)(ctx, *args, **kwargs)
 
 
 LOWERING_TABLE[moe_combine_p] = _moe_combine_lowering
 
 
 def _moe_internode_combine_lowering(ctx, *args, **kwargs):
-    return jax.ffi.ffi_lowering("moe_internode_combine_per_process")(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_combine_per_process", has_side_effect=True)(ctx, *args, **kwargs)
 
 
 LOWERING_TABLE[moe_internode_combine_p] = _moe_internode_combine_lowering

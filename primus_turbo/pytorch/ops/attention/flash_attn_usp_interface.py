@@ -517,7 +517,11 @@ def flash_attn_fp8_usp_func(
 ):
     qkv_format = _infer_qkv_format(q, k, v)
 
-    if qkv_format == "sbhd":
+    if qkv_format == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+    elif qkv_format == "sbhd":
         q = q.permute(1, 0, 2, 3).contiguous()
         k = k.permute(1, 0, 2, 3).contiguous()
         v = v.permute(1, 0, 2, 3).contiguous()
@@ -559,5 +563,7 @@ def flash_attn_fp8_usp_func(
 
     if qkv_format == "sbhd":
         o = o.permute(1, 0, 2, 3).contiguous()
+    elif qkv_format == "bhsd":
+        o = o.permute(0, 2, 1, 3).contiguous()
 
     return o
