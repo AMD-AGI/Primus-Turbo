@@ -256,9 +256,16 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped, in
                 sum += nvl_recv_num_tokens_per_rank.buffer(src_nvl_rank)[src_rdma_rank];
                 recv_gbl_rank_prefix_sum[i] = sum;
             }
-            while (ld_volatile_global(moe_recv_counter_mapped) != -1)
-                ;
-            *moe_recv_counter_mapped = sum;
+            // The host-mapped total receive counter is only consumed by the
+            // dynamic (CPU sync) dispatch path. With num_worst_tokens > 0
+            // (XLA's static-shape path) the host skips its CPU sync, so
+            // back-to-back launches would see the previous iteration's
+            // non-(-1) value and spin forever here.
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_counter_mapped) != -1)
+                    ;
+                *moe_recv_counter_mapped = sum;
+            }
         }
         if (thread_id < num_nvl_experts) {
             int sum = 0;
