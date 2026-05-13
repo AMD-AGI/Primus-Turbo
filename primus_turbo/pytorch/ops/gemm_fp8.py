@@ -20,6 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quant_fp8_blockwise_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
 )
@@ -225,10 +226,30 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         assert trans_a == False
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
+        a_dtype_bwd = _get_fp8_dtype(config.format, False)
 
-        a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
-            a, a_dtype, axis=1, block_size=config.block_size
-        )
+        # When forward and backward share the same FP8 dtype (i.e. non-HYBRID
+        # formats), fuse forward row-quant with column-quant of the same
+        # activation in a single dual kernel pass and save the column result
+        # into ctx so the backward can skip its own column-quant launch.
+        # This is a kernel fusion (single tensor `a` is read once instead of
+        # twice) and does NOT depend on tensor identity across iterations.
+        fuse_a_dual = a_dtype == a_dtype_bwd and a.is_contiguous()
+
+        if fuse_a_dual:
+            (
+                a_fp8_row,
+                a_scale_inv_row,
+                a_fp8_col,
+                a_scale_inv_col,
+            ) = quant_fp8_blockwise_dual_impl(a, a_dtype, config.block_size)
+        else:
+            a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
+                a, a_dtype, axis=1, block_size=config.block_size
+            )
+            a_fp8_col = None
+            a_scale_inv_col = None
+
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
         out = gemm_fp8_impl(
@@ -243,7 +264,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             granularity=config.granularity.value,
             default_backend=BackendType.CK.value,
         )
-        ctx.save_for_backward(a, b_fp8, b_scale_inv)
+        if fuse_a_dual:
+            ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
+            ctx.has_prequantized_a_col = True
+        else:
+            ctx.save_for_backward(a, b_fp8, b_scale_inv)
+            ctx.has_prequantized_a_col = False
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -255,24 +281,25 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        a, b_fp8, b_scale_inv = ctx.saved_tensors
+        if ctx.has_prequantized_a_col:
+            b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
+        else:
+            a, b_fp8, b_scale_inv = ctx.saved_tensors
+            a_dtype = _get_fp8_dtype(ctx.config.format, False)
+            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
+                a, a_dtype, axis=0, block_size=ctx.config.block_size
+            )
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        a_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
-        grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
-            grad_out, grad_out_dtype, -1, ctx.config.block_size
-        )
-        grad_out_fp8_col, grad_out_scale_inv_col = quant_fp8_blockwise_impl(
-            grad_out, grad_out_dtype, -2, ctx.config.block_size
-        )
-
-        # TODO: dequant + quant kernel
-        a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
-            a, a_dtype, axis=0, block_size=ctx.config.block_size
-        )
+        (
+            grad_out_fp8_row,
+            grad_out_scale_inv_row,
+            grad_out_fp8_col,
+            grad_out_scale_inv_col,
+        ) = quant_fp8_blockwise_dual_impl(grad_out, grad_out_dtype, ctx.config.block_size)
 
         a_grad = gemm_fp8_impl(
             grad_out_fp8_row,
