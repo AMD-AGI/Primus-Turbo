@@ -46,15 +46,35 @@ permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_tok
                            expert_map.scalar_type() == at::kLong,
                        "expert_map must be bool or int or int64");
     PRIMUS_TURBO_CHECK(expert_map.dim() == 2, "expert_map must be 2D");
+    PRIMUS_TURBO_CHECK(expert_map.is_contiguous(), "expert_map must be contiguous");
     PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_cuda(),
                        "num_dispatched_token_tensor must be CUDA");
     PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.scalar_type() == at::kInt,
                        "num_dispatched_token_tensor must be int32");
+    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_contiguous(),
+                       "num_dispatched_token_tensor must be contiguous");
+    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.numel() == 1,
+                       "num_dispatched_token_tensor must contain exactly one element");
+
+    if (expert_map.scalar_type() == at::kBool) {
+        PRIMUS_TURBO_CHECK(expert_map.size(1) == num_local_experts,
+                           "bool expert_map second dimension must equal num_local_experts");
+    } else {
+        PRIMUS_TURBO_CHECK(expert_map.size(1) == num_topk,
+                           "index expert_map second dimension must equal num_topk");
+    }
+
+    auto max_num_dispatched_tokens = expert_map.size(0);
+    auto num_dispatched_token_cpu =
+        num_dispatched_token_tensor.to(at::TensorOptions().dtype(at::kInt).device(at::kCPU));
+    auto num_dispatched_tokens = num_dispatched_token_cpu.item<int>();
+    PRIMUS_TURBO_CHECK(num_dispatched_tokens >= 0,
+                       "num_dispatched_token_tensor value must be non-negative");
+    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_dispatched_tokens) <= max_num_dispatched_tokens,
+                       "num_dispatched_token_tensor value must not exceed expert_map.size(0)");
 
     auto device   = expert_map.device();
     auto int_opts = at::TensorOptions().dtype(at::kInt).device(device);
-
-    auto max_num_dispatched_tokens = expert_map.sizes()[0];
 
     auto row_id_map = at::empty(
         {static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple), 2 * num_local_experts + 1},
@@ -100,17 +120,54 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
 
     PRIMUS_TURBO_CHECK(tokens.is_cuda() && output_tokens.is_cuda(),
                        "permute: tokens / output_tokens must be CUDA");
-    PRIMUS_TURBO_CHECK(row_id_map.is_cuda() && row_id_map.scalar_type() == at::kInt,
-                       "permute: row_id_map must be int32 CUDA tensor");
+    PRIMUS_TURBO_CHECK(tokens.is_contiguous() && output_tokens.is_contiguous(),
+                       "permute: tokens / output_tokens must be contiguous");
+    PRIMUS_TURBO_CHECK(tokens.dim() == 2 && output_tokens.dim() == 2,
+                       "permute: tokens / output_tokens must be 2D");
+    PRIMUS_TURBO_CHECK(tokens.size(1) == hidden_size,
+                       "permute: tokens.shape[1] must equal hidden_size");
+    PRIMUS_TURBO_CHECK(output_tokens.size(0) == num_permuted_token &&
+                           output_tokens.size(1) == hidden_size,
+                       "permute: output_tokens shape must be [num_permuted_token, hidden_size]");
+    PRIMUS_TURBO_CHECK(row_id_map.is_cuda() && row_id_map.scalar_type() == at::kInt &&
+                           row_id_map.is_contiguous(),
+                       "permute: row_id_map must be contiguous int32 CUDA tensor");
     PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_cuda() &&
-                           num_dispatched_token_tensor.scalar_type() == at::kInt,
-                       "permute: num_dispatched_token_tensor must be int32 CUDA tensor");
+                           num_dispatched_token_tensor.scalar_type() == at::kInt &&
+                           num_dispatched_token_tensor.is_contiguous() &&
+                           num_dispatched_token_tensor.numel() == 1,
+                       "permute: num_dispatched_token_tensor must be contiguous int32 CUDA tensor "
+                       "with exactly one element");
 
-    if (scaling_factor.has_value())
-        PRIMUS_TURBO_CHECK(scaling_factor->scalar_type() == at::kFloat,
-                           "permute: scaling_factor must be float32");
-    if (probs.has_value())
-        PRIMUS_TURBO_CHECK(probs->scalar_type() == at::kFloat, "permute: probs must be float32");
+    if (use_fp8) {
+        PRIMUS_TURBO_CHECK(tokens.element_size() == 1 && output_tokens.element_size() == 1,
+                           "permute (fp8): tokens / output_tokens must have 1-byte elements");
+    } else {
+        PRIMUS_TURBO_CHECK(tokens.element_size() == 2 && output_tokens.element_size() == 2,
+                           "permute (16-bit): tokens / output_tokens must have 2-byte elements");
+    }
+
+    if (scaling_factor.has_value()) {
+        PRIMUS_TURBO_CHECK(scaling_factor->is_cuda() && scaling_factor->is_contiguous() &&
+                               scaling_factor->scalar_type() == at::kFloat,
+                           "permute: scaling_factor must be contiguous float32 CUDA tensor");
+    }
+    if (output_scaling_factor.has_value()) {
+        PRIMUS_TURBO_CHECK(output_scaling_factor->is_cuda() &&
+                               output_scaling_factor->is_contiguous() &&
+                               output_scaling_factor->scalar_type() == at::kFloat,
+                           "permute: output_scaling_factor must be contiguous float32 CUDA tensor");
+    }
+    if (probs.has_value()) {
+        PRIMUS_TURBO_CHECK(probs->is_cuda() && probs->is_contiguous() &&
+                               probs->scalar_type() == at::kFloat,
+                           "permute: probs must be contiguous float32 CUDA tensor");
+    }
+    if (output_probs.has_value()) {
+        PRIMUS_TURBO_CHECK(output_probs->is_cuda() && output_probs->is_contiguous() &&
+                               output_probs->scalar_type() == at::kFloat,
+                           "permute: output_probs must be contiguous float32 CUDA tensor");
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
