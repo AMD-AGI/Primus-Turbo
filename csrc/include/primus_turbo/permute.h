@@ -5,7 +5,7 @@
 #pragma once
 
 #include "primus_turbo/common.h"
-#include "primus_turbo/dtype_t.h"
+#include "primus_turbo/dtype.h"
 
 namespace primus_turbo {
 
