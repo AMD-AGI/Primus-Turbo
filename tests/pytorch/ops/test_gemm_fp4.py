@@ -125,3 +125,74 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
 
     # Reset config and caches
     GlobalBackendManager.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_use_gradient_sr_true():
+    """Gradient quantization with use_gradient_sr=True should be stochastic (differ across runs)."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    device = "cuda:0"
+    m, k, n = 256, 512, 256
+    dtype = torch.bfloat16
+
+    config = Float4QuantConfig(use_gradient_sr=True)
+
+    a = torch.randn(m, k, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(k, n, dtype=dtype, device=device, requires_grad=True)
+    grad_output = torch.randn(m, n, dtype=dtype, device=device)
+
+    out1 = gemm_fp4(a, b, config=config)
+    out1.backward(grad_output)
+    a_grad1 = a.grad.clone()
+    b_grad1 = b.grad.clone()
+    a.grad = None
+    b.grad = None
+
+    out2 = gemm_fp4(a, b, config=config)
+    out2.backward(grad_output)
+    a_grad2 = a.grad.clone()
+    b_grad2 = b.grad.clone()
+
+    assert not torch.equal(a_grad1, a_grad2) or not torch.equal(
+        b_grad1, b_grad2
+    ), "Gradients should differ with stochastic rounding enabled"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_use_gradient_sr_false():
+    """Gradient quantization with use_gradient_sr=False should be deterministic (identical)."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    device = "cuda:0"
+    m, k, n = 256, 512, 256
+    dtype = torch.bfloat16
+
+    config = Float4QuantConfig(use_gradient_sr=False)
+
+    a = torch.randn(m, k, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(k, n, dtype=dtype, device=device, requires_grad=True)
+    grad_output = torch.randn(m, n, dtype=dtype, device=device)
+
+    out1 = gemm_fp4(a, b, config=config)
+    out1.backward(grad_output)
+    a_grad1 = a.grad.clone()
+    b_grad1 = b.grad.clone()
+    a.grad = None
+    b.grad = None
+
+    out2 = gemm_fp4(a, b, config=config)
+    out2.backward(grad_output)
+    a_grad2 = a.grad.clone()
+    b_grad2 = b.grad.clone()
+
+    assert torch.equal(a_grad1, a_grad2), "A gradients should be identical without stochastic rounding"
+    assert torch.equal(b_grad1, b_grad2), "B gradients should be identical without stochastic rounding"
