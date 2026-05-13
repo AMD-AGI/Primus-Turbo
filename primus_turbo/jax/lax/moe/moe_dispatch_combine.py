@@ -315,12 +315,14 @@ def _moe_dispatch_impl_internode(
     if handle is not None:
         assert topk_idx is None and topk_weights is None
         (
+            is_token_in_rank,
             rdma_channel_prefix_matrix,
-            recv_rdma_rank_prefix_sum,
             gbl_channel_prefix_matrix,
+            _recv_rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            _recv_gbl_channel_prefix_matrix,
             recv_gbl_rank_prefix_sum,
             recv_src_meta,
-            is_token_in_rank,
             send_rdma_head,
             send_nvl_head,
         ) = handle
@@ -389,12 +391,14 @@ def _moe_dispatch_impl_internode(
         )
 
         handle = (
+            is_token_in_rank,
             rdma_channel_prefix_matrix,
-            recv_rdma_rank_prefix_sum,
             gbl_channel_prefix_matrix,
+            recv_rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            recv_gbl_channel_prefix_matrix,
             recv_gbl_rank_prefix_sum,
             recv_src_meta,
-            is_token_in_rank,
             send_rdma_head,
             send_nvl_head,
         )
@@ -552,12 +556,14 @@ def _moe_combine_impl_internode(
 ):
     """Internode combine path (ep_size > 8)."""
     (
-        rdma_channel_prefix_matrix,
-        recv_rdma_rank_prefix_sum,
-        gbl_channel_prefix_matrix,
-        recv_gbl_rank_prefix_sum,
-        recv_src_meta,
         is_token_in_rank,
+        _send_rdma_channel_prefix_matrix,
+        _send_gbl_channel_prefix_matrix,
+        rdma_channel_prefix_matrix,
+        rdma_rank_prefix_sum,
+        gbl_channel_prefix_matrix,
+        gbl_rank_prefix_sum,
+        recv_src_meta,
         send_rdma_head,
         send_nvl_head,
     ) = handle
@@ -571,9 +577,9 @@ def _moe_combine_impl_internode(
         recv_src_meta,
         is_token_in_rank,
         rdma_channel_prefix_matrix,
-        recv_rdma_rank_prefix_sum,
+        rdma_rank_prefix_sum,
         gbl_channel_prefix_matrix,
-        recv_gbl_rank_prefix_sum,
+        gbl_rank_prefix_sum,
         send_rdma_head,
         send_nvl_head,
         ep_size=ep_size,
