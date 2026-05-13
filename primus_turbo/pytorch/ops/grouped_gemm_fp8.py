@@ -69,7 +69,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         out_dtype = a.dtype
         assert out_dtype in [torch.float16, torch.bfloat16]
 
-        assert trans_b, "BLOCKWISE grouped autograd requires trans_b=True"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
@@ -86,7 +85,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         out = grouped_gemm_fp8_impl(
             a_fp8_row, b_fp8, a_scale_inv_row, b_scale_inv,
             group_lens, group_offs,
-            trans_a=False, trans_b=True,
+            trans_a=False, trans_b=trans_b,
             out_dtype=out_dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
@@ -98,6 +97,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             b_fp8, b_scale_inv,
             group_lens, group_offs,
         )
+        ctx.trans_b = trans_b
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -119,23 +119,24 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             grad_out, grad_out_dtype, block_size, group_lens, group_offs
         )
 
-        # NN dgrad: kernel reads weight + scales in their original quant layout.
+        # dgrad swaps trans_b: NT fwd → NN dgrad; TN fwd → TT dgrad.
         grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8_row, b_fp8,
             grad_out_scale_inv_row, b_scale_inv,
             group_lens, group_offs,
-            trans_a=False, trans_b=False,
+            trans_a=False, trans_b=not ctx.trans_b,
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
         )
 
+        # wgrad: trans_c follows fwd's trans_b so the output layout matches `b`.
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8_col, grad_out_fp8_col,
             a_scale_inv_col, grad_out_scale_inv_col,
             var_k_group_lens, var_k_group_offs,
-            trans_a=True, trans_b=False, trans_c=True,
+            trans_a=True, trans_b=False, trans_c=ctx.trans_b,
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,

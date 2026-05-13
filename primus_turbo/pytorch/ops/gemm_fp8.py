@@ -225,9 +225,11 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         config: Float8QuantConfig,
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
-        assert not trans_a and trans_b, "BLOCKWISE autograd requires trans_a=False, trans_b=True"
+        assert not trans_a, "BLOCKWISE autograd requires trans_a=False"
         assert a.shape[0] % config.block_size == 0 and a.shape[1] % config.block_size == 0, \
             f"a shape {tuple(a.shape)} must align to block_size={config.block_size}"
+        assert b.shape[0] % config.block_size == 0 and b.shape[1] % config.block_size == 0, \
+            f"b shape {tuple(b.shape)} must align to block_size={config.block_size}"
 
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
