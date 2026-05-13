@@ -252,9 +252,6 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
-    if backend == BackendType.TRITON and format == Format.HYBRID:
-        pytest.skip("TRITON backend does not support HYBRID format currently.")
-
     _run_gemm_fp8_test(
         m=m,
         n=n,

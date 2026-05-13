@@ -64,7 +64,7 @@ def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: i
     raise NotImplementedError(f"Un-impl")
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
 def quant_fp8_blockwise_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
@@ -98,7 +98,7 @@ def quant_fp8_blockwise_impl(
     x_scales = torch.zeros(scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_kernel)[grid](
+    quant_fp8_blockwise_kernel[grid](
         x,
         x_fp8,
         x_scales,
@@ -211,7 +211,7 @@ def quant_fp8_blockwise_segment_m_impl_meta(
     return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
 def quant_fp8_blockwise_for_weight_impl(
     w: torch.Tensor,
     dtype: torch.dtype,
@@ -245,7 +245,7 @@ def quant_fp8_blockwise_for_weight_impl(
         device=w.device,
     )
     grid = (B, triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_for_weight_kernel)[grid](
+    quant_fp8_blockwise_for_weight_kernel[grid](
         w,
         w_fp8,
         w_scales,
