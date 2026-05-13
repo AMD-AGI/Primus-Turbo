@@ -80,13 +80,6 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        enable_sink = sink is not None
-        if enable_sink:
-            # NOTE: Sink attention is not supported for sbhd format. Fallback to BSHD.
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-
         out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
             q=q,
             k=k,
@@ -103,17 +96,8 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             max_seqlen_q=q.size(1),
             max_seqlen_k=k.size(1),
             sink=sink,
-            qkv_format=qkv_format if not enable_sink else "bshd",
+            qkv_format=qkv_format,
         )
-
-        if enable_sink:
-            if qkv_format == "sbhd":
-                # permute back to SBHD
-                out_padded = out_padded.permute(1, 0, 2, 3).contiguous()
-            elif qkv_format == "bhsd":
-                out_padded = out_padded.permute(0, 2, 1, 3).contiguous()
-            else:
-                assert qkv_format == "bshd"
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -147,23 +131,17 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         head_size_v_og = ctx.head_size_v_og
 
         q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
-
-        enable_sink = ctx.sink is not None
         qkv_format = ctx.qkv_format
-
-        if enable_sink and qkv_format in ("sbhd", "bhsd"):
-            dout = dout.contiguous()
 
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
 
-        bwd_qkv_format = qkv_format if not enable_sink else "bshd"
         batch_size, seq_len, num_heads_q, head_dim_qk = q.size()
         _, _, num_heads_k, head_dim_k = k.size()
         _, _, num_heads_v, head_dim_v = v.size()
 
-        if bwd_qkv_format == "sbhd":
+        if qkv_format == "sbhd":
             dq = torch.ones(
                 (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(1, 0, 2, 3)
@@ -173,7 +151,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             dv_padded = torch.empty(
                 (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
-        elif bwd_qkv_format == "bhsd":
+        elif qkv_format == "bhsd":
             dq = torch.ones(
                 (batch_size, num_heads_q, seq_len, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(0, 2, 1, 3)
@@ -216,20 +194,8 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             dbias=dbias,
             dsink=dsink,
             sink=ctx.sink,
-            qkv_format=bwd_qkv_format,
+            qkv_format=qkv_format,
         )
-
-        if enable_sink:
-            if qkv_format == "sbhd":
-                dq = dq.permute(1, 0, 2, 3).contiguous()
-                dk = dk.permute(1, 0, 2, 3).contiguous()
-                dv_padded = dv_padded.permute(1, 0, 2, 3).contiguous()
-            elif qkv_format == "bhsd":
-                dq = dq.permute(0, 2, 1, 3).contiguous()
-                dk = dk.permute(0, 2, 1, 3).contiguous()
-                dv_padded = dv_padded.permute(0, 2, 1, 3).contiguous()
-            else:
-                assert qkv_format == "bshd"
 
         dq = dq[..., :head_size_q_og]
         dk = dk[..., :head_size_q_og]

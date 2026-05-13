@@ -76,15 +76,25 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         n = ulysses_group.size()
         b, s, h_q, d_qk = q.shape
         _, _, h_kv, d_v = v.shape
-        # Shape is always [b, s, h, d]; sbhd is encoded in strides.
-        # transpose(0,1) yields a contiguous [s, b, h, d] view for A2A.
+        # Shape is always [b, s, h, d];
         if qkv_format == "sbhd":
+            # sbhd is encoded in strides.
+            # transpose(0,1) yields a contiguous [s, b, h, d] view for A2A.
             q = q.transpose(0, 1)
             k = k.transpose(0, 1)
             v = v.transpose(0, 1)
-            seq_dim = 0
+            seq_dim = 0  # A2A
+        elif qkv_format == "bhsd":
+            # bhsd is encoded in strides.
+            # transpose(1, 2) yields a contiguous [b, h, s, d] view for A2A.
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            seq_dim = 2
         else:
+            # bshd
             seq_dim = 1
+
         s = s * n
         assert h_q % n == 0
         assert h_kv % n == 0
@@ -106,6 +116,10 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             q_local_heads = q_local_heads.transpose(0, 1)
             k_local_heads = k_local_heads.transpose(0, 1)
             v_local_heads = v_local_heads.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            q_local_heads = q_local_heads.transpose(1, 2)
+            k_local_heads = k_local_heads.transpose(1, 2)
+            v_local_heads = v_local_heads.transpose(1, 2)
 
         assert not return_softmax
         assert dropout_p == 0.0
@@ -148,17 +162,25 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             ctx.qkv_format = qkv_format
 
         output_local_heads = out_padded[..., :d_v]
-        # Transpose ring-attn output back to A2A layout [s, b, h, d].
+
         if qkv_format == "sbhd":
+            # Transpose ring-attn output back to A2A layout [s, b, h, d].
             output_local_heads = output_local_heads.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            # Transpose ring-attn output back to A2A layout [b, h, s, d].
+            output_local_heads = output_local_heads.transpose(1, 2)
+
         output_local_heads = attn_helper.reshape_o_before_a2a(output_local_heads)
         output_local_tokens = torch.empty_like(output_local_heads)
         torch.distributed.all_to_all_single(
             output_local_tokens, output_local_heads, group=ulysses_group, async_op=False
         )
         output_local_tokens = attn_helper.reshape_o_after_a2a(output_local_tokens)
+
         if qkv_format == "sbhd":
             output_local_tokens = output_local_tokens.transpose(0, 1)
+        elif qkv_format == "bhsd":
+            output_local_tokens = output_local_tokens.transpose(1, 2)
 
         result = [output_local_tokens]
         if return_lse:
@@ -183,6 +205,8 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
         # dout carries sbhd strides; transpose to contiguous for A2A view ops.
         if ctx.qkv_format == "sbhd":
             dout = dout.transpose(0, 1)
+        elif ctx.qkv_format == "bhsd":
+            dout = dout.transpose(1, 2)
 
         dout = attn_helper.reshape_do_before_a2a(dout)
 
@@ -203,9 +227,12 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             output_padded = torch.nn.functional.pad(output_padded, [0, d_qk - d_v])
             dout_padded = torch.nn.functional.pad(dout_local_heads, [0, d_qk - d_v])
 
-        # Transpose dout_padded back to [b, s, h, d] for ring attention kernel.
         if ctx.qkv_format == "sbhd":
+            # Transpose dout_padded back to [b, s, h, d] for ring attention kernel.
             dout_padded = dout_padded.transpose(0, 1)
+        elif ctx.qkv_format == "bhsd":
+            # Transpose dout_padded back to [b, h, s, d] for ring attention kernel.
+            dout_padded = dout_padded.transpose(1, 2)
 
         dq, dk, dv = ring_attn_bwd(
             ctx.ring_group,
@@ -240,6 +267,10 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             dq = dq.transpose(0, 1)
             dk = dk.transpose(0, 1)
             dv = dv.transpose(0, 1)
+        elif ctx.qkv_format == "bhsd":
+            dq = dq.transpose(1, 2)
+            dk = dk.transpose(1, 2)
+            dv = dv.transpose(1, 2)
 
         dqkv = attn_helper.combine_dqkv_before_a2a(dq, dk, dv)
         dqkv_out = torch.empty_like(dqkv)
@@ -250,6 +281,10 @@ class AttentionCKFunctionCPA2A(torch.autograd.Function):
             dq_local_tokens = dq_local_tokens.transpose(0, 1)
             dk_local_tokens = dk_local_tokens.transpose(0, 1)
             dv_local_tokens = dv_local_tokens.transpose(0, 1)
+        elif ctx.qkv_format == "bhsd":
+            dq_local_tokens = dq_local_tokens.transpose(1, 2)
+            dk_local_tokens = dk_local_tokens.transpose(1, 2)
+            dv_local_tokens = dv_local_tokens.transpose(1, 2)
 
         return (
             dq_local_tokens,
