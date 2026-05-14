@@ -23,20 +23,36 @@ namespace turbo {
 // Per-tile compute body for wgrad.  LHS rows (N) are the tile's "M" axis,
 // RHS rows (K) the "N" axis, and M_g the "K" axis.  GMEM row stride is
 // `total_m` for both LHS and RHS.
+// CK-style separation: compute_tile receives ALREADY group-resolved
+// pointers (lhs_grp_ptr / rhs_grp_ptr / lhs_s_grp_ptr / rhs_s_grp_ptr) +
+// only per-tile bookkeeping.  All per-group readfirstlane chains and
+// offset arithmetic live in the outer persistent kernel.  __noinline__
+// gives compute_tile its own register frame, isolated from the outer
+// loop's bookkeeping registers — narrows the SGPR live set so the
+// LDS-direct prologue's scratch_load → readfirstlane → m0 chain no
+// longer races with buffer_load_dwordx4 ... offen lds (gfx950 vmcnt
+// has no FIFO across scratch and buffer ops).  Mirrors the fwd kernel.
 template <typename GemmTile, typename AType, typename BType, typename CType>
 __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     GemmTile &tile, typename GemmTile::ASmemSubtile (*a_smem_tile)[4],
     typename GemmTile::BSmemSubtile (*b_smem_tile)[4],
     typename GemmTile::AScaleSmemSubtile (*a_s_smem_tile)[4],
-    typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *lhs_ptr,
-    const BType *rhs_ptr, const uint32_t *lhs_s_ptr, const uint32_t *rhs_s_ptr, CType *db_ptr,
-    const int64_t *a_group_offs_ptr, const int32_t group_id, const int32_t pid_n_local,
-    const int32_t pid_k_local, const int32_t M_g, const uint32_t n, const uint32_t k,
-    const uint32_t total_m) {
+    typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4],
+    const AType *lhs_grp_ptr, const BType *rhs_grp_ptr,
+    const uint32_t *lhs_s_grp_ptr, const uint32_t *rhs_s_grp_ptr, CType *db_grp_ptr,
+    const int64_t group_col_offset,
+    const int32_t pid_n_local, const int32_t pid_k_local, const int32_t M_g, const uint32_t n,
+    const uint32_t k, const uint32_t total_m) {
     const int32_t pid_n = pid_n_local * 256; // along N (output dim 0)
     const int32_t pid_k = pid_k_local * 256; // along K (output dim 1)
     if (pid_n >= (int32_t) n || pid_k >= (int32_t) k)
         return;
+
+    // Re-assert pinned VGPR reservation per tile invocation: persistent
+    // kernel reserves once at entry, but the compiler can repurpose
+    // pinned VGPRs for spill across loop iterations.  Re-reserving here
+    // refreshes the live-range marker before the LDS-direct prologue.
+    tile.reserve_pinned_regs();
 
     const uint32_t lane_id = tile.lane_id;
     const uint32_t warp_id = tile.warp_id;
@@ -46,24 +62,12 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const uint32_t scale_cols_full =
         (total_m + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
 
-    // Mirror FWD: scalar (s_load) of a_group_offs_ptr[group_id].
-    const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
-    const uint32_t group_offset_hi = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
-    const int64_t group_col_offset =
-        (static_cast<int64_t>(group_offset_hi) << 32) | static_cast<int64_t>(group_offset_lo);
-    // Scales are preshuffled into 16x4 blocks of 64 uint32; skipping
-    // `group_col_offset` raw cols == skipping `group_col_offset / 2`
-    // preshuffled elements.  Requires M_g % 128 == 0 (wrapper-enforced).
-    const int64_t group_scale_offset = group_col_offset / 2;
-
-    const AType    *lhs_base_ptr = lhs_ptr + (int64_t) pid_n * total_m + group_col_offset;
-    const BType    *rhs_base_ptr = rhs_ptr + (int64_t) pid_k * total_m + group_col_offset;
-    const uint32_t *lhs_s_base_ptr =
-        lhs_s_ptr + (int64_t) pid_n * scale_cols_full + group_scale_offset;
-    const uint32_t *rhs_s_base_ptr =
-        rhs_s_ptr + (int64_t) pid_k * scale_cols_full + group_scale_offset;
+    // group_scale_offset derived locally — single divide, no extra arg.
+    const int64_t   group_scale_offset = group_col_offset / 2;
+    const AType    *lhs_base_ptr   = lhs_grp_ptr + (int64_t) pid_n * total_m;
+    const BType    *rhs_base_ptr   = rhs_grp_ptr + (int64_t) pid_k * total_m;
+    const uint32_t *lhs_s_base_ptr = lhs_s_grp_ptr + (int64_t) pid_n * scale_cols_full;
+    const uint32_t *rhs_s_base_ptr = rhs_s_grp_ptr + (int64_t) pid_k * scale_cols_full;
 
     uint32_t ldg_offsets[2];
     tile.compute_ldg_offsets(ldg_offsets, total_m); // stride = total_m
@@ -117,10 +121,13 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const BufferSRD b_srd_t1(rhs_base_ptr, b_t1_remaining);
 
     // ── Load tile 0 → smem[0], tile 1 → smem[1] ──
-    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    // Re-assert pinned VGPR reservation right before the prologue (data
+    // loads use the 2-step path; see fwd kernel comment for rationale).
+    tile.reserve_pinned_regs();
+    tile.template load_a_gmem_to_smem_half_srd_two_step<0>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
+    tile.template load_a_gmem_to_smem_half_srd_two_step<1>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
+    tile.template load_b_gmem_to_smem_half_srd_two_step<0>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    tile.template load_b_gmem_to_smem_half_srd_two_step<1>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols_full);
     tile.template load_a_scale_gmem_to_smem_half_srd<1>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
@@ -332,13 +339,8 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
             b_smem_tile[next][warp_n].u32_ptr(), lds_offsets, b_s_smem_tile[next][warp_n].u32_ptr(),
             scale_lds_offset);
 
-        // Single-GEMM-style split drain: keep the last 6 buffer_load_lds
-        // in flight so Phase 3+4 mfma_lds overlap with the trailing GMEM→LDS
-        // DMAs.  Counter-intuitively, the matching mid-Epi2 `wait_vmcnt<0>`
-        // also lowers race rate from ~0.3% to ~0.004% (closer to fwd) by
-        // giving the LDS-write commits an extra sync point before Phase 3
-        // reads `next`.  Trades a ~2-3% slowdown on K=2048 wgrad for race
-        // parity with fwd / single-GEMM.
+        // Single-GEMM-style split drain: keep last 6 buffer_load_lds in flight
+        // for overlap with phase 3+4 mfma_lds.
         wait_vmcnt<6>();
         __builtin_amdgcn_s_barrier();
         cur ^= 1;
@@ -402,8 +404,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     __builtin_amdgcn_sched_barrier(0);
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
-    CType *db_group_ptr   = db_ptr + (int64_t) group_id * n * k;
-    CType *c_stg_base_ptr = db_group_ptr + (int64_t) pid_n * k + pid_k +
+    CType *c_stg_base_ptr = db_grp_ptr + (int64_t) pid_n * k + pid_k +
                             warp_id / 2 * 64 * (int64_t) k + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_n + 256 > (int32_t) n) || (pid_k + 256 > (int32_t) k);
 
@@ -489,10 +490,33 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_wgrad_256x256x128_16x16x
             continue;
         }
 
+        // CK-style: resolve per-group pointers entirely in the outer loop.
+        // compute_tile then sees only fully-offset base pointers (lhs/rhs
+        // along total_m, scales preshuffled along total_m / 2, dB along
+        // group_id stride) plus group_col_offset for the SRD bound math.
+        // Force scalar (s_load, lgkmcnt-tracked) loads via readfirstlane
+        // so the offset reads don't get vmcnt-tracked alongside data LDGs.
+        const uint32_t scale_cols_full_outer =
+            (total_m + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
+        const uint32_t a_off_lo = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
+        const uint32_t a_off_hi = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
+        const int64_t group_col_offset =
+            (static_cast<int64_t>(a_off_hi) << 32) | static_cast<int64_t>(a_off_lo);
+        const int64_t group_scale_offset = group_col_offset / 2;
+
+        const AType    *lhs_grp_ptr   = lhs_ptr + group_col_offset;
+        const BType    *rhs_grp_ptr   = rhs_ptr + group_col_offset;
+        const uint32_t *lhs_s_grp_ptr = lhs_s_ptr + group_scale_offset;
+        const uint32_t *rhs_s_grp_ptr = rhs_s_ptr + group_scale_offset;
+        CType          *db_grp_ptr    = db_ptr + (int64_t) group_id * (int64_t) n * (int64_t) k;
+
         turbo_grouped_gemm_mxfp8_wgrad_compute_tile<GemmTile, AType, BType, CType>(
-            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, lhs_ptr, rhs_ptr,
-            lhs_s_ptr, rhs_s_ptr, db_ptr, a_group_offs_ptr, group_id, pid_n, pid_k, M_g, n, k,
-            total_m);
+            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile,
+            lhs_grp_ptr, rhs_grp_ptr, lhs_s_grp_ptr, rhs_s_grp_ptr, db_grp_ptr,
+            group_col_offset,
+            pid_n, pid_k, M_g, n, k, total_m);
     }
 #endif
 }

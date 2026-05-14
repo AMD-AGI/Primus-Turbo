@@ -107,10 +107,9 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
                     reinterpret_cast<const dtype::float8_e8m0 *>(b_scales.data_ptr());
                 params.group_lens_ptr = reinterpret_cast<const int64_t *>(group_lens.data_ptr());
                 params.a_group_offs_ptr = reinterpret_cast<const int64_t *>(group_offs.data_ptr());
-                params.c_group_offs_ptr =
-                    c_group_offs.has_value()
-                        ? reinterpret_cast<const int64_t *>(c_group_offs->data_ptr())
-                        : nullptr;
+                params.c_group_offs_ptr = c_group_offs.has_value()
+                    ? reinterpret_cast<const int64_t *>(c_group_offs->data_ptr())
+                    : reinterpret_cast<const int64_t *>(group_offs.data_ptr());
                 params.group_num = (int32_t) group_num; params.total_m = (int32_t) total_m_in;
                 params.n = (int32_t) n; params.k = (int32_t) k;
                 params.workspace = workspace.data_ptr(); params.workspace_size = ws_size;

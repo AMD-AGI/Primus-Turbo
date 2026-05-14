@@ -9,8 +9,6 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
-#include "primus_turbo/device/register.cuh"
-
 namespace primus_turbo::device {
 
 // ════════════════════════════════════════════════════════════════
@@ -76,6 +74,42 @@ __device__ __forceinline__ void load_gmem_to_smem_srd(const BufferSRD &srd, uint
     llvm_amdgcn_raw_buffer_load_lds(srd.srd, lds, Bytes, ldg_offset, soffset, 0, 0);
 }
 
+// ════════════════════════════════════════════════════════════════
+//  GMEM -> SMEM, two-step (global_load → VGPR → ds_write)
+// ════════════════════════════════════════════════════════════════
+//
+// The single-instruction LDS-direct buffer_load_lds path (above) shares
+// vmcnt with compiler-emitted scratch_load (SGPR spill consume).  On
+// gfx950 vmcnt has no FIFO guarantee across scratch and buffer ops, so
+// a stale m0 from spill can leak into the LDS-direct write.  Splitting
+// into a two-step buffer_load (vmcnt-tracked) → ds_write (lgkmcnt-tracked)
+// puts the LDS write on a different counter from the spill and breaks
+// the race.  Caller must wait_lgkmcnt<0>() before LDS reads (the existing
+// kernel already does this between prologue and main loop).
+
+__device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(int32x4_t, int32_t, int32_t, int32_t)
+    __asm("llvm.amdgcn.raw.buffer.load.i32");
+__device__ int32x4_t llvm_amdgcn_raw_buffer_load_b128(int32x4_t, int32_t, int32_t, int32_t)
+    __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
+template <int Bytes>
+__device__ __forceinline__ void load_gmem_to_smem_srd_two_step(const BufferSRD &srd,
+                                                               uint32_t ldg_offset,
+                                                               uint32_t lds_addr,
+                                                               int32_t soffset) {
+    static_assert(Bytes == 4 || Bytes == 16,
+                  "two-step path supports 1 or 4 dwords per thread.");
+    if constexpr (Bytes == 4) {
+        uint32_t v = llvm_amdgcn_raw_buffer_load_b32(srd.srd, ldg_offset, soffset, 0);
+        using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
+        *reinterpret_cast<as3_uint32_ptr>((uintptr_t) lds_addr) = v;
+    } else {
+        int32x4_t v = llvm_amdgcn_raw_buffer_load_b128(srd.srd, ldg_offset, soffset, 0);
+        using as3_int32x4_ptr = __attribute__((address_space(3))) int32x4_t *;
+        *reinterpret_cast<as3_int32x4_ptr>((uintptr_t) lds_addr) = v;
+    }
+}
+
 // ── GMEM -> SMEM via pointer (constructs temporary SRD internally) ──
 // Convenience wrapper when caller doesn't manage an SRD.
 // For hot loops, prefer load_gmem_to_smem_srd with a pre-constructed BufferSRD.
@@ -115,14 +149,6 @@ __device__ __forceinline__ void ds_read_pinned(uint32_t lds_addr) {
     else
         asm volatile("ds_read_b128 v[%0:%1], %2 offset:%3"
             : : "n"(VDST), "n"(VDST + 3), "v"(lds_addr), "n"(IMM_OFFSET) : "memory");
-
-    clobber_vgpr_one<VDST>();
-    if constexpr (Bytes >= 8)
-        clobber_vgpr_one<VDST + 1>();
-    if constexpr (Bytes == 16) {
-        clobber_vgpr_one<VDST + 2>();
-        clobber_vgpr_one<VDST + 3>();
-    }
 }
 // clang-format on
 
