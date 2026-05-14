@@ -12,6 +12,10 @@
 #   args   : CLI arguments (optional, default [])
 #   env    : Extra environment variables (optional, default {})
 #   gpus   : Number of GPUs needed (optional, default 1)
+#   shardable : Set true if the underlying script accepts --num-shards
+#               and --shard-id (currently bench_gemm_turbo.py and
+#               bench_grouped_gemm_turbo.py). Lets run_suite.py -s N
+#               split the task across N GPUs and merge the parts.
 #
 # Usage:
 #   python3 benchmark/ops/run_suite.py -d output/               # run all
@@ -62,6 +66,7 @@ tasks:
     script: bench_gemm_turbo.py
     args: [--dtype, bf16]
     output: gemm_hipblaslt_benchmark.csv
+    shardable: true
 
   - label: gemm_bf16_triton
     group: gemm_bf16
@@ -69,6 +74,7 @@ tasks:
     args: [--dtype, bf16]
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_triton_benchmark.csv
+    shardable: true
 
   # ── GEMM FP8 Tensorwise ──────────────────────────────────
   - label: gemm_fp8_tensorwise_torch
@@ -89,6 +95,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: HIPBLASLT}
     output: gemm_fp8_tensorwise_hipblaslt_benchmark.csv
+    shardable: true
 
   - label: gemm_fp8_tensorwise_ck
     group: gemm_fp8
@@ -96,6 +103,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
     output: gemm_fp8_tensorwise_ck_benchmark.csv
+    shardable: true
 
   - label: gemm_fp8_tensorwise_triton
     group: gemm_fp8
@@ -103,6 +111,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_tensorwise_triton_benchmark.csv
+    shardable: true
 
   - label: gemm_fp8_tensorwise_autotune
     group: gemm_fp8
@@ -110,6 +119,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
     output: gemm_fp8_tensorwise_autotune_benchmark.csv
+    shardable: true
 
   # ── GEMM FP8 Rowwise ─────────────────────────────────────
   - label: gemm_fp8_rowwise_ck
@@ -118,6 +128,7 @@ tasks:
     args: [--dtype, fp8, --granularity, rowwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
     output: gemm_fp8_rowwise_ck_benchmark.csv
+    shardable: true
 
   - label: gemm_fp8_rowwise_triton
     group: gemm_fp8
@@ -125,6 +136,7 @@ tasks:
     args: [--dtype, fp8, --granularity, rowwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_rowwise_triton_benchmark.csv
+    shardable: true
 
   # ── GEMM FP8 Blockwise ───────────────────────────────────
   - label: gemm_fp8_blockwise_ck
@@ -133,6 +145,7 @@ tasks:
     args: [--dtype, fp8, --granularity, blockwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: CK}
     output: gemm_fp8_blockwise_ck_benchmark.csv
+    shardable: true
 
   - label: gemm_fp8_blockwise_triton
     group: gemm_fp8
@@ -140,6 +153,7 @@ tasks:
     args: [--dtype, fp8, --granularity, blockwise]
     env: {PRIMUS_TURBO_GEMM_BACKEND: TRITON}
     output: gemm_fp8_blockwise_triton_benchmark.csv
+    shardable: true
 
   # benchmark machine is MI325, which does not support MXFP8 and MXFP4
   # ── GEMM MXFP8 ─────────────────────────────────────────
@@ -194,6 +208,7 @@ tasks:
     args: [--dtype, bf16]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: HIPBLASLT}
     output: grouped_gemm_hipblaslt_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_bf16_ck
     group: grouped_gemm_bf16
@@ -201,6 +216,7 @@ tasks:
     args: [--dtype, bf16]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
     output: grouped_gemm_ck_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_bf16_triton
     group: grouped_gemm_bf16
@@ -208,6 +224,7 @@ tasks:
     args: [--dtype, bf16]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
     output: grouped_gemm_triton_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_bf16_autotune
     group: grouped_gemm_bf16
@@ -215,6 +232,7 @@ tasks:
     args: [--dtype, bf16]
     env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
     output: grouped_gemm_autotune_benchmark.csv
+    shardable: true
 
   # ── Grouped GEMM FP8 Tensorwise ──────────────────────────
   - label: grouped_gemm_fp8_tensorwise_te
@@ -229,6 +247,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: HIPBLASLT}
     output: grouped_gemm_fp8_tensorwise_hipblaslt_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_fp8_tensorwise_ck
     group: grouped_gemm_fp8
@@ -236,6 +255,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
     output: grouped_gemm_fp8_tensorwise_ck_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_fp8_tensorwise_triton
     group: grouped_gemm_fp8
@@ -243,6 +263,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
     output: grouped_gemm_fp8_tensorwise_triton_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_fp8_tensorwise_autotune
     group: grouped_gemm_fp8
@@ -250,6 +271,7 @@ tasks:
     args: [--dtype, fp8, --granularity, tensorwise]
     env: {PRIMUS_TURBO_AUTO_TUNE: "1"}
     output: grouped_gemm_fp8_tensorwise_autotune_benchmark.csv
+    shardable: true
 
   # ── Grouped GEMM FP8 Rowwise ─────────────────────────────
   - label: grouped_gemm_fp8_rowwise_ck
@@ -258,6 +280,7 @@ tasks:
     args: [--dtype, fp8, --granularity, rowwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
     output: grouped_gemm_fp8_rowwise_ck_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_fp8_rowwise_triton
     group: grouped_gemm_fp8
@@ -265,6 +288,7 @@ tasks:
     args: [--dtype, fp8, --granularity, rowwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
     output: grouped_gemm_fp8_rowwise_triton_benchmark.csv
+    shardable: true
 
   # ── Grouped GEMM FP8 Blockwise ───────────────────────────
   - label: grouped_gemm_fp8_blockwise_ck
@@ -273,6 +297,7 @@ tasks:
     args: [--dtype, fp8, --granularity, blockwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: CK}
     output: grouped_gemm_fp8_blockwise_ck_benchmark.csv
+    shardable: true
 
   - label: grouped_gemm_fp8_blockwise_triton
     group: grouped_gemm_fp8
@@ -280,6 +305,7 @@ tasks:
     args: [--dtype, fp8, --granularity, blockwise]
     env: {PRIMUS_TURBO_GROUPED_GEMM_BACKEND: TRITON}
     output: grouped_gemm_fp8_blockwise_triton_benchmark.csv
+    shardable: true
 
   # ── DeepEP (multi-GPU, placed last) ──────────────────────
   - label: deep_ep_intranode
