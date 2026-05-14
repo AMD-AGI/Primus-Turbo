@@ -15,9 +15,12 @@ Usage:
     python3 run_suite.py -d /path/to/output -g attention             # filter by group
     python3 run_suite.py -d /path/to/output -l gemm_mxfp8_turbo      # run one task by label
     python3 run_suite.py -d /path/to/output -g gemm_bf16 -n 4        # 4 GPUs
+    python3 run_suite.py -d /path/to/output -l gemm_fp8_blockwise_triton -s 8
+        # split a single shardable task into 8 shards across 8 GPUs
 """
 
 import argparse
+import csv
 import os
 import shutil
 import subprocess
@@ -30,6 +33,7 @@ import yaml
 
 SEPARATOR = "=" * 60
 REQUIRED_TASK_FIELDS = {"label", "script", "output"}
+SHARD_LABEL_SEP = "#shard"
 
 
 def log(msg=""):
@@ -74,6 +78,108 @@ def load_config(config_path, groups=None, labels=None):
     single = [t for t in tasks if t.get("gpus", 1) == 1]
     multi = [t for t in tasks if t.get("gpus", 1) > 1]
     return single, multi, num_gpus
+
+
+def expand_shardable_tasks(tasks, num_shards):
+    """Expand each shardable single-GPU task into ``num_shards`` shard tasks.
+
+    A task is sharded only if it sets ``shardable: true`` in YAML and uses a
+    single GPU. Each shard appends ``--num-shards N --shard-id i`` to ``args``
+    and writes to a per-shard CSV named ``<output>.part-<i><ext>``. Returns
+    ``(expanded_tasks, shard_groups)`` where ``shard_groups`` maps the original
+    label to merge metadata used by :func:`merge_shard_outputs`.
+    """
+    if num_shards <= 1:
+        return list(tasks), {}
+
+    expanded = []
+    shard_groups = {}
+    for task in tasks:
+        if not task.get("shardable", False) or task.get("gpus", 1) > 1:
+            expanded.append(task)
+            continue
+
+        original_label = task["label"]
+        original_output = task["output"]
+        base, ext = os.path.splitext(original_output)
+        partials = []
+        for i in range(num_shards):
+            shard_task = dict(task)
+            shard_task["label"] = f"{original_label}{SHARD_LABEL_SEP}{i}"
+            shard_task["args"] = list(task.get("args", [])) + [
+                "--num-shards",
+                str(num_shards),
+                "--shard-id",
+                str(i),
+            ]
+            partial_output = f"{base}.part-{i}{ext}"
+            shard_task["output"] = partial_output
+            partials.append(partial_output)
+            expanded.append(shard_task)
+
+        shard_groups[original_label] = {
+            "final_output": original_output,
+            "partials": partials,
+        }
+        log(f"[shard] {original_label}: split into {num_shards} shards -> {original_output}")
+
+    return expanded, shard_groups
+
+
+def merge_shard_outputs(shard_groups, output_dir):
+    """Merge per-shard CSVs into the final output CSV for each shard group.
+
+    Uses a header-aware CSV merge and sorts rows by the first column (TestID).
+    Missing partials (e.g. a shard crashed before writing) are skipped with a
+    warning. Partial files are removed after a successful merge.
+    """
+    if not shard_groups:
+        return
+
+    log()
+    for label, info in shard_groups.items():
+        final_path = os.path.join(output_dir, info["final_output"])
+        partial_paths = [os.path.join(output_dir, p) for p in info["partials"]]
+        present = [p for p in partial_paths if os.path.exists(p)]
+
+        if not present:
+            log(f"[merge] {label}: no partial CSVs found, nothing to merge")
+            continue
+
+        header = None
+        rows = []
+        for p in present:
+            with open(p, newline="") as f:
+                reader = csv.reader(f)
+                file_header = next(reader, None)
+                if header is None:
+                    header = file_header
+                rows.extend(reader)
+
+        def _sort_key(row):
+            try:
+                return (0, int(row[0]))
+            except (ValueError, IndexError):
+                return (1, 0)
+
+        rows.sort(key=_sort_key)
+
+        with open(final_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            if header is not None:
+                writer.writerow(header)
+            writer.writerows(rows)
+
+        for p in present:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+        log(
+            f"[merge] {label}: merged {len(present)}/{len(partial_paths)} parts "
+            f"({len(rows)} rows) -> {info['final_output']}"
+        )
 
 
 def launch_task(task, gpu_id, output_dir, script_dir, log_dir):
@@ -234,7 +340,22 @@ def main():
         default=None,
         help="Override the number of GPUs",
     )
+    parser.add_argument(
+        "-s",
+        "--shards",
+        type=int,
+        default=1,
+        help=(
+            "Split each shardable single-GPU task into this many shards across "
+            "the GPU pool (default: 1, no sharding). Tasks must declare "
+            "`shardable: true` in YAML and the underlying script must accept "
+            "`--num-shards` and `--shard-id`."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.shards < 1:
+        raise SystemExit(f"--shards must be >= 1, got {args.shards}")
 
     config_path = args.config or os.path.join(os.path.dirname(__file__), "benchmark_suite.yaml")
     script_dir = os.path.dirname(os.path.abspath(config_path))
@@ -242,6 +363,13 @@ def main():
     single_tasks, multi_tasks, num_gpus = load_config(config_path, args.group, args.label)
     if args.num_gpus is not None:
         num_gpus = args.num_gpus
+
+    single_tasks, shard_groups = expand_shardable_tasks(single_tasks, args.shards)
+    if args.shards > 1 and not shard_groups:
+        log(
+            f"[shard] --shards={args.shards} requested but no matched task "
+            f"declares `shardable: true`; running without sharding."
+        )
 
     total = len(single_tasks) + len(multi_tasks)
     if total == 0:
@@ -257,6 +385,8 @@ def main():
         log(f"Filtered by group(s): {', '.join(args.group)}")
     if args.label:
         log(f"Filtered by label(s): {', '.join(args.label)}")
+    if shard_groups:
+        log(f"Sharded labels: {', '.join(shard_groups.keys())} ({args.shards} shards each)")
     log()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -286,6 +416,8 @@ def main():
                 total,
                 started,
             )
+
+        merge_shard_outputs(shard_groups, args.output_dir)
 
         passed = total - failed
         log(f"\n{SEPARATOR}")
