@@ -1202,10 +1202,18 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
 # 8-config curated set covering small/medium/large M and N-major/M-major reductions.
 # All BK=128 (winners). Trimmed from a 32-config sweep that always picked one of these.
 def _get_grouped_blockwise_autotune_configs():
+    # BLOCK_SIZE_N pinned to 128: the persistent kernel loads ONE b_scale per
+    # tile (assumes BN == SCALE_BLOCK_N == 128). With BN=256 the kernel applies
+    # the wrong scale to half the output cols → ~10dB SNR drop. There's also a
+    # known MI300X MFMA layout bug on FP8 e4m3fnuz with BN=64/256.
     return [
         # small/medium fallback
         triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
                        "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=4, num_stages=2),
         # large-M, M-major
         triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
                        "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
@@ -1213,15 +1221,10 @@ def _get_grouped_blockwise_autotune_configs():
                        "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
                        "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
-        # large-N, N-major
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 2, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 64}, num_warps=8, num_stages=1),
     ]
 
 
