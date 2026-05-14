@@ -89,6 +89,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 32,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
     # https://huggingface.co/meta-llama/Llama-2-70b/blob/main/config.json
     "Llama-2-70B": {
@@ -98,6 +99,7 @@ DenseModelConfigs = {
         "num_attention_heads": 64,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
     # https://huggingface.co/meta-llama/Llama-3.1-8B/blob/main/config.json
     "Llama-3.1-8B": {
@@ -107,6 +109,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 128256,
     },
     # https://huggingface.co/meta-llama/Llama-3.1-405B/blob/main/config.json
     "Llama-3.1-405B": {
@@ -116,6 +119,7 @@ DenseModelConfigs = {
         "num_attention_heads": 128,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 128256,
     },
     # https://modelscope.cn/models/Qwen/Qwen2.5-7B-Instruct/file/view/master/config.json
     "Qwen2.5-7B": {
@@ -125,6 +129,7 @@ DenseModelConfigs = {
         "num_attention_heads": 28,
         "num_key_value_heads": 4,
         "head_dim": 128,
+        "vocab_size": 152064,
     },
     # https://modelscope.cn/models/Qwen/Qwen2.5-72B-Instruct
     "Qwen2.5-72B": {
@@ -134,6 +139,7 @@ DenseModelConfigs = {
         "num_attention_heads": 64,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 152064,
     },
     # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1/blob/main/config.json
     "Mistral-7B": {
@@ -143,6 +149,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
 }
 
@@ -301,7 +308,167 @@ MoEModelConfigs = {
 # Benchmark Constants
 ###############################################################################
 
-BATCH_SIZE_LIST = [1, 2, 4]
+BATCH_SIZE_DEFAULT = [1, 2, 4]
+
+BATCH_SIZE_CONFIG = {
+    # (gpu, model, dtype) -> list  (highest priority)
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama3.1_405B-BF16-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI355X/llama3.1_405B-BF16-pretrain.yaml
+    ("MI35*", "Llama-3.1-405B", "bf16"): [1, 2],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama3.1_405B-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI355X/llama3.1_405B-FP8-pretrain.yaml
+    ("MI35*", "Llama-3.1-405B", "fp8"): [1, 2],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama3.1_8B-BF16-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI355X/llama3.1_8B-BF16-pretrain.yaml
+    ("MI35*", "Llama-3.1-8B", "bf16"): [4, 6],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama3.1_8B-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI355X/llama3.1_8B-FP8-pretrain.yaml
+    ("MI35*", "Llama-3.1-8B", "fp8"): [6, 8],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama2_7B-FP8-pretrain.yaml
+    ("MI35*", "Llama-2-7B", "fp8"): [13],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama2_7B-BF16-pretrain.yaml
+    ("MI35*", "Llama-2-7B", "bf16"): [10],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama2_70B-BF16-pretrain.yaml
+    ("MI35*", "Llama-2-70B", "bf16"): [17],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/llama2_70B-FP8-pretrain.yaml
+    ("MI35*", "Llama-2-70B", "fp8"): [7],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen2.5_7B-BF16-pretrain.yaml
+    ("MI35*", "Qwen2.5-7B", "bf16"): [16],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen2.5_7B-FP8-pretrain.yaml
+    ("MI35*", "Qwen2.5-7B", "fp8"): [20],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen2.5_72B-BF16-pretrain.yaml
+    ("MI35*", "Qwen2.5-72B", "bf16"): [16],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen2.5_72B-FP8-pretrain.yaml
+    ("MI35*", "Qwen2.5-72B", "fp8"): [4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v3-BF16-pretrain.yaml
+    ("MI35*", "DeepSeek-V3", "bf16"): [4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v3-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI355X/deepseek_v3_671b-pretrain.yaml
+    ("MI35*", "DeepSeek-V3", "fp8"): [4, 16],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v2-BF16-pretrain.yaml
+    ("MI35*", "DeepSeek-V2", "bf16"): [1],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v2-FP8-pretrain.yaml
+    ("MI35*", "DeepSeek-V2", "fp8"): [1],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v2_lite-BF16-pretrain.yaml
+    ("MI35*", "DeepSeek-V2-Lite", "bf16"): [12],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/deepseek_v2_lite-FP8-pretrain.yaml
+    ("MI35*", "DeepSeek-V2-Lite", "fp8"): [14],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/grok2-BF16-pretrain.yaml
+    ("MI35*", "Grok-2", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/grok2-FP8-pretrain.yaml
+    ("MI35*", "Grok-2", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/mixtral_8x7B_v0.1-BF16-pretrain.yaml
+    ("MI35*", "Mixtral-8x7B", "bf16"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/mixtral_8x7B_v0.1-FP8-pretrain.yaml
+    ("MI35*", "Mixtral-8x7B", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/mixtral_8x22B_v0.1-BF16-pretrain.yaml
+    ("MI35*", "Mixtral-8x22B", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/mixtral_8x22B_v0.1-FP8-pretrain.yaml
+    ("MI35*", "Mixtral-8x22B", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen3_30B_A3B-BF16-pretrain.yaml
+    ("MI35*", "Qwen3-30B-A3B", "bf16"): [8],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen3_30B_A3B-FP8-pretrain.yaml
+    ("MI35*", "Qwen3-30B-A3B", "fp8"): [8],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen3_235B_A22B-BF16-pretrain.yaml
+    ("MI35*", "Qwen3-235B-A22B", "bf16"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI355X/qwen3_235B_A22B-FP8-pretrain.yaml
+    ("MI35*", "Qwen3-235B-A22B", "fp8"): [4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama3.1_405B-BF16-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI300X/llama3.1_405B-BF16-pretrain.yaml
+    ("MI30*", "Llama-3.1-405B", "bf16"): [1, 2],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama3.1_405B-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI300X/llama3.1_405B-FP8-pretrain.yaml
+    ("MI30*", "Llama-3.1-405B", "fp8"): [1, 2],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml
+    ("MI30*", "Llama-3.1-8B", "bf16"): [2, 4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama3.1_8B-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI300X/llama3.1_8B-FP8-pretrain.yaml
+    ("MI30*", "Llama-3.1-8B", "fp8"): [2, 5],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama2_7B-FP8-pretrain.yaml
+    ("MI30*", "Llama-2-7B", "fp8"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml
+    ("MI30*", "Llama-2-7B", "bf16"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama2_70B-BF16-pretrain.yaml
+    ("MI30*", "Llama-2-70B", "bf16"): [7],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/llama2_70B-FP8-pretrain.yaml
+    ("MI30*", "Llama-2-70B", "fp8"): [7],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen2.5_7B-BF16-pretrain.yaml
+    ("MI30*", "Qwen2.5-7B", "bf16"): [10],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen2.5_7B-FP8-pretrain.yaml
+    ("MI30*", "Qwen2.5-7B", "fp8"): [10],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen2.5_72B-BF16-pretrain.yaml
+    ("MI30*", "Qwen2.5-72B", "bf16"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen2.5_72B-FP8-pretrain.yaml
+    ("MI30*", "Qwen2.5-72B", "fp8"): [4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v3-BF16-pretrain.yaml
+    ("MI30*", "DeepSeek-V3", "bf16"): [4],
+    # megatron: https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v3-FP8-pretrain.yaml
+    # torchtitan: https://github.com/AMD-AGI/Primus/blob/main/examples/torchtitan/configs/MI300X/deepseek_v3_671b-pretrain.yaml
+    ("MI30*", "DeepSeek-V3", "fp8"): [4, 16],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v2-BF16-pretrain.yaml
+    ("MI30*", "DeepSeek-V2", "bf16"): [1],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v2-FP8-pretrain.yaml
+    ("MI30*", "DeepSeek-V2", "fp8"): [1],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v2_lite-BF16-pretrain.yaml
+    ("MI30*", "DeepSeek-V2-Lite", "bf16"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/deepseek_v2_lite-FP8-pretrain.yaml
+    ("MI30*", "DeepSeek-V2-Lite", "fp8"): [4],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/grok2-BF16-pretrain.yaml
+    ("MI30*", "Grok-2", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/grok2-FP8-pretrain.yaml
+    ("MI30*", "Grok-2", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/mixtral_8x7B_v0.1-BF16-pretrain.yaml
+    ("MI30*", "Mixtral-8x7B", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/mixtral_8x7B_v0.1-FP8-pretrain.yaml
+    ("MI30*", "Mixtral-8x7B", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/mixtral_8x22B_v0.1-BF16-pretrain.yaml
+    ("MI30*", "Mixtral-8x22B", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/mixtral_8x22B_v0.1-FP8-pretrain.yaml
+    ("MI30*", "Mixtral-8x22B", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen3_30B_A3B-BF16-pretrain.yaml
+    ("MI30*", "Qwen3-30B-A3B", "bf16"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen3_30B_A3B-FP8-pretrain.yaml
+    ("MI30*", "Qwen3-30B-A3B", "fp8"): [2],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen3_235B_A22B-BF16-pretrain.yaml
+    ("MI30*", "Qwen3-235B-A22B", "bf16"): [1],
+    # https://github.com/AMD-AGI/Primus/blob/main/examples/megatron/configs/MI300X/qwen3_235B_A22B-FP8-pretrain.yaml
+    ("MI30*", "Qwen3-235B-A22B", "fp8"): [1],
+    # dtype -> list
+    "fp8": BATCH_SIZE_DEFAULT,
+    "bf16": BATCH_SIZE_DEFAULT,
+}
+
+# Deprecated alias – kept for backward compatibility
+BATCH_SIZE_LIST = BATCH_SIZE_DEFAULT
+
+
+GPU_NAME_MAP = {
+    "MI300X": "MI30*",
+    "MI300A": "MI30*",
+    "MI308X": "MI30*",
+    "MI350X": "MI35*",
+    "MI355X": "MI35*",
+}
+
+
+def get_batch_sizes(model_name=None, dtype_name=None, gpu_name=None):
+    """Look up batch sizes with hierarchical resolution.
+
+    The gpu_name is mapped via gpu_name_map.json to a config key
+    (e.g. "MI355X" -> "MI35*") before lookup.
+
+    Priority (highest to lowest):
+      (gpu, model, dtype) -> (gpu, model) -> (gpu, dtype) ->
+      (model, dtype) -> gpu -> model -> dtype -> default
+    """
+    gpu_key = GPU_NAME_MAP.get(gpu_name, gpu_name)
+    if (gpu_key, model_name, dtype_name) in BATCH_SIZE_CONFIG:
+        return BATCH_SIZE_CONFIG[(gpu_key, model_name, dtype_name)]
+    if dtype_name in BATCH_SIZE_CONFIG:
+        return BATCH_SIZE_CONFIG[dtype_name]
+    return BATCH_SIZE_DEFAULT
+
 
 # Grouped GEMM (MoE) configurations
 GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
@@ -320,6 +487,7 @@ def gen_gemm_test_cases(model_config):
     num_attention_heads = model_config["num_attention_heads"]
     num_key_value_heads = model_config["num_key_value_heads"]
     head_dim = model_config["head_dim"]
+    vocab_size = model_config["vocab_size"]
 
     # [[m, n, k]...]
     gemm_shape_list = []
@@ -337,6 +505,8 @@ def gen_gemm_test_cases(model_config):
     gemm_shape_list.append([seq, int(2 * intermediate_size), hidden_size])
     # mlp down
     gemm_shape_list.append([seq, hidden_size, intermediate_size])
+    # vocab/embedding projection (lm_head)
+    gemm_shape_list.append([seq, vocab_size, hidden_size])
     return gemm_shape_list
 
 
