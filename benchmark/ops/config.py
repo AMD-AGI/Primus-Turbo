@@ -6,6 +6,8 @@
 
 """Shared configurations for benchmark scripts."""
 
+import json
+import os
 import re
 
 import torch
@@ -89,6 +91,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 32,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
     # https://huggingface.co/meta-llama/Llama-2-70b/blob/main/config.json
     "Llama-2-70B": {
@@ -98,6 +101,7 @@ DenseModelConfigs = {
         "num_attention_heads": 64,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
     # https://huggingface.co/meta-llama/Llama-3.1-8B/blob/main/config.json
     "Llama-3.1-8B": {
@@ -107,6 +111,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 128256,
     },
     # https://huggingface.co/meta-llama/Llama-3.1-405B/blob/main/config.json
     "Llama-3.1-405B": {
@@ -116,6 +121,30 @@ DenseModelConfigs = {
         "num_attention_heads": 128,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 128256,
+    },
+    # Llama-4 is an MoE model; these entries cover only its *dense* GEMMs
+    # (attention QKV/O, dense FFN via ffn_hidden_size, lm_head). The routed-expert
+    # (grouped) GEMMs are modeled separately in MoEModelConfigs. The 16E/128E
+    # variants differ only in expert count, so their dense GEMM shapes are
+    # identical. Hyperparameters from Primus configs/models/megatron/llama4_*.yaml.
+    "Llama-4-17Bx16E": {
+        "seqlen": 4096,
+        "hidden_size": 5120,
+        "intermediate_size": 16384,  # ffn_hidden_size (dense FFN)
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,  # num_query_groups
+        "head_dim": 128,
+        "vocab_size": 202048,
+    },
+    "Llama-4-17Bx128E": {
+        "seqlen": 4096,
+        "hidden_size": 5120,
+        "intermediate_size": 16384,  # ffn_hidden_size (dense FFN)
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,  # num_query_groups
+        "head_dim": 128,
+        "vocab_size": 202048,
     },
     # https://modelscope.cn/models/Qwen/Qwen2.5-7B-Instruct/file/view/master/config.json
     "Qwen2.5-7B": {
@@ -125,6 +154,7 @@ DenseModelConfigs = {
         "num_attention_heads": 28,
         "num_key_value_heads": 4,
         "head_dim": 128,
+        "vocab_size": 152064,
     },
     # https://modelscope.cn/models/Qwen/Qwen2.5-72B-Instruct
     "Qwen2.5-72B": {
@@ -134,6 +164,7 @@ DenseModelConfigs = {
         "num_attention_heads": 64,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 152064,
     },
     # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1/blob/main/config.json
     "Mistral-7B": {
@@ -143,6 +174,7 @@ DenseModelConfigs = {
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
+        "vocab_size": 32000,
     },
 }
 
@@ -301,7 +333,71 @@ MoEModelConfigs = {
 # Benchmark Constants
 ###############################################################################
 
-BATCH_SIZE_LIST = [1, 2, 4]
+BATCH_SIZE_DEFAULT = [1, 2, 4]
+
+# Batch sizes are crawled from Primus pretrain configs into batch_size_config.json
+# (regenerate via crawl_batch_sizes.sh). The JSON records the exact Primus commit
+# it was crawled from so values can be tracked back to an upstream revision.
+BATCH_SIZE_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "batch_size_config.json")
+
+
+def _load_batch_size_config(path=BATCH_SIZE_CONFIG_PATH):
+    """Load crawled batch sizes from JSON.
+
+    Returns (config, meta) where ``config`` maps both:
+      (gpu, model, dtype) -> [batch_sizes]   # per-config entries
+      dtype               -> [batch_sizes]   # dtype-level fallback
+    and ``meta`` is the JSON ``_meta`` block (source commit, crawl date, ...).
+
+    On any failure the config is left empty so callers fall back to
+    BATCH_SIZE_DEFAULT instead of crashing the benchmark.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"[config] warning: could not load {path}: {exc}; using default batch sizes")
+        return {}, {}
+
+    config = {}
+    for entry in data.get("entries", []):
+        config[(entry["gpu"], entry["model"], entry["dtype"])] = entry["batch_sizes"]
+    for dtype, sizes in data.get("dtype_default", {}).items():
+        config[dtype] = sizes
+    return config, data.get("_meta", {})
+
+
+BATCH_SIZE_CONFIG, BATCH_SIZE_CONFIG_META = _load_batch_size_config()
+
+# Deprecated alias – kept for backward compatibility
+BATCH_SIZE_LIST = BATCH_SIZE_DEFAULT
+
+
+GPU_NAME_MAP = {
+    "MI300X": "MI30*",
+    "MI300A": "MI30*",
+    "MI308X": "MI30*",
+    "MI350X": "MI35*",
+    "MI355X": "MI35*",
+}
+
+
+def get_batch_sizes(model_name=None, dtype_name=None, gpu_name=None):
+    """Look up batch sizes for a given model/dtype/GPU.
+
+    The gpu_name is mapped via GPU_NAME_MAP to a config key
+    (e.g. "MI355X" -> "MI35*") before lookup.
+
+    Resolution (highest to lowest priority):
+      (gpu, model, dtype) -> dtype -> default
+    """
+    gpu_key = GPU_NAME_MAP.get(gpu_name, gpu_name)
+    if (gpu_key, model_name, dtype_name) in BATCH_SIZE_CONFIG:
+        return BATCH_SIZE_CONFIG[(gpu_key, model_name, dtype_name)]
+    if dtype_name in BATCH_SIZE_CONFIG:
+        return BATCH_SIZE_CONFIG[dtype_name]
+    return BATCH_SIZE_DEFAULT
+
 
 # Grouped GEMM (MoE) configurations
 GROUPED_GEMM_M_SIZE_LIST = [512, 1024, 2048, 4096, 8192, 16384]
@@ -320,6 +416,7 @@ def gen_gemm_test_cases(model_config):
     num_attention_heads = model_config["num_attention_heads"]
     num_key_value_heads = model_config["num_key_value_heads"]
     head_dim = model_config["head_dim"]
+    vocab_size = model_config["vocab_size"]
 
     # [[m, n, k]...]
     gemm_shape_list = []
@@ -337,6 +434,8 @@ def gen_gemm_test_cases(model_config):
     gemm_shape_list.append([seq, int(2 * intermediate_size), hidden_size])
     # mlp down
     gemm_shape_list.append([seq, hidden_size, intermediate_size])
+    # vocab/embedding projection (lm_head)
+    gemm_shape_list.append([seq, vocab_size, hidden_size])
     return gemm_shape_list
 
 

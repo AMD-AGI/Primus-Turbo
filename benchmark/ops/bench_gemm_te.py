@@ -17,12 +17,12 @@ import torch
 import torch.utils.benchmark as benchmark
 import transformer_engine as te
 from config import (
-    BATCH_SIZE_LIST,
     DenseModelConfigs,
     check_allclose,
     compute_snr,
     gemm_ref,
     gen_gemm_test_cases,
+    get_batch_sizes,
     get_platform_info,
 )
 from tabulate import tabulate
@@ -193,7 +193,7 @@ def benchmark_gemm_te(dtype_name="bf16", granularity_name="tensorwise", output_c
 
     for model_name, model_config in DenseModelConfigs.items():
         test_cases = gen_gemm_test_cases(model_config)
-        for MBS in BATCH_SIZE_LIST:
+        for MBS in get_batch_sizes(model_name, dtype_name, gpu_name):
             for shape in test_cases:
                 test_id += 1
                 M = shape[0] * MBS
