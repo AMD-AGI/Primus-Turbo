@@ -1,0 +1,1101 @@
+{
+  "_meta": {
+    "description": "Per-(GPU, model, dtype) training batch sizes crawled from Primus pretrain configs.",
+    "source_repo": "https://github.com/AMD-AGI/Primus",
+    "source_ref": "main",
+    "primus_commit": "714156684f5c824239d880a4591abf122576239c",
+    "crawled_at": "2026-07-17T00:10:34Z",
+    "batch_size_fields": {
+      "megatron": "micro_batch_size",
+      "torchtitan": "local_batch_size"
+    },
+    "generated_by": "benchmark/ops/training/crawl_batch_sizes.sh"
+  },
+  "default": [
+    1,
+    2,
+    4
+  ],
+  "dtype_default": {
+    "bf16": [
+      1,
+      2,
+      4
+    ],
+    "fp8": [
+      1,
+      2,
+      4
+    ]
+  },
+  "entries": [
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V2",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v2-BF16-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V2",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v2-FP8-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V2-Lite",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v2_lite-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V2-Lite",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v2_lite-FP8-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V3",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v3-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "DeepSeek-V3",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4,
+        16
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/deepseek_v3-FP8-pretrain.yaml",
+          "value": 4
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/deepseek_v3_671b-pretrain.yaml",
+          "value": 16
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Grok-2",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/grok2-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Grok-2",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/grok2-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-2-70B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        7
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama2_70B-BF16-pretrain.yaml",
+          "value": 7
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-2-70B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        7
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama2_70B-FP8-pretrain.yaml",
+          "value": 7
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-2-7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-2-7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama2_7B-FP8-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-3.1-405B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama3.1_405B-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama3.1_405B-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-3.1-405B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama3.1_405B-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama3.1_405B-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-3.1-8B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2,
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml",
+          "value": 2
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-3.1-8B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2,
+        5
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama3.1_8B-FP8-pretrain.yaml",
+          "value": 2
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama3.1_8B-FP8-pretrain.yaml",
+          "value": 5
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-4-17Bx128E",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama4_17B128E-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama4_17Bx128E-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-4-17Bx128E",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama4_17B128E-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama4_17Bx128E-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-4-17Bx16E",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama4_17B16E-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama4_17Bx16E-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Llama-4-17Bx16E",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/llama4_17B16E-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI300X/llama4_17Bx16E-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Mixtral-8x22B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/mixtral_8x22B_v0.1-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Mixtral-8x22B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/mixtral_8x22B_v0.1-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Mixtral-8x7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/mixtral_8x7B_v0.1-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Mixtral-8x7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/mixtral_8x7B_v0.1-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen2.5-72B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen2.5_72B-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen2.5-72B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen2.5_72B-FP8-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen2.5-7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        10
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen2.5_7B-BF16-pretrain.yaml",
+          "value": 10
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen2.5-7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        10
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen2.5_7B-FP8-pretrain.yaml",
+          "value": 10
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen3-235B-A22B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen3_235B_A22B-BF16-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen3-235B-A22B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen3_235B_A22B-FP8-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen3-30B-A3B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen3_30B_A3B-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI30*",
+      "model": "Qwen3-30B-A3B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI300X/qwen3_30B_A3B-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V2",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v2-BF16-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V2",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v2-FP8-pretrain.yaml",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V2-Lite",
+      "dtype": "bf16",
+      "batch_sizes": [
+        12
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v2_lite-BF16-pretrain.yaml",
+          "value": 12
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V2-Lite",
+      "dtype": "fp8",
+      "batch_sizes": [
+        14
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v2_lite-FP8-pretrain.yaml",
+          "value": 14
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V3",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v3-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "DeepSeek-V3",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2,
+        16
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/deepseek_v3-FP8-pretrain.yaml",
+          "value": 2
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/deepseek_v3_671b-pretrain.yaml",
+          "value": 16
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Grok-2",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/grok2-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Grok-2",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/grok2-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-2-70B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        14
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama2_70B-BF16-pretrain.yaml",
+          "value": 14
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-2-70B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        7
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama2_70B-FP8-pretrain.yaml",
+          "value": 7
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-2-7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        10
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama2_7B-BF16-pretrain.yaml",
+          "value": 10
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-2-7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        12
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama2_7B-FP8-pretrain.yaml",
+          "value": 12
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-3.1-405B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama3.1_405B-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama3.1_405B-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-3.1-405B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        3
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama3.1_405B-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama3.1_405B-FP8-pretrain.yaml",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-3.1-8B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4,
+        6
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama3.1_8B-BF16-pretrain.yaml",
+          "value": 4
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama3.1_8B-BF16-pretrain.yaml",
+          "value": 6
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-3.1-8B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        6,
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama3.1_8B-FP8-pretrain.yaml",
+          "value": 6
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama3.1_8B-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-4-17Bx128E",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama4_17B128E-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama4_17Bx128E-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-4-17Bx128E",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama4_17B128E-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama4_17Bx128E-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-4-17Bx16E",
+      "dtype": "bf16",
+      "batch_sizes": [
+        1,
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama4_17B16E-BF16-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama4_17Bx16E-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Llama-4-17Bx16E",
+      "dtype": "fp8",
+      "batch_sizes": [
+        1,
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/llama4_17B16E-FP8-pretrain.yaml",
+          "value": 1
+        },
+        {
+          "framework": "torchtitan",
+          "path": "examples/torchtitan/configs/MI355X/llama4_17Bx16E-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Mixtral-8x22B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/mixtral_8x22B_v0.1-BF16-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Mixtral-8x22B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/mixtral_8x22B_v0.1-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Mixtral-8x7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/mixtral_8x7B_v0.1-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Mixtral-8x7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        2
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/mixtral_8x7B_v0.1-FP8-pretrain.yaml",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen2.5-72B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        16
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen2.5_72B-BF16-pretrain.yaml",
+          "value": 16
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen2.5-72B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen2.5_72B-FP8-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen2.5-7B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        16
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen2.5_7B-BF16-pretrain.yaml",
+          "value": 16
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen2.5-7B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        20
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen2.5_7B-FP8-pretrain.yaml",
+          "value": 20
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen3-235B-A22B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen3_235B_A22B-BF16-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen3-235B-A22B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        4
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen3_235B_A22B-FP8-pretrain.yaml",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen3-30B-A3B",
+      "dtype": "bf16",
+      "batch_sizes": [
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen3_30B_A3B-BF16-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "gpu": "MI35*",
+      "model": "Qwen3-30B-A3B",
+      "dtype": "fp8",
+      "batch_sizes": [
+        8
+      ],
+      "sources": [
+        {
+          "framework": "megatron",
+          "path": "examples/megatron/configs/MI355X/qwen3_30B_A3B-FP8-pretrain.yaml",
+          "value": 8
+        }
+      ]
+    }
+  ]
+}
