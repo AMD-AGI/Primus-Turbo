@@ -7,6 +7,7 @@
 """Primus-Turbo Grouped GEMM Benchmark (BF16 and FP8)."""
 
 import argparse
+import os
 from datetime import datetime
 
 import pandas as pd
@@ -168,8 +169,19 @@ def profile_grouped_gemm_fp8(B, M, N, K, dtype, config):
     return fwd_mean_time_ms, fwd_tflops, bwd_mean_time_ms, bwd_tflops, correct
 
 
-def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise", output_csv=None):
+def benchmark_grouped_gemm_turbo(
+    dtype_name="bf16",
+    granularity_name="tensorwise",
+    output_csv=None,
+    num_shards: int = 1,
+    shard_id: int = 0,
+):
     platform, gpu_name = get_platform_info()
+
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if not 0 <= shard_id < num_shards:
+        raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}")
 
     is_fp8 = dtype_name == "fp8"
     config = GRANULARITY_CONFIG_MAP[granularity_name] if is_fp8 else None
@@ -180,6 +192,8 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
     test_id = 0
     for case in test_cases:
         test_id += 1
+        if num_shards > 1 and (test_id - 1) % num_shards != shard_id:
+            continue
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
         dtype = case["dtype"]
 
@@ -270,6 +284,9 @@ def benchmark_grouped_gemm_turbo(dtype_name="bf16", granularity_name="tensorwise
             filename = f"grouped_gemm_turbo_fp8_{granularity_name}_{timestamp}_{gpu_name}.csv"
         else:
             filename = f"grouped_gemm_turbo_bf16_{timestamp}_{gpu_name}.csv"
+        if num_shards > 1:
+            base, ext = os.path.splitext(filename)
+            filename = f"{base}.part-{shard_id}{ext}"
     results.to_csv(filename, index=False)
     print(f"Results saved to {filename}")
 
@@ -297,7 +314,23 @@ if __name__ == "__main__":
         default=None,
         help="Output CSV filename",
     )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total number of shards to split test cases into (default: 1, i.e. no sharding)",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Index of this shard in [0, num_shards) (default: 0)",
+    )
     args = parser.parse_args()
     benchmark_grouped_gemm_turbo(
-        dtype_name=args.dtype, granularity_name=args.granularity, output_csv=args.output
+        dtype_name=args.dtype,
+        granularity_name=args.granularity,
+        output_csv=args.output,
+        num_shards=args.num_shards,
+        shard_id=args.shard_id,
     )
