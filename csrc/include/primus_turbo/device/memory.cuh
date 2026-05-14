@@ -74,18 +74,11 @@ __device__ __forceinline__ void load_gmem_to_smem_srd(const BufferSRD &srd, uint
     llvm_amdgcn_raw_buffer_load_lds(srd.srd, lds, Bytes, ldg_offset, soffset, 0, 0);
 }
 
-// ════════════════════════════════════════════════════════════════
-//  GMEM -> SMEM, two-step (global_load → VGPR → ds_write)
-// ════════════════════════════════════════════════════════════════
-//
-// The single-instruction LDS-direct buffer_load_lds path (above) shares
-// vmcnt with compiler-emitted scratch_load (SGPR spill consume).  On
-// gfx950 vmcnt has no FIFO guarantee across scratch and buffer ops, so
-// a stale m0 from spill can leak into the LDS-direct write.  Splitting
-// into a two-step buffer_load (vmcnt-tracked) → ds_write (lgkmcnt-tracked)
-// puts the LDS write on a different counter from the spill and breaks
-// the race.  Caller must wait_lgkmcnt<0>() before LDS reads (the existing
-// kernel already does this between prologue and main loop).
+// Two-step variant: buffer_load_b128 → VGPR → ds_write_b128.  Splits the
+// LDS write off vmcnt onto lgkmcnt; used by grouped GEMM prologues to
+// keep LDS commits on a separate counter from the compiler-emitted SGPR
+// spill traffic (gfx950 vmcnt has no FIFO across scratch and buffer ops).
+// Caller must wait_lgkmcnt<0>() before the first LDS read.
 
 __device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(int32x4_t, int32_t, int32_t, int32_t)
     __asm("llvm.amdgcn.raw.buffer.load.i32");
@@ -93,12 +86,10 @@ __device__ int32x4_t llvm_amdgcn_raw_buffer_load_b128(int32x4_t, int32_t, int32_
     __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 
 template <int Bytes>
-__device__ __forceinline__ void load_gmem_to_smem_srd_two_step(const BufferSRD &srd,
-                                                               uint32_t ldg_offset,
-                                                               uint32_t lds_addr,
-                                                               int32_t soffset) {
-    static_assert(Bytes == 4 || Bytes == 16,
-                  "two-step path supports 1 or 4 dwords per thread.");
+__device__ __forceinline__ void
+load_gmem_to_smem_srd_two_step(const BufferSRD &srd, uint32_t ldg_offset,
+                               uint32_t lds_addr, int32_t soffset) {
+    static_assert(Bytes == 4 || Bytes == 16, "two-step path supports b32 or b128.");
     if constexpr (Bytes == 4) {
         uint32_t v = llvm_amdgcn_raw_buffer_load_b32(srd.srd, ldg_offset, soffset, 0);
         using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;

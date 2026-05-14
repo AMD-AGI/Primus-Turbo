@@ -124,10 +124,10 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     // Re-assert pinned VGPR reservation right before the prologue (data
     // loads use the 2-step path; see fwd kernel comment for rationale).
     tile.reserve_pinned_regs();
-    tile.template load_a_gmem_to_smem_half_srd_two_step<0>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_a_gmem_to_smem_half_srd_two_step<1>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd_two_step<0>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd_two_step<1>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    tile.template load_a_gmem_to_smem_half_srd<0, true>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
+    tile.template load_a_gmem_to_smem_half_srd<1, true>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
+    tile.template load_b_gmem_to_smem_half_srd<0, true>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    tile.template load_b_gmem_to_smem_half_srd<1, true>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols_full);
     tile.template load_a_scale_gmem_to_smem_half_srd<1>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
@@ -137,13 +137,13 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     tile.template load_b_scale_gmem_to_smem_half_srd<1>(b_s_srd, scale_ldg_offset, b_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols_full);
 
-    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd_t1, ldg_offsets, a_smem_tile[1],
+    tile.template load_a_gmem_to_smem_half_srd<0, true>(a_srd_t1, ldg_offsets, a_smem_tile[1],
                                                   sts_offsets, DATA_STRIDE);
-    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd_t1, ldg_offsets, a_smem_tile[1],
+    tile.template load_a_gmem_to_smem_half_srd<1, true>(a_srd_t1, ldg_offsets, a_smem_tile[1],
                                                   sts_offsets, DATA_STRIDE);
-    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd_t1, ldg_offsets, b_smem_tile[1],
+    tile.template load_b_gmem_to_smem_half_srd<0, true>(b_srd_t1, ldg_offsets, b_smem_tile[1],
                                                   sts_offsets, DATA_STRIDE);
-    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd_t1, ldg_offsets, b_smem_tile[1],
+    tile.template load_b_gmem_to_smem_half_srd<1, true>(b_srd_t1, ldg_offsets, b_smem_tile[1],
                                                   sts_offsets, DATA_STRIDE);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[1],
                                                         scale_sts_offset, scale_cols_full,
