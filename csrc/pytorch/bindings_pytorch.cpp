@@ -63,18 +63,27 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
 
     // ********* Permute (MoE token (un)permute) *********
+    // ``probs_topk_stride`` / ``probs_stride``:
+    //   - ``0`` selects the legacy ``[T, num_local_experts]`` multihot layout
+    //     (aux column in ``row_id_map`` stores ``expert_idx``);
+    //   - a positive value (must equal ``num_topk``) selects the
+    //     ``[T, num_topk]`` topk-aligned layout used by DeepEP /
+    //     ``moe_dispatch``, in which case the aux column stores the
+    //     ``topk_position`` instead. The latter is only valid with the
+    //     ``topk_idx`` expert_map code path.
     m.def("permute_preprocessing(Tensor expert_map, Tensor num_dispatched_token_tensor, "
           "int num_local_experts, int num_topk, int pad_multiple, "
-          "int num_permuted_tokens) -> (Tensor, Tensor, Tensor)");
+          "int num_permuted_tokens, int probs_topk_stride=0) -> (Tensor, Tensor, Tensor)");
     m.def("permute(Tensor tokens, Tensor output_tokens, Tensor? scaling_factor, "
           "Tensor? output_scaling_factor, Tensor? probs, Tensor? output_probs, "
           "Tensor row_id_map, Tensor num_dispatched_token_tensor, "
           "int pad_multiple, int num_local_experts, int hidden_size, int scales_per_token, "
-          "bool use_fp8, bool with_probs, int num_permuted_token) -> ()");
+          "bool use_fp8, bool with_probs, int num_permuted_token, "
+          "int probs_stride=0) -> ()");
     m.def("unpermute(Tensor permuted_tokens, Tensor output_tokens, "
           "Tensor? permuted_probs, Tensor? output_probs, Tensor row_id_map, "
           "Tensor num_dispatched_tokens_tensor, int num_local_experts, int hidden_size, "
-          "bool with_probs) -> ()");
+          "bool with_probs, int probs_stride=0) -> ()");
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "

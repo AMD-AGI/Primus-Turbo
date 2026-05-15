@@ -79,7 +79,8 @@ __launch_bounds__(kNumThreads, 1) __global__
                                       const int *num_dispatched_tokens_ptr, int num_experts,
                                       int num_topk, int pad_multiple, int32_t *tokens_per_expert,
                                       int *row_id_map, int *overflow_flag,
-                                      int64_t num_permuted_tokens, TempStorageLayout layout) {
+                                      int64_t num_permuted_tokens, int probs_topk_stride,
+                                      TempStorageLayout layout) {
     uint64_t *tile_state = layout.tile_state;
     using BlockScan      = hipcub::BlockScan<int32_t, kNumThreads>;
     __shared__ typename BlockScan::TempStorage scan_temp;
@@ -119,7 +120,12 @@ __launch_bounds__(kNumThreads, 1) __global__
 
     __syncthreads();
 
-    // row_id_map row layout: [dst_rows | expert_idx | n_routed], length 2*E + 1.
+    // row_id_map row layout: [dst_rows | aux | n_routed], length 2*E + 1.
+    // ``aux[i]`` is the column at which ``probs[gtoken, ?]`` should be read for
+    // the i-th routed slot. With multihot probs ([T, E]) ``aux = expert_idx``;
+    // with topk-aligned probs ([T, num_topk]) — signalled by
+    // ``probs_topk_stride > 0`` and only valid for the topk_idx code path —
+    // ``aux = topk_position`` (i.e. ``k`` such that ``topk_idx[gtoken, k] == e``).
     const int row_stride = 2 * E + 1;
 
     // Phase 1-2: per-tile InclusiveSum, accumulate into s_acc; multi-tile
@@ -230,8 +236,25 @@ __launch_bounds__(kNumThreads, 1) __global__
         for (int e = 0; e < E; ++e) {
             const int s = patch(read_slot(e), e);
             if (s != 0) {
-                row_id_map[row_base + n]     = s;
-                row_id_map[row_base + E + n] = e;
+                row_id_map[row_base + n] = s;
+                int aux_val              = e;
+                // Topk-aligned probs mode: replace expert_idx with the column
+                // ``k`` inside ``topk_idx[gtoken, :]`` whose entry equals ``e``.
+                // Lookup is O(num_topk); guarded out of the routing_map path at
+                // compile time since ``expert_map_t == bool`` carries no topk.
+                if constexpr (!std::is_same_v<expert_map_t, bool>) {
+                    if (probs_topk_stride > 0) {
+                        for (int k = 0; k < num_topk; ++k) {
+                            const int ek = static_cast<int>(
+                                expert_map[static_cast<int64_t>(gtoken) * num_topk + k]);
+                            if (ek == e) {
+                                aux_val = k;
+                                break;
+                            }
+                        }
+                    }
+                }
+                row_id_map[row_base + E + n] = aux_val;
                 ++n;
             }
         }
@@ -376,18 +399,17 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_ptr, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
                                 int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
-                                int64_t num_permuted_tokens, hipStream_t stream) {
+                                int64_t num_permuted_tokens, int probs_topk_stride,
+                                hipStream_t stream) {
     constexpr int kNumThreads = 512;
     PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
     PRIMUS_TURBO_CHECK(num_local_experts <= kNumThreads,
                        "num_local_experts must fit in a single block");
-    PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0,
-                       "max_num_dispatched_tokens must be >= 0");
+    PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0, "max_num_dispatched_tokens must be >= 0");
 
     if (max_num_dispatched_tokens == 0) {
-        PRIMUS_TURBO_CHECK_HIP(
-            hipMemsetAsync(tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert),
-                           stream));
+        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+            tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert), stream));
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(overflow_flag, 0, sizeof(*overflow_flag), stream));
         return;
     }
@@ -416,7 +438,8 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
     permute_preprocessing_kernel<kNumThreads, expert_map_t>
         <<<grid_size, kNumThreads, kernel_lds_bytes, stream>>>(
             expert_map, num_dispatched_tokens_ptr, num_local_experts, num_topk, pad_multiple,
-            tokens_per_expert, row_id_map, overflow_flag, num_permuted_tokens, tmp_layout);
+            tokens_per_expert, row_id_map, overflow_flag, num_permuted_tokens, probs_topk_stride,
+            tmp_layout);
 
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -427,7 +450,8 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
                         scalar_t *permuted_scaling_factor, const prob_t *probs,
                         prob_t *permuted_probs, const int *row_id_map,
                         const int *num_dispatched_tokens_ptr, int pad_multiple,
-                        int num_local_experts, int hidden_int4, int scales_per_token) {
+                        int num_local_experts, int hidden_int4, int scales_per_token,
+                        int probs_stride) {
     const int lane_id  = static_cast<int>(threadIdx.x);
     const int token_id = static_cast<int>(blockIdx.x);
     const int chunk_id = static_cast<int>(blockIdx.y);
@@ -481,15 +505,20 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
         }
     }
 
-    // probs: [num_dispatched_tokens, E]  (E == num_local_experts).
-    // Matches the Triton reference and the multihot probs emitted by
-    // indices_to_multihot in the dispatcher.
+    // probs: [num_dispatched_tokens, probs_stride]. ``probs_stride == E`` means
+    // multihot layout with ``row[E + idx] == expert_idx`` (the legacy code
+    // path, used by ``indices_to_multihot``); ``probs_stride == num_topk``
+    // means topk-aligned layout (as emitted directly by DeepEP /
+    // ``moe_dispatch``) and ``row[E + idx] == topk_position`` instead — the
+    // preprocessing kernel rewrote ``aux`` accordingly when called with a
+    // matching ``probs_topk_stride``. We just read whichever column the
+    // preprocessing pass stored.
     if (probs != nullptr && lane_id == 0) {
         for (int idx = 0; idx < n_routed; ++idx) {
-            const int dst_row    = row[idx];
-            const int expert_idx = row[E + idx];
+            const int dst_row   = row[idx];
+            const int probs_col = row[E + idx];
             if (dst_row > 0) {
-                permuted_probs[dst_row - 1] = probs[token_id * E + expert_idx];
+                permuted_probs[dst_row - 1] = probs[token_id * probs_stride + probs_col];
             } else {
                 permuted_probs[-dst_row - 1] = prob_t{0};
             }
@@ -543,7 +572,7 @@ __launch_bounds__(kNumThreads, 4) __global__
     void unpermute_kernel(const int4 *permuted_tokens, int4 *tokens, const prob_t *permuted_probs,
                           prob_t *probs, const int *row_id_map,
                           const int *num_dispatched_tokens_ptr, int num_local_experts,
-                          int hidden_int4) {
+                          int hidden_int4, int probs_stride) {
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
 
     const int lane_id  = static_cast<int>(threadIdx.x);
@@ -590,16 +619,18 @@ __launch_bounds__(kNumThreads, 4) __global__
     }
 
     // Probs scatter: only chunk_id == 0 emits the per-token probs row.
-    // probs shape is [num_dispatched_tokens, E].
+    // probs shape is [num_dispatched_tokens, probs_stride]. See the permute
+    // kernel's probs comment for the multihot vs topk-aligned conventions; the
+    // aux column ``row[E + idx]`` is always a valid index into that row.
     if (probs != nullptr && permuted_probs != nullptr && chunk_id == 0) {
-        for (int p_j = lane_id; p_j < E; p_j += kNumThreads) {
-            probs[token_id * E + p_j] = prob_t{0};
+        for (int p_j = lane_id; p_j < probs_stride; p_j += kNumThreads) {
+            probs[token_id * probs_stride + p_j] = prob_t{0};
         }
         for (int idx = lane_id; idx < n_routed; idx += kNumThreads) {
             const int s = row[idx];
             if (s > 0) {
-                const int e             = row[E + idx];
-                probs[token_id * E + e] = permuted_probs[s - 1];
+                const int probs_col                        = row[E + idx];
+                probs[token_id * probs_stride + probs_col] = permuted_probs[s - 1];
             }
         }
     }
@@ -614,7 +645,7 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
                   scalar_t *permuted_scaling_factor, const prob_t *probs, prob_t *permuted_probs,
                   const int *row_id_map, const int *num_dispatched_tokens_ptr, int pad_multiple,
                   int num_local_experts, int hidden_size, int scales_per_token,
-                  int num_dispatched_max, hipStream_t stream) {
+                  int num_dispatched_max, int probs_stride, hipStream_t stream) {
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
 
     PRIMUS_TURBO_CHECK(permuted_tokens != nullptr, "permuted_tokens must be allocated");
@@ -626,6 +657,8 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
     const int4 *tokens_int4          = reinterpret_cast<const int4 *>(tokens);
     int4       *permuted_tokens_int4 = reinterpret_cast<int4 *>(permuted_tokens);
 
+    const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
+
 #define LAUNCH_PERMUTE(num_hidden_per_block)                                                       \
     do {                                                                                           \
         const int num_chunks =                                                                     \
@@ -636,7 +669,7 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
             <<<grid, (num_hidden_per_block), /*shmem=*/0, stream>>>(                               \
                 tokens_int4, permuted_tokens_int4, scaling_factor, permuted_scaling_factor, probs, \
                 permuted_probs, row_id_map, num_dispatched_tokens_ptr, pad_multiple,               \
-                num_local_experts, hidden_int4, scales_per_token);                                 \
+                num_local_experts, hidden_int4, scales_per_token, effective_probs_stride);         \
     } while (0)
 
     DISPATCH_PERMUTE_UNPERMUTE(hidden_size, LAUNCH_PERMUTE);
@@ -649,7 +682,7 @@ template <typename dtype_t, typename prob_t>
 void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_t *permuted_probs,
                     prob_t *probs, const int *row_id_map, const int *num_dispatched_tokens_ptr,
                     int num_local_experts, int hidden_size, int num_dispatched_max,
-                    hipStream_t stream) {
+                    int probs_stride, hipStream_t stream) {
 
     constexpr int kE1NumThreads     = 512;
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
@@ -663,7 +696,13 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
     const int4 *permuted_tokens_int4 = reinterpret_cast<const int4 *>(permuted_tokens);
     int4       *tokens_int4          = reinterpret_cast<int4 *>(tokens);
 
-    if (num_local_experts == 1) {
+    const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
+
+    // ``unpermute_kernel_e1`` hard-codes a row width of 1 for ``probs``; it is
+    // only valid for the legacy multihot path (probs == [T, 1]). With
+    // topk-aligned probs the row width is ``num_topk`` even when
+    // ``num_local_experts == 1``, so we fall back to the general kernel.
+    if (num_local_experts == 1 && effective_probs_stride == 1) {
         // E=1 path keeps the persistent-block design (one warp per token).
         constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;
@@ -682,7 +721,8 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
         unpermute_kernel<(num_hidden_per_block), dtype_t, prob_t>                                  \
             <<<grid, (num_hidden_per_block), /*shmem=*/0, stream>>>(                               \
                 permuted_tokens_int4, tokens_int4, permuted_probs, probs, row_id_map,              \
-                num_dispatched_tokens_ptr, num_local_experts, hidden_int4);                        \
+                num_dispatched_tokens_ptr, num_local_experts, hidden_int4,                         \
+                effective_probs_stride);                                                           \
     } while (0)
 
         DISPATCH_PERMUTE_UNPERMUTE(hidden_size, LAUNCH_UNPERMUTE);
@@ -701,16 +741,16 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
         const expert_map_t *expert_map, int num_topk, int *num_dispatched_tokens_ptr,              \
         int num_local_experts, int max_num_dispatched_tokens, int pad_multiple,                    \
         int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,                           \
-        int64_t num_permuted_tokens, hipStream_t stream)
+        int64_t num_permuted_tokens, int probs_topk_stride, hipStream_t stream)
 
 #define INSTANTIATE_UNPERMUTE_IMPL(dtype_t, prob_t)                                                \
     template void unpermute_impl<dtype_t, prob_t>(const dtype_t *, dtype_t *, const prob_t *,      \
                                                   prob_t *, const int *, const int *, int, int,    \
-                                                  int, hipStream_t)
+                                                  int, int, hipStream_t)
 #define INSTANTIATE_PERMUTE_IMPL(dtype_t, prob_t, scalar_t)                                        \
     template void permute_impl<dtype_t, prob_t, scalar_t>(                                         \
         const dtype_t *, dtype_t *, const scalar_t *, scalar_t *, const prob_t *, prob_t *,        \
-        const int *, const int *, int, int, int, int, int, hipStream_t)
+        const int *, const int *, int, int, int, int, int, int, hipStream_t)
 
 INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(bool);
 INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(int);

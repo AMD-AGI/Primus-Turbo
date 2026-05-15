@@ -233,29 +233,43 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
 
-        if self.tokens_per_expert.numel() > 0:
-            num_out_tokens = self.tokens_per_expert.sum().item()
-        elif self.permute_max_token_num > 0:
-            num_out_tokens = self.permute_max_token_num
+        if self.permute_max_token_num > 0:
+            num_permuted_tokens = self.permute_max_token_num
         else:
-            # will case cpu sync at permute phase
-            num_out_tokens = -1
-
-        self.dispatched_routing_map, dispatched_probs = turbo.ops.indices_to_multihot(
-            self.dispatched_indices, dispatched_probs, self.num_local_experts, fused=self.permute_fusion
-        )
+            # will cause cpu sync at permute phase
+            num_permuted_tokens = -1
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        hidden_states, permuted_probs, self.reversed_mapping_for_combine, tokens_per_expert = (
-            turbo.ops.token_permute(
-                hidden_states,
-                num_out_tokens=num_out_tokens,
-                routing_map=self.dispatched_routing_map,
-                probs=dispatched_probs,
-                fused=self.permute_fusion,
-                return_tokens_per_expert=self.deepep_use_cuda_num_tokens_per_expert or num_out_tokens == -1,
-            )
+
+        # ``moe_permute`` (C++ side) requires ``num_dispatched_token_tensor`` to
+        # be a contiguous int32 CUDA tensor whose value is the *number of
+        # dispatched tokens* (one row per token, not one per (token, expert)
+        # assignment). It must be ≤ ``expert_map.size(0)`` (which is
+        # ``dispatched_indices.shape[0]``); using ``tokens_per_expert.sum()``
+        # would over-count by a factor of ``num_topk``.
+        # Construct via ``ones * scalar`` rather than ``torch.tensor([scalar],
+        # device='cuda')`` so we do not trigger a host→device copy of a Python
+        # int — the latter is rejected during CUDA graph capture.
+
+        # TODO
+        self.num_dispatched_token_tensor = None
+
+        (
+            hidden_states,
+            self.row_id_map,
+            tokens_per_expert,
+            _,
+            _,
+            permuted_probs,
+        ) = turbo.ops.moe_permute(
+            hidden_states,
+            self.dispatched_indices,
+            self.num_dispatched_token_tensor,
+            num_local_experts=self.num_local_experts,
+            num_topk=self.router_topk,
+            num_permuted_tokens=num_permuted_tokens,
+            probs=dispatched_probs,
         )
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
@@ -268,12 +282,12 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         return hidden_states, tokens_per_expert, permuted_probs
 
     def _pre_combine(self, hidden_states):
-        hidden_states = turbo.ops.token_unpermute(
+        hidden_states, _ = turbo.ops.moe_unpermute(
             hidden_states,
-            self.reversed_mapping_for_combine,
+            self.row_id_map,
+            self.num_dispatched_token_tensor,
             restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.dispatched_routing_map,
-            fused=self.permute_fusion,
+            num_local_experts=self.num_local_experts,
         )
         return hidden_states
 

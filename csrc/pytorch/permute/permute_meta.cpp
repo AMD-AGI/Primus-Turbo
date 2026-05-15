@@ -9,7 +9,7 @@ namespace primus_turbo::pytorch {
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 permute_preprocessing_meta(torch::Tensor expert_map, torch::Tensor /*num_dispatched_token_tensor*/,
                            int64_t num_local_experts, int64_t /*num_topk*/, int64_t pad_multiple,
-                           int64_t /*num_permuted_tokens*/) {
+                           int64_t /*num_permuted_tokens*/, int64_t /*probs_topk_stride*/) {
     auto int_opts                  = at::TensorOptions().dtype(at::kInt).device(at::kMeta);
     auto max_num_dispatched_tokens = expert_map.sizes()[0];
     auto row_id_map =
@@ -26,12 +26,12 @@ void permute_meta(at::Tensor /*tokens*/, at::Tensor /*output_tokens*/,
                   at::Tensor /*row_id_map*/, at::Tensor /*num_dispatched_token_tensor*/,
                   int64_t /*pad_multiple*/, int64_t /*num_local_experts*/, int64_t /*hidden_size*/,
                   int64_t /*scales_per_token*/, bool /*use_fp8*/, bool /*with_probs*/,
-                  int64_t /*num_permuted_token*/) {}
+                  int64_t /*num_permuted_token*/, int64_t /*probs_stride*/) {}
 
 void unpermute_meta(at::Tensor /*permuted_tokens*/, at::Tensor /*output_tokens*/,
                     c10::optional<at::Tensor> /*permuted_probs*/,
                     c10::optional<at::Tensor> /*output_probs*/, at::Tensor /*row_id_map*/,
                     at::Tensor /*num_dispatched_tokens_tensor*/, int64_t /*num_local_experts*/,
-                    int64_t /*hidden_size*/, bool /*with_probs*/) {}
+                    int64_t /*hidden_size*/, bool /*with_probs*/, int64_t /*probs_stride*/) {}
 
 } // namespace primus_turbo::pytorch

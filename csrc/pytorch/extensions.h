@@ -243,19 +243,19 @@ at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 permute_preprocessing(at::Tensor expert_map, at::Tensor num_dispatched_token_tensor,
                       int64_t num_local_experts, int64_t num_topk, int64_t pad_multiple,
-                      int64_t num_permuted_tokens);
+                      int64_t num_permuted_tokens, int64_t probs_topk_stride);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 permute_preprocessing_meta(at::Tensor expert_map, at::Tensor num_dispatched_token_tensor,
                            int64_t num_local_experts, int64_t num_topk, int64_t pad_multiple,
-                           int64_t num_permuted_tokens);
+                           int64_t num_permuted_tokens, int64_t probs_topk_stride);
 
 void permute(at::Tensor tokens, at::Tensor output_tokens, c10::optional<at::Tensor> scaling_factor,
              c10::optional<at::Tensor> output_scaling_factor, c10::optional<at::Tensor> probs,
              c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,
              at::Tensor num_dispatched_token_tensor, int64_t pad_multiple,
              int64_t num_local_experts, int64_t hidden_size, int64_t scales_per_token, bool use_fp8,
-             bool with_probs, int64_t num_permuted_token);
+             bool with_probs, int64_t num_permuted_token, int64_t probs_stride);
 
 void permute_meta(at::Tensor tokens, at::Tensor output_tokens,
                   c10::optional<at::Tensor> scaling_factor,
@@ -263,18 +263,19 @@ void permute_meta(at::Tensor tokens, at::Tensor output_tokens,
                   c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,
                   at::Tensor num_dispatched_token_tensor, int64_t pad_multiple,
                   int64_t num_local_experts, int64_t hidden_size, int64_t scales_per_token,
-                  bool use_fp8, bool with_probs, int64_t num_permuted_token);
+                  bool use_fp8, bool with_probs, int64_t num_permuted_token, int64_t probs_stride);
 
 void unpermute(at::Tensor permuted_tokens, at::Tensor output_tokens,
                c10::optional<at::Tensor> permuted_probs, c10::optional<at::Tensor> output_probs,
                at::Tensor row_id_map, at::Tensor num_dispatched_tokens_tensor,
-               int64_t num_local_experts, int64_t hidden_size, bool with_probs);
+               int64_t num_local_experts, int64_t hidden_size, bool with_probs,
+               int64_t probs_stride);
 
 void unpermute_meta(at::Tensor permuted_tokens, at::Tensor output_tokens,
                     c10::optional<at::Tensor> permuted_probs,
                     c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,
                     at::Tensor num_dispatched_tokens_tensor, int64_t num_local_experts,
-                    int64_t hidden_size, bool with_probs);
+                    int64_t hidden_size, bool with_probs, int64_t probs_stride);
 
 //==================================================================
 //  Runtime

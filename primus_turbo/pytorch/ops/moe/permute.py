@@ -14,6 +14,46 @@ import torch
 __all__ = ["moe_permute", "moe_unpermute"]
 
 
+def _infer_probs_topk_stride(
+    probs: Optional[torch.Tensor],
+    num_local_experts: int,
+    num_topk: int,
+) -> int:
+    """Pick the cu-kernel ``probs_stride`` from ``probs``'s row width.
+
+    Returns:
+        - 0 when ``probs`` is absent or already in the legacy multihot
+          ``[T, num_local_experts]`` layout (kernel uses ``num_local_experts``
+          internally, aux column stores ``expert_idx``);
+        - ``num_topk`` when ``probs`` is in the topk-aligned ``[T, num_topk]``
+          layout emitted by DeepEP / ``moe_dispatch`` (aux column stores
+          ``topk_position``).
+
+    Errors out for any other row width — including the ambiguous case
+    ``num_local_experts == num_topk`` where the layout cannot be inferred from
+    shape alone (callers must reshape ``probs`` to disambiguate).
+    """
+    if probs is None:
+        return 0
+    assert probs.dim() == 2, "probs must be 2D ([T, num_local_experts] or [T, num_topk])"
+    row_width = int(probs.shape[1])
+    if row_width == num_local_experts and row_width == num_topk and num_topk > 0:
+        raise ValueError(
+            "moe_permute: cannot disambiguate probs layout because num_local_experts == "
+            f"num_topk == {num_topk}. Pass probs in the layout you intend "
+            "(reshape or pad to make the row width unique)."
+        )
+    if row_width == num_local_experts:
+        return 0
+    if num_topk > 0 and row_width == num_topk:
+        return num_topk
+    raise ValueError(
+        f"moe_permute: probs.shape[1]={row_width} must equal num_local_experts="
+        f"{num_local_experts} (multihot layout) or num_topk={num_topk} (topk-aligned "
+        "layout, only valid when expert_map is topk_idx)."
+    )
+
+
 class _MoEPermute(torch.autograd.Function):
     """Forward: permute_preprocessing + permute. Backward: unpermute (+ probs)."""
 
@@ -43,12 +83,24 @@ class _MoEPermute(torch.autograd.Function):
         hidden_size = int(tokens.shape[-1])
         num_dispatched = int(tokens.shape[0])
 
+        # The cu kernel now supports two probs layouts:
+        # ``[T, num_local_experts]`` (multihot, probs_stride == 0) and
+        # ``[T, num_topk]`` (topk-aligned, probs_stride == num_topk). We
+        # pick the stride from ``probs.shape[1]`` here and feed it through
+        # preprocessing → permute → backward unpermute so the kernel reads /
+        # writes probs at the correct offsets without an extra Python-side
+        # ``indices_to_multihot`` step.
+        probs_topk_stride = _infer_probs_topk_stride(probs, num_local_experts, num_topk)
+        probs_row_width = probs_topk_stride if probs_topk_stride > 0 else num_local_experts
+
         ctx.num_dispatched = num_dispatched
         ctx.hidden_size = hidden_size
         ctx.num_local_experts = num_local_experts
         ctx.use_fp8 = use_fp8
         ctx.with_probs = probs is not None
         ctx.probs_dtype = probs.dtype if probs is not None else None
+        ctx.probs_topk_stride = probs_topk_stride
+        ctx.probs_row_width = probs_row_width
 
         if use_fp8 and scaling_factor is not None:
             assert scales_per_token > 0, "scales_per_token must be > 0 when use_fp8=True"
@@ -84,6 +136,7 @@ class _MoEPermute(torch.autograd.Function):
                 num_topk,
                 pad_multiple,
                 num_permuted_tokens,
+                probs_topk_stride,
             )
         )
 
@@ -125,6 +178,7 @@ class _MoEPermute(torch.autograd.Function):
             use_fp8,
             probs is not None,
             num_permuted_alloc,
+            probs_topk_stride,
         )
 
         ctx.save_for_backward(row_id_map, num_dispatched_token_tensor)
@@ -160,10 +214,12 @@ class _MoEPermute(torch.autograd.Function):
         )
 
         # empty: unpermute kernel zeros every probs[t, :] slot up front.
+        # Match the row width of the forward-input probs so the gradient
+        # tensor lines up with what the user passed in.
         if ctx.with_probs and permuted_probs_grad is not None:
             permuted_probs_grad = permuted_probs_grad.contiguous()
             grad_probs: Optional[torch.Tensor] = torch.empty(
-                (ctx.num_dispatched, ctx.num_local_experts),
+                (ctx.num_dispatched, ctx.probs_row_width),
                 dtype=ctx.probs_dtype,
                 device=device,
             )
@@ -187,6 +243,7 @@ class _MoEPermute(torch.autograd.Function):
                 ctx.num_local_experts,
                 ctx.hidden_size,
                 grad_probs is not None,
+                ctx.probs_topk_stride,
             )
 
         return (
@@ -216,24 +273,35 @@ class _MoEUnpermute(torch.autograd.Function):
         restore_shape: torch.Size,
         num_local_experts: int,
         permuted_probs: Optional[torch.Tensor],
+        probs_topk_stride: int,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         device = permuted_tokens.device
         num_permuted = int(permuted_tokens.shape[0])
         # restore_shape == (num_dispatched, hidden_size); see moe_unpermute().
         num_dispatched, hidden_size = int(restore_shape[0]), int(restore_shape[1])
 
+        # ``probs_topk_stride == 0`` is the legacy ``[T, num_local_experts]``
+        # multihot output (matches the value the preprocessing pass wrote
+        # into ``row_id_map.aux``); a positive value selects the topk-aligned
+        # ``[T, probs_topk_stride]`` output. The caller is responsible for
+        # picking the layout that matches the row_id_map produced by
+        # forward-permute.
+        probs_row_width = probs_topk_stride if probs_topk_stride > 0 else num_local_experts
+
         ctx.num_permuted = num_permuted
         ctx.hidden_size = hidden_size
         ctx.num_local_experts = num_local_experts
         ctx.with_probs = permuted_probs is not None
         ctx.permuted_probs_dtype = permuted_probs.dtype if permuted_probs is not None else None
+        ctx.probs_topk_stride = probs_topk_stride
+        ctx.probs_row_width = probs_row_width
 
         unpermuted_tokens = torch.empty(
             (num_dispatched, hidden_size), dtype=permuted_tokens.dtype, device=device
         )
         unpermuted_probs = (
             torch.zeros(
-                (num_dispatched, num_local_experts),
+                (num_dispatched, probs_row_width),
                 dtype=permuted_probs.dtype,
                 device=device,
             )
@@ -257,6 +325,7 @@ class _MoEUnpermute(torch.autograd.Function):
             num_local_experts,
             hidden_size,
             permuted_probs is not None,
+            probs_topk_stride,
         )
 
         ctx.save_for_backward(row_id_map, num_dispatched_tokens_tensor)
@@ -306,6 +375,7 @@ class _MoEUnpermute(torch.autograd.Function):
                 False,  # use_fp8
                 grad_permuted_probs is not None,
                 ctx.num_permuted,
+                ctx.probs_topk_stride,
             )
 
         return (
@@ -315,6 +385,7 @@ class _MoEUnpermute(torch.autograd.Function):
             None,  # restore_shape
             None,  # num_local_experts
             grad_permuted_probs,  # permuted_probs
+            None,  # probs_topk_stride
         )
 
 
@@ -367,11 +438,20 @@ def moe_unpermute(
     restore_shape: torch.Size,
     num_local_experts: int,
     permuted_probs: Optional[torch.Tensor] = None,
+    probs_topk_stride: int = 0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Unpermute back into ``restore_shape`` (= original ``tokens.shape``).
 
+    Args:
+        probs_topk_stride: row width of the produced ``unpermuted_probs``.
+            ``0`` selects the legacy multihot layout
+            ``[restore_shape[0], num_local_experts]``; a positive value (must
+            equal ``num_topk``) selects the topk-aligned layout
+            ``[restore_shape[0], probs_topk_stride]`` and must match the value
+            passed to forward ``moe_permute``.
+
     Returns (unpermuted_tokens, unpermuted_probs) shaped ``restore_shape``
-    and ``[restore_shape[0], num_local_experts]``.
+    and ``[restore_shape[0], probs_row_width]``.
     """
     return _MoEUnpermute.apply(
         permuted_tokens,
@@ -380,4 +460,5 @@ def moe_unpermute(
         restore_shape,
         num_local_experts,
         permuted_probs,
+        probs_topk_stride,
     )
