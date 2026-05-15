@@ -22,8 +22,15 @@ Contains:
     - gemm_fp8_rowwise_triton_kernel: Public API
 
   Blockwise scaling:
-    - _blockwise_fp8_autotune_kernel: Core autotuned persistent kernel
-    - gemm_fp8_blockwise_triton_kernel: Unified public API (NT/NN/TN)
+    - _blockwise_fp8_unified_kernel: Single jit body shared by NT/NN/TN.
+      Layout differences (A/B K-contiguity, B-scale 2D vs 1D, EVEN_K fast
+      path, transposed-store epilogue) are guarded by `tl.constexpr` flags
+      so each (key tuple) compiles to an independent binary.
+    - _blockwise_fp8_{nt,nn,tn}_kernel: Layout-specialised `triton.autotune`
+      wrappers around the unified jit body. Each owns its own config search
+      space and best-config cache (NT: 96 configs, NN: 144 with
+      matrix_instr_nonkdim=16 stack on BM=256, TN: 64 without num_stages=3).
+    - gemm_fp8_blockwise_triton_kernel: Unified public API (NT/NN/TN).
 
 Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
 """
@@ -719,25 +726,61 @@ def gemm_fp8_rowwise_triton_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise autotune configs (32 total)
+# Blockwise autotune configs
 # Fixed: BLOCK_N=128, BLOCK_K=128, wpe=2, mfma=16
 # Variable: BLOCK_M, kpack, GROUP_M, CHUNK, num_stages
+#
+# ``allow_num_stages_3`` is a per-autotune-wrapper switch. The TN/wgrad
+# specialisation of the unified kernel uses dual strided-K loads
+# (A_K_CONTIGUOUS=False, B_K_CONTIGUOUS=False); on triton 3.7.0 the AMD
+# backend hits ``llvm/ADT/Sequence.h:275: Assertion `Begin <= End`'' (SIGABRT,
+# uncatchable by autotune) when ``num_stages=3`` is combined with that load
+# pattern. The contiguous-K NT/NN specialisations do not exercise that backend
+# path, so they keep the full ns=[1,2,3] space on gfx950. This matches the
+# historic TN-wgrad-only fragility noted in tips.md (R57: dual-strided loads
+# need different code-gen guards than the other two layouts).
 # ═══════════════════════════════════════════════════════════════════════════════
-def _get_blockwise_autotune_configs():
+def _get_blockwise_autotune_configs(
+    allow_num_stages_3: bool = True,
+    extra_matrix_instr_nonkdim: list | None = None,
+):
+    """Generate blockwise FP8 GEMM autotune configs.
+
+    Args:
+        allow_num_stages_3: whether to include `num_stages=3` candidates.
+            Set False for the dual strided-K wgrad kernel which hits a
+            Triton 3.7.0 LLVM-backend assertion at ns=3.
+        extra_matrix_instr_nonkdim: extra `matrix_instr_nonkdim` values to
+            stack on top of the Triton default (which selects 32x32x64 for
+            FP8 on gfx950). For example, passing ``[16]`` doubles the
+            candidate space by emitting an extra copy of every (BM, BN,
+            ns, gm, chunk) tuple with ``matrix_instr_nonkdim=16`` so the
+            autotuner can pick `v_mfma_f32_16x16x128_f8f6f4` when that
+            instruction wins (typically the AGPR-bound NN/dgrad path).
+            ``None`` keeps the original search space.
+    """
     configs = []
-    for block_m, kp, gm, chunk, ns in itertools.product(
+    if _is_gfx950():
+        num_stage_values = [1, 2, 3] if allow_num_stages_3 else [1, 2]
+        block_n_values = [64, 128]
+    else:
+        num_stage_values = [1, 2]
+        block_n_values = [128]
+    for block_m, block_n, kp, gm, chunk, ns in itertools.product(
         [128, 256],
+        block_n_values,
         [1, 2],
         [4, 8],
         [32, 64],
-        [1, 2],
+        num_stage_values,
     ):
         nw = 4 if block_m == 128 else 8
+        # Default-nonkdim (Triton picks 32x32x64 for FP8 on gfx950).
         configs.append(
             triton.Config(
                 {
                     "BLOCK_M": block_m,
-                    "BLOCK_N": 128,
+                    "BLOCK_N": block_n,
                     "BLOCK_K": 128,
                     "GROUP_M": gm,
                     "NUM_XCDS": 8,
@@ -748,18 +791,71 @@ def _get_blockwise_autotune_configs():
                 pre_hook=None,
             )
         )
+        # Extra nonkdim variants are only added for BM=256 + nw=8 configs,
+        # which is the only branch where 32x32x64 actually overflows into
+        # AGPR. BM=128 + nw=4 already fits 16 AGPR comfortably, so we keep
+        # the search space tight and skip the duplicate compile cost there.
+        if extra_matrix_instr_nonkdim and block_m == 256:
+            for nonkdim in extra_matrix_instr_nonkdim:
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": block_m,
+                            "BLOCK_N": block_n,
+                            "BLOCK_K": 128,
+                            "GROUP_M": gm,
+                            "NUM_XCDS": 8,
+                            "CHUNK": chunk,
+                            "matrix_instr_nonkdim": nonkdim,
+                        },
+                        num_warps=nw,
+                        num_stages=ns,
+                        pre_hook=None,
+                    )
+                )
     return configs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Autotuned block-wise FP8 GEMM kernel
+# Unified blockwise FP8 GEMM kernel — single jit body shared by NT/NN/TN.
+#
+# Layout differences are guarded by `tl.constexpr` flags so each (key tuple)
+# compiles to an independent binary equivalent to the previous per-layout
+# kernels (NT forward, NN dgrad, TN wgrad). The mapping is:
+#
+#     Layout │ A_K_CONTIGUOUS │ B_K_CONTIGUOUS │ SCALE_2D_B │ EVEN_K │ TRANS_C_STORE
+#     ───────┼────────────────┼────────────────┼────────────┼────────┼──────────────
+#     NT     │ True           │ True           │ True       │ K%128==0 │ False
+#     NN     │ True           │ False          │ True       │ K%128==0 │ False
+#     TN     │ False          │ False          │ False      │ False    │ True
+#
+# Kept invariants (do not break without re-benchmarking):
+#   * `EVEN_K` fast path skips the K-tail mask on NT/NN (R26: removes two
+#     `v_cmp_*` + one `v_cndmask_*` per K iteration). TN keeps the mask path
+#     because its `b_ptrs += BLOCK_K * stride_bk_val` arithmetic combined with
+#     `num_stages=3` triggered the historic Triton 3.7 LLVM-backend
+#     `Begin <= End` assertion; the TN autotune wrapper below already drops
+#     `ns=3`, but EVEN_K=False on TN is the matched safety net documented in
+#     `pr_report_blockwise_gemm_triton.md` §3.2.
+#   * `TRANS_C_STORE=True` takes the `tl.trans(acc)` epilogue so the BF16
+#     write coalesces into `(buffer|global)_store_dwordx4` under
+#     `trans_c=True` (stride_cm=1, stride_cn=N). NT/NN (`trans_c=False`) keep
+#     the direct store; their output buffer is BN-contiguous, so the direct
+#     epilogue is already vectorised.
+#
+# Three `triton.autotune` wrappers below specialise the kernel along the
+# dimensions that historically required separate search spaces:
+#   * NT  : 96 configs, key=("M","N","K","EVEN_K"), keeps `num_stages=3`.
+#   * NN  : 144 configs (96 + matrix_instr_nonkdim=16 stack on BM=256),
+#           key=("M","N","K","EVEN_K"), keeps `num_stages=3` (the nonkdim=16
+#           candidate is what avoids the 16-AGPR overflow on
+#           BM=256/nw=8/ns=3 documented in §3.3).
+#   * TN  : 64 configs (no `num_stages=3` — dual strided-K + ns=3 hits the
+#           Triton 3.7 AMD-backend assertion mentioned above),
+#           key=("M","N","K").
 # ═══════════════════════════════════════════════════════════════════════════════
-@triton.autotune(
-    configs=_get_blockwise_autotune_configs(),
-    key=["M", "N", "K", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS", "SCALE_2D_B"],
-)
 @triton.jit
-def _blockwise_fp8_autotune_kernel(
+def _blockwise_fp8_unified_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -783,6 +879,8 @@ def _blockwise_fp8_autotune_kernel(
     A_K_CONTIGUOUS: tl.constexpr,
     B_K_CONTIGUOUS: tl.constexpr,
     SCALE_2D_B: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    TRANS_C_STORE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -793,7 +891,7 @@ def _blockwise_fp8_autotune_kernel(
     pid = tl.program_id(0)
 
     # XCD-aware PID transform (inlined from _chiplet_transform_chunked
-    # because NUM_SMS is not constexpr in this kernel)
+    # because NUM_SMS is not constexpr in this kernel).
     if NUM_XCDS != 1:
         full_chunk_pids = (NUM_SMS // (NUM_XCDS * CHUNK)) * (NUM_XCDS * CHUNK)
         if pid <= full_chunk_pids:
@@ -827,38 +925,36 @@ def _blockwise_fp8_autotune_kernel(
         rk = tl.arange(0, BLOCK_K)
 
         if A_K_CONTIGUOUS:
-            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :]
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64)
         else:
-            a_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak_val
+            a_ptrs = A_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak_val
 
         if B_K_CONTIGUOUS:
-            b_ptrs = B_ptr + rk[:, None] + rn[None, :] * stride_bn
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) + rn[None, :].to(tl.int64) * stride_bn
         else:
-            b_ptrs = B_ptr + rk[:, None] * stride_bk_val + rn[None, :] * stride_bn
+            b_ptrs = B_ptr + rk[:, None].to(tl.int64) * stride_bk_val + rn[None, :].to(tl.int64) * stride_bn
 
         as_ptrs = A_scales_ptr + rm * stride_as_m
 
         if SCALE_2D_B:
-            bs_ptr_base = B_scales_ptr + pn * stride_bs_0
+            # Blockwise B scales are still stored on 128-column granularity even
+            # when autotune tries a narrower output tile such as BLOCK_N=64.
+            scale_block_n = (pn * BLOCK_N) // 128
+            bs_ptr_base = B_scales_ptr + scale_block_n * stride_bs_0
         else:
             bs_ptrs = B_scales_ptr + rn * stride_bs_0
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for ki in range(NUM_K_BLOCKS):
-            # Mask for partial K blocks (last iteration when K % BLOCK_K != 0)
-            k_remaining = K - ki * BLOCK_K
-            mask_k_col = rk[None, :] < k_remaining  # [1, BLOCK_K] for A
-            mask_k_row = rk[:, None] < k_remaining  # [BLOCK_K, 1] for B
-
-            if A_K_CONTIGUOUS:
-                a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
+            if EVEN_K:
+                a = tl.load(a_ptrs, cache_modifier=".ca")
+                b = tl.load(b_ptrs, cache_modifier=".ca")
             else:
+                k_remaining = K - ki * BLOCK_K
+                mask_k_col = rk[None, :] < k_remaining
+                mask_k_row = rk[:, None] < k_remaining
                 a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
-
-            if B_K_CONTIGUOUS:
-                b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
-            else:
                 b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
 
             partial = tl.dot(a, b, input_precision="ieee")
@@ -884,9 +980,43 @@ def _blockwise_fp8_autotune_kernel(
 
         offs_m = pm * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
-        c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+        if TRANS_C_STORE:
+            # `trans_c=True` flips the output to (N, M) with stride_cm=1 and
+            # stride_cn=N. Without `tl.trans`, the BF16 store degrades to
+            # 64×buffer_store_short per tile; transposing here lets the
+            # compiler emit (buffer|global)_store_dwordx4 ×4-8.
+            c_ptrs_t = (
+                C_ptr + offs_n[:, None].to(tl.int64) * stride_cn + offs_m[None, :].to(tl.int64) * stride_cm
+            )
+            mask_t = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+            acc_t = tl.trans(acc.to(C_ptr.type.element_ty))
+            tl.store(c_ptrs_t, acc_t, mask_t)
+        else:
+            c_ptrs = (
+                C_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :].to(tl.int64) * stride_cn
+            )
+            mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+            tl.store(c_ptrs, acc.to(C_ptr.type.element_ty), mask)
+
+
+# Layout-specialised autotune wrappers around the shared jit body. Each wrapper
+# owns an independent `Autotuner` instance with its own config search space and
+# best-config cache; the underlying jit kernel is shared, so binaries are still
+# emitted per (autotune key + constexpr) tuple.
+_blockwise_fp8_nt_kernel = triton.autotune(
+    configs=_get_blockwise_autotune_configs(),
+    key=["M", "N", "K", "EVEN_K"],
+)(_blockwise_fp8_unified_kernel)
+
+_blockwise_fp8_nn_kernel = triton.autotune(
+    configs=_get_blockwise_autotune_configs(extra_matrix_instr_nonkdim=[16]),
+    key=["M", "N", "K", "EVEN_K"],
+)(_blockwise_fp8_unified_kernel)
+
+_blockwise_fp8_tn_kernel = triton.autotune(
+    configs=_get_blockwise_autotune_configs(allow_num_stages_3=False),
+    key=["M", "N", "K"],
+)(_blockwise_fp8_unified_kernel)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -983,7 +1113,7 @@ def _blockwise_nt(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_nt_kernel[(NUM_SMS,)](
         a,
         B_t,
         out,
@@ -993,8 +1123,8 @@ def _blockwise_nt(
         N,
         K,
         a.stride(0),
-        a.stride(1),
-        B_t.stride(0),
+        1,  # stride_ak_val unused: A_K_CONTIGUOUS=True
+        1,  # stride_bk_val unused: B_K_CONTIGUOUS=True
         B_t.stride(1),
         stride_cm,
         stride_cn,
@@ -1007,6 +1137,8 @@ def _blockwise_nt(
         A_K_CONTIGUOUS=True,
         B_K_CONTIGUOUS=True,
         SCALE_2D_B=True,
+        EVEN_K=(K % 128) == 0,
+        TRANS_C_STORE=False,
     )
     return out
 
@@ -1045,7 +1177,7 @@ def _blockwise_nn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    _blockwise_fp8_nn_kernel[(NUM_SMS,)](
         a,
         b,
         out,
@@ -1055,7 +1187,7 @@ def _blockwise_nn(
         N,
         K,
         a.stride(0),
-        a.stride(1),
+        1,  # stride_ak_val unused: A_K_CONTIGUOUS=True
         b.stride(0),
         b.stride(1),
         stride_cm,
@@ -1069,6 +1201,8 @@ def _blockwise_nn(
         A_K_CONTIGUOUS=True,
         B_K_CONTIGUOUS=False,
         SCALE_2D_B=True,
+        EVEN_K=(K % 128) == 0,
+        TRANS_C_STORE=False,
     )
     return out
 
@@ -1109,7 +1243,18 @@ def _blockwise_tn(
     num_n = (N + 127) // 128
     NUM_SMS = num_m * num_n
 
-    _blockwise_fp8_autotune_kernel[(NUM_SMS,)](
+    # Round-6 (P2-#7.6): wgrad runs under `trans_c=True` (output buffer is
+    # `(N, M)` with `stride_cm=1, stride_cn=N`). The shared kernel emits an
+    # element-wise `buffer_store_short[_d16_hi]` epilogue under that layout
+    # (64 store instructions per tile in dev). The unified kernel routes TN
+    # through the `TRANS_C_STORE=True` epilogue, which transposes `acc` before
+    # storing so BM is the innermost axis and the compiler can pack the BF16
+    # write into dwordx4. EVEN_K is forced to False here so this kernel keeps
+    # the historical mask-load path for the dual strided-K loads (avoids the
+    # Triton 3.7 `Begin <= End` LLVM-backend assertion that fired only on
+    # dual-strided + ns=3; the TN autotune wrapper already drops ns=3, but
+    # leaving EVEN_K=False is the matched-pair safety net).
+    _blockwise_fp8_tn_kernel[(NUM_SMS,)](
         A_view,
         b,
         out,
@@ -1133,5 +1278,7 @@ def _blockwise_tn(
         A_K_CONTIGUOUS=False,
         B_K_CONTIGUOUS=False,
         SCALE_2D_B=False,
+        EVEN_K=False,
+        TRANS_C_STORE=True,
     )
     return out
