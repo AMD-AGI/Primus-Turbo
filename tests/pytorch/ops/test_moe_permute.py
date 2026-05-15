@@ -10,7 +10,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.ops.moe.permute import moe_permute, moe_unpermute
+from primus_turbo.pytorch.ops.moe.moe_permute import moe_permute, moe_unpermute
 from tests.pytorch.ref.permuatation_ref import (
     pytorch_permute_mask_map,
     pytorch_unpermute_mask_map,

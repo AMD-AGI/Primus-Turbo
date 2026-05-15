@@ -2,9 +2,9 @@
 //
 // See LICENSE for license information.
 
-#include "permute.cuh"
+#include "moe_permute.cuh"
 #include "primus_turbo/common.h"
-#include "primus_turbo/permute.h"
+#include "primus_turbo/moe_permute.h"
 
 #include <hip/hip_runtime.h>
 #include <hipcub/block/block_scan.hpp>
@@ -381,13 +381,11 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
     PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
     PRIMUS_TURBO_CHECK(num_local_experts <= kNumThreads,
                        "num_local_experts must fit in a single block");
-    PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0,
-                       "max_num_dispatched_tokens must be >= 0");
+    PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0, "max_num_dispatched_tokens must be >= 0");
 
     if (max_num_dispatched_tokens == 0) {
-        PRIMUS_TURBO_CHECK_HIP(
-            hipMemsetAsync(tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert),
-                           stream));
+        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+            tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert), stream));
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(overflow_flag, 0, sizeof(*overflow_flag), stream));
         return;
     }
@@ -693,7 +691,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
 }
 
 // =============================================================================
-// Explicit template instantiations consumed by csrc/pytorch/permute/permute.cpp.
+// Explicit template instantiations consumed by csrc/pytorch/moe_permute/moe_permute.cpp.
 // =============================================================================
 
 #define INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(expert_map_t)                                       \
