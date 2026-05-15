@@ -73,9 +73,12 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         b_dtype = _get_fp8_dtype(config.format, True)
 
         # One bf16 read of `a` produces row-wise (fwd) + segment-padded col-wise (bwd wgrad).
+        # `a` is [M_total, K]; the fwd-GEMM output dim N = b.size(-2 if trans_b else -1).
+        gemm_n = b.size(-2) if trans_b else b.size(-1)
         a_fp8_row, a_fp8_col, a_scale_inv_row, a_scale_inv_col, _, _ = (
             quant_fp8_blockwise_segment_m_row_col_impl(
-                a, a_dtype, config.block_size, group_lens, group_offs
+                a, a_dtype, config.block_size, group_lens, group_offs,
+                gemm_other_dim=gemm_n,
             )
         )
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(
@@ -113,10 +116,13 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         # One bf16 read of grad_out → row-wise (dgrad) + segment-padded col-wise (wgrad).
+        # grad_out is [M_total, N]; bwd-GEMM K dim from b_fp8 = b.size(-1 if trans_b else -2).
+        gemm_k = b_fp8.size(-1) if ctx.trans_b else b_fp8.size(-2)
         (grad_out_fp8_row, grad_out_fp8_col,
          grad_out_scale_inv_row, grad_out_scale_inv_col,
          var_k_group_lens, var_k_group_offs) = quant_fp8_blockwise_segment_m_row_col_impl(
-            grad_out, grad_out_dtype, block_size, group_lens, group_offs
+            grad_out, grad_out_dtype, block_size, group_lens, group_offs,
+            gemm_other_dim=gemm_k,
         )
 
         # dgrad swaps trans_b: NT fwd → NN dgrad; TN fwd → TT dgrad.

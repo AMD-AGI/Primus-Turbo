@@ -37,6 +37,65 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
     return output;
 }
 
+std::vector<at::Tensor> quantize_fp8_blockwise_meta(const at::Tensor     input,
+                                                     const at::ScalarType dest_dtype,
+                                                     const int64_t        axis,
+                                                     const int64_t        block_size) {
+    const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    auto x_fp8 = at::empty({M, N}, at::dtype(dest_dtype).device(at::kMeta));
+    std::vector<int64_t> scale_shape;
+    if (valid_axis == 1) {
+        scale_shape = {M, (N + block_size - 1) / block_size};
+    } else {
+        scale_shape = {(M + block_size - 1) / block_size, N};
+    }
+    auto scale_inv = at::empty(scale_shape, at::dtype(at::kFloat).device(at::kMeta));
+    return {x_fp8, scale_inv};
+}
+
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t block_size,
+    const at::Tensor group_lens, const at::Tensor group_offs) {
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    const int64_t num_groups = group_lens.size(0);
+    const int64_t M_padded_max = M + num_groups * block_size;
+    auto fp8_meta = at::dtype(dest_dtype).device(at::kMeta);
+    auto fp32_meta = at::dtype(at::kFloat).device(at::kMeta);
+    auto i64_meta = at::dtype(at::kLong).device(at::kMeta);
+    return {
+        at::empty({M, N}, fp8_meta),
+        at::empty({M_padded_max, N}, fp8_meta),
+        at::empty({M, (N + block_size - 1) / block_size}, fp32_meta),
+        at::empty({(M_padded_max + block_size - 1) / block_size, N}, fp32_meta),
+        at::empty({num_groups}, i64_meta),
+        at::empty({num_groups + 1}, i64_meta),
+    };
+}
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor     input,
+                                                                const at::ScalarType dest_dtype,
+                                                                const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3);
+    const bool    is_2d = (input.dim() == 2);
+    const int64_t B     = is_2d ? 1 : input.size(0);
+    const int64_t M     = is_2d ? input.size(0) : input.size(1);
+    const int64_t N     = is_2d ? input.size(1) : input.size(2);
+    const int64_t m_blocks = (M + block_size - 1) / block_size;
+    const int64_t n_blocks = (N + block_size - 1) / block_size;
+    auto fp8_meta  = at::dtype(dest_dtype).device(at::kMeta);
+    auto fp32_meta = at::dtype(at::kFloat).device(at::kMeta);
+    if (is_2d) {
+        return {at::empty({M, N}, fp8_meta),
+                at::empty({m_blocks, n_blocks}, fp32_meta)};
+    } else {
+        return {at::empty({B, M, N}, fp8_meta),
+                at::empty({B, m_blocks, n_blocks}, fp32_meta)};
+    }
+}
+
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
     const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,

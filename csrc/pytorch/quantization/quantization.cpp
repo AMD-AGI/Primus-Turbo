@@ -200,6 +200,127 @@ std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
     return {output, scale_inv};
 }
 
+// Blockwise FP8 Quant (BLOCK_SIZE=128, axis-wise scaling, 2D input)
+std::vector<at::Tensor> quantize_fp8_blockwise(const at::Tensor     input,
+                                                const at::ScalarType dest_dtype,
+                                                const int64_t        axis,
+                                                const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "blockwise quant requires 2D input");
+    PRIMUS_TURBO_CHECK(block_size == 128, "only block_size=128 currently supported");
+
+    const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
+    PRIMUS_TURBO_CHECK(valid_axis == 0 || valid_axis == 1, "axis must be 0 or 1");
+
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    auto output = at::empty({M, N}, input.options().dtype(dest_dtype));
+
+    std::vector<int64_t> scale_shape;
+    if (valid_axis == 1) {
+        scale_shape = {M, (N + block_size - 1) / block_size};
+    } else {
+        scale_shape = {(M + block_size - 1) / block_size, N};
+    }
+    auto scale_inv = at::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_blockwise_impl<FType, QType, float>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()),
+                reinterpret_cast<float *>(scale_inv.data_ptr()),
+                M, N, static_cast<int>(valid_axis), fp8_max, stream);
+        });
+    });
+    return {output, scale_inv};
+}
+
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t block_size,
+    const at::Tensor group_lens, const at::Tensor group_offs) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2);
+    PRIMUS_TURBO_CHECK(block_size == 128);
+
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    const int     num_groups = static_cast<int>(group_lens.size(0));
+
+    auto var_k_group_lens = at::div(group_lens + (block_size - 1), block_size, "floor") * block_size;
+    auto var_k_group_offs = at::zeros({num_groups + 1}, group_lens.options());
+    var_k_group_offs.slice(0, 1, num_groups + 1) = at::cumsum(var_k_group_lens, 0);
+
+    const int64_t M_padded_max = M + num_groups * block_size;
+
+    auto x_fp8_row             = at::zeros({M, N}, input.options().dtype(dest_dtype));
+    auto x_fp8_col_padded      = at::zeros({M_padded_max, N}, input.options().dtype(dest_dtype));
+    auto x_scales_row          = at::zeros({M, (N + block_size - 1) / block_size},
+                                           input.options().dtype(at::kFloat));
+    auto x_scales_col_padded   = at::zeros({(M_padded_max + block_size - 1) / block_size, N},
+                                           input.options().dtype(at::kFloat));
+
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(x_fp8_row.scalar_type(), QType, {
+            quantize_blockwise_segment_m_row_col_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(x_fp8_row.data_ptr()),
+                reinterpret_cast<QType *>(x_fp8_col_padded.data_ptr()),
+                reinterpret_cast<float *>(x_scales_row.data_ptr()),
+                reinterpret_cast<float *>(x_scales_col_padded.data_ptr()),
+                reinterpret_cast<const int64_t *>(group_offs.data_ptr()),
+                reinterpret_cast<const int64_t *>(var_k_group_offs.data_ptr()),
+                M, N, M_padded_max, num_groups, fp8_max, stream);
+        });
+    });
+
+    return {x_fp8_row, x_fp8_col_padded, x_scales_row, x_scales_col_padded,
+            var_k_group_lens, var_k_group_offs};
+}
+
+// Weight blockwise FP8 quant: 2D or 3D weight, single scalar scale per [block_size, block_size] tile.
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                           const at::ScalarType dest_dtype,
+                                                           const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3, "weight quant requires 2D or 3D input");
+    PRIMUS_TURBO_CHECK(block_size == 128, "only block_size=128 currently supported");
+
+    const bool    is_2d = (input.dim() == 2);
+    const int64_t B     = is_2d ? 1 : input.size(0);
+    const int64_t M     = is_2d ? input.size(0) : input.size(1);
+    const int64_t N     = is_2d ? input.size(1) : input.size(2);
+    const int64_t m_blocks = (M + block_size - 1) / block_size;
+    const int64_t n_blocks = (N + block_size - 1) / block_size;
+
+    std::vector<int64_t> out_shape   = is_2d ? std::vector<int64_t>{M, N}
+                                              : std::vector<int64_t>{B, M, N};
+    std::vector<int64_t> scale_shape = is_2d ? std::vector<int64_t>{m_blocks, n_blocks}
+                                              : std::vector<int64_t>{B, m_blocks, n_blocks};
+    auto output    = at::empty(out_shape, input.options().dtype(dest_dtype));
+    auto scale_inv = at::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_blockwise_for_weight_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()),
+                reinterpret_cast<float *>(scale_inv.data_ptr()),
+                B, M, N, fp8_max, stream);
+        });
+    });
+    return {output, scale_inv};
+}
+
 // De-Quantize
 at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
                                      const at::ScalarType dest_dtype) {

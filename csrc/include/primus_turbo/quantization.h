@@ -30,6 +30,29 @@ void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_
                                      const int64_t batch, const int64_t m, const int64_t n,
                                      hipStream_t stream);
 
+// Blockwise FP8 quant (BLOCK=128, axis-wise scaling).
+// axis=1: scale_inv shape [M, ceil(N/128)]; axis=0: [ceil(M/128), N].
+template <typename FType, typename QType, typename ComputeType = float>
+void quantize_blockwise_impl(const FType *x, QType *y, float *scale_inv, const int64_t M,
+                              const int64_t N, const int axis, const float fp8_max,
+                              hipStream_t stream);
+
+// Single-pass fused row + segment-padded col blockwise FP8 quant (grouped grad_out / a).
+// One bf16 read of x [M_in, N] produces row + col-padded FP8 outputs and scales.
+template <typename FType, typename QType>
+void quantize_blockwise_segment_m_row_col_impl(
+    const FType *x, QType *y_row, QType *y_col_padded,
+    float *scales_row, float *scales_col_padded,
+    const int64_t *group_offs, const int64_t *padded_group_offs,
+    const int64_t M_in, const int64_t N, const int64_t M_padded_max,
+    const int num_groups, const float fp8_max, hipStream_t stream);
+
+// Weight blockwise FP8 quant: 3D weight [B, M, N], single scalar scale per [128, 128] tile.
+template <typename FType, typename QType>
+void quantize_blockwise_for_weight_impl(const FType *w, QType *w_fp8, float *w_scales_inv,
+                                         const int64_t B, const int64_t M, const int64_t N,
+                                         const float fp8_max, hipStream_t stream);
+
 namespace detail {
 
 enum class QuantizeMode { ROWWISE, COLWISE };
