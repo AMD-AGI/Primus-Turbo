@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
-from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
@@ -130,13 +129,28 @@ def quant_fp8_blockwise_impl_meta(
     return x_fp8, x_scales
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_dual_impl", mutates_args=())
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_dual_impl", mutates_args=())
 def quant_fp8_blockwise_dual_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize a 2D tensor in both blockwise row and column modes in one pass."""
+    """Quantize a 2D tensor in both blockwise row and column modes in one pass.
+
+    NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
+    inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
+    (gfx942) + Triton 3.7 combination, the analysis pass
+    ``identify_mutated_tensors`` raises ``IndexError('Function argument index
+    out of range')`` while generating TTIR. PyTorch then falls back to the
+    conservative "all inputs mutated" path, but in this PyTorch build that
+    fallback only checks ``isinstance(value, Tensor)`` and misses ``TensorBox``
+    values seen during inductor lowering, so the kernel call is silently
+    eliminated by DCE and the returned ``torch.empty`` buffers leak as the
+    "outputs". The opaque ``custom_op`` registration sidesteps the
+    ``identify_mutated_tensors`` path entirely and matches the pattern already
+    used by ``quant_fp8_blockwise_impl`` and
+    ``quant_fp8_blockwise_for_weight_impl``.
+    """
     assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
 
     M, N = x.shape
@@ -149,7 +163,7 @@ def quant_fp8_blockwise_dual_impl(
     x_scales_col = torch.empty(col_scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_dual_kernel)[grid](
+    quant_fp8_blockwise_dual_kernel[grid](
         x,
         x_fp8_row,
         x_scales_row,
@@ -180,7 +194,7 @@ def quant_fp8_blockwise_dual_impl_meta(
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
 def quant_fp8_blockwise_segment_m_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
@@ -224,8 +238,11 @@ def quant_fp8_blockwise_segment_m_impl(
     x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
 
     # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
+    # NOTE: registered as ``torch.library.custom_op`` (opaque) for the same
+    # reason as ``quant_fp8_blockwise_dual_impl`` above (Triton 3.7 + MI300
+    # ``identify_mutated_tensors`` failure leading to silent DCE).
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
+    quant_fp8_blockwise_segment_m_kernel[grid](
         x,
         x_fp8,
         x_scales,
