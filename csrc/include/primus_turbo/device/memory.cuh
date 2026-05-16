@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
+#include "primus_turbo/device/register.cuh"
+
 namespace primus_turbo::device {
 
 // ════════════════════════════════════════════════════════════════
@@ -113,6 +115,14 @@ __device__ __forceinline__ void ds_read_pinned(uint32_t lds_addr) {
     else
         asm volatile("ds_read_b128 v[%0:%1], %2 offset:%3"
             : : "n"(VDST), "n"(VDST + 3), "v"(lds_addr), "n"(IMM_OFFSET) : "memory");
+
+    clobber_vgpr_one<VDST>();
+    if constexpr (Bytes >= 8)
+        clobber_vgpr_one<VDST + 1>();
+    if constexpr (Bytes == 16) {
+        clobber_vgpr_one<VDST + 2>();
+        clobber_vgpr_one<VDST + 3>();
+    }
 }
 // clang-format on
 

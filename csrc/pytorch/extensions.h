@@ -87,6 +87,30 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
     const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
     const bool shuffle_colwise = false);
 
+std::vector<at::Tensor> quantize_mxfp8_dual_grouped(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
+    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+    const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp8_dual_grouped_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
+    const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
+    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+    const bool shuffle_colwise = false);
+
+std::vector<at::Tensor> quantize_mxfp8_dual_perg(const at::Tensor     input,
+                                                 const at::ScalarType dest_dtype,
+                                                 const bool           rowwise_use_2d_block,
+                                                 const bool           colwise_use_2d_block);
+
+std::vector<at::Tensor> quantize_mxfp8_dual_perg_meta(const at::Tensor     input,
+                                                      const at::ScalarType dest_dtype,
+                                                      const bool           rowwise_use_2d_block,
+                                                      const bool           colwise_use_2d_block);
+
 std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
                                        const int64_t axis, const bool use_2d_block,
                                        const bool shuffle_scale = false,
@@ -231,6 +255,34 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
                                            at::Tensor &group_offs, const bool transA,
                                            const bool transB, at::ScalarType out_dtype,
                                            const std::string &granularity, const bool pre_sync);
+
+at::Tensor turbo_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                  at::Tensor &b_scales, at::Tensor &group_lens,
+                                  at::Tensor                      &group_offs,
+                                  const c10::optional<at::Tensor> &c_group_offs,
+                                  int64_t total_m_out, const bool transA, const bool transB,
+                                  at::ScalarType out_dtype, const std::string &granularity,
+                                  const int64_t grid_x_hint);
+
+at::Tensor turbo_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                       at::Tensor &b_scales, at::Tensor &group_lens,
+                                       at::Tensor                      &group_offs,
+                                       const c10::optional<at::Tensor> &c_group_offs,
+                                       int64_t total_m_out, const bool transA, const bool transB,
+                                       at::ScalarType out_dtype, const std::string &granularity,
+                                       const int64_t grid_x_hint);
+
+at::Tensor turbo_grouped_gemm_variable_k_fp8(at::Tensor &lhs, at::Tensor &lhs_scales,
+                                             at::Tensor &rhs, at::Tensor &rhs_scales,
+                                             at::Tensor &group_lens, at::Tensor &group_offs,
+                                             at::ScalarType     out_dtype,
+                                             const std::string &granularity);
+
+at::Tensor turbo_grouped_gemm_variable_k_fp8_meta(at::Tensor &lhs, at::Tensor &lhs_scales,
+                                                  at::Tensor &rhs, at::Tensor &rhs_scales,
+                                                  at::Tensor &group_lens, at::Tensor &group_offs,
+                                                  at::ScalarType     out_dtype,
+                                                  const std::string &granularity);
 
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 

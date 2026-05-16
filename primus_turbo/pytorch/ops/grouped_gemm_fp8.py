@@ -24,6 +24,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
+    quantize_mxfp8_dual_grouped_impl,
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
@@ -47,6 +48,66 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     # Some upstream reductions can produce expanded zero-stride grad_out views.
     # Custom grouped GEMM kernels expect dense layouts.
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+
+
+def _turbo_grouped_gemm_mxfp8(
+    a_fp8,
+    b_fp8,
+    a_scales,
+    b_scales,
+    group_lens,
+    group_offs_in,
+    out_dtype,
+    *,
+    c_group_offs=None,
+    total_m_out=0,
+    grid_x_hint=0,
+):
+    """MX_BLOCKWISE NT grouped GEMM with optional fused unpad-on-store.
+
+    For per-group-padded inputs, pass ``group_offs_in =
+    group_offs_padded`` (input row offsets), ``c_group_offs =
+    group_offs`` (output row offsets in the original/unpadded layout),
+    and ``total_m_out = a.size(0)`` (original total_M).  When the
+    layout is identity (balanced + aligned) ``c_group_offs`` may be
+    left as ``None``.
+    """
+    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_fp8(
+        a_fp8,
+        b_fp8,
+        a_scales,
+        b_scales,
+        group_lens,
+        group_offs_in,
+        c_group_offs,
+        int(total_m_out),
+        False,
+        True,
+        out_dtype,
+        "MX_BLOCKWISE",
+        int(grid_x_hint),
+    )
+
+
+def _turbo_grouped_gemm_variable_k_mxfp8(
+    lhs_fp8,
+    lhs_scales,
+    rhs_fp8,
+    rhs_scales,
+    group_lens,
+    group_offs,
+    out_dtype,
+):
+    return torch.ops.primus_turbo_cpp_extension.turbo_grouped_gemm_variable_k_fp8(
+        lhs_fp8,
+        lhs_scales,
+        rhs_fp8,
+        rhs_scales,
+        group_lens,
+        group_offs,
+        out_dtype,
+        "MX_BLOCKWISE",
+    )
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
@@ -373,6 +434,158 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None
 
 
+class GroupedGemmFP8MXFunc(torch.autograd.Function):
+    """MXFP8 grouped GEMM autograd (MX_BLOCKWISE).
+
+    Forward / dgrad / wgrad all land on the turbo MXFP8 backends.
+
+    The turbo kernel itself only supports NT layout with per-group
+    M_g aligned to 16 rows (fwd / dgrad row-scale preshuffle) and 128
+    rows (wgrad col-scale preshuffle).  The wrapper adapts both
+    directions transparently:
+
+    - ``trans_b=False`` (TT layout): ``b`` is materialised in NT form via
+      a contiguous transpose; the wgrad output is transposed back.
+    - Unaligned per-group M_g: ``a`` and ``grad_out`` are zero-padded
+      along the M axis to 128-aligned per-group sizes (a strictly
+      stronger requirement than 16 — we only pay for one padding shape).
+      Forward / dgrad outputs are sliced back to the user-visible shape;
+      wgrad output (``(G, N, K)``) does not depend on the padding.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,  # [G,] int64
+        group_offs: torch.Tensor,  # [G+1,] int64
+        trans_b: bool,
+        config: Float8QuantConfig,
+        num_cu: int | None,
+    ):
+        assert config.granularity == ScalingGranularity.MX_BLOCKWISE
+        assert a.ndim == 2, "A must be 2D [total_M, K]."
+        assert b.ndim == 3, "B must be 3D."
+        out_dtype = a.dtype
+        assert out_dtype in [torch.float16, torch.bfloat16]
+
+        # Kernel only supports NT, so materialise b in (G, N, K).
+        b_internal = b if trans_b else b.transpose(-1, -2).contiguous()
+        G, _, _ = b_internal.shape
+        a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
+
+        # Fused grouped quant for A: produces row + col MXFP8 outputs
+        # in the padded layout AND computes the padded per-group layout
+        # on GPU (no D2H sync).
+        a_fp8_row, a_scale_inv_row, a_fp8_col, a_scale_inv_col, _, group_offs_padded = (
+            quantize_mxfp8_dual_grouped_impl(
+                a,
+                a_dtype,
+                group_lens,
+                group_offs,
+            )
+        )
+        # Per-group dual quant for B: rowwise (G, N, K_pad) for fwd,
+        # colwise (G, K, N_pad) for dgrad, both ready for GEMM.
+        b_fp8_row, b_scale_inv_row, b_fp8_col, b_scale_inv_col = (
+            torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_perg(b_internal, b_dtype, True, True)
+        )
+
+        # Inputs read from the padded layout via ``group_offs_padded``;
+        # output is written directly to the unpadded (total_M, N) buffer
+        # via ``c_group_offs``.  When balanced + aligned the two layouts
+        # match and the write is a pure contiguous store.
+        out = _turbo_grouped_gemm_mxfp8(
+            a_fp8_row,
+            b_fp8_row,
+            a_scale_inv_row,
+            b_scale_inv_row,
+            group_lens,
+            group_offs_padded,
+            out_dtype,
+            c_group_offs=group_offs,
+            total_m_out=a.size(0),
+        )
+
+        ctx.save_for_backward(
+            a_fp8_col,
+            a_scale_inv_col,
+            b_fp8_col,
+            b_scale_inv_col,
+            group_lens,
+            group_offs,
+            group_offs_padded,
+        )
+        ctx.config = config
+        ctx.out_dtype = out_dtype
+        ctx.num_cu = num_cu
+        ctx.trans_b = trans_b
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
+        (
+            a_fp8_col,
+            a_scale_inv_col,
+            b_fp8_col,
+            b_scale_inv_col,
+            group_lens,
+            group_offs,
+            group_offs_padded,
+        ) = ctx.saved_tensors
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+
+        # Fused grouped quant for grad_out (same op as fwd).
+        (
+            grad_out_fp8_row,
+            grad_out_scale_inv_row,
+            grad_out_t_fp8,
+            grad_out_t_scale_inv,
+            group_lens_padded,
+            _,
+        ) = quantize_mxfp8_dual_grouped_impl(
+            grad_out,
+            grad_out_dtype,
+            group_lens,
+            group_offs,
+        )
+
+        # dgrad: store-side unpad fused like fwd.
+        grad_a = _turbo_grouped_gemm_mxfp8(
+            grad_out_fp8_row,
+            b_fp8_col,
+            grad_out_scale_inv_row,
+            b_scale_inv_col,
+            group_lens,
+            group_offs_padded,
+            ctx.out_dtype,
+            c_group_offs=group_offs,
+            total_m_out=grad_out.size(0),
+        )
+
+        # wgrad: dB = dC^T @ A via fixed-NT variable-K turbo.  Operates
+        # on the padded layout end-to-end (output is (G, N, K), no row
+        # compression needed).
+        grad_b = _turbo_grouped_gemm_variable_k_mxfp8(
+            grad_out_t_fp8,
+            grad_out_t_scale_inv,
+            a_fp8_col,
+            a_scale_inv_col,
+            group_lens_padded,
+            group_offs_padded,
+            ctx.out_dtype,
+        )
+
+        # Transpose back to (G, K, N) when the user originally supplied
+        # b in TT layout.
+        if not ctx.trans_b:
+            grad_b = grad_b.transpose(-1, -2).contiguous()
+
+        return grad_a, grad_b, None, None, None, None, None
+
+
 def grouped_gemm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -400,5 +613,7 @@ def grouped_gemm_fp8(
         return FP8GroupedGemmRowFunc.apply(*args)
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         return FP8GroupedGemmBlockFunc.apply(*args)
+    elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
+        return GroupedGemmFP8MXFunc.apply(*args)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

@@ -62,6 +62,7 @@ template <int AGPR> __device__ __forceinline__ void clobber_agpr_one() {
 
 template <int AC> __device__ __forceinline__ void zero_agpr() {
     asm volatile("v_accvgpr_write_b32 a[%0], 0" : : "n"(AC));
+    clobber_agpr_one<AC>();
 }
 
 // Read N consecutive AGPRs starting at AC, returned as type T.

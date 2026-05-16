@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
@@ -110,8 +111,15 @@ def _run_grouped_gemm_fp8_test(
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    # Turbo
-    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
+    # Turbo — MX_BLOCKWISE requires E8M0 scale_dtype (others default to FP32).
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        if block_size is None:
+            block_size = 32
+        config = Float8QuantConfig(
+            format=format, granularity=granularity, block_size=block_size, scale_dtype=ScaleDtype.E8M0
+        )
+    else:
+        config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
 
     if cuda_graph:
         # CUDA graph mode: warmup -> capture -> replay
@@ -478,6 +486,42 @@ def test_grouped_gemm_fp8_blockwise(
         block_size=block_size,
         backend=backend,
         auto_tune=auto_tune,
+    )
+
+
+# MX_BLOCKWISE turbo backend coverage mirrors tensorwise's full parameter
+# sweep (HYBRID format is intentionally excluded — the mxfp8 kernel itself
+# supports it, but turbo's hybrid path is out of scope for this PR).
+#
+# Constraints handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
+#   - trans_b=False: b is transposed to NT internally; wgrad output is
+#     transposed back to (G, K, N).
+#   - balance=False (per-group M_g not multiple of 128): a / grad_out are
+#     zero-padded along the M axis so wgrad sees 128-aligned per-group sizes.
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the turbo backend."""
+    N, K = NK
+    if get_device_compute_capability() != (9, 5):
+        pytest.skip("MXFP8 grouped GEMM requires gfx950 (MI350/MI355).")
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        backend=BackendType.TURBO,
+        auto_tune=False,
     )
 
 
