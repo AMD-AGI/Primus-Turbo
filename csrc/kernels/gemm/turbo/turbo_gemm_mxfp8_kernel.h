@@ -16,6 +16,8 @@ namespace turbo {
 using dtype::float32x4;
 
 // from device/register.cuh
+using device::clobber_agpr_one;
+using device::clobber_vgpr_one;
 using device::read_agpr;
 using device::reserve_agpr_range;
 using device::reserve_vgpr_range;
@@ -130,13 +132,7 @@ public:
         : lane_id(tid % WARP_SIZE), warp_id(tid / WARP_SIZE), warp_m(tid / WARP_SIZE / 2),
           warp_n(tid / WARP_SIZE % 2), m(m), n(n), k(k) {}
 
-    // TwoStep=true switches the data load to buffer_load_b128 → ds_write_b128,
-    // putting the LDS commit on lgkmcnt instead of vmcnt.  Used in grouped GEMM
-    // prologues to keep LDS commits off the same counter as compiler-emitted
-    // SGPR spill traffic — gfx950 vmcnt has no FIFO across scratch and
-    // buffer_load_lds, so a stale m0 from spill consume could otherwise leak
-    // into the LDS-direct write.  Main loop stays LDS-direct (LDG/MFMA overlap).
-    template <uint32_t H, bool TwoStep = false>
+    template <uint32_t H>
     __device__ __forceinline__ void
     load_a_gmem_to_smem_half_srd(const BufferSRD &a_srd, const uint32_t (&ldg_offsets)[2],
                                  ASmemSubtile (&a_smem_tile)[4], const uint32_t (&sts_offsets)[2],
@@ -147,19 +143,16 @@ public:
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 64 + warp_id * MFMA_SIZE_M) * k) + extra_soffset);
-            uint32_t addr0 = a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0];
-            uint32_t addr1 = a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1];
-            if constexpr (TwoStep) {
-                load_gmem_to_smem_srd_two_step<16>(a_srd, ldg_offsets[0], addr0, soff);
-                load_gmem_to_smem_srd_two_step<16>(a_srd, ldg_offsets[1], addr1, soff);
-            } else {
-                load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[0], addr0, soff);
-                load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[1], addr1, soff);
-            }
+            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[0],
+                                      a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0],
+                                      soff);
+            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[1],
+                                      a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1],
+                                      soff);
         }
     }
 
-    template <uint32_t H, bool TwoStep = false>
+    template <uint32_t H>
     __device__ __forceinline__ void
     load_b_gmem_to_smem_half_srd(const BufferSRD &b_srd, const uint32_t (&ldg_offsets)[2],
                                  BSmemSubtile (&b_smem_tile)[4], const uint32_t (&sts_offsets)[2],
@@ -170,19 +163,16 @@ public:
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 64 + warp_id * MFMA_SIZE_N) * k) + extra_soffset);
-            uint32_t addr0 = b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0];
-            uint32_t addr1 = b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1];
-            if constexpr (TwoStep) {
-                load_gmem_to_smem_srd_two_step<16>(b_srd, ldg_offsets[0], addr0, soff);
-                load_gmem_to_smem_srd_two_step<16>(b_srd, ldg_offsets[1], addr1, soff);
-            } else {
-                load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[0], addr0, soff);
-                load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[1], addr1, soff);
-            }
+            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[0],
+                                      b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0],
+                                      soff);
+            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[1],
+                                      b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1],
+                                      soff);
         }
     }
 
-    template <uint32_t H, bool TwoStep = false>
+    template <uint32_t H>
     __device__ __forceinline__ void load_a_scale_gmem_to_smem_half_srd(
         const BufferSRD &a_s_srd, const uint32_t scale_ldg_offset, AScaleSmemSubtile (&a_s_smem)[4],
         const uint32_t scale_sts_offset, const uint32_t scale_cols, int32_t extra_soffset = 0) {
@@ -194,16 +184,12 @@ public:
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 4 + warp_id) * (16 * scale_cols) * sizeof(uint32_t)) +
                 extra_soffset);
-            uint32_t addr = a_s_smem[i].u32_ptr() + smem_byte_offset;
-            if constexpr (TwoStep) {
-                load_gmem_to_smem_srd_two_step<4>(a_s_srd, gmem_byte_offset, addr, soff);
-            } else {
-                load_gmem_to_smem_srd<4>(a_s_srd, gmem_byte_offset, addr, soff);
-            }
+            load_gmem_to_smem_srd<4>(a_s_srd, gmem_byte_offset,
+                                     a_s_smem[i].u32_ptr() + smem_byte_offset, soff);
         }
     }
 
-    template <uint32_t H, bool TwoStep = false>
+    template <uint32_t H>
     __device__ __forceinline__ void load_b_scale_gmem_to_smem_half_srd(
         const BufferSRD &b_s_srd, const uint32_t scale_ldg_offset, BScaleSmemSubtile (&b_s_smem)[4],
         const uint32_t scale_sts_offset, const uint32_t scale_cols, int32_t extra_soffset = 0) {
@@ -215,12 +201,8 @@ public:
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 4 + warp_id) * (16 * scale_cols) * sizeof(uint32_t)) +
                 extra_soffset);
-            uint32_t addr = b_s_smem[i].u32_ptr() + smem_byte_offset;
-            if constexpr (TwoStep) {
-                load_gmem_to_smem_srd_two_step<4>(b_s_srd, gmem_byte_offset, addr, soff);
-            } else {
-                load_gmem_to_smem_srd<4>(b_s_srd, gmem_byte_offset, addr, soff);
-            }
+            load_gmem_to_smem_srd<4>(b_s_srd, gmem_byte_offset,
+                                     b_s_smem[i].u32_ptr() + smem_byte_offset, soff);
         }
     }
 
