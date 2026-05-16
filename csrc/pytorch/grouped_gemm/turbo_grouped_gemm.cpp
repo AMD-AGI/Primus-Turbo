@@ -110,7 +110,10 @@ static at::Tensor launch_mxfp8_grouped(at::Tensor &a, at::Tensor &a_scales, at::
                 params.c_group_offs_ptr =
                     c_group_offs.has_value()
                         ? reinterpret_cast<const int64_t *>(c_group_offs->data_ptr())
-                        : nullptr;
+                        : reinterpret_cast<const int64_t *>(group_offs.data_ptr());
+                params.c_padding_align_mask = c_group_offs.has_value()
+                    ? (int32_t) (primus_turbo::detail::MXFP8_PADDING_ALIGN_SIZE - 1)
+                    : 0;
                 params.group_num = (int32_t) group_num; params.total_m = (int32_t) total_m_in;
                 params.n = (int32_t) n; params.k = (int32_t) k;
                 params.workspace = workspace.data_ptr(); params.workspace_size = ws_size;

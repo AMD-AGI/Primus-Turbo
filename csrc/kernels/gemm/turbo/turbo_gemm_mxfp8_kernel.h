@@ -9,6 +9,7 @@
 #include "primus_turbo/device/register.cuh"
 #include <cassert>
 #include <cstdint>
+#include <type_traits>
 
 namespace primus_turbo {
 namespace turbo {
@@ -132,13 +133,21 @@ public:
         : lane_id(tid % WARP_SIZE), warp_id(tid / WARP_SIZE), warp_m(tid / WARP_SIZE / 2),
           warp_n(tid / WARP_SIZE % 2), m(m), n(n), k(k) {}
 
+    // SMEM-write helpers for buffer_load_lds.  m0 takes the per-warp BASE
+    // address (uniform).  Hardware auto-strides per lane by data size
+    // (16 B for b128, 4 B for b32), so any per-lane contribution in the
+    // ``sts_offsets`` / ``scale_sts_offset`` arguments must be zero — the
+    // call site keeps these uniform on purpose.  ``readfirstlane`` makes
+    // the warp-id arithmetic explicitly scalar so the entire LDS-base
+    // computation lives in SGPR (no VGPR intermediate to spill).
     template <uint32_t H>
     __device__ __forceinline__ void
     load_a_gmem_to_smem_half_srd(const BufferSRD &a_srd, const uint32_t (&ldg_offsets)[2],
                                  ASmemSubtile (&a_smem_tile)[4], const uint32_t (&sts_offsets)[2],
                                  int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
-        const uint32_t sts_warp_base = warp_id * MFMA_SIZE_M * MFMA_SIZE_K;
+        const uint32_t sts_warp_base =
+            __builtin_amdgcn_readfirstlane(warp_id * MFMA_SIZE_M * MFMA_SIZE_K);
 #pragma unroll
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
@@ -158,7 +167,8 @@ public:
                                  BSmemSubtile (&b_smem_tile)[4], const uint32_t (&sts_offsets)[2],
                                  int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
-        const uint32_t sts_warp_base = warp_id * MFMA_SIZE_M * MFMA_SIZE_K;
+        const uint32_t sts_warp_base =
+            __builtin_amdgcn_readfirstlane(warp_id * MFMA_SIZE_M * MFMA_SIZE_K);
 #pragma unroll
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
@@ -175,10 +185,12 @@ public:
     template <uint32_t H>
     __device__ __forceinline__ void load_a_scale_gmem_to_smem_half_srd(
         const BufferSRD &a_s_srd, const uint32_t scale_ldg_offset, AScaleSmemSubtile (&a_s_smem)[4],
-        const uint32_t scale_sts_offset, const uint32_t scale_cols, int32_t extra_soffset = 0) {
+        const uint32_t /*scale_sts_offset, hw auto-strides per lane*/,
+        const uint32_t scale_cols, int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
         const uint32_t gmem_byte_offset = scale_ldg_offset * sizeof(uint32_t);
-        const uint32_t smem_byte_offset = (warp_id * 64 + scale_sts_offset) * sizeof(uint32_t);
+        const uint32_t smem_byte_offset =
+            __builtin_amdgcn_readfirstlane(warp_id * 64 * sizeof(uint32_t));
 #pragma unroll
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
@@ -192,10 +204,12 @@ public:
     template <uint32_t H>
     __device__ __forceinline__ void load_b_scale_gmem_to_smem_half_srd(
         const BufferSRD &b_s_srd, const uint32_t scale_ldg_offset, BScaleSmemSubtile (&b_s_smem)[4],
-        const uint32_t scale_sts_offset, const uint32_t scale_cols, int32_t extra_soffset = 0) {
+        const uint32_t /*scale_sts_offset, hw auto-strides per lane*/,
+        const uint32_t scale_cols, int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
         const uint32_t gmem_byte_offset = scale_ldg_offset * sizeof(uint32_t);
-        const uint32_t smem_byte_offset = (warp_id * 64 + scale_sts_offset) * sizeof(uint32_t);
+        const uint32_t smem_byte_offset =
+            __builtin_amdgcn_readfirstlane(warp_id * 64 * sizeof(uint32_t));
 #pragma unroll
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
@@ -274,6 +288,21 @@ public:
         c_out[3][3]     = read_agpr<float32x4, B + 60>();
     }
 
+    // float -> CType conversion.  Default invokes CType's float ctor; for
+    // hip_bfloat16 the default ctor uses software round-to-nearest-even
+    // (branches over the SCC) which the compiler spills to lane storage.
+    // Specialize to a single-shot truncation: matches v_cvt_f32_bf16 truncate
+    // mode, sub-LSB difference vs round-to-even on the GEMM accumulator.
+    __device__ __forceinline__ static CType float_to_ctype(float f) {
+        if constexpr (std::is_same_v<CType, dtype::bfloat16>) {
+            CType r;
+            r.data = static_cast<uint16_t>(__builtin_bit_cast(uint32_t, f) >> 16);
+            return r;
+        } else {
+            return CType(f);
+        }
+    }
+
     __device__ __forceinline__ void store_c_subtile(CType *c_stg_base_ptr, const int32_t n,
                                                     float32x4 (&c_frags)[4][4],
                                                     uint32_t (&c_stg_offsets)[4],
@@ -289,7 +318,7 @@ public:
                     int32_t row = tr * MFMA_SIZE_M + lane_id / 16 * 4 + i;
                     int32_t col = tc * MFMA_SIZE_N + lane_id % 16;
                     if (row < valid_rows && col < valid_cols)
-                        c_stg_ptr[c_stg_offsets[i]] = CType(c_frags[tr][tc][i]);
+                        c_stg_ptr[c_stg_offsets[i]] = float_to_ctype(c_frags[tr][tc][i]);
                 }
             }
         }
@@ -305,11 +334,14 @@ public:
         }
     }
 
+    // Per-lane STS offsets for buffer_load_lds.  m0 holds the per-warp BASE;
+    // hardware strides per lane by 16 B (b128) automatically, so the only
+    // non-zero contribution we need is the half-subtile separator (1024 B).
+    // Keeping this uniform lets the LDS-base computation stay in SGPR,
+    // avoiding VGPR spill of the SMEM subtile addresses.
     __device__ __forceinline__ void compute_sts_offsets(uint32_t (&sts_offsets)[2]) {
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            sts_offsets[i] = i * 1024 + lane_id * 16;
-        }
+        sts_offsets[0] = 0;
+        sts_offsets[1] = 1024;
     }
 
     __device__ __forceinline__ void compute_lds_offsets(uint32_t (&lds_offsets)[2]) {

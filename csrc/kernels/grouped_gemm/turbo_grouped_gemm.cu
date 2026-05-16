@@ -129,7 +129,8 @@ void turbo_grouped_gemm_mxfp8_impl(const TurboGroupedGemmMXFP8Params<AType, BTyp
         <<<grid, block, 0, params.stream>>>(params.a_ptr, params.b_ptr, a_scale_preshuf,
                                             b_scale_preshuf, params.c_ptr, params.group_lens_ptr,
                                             params.a_group_offs_ptr, params.c_group_offs_ptr,
-                                            group_num, (uint32_t) n, (uint32_t) k, grid_m, grid_n);
+                                            params.c_padding_align_mask, group_num, (uint32_t) n,
+                                            (uint32_t) k, grid_m, grid_n);
 }
 
 // ── Explicit instantiations ──

@@ -119,10 +119,21 @@ template <typename AType, typename BType, typename CType> struct TurboGroupedGem
     const int64_t *group_lens_ptr = nullptr; // [group_num]
     const int64_t *a_group_offs_ptr = nullptr; // [group_num+1]
 
-    // Optional output-row offsets.  When non-null, the GEMM writes group g
-    // starting at ``c_group_offs_ptr[g]`` (unpadded layout), allowing
-    // padded inputs to be compressed away as part of the store.
-    const int64_t *c_group_offs_ptr = nullptr; // [group_num+1] or null
+    // Output-row offsets (always non-null; launcher must fall back to
+    // a_group_offs_ptr when the unpadded-input case is intended).  When
+    // distinct from a_group_offs_ptr, the GEMM writes group g starting at
+    // ``c_group_offs_ptr[g]`` (unpadded layout), allowing padded inputs to
+    // be compressed away as part of the store.
+    const int64_t *c_group_offs_ptr = nullptr; // [group_num+1]
+
+    // Bitmask used to round M_g up to the input-layout padding alignment
+    // for SRD bound calculation: ``M_g_in = (M_g + mask) & ~mask``.
+    //   127 → padded input (per-group regions aligned to 128 rows)
+    //     0 → unpadded input (M_g_in == M_g)
+    // Branchless on the kernel side; lets the outer kernel resolve
+    // c_group_offs_ptr unconditionally, removing a per-tile null-check
+    // and the duplicate i64 split-load chain that came with it.
+    int32_t c_padding_align_mask = 0;
 
     int32_t group_num = 0;
     int32_t total_m   = 0; // total INPUT rows (a's first dim)

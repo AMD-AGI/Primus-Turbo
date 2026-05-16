@@ -13,26 +13,22 @@ namespace primus_turbo {
 namespace turbo {
 
 // Per-tile compute body for the persistent kernel.  Computes one 256x256
-// output tile for (group_id, pid_m_local, pid_n_idx); SMEM and tile dispatch
-// are owned by the caller.
-//
-// ``a_group_offs_ptr[group_id]`` is the *input* row base (where group g's
-// real rows start in the per-group-padded input layout); ``M_g`` is the
-// number of *real* rows in group g (compute bound — padding rows are
-// never visited).  When ``c_group_offs_ptr`` is non-null the kernel
-// writes group g's output rows starting at ``c_group_offs_ptr[group_id]``
-// (the original/unpadded layout) instead of ``a_group_offs_ptr[group_id]``,
-// fusing the per-group-padding extract directly into the GEMM store.
+// output tile for (pid_m_local, pid_n_idx) within a group whose per-group
+// base pointers (a_grp_ptr/b_grp_ptr/.../c_grp_ptr) and per-group bounds
+// (M_g real for output, M_g_in padded for input/scale SRD) the caller
+// resolved in the outer kernel.  Inner takes only resolved pointers so
+// the per-group i64 offset arithmetic stays out of the inner kernel's
+// VGPR live set — keeps general-purpose VGPR (v[0:111]) under the cap
+// imposed by the pinned data/scale buffers (v[112:255]).
 template <typename GemmTile, typename AType, typename BType, typename CType>
 __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     GemmTile &tile, typename GemmTile::ASmemSubtile (*a_smem_tile)[4],
     typename GemmTile::BSmemSubtile (*b_smem_tile)[4],
     typename GemmTile::AScaleSmemSubtile (*a_s_smem_tile)[4],
-    typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *a_ptr,
-    const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr, CType *c_ptr,
-    const int64_t *a_group_offs_ptr, const int64_t *c_group_offs_ptr, const int32_t group_id,
-    const int32_t pid_m_local, const int32_t pid_n_idx, const int32_t M_g, const uint32_t n,
-    const uint32_t k) {
+    typename GemmTile::BScaleSmemSubtile (*b_s_smem_tile)[4], const AType *a_grp_ptr,
+    const BType *b_grp_ptr, const uint32_t *a_s_grp_ptr, const uint32_t *b_s_grp_ptr,
+    CType *c_grp_ptr, const int32_t pid_m_local, const int32_t pid_n_idx, const int32_t M_g,
+    const int32_t M_g_in, const uint32_t n, const uint32_t k) {
     const int32_t pid_m = pid_m_local * 256;
     const int32_t pid_n = pid_n_idx * 256;
     if (pid_m >= M_g || pid_n >= (int32_t) n)
@@ -44,52 +40,11 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     const uint32_t warp_n  = tile.warp_n;
 
     const uint32_t scale_cols = (k + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
-    // Force a scalar (s_load, lgkmcnt-tracked) load of a_group_offs_ptr[group_id]
-    // so it does not get vmcnt-tracked alongside data LDGs.
-    const uint32_t group_offset_lo = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
-    const uint32_t group_offset_hi = __builtin_amdgcn_readfirstlane(
-        static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
-    const int64_t group_offset =
-        (static_cast<int64_t>(group_offset_hi) << 32) | static_cast<int64_t>(group_offset_lo);
-    const int64_t m_global     = group_offset + (int64_t) pid_m;
-    const int64_t b_group_off  = (int64_t) group_id * (int64_t) n * (int64_t) k;
-    const int64_t bs_group_off = (int64_t) group_id * (int64_t) n * (int64_t) scale_cols;
 
-    // Output row base + per-group input bound.
-    //
-    // ``c_group_offs_ptr`` non-null marks the per-group-padded input
-    // layout: ``M_g`` is the *real* (orig) per-group length used for
-    // compute early-exit and output writes, while the input/scale SRD
-    // bounds need the *padded* length so the preshuffled-scale SRD
-    // covers complete 16-row blocks (else the linear byte bound cuts
-    // mid-block and OOB-zeros real scale data for the last few rows).
-    // The padded length is round-up to MXFP8_PADDING_ALIGN_SIZE (128).
-    int64_t c_m_global;
-    int32_t M_g_in;
-    if (c_group_offs_ptr != nullptr) {
-        const uint32_t c_offset_lo = __builtin_amdgcn_readfirstlane(
-            static_cast<uint32_t>(c_group_offs_ptr[group_id] & 0xffffffffULL));
-        const uint32_t c_offset_hi = __builtin_amdgcn_readfirstlane(
-            static_cast<uint32_t>(static_cast<uint64_t>(c_group_offs_ptr[group_id]) >> 32));
-        const int64_t c_group_offset =
-            (static_cast<int64_t>(c_offset_hi) << 32) | static_cast<int64_t>(c_offset_lo);
-        c_m_global = c_group_offset + (int64_t) pid_m;
-        // M_g_padded = ceil(M_g, MXFP8_PADDING_ALIGN_SIZE).  Quant kernel
-        // pads each per-group region to ALIGN-aligned, so this matches
-        // group_offs_padded[g+1] - group_offs_padded[g] without an extra
-        // scalar load.
-        M_g_in = (M_g + detail::MXFP8_PADDING_ALIGN_SIZE - 1) &
-                 ~(detail::MXFP8_PADDING_ALIGN_SIZE - 1);
-    } else {
-        c_m_global = m_global;
-        M_g_in     = M_g;
-    }
-
-    const AType    *a_base_ptr   = a_ptr + m_global * k;
-    const BType    *b_base_ptr   = b_ptr + b_group_off + (int64_t) pid_n * k;
-    const uint32_t *a_s_base_ptr = a_s_ptr + m_global * scale_cols;
-    const uint32_t *b_s_base_ptr = b_s_ptr + bs_group_off + (int64_t) pid_n * scale_cols;
+    const AType    *a_base_ptr   = a_grp_ptr + (int64_t) pid_m * k;
+    const BType    *b_base_ptr   = b_grp_ptr + (int64_t) pid_n * k;
+    const uint32_t *a_s_base_ptr = a_s_grp_ptr + (int64_t) pid_m * scale_cols;
+    const uint32_t *b_s_base_ptr = b_s_grp_ptr + (int64_t) pid_n * scale_cols;
 
     uint32_t ldg_offsets[2];
     tile.compute_ldg_offsets(ldg_offsets, k);
@@ -395,7 +350,7 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_compute_tile(
     __builtin_amdgcn_sched_barrier(0);
     uint32_t c_stg_offsets[4];
     tile.compute_stg_offsets(c_stg_offsets);
-    CType *c_stg_base_ptr = c_ptr + c_m_global * (int64_t) n + pid_n +
+    CType *c_stg_base_ptr = c_grp_ptr + (int64_t) pid_m * n + pid_n +
                             warp_id / 2 * 64 * (int64_t) n + warp_id % 2 * 64;
     const bool is_boundary_tile = (pid_m + 256 > M_g) || (pid_n + 256 > (int32_t) n);
 
@@ -439,8 +394,8 @@ __global__
 __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4wave_persistent_kernel(
     const AType *a_ptr, const BType *b_ptr, const uint32_t *a_s_ptr, const uint32_t *b_s_ptr,
     CType *c_ptr, const int64_t *group_lens_ptr, const int64_t *a_group_offs_ptr,
-    const int64_t *c_group_offs_ptr, const int32_t group_num, const uint32_t n, const uint32_t k,
-    const int32_t grid_m, const int32_t grid_n) {
+    const int64_t *c_group_offs_ptr, const int32_t c_padding_align_mask, const int32_t group_num,
+    const uint32_t n, const uint32_t k, const int32_t grid_m, const int32_t grid_n) {
 #if !defined(__gfx950__)
     assert(false && "turbo_grouped_gemm_mxfp8 persistent kernel requires gfx950");
     return;
@@ -467,8 +422,9 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4w
     GemmTile tile(threadIdx.x, 0, n, k);
     tile.reserve_pinned_regs();
 
-    const int32_t tiles_per_group = grid_m * grid_n;
-    const int32_t total_tiles     = tiles_per_group * group_num;
+    const uint32_t scale_cols     = (k + GemmTile::MX_BLOCK_SIZE - 1) / GemmTile::MX_BLOCK_SIZE;
+    const int32_t  tiles_per_group = grid_m * grid_n;
+    const int32_t  total_tiles     = tiles_per_group * group_num;
     for (int32_t tile_id = (int32_t) blockIdx.x; tile_id < total_tiles;
          tile_id += (int32_t) gridDim.x) {
         const int32_t group_id = tile_id / tiles_per_group;
@@ -482,9 +438,40 @@ __launch_bounds__(256, 1) void turbo_grouped_gemm_mxfp8_256x256x128_16x16x128_4w
             continue;
         }
 
+        // Resolve per-group base pointers here (split-load + recombine of
+        // group offsets) so compute_tile sees only resolved pointers — keeps
+        // the i64 group offset chain out of the inner kernel's VGPR set.
+        const uint32_t a_off_lo = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(a_group_offs_ptr[group_id] & 0xffffffffULL));
+        const uint32_t a_off_hi = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(static_cast<uint64_t>(a_group_offs_ptr[group_id]) >> 32));
+        const int64_t a_group_offset =
+            (static_cast<int64_t>(a_off_hi) << 32) | static_cast<int64_t>(a_off_lo);
+
+        const AType    *a_grp_ptr   = a_ptr + a_group_offset * (int64_t) k;
+        const BType    *b_grp_ptr   = b_ptr + (int64_t) group_id * (int64_t) n * (int64_t) k;
+        const uint32_t *a_s_grp_ptr = a_s_ptr + a_group_offset * (int64_t) scale_cols;
+        const uint32_t *b_s_grp_ptr =
+            b_s_ptr + (int64_t) group_id * (int64_t) n * (int64_t) scale_cols;
+
+        // Output base + per-group input bound, branchless.  Caller guarantees
+        // c_group_offs_ptr is always valid (falls back to a_group_offs_ptr
+        // when output and input share the same layout).  c_padding_align_mask
+        // = 127 marks per-group-padded input (M_g_in must round to 128 so the
+        // preshuffled-scale SRD covers complete 16-row blocks); = 0 leaves
+        // M_g_in == M_g for the unpadded case.
+        const uint32_t c_off_lo = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(c_group_offs_ptr[group_id] & 0xffffffffULL));
+        const uint32_t c_off_hi = __builtin_amdgcn_readfirstlane(
+            static_cast<uint32_t>(static_cast<uint64_t>(c_group_offs_ptr[group_id]) >> 32));
+        const int64_t c_group_offset =
+            (static_cast<int64_t>(c_off_hi) << 32) | static_cast<int64_t>(c_off_lo);
+        CType *c_grp_ptr = c_ptr + c_group_offset * (int64_t) n;
+        const int32_t M_g_in = (M_g + c_padding_align_mask) & ~c_padding_align_mask;
+
         turbo_grouped_gemm_mxfp8_compute_tile<GemmTile, AType, BType, CType>(
-            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_ptr, b_ptr, a_s_ptr,
-            b_s_ptr, c_ptr, a_group_offs_ptr, c_group_offs_ptr, group_id, pid_m, pid_n, M_g, n, k);
+            tile, a_smem_tile, b_smem_tile, a_s_smem_tile, b_s_smem_tile, a_grp_ptr, b_grp_ptr,
+            a_s_grp_ptr, b_s_grp_ptr, c_grp_ptr, pid_m, pid_n, M_g, M_g_in, n, k);
     }
 #endif
 }
