@@ -56,8 +56,6 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
 
     uint32_t ldg_offsets[2];
     tile.compute_ldg_offsets(ldg_offsets, total_m); // stride = total_m
-    uint32_t sts_offsets[2];
-    tile.compute_sts_offsets(sts_offsets);
     uint32_t lds_offsets[2];
     tile.compute_lds_offsets(lds_offsets);
     const uint32_t scale_ldg_offset = lane_id;
@@ -109,10 +107,10 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
     const BufferSRD b_srd_t1(rhs_base_ptr, b_t1_remaining);
 
     // ── Load tile 0 → smem[0], tile 1 → smem[1] ──
-    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[0]);
+    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[0]);
+    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[0]);
+    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[0]);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols_full);
     tile.template load_a_scale_gmem_to_smem_half_srd<1>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
@@ -123,13 +121,13 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
                                                         scale_sts_offset, scale_cols_full);
 
     tile.template load_a_gmem_to_smem_half_srd<0>(a_srd_t1, ldg_offsets, a_smem_tile[1],
-                                                  sts_offsets, DATA_STRIDE);
+                                                  DATA_STRIDE);
     tile.template load_a_gmem_to_smem_half_srd<1>(a_srd_t1, ldg_offsets, a_smem_tile[1],
-                                                  sts_offsets, DATA_STRIDE);
+                                                  DATA_STRIDE);
     tile.template load_b_gmem_to_smem_half_srd<0>(b_srd_t1, ldg_offsets, b_smem_tile[1],
-                                                  sts_offsets, DATA_STRIDE);
+                                                  DATA_STRIDE);
     tile.template load_b_gmem_to_smem_half_srd<1>(b_srd_t1, ldg_offsets, b_smem_tile[1],
-                                                  sts_offsets, DATA_STRIDE);
+                                                  DATA_STRIDE);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[1],
                                                         scale_sts_offset, scale_cols_full,
                                                         SCALE_STRIDE);
@@ -162,12 +160,12 @@ __device__ __forceinline__ void turbo_grouped_gemm_mxfp8_wgrad_compute_tile(
 
     if (k_iters > 2) {
         tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[cur],
-                                                      sts_offsets, 2 * DATA_STRIDE);
+                                                      2 * DATA_STRIDE);
         tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset,
                                                             a_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols_full, 2 * SCALE_STRIDE);
         tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[cur],
-                                                      sts_offsets, 2 * DATA_STRIDE);
+                                                      2 * DATA_STRIDE);
         tile.template load_b_scale_gmem_to_smem_half_srd<0>(b_s_srd, scale_ldg_offset,
                                                             b_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols_full, 2 * SCALE_STRIDE);

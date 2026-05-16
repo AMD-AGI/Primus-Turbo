@@ -135,16 +135,17 @@ public:
 
     // SMEM-write helpers for buffer_load_lds.  m0 takes the per-warp BASE
     // address (uniform).  Hardware auto-strides per lane by data size
-    // (16 B for b128, 4 B for b32), so any per-lane contribution in the
-    // ``sts_offsets`` / ``scale_sts_offset`` arguments must be zero — the
-    // call site keeps these uniform on purpose.  ``readfirstlane`` makes
-    // the warp-id arithmetic explicitly scalar so the entire LDS-base
-    // computation lives in SGPR (no VGPR intermediate to spill).
+    // (16 B for b128, 4 B for b32), so the m0 we feed must be uniform.
+    // The two ldg_offsets correspond to the two contiguous 1024-byte
+    // wave-writes that fill this warp's 2048-byte slice of the subtile;
+    // 1024 is the per-wave LDS write span for buffer_load_dwordx4
+    // (16 B/lane × 64 lanes).  ``readfirstlane`` keeps the warp-id
+    // arithmetic explicitly scalar so the entire LDS-base computation
+    // lives in SGPR (no VGPR intermediate to spill).
     template <uint32_t H>
     __device__ __forceinline__ void
     load_a_gmem_to_smem_half_srd(const BufferSRD &a_srd, const uint32_t (&ldg_offsets)[2],
-                                 ASmemSubtile (&a_smem_tile)[4], const uint32_t (&sts_offsets)[2],
-                                 int32_t extra_soffset = 0) {
+                                 ASmemSubtile (&a_smem_tile)[4], int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
         const uint32_t sts_warp_base =
             __builtin_amdgcn_readfirstlane(warp_id * MFMA_SIZE_M * MFMA_SIZE_K);
@@ -152,20 +153,16 @@ public:
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 64 + warp_id * MFMA_SIZE_M) * k) + extra_soffset);
-            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[0],
-                                      a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0],
-                                      soff);
-            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[1],
-                                      a_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1],
-                                      soff);
+            const uint32_t base = a_smem_tile[i].u32_ptr() + sts_warp_base;
+            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[0], base, soff);
+            load_gmem_to_smem_srd<16>(a_srd, ldg_offsets[1], base + 1024, soff);
         }
     }
 
     template <uint32_t H>
     __device__ __forceinline__ void
     load_b_gmem_to_smem_half_srd(const BufferSRD &b_srd, const uint32_t (&ldg_offsets)[2],
-                                 BSmemSubtile (&b_smem_tile)[4], const uint32_t (&sts_offsets)[2],
-                                 int32_t extra_soffset = 0) {
+                                 BSmemSubtile (&b_smem_tile)[4], int32_t extra_soffset = 0) {
         static_assert(H < 2, "H must be 0 or 1");
         const uint32_t sts_warp_base =
             __builtin_amdgcn_readfirstlane(warp_id * MFMA_SIZE_M * MFMA_SIZE_K);
@@ -173,12 +170,9 @@ public:
         for (uint32_t i = H * 2; i < H * 2 + 2; ++i) {
             int32_t soff = __builtin_amdgcn_readfirstlane(
                 (int32_t) ((i * 64 + warp_id * MFMA_SIZE_N) * k) + extra_soffset);
-            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[0],
-                                      b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[0],
-                                      soff);
-            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[1],
-                                      b_smem_tile[i].u32_ptr() + sts_warp_base + sts_offsets[1],
-                                      soff);
+            const uint32_t base = b_smem_tile[i].u32_ptr() + sts_warp_base;
+            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[0], base, soff);
+            load_gmem_to_smem_srd<16>(b_srd, ldg_offsets[1], base + 1024, soff);
         }
     }
 
@@ -332,16 +326,6 @@ public:
             uint32_t ldg_col = swizzle_col_(ldg_row, lane_id % 8);
             ldg_offsets[i]   = ldg_row * stride + ldg_col * 16;
         }
-    }
-
-    // Per-lane STS offsets for buffer_load_lds.  m0 holds the per-warp BASE;
-    // hardware strides per lane by 16 B (b128) automatically, so the only
-    // non-zero contribution we need is the half-subtile separator (1024 B).
-    // Keeping this uniform lets the LDS-base computation stay in SGPR,
-    // avoiding VGPR spill of the SMEM subtile addresses.
-    __device__ __forceinline__ void compute_sts_offsets(uint32_t (&sts_offsets)[2]) {
-        sts_offsets[0] = 0;
-        sts_offsets[1] = 1024;
     }
 
     __device__ __forceinline__ void compute_lds_offsets(uint32_t (&lds_offsets)[2]) {
@@ -567,8 +551,6 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
 
     uint32_t ldg_offsets[2];
     tile.compute_ldg_offsets(ldg_offsets, k);
-    uint32_t sts_offsets[2];
-    tile.compute_sts_offsets(sts_offsets);
     uint32_t lds_offsets[2];
     tile.compute_lds_offsets(lds_offsets);
     const uint32_t scale_ldg_offset = lane_id;
@@ -588,10 +570,10 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
     constexpr int32_t SCALE_STRIDE = GemmTile::SCALE_FRAG_SIZE * sizeof(uint32_t);
 
     // ── Load tile 0 → smem[0], tile 1 → smem[1] ──
-    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
-    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[0], sts_offsets);
+    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[0]);
+    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[0]);
+    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[0]);
+    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[0]);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols);
     tile.template load_a_scale_gmem_to_smem_half_srd<1>(a_s_srd, scale_ldg_offset, a_s_smem_tile[0],
@@ -601,14 +583,10 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
     tile.template load_b_scale_gmem_to_smem_half_srd<1>(b_s_srd, scale_ldg_offset, b_s_smem_tile[0],
                                                         scale_sts_offset, scale_cols);
 
-    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[1], sts_offsets,
-                                                  DATA_STRIDE);
-    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[1], sts_offsets,
-                                                  DATA_STRIDE);
-    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[1], sts_offsets,
-                                                  DATA_STRIDE);
-    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[1], sts_offsets,
-                                                  DATA_STRIDE);
+    tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[1], DATA_STRIDE);
+    tile.template load_a_gmem_to_smem_half_srd<1>(a_srd, ldg_offsets, a_smem_tile[1], DATA_STRIDE);
+    tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[1], DATA_STRIDE);
+    tile.template load_b_gmem_to_smem_half_srd<1>(b_srd, ldg_offsets, b_smem_tile[1], DATA_STRIDE);
     tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset, a_s_smem_tile[1],
                                                         scale_sts_offset, scale_cols, SCALE_STRIDE);
     tile.template load_a_scale_gmem_to_smem_half_srd<1>(a_s_srd, scale_ldg_offset, a_s_smem_tile[1],
@@ -638,12 +616,12 @@ __global__ __launch_bounds__(256, 1) void turbo_gemm_mxfp8_256x256x128_16x16x128
 
     if (k_iters > 2) {
         tile.template load_a_gmem_to_smem_half_srd<0>(a_srd, ldg_offsets, a_smem_tile[cur],
-                                                      sts_offsets, 2 * DATA_STRIDE);
+                                                      2 * DATA_STRIDE);
         tile.template load_a_scale_gmem_to_smem_half_srd<0>(a_s_srd, scale_ldg_offset,
                                                             a_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols, 2 * SCALE_STRIDE);
         tile.template load_b_gmem_to_smem_half_srd<0>(b_srd, ldg_offsets, b_smem_tile[cur],
-                                                      sts_offsets, 2 * DATA_STRIDE);
+                                                      2 * DATA_STRIDE);
         tile.template load_b_scale_gmem_to_smem_half_srd<0>(b_s_srd, scale_ldg_offset,
                                                             b_s_smem_tile[cur], scale_sts_offset,
                                                             scale_cols, 2 * SCALE_STRIDE);
