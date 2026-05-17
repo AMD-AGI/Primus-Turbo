@@ -196,6 +196,16 @@ def _is_gfx950() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    """Check if current GPU is gfx1250 (MI400 / MI450)."""
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return target is not None and target.backend == "hip" and target.arch == "gfx1250"
+    except (AttributeError, TypeError):
+        return False
+
+
 _KNOBS_SET = False
 
 

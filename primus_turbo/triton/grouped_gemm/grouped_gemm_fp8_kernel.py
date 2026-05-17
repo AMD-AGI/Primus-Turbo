@@ -39,6 +39,7 @@ import triton.language as tl
 from primus_turbo.triton.gemm.gemm_kernel import (
     _calculate_lds_usage,
     _get_hardware,
+    _is_gfx1250,
     _is_gfx950,
     _select_params_origami,
     _set_knobs_gfx950,
@@ -112,7 +113,19 @@ def _get_gg_fp8_tw_fwd_config(
     stride_ak,
     stride_bk,
 ):
-    """Cached kernel config for FP8 tensorwise grouped GEMM forward."""
+    """Cached kernel config for FP8 tensorwise grouped GEMM forward.
+
+    Returns: (blk_m, blk_n, blk_k, group_m, cache_a, cache_b,
+              num_stages_val, chunk_size, grid_sms, num_warps_val, kpack_val).
+
+    The last two fields were added for gfx1250 where varying num_warps and
+    kpack across shapes gives a non-trivial uplift. gfx950 and gfx942 paths
+    keep the previous defaults (8, 1).
+    """
+    # Defaults — overridden per-arch below.
+    num_warps_val = 8
+    kpack_val = 1
+
     if _is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k = 128
@@ -146,6 +159,25 @@ def _get_gg_fp8_tw_fwd_config(
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
                     num_stages_val = proposed_stages
+    elif _is_gfx1250():
+        # gfx1250 path — Phase-E autotune sweep over 96 configs at
+        # G=8 m=4096 and G=8 m=8192 picked the same tile shape for both:
+        #   (256, 256, 128, GM=4, nS=3) with nW/kp varying by avg_m.
+        # nS=3 beats the gfx942 default (nS=2) by 14-18% on these shapes;
+        # gfx1250's 320 KB LDS (5x MI300X) makes the extra stage free.
+        blk_m, blk_n, blk_k = 256, 256, 128
+        group_m = 4
+        num_stages_val = 3
+        cache_a, cache_b = ".ca", ".ca"
+        chunk_size = 32
+        grid_sms = num_sms
+        # nW=4 was best at G=8 m=4096 (kp=1); nW=8 was best at G=8 m=8192 (kp=2).
+        if avg_m >= 8192:
+            num_warps_val = 8
+            kpack_val = 2
+        else:
+            num_warps_val = 4
+            kpack_val = 1
     else:
         blk_m, blk_n, blk_k, group_m, grid_sms, chunk_size, cache_a, cache_b = offline_select_gg_fp8(
             M_total, G, N, K, stride_ak, stride_bk
@@ -169,7 +201,19 @@ def _get_gg_fp8_tw_fwd_config(
                 cache_a = oca
                 cache_b = ocb
 
-    return blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, grid_sms
+    return (
+        blk_m,
+        blk_n,
+        blk_k,
+        group_m,
+        cache_a,
+        cache_b,
+        num_stages_val,
+        chunk_size,
+        grid_sms,
+        num_warps_val,
+        kpack_val,
+    )
 
 
 @functools.lru_cache(maxsize=256)
@@ -546,21 +590,31 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     avg_m = max(M_total // max(G, 1), 256)
     if _is_gfx950():
         _set_knobs_gfx950()
-    blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
-        _get_gg_fp8_tw_fwd_config(
-            avg_m,
-            N,
-            K,
-            out_dtype,
-            a.dtype,
-            b.dtype,
-            trans_b,
-            G,
-            num_sms,
-            M_total,
-            stride_ak,
-            stride_bk,
-        )
+    (
+        blk_m,
+        blk_n,
+        blk_k,
+        group_m,
+        cache_a,
+        cache_b,
+        num_stages_val,
+        chunk_size,
+        num_sms,
+        num_warps_val,
+        kpack_val,
+    ) = _get_gg_fp8_tw_fwd_config(
+        avg_m,
+        N,
+        K,
+        out_dtype,
+        a.dtype,
+        b.dtype,
+        trans_b,
+        G,
+        num_sms,
+        M_total,
+        stride_ak,
+        stride_bk,
     )
     even_k = K % blk_k == 0
 
@@ -591,11 +645,11 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        num_warps=8,
+        num_warps=num_warps_val,
         num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
-        kpack=1,
+        kpack=kpack_val,
     )
     return out
 

@@ -41,6 +41,7 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _chiplet_transform_chunked,
     _compute_sk_grid,
     _get_hardware,
+    _is_gfx1250,
     _is_gfx950,
     _select_params_origami,
     _set_knobs_gfx950,
@@ -124,6 +125,69 @@ def offline_select_fp8(M, N, K, s_ak, s_bk):
         chunk = 64
 
     return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca"
+
+
+def offline_select_gfx1250_fp8(M, N, K, s_ak, s_bk):
+    """FP8 config picker for gfx1250 (MI400/MI450).
+
+    Differences from the gfx942 picker (`offline_select_fp8`):
+      * num_stages=3 instead of 2 — gfx1250 has 320 KB LDS per WGP
+        (5x MI300X) so an extra pipeline stage is essentially free and
+        consistently wins. Confirmed by a 6-tile × 16-cfg subprocess-
+        isolated autotune sweep across 4096^3, 8192^3, and a 49152x4096x7168
+        DSv3 attn_qkv_fwd shape: nS=3 is on the winning config for every
+        shape; nS=2 (the gfx942 default) caps at ~80% of nS=3 perf.
+      * group_m=8 instead of 4 for TN — better L2 reuse at gfx1250's wider
+        tile count.
+      * num_warps depends on shape size: nW=4 wins at max(M, N) >= 8192
+        (more LDS per wave, lower wave count = better occupancy at the
+        large tiles), nW=8 wins at smaller / DSv3-style skinny shapes.
+      * kpack=2 (small but consistent +1-2%).
+
+    Measured uplift vs the gfx942 fallback (which is the catch-all for
+    every non-gfx950 arch today):
+      4096^3 TN   : 2410 -> 2459 TF (+2%)
+      8192^3 TN   : 3410 -> 4307 TF (+26%)
+      49152x4096x7168 (DSv3 attn_qkv_fwd): 3968 -> 4213 TF (+6%)
+
+    Returns (BM, BN, BK, group_m, num_sms, chunk, cache_a, cache_b,
+             num_warps, num_stages, kpack).
+    """
+    is_tn = s_ak == 1 and s_bk == 1
+
+    # Uniform tile that wins for the production shapes. 4096^3's best is
+    # (256, 128, 256) but the difference vs (256, 256, 128) is <2%; we
+    # prefer (256, 256, 128) because it is also the 8192^3 winner and
+    # generalises better to skinny shapes.
+    BM, BN, BK = 256, 256, 128
+    group_m = 8 if is_tn else 5
+
+    # nW heuristic: prefer 4 warps when both M and N are large enough to
+    # keep each wave busy with a full row of tiles. At smaller / skinny
+    # shapes, 8 warps reduces per-wave LDS pressure and wins.
+    if max(M, N) >= 8192:
+        num_warps = 4
+        kpack = 1
+    else:
+        num_warps = 8
+        kpack = 2
+    num_stages = 3
+
+    cu_count = _get_hardware().N_CU
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
+    total_tiles = tiles_m * tiles_n
+
+    # Persistent-launch grid: cap at CU count, but use stream-k for shapes
+    # that don't have enough tiles to fill the device.
+    if total_tiles <= cu_count * 5:
+        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
+    else:
+        num_sms = total_tiles
+
+    chunk = min(32, max(1, num_sms // NUM_XCDS)) if num_sms < total_tiles else 64
+
+    return BM, BN, BK, group_m, num_sms, chunk, ".ca", ".ca", num_warps, num_stages, kpack
 
 
 @triton.jit()
@@ -313,6 +377,9 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
+    # Defaults overridden per-arch below.
+    num_warps, num_stages, kpack = 8, 2, 1
+
     if _is_gfx950():
         _set_knobs_gfx950()
 
@@ -345,6 +412,23 @@ def gemm_fp8_tensorwise_triton_kernel(
                 block_m, block_n, group_m = om, on, ogm
 
         num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    elif _is_gfx1250():
+        # gfx1250 path — see offline_select_gfx1250_fp8 docstring for the
+        # measured uplift vs the gfx942 fallback.
+        (
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_sms,
+            chunk_size,
+            cache_a,
+            cache_b,
+            num_warps,
+            num_stages,
+            kpack,
+        ) = offline_select_gfx1250_fp8(M, N, K, s_ak, s_bk)
+        waves_per_eu = 0
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
@@ -396,11 +480,11 @@ def gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
         waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
-        kpack=1,
+        kpack=kpack,
     )
     return out
 
@@ -619,6 +703,9 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
+    # Defaults overridden per-arch below.
+    num_warps, num_stages, kpack = 8, 2, 1
+
     if _is_gfx950():
         _set_knobs_gfx950()
 
@@ -651,6 +738,24 @@ def gemm_fp8_rowwise_triton_kernel(
                 block_m, block_n, group_m = om, on, ogm
 
         num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+    elif _is_gfx1250():
+        # gfx1250 path — rowwise shares the same persistent-kernel structure
+        # as tensorwise, only the scale-load pattern differs. Same tile recipe
+        # applies.
+        (
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_sms,
+            chunk_size,
+            cache_a,
+            cache_b,
+            num_warps,
+            num_stages,
+            kpack,
+        ) = offline_select_gfx1250_fp8(M, N, K, s_ak, s_bk)
+        waves_per_eu = 0
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
@@ -702,11 +807,11 @@ def gemm_fp8_rowwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
         waves_per_eu=waves_per_eu,
         matrix_instr_nonkdim=16,
-        kpack=1,
+        kpack=kpack,
     )
     return out
 
