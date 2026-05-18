@@ -14,6 +14,8 @@ from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     moe_dispatch_impl,
 )
 
+__all__ = ["moe_dispatch", "moe_combine"]
+
 
 class MoEDispatch(torch.autograd.Function):
 

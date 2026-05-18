@@ -11,6 +11,10 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
+    MXFP4_PADDING_ALIGN_SIZE,
+    MXFP8_BLOCK_SIZE,
+    MXFP8_PADDING_ALIGN_SIZE,
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
@@ -29,24 +33,24 @@ def ceil_div(a, b):
 
 
 def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, scale)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
 
 def quantize_fp8_rowwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale: Optional[torch.Tensor] = None
+    x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Row-Wise
     """
-    if not x.is_contiguous():
-        x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, scale)
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_rowwise(x, out_dtype, axis, None)
+
     return x_fp8, scale_inv
 
 
@@ -61,7 +65,10 @@ def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: i
     """
     DeQuantize FP8 Row-Wise
     """
-    raise NotImplementedError(f"Un-impl")
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
+
+    return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_rowwise(x, scale_inv, axis, out_dtype)
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
@@ -299,6 +306,8 @@ def quantize_mxfp8_impl(
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
 
+    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
         scaling_recipe_for_trans = (
@@ -316,6 +325,7 @@ def quantize_mxfp8_impl(
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
+            MXFP8_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe_for_trans.use_2d_block,
             scaling_recipe.shuffle_scale,
@@ -328,6 +338,7 @@ def quantize_mxfp8_impl(
             x,
             out_dtype,
             axis,
+            MXFP8_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
@@ -404,6 +415,8 @@ def quantize_mxfp4_impl(
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
 
+    assert block_size == MXFP4_BLOCK_SIZE, f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
     if with_trans:
         scaling_recipe_for_trans = (
@@ -421,6 +434,7 @@ def quantize_mxfp4_impl(
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
             out_dtype,
+            MXFP4_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,
@@ -437,6 +451,7 @@ def quantize_mxfp4_impl(
             x,
             out_dtype,
             axis,
+            MXFP4_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,

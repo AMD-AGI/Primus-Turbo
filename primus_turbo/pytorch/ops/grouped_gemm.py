@@ -8,12 +8,12 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
-    grouped_gemm_compute_offs,
-)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_impl,
     grouped_gemm_variable_k_impl,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    group_offs_from_lens,
 )
 
 __all__ = ["grouped_gemm"]
@@ -26,7 +26,7 @@ class GroupedGemmFunc(torch.autograd.Function):
         a: torch.Tensor,
         b: torch.Tensor,
         group_lens: torch.Tensor,  # [B,] int64
-        group_offs: torch.Tensor,  # [B+1,] int64
+        group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
         num_cu: int | None,
     ):
@@ -139,6 +139,6 @@ def grouped_gemm(
         torch.Size([96, 64])
     """
     if group_offs is None:
-        group_offs = grouped_gemm_compute_offs(group_lens)
+        group_offs = group_offs_from_lens(group_lens)
 
     return GroupedGemmFunc.apply(a, b, group_lens, group_offs, trans_b, num_cu)

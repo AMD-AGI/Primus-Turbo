@@ -14,6 +14,8 @@ from primus_turbo.triton.moe.multihot_to_indices import (
     _multihot_to_indices_kernel,
 )
 
+__all__ = ["indices_to_multihot"]
+
 
 class IndicesToMultihot(torch.autograd.Function):
     """Convert moe topk indices to multihot representation.

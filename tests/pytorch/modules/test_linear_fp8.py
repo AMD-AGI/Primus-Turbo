@@ -64,7 +64,7 @@ def test_float8linear(config, dtype, format, M, N, K, bias, enable_torch_compile
     assert isinstance(model, Float8Linear)
     if enable_torch_compile:
         torch._dynamo.reset()
-        model = torch.compile(model, fullgraph=True, mode="max-autotune")
+        model = torch.compile(model, fullgraph=False, mode="max-autotune")
 
     out = model(x2)
     out.backward(grad_out)

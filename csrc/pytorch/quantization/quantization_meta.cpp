@@ -37,11 +37,20 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
     return output;
 }
 
+at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                       const int64_t axis, const at::ScalarType dest_dtype) {
+    const int64_t valid_axis = (axis >= 0) ? axis : input.dim() + axis;
+    PRIMUS_TURBO_CHECK(valid_axis >= 0 && valid_axis < input.dim());
+    at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    return output;
+}
+
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
-    const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,
-    const bool colwise_use_sr, const bool colwise_use_rht, const bool shuffle_rowwise_scale,
-    const bool shuffle_rowwise, const bool shuffle_colwise_scale, const bool shuffle_colwise) {
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
+    const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
+    const bool shuffle_colwise) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
@@ -53,12 +62,17 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
+    // Guard the public op argument against zero/negative values (would otherwise
+    // divide-by-zero in cdiv below) and lock it to the expected MXFP4 constant.
+    PRIMUS_TURBO_CHECK(padding_align_size == MXFP4_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", MXFP4_PADDING_ALIGN_SIZE,
+                       " for MXFP4. But got padding_align_size=", padding_align_size);
 
     const int64_t M = input.size(0);
     const int64_t N = input.size(1);
 
-    const int64_t M_pad = cdiv(M, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
-    const int64_t N_pad = cdiv(N, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+    const int64_t M_pad = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad = cdiv(N, padding_align_size) * padding_align_size;
 
     PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by 32");
 
@@ -114,9 +128,10 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
 }
 
 std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const bool use_2d_block,
-                                            const bool use_sr, const bool use_rht,
-                                            const bool shuffle_scale, const bool shuffle_out) {
+                                            const int64_t axis, const int64_t padding_align_size,
+                                            const bool use_2d_block, const bool use_sr,
+                                            const bool use_rht, const bool shuffle_scale,
+                                            const bool shuffle_out) {
     using namespace primus_turbo::detail;
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
@@ -126,12 +141,17 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    // Guard the public op argument against zero/negative values (would otherwise
+    // divide-by-zero in cdiv below) and lock it to the expected MXFP4 constant.
+    PRIMUS_TURBO_CHECK(padding_align_size == MXFP4_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", MXFP4_PADDING_ALIGN_SIZE,
+                       " for MXFP4. But got padding_align_size=", padding_align_size);
 
     const bool    is_rowwise = (axis == 1);
     const int64_t M          = input.size(0);
     const int64_t N          = input.size(1);
-    const int64_t M_pad      = cdiv(M, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
-    const int64_t N_pad      = cdiv(N, MXFP4_PADDING_ALIGN_SIZE) * MXFP4_PADDING_ALIGN_SIZE;
+    const int64_t M_pad      = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad      = cdiv(N, padding_align_size) * padding_align_size;
 
     int64_t scale_outer = is_rowwise ? M : N;
     int64_t scale_N = is_rowwise ? cdiv(N_pad, MXFP4_BLOCK_SIZE) : cdiv(M_pad, MXFP4_BLOCK_SIZE);
@@ -157,9 +177,10 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
 
 std::vector<at::Tensor>
 quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                         const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
-                         const bool shuffle_rowwise_scale, const bool shuffle_rowwise,
-                         const bool shuffle_colwise_scale, const bool shuffle_colwise) {
+                         const int64_t padding_align_size, const bool rowwise_use_2d_block,
+                         const bool colwise_use_2d_block, const bool shuffle_rowwise_scale,
+                         const bool shuffle_rowwise, const bool shuffle_colwise_scale,
+                         const bool shuffle_colwise) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
@@ -172,12 +193,17 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
                        "Output must be Float8_e4m3fn or Float8_e5m2");
+    // Guard the public op argument against zero/negative values (would otherwise
+    // divide-by-zero in cdiv below) and lock it to the expected MXFP8 constant.
+    PRIMUS_TURBO_CHECK(padding_align_size == MXFP8_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", MXFP8_PADDING_ALIGN_SIZE,
+                       " for MXFP8. But got padding_align_size=", padding_align_size);
 
     const int64_t M = input.size(0);
     const int64_t N = input.size(1);
 
-    const int64_t M_pad = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
-    const int64_t N_pad = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+    const int64_t M_pad = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad = cdiv(N, padding_align_size) * padding_align_size;
 
     PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
 
@@ -227,8 +253,9 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
 }
 
 std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const bool use_2d_block,
-                                            const bool shuffle_scale, const bool shuffle_out) {
+                                            const int64_t axis, const int64_t padding_align_size,
+                                            const bool use_2d_block, const bool shuffle_scale,
+                                            const bool shuffle_out) {
     using namespace primus_turbo::detail;
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
@@ -240,12 +267,17 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
                        "Output must be Float8_e4m3fn or Float8_e5m2");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    // Guard the public op argument against zero/negative values (would otherwise
+    // divide-by-zero in cdiv below) and lock it to the expected MXFP8 constant.
+    PRIMUS_TURBO_CHECK(padding_align_size == MXFP8_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", MXFP8_PADDING_ALIGN_SIZE,
+                       " for MXFP8. But got padding_align_size=", padding_align_size);
 
     const bool    is_rowwise = (axis == 1);
     const int64_t M          = input.size(0);
     const int64_t N          = input.size(1);
-    const int64_t M_pad      = cdiv(M, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
-    const int64_t N_pad      = cdiv(N, MXFP8_PADDING_ALIGN_SIZE) * MXFP8_PADDING_ALIGN_SIZE;
+    const int64_t M_pad      = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad      = cdiv(N, padding_align_size) * padding_align_size;
 
     PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
 

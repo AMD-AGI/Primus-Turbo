@@ -632,11 +632,6 @@ def grouped_gemm_fp8_variable_k_impl(
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
-def grouped_gemm_compute_offs(group_lens: torch.Tensor) -> torch.Tensor:
-    group_offs = torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(group_lens)
-    return group_offs
-
-
 @grouped_gemm_fp8_impl.register_fake
 def grouped_gemm_fp8_impl_meta(
     a: torch.Tensor,
