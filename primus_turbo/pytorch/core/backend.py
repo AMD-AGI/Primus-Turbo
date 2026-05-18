@@ -202,9 +202,9 @@ class GlobalBackendManager:
     def get_ep_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
         """Get the EP backend configuration. Returns None if not set.
 
-        If the environment variable contains a value that is not a valid ``BackendType``
-        (e.g. a custom EP backend name like ``UCCL_EP``), this method returns ``None`` so
-        the EP-specific backend registry in ``moe_dispatch_combine_impl`` can handle it.
+        If the environment variable contains a value that is not a valid ``BackendType``,
+        this method returns ``None`` so the EP-specific backend registry in
+        ``moe_dispatch_combine_impl`` can handle it.
         """
         if cls._ep_backend is not None:
             return cls._ep_backend[precision]

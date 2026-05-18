@@ -21,6 +21,7 @@ from primus_turbo.common.constants import ENV_MORI_NUM_QP_PER_PE
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.kernels.moe.moe_utils import detect_group_topology
 
+from ._config import EPBufferConfig
 from .base import _apply_env_with_nccl_fallback
 
 # ==========================================================================
@@ -70,7 +71,7 @@ def compute_expert_token_info_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     HAS_TOTAL_RECV: tl.constexpr,
 ):
-    """Count per-expert received tokens and emit a DeepEP-format topk_idx. will be removed in the future."""
+    """Count per-expert received tokens and emit a DeepEP-format topk_idx."""
     pid = tl.program_id(0)
     row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     col_offs = tl.arange(0, BLOCK_SIZE_K)
@@ -208,9 +209,7 @@ class _MoriDispatchCfg:
     rdma_block_num: int
 
 
-def _get_mori_dispatch_configs(
-    num_max_dispatch_tokens_per_rank: int,
-) -> Dict[_MoriEpMode, _MoriDispatchCfg]:
+def _get_mori_dispatch_configs() -> Dict[_MoriEpMode, _MoriDispatchCfg]:
     """Return per-mode Mori kernel launch configs."""
     import mori.ops
 
@@ -244,8 +243,6 @@ def _align_mori_hip_with_torch() -> None:
         import ctypes
 
         import mori.jit.hip_driver as _hd
-
-        # ensture must have _hip
     except ImportError:
         return
 
@@ -261,7 +258,7 @@ def _align_mori_hip_with_torch() -> None:
 
 
 def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
-    """Register ``group`` with the Mori SHMEM runtime."""
+    """Register ``group`` with the Mori SHMEM runtime (idempotent)."""
     import mori.shmem
 
     assert dist.is_initialized(), "torch.distributed must be initialized before Mori SHMEM init."
@@ -269,30 +266,28 @@ def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
     try:
         torch._C._distributed_c10d._register_process_group(_MORI_SHMEM_PG_NAME, group)
     except Exception as e:  # noqa: BLE001 - mori binds raise a mix of exception types.
-        if "already registered" in str(e):
-            logger.info(
-                f"[MORI init] Process group already registered under "
-                f"'{_MORI_SHMEM_PG_NAME}'; reusing existing SHMEM binding "
-                f"({e}).",
-                rank=0,
-            )
-        else:
+        if "already registered" not in str(e):
             raise
-    else:
-        mori.shmem.shmem_torch_process_group_init(_MORI_SHMEM_PG_NAME)
+        logger.info(
+            f"[MORI init] Process group already registered under "
+            f"'{_MORI_SHMEM_PG_NAME}'; reusing existing SHMEM binding "
+            f"({e}).",
+            rank=0,
+        )
+        return
+    mori.shmem.shmem_torch_process_group_init(_MORI_SHMEM_PG_NAME)
 
 
 def _resolve_mori_dispatch_cfg(
     group: dist.ProcessGroup,
-    num_max_dispatch_tokens_per_rank: int,
-    config: Optional["EPBufferConfig"] = None,
+    config: Optional[EPBufferConfig] = None,
 ) -> _MoriDispatchCfg:
     """Resolve Mori kernel launch cfg: topology default, overridden by
     ``config.num_sms`` (``block_num``) and ``config.dispatch_config`` (full).
     """
     _, num_nodes = detect_group_topology(group)
     mode = _MoriEpMode.INTRA_NODE if num_nodes <= 1 else _MoriEpMode.INTER_NODE
-    base = _get_mori_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
+    base = _get_mori_dispatch_configs()[mode]
 
     kernel_type = base.kernel_type
     warp_num_per_block = base.warp_num_per_block
@@ -472,7 +467,7 @@ class MoriEPBackend:
         num_topk: int,
         seqlen: int,
         fp8_dispatch: bool,
-        config: "EPBufferConfig",
+        config: EPBufferConfig,
     ) -> None:
         """Register Mori SHMEM and build/rebuild the Mori op as needed.
 
@@ -496,7 +491,7 @@ class MoriEPBackend:
 
         num_local_experts = num_experts // group.size()
         params_dtype = self._derive_params_dtype(fp8_dispatch)
-        kernel_cfg = _resolve_mori_dispatch_cfg(group, seqlen, config)
+        kernel_cfg = _resolve_mori_dispatch_cfg(group, config)
 
         # Rebuild on shape-signature or kernel-cfg change (_build_mori_op is cached).
         needs_rebuild = (
@@ -539,24 +534,28 @@ class MoriEPBackend:
         handle: Optional[tuple] = None,
         topk_idx: Optional[torch.Tensor] = None,
         token_weights: Optional[torch.Tensor] = None,
-        num_experts: Optional[int] = None,
-        async_finish: bool = False,  # noqa: ARG002 - API compat only.
-        allocate_on_comm_stream: bool = False,  # noqa: ARG002 - API compat only.
-        num_worst_tokens: int = 0,  # noqa: ARG002 - API compat only.
-        config: Optional[Any] = None,  # noqa: ARG002 - API compat only.
+        num_experts: Optional[int] = None,  # noqa: ARG002 - sized via init_buffer.
+        async_finish: bool = False,  # noqa: ARG002 - Mori runs sync on caller stream.
+        allocate_on_comm_stream: bool = False,  # noqa: ARG002 - Mori runs sync on caller stream.
+        num_worst_tokens: int = 0,
+        config: Optional[Any] = None,  # noqa: ARG002 - kernel cfg picked at init_buffer.
     ):
         assert self.is_initialized(), "Backend is not initialized"
-        scale = None
-        non_blocking = num_worst_tokens > 0
+
+        # ``num_worst_tokens > 0`` signals a graph-friendly caller: keep
+        # tokens_per_expert as a CUDA tensor to skip the D2H ``.tolist()`` sync.
+        keep_tokens_per_expert_on_device = num_worst_tokens > 0
 
         if handle is None:
             assert topk_idx is not None
             topk_idx_i32 = topk_idx.to(torch.int32)
         else:
-            assert topk_idx is None, token_weights is None
+            assert topk_idx is None and token_weights is None
             (topk_idx_i32, token_weights, _) = handle
 
-        recv_x, recv_topk_weights, recv_x_scales, recv_topk_idx, total_recv = self._op.dispatch(
+        # ``scale`` is the FP8 scales arg; Mori path is BF16-only for now.
+        scale = None
+        recv_x, recv_topk_weights, _recv_x_scales, recv_topk_idx, total_recv = self._op.dispatch(
             x,
             token_weights,
             scale,
@@ -569,11 +568,11 @@ class MoriEPBackend:
             expert_base=expert_base,
             total_recv=total_recv,
         )
-        if not non_blocking:
+        if not keep_tokens_per_expert_on_device:
             num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
 
-        # hold token_weights for dispatch weights in backward
-        # it's a workaround to aviod illegal access when token_weights is None
+        # Hold ``token_weights`` in the handle so backward can reach it even
+        # when the original caller passed ``None`` (avoids illegal access).
         handle = (topk_idx_i32, token_weights, recv_topk_idx)
         return (recv_x, deepep_like_recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert, handle)
 
@@ -613,7 +612,12 @@ class MoriEPBackend:
         raise NotImplementedError("tune_configs is not implemented for MoriEPBackend")
 
     def release_buffer(self) -> None:
-        """Drop the fast-path op reference and SHMEM binding state."""
+        """Drop the fast-path op reference and shape signature.
+
+        ``self._group`` is intentionally kept: Mori's SHMEM binding to the
+        process group is global / non-rebindable once registered, so the next
+        ``init_buffer`` on the same group can skip re-registration.
+        """
         self._op = None
         self._hidden_size = 0
         self._num_local_experts = 0

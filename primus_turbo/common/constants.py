@@ -24,7 +24,7 @@ ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 # Default: None (auto-select)
 ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
-# MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
+# MoE dispatch/combine EP backend (TURBO, DEEP_EP, MORI, UCCL).
 # Default: TURBO
 ENV_EP_BACKEND = "PRIMUS_TURBO_EP_BACKEND"
 

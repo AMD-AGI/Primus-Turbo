@@ -402,7 +402,11 @@ if __name__ == "__main__":
 
     # Entry points and Install Requires
     entry_points = {}
-    install_requires = [f"uccl @ git+https://github.com/uccl-project/uccl.git@{UCCL_COMMIT}"]
+    install_requires = []
+    # UCCL is an optional EP backend
+    extras_require = {
+        "uccl": [f"uccl @ git+https://github.com/uccl-project/uccl.git@{UCCL_COMMIT}"],
+    }
 
     # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
     if torch_ext is not None and not is_package_installed("amd-aiter"):
@@ -429,4 +433,5 @@ if __name__ == "__main__":
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,
         install_requires=install_requires,
+        extras_require=extras_require,
     )

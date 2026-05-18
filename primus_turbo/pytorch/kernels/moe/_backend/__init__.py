@@ -3,13 +3,9 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""EP backend implementations split out from ``moe_dispatch_combine_impl``.
+"""EP backend implementations; submodules touch optional deps only when imported."""
 
-Each concrete backend lives in its own module so that optional dependencies
-are only touched when the backend is actually imported / used. The public
-entry points are re-exported here for convenience.
-"""
-
+from ._config import EPBufferConfig
 from .base import (
     EPBackend,
     _broadcast_from_rank0_float,
@@ -24,6 +20,7 @@ from .uccl_ep import UCCLEPBackend
 
 __all__ = [
     "EPBackend",
+    "EPBufferConfig",
     "_DeepEPLikeBackend",
     "_DeepEPLikeKernelName",
     "_broadcast_from_rank0_float",

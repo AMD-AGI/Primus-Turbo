@@ -191,14 +191,11 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
     def test_autotune(self):
         self._bind_device()
-        envs = {k: v for k, v in os.environ.items()}
-        envs.pop("PRIMUS_TURBO_EP_BACKEND", None)
-        envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
-        with patch.dict(os.environ, envs, clear=True):
-            _run_dispatch_combine(
-                self.rank,
-                self.pg,
-            )
+        # ``patch.dict`` snapshots ``os.environ`` and restores it on exit, so
+        # the inner ``pop`` is reverted automatically.
+        with patch.dict(os.environ, {"PRIMUS_TURBO_AUTO_TUNE": "1"}):
+            os.environ.pop("PRIMUS_TURBO_EP_BACKEND", None)
+            _run_dispatch_combine(self.rank, self.pg)
 
     # ------------------------------------------------------------------
     # Autotune without an explicit backend override: actually sweep configs
@@ -220,11 +217,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         )
 
         self._bind_device()
-        envs = {k: v for k, v in os.environ.items()}
-        envs.pop("PRIMUS_TURBO_EP_BACKEND", None)
-        envs["PRIMUS_TURBO_AUTO_TUNE"] = "1"
-
-        with patch.dict(os.environ, envs, clear=True):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_AUTO_TUNE": "1"}):
+            os.environ.pop("PRIMUS_TURBO_EP_BACKEND", None)
             MoEDispatchCombineAutoTuner.clear()
 
             # First run triggers autotune and registers the handle mapping.
@@ -232,7 +226,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
             first = MoEDispatchCombineAutoTuner.current()
             assert first is not None, "autotune should have populated a result"
             assert (
-                len(MoEDispatchCombineAutoTuner._handle_cache) > 0
+                MoEDispatchCombineAutoTuner.handle_cache_size() > 0
             ), "moe_dispatch should have bound the tuned result to at least one handle"
 
             # Second run hits the shape cache (no extra measurements) and

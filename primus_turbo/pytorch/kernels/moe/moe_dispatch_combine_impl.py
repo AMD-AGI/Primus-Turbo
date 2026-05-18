@@ -16,29 +16,23 @@ import torch.distributed as dist
 
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.core.backend import (
+    BackendType,
     GlobalBackendManager,
     PrecisionType,
     TuneCache,
+)
+from primus_turbo.pytorch.kernels.moe._backend import (
+    DeepEPBackend,
+    EPBackend,
+    EPBufferConfig,
+    MoriEPBackend,
+    TurboEPBackend,
+    UCCLEPBackend,
 )
 
 # =========================================================================
 # Buffer configuration
 # =========================================================================
-
-
-@dataclass
-class EPBufferConfig:
-    """Configuration for EP communication buffer initialization.
-
-    Attributes:
-        num_sms: Number of SMs used by high-throughput kernels.
-        dispatch_config: Dispatch config; ``None`` means use backend default.
-        combine_config: Combine config; ``None`` means use backend default.
-    """
-
-    num_sms: int = 64
-    dispatch_config: Any = None
-    combine_config: Any = None
 
 
 # Per-backend default buffer configuration. Keys must match the names used
@@ -54,7 +48,7 @@ _DEFAULT_BUFFER_CONFIG_PER_BACKEND: Dict[str, EPBufferConfig] = {
         dispatch_config=None,
         combine_config=None,
     ),
-    "UCCL_EP": EPBufferConfig(
+    "UCCL": EPBufferConfig(
         num_sms=64,
         dispatch_config=None,
         combine_config=None,
@@ -84,9 +78,15 @@ def set_buffer_global_config(
     autotune_config: Optional[tuple] = None,
     backend: Optional[str] = None,
 ) -> None:
-    """Set the EP buffer config for a backend, or for all backends when
-    ``backend`` is ``None`` (backward-compat). Accepts SM count and an
-    optional ``(dispatch_config, combine_config)`` tuple.
+    """Set the EP buffer config.
+
+    Args:
+        num_use_cu: SM count for high-throughput kernels.
+        autotune_config: Optional ``(dispatch_config, combine_config)`` from
+            offline tuning.
+        backend: Target backend name (matches ``_BACKEND_REGISTRY``). When
+            ``None``, the same config is broadcast to every registered
+            backend (backward-compat with the pre-multi-backend API).
     """
     dispatch_cfg, combine_cfg = autotune_config if autotune_config is not None else (None, None)
     new_cfg = EPBufferConfig(
@@ -101,22 +101,6 @@ def set_buffer_global_config(
     else:
         _buffer_config_per_backend[backend] = new_cfg
 
-
-# =========================================================================
-# Backend imports
-#
-# Imported after ``EPBufferConfig`` is defined so ``_backend`` submodules can
-# resolve it via deferred (in-function) imports without a circular-import
-# deadlock.
-# =========================================================================
-
-from primus_turbo.pytorch.kernels.moe._backend import (  # noqa: E402
-    DeepEPBackend,
-    EPBackend,
-    MoriEPBackend,
-    TurboEPBackend,
-    UCCLEPBackend,
-)
 
 # =========================================================================
 # Backend registry
@@ -139,7 +123,7 @@ def clear_backend_instances():
 
 
 def register_ep_backend(name: str, cls: Type[EPBackend]) -> None:
-    """Register a new EP backend class (e.g. ``UCCL_EP``)."""
+    """Register a new EP backend class (e.g. ``UCCL``)."""
     _BACKEND_REGISTRY[name] = cls
 
 
@@ -211,7 +195,12 @@ class MoEDispatchCombineAutoTuner:
     # Shape-based cache shared across layers with identical input shape.
     _cache: TuneCache = TuneCache(capacity=1024)
 
-    _HANDLE_CACHE_MAX: int = 1024
+    # ``handle -> tune result`` LRU. Handles are tuples (not weakref-able), so
+    # we keep a strong ref alongside the result and rely on ``stored_handle
+    # is handle`` to defend against ``id()`` reuse. Cap is small because a
+    # dispatch/combine pair turns over quickly; the LRU evicts stale entries
+    # before they pile up. ``clear()`` empties this cache as well.
+    _HANDLE_CACHE_MAX: int = 128
     _handle_cache: "OrderedDict[int, Tuple[Any, EPAutoTuneResult]]" = OrderedDict()
 
     # Fallback for calls made before any handle mapping is registered.
@@ -267,7 +256,11 @@ class MoEDispatchCombineAutoTuner:
 
     @classmethod
     def lookup_handle(cls, handle: Any) -> Optional[EPAutoTuneResult]:
-        """Return the result bound to ``handle``, or ``None`` if unknown."""
+        """Return the result bound to ``handle``, or ``None`` if unknown.
+
+        ``stored_handle is handle`` guards against ``id()`` collisions after
+        the original handle was GC'd and its id was reused by a new one.
+        """
         if handle is None:
             return None
         entry = cls._handle_cache.get(id(handle))
@@ -279,6 +272,23 @@ class MoEDispatchCombineAutoTuner:
             return None
         cls._handle_cache.move_to_end(id(handle))
         return res
+
+    @classmethod
+    def discard_handle(cls, handle: Any) -> None:
+        """Drop the cache entry for ``handle`` once the caller is done with it.
+
+        Call this after the paired combine (and any backward that reuses the
+        handle) so long-running jobs don't pin tune-result tensors via the
+        LRU.
+        """
+        if handle is None:
+            return
+        cls._handle_cache.pop(id(handle), None)
+
+    @classmethod
+    def handle_cache_size(cls) -> int:
+        """Return current entry count in the handle cache (tests / metrics)."""
+        return len(cls._handle_cache)
 
     @classmethod
     def _candidate_backend_names(cls) -> List[str]:
@@ -474,11 +484,22 @@ class MoEDispatchCombineAutoTuner:
 
 _DEFAULT_BACKEND_NAME = "TURBO"
 
+# Explicit ``BackendType -> registry name`` map so renaming the enum doesn't
+# silently break EP backend selection. Keys must mirror ``_BACKEND_REGISTRY``.
+_BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
+    BackendType.TURBO: "TURBO",
+    BackendType.DEEP_EP: "DEEP_EP",
+    BackendType.MORI: "MORI",
+    BackendType.UCCL: "UCCL",
+}
+
 
 def _get_backend_name() -> str:
     """Return the user-selected backend name, or ``TURBO`` by default."""
     bt = GlobalBackendManager.get_ep_backend(PrecisionType.BF16_FP16_FP32)
-    return bt.name if bt is not None else _DEFAULT_BACKEND_NAME
+    if bt is None:
+        return _DEFAULT_BACKEND_NAME
+    return _BACKEND_TYPE_TO_NAME.get(bt, _DEFAULT_BACKEND_NAME)
 
 
 # =========================================================================

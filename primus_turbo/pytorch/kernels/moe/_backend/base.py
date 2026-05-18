@@ -3,9 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""Shared backend infrastructure: ``EPBackend`` Protocol, DeepEP-style base
-class, and a couple of broadcast helpers used by the tuning loop.
-"""
+"""``EPBackend`` Protocol + ``_DeepEPLikeBackend`` shared base for DeepEP-style backends."""
 
 import os
 from dataclasses import dataclass
@@ -29,6 +27,8 @@ from primus_turbo.pytorch.kernels.moe.moe_utils import (
     detect_group_topology,
     inplace_unique,
 )
+
+from ._config import EPBufferConfig
 
 # =========================================================================
 # EPBackend Protocol
@@ -258,7 +258,7 @@ class _DeepEPLikeBackend:
         num_topk: int,  # noqa: ARG002 - DeepEP sizes by hidden_bytes only.
         seqlen: int,  # noqa: ARG002 - DeepEP sizes by hidden_bytes only.
         fp8_dispatch: bool,
-        config: "EPBufferConfig",
+        config: EPBufferConfig,
     ) -> None:
         # Best-effort NCCL-fallback for backend-specific network env vars.
         # No-op for backends without RDMA env settings; idempotent across
@@ -461,10 +461,6 @@ class _DeepEPLikeBackend:
             ``(best_dispatch_config, best_combine_config, best_dispatch_s, best_combine_s)``
             with times identical on all ranks (rank 0's pick, broadcast).
         """
-        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
-            EPBufferConfig,
-        )
-
         mod = self._get_module()
         BufferClass = mod.Buffer
         BufferClass.set_num_sms(num_sms)
@@ -508,7 +504,10 @@ class _DeepEPLikeBackend:
                     "``topk_weights`` are both required."
                 )
 
-        # Buffer sizes (ported from uccl-ep).
+        # Per-(EP size) NVL/RDMA buffer sizes (chunks). Defaults come from
+        # the upstream UCCL-EP tuning sweep and are known-good for DeepEP /
+        # Turbo on the same shapes; revisit if a new EP topology under-fills
+        # the sweep range.
         rdma_buffer_size, nvl_buffer_size = 512, (720 if ep_size in (144, 160) else 512)
         if ep_size == 24:
             nvl_buffer_size = 540
