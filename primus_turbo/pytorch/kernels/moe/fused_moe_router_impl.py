@@ -10,7 +10,7 @@ import torch
 import triton
 from torch.library import triton_op, wrap_triton
 
-from primus_turbo.triton.moe.fused_router_kernel import (
+from primus_turbo.triton.moe.moe_utils import (
     fused_scaling_group_sum_routing_backward_kernel,
     fused_scaling_group_sum_routing_kernel,
 )

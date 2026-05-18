@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from primus_turbo.triton.moe.tokens_per_expert_to_mask_kernel import (
+from primus_turbo.triton.moe.moe_utils import (
     tokens_per_expert_to_mask_kernel,
 )
 

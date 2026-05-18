@@ -95,7 +95,7 @@ def _test_permutation_mask_map(
     turbo_permute_fwd_input.requires_grad_(True)
     turbo_permute_bwd_input = pytorch_permute_bwd_input.detach()
 
-    turbo_permute_output, _, row_id_map, tokens_per_experts = turbo.ops.token_permute(
+    turbo_permute_output, _, row_id_map, tokens_per_experts = turbo.ops.moe_permute(
         turbo_permute_fwd_input,
         routing_map=routing_map,
         num_out_tokens=num_out_tokens,
@@ -112,7 +112,7 @@ def _test_permutation_mask_map(
     turbo_unpermute_fwd_input.requires_grad_(True)
     turbo_unpermute_bwd_input = pytorch_unpermute_bwd_input.detach()
 
-    turbo_unpermute_output = turbo.ops.token_unpermute(
+    turbo_unpermute_output = turbo.ops.moe_unpermute(
         turbo_unpermute_fwd_input,
         row_id_map,
         turbo_probs,
