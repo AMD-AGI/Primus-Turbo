@@ -39,3 +39,7 @@ ENV_ATTN_V3_ATOMIC_FP32 = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
 # When set to "1", EP dispatch/combine kernels run on the caller's current CUDA stream.
 # Default: "0"
 ENV_EP_FORCE_CURRENT_STREAM = "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"
+
+# Number of RDMA queue pairs per PE used by the Mori EP backend.
+# Default: "2"
+ENV_MORI_NUM_QP_PER_PE = "PRIMUS_TURBO_MORI_NUM_QP_PER_PE"
