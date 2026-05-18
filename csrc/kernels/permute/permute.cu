@@ -3,10 +3,12 @@
 // See LICENSE for license information.
 
 #include "permute.cuh"
+#include "primus_turbo/arch.h"
 #include "primus_turbo/common.h"
 #include "primus_turbo/permute.h"
 
 #include <hip/hip_runtime.h>
+#include <hipcub/block/block_reduce.hpp>
 #include <hipcub/block/block_scan.hpp>
 
 #include <algorithm>
@@ -40,22 +42,18 @@ fill_s_tile_from_topk_idx(int *s_tile, const topk_idx_t *topk_idx, int num_topk,
                           int E, int kNumItemsPerTile, int num_dispatched_tokens) {
     const int thread_id = static_cast<int>(threadIdx.x);
 
-    for (int i = thread_id; i < kNumItemsPerTile * E; i += kNumThreads) {
+    for (int i = thread_id; i < kNumItemsPerTile * E; i += kNumThreads)
         s_tile[i] = 0;
-    }
     __syncthreads();
 
     for (int i = thread_id; i < kNumItemsPerTile * num_topk; i += kNumThreads) {
-        const int t      = i / num_topk;
-        const int k      = i % num_topk;
+        const int t = i / num_topk, k = i % num_topk;
         const int gtoken = tile_offset + t;
-        if (gtoken >= num_dispatched_tokens) {
+        if (gtoken >= num_dispatched_tokens)
             continue;
-        }
         const int e = topk_idx[static_cast<int64_t>(gtoken) * num_topk + k];
-        if (e >= 0 && e < E) {
+        if (e >= 0 && e < E)
             s_tile[t * E + e] = 1;
-        }
     }
 }
 
@@ -75,23 +73,37 @@ __device__ __forceinline__ void fill_s_tile(int *s_tile, const expert_map_t *exp
 
 template <int kNumThreads, typename expert_map_t>
 __launch_bounds__(kNumThreads, 1) __global__
-    void permute_preprocessing_kernel(const expert_map_t *expert_map,
-                                      const int *num_dispatched_tokens_ptr, int num_experts,
-                                      int num_topk, int pad_multiple, int32_t *tokens_per_expert,
-                                      int *row_id_map, int *overflow_flag,
-                                      int64_t num_permuted_tokens, int probs_topk_stride,
-                                      TempStorageLayout layout) {
-    uint64_t *tile_state = layout.tile_state;
-    using BlockScan      = hipcub::BlockScan<int32_t, kNumThreads>;
-    __shared__ typename BlockScan::TempStorage scan_temp;
-    extern __shared__ int                      dyn_shmem[];
+    void permute_preprocessing_kernel(const expert_map_t *expert_map, int max_num_dispatched_tokens,
+                                      int *num_dispatched_tokens_out, int num_experts, int num_topk,
+                                      int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
+                                      int *overflow_flag, int64_t num_permuted_tokens,
+                                      int probs_topk_stride, TempStorageLayout layout) {
+    using BlockScan   = hipcub::BlockScan<int32_t, kNumThreads>;
+    using BlockReduce = hipcub::BlockReduce<int32_t, kNumThreads>;
+    // Scan and reduce are never live at the same time; alias to save LDS.
+    union SharedTemp {
+        typename BlockScan::TempStorage   scan;
+        typename BlockReduce::TempStorage reduce;
+    };
+    __shared__ SharedTemp shared_temp;
+
+    // Per-block real-row count accumulator, plus the grid-wide total
+    // published by the col-E lookback (consumed by the last block).
+    __shared__ int s_block_dispatched;
+    __shared__ int s_total_dispatched;
+
+    extern __shared__ int dyn_shmem[];
 
     constexpr int kNumItemsPerTile = kNumThreads;
 
-    const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto block_id  = static_cast<int>(blockIdx.x);
-    const auto grid_size = static_cast<int>(gridDim.x);
-    const int  E         = num_experts;
+    const int thread_id         = static_cast<int>(threadIdx.x);
+    const int block_id          = static_cast<int>(blockIdx.x);
+    const int grid_size         = static_cast<int>(gridDim.x);
+    const int E                 = num_experts;
+    const int row_stride        = 2 * E + 1;
+    const int tile_state_stride = E + 1;
+
+    uint64_t *tile_state = layout.tile_state;
 
     // Per-block scratch: LDS, or a slice of the global vsmem fallback.
     int *temp_storage  = get_temp_storage<int>(dyn_shmem, layout.vsmem);
@@ -101,101 +113,98 @@ __launch_bounds__(kNumThreads, 1) __global__
     int *s_tpe_prefix  = s_excl_prefix + E;
     int *s_num_padded  = s_tpe_prefix + E;
 
-    const int num_dispatched_tokens = *num_dispatched_tokens_ptr;
-    const int num_token_tiles = (num_dispatched_tokens + kNumItemsPerTile - 1) / kNumItemsPerTile;
+    // Worst-case row range: padding rows trip the [0, E) guard in
+    // fill_s_tile_* and end up with all-zero masks (n_routed == 0).
+    const int N               = max_num_dispatched_tokens;
+    const int num_token_tiles = (N + kNumItemsPerTile - 1) / kNumItemsPerTile;
     const int tiles_per_block = (num_token_tiles + grid_size - 1) / grid_size;
     const int tile_begin      = block_id * tiles_per_block;
     const int tile_end        = min(tile_begin + tiles_per_block, num_token_tiles);
-    // single_tile blocks keep s_tile in LDS through Phase 6 and skip the
-    // row_id_map spill / read-back.
+    // Single-tile blocks keep s_tile in LDS through the compact step and
+    // skip the row_id_map spill / read-back.
     const bool single_tile = (tile_end - tile_begin) == 1;
 
     const int npt = num_permuted_tokens < 0 ? INT_MAX : static_cast<int>(num_permuted_tokens);
 
-    if (block_id == 0 and thread_id == 0)
+    // ----- init -----
+    if (block_id == 0 && thread_id == 0)
         *overflow_flag = 0;
-
+    if (thread_id == 0) {
+        s_block_dispatched = 0;
+        s_total_dispatched = 0;
+    }
     for (int i = thread_id; i < E; i += kNumThreads)
         s_acc[i] = 0;
-
     __syncthreads();
 
-    // row_id_map row layout: [dst_rows | aux | n_routed], length 2*E + 1.
-    // ``aux[i]`` is the column at which ``probs[gtoken, ?]`` should be read for
-    // the i-th routed slot. With multihot probs ([T, E]) ``aux = expert_idx``;
-    // with topk-aligned probs ([T, num_topk]) — signalled by
-    // ``probs_topk_stride > 0`` and only valid for the topk_idx code path —
-    // ``aux = topk_position`` (i.e. ``k`` such that ``topk_idx[gtoken, k] == e``).
-    const int row_stride = 2 * E + 1;
-
-    // Phase 1-2: per-tile InclusiveSum, accumulate into s_acc; multi-tile
-    // blocks spill the partial scan to row_id_map for Phase 6 to read back.
+    // ----- per-tile: count real rows, then per-expert exclusive scan -----
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
         const int tile_offset = tile_idx * kNumItemsPerTile;
 
         fill_s_tile<kNumThreads, expert_map_t>(s_tile, expert_map, tile_offset, E, num_topk,
-                                               kNumItemsPerTile, num_dispatched_tokens);
+                                               kNumItemsPerTile, N);
         __syncthreads();
 
+        // Count real rows while s_tile still holds the raw 0/1 mask.
+        {
+            int       local_real = 0;
+            const int t = thread_id, gtoken = tile_offset + t;
+            if (gtoken < N) {
+                for (int e = 0; e < E; ++e) {
+                    if (s_tile[t * E + e]) {
+                        local_real = 1;
+                        break;
+                    }
+                }
+            }
+            const int tile_total = BlockReduce(shared_temp.reduce).Sum(local_real);
+            if (thread_id == 0)
+                s_block_dispatched += tile_total;
+            __syncthreads(); // reduce → scan union re-use.
+        }
+
+        // Per-expert ExclusiveSum: rewrite mask to slot index (1-based).
         for (int e = 0; e < E; ++e) {
             const int local = s_tile[thread_id * E + e];
             int       excl_block, scan_total;
-            BlockScan(scan_temp).ExclusiveSum(local, excl_block, scan_total);
+            BlockScan(shared_temp.scan).ExclusiveSum(local, excl_block, scan_total);
             const int prev            = s_acc[e];
             s_tile[thread_id * E + e] = (local == 1) ? (excl_block + prev + 1) : 0;
-            if (thread_id == 0) {
+            if (thread_id == 0)
                 s_acc[e] += scan_total;
-            }
             __syncthreads();
         }
 
-        if (not single_tile) {
+        if (!single_tile) {
             for (int i = thread_id; i < kNumItemsPerTile * E; i += kNumThreads) {
                 const int gtoken = tile_offset + i / E;
                 const int e      = i % E;
-                if (gtoken < num_dispatched_tokens) {
+                if (gtoken < N)
                     row_id_map[static_cast<int64_t>(gtoken) * row_stride + e] = s_tile[i];
-                }
             }
             __syncthreads();
         }
     }
 
-    // Phase 3: per-expert decoupled lookback. Thread e publishes PARTIAL,
-    // walks predecessors backward until it hits a COMPLETE, then re-publishes
-    // the inclusive prefix as COMPLETE.
+    // ----- decoupled lookback over (E + 1) cols -----
     if (thread_id < E) {
-        const int      e         = thread_id;
-        const int32_t  agg       = s_acc[e];
-        const uint32_t init_flag = (block_id == 0) ? TileState::kComplete : TileState::kPartial;
-        store_tile_state(&tile_state[static_cast<int64_t>(block_id) * E + e], init_flag, agg);
-
-        int32_t accum = 0;
-        for (int b = block_id - 1; b >= 0; --b) {
-            TileState s;
-            do {
-                s = load_tile_state(&tile_state[static_cast<int64_t>(b) * E + e]);
-            } while (s.flag == TileState::kInvalid);
-            accum += s.value;
-            if (s.flag == TileState::kComplete) {
-                break;
-            }
-        }
-        s_excl_prefix[e] = accum;
-
-        if (block_id != 0) {
-            store_tile_state(&tile_state[static_cast<int64_t>(block_id) * E + e],
-                             TileState::kComplete, accum + agg);
-        }
+        s_excl_prefix[thread_id] = decoupled_lookback(tile_state, block_id, tile_state_stride,
+                                                      thread_id, s_acc[thread_id]);
+    } else if (thread_id == E) {
+        const int32_t agg  = s_block_dispatched;
+        const int32_t excl = decoupled_lookback(tile_state, block_id, tile_state_stride, E, agg);
+        // Inclusive prefix at this block; the last block's value is the
+        // grid-wide dispatched-row count.
+        s_total_dispatched = excl + agg;
     }
     __syncthreads();
 
-    // Phase 5: read full-grid inclusive prefix from the LAST block's slot,
-    // then ExclusiveSum across experts to get padded base offsets.
+    // ----- pull grid totals from the last block, build padded base offsets -----
     if (thread_id < E) {
         TileState s;
         do {
-            s = load_tile_state(&tile_state[static_cast<int64_t>(grid_size - 1) * E + thread_id]);
+            s = load_tile_state(
+                &tile_state[static_cast<int64_t>(grid_size - 1) * tile_state_stride + thread_id]);
         } while (s.flag != TileState::kComplete);
         const int v      = s.value;
         s_acc[thread_id] = v;
@@ -208,20 +217,17 @@ __launch_bounds__(kNumThreads, 1) __global__
     {
         const int v = (thread_id < E) ? s_tpe_prefix[thread_id] : 0;
         int       excl;
-        BlockScan(scan_temp).ExclusiveSum(v, excl);
-        if (thread_id < E) {
+        BlockScan(shared_temp.scan).ExclusiveSum(v, excl);
+        if (thread_id < E)
             s_tpe_prefix[thread_id] = excl;
-        }
     }
     __syncthreads();
 
-    // Phase 6: patch + compact each token's row into the dense
-    // [dst | idx | n] layout. One thread per token; in-place write is WAR
-    // safe because n <= e during the scan.
+    // ----- compact: rewrite per-token slot indices into the dense row layout -----
+    // One thread per token; in-place write is WAR-safe because n <= e.
     auto patch = [&](int local, int expert) -> int {
-        if (local == 0) {
+        if (local == 0)
             return 0;
-        }
         const int new_val = local + s_excl_prefix[expert] + s_tpe_prefix[expert];
         if (new_val > npt) {
             *overflow_flag = 1;
@@ -235,28 +241,26 @@ __launch_bounds__(kNumThreads, 1) __global__
         int           n        = 0;
         for (int e = 0; e < E; ++e) {
             const int s = patch(read_slot(e), e);
-            if (s != 0) {
-                row_id_map[row_base + n] = s;
-                int aux_val              = e;
-                // Topk-aligned probs mode: replace expert_idx with the column
-                // ``k`` inside ``topk_idx[gtoken, :]`` whose entry equals ``e``.
-                // Lookup is O(num_topk); guarded out of the routing_map path at
-                // compile time since ``expert_map_t == bool`` carries no topk.
-                if constexpr (!std::is_same_v<expert_map_t, bool>) {
-                    if (probs_topk_stride > 0) {
-                        for (int k = 0; k < num_topk; ++k) {
-                            const int ek = static_cast<int>(
-                                expert_map[static_cast<int64_t>(gtoken) * num_topk + k]);
-                            if (ek == e) {
-                                aux_val = k;
-                                break;
-                            }
+            if (s == 0)
+                continue;
+            row_id_map[row_base + n] = s;
+            int aux_val              = e;
+            // Topk-aligned probs: aux is the k such that topk_idx[gtoken,k]==e.
+            // O(num_topk); compiled out for the routing_map (bool) path.
+            if constexpr (!std::is_same_v<expert_map_t, bool>) {
+                if (probs_topk_stride > 0) {
+                    for (int k = 0; k < num_topk; ++k) {
+                        const int ek = static_cast<int>(
+                            expert_map[static_cast<int64_t>(gtoken) * num_topk + k]);
+                        if (ek == e) {
+                            aux_val = k;
+                            break;
                         }
                     }
                 }
-                row_id_map[row_base + E + n] = aux_val;
-                ++n;
             }
+            row_id_map[row_base + E + n] = aux_val;
+            ++n;
         }
         row_id_map[row_base + 2 * E] = n;
     };
@@ -265,7 +269,7 @@ __launch_bounds__(kNumThreads, 1) __global__
         const int tile_offset = tile_begin * kNumItemsPerTile;
         for (int t = thread_id; t < kNumItemsPerTile; t += kNumThreads) {
             const int gtoken = tile_offset + t;
-            if (gtoken >= num_dispatched_tokens)
+            if (gtoken >= N)
                 continue;
             compact_row(gtoken, [&](int e) { return s_tile[t * E + e]; });
         }
@@ -274,7 +278,7 @@ __launch_bounds__(kNumThreads, 1) __global__
             const int tile_offset = tile_idx * kNumItemsPerTile;
             for (int t = thread_id; t < kNumItemsPerTile; t += kNumThreads) {
                 const int gtoken = tile_offset + t;
-                if (gtoken >= num_dispatched_tokens)
+                if (gtoken >= N)
                     continue;
                 const int64_t row_base = static_cast<int64_t>(gtoken) * row_stride;
                 compact_row(gtoken, [&](int e) { return row_id_map[row_base + e]; });
@@ -282,11 +286,10 @@ __launch_bounds__(kNumThreads, 1) __global__
         }
     }
 
-    // Phase 7: padding rows live at row_id_map[N + i, :] and use NEGATIVE
-    // 1-indexed offsets, signalling the data-movement kernel to write zeros.
+    // ----- block 0: emit padding rows (negative 1-indexed offsets) -----
     if (block_id == 0) {
         for (int i = thread_id; i < pad_multiple; i += kNumThreads) {
-            const int64_t row_base = (static_cast<int64_t>(num_dispatched_tokens) + i) * row_stride;
+            const int64_t row_base = (static_cast<int64_t>(N) + i) * row_stride;
             int           n        = 0;
             for (int e = 0; e < E; ++e) {
                 if (i >= s_num_padded[e])
@@ -304,9 +307,7 @@ __launch_bounds__(kNumThreads, 1) __global__
         }
     }
 
-    // Phase 8: the LAST block finalises tokens_per_expert and zeroes the
-    // PREVIOUS launch's tile_state buffer (double-buffer maintenance).
-    // Stream serialisation makes the clear visible to the next launch.
+    // ----- last block: finalise tokens_per_expert, publish total, clear prev -----
     if (block_id == grid_size - 1) {
         if (thread_id < E) {
             const int tokens_for_expert = s_acc[thread_id] + s_num_padded[thread_id];
@@ -314,36 +315,14 @@ __launch_bounds__(kNumThreads, 1) __global__
             tokens_per_expert[thread_id] =
                 (overflow < 0) ? tokens_for_expert : max(0, tokens_for_expert - overflow);
         }
-
+        if (thread_id == 0)
+            *num_dispatched_tokens_out = s_total_dispatched;
         for (int i = thread_id; i < layout.num_memset_int64; i += kNumThreads)
             layout.prev_tile_state[i] = 0;
     }
 }
 
-// Process-lifetime cache for device caps and per-shmem-bytes occupancy.
-struct DeviceCaps {
-    int dev                 = -1;
-    int num_cu              = 0;
-    int max_shmem_per_block = 0;
-};
-
-inline const DeviceCaps &cached_device_caps() {
-    static thread_local DeviceCaps caps;
-    int                            dev = 0;
-    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&dev));
-    if (caps.dev != dev) {
-        PRIMUS_TURBO_CHECK_HIP(
-            hipDeviceGetAttribute(&caps.num_cu, hipDeviceAttributeMultiprocessorCount, dev));
-        PRIMUS_TURBO_CHECK_HIP(hipDeviceGetAttribute(
-            &caps.max_shmem_per_block, hipDeviceAttributeMaxSharedMemoryPerBlock, dev));
-        caps.dev = dev;
-    }
-    return caps;
-}
-
-// Per-stream double-buffered tile_state + optional vsmem region. Realloc on
-// shape change; toggle active buffer each launch so Phase 8's clear of the
-// other half is visible to the next launch via stream ordering.
+// Per-stream double-buffered tile_state + optional vsmem region.
 static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
                                                         size_t vsmem_bytes_per_block,
                                                         size_t grid_size, hipStream_t stream) {
@@ -361,9 +340,8 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
 
     if (c.ptr == nullptr || c.total < total_bytes || c.buf_bytes != buf_bytes) {
         if (c.total < total_bytes) {
-            if (c.ptr != nullptr) {
+            if (c.ptr != nullptr)
                 PRIMUS_TURBO_CHECK_HIP(hipFreeAsync(c.ptr, stream));
-            }
             PRIMUS_TURBO_CHECK_HIP(hipMallocAsync(&c.ptr, total_bytes, stream));
             c.total = total_bytes;
         }
@@ -373,73 +351,77 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
     }
 
     char *const base = static_cast<char *>(c.ptr);
-    const int   cur  = c.active_idx;
-    const int   nxt  = 1 - cur;
+    const int   cur = c.active_idx, nxt = 1 - cur;
 
     TempStorageLayout layout{};
     layout.tile_state       = reinterpret_cast<uint64_t *>(base + cur * buf_bytes);
     layout.prev_tile_state  = reinterpret_cast<uint64_t *>(base + nxt * buf_bytes);
     layout.num_memset_int64 = buf_bytes / sizeof(uint64_t);
-    // gmem_ptr MUST be nullptr when vsmem isn't requested; the kernel's
-    // get_temp_storage() keys off it to choose between LDS and global mem.
+    // gmem_ptr == nullptr signals the kernel to use LDS instead of vsmem.
     layout.vsmem.gmem_ptr        = (vsmem_bytes_per_block > 0) ? (base + 2 * buf_bytes) : nullptr;
     layout.vsmem.bytes_per_block = vsmem_bytes;
 
     c.active_idx = nxt;
-
     return layout;
 }
 
-// Shared host-side launch path for both routing_map and topk_idx inputs. The
-// only thing that varies is the `expert_map_t` type tag and the `num_topk`
-// parameter (ignored in routing_map mode); everything else (scratch sizing,
-// lookback layout, grid size) is identical.
+// Host launcher shared by routing_map (bool) and topk_idx (int/int64) inputs.
 template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
-                                int *num_dispatched_tokens_ptr, int num_local_experts,
+                                int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
                                 int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
                                 int64_t num_permuted_tokens, int probs_topk_stride,
                                 hipStream_t stream) {
     constexpr int kNumThreads = 512;
     PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
-    PRIMUS_TURBO_CHECK(num_local_experts <= kNumThreads,
-                       "num_local_experts must fit in a single block");
+    // Strict ``<``: the kernel uses thread ``E`` for the dispatched-count
+    // lookback column. Production MoE configs sit well below this bound.
+    PRIMUS_TURBO_CHECK(num_local_experts < kNumThreads, "num_local_experts must be < kNumThreads");
     PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0, "max_num_dispatched_tokens must be >= 0");
 
     if (max_num_dispatched_tokens == 0) {
+        // Nothing to do; satisfy output contract via memset.
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
             tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert), stream));
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(overflow_flag, 0, sizeof(*overflow_flag), stream));
+        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(num_dispatched_tokens_out, 0,
+                                              sizeof(*num_dispatched_tokens_out), stream));
         return;
     }
 
-    const auto &caps            = cached_device_caps();
-    const int   per_tile        = kNumThreads;
-    const int   num_token_tiles = (max_num_dispatched_tokens + per_tile - 1) / per_tile;
+    int device_id = 0;
+    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
+    const int num_cu              = get_multi_processor_count(device_id);
+    const int max_shmem_per_block = get_max_shmem_per_block(device_id);
 
-    const auto required_temp_storage_bytes = (static_cast<size_t>(kNumThreads) * num_local_experts +
-                                              4 * static_cast<size_t>(num_local_experts)) *
-                                             sizeof(int);
-    // Spill per-block scratch to global memory (vsmem) when LDS is too small.
-    const bool use_vsmem =
-        required_temp_storage_bytes > static_cast<size_t>(caps.max_shmem_per_block);
+    const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
+
+    // Per-block scratch: s_tile (T * E) + s_acc + s_excl_prefix +
+    // s_tpe_prefix + s_num_padded.
+    const size_t required_temp_storage_bytes =
+        (static_cast<size_t>(kNumThreads) * num_local_experts +
+         4 * static_cast<size_t>(num_local_experts)) *
+        sizeof(int);
+    // Spill to global memory (vsmem) when LDS is too small for E.
+    const bool   use_vsmem = required_temp_storage_bytes > static_cast<size_t>(max_shmem_per_block);
     const size_t kernel_lds_bytes       = use_vsmem ? 0 : required_temp_storage_bytes;
     const size_t vshmem_bytes_per_block = use_vsmem ? required_temp_storage_bytes : 0;
 
-    const int grid_size = std::min(num_token_tiles, caps.num_cu);
+    const int grid_size = std::min(num_token_tiles, num_cu);
 
-    const auto lookback_workspace_bytes =
-        static_cast<size_t>(grid_size) * num_local_experts * sizeof(uint64_t);
+    // (E + 1) lookback cols per block: [0, E) per-expert, E dispatched-count.
+    const size_t lookback_workspace_bytes =
+        static_cast<size_t>(grid_size) * (num_local_experts + 1) * sizeof(uint64_t);
 
     auto tmp_layout = get_temp_storage_layout(lookback_workspace_bytes, vshmem_bytes_per_block,
                                               grid_size, stream);
 
     permute_preprocessing_kernel<kNumThreads, expert_map_t>
         <<<grid_size, kNumThreads, kernel_lds_bytes, stream>>>(
-            expert_map, num_dispatched_tokens_ptr, num_local_experts, num_topk, pad_multiple,
-            tokens_per_expert, row_id_map, overflow_flag, num_permuted_tokens, probs_topk_stride,
-            tmp_layout);
+            expert_map, max_num_dispatched_tokens, num_dispatched_tokens_out, num_local_experts,
+            num_topk, pad_multiple, tokens_per_expert, row_id_map, overflow_flag,
+            num_permuted_tokens, probs_topk_stride, tmp_layout);
 
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -461,73 +443,55 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
     const int row_stride            = 2 * E + 1;
     const int num_dispatched_tokens = *num_dispatched_tokens_ptr + pad_multiple;
 
-    if (token_id >= num_dispatched_tokens) {
+    if (token_id >= num_dispatched_tokens)
         return;
-    }
 
     const int *row      = row_id_map + token_id * row_stride;
     const int  n_routed = row[2 * E];
 
-    // Hidden-chunk fan-out: load source pack once, scatter to every
-    // routed destination at the same column.
+    // Hidden chunk: load once, scatter to every routed destination.
     if (j < hidden_int4) {
         const int4 src_pack = __ldg(tokens + token_id * hidden_int4 + j);
         const int4 zero4    = make_int4(0, 0, 0, 0);
-
         for (int idx = 0; idx < n_routed; ++idx) {
             const int dst_row = row[idx];
-            if (dst_row > 0) {
+            if (dst_row > 0)
                 st_na_global(permuted_tokens + (dst_row - 1) * hidden_int4 + j, src_pack);
-            } else {
+            else
                 st_na_global(permuted_tokens + (-dst_row - 1) * hidden_int4 + j, zero4);
-            }
         }
     }
 
-    // Per-(token, dst_row) tail data — emit only from chunk_id == 0.
-    if (chunk_id != 0) {
+    // Tail data (scales, probs) — emit only from chunk_id == 0.
+    if (chunk_id != 0)
         return;
-    }
 
     if (scaling_factor != nullptr) {
         for (int idx = 0; idx < n_routed; ++idx) {
             const int dst_row = row[idx];
             if (dst_row > 0) {
-                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks) {
+                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks)
                     permuted_scaling_factor[(dst_row - 1) * scales_per_token + sj] =
                         scaling_factor[token_id * scales_per_token + sj];
-                }
             } else {
-                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks) {
+                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks)
                     permuted_scaling_factor[(-dst_row - 1) * scales_per_token + sj] = scalar_t{0};
-                }
             }
         }
     }
 
-    // probs: [num_dispatched_tokens, probs_stride]. ``probs_stride == E`` means
-    // multihot layout with ``row[E + idx] == expert_idx`` (the legacy code
-    // path, used by ``indices_to_multihot``); ``probs_stride == num_topk``
-    // means topk-aligned layout (as emitted directly by DeepEP /
-    // ``moe_dispatch``) and ``row[E + idx] == topk_position`` instead — the
-    // preprocessing kernel rewrote ``aux`` accordingly when called with a
-    // matching ``probs_topk_stride``. We just read whichever column the
-    // preprocessing pass stored.
     if (probs != nullptr && lane_id == 0) {
         for (int idx = 0; idx < n_routed; ++idx) {
             const int dst_row   = row[idx];
             const int probs_col = row[E + idx];
-            if (dst_row > 0) {
+            if (dst_row > 0)
                 permuted_probs[dst_row - 1] = probs[token_id * probs_stride + probs_col];
-            } else {
+            else
                 permuted_probs[-dst_row - 1] = prob_t{0};
-            }
         }
     }
 }
 
-// E=1 specialised gather-copy: 1 warp per token, no float reduction, no
-// E-walk. Row layout collapses to 3 ints [dst | idx=0 | n ∈ {0,1}].
 template <int kNumThreads, typename dtype_t, typename prob_t>
 __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
                                     const prob_t *permuted_probs, prob_t *probs,
@@ -536,10 +500,10 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
     constexpr int num_warps  = kNumThreads / kWarpSize;
     constexpr int row_stride = 3;
 
-    const auto thread_id             = static_cast<int>(threadIdx.x);
-    const auto lane_id               = thread_id % kWarpSize;
-    const auto warp_id               = thread_id / kWarpSize;
-    const int  num_dispatched_tokens = *num_dispatched_tokens_ptr;
+    const int thread_id             = static_cast<int>(threadIdx.x);
+    const int lane_id               = thread_id % kWarpSize;
+    const int warp_id               = thread_id / kWarpSize;
+    const int num_dispatched_tokens = *num_dispatched_tokens_ptr;
 
     for (int64_t block_start = blockIdx.x * num_warps; block_start < num_dispatched_tokens;
          block_start += static_cast<int64_t>(num_warps) * gridDim.x) {
@@ -555,15 +519,12 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
             UNROLLED_WARP_COPY(4, lane_id, hidden_int4, dst, src, __ldg, st_na_global);
         } else {
             const int4 zero4 = make_int4(0, 0, 0, 0);
-            for (int64_t j = lane_id; j < hidden_int4; j += kWarpSize) {
+            for (int64_t j = lane_id; j < hidden_int4; j += kWarpSize)
                 st_na_global(dst + j, zero4);
-            }
         }
 
-        // probs collapses to [T, 1] when E == 1; only lane 0 writes the row.
-        if (probs != nullptr && permuted_probs != nullptr && lane_id == 0) {
+        if (probs != nullptr && permuted_probs != nullptr && lane_id == 0)
             probs[token_id] = (s > 0) ? permuted_probs[s - 1] : prob_t{0};
-        }
     }
 }
 
@@ -583,9 +544,8 @@ __launch_bounds__(kNumThreads, 4) __global__
     const int E          = num_local_experts;
     const int row_stride = 2 * E + 1;
 
-    if (token_id >= *num_dispatched_tokens_ptr) {
+    if (token_id >= *num_dispatched_tokens_ptr)
         return;
-    }
 
     const int *row      = row_id_map + token_id * row_stride;
     const int  n_routed = row[2 * E];
@@ -604,28 +564,23 @@ __launch_bounds__(kNumThreads, 4) __global__
             int4           pack = __ldg(permuted_tokens + (s - 1) * hidden_int4 + j);
             const dtype_t *p    = reinterpret_cast<const dtype_t *>(&pack);
 #pragma unroll
-            for (int k = 0; k < num_eles_per_pack; ++k) {
+            for (int k = 0; k < num_eles_per_pack; ++k)
                 acc[k] += static_cast<float>(p[k]);
-            }
         }
 
         int4     out_pack;
         dtype_t *outp = reinterpret_cast<dtype_t *>(&out_pack);
 #pragma unroll
-        for (int k = 0; k < num_eles_per_pack; ++k) {
+        for (int k = 0; k < num_eles_per_pack; ++k)
             outp[k] = static_cast<dtype_t>(acc[k]);
-        }
         st_na_global(tokens + token_id * hidden_int4 + j, out_pack);
     }
 
-    // Probs scatter: only chunk_id == 0 emits the per-token probs row.
-    // probs shape is [num_dispatched_tokens, probs_stride]. See the permute
-    // kernel's probs comment for the multihot vs topk-aligned conventions; the
-    // aux column ``row[E + idx]`` is always a valid index into that row.
+    // Probs scatter (chunk_id == 0 only): row[E + idx] is the column inside
+    // probs[token_id, :] to write — same convention as permute_kernel.
     if (probs != nullptr && permuted_probs != nullptr && chunk_id == 0) {
-        for (int p_j = lane_id; p_j < probs_stride; p_j += kNumThreads) {
+        for (int p_j = lane_id; p_j < probs_stride; p_j += kNumThreads)
             probs[token_id * probs_stride + p_j] = prob_t{0};
-        }
         for (int idx = lane_id; idx < n_routed; idx += kNumThreads) {
             const int s = row[idx];
             if (s > 0) {
@@ -738,7 +693,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
 
 #define INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(expert_map_t)                                       \
     template void permute_preprocessing_impl<expert_map_t>(                                        \
-        const expert_map_t *expert_map, int num_topk, int *num_dispatched_tokens_ptr,              \
+        const expert_map_t *expert_map, int num_topk, int *num_dispatched_tokens_out,              \
         int num_local_experts, int max_num_dispatched_tokens, int pad_multiple,                    \
         int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,                           \
         int64_t num_permuted_tokens, int probs_topk_stride, hipStream_t stream)

@@ -5,7 +5,6 @@
 #include "../extensions.h"
 #include "primus_turbo/arch.h"
 
-#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/util/Optional.h>
 
 #define SWITCH_EXPERT_MAP_TYPE(case_macro)                                                         \
@@ -37,10 +36,18 @@ template <typename T> static inline T *opt_data_ptr(const c10::optional<at::Tens
     return reinterpret_cast<T *>(t->data_ptr());
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_token_tensor,
-                      int64_t num_local_experts, int64_t num_topk, int64_t pad_multiple,
-                      int64_t num_permuted_tokens, int64_t probs_topk_stride) {
+// Returns ``(row_id_map, tokens_per_expert, overflow_flag,
+// num_dispatched_tokens)``. The trailing ``num_dispatched_tokens`` is a
+// 1-element int32 CUDA tensor populated by the cu kernel itself by scanning
+// ``expert_map`` for non-padding rows — DeepEP's worst-case dispatch buffer
+// uses ``-1`` (topk_idx) / all-false (routing_map) padding, so the count is
+// recoverable on-device without a host sync. Downstream ``permute`` /
+// ``unpermute`` consume this tensor in place of the legacy caller-provided
+// ``num_dispatched_token_tensor``.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64_t num_topk,
+                      int64_t pad_multiple, int64_t num_permuted_tokens,
+                      int64_t probs_topk_stride) {
     PRIMUS_TURBO_CHECK(expert_map.is_cuda(), "routing_map must be CUDA");
     PRIMUS_TURBO_CHECK(expert_map.scalar_type() == at::kBool ||
                            expert_map.scalar_type() == at::kInt ||
@@ -48,14 +55,6 @@ permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_tok
                        "expert_map must be bool or int or int64");
     PRIMUS_TURBO_CHECK(expert_map.dim() == 2, "expert_map must be 2D");
     PRIMUS_TURBO_CHECK(expert_map.is_contiguous(), "expert_map must be contiguous");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_cuda(),
-                       "num_dispatched_token_tensor must be CUDA");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.scalar_type() == at::kInt,
-                       "num_dispatched_token_tensor must be int32");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_contiguous(),
-                       "num_dispatched_token_tensor must be contiguous");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.numel() == 1,
-                       "num_dispatched_token_tensor must contain exactly one element");
 
     if (expert_map.scalar_type() == at::kBool) {
         PRIMUS_TURBO_CHECK(expert_map.size(1) == num_local_experts,
@@ -72,40 +71,25 @@ permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_tok
     }
 
     auto max_num_dispatched_tokens = expert_map.size(0);
-    // Skip the D2H validation during CUDA Graph capture: ``.to(CPU).item<>()``
-    // forces a host-blocking copy from a stream that's being recorded, which
-    // ``cudaStreamIsCapturing`` rejects. The real value lives on device in
-    // ``num_dispatched_token_tensor`` and is consumed by the kernel via
-    // ``*num_dispatched_tokens_ptr``; ``max_num_dispatched_tokens`` (a static
-    // expert_map dimension) is the only bound the host-side fast path
-    // depends on, and the kernel itself clamps to it.
-    const bool is_capturing =
-        c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None;
-    if (!is_capturing) {
-        auto num_dispatched_token_cpu =
-            num_dispatched_token_tensor.to(at::TensorOptions().dtype(at::kInt).device(at::kCPU));
-        const int num_dispatched_tokens = num_dispatched_token_cpu.item<int>();
-        PRIMUS_TURBO_CHECK(num_dispatched_tokens >= 0,
-                           "num_dispatched_token_tensor value must be non-negative");
-        PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_dispatched_tokens) <= max_num_dispatched_tokens,
-                           "num_dispatched_token_tensor value must not exceed expert_map.size(0)");
-    }
-
-    auto device   = expert_map.device();
-    auto int_opts = at::TensorOptions().dtype(at::kInt).device(device);
+    auto device                    = expert_map.device();
+    auto int_opts                  = at::TensorOptions().dtype(at::kInt).device(device);
 
     auto row_id_map = at::empty(
         {static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple), 2 * num_local_experts + 1},
         int_opts);
     auto tokens_per_expert = at::empty({num_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
+    // ``at::zeros`` so the kernel only does atomicAdd; the memset is
+    // CUDA-graph capturable (all subsequent host→device traffic stays on
+    // the stream).
+    auto num_dispatched_tokens = at::zeros({1}, int_opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
 #define DISPATCH_EXPERT_MAP_TYPE(expert_map_type)                                                  \
     permute_preprocessing_impl<expert_map_type>(                                                   \
         reinterpret_cast<expert_map_type *>(expert_map.data_ptr()), num_topk,                      \
-        num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),          \
+        num_dispatched_tokens.data_ptr<int>(), static_cast<int>(num_local_experts),                \
         static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),               \
         tokens_per_expert.data_ptr<int>(), row_id_map.data_ptr<int>(),                             \
         overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens),                  \
@@ -113,7 +97,7 @@ permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_tok
 
     SWITCH_EXPERT_MAP_TYPE(DISPATCH_EXPERT_MAP_TYPE);
 
-    return std::make_tuple(row_id_map, tokens_per_expert, overflow_flag);
+    return std::make_tuple(row_id_map, tokens_per_expert, overflow_flag, num_dispatched_tokens);
 }
 
 // -----------------------------------------------------------------------------

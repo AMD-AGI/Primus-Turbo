@@ -82,7 +82,6 @@ def expected_permuted_layout(routing_map: torch.Tensor, pad_multiple: int):
 def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hidden_size):
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=1234)
     expert_map = routing_map_to_expert_map(routing_map, num_topk, expert_map_kind)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
     base = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     tokens_ref = base.detach().clone().requires_grad_(True)
@@ -99,14 +98,14 @@ def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hid
     ref_unp_out.backward(grad_unp, retain_graph=True)
 
     # --- turbo: permute (forward + backward) -----------------------------
-    permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, _, _ = moe_permute(
+    permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, ndtt, _, _ = moe_permute(
         tokens_turbo,
         expert_map,
-        ndtt,
         num_local_experts=num_experts,
         num_topk=0 if expert_map_kind == "routing_map" else num_topk,
     )
     assert int(overflow_flag.item()) == 0
+    assert int(ndtt.item()) == num_tokens
     torch.testing.assert_close(
         tokens_per_expert.cpu(),
         routing_map.sum(dim=0).to(torch.int32).cpu(),
@@ -148,20 +147,17 @@ def test_moe_permute_pad_multiple(num_topk, pad_multiple):
     ``pad_multiple = 0`` baseline."""
     num_tokens, num_experts, hidden_size = 1024, 8, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=1234)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
 
-    _, _, base_per_expert, _, _, _ = moe_permute(
+    _, _, base_per_expert, _, _, _, _ = moe_permute(
         tokens,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=0,
     )
-    _, _, padded_per_expert, _, _, _ = moe_permute(
+    _, _, padded_per_expert, _, _, _, _ = moe_permute(
         tokens,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
     )
@@ -215,10 +211,9 @@ def test_overflow_flag(pad_multiple, cap_kind, expected):
         cap = (real if base == "real" else padded) + delta
 
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    _, _, _, overflow_flag, _, _ = moe_permute(
+    _, _, _, overflow_flag, _, _, _ = moe_permute(
         tokens,
         routing_map,
-        torch.tensor([num_tokens], dtype=torch.int32, device="cuda"),
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         num_permuted_tokens=cap,
@@ -240,7 +235,6 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
     """Empty dispatch (``num_tokens == 0``) takes the Python-side fast path."""
     num_experts, hidden_size = 8, 64
     routing_map = torch.zeros((0, num_experts), dtype=torch.bool, device="cuda")
-    ndtt = torch.tensor([0], dtype=torch.int32, device="cuda")
     tokens = torch.randn((0, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     probs = (
         torch.zeros((0, num_experts), dtype=torch.float32, device="cuda", requires_grad=True)
@@ -248,10 +242,17 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
         else None
     )
 
-    permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, _, permuted_probs = moe_permute(
+    (
+        permuted_tokens,
+        row_id_map,
+        tokens_per_expert,
+        overflow_flag,
+        ndtt,
+        _,
+        permuted_probs,
+    ) = moe_permute(
         tokens,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         probs=probs,
@@ -261,6 +262,7 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
     assert tokens_per_expert.shape == (num_experts,)
     assert int(tokens_per_expert.sum().item()) == 0
     assert int(overflow_flag.item()) == 0
+    assert int(ndtt.item()) == 0
     assert row_id_map.shape == (pad_multiple, 2 * num_experts + 1)
     if with_probs:
         assert permuted_probs is not None
@@ -308,7 +310,6 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
 def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple):
     num_tokens, num_experts, hidden_size = 256, 8, 128
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=7)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     # Use random multihot probs so the gather is observable; non-routed slots
@@ -317,10 +318,9 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple):
     probs_dense = probs_dense * routing_map.float()
     probs = probs_dense.detach().clone().requires_grad_(True)
 
-    permuted_tokens, row_id_map, _, overflow_flag, _, permuted_probs = moe_permute(
+    permuted_tokens, row_id_map, _, overflow_flag, _, _, permuted_probs = moe_permute(
         tokens,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         probs=probs,
@@ -364,14 +364,12 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple):
 def test_moe_unpermute_with_probs_fwd_bwd():
     num_tokens, num_experts, num_topk, hidden_size = 256, 8, 2, 128
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=11)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     probs = torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda") * routing_map.float()
-    permuted_tokens, row_id_map, _, _, _, permuted_probs = moe_permute(
+    permuted_tokens, row_id_map, _, _, ndtt, _, permuted_probs = moe_permute(
         tokens,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         probs=probs,
     )
@@ -417,7 +415,6 @@ def test_moe_unpermute_with_probs_fwd_bwd():
 def test_moe_permute_fp16_fwd_bwd(num_topk):
     num_tokens, num_experts, hidden_size = 1024, 8, 256
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=21)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
     base = torch.randn((num_tokens, hidden_size), dtype=torch.float16, device="cuda")
     tokens_ref = base.detach().clone().requires_grad_(True)
@@ -432,10 +429,9 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
     grad_unp = torch.randn_like(ref_unp_out)
     ref_unp_out.backward(grad_unp, retain_graph=True)
 
-    permuted_tokens, row_id_map, _, overflow_flag, _, _ = moe_permute(
+    permuted_tokens, row_id_map, _, overflow_flag, ndtt, _, _ = moe_permute(
         tokens_turbo,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
     )
     assert int(overflow_flag.item()) == 0
@@ -476,16 +472,14 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
 def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     num_tokens, num_experts, hidden_size = 512, 8, 128
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=33)
-    ndtt = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
     base = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
 
     # Reference: pad_multiple = 0.
     tokens_ref = base.detach().clone().requires_grad_(True)
-    perm_ref, row_id_map_ref, _, _, _, _ = moe_permute(
+    perm_ref, row_id_map_ref, _, _, ndtt_ref, _, _ = moe_permute(
         tokens_ref,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=0,
     )
@@ -496,7 +490,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     unp_out_ref, _ = moe_unpermute(
         unp_in_ref,
         row_id_map_ref,
-        ndtt,
+        ndtt_ref,
         restore_shape=tokens_ref.shape,
         num_local_experts=num_experts,
     )
@@ -507,10 +501,9 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     # (``[expert0 real | expert0 pad | expert1 real | expert1 pad | ...]``),
     # so the real entries do NOT form a contiguous prefix in general.
     tokens_pad = base.detach().clone().requires_grad_(True)
-    perm_pad, row_id_map_pad, tokens_per_expert_pad, _, _, _ = moe_permute(
+    perm_pad, row_id_map_pad, tokens_per_expert_pad, _, ndtt_pad, _, _ = moe_permute(
         tokens_pad,
         routing_map,
-        ndtt,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
     )
@@ -541,7 +534,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     unp_out_pad, _ = moe_unpermute(
         unp_in_pad,
         row_id_map_pad,
-        ndtt,
+        ndtt_pad,
         restore_shape=tokens_pad.shape,
         num_local_experts=num_experts,
     )

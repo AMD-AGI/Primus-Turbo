@@ -71,9 +71,14 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     //     ``moe_dispatch``, in which case the aux column stores the
     //     ``topk_position`` instead. The latter is only valid with the
     //     ``topk_idx`` expert_map code path.
-    m.def("permute_preprocessing(Tensor expert_map, Tensor num_dispatched_token_tensor, "
-          "int num_local_experts, int num_topk, int pad_multiple, "
-          "int num_permuted_tokens, int probs_topk_stride=0) -> (Tensor, Tensor, Tensor)");
+    // ``permute_preprocessing`` no longer accepts a caller-provided
+    // ``num_dispatched_token_tensor``: the cu kernel scans ``expert_map`` for
+    // padding (``-1`` in topk_idx mode, all-false in routing_map mode) and
+    // emits the count as the trailing output tensor (1-element int32 CUDA),
+    // which downstream ``permute`` / ``unpermute`` consume.
+    m.def("permute_preprocessing(Tensor expert_map, int num_local_experts, int num_topk, "
+          "int pad_multiple, int num_permuted_tokens, int probs_topk_stride=0) "
+          "-> (Tensor, Tensor, Tensor, Tensor)");
     m.def("permute(Tensor tokens, Tensor output_tokens, Tensor? scaling_factor, "
           "Tensor? output_scaling_factor, Tensor? probs, Tensor? output_probs, "
           "Tensor row_id_map, Tensor num_dispatched_token_tensor, "

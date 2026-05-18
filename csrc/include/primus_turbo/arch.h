@@ -43,4 +43,11 @@ inline int32_t get_multi_processor_count(const int32_t device_id) {
     return num_cu;
 }
 
+inline int32_t get_max_shmem_per_block(const int32_t device_id) {
+    int32_t max_shmem = 0;
+    PRIMUS_TURBO_CHECK_HIP(
+        hipDeviceGetAttribute(&max_shmem, hipDeviceAttributeMaxSharedMemoryPerBlock, device_id));
+    return max_shmem;
+}
+
 } // namespace primus_turbo
