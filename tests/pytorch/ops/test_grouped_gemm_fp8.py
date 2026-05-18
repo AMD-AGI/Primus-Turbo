@@ -392,12 +392,23 @@ def test_grouped_gemm_fp8_blockwise_triton_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.HIPKITTEN])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
     # FIXME(ruibin): CK backend has numerical issues.
     if backend == BackendType.CK or backend == None:
         pytest.skip("CK backend has numerical issues currently")
+
+    # HIPKITTEN FP8 backend constraints (SUPPORTED_DTYPES / SUPPORTED_GRANULARITIES
+    # in GroupedGEMMFP8HipKittenBackend): TENSORWISE only, E4M3 only,
+    # ori_dtype=bfloat16 only (out_dtype must be bfloat16).
+    if backend is BackendType.HIPKITTEN:
+        if auto_tune:
+            pytest.skip("auto_tune is ignored when backend is explicitly specified")
+        if format != Format.E4M3:
+            pytest.skip("HIPKITTEN FP8 only supports E4M3 (no E5M2, no HYBRID)")
+        if ori_dtype != torch.bfloat16:
+            pytest.skip("HIPKITTEN FP8 only supports bfloat16 output (ori_dtype)")
 
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
     # This has been observed under pytest; root cause not yet identified. MI355 works normally.

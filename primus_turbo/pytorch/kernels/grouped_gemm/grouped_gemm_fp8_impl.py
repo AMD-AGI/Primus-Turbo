@@ -482,7 +482,9 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         op = torch.ops.primus_turbo_cpp_extension.hk_grouped_rcr_fp8
         # Round-2026-05-14: 3-way autotune adds bn_block ∈ {0, 128} to the
         # (gm, xcds) sweep. bn_block=0 → default 256x256 kernel; bn_block=128
-        # → 256x128 (bn128) variant. Cross-product = |RCR_CANDIDATES| × 2.
+        # → 256x128 (bn128) variant. Both kernels now carry the ceil_div
+        # bpr_g + per-group shifted gl view + masked store fix (2026-05-18),
+        # so unbalanced / M_g < BLOCK_SIZE shapes are correct in either.
         bn_choices = (0, 128)
         candidates_3way = tuple(
             (gm_, xcds_, bn_)
@@ -593,7 +595,11 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
             return False
         if (a.dtype, b.dtype, out_dtype) not in GroupedGEMMFP8VariableKHipKittenBackend.SUPPORTED_DTYPES:
             return False
-        if a.dim() != 2 or b.dim() != 2 or not (trans_a and not trans_b and trans_c):
+        # wgrad requires trans_a=True, !trans_b. trans_c can be either; the
+        # two layouts are transposes of each other and we handle both by
+        # swapping the op-side (a / b) roles in execute() below — mirrors
+        # GroupedGEMMVariableKHipKittenBackend in grouped_gemm_impl.py.
+        if a.dim() != 2 or b.dim() != 2 or not (trans_a and not trans_b):
             return False
         if a_scales.numel() != 1 or b_scales.numel() != 1:
             return False
@@ -617,7 +623,7 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        del trans_a, trans_b, trans_c, granularity, num_cu, kwargs
+        del trans_a, trans_b, granularity, num_cu, kwargs
 
         # Standard CRR var-K path (a, b 2D)
         if a.dim() == 3:
@@ -631,21 +637,37 @@ class GroupedGEMMFP8VariableKHipKittenBackend(KernelBackend):
                 # Transposed (G, N, M_g) — un-transpose for CRR
                 b = fp8_transpose_3d(b.contiguous())  # (G, M_g, N)
                 b = b.view(G * m_g, b.shape[2])
-        m_total = a.shape[0]
-        b_in = b if b.is_contiguous() else b.contiguous()
-        a_in = a if a.is_contiguous() else a.contiguous()
-        n_out = b_in.shape[1]
-        k = a_in.shape[1]
+        x_in = a if a.is_contiguous() else a.contiguous()
+        grad_out_in = b if b.is_contiguous() else b.contiguous()
+        # Kernel computes c[g] = op_a[g]^T @ op_b[g] with output shape
+        # [G, op_a.shape[1], op_b.shape[1]]. Two output layouts via swapping
+        # the op-side (x, grad_out) roles; mirrors the bf16 backend:
+        #   trans_c=True  → c [G, N_fwd, K_fwd] = grad_out^T @ x
+        #     op_a=grad_out (PT ``b``), op_b=x (PT ``a``)
+        #     scales: a_scales is x's scale, b_scales is grad_out's scale,
+        #     so op_a_scales=b_scales, op_b_scales=a_scales.
+        #   trans_c=False → c [G, K_fwd, N_fwd] = x^T @ grad_out
+        #     op_a=x (PT ``a``), op_b=grad_out (PT ``b``)
+        #     op_a_scales=a_scales, op_b_scales=b_scales.
+        if trans_c:
+            op_a, op_b = grad_out_in, x_in
+            op_a_scales, op_b_scales = b_scales, a_scales
+        else:
+            op_a, op_b = x_in, grad_out_in
+            op_a_scales, op_b_scales = a_scales, b_scales
+        m_total = op_a.shape[0]
+        n_out = op_a.shape[1]
+        k = op_b.shape[1]
 
         op = torch.ops.primus_turbo_cpp_extension.hk_grouped_var_k_crr_fp8
         # Positional layout: a, b, a_scales, b_scales, group_offs,
         #                    group_m(5), num_xcds(6), out_dtype.
-        fixed = (b_in, a_in, b_scales, a_scales, group_offs, 0, 0, out_dtype)
+        fixed = (op_a, op_b, op_a_scales, op_b_scales, group_offs, 0, 0, out_dtype)
         gm, xcds = _autotune_pick(
             op, fixed, _HK_FP8_VARK_CANDIDATES, (5, 6),
             key=("vark_fp8", m_total, n_out, k),
         )
-        return op(b_in, a_in, b_scales, a_scales, group_offs,
+        return op(op_a, op_b, op_a_scales, op_b_scales, group_offs,
                   gm, xcds, out_dtype)
 
 
