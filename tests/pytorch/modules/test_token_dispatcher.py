@@ -50,7 +50,7 @@ def _run_dispatch_combine(
     permute_fusion=True,
     deepep_use_cuda_num_tokens_per_expert=False,
     deepep_num_worst_tokens=0,
-    permute_max_token_num=0,
+    num_permuted_tokens=0,
     expert_capacity_factor=None,
     deepep_use_comm_stream=False,
 ):
@@ -62,7 +62,7 @@ def _run_dispatch_combine(
         permute_fusion=permute_fusion,
         deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
         deepep_num_worst_tokens=deepep_num_worst_tokens,
-        permute_max_token_num=permute_max_token_num,
+        num_permuted_tokens=num_permuted_tokens,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
     )
@@ -139,8 +139,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # ------------------------------------------------------------------
 
     @parametrize("backend", _get_backends())
-    @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
-    def test_worst_tokens(self, backend, permute_max_token_num):
+    @parametrize("num_permuted_tokens", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
+    def test_worst_tokens(self, backend, num_permuted_tokens):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -148,7 +148,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 dist.group.WORLD,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
-                permute_max_token_num=permute_max_token_num,
+                num_permuted_tokens=num_permuted_tokens,
             )
 
     # ------------------------------------------------------------------
@@ -219,7 +219,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
             {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8
-            permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
+            num_permuted_tokens = NUM_TOKENS * 8 * ROUTER_TOPK
 
             # clear buffer for reset
             # a trick to reset the backend instance
@@ -234,7 +234,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
                 permute_fusion=True,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=num_worst_tokens,
-                permute_max_token_num=permute_max_token_num,
+                num_permuted_tokens=num_permuted_tokens,
             )
 
             hidden_states = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")

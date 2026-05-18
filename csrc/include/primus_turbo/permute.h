@@ -9,9 +9,16 @@
 
 namespace primus_turbo {
 
+// ``num_dispatched_tokens_out``: 1-element int32 device buffer that receives
+// the count of "real" (non-padding) rows. The count is computed grid-wide
+// via the col-E lane of the decoupled lookback that already underpins the
+// per-expert prefix sums, then written by the LAST block with a single
+// plain store (no atomicAdd). The kernel consumes ``max_num_dispatched_tokens``
+// to pick the row range and skips padding rows naturally via the ``-1`` /
+// all-false guard inside ``fill_s_tile_*``.
 template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
-                                int *num_dispatched_tokens_ptr, int num_local_experts,
+                                int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
                                 int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
                                 int64_t num_permuted_tokens, int probs_topk_stride,

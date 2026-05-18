@@ -63,6 +63,28 @@ __device__ __forceinline__ void store_tile_state(uint64_t *p, uint32_t flag, int
     __hip_atomic_store(p, raw, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+__device__ __forceinline__ int32_t decoupled_lookback(uint64_t *tile_state, int block_id,
+                                                      int row_stride, int col, int32_t agg) {
+    uint64_t      *self      = &tile_state[static_cast<int64_t>(block_id) * row_stride + col];
+    const uint32_t init_flag = (block_id == 0) ? TileState::kComplete : TileState::kPartial;
+    store_tile_state(self, init_flag, agg);
+
+    int32_t accum = 0;
+    for (int b = block_id - 1; b >= 0; --b) {
+        TileState s;
+        do {
+            s = load_tile_state(&tile_state[static_cast<int64_t>(b) * row_stride + col]);
+        } while (s.flag == TileState::kInvalid);
+        accum += s.value;
+        if (s.flag == TileState::kComplete)
+            break;
+    }
+    if (block_id != 0) {
+        store_tile_state(self, TileState::kComplete, accum + agg);
+    }
+    return accum;
+}
+
 template <typename T>
 __device__ __forceinline__ T *get_temp_storage(T *static_temp_storage, vsmem_t vsmem) {
     if (vsmem.gmem_ptr == nullptr) {

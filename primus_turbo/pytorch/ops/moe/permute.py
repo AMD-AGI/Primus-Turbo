@@ -55,14 +55,19 @@ def _infer_probs_topk_stride(
 
 
 class _MoEPermute(torch.autograd.Function):
-    """Forward: permute_preprocessing + permute. Backward: unpermute (+ probs)."""
+    """Forward: permute_preprocessing + permute. Backward: unpermute (+ probs).
+
+    The cu kernel now scans ``expert_map`` itself for non-padding rows and
+    emits ``num_dispatched_tokens`` as a 1-element int32 CUDA tensor — caller
+    no longer has to plumb one in. We surface that tensor as an extra forward
+    return so callers can hand it to ``moe_unpermute`` directly.
+    """
 
     @staticmethod
     def forward(
         ctx,
         tokens: torch.Tensor,
         expert_map: torch.Tensor,
-        num_dispatched_token_tensor: torch.Tensor,
         num_local_experts: int,
         num_topk: int,
         pad_multiple: int = 0,
@@ -72,6 +77,7 @@ class _MoEPermute(torch.autograd.Function):
         scales_per_token: int = 0,
         use_fp8: bool = False,
     ) -> Tuple[
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -111,6 +117,7 @@ class _MoEPermute(torch.autograd.Function):
             row_id_map = torch.zeros((pad_multiple, 2 * num_local_experts + 1), **int_opts)
             tokens_per_expert = torch.zeros((num_local_experts,), **int_opts)
             overflow_flag = torch.zeros((1,), **int_opts)
+            num_dispatched_tokens = torch.zeros((1,), **int_opts)
             permuted_tokens = tokens.new_empty((0, hidden_size))
             permuted_scaling_factor = (
                 scaling_factor.new_empty((0, scales_per_token))
@@ -118,20 +125,20 @@ class _MoEPermute(torch.autograd.Function):
                 else None
             )
             permuted_probs = probs.new_zeros((0,)) if probs is not None else None
-            ctx.save_for_backward(row_id_map, num_dispatched_token_tensor)
+            ctx.save_for_backward(row_id_map, num_dispatched_tokens)
             return (
                 permuted_tokens,
                 row_id_map,
                 tokens_per_expert,
                 overflow_flag,
+                num_dispatched_tokens,
                 permuted_scaling_factor,
                 permuted_probs,
             )
 
-        row_id_map, tokens_per_expert, overflow_flag = (
+        row_id_map, tokens_per_expert, overflow_flag, num_dispatched_tokens = (
             torch.ops.primus_turbo_cpp_extension.permute_preprocessing(
                 expert_map,
-                num_dispatched_token_tensor,
                 num_local_experts,
                 num_topk,
                 pad_multiple,
@@ -170,7 +177,7 @@ class _MoEPermute(torch.autograd.Function):
             probs,
             permuted_probs,
             row_id_map,
-            num_dispatched_token_tensor,
+            num_dispatched_tokens,
             pad_multiple,
             num_local_experts,
             hidden_size,
@@ -181,12 +188,13 @@ class _MoEPermute(torch.autograd.Function):
             probs_topk_stride,
         )
 
-        ctx.save_for_backward(row_id_map, num_dispatched_token_tensor)
+        ctx.save_for_backward(row_id_map, num_dispatched_tokens)
         return (
             permuted_tokens,
             row_id_map,
             tokens_per_expert,
             overflow_flag,
+            num_dispatched_tokens,
             permuted_scaling_factor,
             permuted_probs,
         )
@@ -198,13 +206,14 @@ class _MoEPermute(torch.autograd.Function):
         row_id_map_grad: Optional[torch.Tensor],
         tokens_per_expert_grad: Optional[torch.Tensor],
         overflow_flag_grad: Optional[torch.Tensor],
+        num_dispatched_tokens_grad: Optional[torch.Tensor],
         permuted_scaling_factor_grad: Optional[torch.Tensor],
         permuted_probs_grad: Optional[torch.Tensor],
     ):
         # unpermute kernel only accepts bf16 / fp16.
         assert not ctx.use_fp8, "_MoEPermute.backward: FP8 backward not supported"
 
-        row_id_map, num_dispatched_token_tensor = ctx.saved_tensors
+        row_id_map, num_dispatched_tokens = ctx.saved_tensors
         grad_permuted_tokens = grad_permuted_tokens.contiguous()
         device = grad_permuted_tokens.device
         grad_tokens = torch.empty(
@@ -239,7 +248,7 @@ class _MoEPermute(torch.autograd.Function):
                 permuted_probs_grad,
                 grad_probs,
                 row_id_map,
-                num_dispatched_token_tensor,
+                num_dispatched_tokens,
                 ctx.num_local_experts,
                 ctx.hidden_size,
                 grad_probs is not None,
@@ -249,7 +258,6 @@ class _MoEPermute(torch.autograd.Function):
         return (
             grad_tokens,
             None,  # expert_map
-            None,  # num_dispatched_token_tensor
             None,  # num_local_experts
             None,  # num_topk
             None,  # pad_multiple
@@ -392,7 +400,6 @@ class _MoEUnpermute(torch.autograd.Function):
 def moe_permute(
     tokens: torch.Tensor,
     expert_map: torch.Tensor,
-    num_dispatched_token_tensor: torch.Tensor,
     *,
     num_local_experts: int,
     num_topk: int = 0,
@@ -407,18 +414,24 @@ def moe_permute(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
     """Fused preprocessing + permute.
 
+    The cu kernel computes ``num_dispatched_tokens`` itself by scanning
+    ``expert_map`` for non-padding rows (``-1`` in topk_idx mode, all-false
+    in routing_map mode), so the caller no longer has to plumb in a
+    ``num_dispatched_token_tensor``. Pass the returned tensor to
+    ``moe_unpermute``.
+
     Returns (permuted_tokens, row_id_map, tokens_per_expert, overflow_flag,
-    permuted_scaling_factor, permuted_probs).
+    num_dispatched_tokens, permuted_scaling_factor, permuted_probs).
     """
     return _MoEPermute.apply(
         tokens,
         expert_map,
-        num_dispatched_token_tensor,
         num_local_experts,
         num_topk,
         pad_multiple,
