@@ -10,16 +10,181 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from primus_turbo.common.constants import ENV_MORI_NUM_QP_PER_PE
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.kernels.moe.moe_utils import detect_group_topology
 
 from .base import _apply_env_with_nccl_fallback
+
+# ==========================================================================
+# Per-expert token counting (Mori dispatch post-processing)
+# ==========================================================================
+
+
+def _compute_expert_token_info_configs() -> List[triton.Config]:
+    """Autotune space for :func:`compute_expert_token_info_kernel`."""
+    configs: List[triton.Config] = []
+    for block_m in (64, 128, 256, 512, 1024):
+        for num_warps in (1, 2, 4, 8):
+            # Wave=64, cap threads/CTA to 1024 (HW limit on CDNA).
+            if num_warps * 64 > 1024:
+                continue
+            # Keep at least one element per thread in the M dimension.
+            if block_m < num_warps * 64:
+                continue
+            for num_stages in (1, 2):
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_SIZE_M": block_m},
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
+                )
+    return configs
+
+
+@triton.autotune(
+    configs=_compute_expert_token_info_configs(),
+    key=["num_tokens", "num_topk"],
+    reset_to_zero=["num_recv_tokens_per_expert_ptr"],
+)
+@triton.jit
+def compute_expert_token_info_kernel(
+    recv_topk_idx_ptr,
+    deepep_topk_idx_ptr,
+    num_recv_tokens_per_expert_ptr,
+    total_recv_ptr,
+    num_tokens: tl.int32,
+    num_topk: tl.int32,
+    num_local_experts: tl.int32,
+    expert_base: tl.int32,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    HAS_TOTAL_RECV: tl.constexpr,
+):
+    """Count per-expert received tokens and emit a DeepEP-format topk_idx. will be removed in the future."""
+    pid = tl.program_id(0)
+    row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    col_offs = tl.arange(0, BLOCK_SIZE_K)
+    bin_offs = tl.arange(0, BLOCK_SIZE_N)
+
+    if HAS_TOTAL_RECV:
+        total_recv = tl.load(total_recv_ptr)
+        row_limit = tl.minimum(total_recv, num_tokens)
+    else:
+        row_limit = num_tokens
+
+    in_footprint = row_offs < num_tokens
+    in_valid_rows = row_offs < row_limit
+    col_mask = col_offs < num_topk
+
+    footprint_mask = in_footprint[:, None] & col_mask[None, :]
+    load_mask = in_valid_rows[:, None] & col_mask[None, :]
+
+    safe_row = tl.where(in_footprint, row_offs, 0)
+    expert_offs = safe_row[:, None] * num_topk + col_offs[None, :]
+
+    topk_experts = tl.load(
+        recv_topk_idx_ptr + expert_offs,
+        mask=load_mask,
+        other=0,
+    )
+
+    local_experts = topk_experts - expert_base
+    valid = load_mask & (local_experts >= 0) & (local_experts < num_local_experts)
+    # Clamp the experts of invalid lanes so they land on a legal bin; the
+    # ``mask`` passed to ``tl.histogram`` makes sure they are not counted.
+    safe_experts = tl.where(valid, local_experts, 0)
+
+    # ``tl.histogram`` requires a flat 1D input; reshape the 2D tile.
+    flat_experts = tl.reshape(safe_experts, [BLOCK_SIZE_M * BLOCK_SIZE_K])
+    flat_mask = tl.reshape(valid, [BLOCK_SIZE_M * BLOCK_SIZE_K])
+    local_counts = tl.histogram(flat_experts, BLOCK_SIZE_N, mask=flat_mask)
+
+    # Flush CTA-local accumulator to global memory with one atomic per bin.
+    bin_mask = (bin_offs < num_local_experts) & (local_counts > 0)
+    tl.atomic_add(
+        num_recv_tokens_per_expert_ptr + bin_offs,
+        local_counts,
+        sem="relaxed",
+        scope="gpu",
+        mask=bin_mask,
+    )
+
+    deepep_experts = tl.where(valid, local_experts, -1).to(topk_experts.dtype)
+    tl.store(deepep_topk_idx_ptr + expert_offs, deepep_experts, mask=footprint_mask)
+
+
+def compute_expert_token_info(
+    recv_topk_idx: torch.Tensor,
+    num_local_experts: int,
+    *,
+    expert_base: int = 0,
+    total_recv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Count per-expert received tokens and emit ``recv_topk_idx`` in DeepEP
+    layout (as a new tensor).
+    """
+    assert recv_topk_idx.is_cuda, "recv_topk_idx must be a CUDA tensor"
+    assert recv_topk_idx.dim() == 2, "recv_topk_idx must be 2D [num_tokens, num_topk]"
+
+    device = recv_topk_idx.device
+    num_tokens, num_topk = recv_topk_idx.shape
+
+    num_recv_tokens_per_expert = torch.zeros(num_local_experts, dtype=recv_topk_idx.dtype, device=device)
+    deepep_like_topk_idx = torch.empty_like(recv_topk_idx)
+
+    if num_tokens == 0 or num_topk == 0 or num_local_experts == 0:
+        # Nothing to count; fill the output with the DeepEP padding sentinel
+        # so callers can rely on a uniform layout.
+        if deepep_like_topk_idx.numel() > 0:
+            deepep_like_topk_idx.fill_(-1)
+        return num_recv_tokens_per_expert, deepep_like_topk_idx
+
+    has_total_recv = total_recv is not None
+    if has_total_recv:
+        assert total_recv.is_cuda, "total_recv must be a CUDA tensor"
+        assert total_recv.numel() >= 1, "total_recv must have at least 1 element"
+        # Triton expects an int32 pointer; coerce silently if the caller
+        # passed (e.g.) int64.
+        if total_recv.dtype != torch.int32:
+            total_recv = total_recv.to(torch.int32)
+        total_recv_ptr = total_recv
+    else:
+        # Triton requires a real pointer; reuse ``recv_topk_idx`` as a dummy
+        # (the kernel won't dereference it because ``HAS_TOTAL_RECV=False``).
+        total_recv_ptr = recv_topk_idx
+
+    # ``tl.histogram`` requires ``num_bins`` to be a power of 2 on AMD Triton.
+    block_size_n = triton.next_power_of_2(num_local_experts)
+
+    # ``BLOCK_SIZE_M`` is picked by the autotuner; the grid size depends on it.
+    def grid(META):
+        return (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
+
+    compute_expert_token_info_kernel[grid](
+        recv_topk_idx,
+        deepep_like_topk_idx,
+        num_recv_tokens_per_expert,
+        total_recv_ptr,
+        num_tokens,
+        num_topk,
+        num_local_experts,
+        expert_base,
+        BLOCK_SIZE_K=triton.next_power_of_2(num_topk),
+        BLOCK_SIZE_N=block_size_n,
+        HAS_TOTAL_RECV=has_total_recv,
+    )
+    return num_recv_tokens_per_expert, deepep_like_topk_idx
+
 
 # ==========================================================================
 # Mori EP backend helpers
@@ -66,6 +231,33 @@ def _get_mori_dispatch_configs(
 
 
 _MORI_SHMEM_PG_NAME = "mori"
+
+
+def _align_mori_hip_with_torch() -> None:
+    """Make Mori's JIT reuse torch's ``libamdhip64.so``.
+
+    On ROCm 7.2+ Mori's separate ``dlopen`` of system HIP gets a different
+    module table than torch's, causing HIP error 500 in ``hipModuleGetFunction``.
+    Preloading torch's copy into Mori's lazy handle fixes it.
+    """
+    try:
+        import ctypes
+
+        import mori.jit.hip_driver as _hd
+
+        # ensture must have _hip
+    except ImportError:
+        return
+
+    torch_hip = os.path.join(os.path.dirname(torch.__file__), "lib", "libamdhip64.so")
+    if not os.path.isfile(torch_hip):
+        return
+
+    try:
+        _hd._hip = ctypes.CDLL(torch_hip)
+        logger.info(f"[MORI init] Aligned Mori HIP with torch ({torch_hip}).", rank=0, once=True)
+    except OSError as e:  # pragma: no cover - best-effort.
+        logger.warning(f"[MORI init] Failed to preload {torch_hip}: {e}.", once=True)
 
 
 def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
@@ -235,6 +427,11 @@ class MoriEPBackend:
             return False
 
     @staticmethod
+    def supports_cuda_graph() -> bool:
+        """not supported"""
+        return False
+
+    @staticmethod
     def _derive_params_dtype(fp8_dispatch: bool) -> torch.dtype:
         """Pick the Mori ``data_type`` argument from ``fp8_dispatch``."""
         assert not fp8_dispatch, "Not implemented"
@@ -249,27 +446,13 @@ class MoriEPBackend:
         ib_tc: Optional[str] = None,
         ib_sl: Optional[str] = None,
     ) -> None:
-        """Populate MORI_* RDMA env vars, falling back to NCCL_* when unset.
+        """Set MORI_* RDMA env vars, falling back to NCCL_* equivalents.
 
-        Mapping (MORI doc → NCCL equivalent):
-
-        - ``MORI_IB_GID_INDEX``  ↔ ``NCCL_IB_GID_INDEX``
-        - ``MORI_RDMA_DEVICES``  ↔ ``NCCL_IB_HCA`` (both accept ``mlx5_0,mlx5_1``
-          include lists and ``^mlx5_2`` exclude lists)
-        - ``MORI_SOCKET_IFNAME`` ↔ ``NCCL_SOCKET_IFNAME``
-        - ``MORI_RDMA_TC``       ↔ ``NCCL_IB_TC``
-        - ``MORI_RDMA_SL``       ↔ ``NCCL_IB_SL``
-
-        Args:
-            ib_gid_index: Override for ``MORI_IB_GID_INDEX``.
-            ib_hca: Override for ``MORI_RDMA_DEVICES``.
-            socket_ifname: Override for ``MORI_SOCKET_IFNAME``.
-            ib_tc: Override for ``MORI_RDMA_TC``.
-            ib_sl: Override for ``MORI_RDMA_SL``.
-
-        Any argument left ``None`` inherits from the corresponding ``NCCL_*``
-        env var when it is set; otherwise the variable stays unset and Mori
-        applies its own default (typically auto-detect).
+        Mapping: ``MORI_IB_GID_INDEX``/``NCCL_IB_GID_INDEX``,
+        ``MORI_RDMA_DEVICES``/``NCCL_IB_HCA``, ``MORI_SOCKET_IFNAME``/
+        ``NCCL_SOCKET_IFNAME``, ``MORI_RDMA_TC``/``NCCL_IB_TC``,
+        ``MORI_RDMA_SL``/``NCCL_IB_SL``. Each kwarg overrides the
+        corresponding MORI var; ``None`` keeps it unset (Mori auto-detects).
         """
         _apply_env_with_nccl_fallback(
             [
@@ -300,8 +483,10 @@ class MoriEPBackend:
         """
         assert not fp8_dispatch, "not implemented"
 
-        # Best-effort NCCL-fallback for Mori RDMA env vars. Must run before
-        # SHMEM init so Mori picks up the right network configuration.
+        # Must run before any Mori JIT/SHMEM activity (fixes HIP error 500 on ROCm 7.2+).
+        _align_mori_hip_with_torch()
+
+        # Apply MORI_* fallbacks from NCCL_* before SHMEM init.
         self.setup_env()
 
         if self._group is not group:
@@ -360,10 +545,6 @@ class MoriEPBackend:
         num_worst_tokens: int = 0,  # noqa: ARG002 - API compat only.
         config: Optional[Any] = None,  # noqa: ARG002 - API compat only.
     ):
-        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
-            compute_expert_token_info,
-        )
-
         assert self.is_initialized(), "Backend is not initialized"
         scale = None
         non_blocking = num_worst_tokens > 0

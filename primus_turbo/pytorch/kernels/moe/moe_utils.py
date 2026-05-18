@@ -10,7 +10,7 @@ import socket
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -136,14 +136,25 @@ def bench_kineto(
     return kernel_durations if is_tuple else kernel_durations[0]
 
 
-def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int]:
-    """
-    Infer node topology for a process group.
+# Cached per ``id(group)``: topology is fixed for a group's lifetime, and
+# the underlying ``dist.all_gather_object`` does a D2H sync illegal under
+# CUDA graph capture.
+_TOPOLOGY_CACHE: Dict[int, Tuple[int, int]] = {}
 
-    Returns:
-        node_idx: compact node index within the given group.
-        num_nodes: number of distinct nodes spanned by the group.
+
+def clear_group_topology_cache() -> None:
+    """Clear the topology cache (for tests that recreate process groups)."""
+    _TOPOLOGY_CACHE.clear()
+
+
+def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int]:
+    """Return ``(node_idx, num_nodes)`` for ``group``. Cached per ``id(group)``
+    so it runs the underlying ``all_gather_object`` only once.
     """
+    cache_key = id(group)
+    cached = _TOPOLOGY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     node_token = (
         os.environ.get("NODE_RANK")
@@ -163,7 +174,9 @@ def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int]:
 
     node_idx = token_to_idx[node_token]
     num_nodes = len(token_to_idx)
-    return node_idx, num_nodes
+    result = (node_idx, num_nodes)
+    _TOPOLOGY_CACHE[cache_key] = result
+    return result
 
 
 def inplace_unique(x: torch.Tensor, num_slots: int):

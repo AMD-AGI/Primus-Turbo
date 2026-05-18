@@ -44,27 +44,24 @@ class EPBackend(Protocol):
         """Return True if this backend's dependencies are importable."""
         ...
 
+    @staticmethod
+    def supports_cuda_graph() -> bool:
+        """Return True if dispatch/combine are safe inside ``torch.cuda.graph``.
+
+        Override to ``False`` on backends that rely on synchronous HIP APIs
+        or per-call device->host plumbing (they would deadlock under capture).
+        """
+        ...
+
     def is_initialized(self) -> bool:
         """Return True if the backend is initialized."""
         ...
 
     def setup_env(self, **overrides: Optional[str]) -> None:
-        """Configure backend-specific network/RDMA env vars before init.
+        """Configure backend RDMA/network env vars before init.
 
-        Backends that talk to an RDMA fabric (UCCL, Mori, ...) use this hook
-        to populate their own ``*_IB_GID_INDEX``/``*_IB_HCA``/``*_SOCKET_IFNAME``
-        /``*_IB_TC``/``*_IB_SL`` (or equivalent) variables. Resolution order
-        for each variable:
-
-        1. If the caller passes an explicit override (non-``None``), use it.
-        2. Otherwise, if the backend env var is already set in the process
-           environment, leave it untouched.
-        3. Otherwise, fall back to the corresponding ``NCCL_*`` env var when
-           present.
-        4. Otherwise leave the variable unset and use the backend's default.
-
-        Backends without network env vars (e.g. the in-tree DeepEP backend)
-        provide a no-op implementation.
+        Resolution per var: explicit override > existing env > matching ``NCCL_*``
+        > backend default. Backends without network state implement as no-op.
         """
         ...
 
@@ -160,18 +157,8 @@ class EPBackend(Protocol):
 def _apply_env_with_nccl_fallback(
     mappings: Sequence[Tuple[str, str, Optional[str]]],
 ) -> None:
-    """Apply env-var settings with NCCL fallback.
-
-    For each ``(backend_env, nccl_env, explicit_value)`` tuple:
-
-    1. If ``explicit_value`` is given (non-``None``), unconditionally set
-       ``os.environ[backend_env]`` to ``str(explicit_value)``.
-    2. Otherwise, if ``backend_env`` is already set in the environment, leave
-       it alone (respect prior user configuration).
-    3. Otherwise, if ``nccl_env`` is set in the environment, copy its value
-       to ``backend_env``.
-    4. Otherwise leave ``backend_env`` unset so the backend can use its own
-       default.
+    """Set each ``backend_env`` with the first available source:
+    explicit value > existing env > ``nccl_env`` > leave unset.
     """
     for backend_env, nccl_env, explicit in mappings:
         if explicit is not None:
@@ -236,6 +223,11 @@ class _DeepEPLikeBackend:
     def is_available() -> bool:
         """Return True if backend dependencies are importable."""
         raise NotImplementedError
+
+    @staticmethod
+    def supports_cuda_graph() -> bool:
+        """DeepEP-style backends run on the caller's stream and are graph-safe."""
+        return True
 
     @staticmethod
     def _get_module():

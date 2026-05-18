@@ -50,18 +50,8 @@ class UCCLEPBackend(_DeepEPLikeBackend):
         ib_tc: Optional[str] = None,
         ib_sl: Optional[str] = None,
     ) -> None:
-        """Populate UCCL_* RDMA env vars, falling back to NCCL_* when unset.
-
-        Args:
-            ib_gid_index: Override for ``UCCL_IB_GID_INDEX``.
-            ib_hca: Override for ``UCCL_IB_HCA``.
-            socket_ifname: Override for ``UCCL_SOCKET_IFNAME``.
-            ib_tc: Override for ``UCCL_IB_TC``.
-            ib_sl: Override for ``UCCL_IB_SL``.
-
-        Any argument left ``None`` inherits from the corresponding ``NCCL_*``
-        env var when it is set; otherwise the variable stays unset and UCCL
-        applies its own default.
+        """Set UCCL_* RDMA env vars, falling back to ``NCCL_*`` equivalents.
+        ``None`` kwargs inherit from ``NCCL_*`` if set, else UCCL defaults.
         """
         _apply_env_with_nccl_fallback(
             [

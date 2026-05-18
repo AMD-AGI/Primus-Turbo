@@ -233,7 +233,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
 
-        if self.tokens_per_expert.numel() > 0:
+        # ``.item()`` is a D2H sync illegal under CUDA graph capture; fall back
+        # to ``permute_max_token_num`` (or -1) so the graph stays sync-free.
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self.tokens_per_expert.numel() > 0 and not capturing:
             num_out_tokens = self.tokens_per_expert.sum().item()
         elif self.permute_max_token_num > 0:
             num_out_tokens = self.permute_max_token_num

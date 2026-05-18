@@ -248,6 +248,15 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
     @parametrize("backend", _get_backends())
     def test_cuda_graph(self, backend):
         from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
+        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+            _BACKEND_REGISTRY,
+        )
+
+        # Skip backends that self-declare graph-incompatible via
+        # ``EPBackend.supports_cuda_graph`` (currently Mori).
+        backend_cls = _BACKEND_REGISTRY.get(backend)
+        if backend_cls is None or not getattr(backend_cls, "supports_cuda_graph", lambda: True)():
+            self.skipTest(f"EP backend '{backend}' is not CUDA-graph compatible")
 
         self._bind_device()
         with patch.dict(

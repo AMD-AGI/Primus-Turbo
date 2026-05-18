@@ -13,8 +13,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
 
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.core.backend import (
@@ -26,164 +24,6 @@ from primus_turbo.pytorch.core.backend import (
 # =========================================================================
 # Buffer configuration
 # =========================================================================
-
-
-def _compute_expert_token_info_configs() -> List[triton.Config]:
-    """Autotune space for :func:`compute_expert_token_info_kernel`."""
-    configs: List[triton.Config] = []
-    for block_m in (64, 128, 256, 512, 1024):
-        for num_warps in (1, 2, 4, 8):
-            # Wave=64, cap threads/CTA to 1024 (HW limit on CDNA).
-            if num_warps * 64 > 1024:
-                continue
-            # Keep at least one element per thread in the M dimension.
-            if block_m < num_warps * 64:
-                continue
-            for num_stages in (1, 2):
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_SIZE_M": block_m},
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                    )
-                )
-    return configs
-
-
-@triton.autotune(
-    configs=_compute_expert_token_info_configs(),
-    key=["num_tokens", "num_topk"],
-    reset_to_zero=["num_recv_tokens_per_expert_ptr"],
-)
-@triton.jit
-def compute_expert_token_info_kernel(
-    recv_topk_idx_ptr,
-    deepep_topk_idx_ptr,
-    num_recv_tokens_per_expert_ptr,
-    total_recv_ptr,
-    num_tokens: tl.int32,
-    num_topk: tl.int32,
-    num_local_experts: tl.int32,
-    expert_base: tl.int32,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    HAS_TOTAL_RECV: tl.constexpr,
-):
-    """Count per-expert received tokens and emit a DeepEP-format topk_idx. will be removed in the future."""
-    pid = tl.program_id(0)
-    row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col_offs = tl.arange(0, BLOCK_SIZE_K)
-    bin_offs = tl.arange(0, BLOCK_SIZE_N)
-
-    if HAS_TOTAL_RECV:
-        total_recv = tl.load(total_recv_ptr)
-        row_limit = tl.minimum(total_recv, num_tokens)
-    else:
-        row_limit = num_tokens
-
-    in_footprint = row_offs < num_tokens
-    in_valid_rows = row_offs < row_limit
-    col_mask = col_offs < num_topk
-
-    footprint_mask = in_footprint[:, None] & col_mask[None, :]
-    load_mask = in_valid_rows[:, None] & col_mask[None, :]
-
-    safe_row = tl.where(in_footprint, row_offs, 0)
-    expert_offs = safe_row[:, None] * num_topk + col_offs[None, :]
-
-    topk_experts = tl.load(
-        recv_topk_idx_ptr + expert_offs,
-        mask=load_mask,
-        other=0,
-    )
-
-    local_experts = topk_experts - expert_base
-    valid = load_mask & (local_experts >= 0) & (local_experts < num_local_experts)
-    # Clamp the experts of invalid lanes so they land on a legal bin; the
-    # ``mask`` passed to ``tl.histogram`` makes sure they are not counted.
-    safe_experts = tl.where(valid, local_experts, 0)
-
-    # ``tl.histogram`` requires a flat 1D input; reshape the 2D tile.
-    flat_experts = tl.reshape(safe_experts, [BLOCK_SIZE_M * BLOCK_SIZE_K])
-    flat_mask = tl.reshape(valid, [BLOCK_SIZE_M * BLOCK_SIZE_K])
-    local_counts = tl.histogram(flat_experts, BLOCK_SIZE_N, mask=flat_mask)
-
-    # Flush CTA-local accumulator to global memory with one atomic per bin.
-    bin_mask = (bin_offs < num_local_experts) & (local_counts > 0)
-    tl.atomic_add(
-        num_recv_tokens_per_expert_ptr + bin_offs,
-        local_counts,
-        sem="relaxed",
-        scope="gpu",
-        mask=bin_mask,
-    )
-
-    deepep_experts = tl.where(valid, local_experts, -1).to(topk_experts.dtype)
-    tl.store(deepep_topk_idx_ptr + expert_offs, deepep_experts, mask=footprint_mask)
-
-
-def compute_expert_token_info(
-    recv_topk_idx: torch.Tensor,
-    num_local_experts: int,
-    *,
-    expert_base: int = 0,
-    total_recv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Count per-expert received tokens and emit ``recv_topk_idx`` in DeepEP
-    layout (as a new tensor).
-    """
-    assert recv_topk_idx.is_cuda, "recv_topk_idx must be a CUDA tensor"
-    assert recv_topk_idx.dim() == 2, "recv_topk_idx must be 2D [num_tokens, num_topk]"
-
-    device = recv_topk_idx.device
-    num_tokens, num_topk = recv_topk_idx.shape
-
-    num_recv_tokens_per_expert = torch.zeros(num_local_experts, dtype=recv_topk_idx.dtype, device=device)
-    deepep_like_topk_idx = torch.empty_like(recv_topk_idx)
-
-    if num_tokens == 0 or num_topk == 0 or num_local_experts == 0:
-        # Nothing to count; fill the output with the DeepEP padding sentinel
-        # so callers can rely on a uniform layout.
-        if deepep_like_topk_idx.numel() > 0:
-            deepep_like_topk_idx.fill_(-1)
-        return num_recv_tokens_per_expert, deepep_like_topk_idx
-
-    has_total_recv = total_recv is not None
-    if has_total_recv:
-        assert total_recv.is_cuda, "total_recv must be a CUDA tensor"
-        assert total_recv.numel() >= 1, "total_recv must have at least 1 element"
-        # Triton expects an int32 pointer; coerce silently if the caller
-        # passed (e.g.) int64.
-        if total_recv.dtype != torch.int32:
-            total_recv = total_recv.to(torch.int32)
-        total_recv_ptr = total_recv
-    else:
-        # Triton requires a real pointer; reuse ``recv_topk_idx`` as a dummy
-        # (the kernel won't dereference it because ``HAS_TOTAL_RECV=False``).
-        total_recv_ptr = recv_topk_idx
-
-    # ``tl.histogram`` requires ``num_bins`` to be a power of 2 on AMD Triton.
-    block_size_n = triton.next_power_of_2(num_local_experts)
-
-    # ``BLOCK_SIZE_M`` is picked by the autotuner; the grid size depends on it.
-    def grid(META):
-        return (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
-
-    compute_expert_token_info_kernel[grid](
-        recv_topk_idx,
-        deepep_like_topk_idx,
-        num_recv_tokens_per_expert,
-        total_recv_ptr,
-        num_tokens,
-        num_topk,
-        num_local_experts,
-        expert_base,
-        BLOCK_SIZE_K=triton.next_power_of_2(num_topk),
-        BLOCK_SIZE_N=block_size_n,
-        HAS_TOTAL_RECV=has_total_recv,
-    )
-    return num_recv_tokens_per_expert, deepep_like_topk_idx
 
 
 @dataclass
@@ -265,9 +105,9 @@ def set_buffer_global_config(
 # =========================================================================
 # Backend imports
 #
-# Imported after ``EPBufferConfig`` and ``compute_expert_token_info`` are
-# defined so that ``_backend`` submodules can resolve them via deferred
-# (in-function) imports without a circular-import deadlock.
+# Imported after ``EPBufferConfig`` is defined so ``_backend`` submodules can
+# resolve it via deferred (in-function) imports without a circular-import
+# deadlock.
 # =========================================================================
 
 from primus_turbo.pytorch.kernels.moe._backend import (  # noqa: E402
@@ -361,16 +201,11 @@ class EPAutoTuneResult:
 
 
 class MoEDispatchCombineAutoTuner:
-    """Autotuner that picks the best *(backend, dispatch_config, combine_config)*
-    for a given MoE dispatch / combine case.
+    """Picks the best ``(backend, dispatch_config, combine_config)`` per shape.
 
-    Tuning is driven by ``moe_dispatch`` on a shape-based key; the resulting
-    :class:`EPAutoTuneResult` is bound to the returned ``handle`` so that the
-    paired ``moe_combine`` / cached-``moe_dispatch`` / autograd backward can
-    reuse it without any further lookup.
-
-    Enable via ``PRIMUS_TURBO_AUTO_TUNE=1`` or by calling
-    :meth:`get_or_tune` explicitly.
+    The shape-keyed result is bound to the dispatch ``handle`` so the paired
+    combine / cached dispatch / backward reuse it. Enable via
+    ``PRIMUS_TURBO_AUTO_TUNE=1`` or :meth:`get_or_tune`.
     """
 
     # Shape-based cache shared across layers with identical input shape.
@@ -705,6 +540,30 @@ def _maybe_tune_config(
 # =========================================================================
 
 
+def _warn_if_graph_capture_incompatible(backend_name: str, op: str) -> None:
+    """Warn when a graph-incompatible backend runs under active capture.
+
+    Triggered iff ``torch.cuda.is_current_stream_capturing()`` is True and the
+    backend's ``supports_cuda_graph()`` returns False. Does not raise;
+    kernels will likely deadlock so the warning makes the cause obvious.
+    """
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    cls = _BACKEND_REGISTRY.get(backend_name)
+    if cls is None:
+        return
+    supports = getattr(cls, "supports_cuda_graph", None)
+    if supports is None or supports():
+        return
+    logger.warning(
+        f"EP backend '{backend_name}' does not support CUDA graph capture "
+        f"(detected during moe_{op}); dispatch/combine may hang. Switch to "
+        f"a graph-capable backend (e.g. PRIMUS_TURBO_EP_BACKEND=TURBO) or "
+        f"disable capture for this layer.",
+        once=True,
+    )
+
+
 def moe_dispatch_impl(
     x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     group: dist.ProcessGroup,
@@ -733,6 +592,7 @@ def moe_dispatch_impl(
         ``(recv_x, recv_topk_idx, recv_topk_weights, tokens_per_expert, handle)``.
     """
     name, cfg, result = _maybe_tune_config(x, group, handle, topk_idx, token_weights, num_experts)
+    _warn_if_graph_capture_incompatible(name, "dispatch")
     backend = _get_backend_instance(name)
     if num_experts is None or topk_idx is None:
         assert backend.is_initialized(), "Backend is not initialized"
@@ -791,6 +651,7 @@ def moe_combine_impl(
         ``(combined_x, combined_topk_weights)``.
     """
     name, cfg, _ = _maybe_tune_config(x, group, handle, None, None, None)
+    _warn_if_graph_capture_incompatible(name, "combine")
     backend = _get_backend_instance(name)
     assert backend.is_initialized(), "Backend is not initialized"
     return backend.combine(
