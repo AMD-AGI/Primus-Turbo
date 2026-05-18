@@ -127,6 +127,10 @@ def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N, torch_compi
         **get_tolerances(dest_dtype),
     )
 
+    x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv)
+    x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv_ref)
+    torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
+
 
 def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n

@@ -74,5 +74,5 @@ def gemm(
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
-        out_dtype = torch.result_type(a, b)
+        out_dtype = torch.promote_types(a.dtype, b.dtype)
     return GemmFunction.apply(a, b, trans_a, trans_b, out_dtype)

@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -90,8 +90,16 @@ except AttributeError:
 
 ###################################################
 
+# Block size for MXFP4
 MXFP4_BLOCK_SIZE = 32
+# Padding align size for MXFP4
+MXFP4_PADDING_ALIGN_SIZE = 128
+# Block size for MXFP8
 MXFP8_BLOCK_SIZE = 32
+# Padding align size for MXFP8
+MXFP8_PADDING_ALIGN_SIZE = 128
+# Block size for BLOCKWISE scaling
+BLOCKWISE_BLOCK_SIZE = 128
 
 
 class Format(Enum):
@@ -134,12 +142,11 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
-@dataclass
-class ScalingRecipe:
+class ScalingRecipe(NamedTuple):
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
-    - use_2d_block: Whether to use 2D block in quantization. Available in MXFP8 and MXFP4.
+    - use_2d_block: Whether to use 2D block in quantization. Available in blockwise, MXFP8 and MXFP4.
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.

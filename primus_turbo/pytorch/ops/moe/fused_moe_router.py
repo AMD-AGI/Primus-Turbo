@@ -11,6 +11,8 @@ from primus_turbo.pytorch.kernels.moe.fused_moe_router_impl import (
     fused_moe_router_fwd,
 )
 
+__all__ = ["fused_group_topk_routing_with_aux_score"]
+
 
 class FusedGroupTopkRoutingWithAuxScoreFunction(torch.autograd.Function):
     """Fused Scaling GroupTopk and Auxiliary Score Function"""
