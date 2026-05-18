@@ -48,52 +48,59 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
 
-std::vector<at::Tensor>
-quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
-                    const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-                    const bool rowwise_use_rht, const bool colwise_use_2d_block,
-                    const bool colwise_use_sr, const bool colwise_use_rht,
-                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
-                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+std::vector<at::Tensor> quantize_mxfp4_dual(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
+    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+
+at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,
+                                  const int64_t axis, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                       const int64_t axis, const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
-    const bool rowwise_use_sr, const bool rowwise_use_rht, const bool colwise_use_2d_block,
-    const bool colwise_use_sr, const bool colwise_use_rht, const bool shuffle_rowwise_scale = false,
-    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
-    const bool shuffle_colwise = false);
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
+    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
 std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarType dest_dtype,
-                                       const int64_t axis, const bool use_2d_block,
-                                       const bool use_sr, const bool use_rht,
-                                       const bool shuffle_scale = false,
-                                       const bool shuffle_out   = false);
+                                       const int64_t axis, const int64_t padding_align_size,
+                                       const bool use_2d_block, const bool use_sr,
+                                       const bool use_rht, const bool shuffle_scale = false,
+                                       const bool shuffle_out = false);
 
 std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const bool use_2d_block,
-                                            const bool use_sr, const bool use_rht,
-                                            const bool shuffle_scale = false,
-                                            const bool shuffle_out   = false);
+                                            const int64_t axis, const int64_t padding_align_size,
+                                            const bool use_2d_block, const bool use_sr,
+                                            const bool use_rht, const bool shuffle_scale = false,
+                                            const bool shuffle_out = false);
 
 std::vector<at::Tensor>
 quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
-                    const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
-                    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
-                    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+                    const int64_t padding_align_size, const bool rowwise_use_2d_block,
+                    const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
+                    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+                    const bool shuffle_colwise = false);
 
 std::vector<at::Tensor> quantize_mxfp8_dual_meta(
-    const at::Tensor input, const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
-    const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
-    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
-    const bool shuffle_colwise = false);
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
+    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
+    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
 std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
-                                       const int64_t axis, const bool use_2d_block,
-                                       const bool shuffle_scale = false,
-                                       const bool shuffle_out   = false);
+                                       const int64_t axis, const int64_t padding_align_size,
+                                       const bool use_2d_block, const bool shuffle_scale = false,
+                                       const bool shuffle_out = false);
 
 std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const bool use_2d_block,
+                                            const int64_t axis, const int64_t padding_align_size,
+                                            const bool use_2d_block,
                                             const bool shuffle_scale = false,
                                             const bool shuffle_out   = false);
 
@@ -152,20 +159,6 @@ at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
 at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
                                bool transB, bool transC, const std::string &granularity);
-
-//==================================================================
-//  Normalization
-//==================================================================
-
-at::Tensor rmsnorm_fwd(const at::Tensor &input, const at::Tensor &gamma, const double eps);
-
-at::Tensor rmsnorm_fwd_meta(const at::Tensor &input, const at::Tensor &gamma, const double eps);
-
-std::vector<at::Tensor> rmsnorm_bwd(const at::Tensor &input, const at::Tensor &gamma,
-                                    const at::Tensor &grad_output, const double eps);
-
-std::vector<at::Tensor> rmsnorm_bwd_meta(const at::Tensor &input, const at::Tensor &gamma,
-                                         const at::Tensor &grad_output, const double eps);
 
 //==================================================================
 //  Grouped GEMM
