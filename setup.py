@@ -247,6 +247,18 @@ def get_common_flags():
     if check_hip_compiler_flag("-mllvm -amdgpu-coerce-illegal-types=1"):
         nvcc_flags.extend(["-mllvm", "-amdgpu-coerce-illegal-types=1"])
 
+    # gfx950 vmcnt-FIFO race mitigation (2026-05-14): scratch_load (SGPR
+    # spill) and buffer_load_lds share vmcnt but completion order is NOT
+    # FIFO. Compiler-emitted s_waitcnt vmcnt(N>0) for spill restore can
+    # see stale values, leading to wrong m0 → wrong LDS write addr →
+    # SMEM data corruption → MFMA garbage. Manifests as bit-non-determinism
+    # under SGPR pressure (e.g. BN=128 RCR variant at large M_total).
+    # Mitigations: reduce spill (sink instructions, merge m0 inits).
+    if check_hip_compiler_flag("-mllvm -sink-insts-to-avoid-spills=true"):
+        nvcc_flags.extend(["-mllvm", "-sink-insts-to-avoid-spills=true"])
+    if check_hip_compiler_flag("-mllvm -amdgpu-enable-merge-m0=true"):
+        nvcc_flags.extend(["-mllvm", "-amdgpu-enable-merge-m0=true"])
+
     # Device Archs
     offload_arch_list, macro_arch_list = get_offload_archs()
     cxx_flags += macro_arch_list
@@ -285,6 +297,10 @@ def build_kernels_extension():
         Path(PROJECT_ROOT / "csrc"),
         Path(PROJECT_ROOT / "csrc" / "include"),
         Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
+        Path(PROJECT_ROOT / "3rdparty" / "HipKittens" / "include"),
+        Path(PROJECT_ROOT / "3rdparty" / "HipKittens" / "prototype"),
+        Path(PROJECT_ROOT / "3rdparty" / "HipKittens" / "analysis" / "fp8_gemm" / "mi350x"),
+        Path(PROJECT_ROOT / "3rdparty" / "HipKittens" / "analysis" / "bf16_gemm" / "mi350x"),
     ]
     library_dirs = []
 
@@ -301,6 +317,19 @@ def build_kernels_extension():
             or "--hip-link" in ROCSHMEM_LIBRARY.extra_link_args
         ):
             extra_flags["extra_compile_args"]["nvcc"] += ["-fgpu-rdc"]
+
+    # HipKittens kernels (only the *_gfx950.cu adapter files in
+    # csrc/kernels/{gemm,grouped_gemm}/HipKittens/) require these macros.
+    # KITTENS_CDNA4 + HIP_ENABLE_WARP_SYNC_BUILTINS are kittens-internal
+    # gates; safe additive defines for the CK / hipBLASLt sources too.
+    extra_flags["extra_compile_args"]["nvcc"] += [
+        "-DKITTENS_CDNA4", "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+    ]
+    # HipKittens' pyutils header pulls in pybind11 unconditionally
+    # (we ifdef-guard the bound functions but the include itself
+    # happens before our guard). Make pybind11 headers visible.
+    import pybind11 as _pybind11
+    include_dirs.append(Path(_pybind11.get_include()))
 
     return HIPExtension(
         name="libprimus_turbo_kernels",

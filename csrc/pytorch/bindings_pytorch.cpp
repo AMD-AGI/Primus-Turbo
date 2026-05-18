@@ -73,6 +73,24 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("ck_grouped_gemm_fp8_variable_k(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
+    m.def("hk_grouped_rcr_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
+          "ScalarType out_dtype, int bn_block=0) -> Tensor");
+    m.def("hk_grouped_var_k_crr_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_offs, int group_m, int num_xcds, ScalarType out_dtype) -> Tensor");
+    m.def("hk_grouped_rrr_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
+          "ScalarType out_dtype) -> Tensor");
+    m.def("hk_grouped_rcr_bf16(Tensor a, Tensor b, Tensor group_offs, "
+          "int group_m, int m_per_group, int num_xcds) -> Tensor");
+    m.def("hk_grouped_rrr_bf16(Tensor a, Tensor b, Tensor group_offs, "
+          "int group_m, int m_per_group, int num_xcds) -> Tensor");
+    m.def("hk_grouped_var_k_crr_bf16(Tensor a, Tensor b, Tensor group_offs, "
+          "int group_m, int num_xcds) -> Tensor");
+    m.def("hk_gemm_bf16(Tensor a, Tensor b, str layout, "
+          "int group_m, int num_xcds) -> Tensor");
+    m.def("hk_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "str layout, int group_m, ScalarType out_dtype) -> Tensor");
     m.def("hipblaslt_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
           "bool transA, bool transB, bool pre_sync) -> Tensor");
     m.def("hipblaslt_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
@@ -114,6 +132,14 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("ck_grouped_gemm_variable_k", ck_grouped_gemm_variable_k);
     m.impl("ck_grouped_gemm_fp8", ck_grouped_gemm_fp8);
     m.impl("ck_grouped_gemm_fp8_variable_k", ck_grouped_gemm_fp8_variable_k);
+    m.impl("hk_grouped_rcr_fp8", hk_grouped_rcr_fp8);
+    m.impl("hk_grouped_var_k_crr_fp8", hk_grouped_var_k_crr_fp8);
+    m.impl("hk_grouped_rrr_fp8", hk_grouped_rrr_fp8);
+    m.impl("hk_grouped_rcr_bf16", hk_grouped_rcr_bf16);
+    m.impl("hk_grouped_rrr_bf16", hk_grouped_rrr_bf16);
+    m.impl("hk_grouped_var_k_crr_bf16", hk_grouped_var_k_crr_bf16);
+    m.impl("hk_gemm_bf16", hk_gemm_bf16);
+    m.impl("hk_gemm_fp8", hk_gemm_fp8);
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);

@@ -205,6 +205,46 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
                                           const std::string     &granularity,
                                           c10::optional<int64_t> num_cu);
 
+// HipKittens FP8 grouped GEMM (gfx950 only — kernel headers in
+// 3rdparty/HipKittens/analysis/fp8_gemm/mi350x/, adapter in
+// csrc/kernels/grouped_gemm/HipKittens/hk_grouped_gemm_gfx950.cu).
+at::Tensor hk_grouped_rcr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                              at::Tensor &b_scales, at::Tensor &group_offs,
+                              int64_t group_m, int64_t m_per_group, int64_t num_xcds,
+                              at::ScalarType out_dtype, int64_t bn_block = 0);
+
+at::Tensor hk_grouped_var_k_crr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                    at::Tensor &b_scales, at::Tensor &group_offs,
+                                    int64_t group_m, int64_t num_xcds,
+                                    at::ScalarType out_dtype);
+
+at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                              at::Tensor &b_scales, at::Tensor &group_offs,
+                              int64_t group_m, int64_t m_per_group, int64_t num_xcds,
+                              at::ScalarType out_dtype);
+
+// HipKittens BF16 grouped GEMM (gfx950 only — adapter in
+// csrc/kernels/grouped_gemm/HipKittens/hk_grouped_gemm_bf16_gfx950.cu).
+at::Tensor hk_grouped_rcr_bf16(at::Tensor &a, at::Tensor &b, at::Tensor &group_offs,
+                               int64_t group_m, int64_t m_per_group, int64_t num_xcds);
+
+at::Tensor hk_grouped_rrr_bf16(at::Tensor &a, at::Tensor &b, at::Tensor &group_offs,
+                               int64_t group_m, int64_t m_per_group, int64_t num_xcds);
+
+at::Tensor hk_grouped_var_k_crr_bf16(at::Tensor &a, at::Tensor &b, at::Tensor &group_offs,
+                                     int64_t group_m, int64_t num_xcds);
+
+// HipKittens dense GEMM (gfx950 only — entry points appended to the
+// grouped adapters; ATen wrappers in csrc/pytorch/gemm/hk_gemm.cpp).
+at::Tensor hk_gemm_bf16(at::Tensor &a, at::Tensor &b,
+                        const std::string &layout,
+                        int64_t group_m, int64_t num_xcds);
+
+at::Tensor hk_gemm_fp8(at::Tensor &a, at::Tensor &b,
+                       at::Tensor &a_scales, at::Tensor &b_scales,
+                       const std::string &layout, int64_t group_m,
+                       at::ScalarType out_dtype);
+
 at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                                at::Tensor &b_scales, at::Tensor &group_lens,
                                                at::Tensor &group_offs, const bool transA,

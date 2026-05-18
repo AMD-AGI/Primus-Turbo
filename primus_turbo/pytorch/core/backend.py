@@ -60,6 +60,7 @@ _OTHER_PRECISION_HOLDER = "OTHER"
 class BackendType(Enum):
     CK = auto()
     HIPBLASLT = auto()
+    HIPKITTEN = auto()
     AITER = auto()
     TRITON = auto()
     DEEP_EP = auto()
