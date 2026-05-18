@@ -10,3 +10,7 @@ test-reports/
 *_hip.cpp
 *_hip.hpp
 *_hip.cuh
+
+# Local probe/bench scripts + autotune logs (HK debug iteration history)
+scripts/
+auto_optimize_logs/

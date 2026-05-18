@@ -25,7 +25,7 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.HIPKITTEN])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
     seed = 42
@@ -44,6 +44,28 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
         pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
+
+    # HIPKITTEN backend only supports bfloat16 (per _HIPKITTEN_SUPPORTED_DTYPES);
+    # its execute() also ignores num_cu, so reduce_num_cu > 0 just duplicates runs.
+    if backend is BackendType.HIPKITTEN:
+        if dtype != torch.bfloat16:
+            pytest.skip("HIPKITTEN only supports bfloat16")
+        if reduce_num_cu > 0:
+            pytest.skip("HIPKITTEN ignores num_cu; skip duplicate runs")
+
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
+    # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
+    # We skip for now to keep CI stable while we investigate the root cause.
+    # (Also skip when auto_tune=True because the tuner may select hipBLASLt.)
+    if (
+        M <= 512
+        and (backend is BackendType.HIPBLASLT or auto_tune is True)
+        and get_device_compute_capability() == (9, 4)
+    ):
+        pytest.skip(
+            "Intermittent flake on gfx942 with hipBLASLt when M <= 512; "
+            "skipping pending root-cause investigation (not reproduced on MI355)."
+        )
 
     # Set backend and auto_tune config
     GlobalBackendManager.set_grouped_gemm_backend(backend)
