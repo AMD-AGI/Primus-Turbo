@@ -47,6 +47,28 @@ def _get_backends():
     return all_backends
 
 
+def _get_cuda_graph_backends():
+    """Filter ``_get_backends`` down to ones that self-declare graph-safe.
+
+    Done at parametrize time so graph-unsafe backends (e.g. Mori) never enter
+    the worker process: calling ``self.skipTest`` mid-test under
+    ``MultiProcContinuousTest`` re-raises as ``RuntimeError`` and fails the run.
+    """
+    from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+        _BACKEND_REGISTRY,
+    )
+
+    out = []
+    for name in _get_backends():
+        cls = _BACKEND_REGISTRY.get(name)
+        if cls is None:
+            continue
+        supports = getattr(cls, "supports_cuda_graph", None)
+        if supports is None or supports():
+            out.append(name)
+    return out
+
+
 def _run_dispatch_combine(
     rank,
     ep_group,
@@ -245,18 +267,9 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
         os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
         super().setUpClass()
 
-    @parametrize("backend", _get_backends())
+    @parametrize("backend", _get_cuda_graph_backends())
     def test_cuda_graph(self, backend):
         from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
-        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
-            _BACKEND_REGISTRY,
-        )
-
-        # Skip backends that self-declare graph-incompatible via
-        # ``EPBackend.supports_cuda_graph`` (currently Mori).
-        backend_cls = _BACKEND_REGISTRY.get(backend)
-        if backend_cls is None or not getattr(backend_cls, "supports_cuda_graph", lambda: True)():
-            self.skipTest(f"EP backend '{backend}' is not CUDA-graph compatible")
 
         self._bind_device()
         with patch.dict(
