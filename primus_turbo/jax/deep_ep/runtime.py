@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 _ep_group_ranks: Optional[Tuple[int, ...]] = None
 _ep_group_id: Optional[str] = None  # short hash, used as KV-store key suffix
+_ep_fallback_warned: bool = False    # one-shot guard for the "no pin" WARNING
 
 
 def set_ep_group(ep_ranks: Sequence[int]) -> None:
@@ -149,8 +150,31 @@ def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
 
 def _ep_group_size_or_world() -> int:
     """EP-aware ep_size.  Falls back to ``jax.process_count()`` when no
-    group is pinned (legacy "EP == world" semantics)."""
-    return len(_ep_group_ranks) if _ep_group_ranks is not None else jax.process_count()
+    group is pinned (legacy "EP == world" semantics).
+
+    Emits a one-shot WARNING on the fallback path when the JAX world has
+    more than one process: in that regime the fallback is correct only when
+    the EP axis really spans the whole world; otherwise it silently
+    over-sizes IPC/RDMA buffers and inflates ``num_worst_tokens`` by the
+    ``world_size / ep_size`` factor.  Call ``pin_ep_group_from_jax_mesh``
+    before the first DeepEP entry point to silence it.
+    """
+    if _ep_group_ranks is not None:
+        return len(_ep_group_ranks)
+
+    global _ep_fallback_warned
+    nproc = jax.process_count()
+    if not _ep_fallback_warned and nproc > 1:
+        log.warning(
+            "DeepEP EP group not pinned; falling back to ep_size = "
+            "jax.process_count() = %d. If the EP axis is a strict subset of "
+            "the JAX world (e.g. multi-axis 1-GPU/proc mesh), call "
+            "primus_turbo.jax.deep_ep.runtime.pin_ep_group_from_jax_mesh"
+            "(mesh) BEFORE the first DeepEP call to avoid over-allocation.",
+            nproc,
+        )
+        _ep_fallback_warned = True
+    return nproc
 
 
 def _ep_group_rank_or_world() -> int:
@@ -531,12 +555,13 @@ def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) ->
 
 def reset_runtime() -> None:
     global _locked_mode, _per_process_nvl_bytes, _per_process_rdma_bytes
-    global _ep_group_ranks, _ep_group_id
+    global _ep_group_ranks, _ep_group_id, _ep_fallback_warned
     _locked_mode = None
     _per_process_nvl_bytes = 0
     _per_process_rdma_bytes = 0
     _ep_group_ranks = None
     _ep_group_id = None
+    _ep_fallback_warned = False
     try:
         dep = _get_c_deep_ep()
         if dep.is_per_process_buffer_ready():
