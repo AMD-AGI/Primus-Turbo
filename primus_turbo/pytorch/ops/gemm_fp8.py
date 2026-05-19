@@ -241,7 +241,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.TURBO.value,
         )
         ctx.save_for_backward(a, b_fp8, b_scale_inv)
         ctx.trans_a = trans_a

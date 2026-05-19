@@ -21,6 +21,7 @@ from primus_turbo.pytorch.core.backend import (
 )
 from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
 )
@@ -266,14 +267,21 @@ class GEMMFP8TritonBackend(KernelBackend):
 
 
 class GEMMFP8TurboBackend(KernelBackend):
-    """Hand-tuned MXFP8 GEMM kernel for GFX950 (MI350/MI355).
+    """Hand-tuned FP8 GEMM kernels for GFX950 (MI350/MI355).
 
-    Supports MX_BLOCKWISE only. NT layout. Tile 256x256x128.
-    Shape constraints: m,n % 16 == 0, k % 128 == 0, k >= 384.
+    Two scaling modes are routed to two different kernels:
+      - MX_BLOCKWISE: native scaled MFMA, 256×256×128 tile,
+        m,n % 16 == 0, k % 128 == 0, k >= 384.
+      - BLOCKWISE   (DeepSeek-V3 style 1×128 + 128×128 FP32 scales):
+        unscaled MFMA + software promotion, 128×128×128 tile,
+        m,n,k all multiples of 128.
+
+    Both kernels assume forward NT layout (trans_a=F, trans_b=T, trans_c=F).
     """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.MX_BLOCKWISE,
+        ScalingGranularity.BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -290,12 +298,18 @@ class GEMMFP8TurboBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
+        # Both turbo paths consume gfx950-only MFMA instructions.
+        if not check_mxfp8_support()[0]:
+            return False
         supported = True
         supported &= granularity in GEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TurboBackend.SUPPORTED_DTYPES
         supported &= not trans_a and trans_b and not trans_c
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        supported &= m % 16 == 0 and n % 16 == 0 and k % 128 == 0 and k >= 384
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            supported &= m % 16 == 0 and n % 16 == 0 and k % 128 == 0 and k >= 384
+        elif granularity == ScalingGranularity.BLOCKWISE:
+            supported &= m % 128 == 0 and n % 128 == 0 and k % 128 == 0
         return supported
 
     @staticmethod

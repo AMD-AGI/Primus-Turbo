@@ -92,4 +92,19 @@ void turbo_gemm_mxfp8_impl(const AType *a_ptr, const BType *b_ptr,
                            int32_t n, int32_t k, void *workspace, size_t workspace_size,
                            hipStream_t stream);
 
+// ── Blockwise FP8 (DeepSeek-V3 style) ──
+// A-scale layout: rowwise 1×128 FP32, shape [M, ceil(K/128)] (row-major).
+// B-scale layout: 2D 128×128 FP32, shape [ceil(N/128), ceil(K/128)] (row-major).
+// Forward NT only (matches the dispatcher path in primus_turbo.pytorch).
+//
+// Constraints for the turbo kernel: K is a multiple of 128, M and N are
+// multiples of 128. Callers must validate these and fall back otherwise.
+bool turbo_gemm_blockwise_fp8_supported(int32_t m, int32_t n, int32_t k);
+
+template <typename AType, typename BType, typename CType>
+void turbo_gemm_blockwise_fp8_impl(const AType *a_ptr, const BType *b_ptr,
+                                   const float *a_scale_ptr, const float *b_scale_ptr,
+                                   CType *c_ptr, int32_t m, int32_t n, int32_t k,
+                                   hipStream_t stream);
+
 } // namespace primus_turbo

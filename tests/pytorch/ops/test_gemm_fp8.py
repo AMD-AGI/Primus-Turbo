@@ -294,9 +294,20 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.TURBO])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+    # Turbo backend is gfx950-only and only handles the NT-forward 128-aligned
+    # subset; let the test skip cleanly on unsupported configurations.
+    if backend == BackendType.TURBO:
+        mxfp8_supported, reason = check_mxfp8_support()
+        if not mxfp8_supported:
+            pytest.skip(reason)
+        if layout != "NT":
+            pytest.skip("Turbo BLOCKWISE only supports NT forward.")
+        if m % 128 != 0 or n % 128 != 0 or k % 128 != 0:
+            pytest.skip("Turbo BLOCKWISE requires M/N/K multiples of 128.")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
