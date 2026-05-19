@@ -6,16 +6,165 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from enum import IntEnum
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 
 import jax
 
 _MODE_ENV_VAR = "PRIMUS_TURBO_JAX_DEEPEP_MODE"
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+#  EP-group state (decouple "EP rank set" from "JAX world")
+# ---------------------------------------------------------------------------
+#
+# Mirrors the torch ``deep_ep.Buffer(group=ProcessGroup, ...)`` design: the EP
+# communication domain may be a strict subset of all JAX processes (e.g. when
+# only one mesh axis carries expert parallelism while others carry FSDP / data
+# parallelism).  When set, all rank/num_ranks computations below switch to the
+# group-relative view.  When unset, behavior falls back to the legacy
+# "EP == world" assumption (kept for backward compatibility with existing
+# 1-node/proc and single-node 1-GPU/proc users).
+#
+# Storage is module-global because the C++ Buffer singleton lives in
+# ``primus_turbo.jax._C.deep_ep`` and must agree on rank/num_ranks across
+# every Python entry point that touches it.
+
+_ep_group_ranks: Optional[Tuple[int, ...]] = None
+_ep_group_id: Optional[str] = None  # short hash, used as KV-store key suffix
+
+
+def set_ep_group(ep_ranks: Sequence[int]) -> None:
+    """Pin the EP communication domain to a specific ``jax.process_index`` set.
+
+    Must be called collectively (all processes in ``ep_ranks`` pass the same
+    ordered tuple) before the first ``get_mode(lock=True)`` / DeepEP call.
+
+    Arguments:
+        ep_ranks: ordered list of ``jax.process_index()`` values that form
+            this EP group.  Order defines rank-in-group: ``ep_ranks[k]`` is
+            EP-rank ``k``.  ``jax.process_index()`` of the calling process
+            must appear in the list.
+    """
+    global _ep_group_ranks, _ep_group_id
+
+    ranks = tuple(int(r) for r in ep_ranks)
+    if len(ranks) == 0:
+        raise ValueError("ep_ranks must be non-empty")
+    if len(set(ranks)) != len(ranks):
+        raise ValueError(f"ep_ranks must be unique, got duplicates in {ranks}")
+    my_proc = jax.process_index()
+    if my_proc not in ranks:
+        raise ValueError(
+            f"jax.process_index()={my_proc} is not in ep_ranks={ranks}; "
+            "every process that calls set_ep_group must include itself in the group."
+        )
+
+    # Reject silent reconfiguration.  If the same group is already pinned
+    # (collective re-entry from a fresh layer), it's a no-op.
+    if _ep_group_ranks is not None and _ep_group_ranks != ranks:
+        raise RuntimeError(
+            "EP group already pinned; cannot change. "
+            f"Existing={_ep_group_ranks}, new={ranks}. "
+            "Call reset_runtime() between distinct EP groups."
+        )
+
+    _ep_group_ranks = ranks
+    # Stable, collision-resistant id derived from the ordered rank tuple
+    # (all members compute the same id locally — no cross-process exchange).
+    _ep_group_id = hashlib.blake2b(
+        ",".join(str(r) for r in ranks).encode(), digest_size=8
+    ).hexdigest()
+    log.info(
+        "Pinned EP group: size=%d, members=%s, id=%s",
+        len(ranks), ranks, _ep_group_id,
+    )
+
+
+def get_ep_group_ranks() -> Optional[Tuple[int, ...]]:
+    """Return the pinned EP group (ordered tuple), or None if not set."""
+    return _ep_group_ranks
+
+
+def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
+    """Derive the EP group from a ``jax.sharding.Mesh`` axis and pin it.
+
+    Convenience wrapper around ``set_ep_group``.  Walks ``mesh.devices`` along
+    ``axis_name`` for the calling process's slot, collects the
+    ``process_index`` of every EP-axis peer in mesh order, and pins them as
+    the EP group.
+
+    No-ops in two cases (logged, no exception):
+      * the mesh has no axis named ``axis_name``;
+      * the EP axis is intra-process (every entry shares the same
+        ``process_index``) — i.e. 1-node/proc mode, where the legacy
+        "EP == jax.local_device_count()" path in INPROC mode (or
+        "EP == process_count" path in PER_PROCESS mode) is already correct.
+
+    Idempotent: a second call with the same group is a no-op (delegated to
+    ``set_ep_group``).  Reconfiguration with a different group raises.
+
+    Must be called collectively by every process in the EP group, before
+    the first ``ensure_deepep_runtime`` / dispatch / combine call.
+    """
+    if axis_name not in mesh.axis_names:
+        log.info("EP group not pinned: mesh has no axis named %r.", axis_name)
+        return
+    # Local import — keep numpy out of the module top-level; matches the
+    # rest of this file's "import inside function" style for optional deps.
+    import numpy as np  # type: ignore[import-untyped]
+    expert_axis_idx = mesh.axis_names.index(axis_name)
+    devices_arr = np.asarray(mesh.devices)
+    my_proc = jax.process_index()
+    coords_my = None
+    for idx in np.ndindex(*devices_arr.shape):
+        if devices_arr[idx].process_index == my_proc:
+            coords_my = idx
+            break
+    if coords_my is None:
+        raise RuntimeError(
+            f"jax.process_index()={my_proc} not present in mesh.devices; "
+            "cannot derive EP group."
+        )
+    ep_ranks: List[int] = []
+    for v in range(devices_arr.shape[expert_axis_idx]):
+        coords = list(coords_my)
+        coords[expert_axis_idx] = v
+        ep_ranks.append(int(devices_arr[tuple(coords)].process_index))
+    if len(set(ep_ranks)) != len(ep_ranks):
+        log.info(
+            "EP group not pinned: %r axis is intra-process "
+            "(every peer shares process_index=%d); legacy 'EP == world' "
+            "semantics are correct here.",
+            axis_name, my_proc,
+        )
+        return
+    set_ep_group(ep_ranks)
+
+
+def _ep_group_size_or_world() -> int:
+    """EP-aware ep_size.  Falls back to ``jax.process_count()`` when no
+    group is pinned (legacy "EP == world" semantics)."""
+    return len(_ep_group_ranks) if _ep_group_ranks is not None else jax.process_count()
+
+
+def _ep_group_rank_or_world() -> int:
+    """Rank of the calling process within the EP group, or
+    ``jax.process_index()`` when no group is pinned."""
+    if _ep_group_ranks is None:
+        return jax.process_index()
+    return _ep_group_ranks.index(jax.process_index())
+
+
+def _ep_kv_key_suffix() -> str:
+    """Per-EP-group KV-store key suffix.  Empty string when no group is pinned
+    (preserves byte-for-byte compatibility with legacy single-group runs)."""
+    return "" if _ep_group_id is None else f":g{_ep_group_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +188,10 @@ class LaunchMode(IntEnum):
     def ep_size(self) -> int:
         if self is LaunchMode.INPROC:
             return jax.local_device_count()
-        return jax.process_count()
+        # PER_PROCESS: prefer the pinned EP group when set; otherwise fall back
+        # to ``jax.process_count()`` so legacy single-group runs (where
+        # process_count == ep_size by construction) keep working unchanged.
+        return _ep_group_size_or_world()
 
     def target_name(self, op_name: str) -> str:
         return f"{op_name}_{self.mode_name}"
@@ -88,12 +240,22 @@ def auto_detect_mode() -> None:
     DeepEP must use inter-process IPC buffers instead of intra-process
     shared memory.  Call this before the first ``get_mode(lock=True)``
     so that the env var is in place before the mode is locked.
+
+    Heuristic: ``jax.local_device_count() == 1`` is the reliable trigger
+    for PER_PROCESS — it's true under any multi-process launcher,
+    regardless of whether multiple processes share a node or span nodes,
+    or whether the EP communication domain is a strict subset of the
+    JAX world (see ``set_ep_group``).
     """
     if os.environ.get(_MODE_ENV_VAR) is not None:
         return
     if jax.local_device_count() == 1 and jax.process_count() > 1:
         os.environ[_MODE_ENV_VAR] = "per_process"
-        log.info("Auto-detected per_process mode (1 GPU per process, %d processes)", jax.process_count())
+        log.info(
+            "Auto-detected per_process mode "
+            "(1 GPU per process, %d JAX processes, ep_group_size=%d)",
+            jax.process_count(), _ep_group_size_or_world(),
+        )
 
 
 def get_mode(*, lock: bool = False) -> LaunchMode:
@@ -138,7 +300,13 @@ def _get_c_deep_ep():
 
 
 def is_internode(*, lock: bool = False) -> bool:
-    """Return True if ep_size > NUM_MAX_NVL_PEERS (internode communication)."""
+    """Return True if ep_size > NUM_MAX_NVL_PEERS (internode communication).
+
+    ``ep_size`` is the EP-group size (``len(ep_ranks)`` when a group is pinned;
+    otherwise ``jax.process_count()``).  This decouples "EP needs RDMA" from
+    "JAX world spans multiple nodes" — e.g. a 64-process job with EP-group=8
+    is intranode-EP even though the world is multi-node.
+    """
     mode = get_mode(lock=lock)
     if mode.ep_size <= NUM_MAX_NVL_PEERS:
         return False
@@ -153,16 +321,33 @@ def is_internode(*, lock: bool = False) -> bool:
 _kv_allgather_call_id: int = 0
 
 
-def _kv_allgather_bytes(label: str, payload, num_ranks: int, my_rank: int) -> list[bytearray]:
+def _kv_allgather_bytes(
+    label: str,
+    payload,
+    num_ranks: int,
+    my_rank: int,
+    *,
+    rank_to_world: Optional[Sequence[int]] = None,
+) -> list[bytearray]:
     """Bytes-level allgather via JAX distributed KV-store.
 
     Bypasses a known ``jax.experimental.multihost_utils.process_allgather`` bug
     under XLA/RCCL where one random rank's slot in the gathered output is
     silently zero-filled.
 
+    Arguments:
+        label, payload, num_ranks, my_rank: as before; ranks here are
+            *EP-group-relative* (0..num_ranks-1).
+        rank_to_world: optional EP-rank → ``jax.process_index`` mapping used
+            only to disambiguate KV keys when multiple non-overlapping EP
+            groups co-exist (e.g. 8 EP groups of size 8 sharing a 64-process
+            JAX world).  Each group writes/reads under its own key suffix
+            (derived from ``_ep_kv_key_suffix()``), so no cross-group races.
+
     Each call uses a fresh, monotonically increasing call ID so concurrent
     allgathers under different labels don't collide on the same key prefix.
     """
+    del rank_to_world  # group identity already encoded via _ep_kv_key_suffix
     global _kv_allgather_call_id
 
     from jax._src.distributed import global_state as _gs
@@ -170,7 +355,7 @@ def _kv_allgather_bytes(label: str, payload, num_ranks: int, my_rank: int) -> li
     client = _gs.client
     _kv_allgather_call_id += 1
     cid = _kv_allgather_call_id
-    prefix = f"primus_turbo_kvgather:{label}:c{cid}"
+    prefix = f"primus_turbo_kvgather:{label}:c{cid}{_ep_kv_key_suffix()}"
     client.key_value_set(f"{prefix}:{my_rank}", bytes(payload).hex())
     out: list[bytearray] = []
     for r in range(num_ranks):
@@ -182,8 +367,8 @@ def _kv_allgather_bytes(label: str, payload, num_ranks: int, my_rank: int) -> li
 def _check_internode_rank_count(num_ranks: int) -> None:
     if num_ranks % NUM_MAX_NVL_PEERS != 0:
         raise ValueError(
-            f"Internode DeepEP requires process_count to be divisible by "
-            f"NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got {num_ranks}"
+            f"Internode DeepEP requires ep_size to be divisible by "
+            f"NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got ep_size={num_ranks}"
         )
 
 
@@ -220,14 +405,21 @@ def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
 def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     """Create (or grow) the per-process IPC buffer and exchange handles.
 
-    All processes must call this collectively; the IPC handle allgather acts as
-    an implicit barrier.
+    All processes in the EP group must call this collectively; the IPC
+    handle allgather acts as an implicit barrier.
+
+    When an EP group is pinned via ``set_ep_group``, ``rank`` and
+    ``num_ranks`` here are *EP-group-relative* (so the C++ ``Buffer`` —
+    which is sized by these values — only allocates the
+    intersection it actually communicates over).  When no group is pinned,
+    they fall back to ``jax.process_index()`` / ``jax.process_count()`` so
+    legacy single-group runs are unchanged.
     """
     global _per_process_nvl_bytes, _per_process_rdma_bytes
 
     dep = _get_c_deep_ep()
-    rank = jax.process_index()
-    num_ranks = jax.process_count()
+    rank = _ep_group_rank_or_world()
+    num_ranks = _ep_group_size_or_world()
 
     internode = num_ranks > NUM_MAX_NVL_PEERS
     if internode:
@@ -307,9 +499,11 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
 
     log.info(
         "Per-process DeepEP buffer ready: rank=%d, num_ranks=%d, "
-        "nvl_bytes=%d, rdma_bytes=%d, internode=%s",
+        "nvl_bytes=%d, rdma_bytes=%d, internode=%s, ep_group_id=%s",
         rank, num_ranks, num_nvl_bytes, num_rdma_bytes, internode,
+        _ep_group_id or "(world)",
     )
+   
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +531,12 @@ def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) ->
 
 def reset_runtime() -> None:
     global _locked_mode, _per_process_nvl_bytes, _per_process_rdma_bytes
+    global _ep_group_ranks, _ep_group_id
     _locked_mode = None
     _per_process_nvl_bytes = 0
     _per_process_rdma_bytes = 0
+    _ep_group_ranks = None
+    _ep_group_id = None
     try:
         dep = _get_c_deep_ep()
         if dep.is_per_process_buffer_ready():
