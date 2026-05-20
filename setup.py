@@ -30,8 +30,8 @@ ROCSHMEM_LIBRARY = find_rocshmem_library()
 
 # ---------- AITER COMMIT ------------
 
-# PR: feat: _flash_attn_forward add out args (#2648)
-AITER_COMMIT = "857f4d15775a29af153a2c68a2f8e8a8d696c986"
+# PR: Fix dsink bf16 noise in Triton MHA one-kernel backward (#3070)
+AITER_COMMIT = "b5e03ed191fca11ee423226537ef8d9435e432a6"
 
 # -------------------------------------
 
