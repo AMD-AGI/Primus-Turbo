@@ -130,7 +130,10 @@ _HK_FP8_RRR_CANDIDATES: tuple[tuple[int, int], ...] = (
 )
 
 _AUTOTUNE_WARMUP_ITERS = 5
-_AUTOTUNE_TIMED_ITERS = 50  # 2026-05-15: bumped 15→50 + warmup 3→5 because
+_AUTOTUNE_TIMED_ITERS = 50  # 2026-05-19 confirmed 100-iter gives same picks as
+# 50-iter (geomean within 0.3% noise); the brute-force probe's 298us outlier
+# was not reproducible in autotune context — reverted to 50/5 to save first-call
+# cost. 2026-05-15: bumped 15→50 + warmup 3→5 because
 # heavy probe (_probe_down_b4_2048.py at ITERS=50) found cfgs ~1-3% better
 # than 15-iter autotune picks (e.g. fwd RCR Down_B4_M2048: probe pick
 # (gm=12,xcds=2)=1507T vs autotune pick (gm=4,xcds=4)=1489T = +1.2%).
@@ -153,10 +156,15 @@ def _autotune_pick(
                      ``cfg_slot_indices`` get substituted each iter.
     ``cfg_slot_indices`` — positions for the candidate-tuple components.
                           Length must match every candidate's arity.
+
+    Uses cuda-event mean timing only — triton.testing.do_bench was tried
+    but destabilizes the pytest sweep (memory access fault under accumulated
+    state); per user direction 2026-05-20, do_bench is disallowed here.
     """
     cached = _HK_FP8_AUTOTUNE.get(key)
     if cached is not None:
         return cached
+    _do_bench = None
     args = list(fixed_args)
     best_ms = float("inf")
     best_cfg = candidates[0]
@@ -164,17 +172,23 @@ def _autotune_pick(
         for slot, val in zip(cfg_slot_indices, cfg):
             args[slot] = val
         try:
-            for _ in range(_AUTOTUNE_WARMUP_ITERS):
-                op(*args)
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(_AUTOTUNE_TIMED_ITERS):
-                op(*args)
-            end.record()
-            torch.cuda.synchronize()
-            ms = start.elapsed_time(end) / _AUTOTUNE_TIMED_ITERS
+            local_args = tuple(args)
+            fn = lambda local_args=local_args: op(*local_args)
+            if _do_bench is not None:
+                ms = _do_bench(fn, warmup=_AUTOTUNE_WARMUP_ITERS,
+                               rep=_AUTOTUNE_TIMED_ITERS, return_mode="median")
+            else:
+                for _ in range(_AUTOTUNE_WARMUP_ITERS):
+                    op(*args)
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(_AUTOTUNE_TIMED_ITERS):
+                    op(*args)
+                end.record()
+                torch.cuda.synchronize()
+                ms = start.elapsed_time(end) / _AUTOTUNE_TIMED_ITERS
         except Exception:
             continue
         if ms < best_ms:
