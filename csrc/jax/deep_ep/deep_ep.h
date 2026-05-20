@@ -34,9 +34,9 @@ public:
 
     // Synchronize buffer pointers using IPC handles gathered from all ranks.
     // Each element is the raw bytes of a hipIpcMemHandle_t (size HIP_IPC_HANDLE_SIZE).
-    void SyncFromIPCHandles(
-        const std::vector<std::optional<pybind11::bytearray>> &all_handles,
-        const std::optional<pybind11::bytes>                  &root_unique_id_opt = std::nullopt);
+    void
+    SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+                       const std::optional<pybind11::bytes> &root_unique_id_opt = std::nullopt);
 
     int64_t num_nvl_bytes() const { return num_nvl_bytes_; }
     int64_t num_rdma_bytes() const { return num_rdma_bytes_; }
@@ -103,55 +103,51 @@ public:
         std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
         std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
         ffi::Buffer<ffi::PRED>               is_token_in_rank,
-        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert,
-        int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
+        std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert, int cached_num_recv_tokens,
+        int                                  cached_num_rdma_recv_tokens,
         std::optional<ffi::Buffer<ffi::S32>> cached_rdma_channel_prefix_matrix,
         std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
         std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
-        std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum,
-        int expert_alignment, int num_worst_tokens, primus_turbo::deep_ep::Config config,
-        ffi::Result<ffi::AnyBuffer>                      recv_x,
-        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
-        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
+        std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum, int expert_alignment,
+        int num_worst_tokens, primus_turbo::deep_ep::Config config,
+        ffi::Result<ffi::AnyBuffer>                        recv_x,
+        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_x_scales,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_topk_idx,
+        std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_topk_weights,
         std::optional<ffi::Result<ffi::Buffer<ffi::PRED>>> is_token_in_rank_out,
         std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  num_tokens_per_rank_out,
         std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  num_tokens_per_expert_out,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rdma_channel_prefix_matrix,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_rank_prefix_sum,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> gbl_channel_prefix_matrix,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_rank_prefix_sum,
-        std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>  recv_src_meta,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_channel_prefix_matrix,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_channel_prefix_matrix,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_rdma_head,
-        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_nvl_head);
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  rdma_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_rdma_rank_prefix_sum,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  gbl_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_gbl_rank_prefix_sum,
+        std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>   recv_src_meta,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_rdma_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_gbl_channel_prefix_matrix,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  send_rdma_head,
+        std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  send_nvl_head);
 
     void InternodeCombine(
         hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> topk_weights,
-        ffi::Buffer<ffi::U8>  src_meta,
-        ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
+        ffi::Buffer<ffi::U8> src_meta, ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
         ffi::Buffer<ffi::S32> rdma_channel_prefix_matrix,
-        ffi::Buffer<ffi::S32> rdma_rank_prefix_sum,
-        ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
+        ffi::Buffer<ffi::S32> rdma_rank_prefix_sum, ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
         std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
-        ffi::Buffer<ffi::S32> combined_rdma_head,
-        ffi::Buffer<ffi::S32> combined_nvl_head,
-        primus_turbo::deep_ep::Config config,
-        ffi::Result<ffi::AnyBuffer>                       combined_x,
+        ffi::Buffer<ffi::S32> combined_rdma_head, ffi::Buffer<ffi::S32> combined_nvl_head,
+        primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
         std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights);
 
 private:
     // NVLink Buffer
-    int64_t            num_nvl_bytes_;
-    hipIpcMemHandle_t  ipc_handles_[NUM_MAX_NVL_PEERS] = {};
-    bool               ipc_synced_ = false;
-    void              *buffer_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
-    void             **buffer_ptrs_gpu_                = nullptr;
+    int64_t           num_nvl_bytes_;
+    hipIpcMemHandle_t ipc_handles_[NUM_MAX_NVL_PEERS] = {};
+    bool              ipc_synced_                     = false;
+    void             *buffer_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
+    void            **buffer_ptrs_gpu_                = nullptr;
 
     // NVSHMEM Buffer
     int64_t num_rdma_bytes_;
-    void   *rdma_buffer_ptr_ = nullptr;
+    void   *rdma_buffer_ptr_      = nullptr;
     bool    rocshmem_initialized_ = false;
 
     // Device info and communication
@@ -193,14 +189,14 @@ Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::Config &config);
 
 // Per-process mode: single buffer per process, IPC-synced from Python.
-Buffer *get_per_process_buffer();
+Buffer             *get_per_process_buffer();
 pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t num_nvl_bytes,
                                               int64_t num_rdma_bytes);
-void sync_per_process_buffer(
-    const std::vector<std::optional<pybind11::bytearray>> &all_handles,
-    const std::optional<pybind11::bytes>                  &root_unique_id_opt = std::nullopt);
-void destroy_per_process_buffer();
-bool is_per_process_buffer_ready();
+void                sync_per_process_buffer(
+                   const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+                   const std::optional<pybind11::bytes>                  &root_unique_id_opt = std::nullopt);
+void    destroy_per_process_buffer();
+bool    is_per_process_buffer_ready();
 int64_t per_process_buffer_nvl_bytes();
 
 } // namespace primus_turbo::jax::deep_ep

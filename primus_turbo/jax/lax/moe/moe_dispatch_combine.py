@@ -218,9 +218,17 @@ def _moe_dispatch_impl(
 
     if internode:
         return _moe_dispatch_impl_internode(
-            x, x_scales, handle, topk_idx, topk_weights,
-            expert_alignment, num_experts, config,
-            ep_size, launch_mode, num_worst_tokens,
+            x,
+            x_scales,
+            handle,
+            topk_idx,
+            topk_weights,
+            expert_alignment,
+            num_experts,
+            config,
+            ep_size,
+            launch_mode,
+            num_worst_tokens,
         )
 
     if handle is not None:
@@ -304,12 +312,20 @@ def _moe_dispatch_impl(
 
 
 def _moe_dispatch_impl_internode(
-    x, x_scales, handle, topk_idx, topk_weights,
-    expert_alignment, num_experts, config,
-    ep_size, launch_mode, num_worst_tokens,
+    x,
+    x_scales,
+    handle,
+    topk_idx,
+    topk_weights,
+    expert_alignment,
+    num_experts,
+    config,
+    ep_size,
+    launch_mode,
+    num_worst_tokens,
 ):
     """Internode dispatch path (ep_size > 8)."""
-    num_tokens = x.shape[0]
+    x.shape[0]
     source_meta_bytes = _get_source_meta_bytes()
 
     if handle is not None:
@@ -509,7 +525,12 @@ def _moe_combine_impl(
 
     if internode:
         return _moe_combine_impl_internode(
-            x, handle, topk_weights, config, ep_size, launch_mode,
+            x,
+            handle,
+            topk_weights,
+            config,
+            ep_size,
+            launch_mode,
         )
 
     # unpack bias
@@ -552,7 +573,12 @@ def _moe_combine_impl(
 
 
 def _moe_combine_impl_internode(
-    x, handle, topk_weights, config, ep_size, launch_mode,
+    x,
+    handle,
+    topk_weights,
+    config,
+    ep_size,
+    launch_mode,
 ):
     """Internode combine path (ep_size > 8)."""
     (

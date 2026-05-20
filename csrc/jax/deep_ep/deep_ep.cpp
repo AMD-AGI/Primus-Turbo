@@ -184,8 +184,8 @@ void Buffer::Destroy() {
             // after IPC sync) never became visible to kernels, so close the
             // handles without the collective barrier.
             if (is_available()) {
-                primus_turbo::deep_ep::intranode::barrier(
-                    barrier_signal_ptrs_gpu_, nvl_rank_, num_nvl_ranks_, nullptr);
+                primus_turbo::deep_ep::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
+                                                          num_nvl_ranks_, nullptr);
                 PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
             }
 
@@ -207,7 +207,7 @@ void Buffer::Destroy() {
             primus_turbo::deep_ep::internode::free(rdma_buffer_ptr_);
         }
         primus_turbo::deep_ep::internode::finalize();
-        rdma_buffer_ptr_ = nullptr;
+        rdma_buffer_ptr_      = nullptr;
         rocshmem_initialized_ = false;
     }
 #endif
@@ -218,22 +218,22 @@ void Buffer::Destroy() {
     }
     if (moe_recv_counter_ != nullptr) {
         PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_counter_)));
-        moe_recv_counter_ = nullptr;
+        moe_recv_counter_        = nullptr;
         moe_recv_counter_mapped_ = nullptr;
     }
     if (moe_recv_expert_counter_ != nullptr) {
         PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_expert_counter_)));
-        moe_recv_expert_counter_ = nullptr;
+        moe_recv_expert_counter_        = nullptr;
         moe_recv_expert_counter_mapped_ = nullptr;
     }
     if (moe_recv_rdma_counter_ != nullptr) {
         PRIMUS_TURBO_CHECK_HIP(hipFreeHost(const_cast<int *>(moe_recv_rdma_counter_)));
-        moe_recv_rdma_counter_ = nullptr;
+        moe_recv_rdma_counter_        = nullptr;
         moe_recv_rdma_counter_mapped_ = nullptr;
     }
 
     is_available_ = false;
-    destroyed_ = true;
+    destroyed_    = true;
 }
 
 bool Buffer::is_internode_available() const {
@@ -583,29 +583,28 @@ void Buffer::InternodeDispatch(
     std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rank,
     std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_rdma_rank,
     ffi::Buffer<ffi::PRED>               is_token_in_rank,
-    std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert,
-    int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
+    std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert, int cached_num_recv_tokens,
+    int                                  cached_num_rdma_recv_tokens,
     std::optional<ffi::Buffer<ffi::S32>> cached_rdma_channel_prefix_matrix,
     std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
     std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
-    std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum,
-    int expert_alignment, int num_worst_tokens, primus_turbo::deep_ep::Config config,
-    ffi::Result<ffi::AnyBuffer>                      recv_x,
-    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
-    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
+    std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum, int expert_alignment,
+    int num_worst_tokens, primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
+    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_x_scales,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_topk_idx,
+    std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_topk_weights,
     std::optional<ffi::Result<ffi::Buffer<ffi::PRED>>> is_token_in_rank_out,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  num_tokens_per_rank_out,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  num_tokens_per_expert_out,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> rdma_channel_prefix_matrix,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_rank_prefix_sum,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> gbl_channel_prefix_matrix,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_rank_prefix_sum,
-    std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>  recv_src_meta,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_rdma_channel_prefix_matrix,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_gbl_channel_prefix_matrix,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_rdma_head,
-    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> send_nvl_head) {
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  rdma_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_rdma_rank_prefix_sum,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  gbl_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_gbl_rank_prefix_sum,
+    std::optional<ffi::Result<ffi::Buffer<ffi::U8>>>   recv_src_meta,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_rdma_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_gbl_channel_prefix_matrix,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  send_rdma_head,
+    std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  send_nvl_head) {
 
 #ifndef DISABLE_ROCSHMEM
     const int num_channels = config.num_sms / 2;
@@ -649,8 +648,8 @@ void Buffer::InternodeDispatch(
     PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
     PRIMUS_TURBO_CHECK((x.dimensions()[1] * ffi::ByteWidth(x.element_type())) % sizeof(int4) == 0);
 
-    auto num_tokens = static_cast<int>(x.dimensions()[0]),
-         hidden     = static_cast<int>(x.dimensions()[1]);
+    auto num_tokens  = static_cast<int>(x.dimensions()[0]),
+         hidden      = static_cast<int>(x.dimensions()[1]);
     auto hidden_int4 = static_cast<int>(hidden * ffi::ByteWidth(x.element_type()) / sizeof(int4));
     auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->dimensions()[0]),
          num_local_experts = num_experts / num_ranks_;
@@ -703,11 +702,10 @@ void Buffer::InternodeDispatch(
             hidden_int4, num_scales, num_topk, num_topk, num_ranks_, num_channels, 0, nullptr,
             nullptr, nullptr, nullptr, rdma_buffer_ptr_, config.num_max_rdma_chunked_recv_tokens,
             buffer_ptrs_gpu_, config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu_,
-            rank_, stream,
-            config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks_),
+            rank_, stream, config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks_),
             num_nvl_bytes_, true, false);
     } else {
-        *moe_recv_counter_ = -1;
+        *moe_recv_counter_      = -1;
         *moe_recv_rdma_counter_ = -1;
         for (int i = 0; i < num_local_experts; ++i)
             moe_recv_expert_counter_[i] = -1;
@@ -778,8 +776,7 @@ void Buffer::InternodeDispatch(
 
     primus_turbo::deep_ep::internode::dispatch(
         recv_x->untyped_data(), recv_x_scales_ptr, recv_topk_idx_ptr, recv_topk_weights_ptr,
-        cached_mode ? nullptr
-                    : static_cast<void *>(recv_src_meta.value()->typed_data()),
+        cached_mode ? nullptr : static_cast<void *>(recv_src_meta.value()->typed_data()),
         x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
         cached_mode ? nullptr : send_rdma_head.value()->typed_data(),
         cached_mode ? nullptr : send_nvl_head.value()->typed_data(),
@@ -807,16 +804,12 @@ void Buffer::InternodeDispatch(
 
 void Buffer::InternodeCombine(
     hipStream_t stream, ffi::AnyBuffer x, std::optional<ffi::Buffer<ffi::F32>> topk_weights,
-    ffi::Buffer<ffi::U8>  src_meta,
-    ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
-    ffi::Buffer<ffi::S32> rdma_channel_prefix_matrix,
-    ffi::Buffer<ffi::S32> rdma_rank_prefix_sum,
-    ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
+    ffi::Buffer<ffi::U8> src_meta, ffi::Buffer<ffi::PRED> is_combined_token_in_rank,
+    ffi::Buffer<ffi::S32> rdma_channel_prefix_matrix, ffi::Buffer<ffi::S32> rdma_rank_prefix_sum,
+    ffi::Buffer<ffi::S32>                gbl_channel_prefix_matrix,
     std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
-    ffi::Buffer<ffi::S32> combined_rdma_head,
-    ffi::Buffer<ffi::S32> combined_nvl_head,
-    primus_turbo::deep_ep::Config config,
-    ffi::Result<ffi::AnyBuffer>                       combined_x,
+    ffi::Buffer<ffi::S32> combined_rdma_head, ffi::Buffer<ffi::S32> combined_nvl_head,
+    primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights) {
 
 #ifndef DISABLE_ROCSHMEM
@@ -831,8 +824,8 @@ void Buffer::InternodeCombine(
     PRIMUS_TURBO_CHECK(gbl_channel_prefix_matrix.dimensions().size() == 2);
     PRIMUS_TURBO_CHECK(combined_rdma_head.dimensions().size() == 2);
     PRIMUS_TURBO_CHECK(combined_nvl_head.dimensions().size() == 2);
-    auto num_tokens = static_cast<int>(x.dimensions()[0]),
-         hidden     = static_cast<int>(x.dimensions()[1]);
+    auto num_tokens  = static_cast<int>(x.dimensions()[0]),
+         hidden      = static_cast<int>(x.dimensions()[1]);
     auto hidden_int4 = static_cast<int>(hidden * ffi::ByteWidth(x.element_type()) / sizeof(int4));
     auto num_combined_tokens = static_cast<int>(is_combined_token_in_rank.dimensions()[0]);
     PRIMUS_TURBO_CHECK((hidden * ffi::ByteWidth(x.element_type())) % sizeof(int4) == 0);
@@ -863,11 +856,11 @@ void Buffer::InternodeCombine(
         PRIMUS_TURBO_CHECK(combined_topk_weights.has_value());
         PRIMUS_TURBO_CHECK(topk_weights->dimensions().size() == 2);
         PRIMUS_TURBO_CHECK(topk_weights->dimensions()[0] == num_tokens);
-        num_topk         = static_cast<int>(topk_weights->dimensions()[1]);
+        num_topk = static_cast<int>(topk_weights->dimensions()[1]);
         PRIMUS_TURBO_CHECK(combined_topk_weights.value()->dimensions().size() == 2);
         PRIMUS_TURBO_CHECK(combined_topk_weights.value()->dimensions()[0] == num_combined_tokens);
         PRIMUS_TURBO_CHECK(combined_topk_weights.value()->dimensions()[1] == num_topk);
-        topk_weights_ptr = topk_weights->typed_data();
+        topk_weights_ptr          = topk_weights->typed_data();
         combined_topk_weights_ptr = combined_topk_weights.value()->typed_data();
     }
 
@@ -888,18 +881,16 @@ void Buffer::InternodeCombine(
         gbl_rank_prefix_sum.has_value() ? gbl_rank_prefix_sum->typed_data() : nullptr;
 
     primus_turbo::deep_ep::internode::combine(
-        primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()),
-        combined_x->untyped_data(), combined_topk_weights_ptr,
-        is_combined_token_in_rank.typed_data(), x.untyped_data(), topk_weights_ptr,
-        nullptr, nullptr,
-        combined_rdma_head.typed_data(), combined_nvl_head.typed_data(),
-        src_meta.untyped_data(), rdma_channel_prefix_matrix.typed_data(),
-        rdma_rank_prefix_sum.typed_data(), gbl_channel_prefix_matrix.typed_data(),
-        gbl_rank_prefix_sum_ptr, num_tokens, num_combined_tokens, hidden, num_topk,
-        rdma_buffer_ptr_, config.num_max_rdma_chunked_send_tokens,
-        config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu_,
-        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens, rank_,
-        num_ranks_, stream, num_channels, false);
+        primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()), combined_x->untyped_data(),
+        combined_topk_weights_ptr, is_combined_token_in_rank.typed_data(), x.untyped_data(),
+        topk_weights_ptr, nullptr, nullptr, combined_rdma_head.typed_data(),
+        combined_nvl_head.typed_data(), src_meta.untyped_data(),
+        rdma_channel_prefix_matrix.typed_data(), rdma_rank_prefix_sum.typed_data(),
+        gbl_channel_prefix_matrix.typed_data(), gbl_rank_prefix_sum_ptr, num_tokens,
+        num_combined_tokens, hidden, num_topk, rdma_buffer_ptr_,
+        config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu_, config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens, rank_, num_ranks_, stream, num_channels, false);
 
 #else
     PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled; internode unavailable");
@@ -913,9 +904,8 @@ pybind11::bytearray Buffer::get_local_ipc_handle() const {
     return {ipc_handles_[nvl_rank_].reserved, HIP_IPC_HANDLE_SIZE};
 }
 
-void Buffer::SyncFromIPCHandles(
-    const std::vector<std::optional<pybind11::bytearray>> &all_handles,
-    const std::optional<pybind11::bytes>                  &root_unique_id_opt) {
+void Buffer::SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+                                const std::optional<pybind11::bytes> &root_unique_id_opt) {
     PRIMUS_TURBO_CHECK(not is_available());
     PRIMUS_TURBO_CHECK(not ipc_synced_);
     PRIMUS_TURBO_CHECK(static_cast<int>(all_handles.size()) == num_ranks_);
@@ -929,8 +919,8 @@ void Buffer::SyncFromIPCHandles(
             if (offset + i != rank_) {
                 hipIpcMemHandle_t remote_handle;
                 std::memcpy(remote_handle.reserved, handle_str.c_str(), HIP_IPC_HANDLE_SIZE);
-                PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(
-                    &buffer_ptrs_[i], remote_handle, hipIpcMemLazyEnablePeerAccess));
+                PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(&buffer_ptrs_[i], remote_handle,
+                                                           hipIpcMemLazyEnablePeerAccess));
                 barrier_signal_ptrs_[i] = reinterpret_cast<int *>(
                     static_cast<uint8_t *>(buffer_ptrs_[i]) + num_nvl_bytes_);
             } else {
@@ -940,7 +930,8 @@ void Buffer::SyncFromIPCHandles(
         }
 
         PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
-                                         sizeof(void *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+                                         sizeof(void *) * NUM_MAX_NVL_PEERS,
+                                         hipMemcpyHostToDevice));
         PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
                                          sizeof(int *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
@@ -952,11 +943,9 @@ void Buffer::SyncFromIPCHandles(
     if (num_rdma_bytes_ > 0) {
         PRIMUS_TURBO_CHECK(root_unique_id_opt.has_value());
         auto                 root_unique_id_str = root_unique_id_opt->cast<std::string>();
-        std::vector<uint8_t> root_unique_id(root_unique_id_str.begin(),
-                                            root_unique_id_str.end());
-        PRIMUS_TURBO_CHECK(
-            rdma_rank_ == primus_turbo::deep_ep::internode::init(
-                              root_unique_id, rdma_rank_, num_rdma_ranks_, false));
+        std::vector<uint8_t> root_unique_id(root_unique_id_str.begin(), root_unique_id_str.end());
+        PRIMUS_TURBO_CHECK(rdma_rank_ == primus_turbo::deep_ep::internode::init(
+                                             root_unique_id, rdma_rank_, num_rdma_ranks_, false));
         rocshmem_initialized_ = true;
         primus_turbo::deep_ep::internode::barrier();
 
@@ -980,7 +969,9 @@ void Buffer::SyncFromIPCHandles(
 
 static std::unique_ptr<Buffer> g_per_process_buffer;
 
-Buffer *get_per_process_buffer() { return g_per_process_buffer.get(); }
+Buffer *get_per_process_buffer() {
+    return g_per_process_buffer.get();
+}
 
 pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t num_nvl_bytes,
                                               int64_t num_rdma_bytes) {
@@ -993,9 +984,8 @@ pybind11::bytearray create_per_process_buffer(int rank, int num_ranks, int64_t n
     return g_per_process_buffer->get_local_ipc_handle();
 }
 
-void sync_per_process_buffer(
-    const std::vector<std::optional<pybind11::bytearray>> &all_handles,
-    const std::optional<pybind11::bytes>                  &root_unique_id_opt) {
+void sync_per_process_buffer(const std::vector<std::optional<pybind11::bytearray>> &all_handles,
+                             const std::optional<pybind11::bytes> &root_unique_id_opt) {
     PRIMUS_TURBO_CHECK(g_per_process_buffer != nullptr);
     g_per_process_buffer->SyncFromIPCHandles(all_handles, root_unique_id_opt);
 }

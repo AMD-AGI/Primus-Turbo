@@ -57,6 +57,7 @@ def _init_per_process():
     import jax
     import jax.numpy as jnp
     import numpy as np
+
     import primus_turbo.jax  # noqa: F401 – registers FFI targets
 
     primus_turbo.jax.initialize()
@@ -72,10 +73,7 @@ def _generate(rank, world_size):
     key = jax.random.PRNGKey(rank)
 
     x = jnp.ones((_NUM_TOKENS, _HIDDEN), dtype=jnp.bfloat16) * rank
-    scores = (
-        jnp.abs(jax.random.normal(key, (_NUM_TOKENS, num_experts), dtype=jnp.float32))
-        + 1
-    )
+    scores = jnp.abs(jax.random.normal(key, (_NUM_TOKENS, num_experts), dtype=jnp.float32)) + 1
     topk_idx = jax.lax.top_k(scores, _NUM_TOPK)[1].astype(jnp.int32)
     topk_weights = jnp.ones((_NUM_TOKENS, _NUM_TOPK), dtype=jnp.float32) * rank
 
@@ -85,6 +83,7 @@ def _generate(rank, world_size):
 def _per_token_cast_to_fp8(x):
     """BF16 ``[n, h]`` -> ``(FP8 E4M3 [n, h], scales [n, h//128])``."""
     import jax.numpy as jnp
+
     from primus_turbo.jax.core.low_precision import float8_e4m3
 
     n, h = x.shape
@@ -127,19 +126,19 @@ def _check_dispatch(cx, cw, rpm, rank, world_size, num_experts):
     start = 0
     for src in range(world_size):
         end = int(rpm[src][rank])
-        assert (cx[start:end, :].astype(np.int32) - src).sum() == 0, (
-            f"Rank {rank}: tokens from src={src} should carry value {src}"
-        )
-        assert (cw[start:end, :].astype(np.int32) - src).sum() == 0, (
-            f"Rank {rank}: weights from src={src} should carry value {src}"
-        )
+        assert (
+            cx[start:end, :].astype(np.int32) - src
+        ).sum() == 0, f"Rank {rank}: tokens from src={src} should carry value {src}"
+        assert (
+            cw[start:end, :].astype(np.int32) - src
+        ).sum() == 0, f"Rank {rank}: weights from src={src} should carry value {src}"
         start = end
 
 
 def _dispatch_and_check(rank, world_size, use_fp8):
     """Run dispatch + combine forward and return ``(combined_x, x, handle)``."""
-    import numpy as np
     import jax.numpy as jnp
+    import numpy as np
 
     from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
 
@@ -254,9 +253,7 @@ def _worker_eval_shape(rank, world_size):
     warmup(hidden_bytes)
 
     def model_fn(x, topk_idx, topk_weights):
-        recv_x, _, _, handle = moe_dispatch(
-            x, topk_idx, topk_weights, num_experts
-        )
+        recv_x, _, _, handle = moe_dispatch(x, topk_idx, topk_weights, num_experts)
         combined_x = moe_combine(recv_x, handle)
         return combined_x
 
@@ -265,9 +262,9 @@ def _worker_eval_shape(rank, world_size):
     weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
 
     out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
-    assert out_shape.shape[1] == _HIDDEN, (
-        f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
-    )
+    assert (
+        out_shape.shape[1] == _HIDDEN
+    ), f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
 
 
 def _worker_eval_shape_no_warmup(rank, world_size):
@@ -282,9 +279,7 @@ def _worker_eval_shape_no_warmup(rank, world_size):
     num_experts = _EXPERTS_PER_RANK * world_size
 
     def model_fn(x, topk_idx, topk_weights):
-        recv_x, _, _, handle = moe_dispatch(
-            x, topk_idx, topk_weights, num_experts
-        )
+        recv_x, _, _, handle = moe_dispatch(x, topk_idx, topk_weights, num_experts)
         combined_x = moe_combine(recv_x, handle)
         return combined_x
 
@@ -293,9 +288,9 @@ def _worker_eval_shape_no_warmup(rank, world_size):
     weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
 
     out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
-    assert out_shape.shape[1] == _HIDDEN, (
-        f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
-    )
+    assert (
+        out_shape.shape[1] == _HIDDEN
+    ), f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
 
 
 # ---------------------------------------------------------------------------

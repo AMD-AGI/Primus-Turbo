@@ -5,9 +5,9 @@
 ###############################################################################
 
 from .runtime import (
-    LaunchMode,
     MODE_INPROC,
     MODE_PER_PROCESS,
+    LaunchMode,
     ensure_deepep_runtime,
     get_ep_size,
     get_launch_mode,

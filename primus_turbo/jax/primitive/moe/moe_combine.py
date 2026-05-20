@@ -102,16 +102,13 @@ def _moe_internode_combine_abstract_eval(
     num_combined_tokens = is_combined_token_in_rank.shape[0]
     _, hidden_size = x.shape
     combined_x = ShapedArray((num_combined_tokens, hidden_size), x.dtype)
-    shape = (
-        (num_combined_tokens, topk_weights.shape[1])
-        if topk_weights.size > 0
-        else topk_weights.shape
-    )
+    shape = (num_combined_tokens, topk_weights.shape[1]) if topk_weights.size > 0 else topk_weights.shape
     combined_topk_weights = ShapedArray(shape, topk_weights.dtype)
     return combined_x, combined_topk_weights
 
 
 ABSTRACT_EVAL_TABLE[moe_internode_combine_p] = _moe_internode_combine_abstract_eval
+
 
 # ----------------------------------------
 # Step-4: JIT Lowering
@@ -125,7 +122,9 @@ LOWERING_TABLE[moe_combine_p] = _moe_combine_lowering
 
 
 def _moe_internode_combine_lowering(ctx, *args, **kwargs):
-    return jax.ffi.ffi_lowering("moe_internode_combine_per_process", has_side_effect=True)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_combine_per_process", has_side_effect=True)(
+        ctx, *args, **kwargs
+    )
 
 
 LOWERING_TABLE[moe_internode_combine_p] = _moe_internode_combine_lowering

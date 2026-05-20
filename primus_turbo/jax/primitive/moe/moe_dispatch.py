@@ -188,23 +188,23 @@ def _moe_internode_dispatch_abstract_eval(
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_worst_tokens)
 
     return (
-        ShapedArray((num_worst_tokens, hidden_size), x.dtype),            # recv_x
-        recv_x_scales,                                                     # recv_x_scales
-        ShapedArray((num_worst_tokens, num_topk), jnp.int32),             # recv_topk_idx
-        ShapedArray((num_worst_tokens, num_topk), jnp.float32),           # recv_topk_weights
-        ShapedArray((num_tokens, num_ranks), jnp.bool_),                  # is_token_in_rank
-        ShapedArray((num_ranks,), jnp.int32),                             # num_tokens_per_rank
-        ShapedArray((num_rdma_ranks,), jnp.int32),                        # num_tokens_per_rdma_rank
-        ShapedArray((num_experts,), jnp.int32),                           # num_tokens_per_expert
-        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),           # rdma_channel_prefix_matrix
-        ShapedArray((num_rdma_ranks,), jnp.int32),                        # recv_rdma_rank_prefix_sum
-        ShapedArray((num_ranks, num_channels), jnp.int32),                # gbl_channel_prefix_matrix
-        ShapedArray((num_ranks,), jnp.int32),                             # recv_gbl_rank_prefix_sum
-        ShapedArray((num_worst_tokens, source_meta_bytes), jnp.uint8),    # recv_src_meta
-        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),           # recv_rdma_channel_prefix_matrix
-        ShapedArray((num_ranks, num_channels), jnp.int32),                # recv_gbl_channel_prefix_matrix
-        ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),             # send_rdma_head
-        ShapedArray((num_worst_tokens, NUM_MAX_NVL_PEERS), jnp.int32),    # send_nvl_head
+        ShapedArray((num_worst_tokens, hidden_size), x.dtype),  # recv_x
+        recv_x_scales,  # recv_x_scales
+        ShapedArray((num_worst_tokens, num_topk), jnp.int32),  # recv_topk_idx
+        ShapedArray((num_worst_tokens, num_topk), jnp.float32),  # recv_topk_weights
+        ShapedArray((num_tokens, num_ranks), jnp.bool_),  # is_token_in_rank
+        ShapedArray((num_ranks,), jnp.int32),  # num_tokens_per_rank
+        ShapedArray((num_rdma_ranks,), jnp.int32),  # num_tokens_per_rdma_rank
+        ShapedArray((num_experts,), jnp.int32),  # num_tokens_per_expert
+        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),  # rdma_channel_prefix_matrix
+        ShapedArray((num_rdma_ranks,), jnp.int32),  # recv_rdma_rank_prefix_sum
+        ShapedArray((num_ranks, num_channels), jnp.int32),  # gbl_channel_prefix_matrix
+        ShapedArray((num_ranks,), jnp.int32),  # recv_gbl_rank_prefix_sum
+        ShapedArray((num_worst_tokens, source_meta_bytes), jnp.uint8),  # recv_src_meta
+        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),  # recv_rdma_channel_prefix_matrix
+        ShapedArray((num_ranks, num_channels), jnp.int32),  # recv_gbl_channel_prefix_matrix
+        ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),  # send_rdma_head
+        ShapedArray((num_worst_tokens, NUM_MAX_NVL_PEERS), jnp.int32),  # send_nvl_head
     )
 
 
@@ -242,17 +242,18 @@ def _moe_internode_cached_dispatch_abstract_eval(
     recv_x_scales = _get_recv_x_scale_shape(x_scales, num_recv_tokens)
 
     return (
-        ShapedArray((num_recv_tokens, hidden_size), x.dtype),             # recv_x
-        recv_x_scales,                                                     # recv_x_scales
-        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),           # recv_rdma_channel_prefix_matrix
-        ShapedArray((num_ranks, num_channels), jnp.int32),                # recv_gbl_channel_prefix_matrix
-        ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),             # send_rdma_head
-        ShapedArray((num_rdma_recv_tokens, NUM_MAX_NVL_PEERS), jnp.int32), # send_nvl_head
+        ShapedArray((num_recv_tokens, hidden_size), x.dtype),  # recv_x
+        recv_x_scales,  # recv_x_scales
+        ShapedArray((num_rdma_ranks, num_channels), jnp.int32),  # recv_rdma_channel_prefix_matrix
+        ShapedArray((num_ranks, num_channels), jnp.int32),  # recv_gbl_channel_prefix_matrix
+        ShapedArray((num_tokens, num_rdma_ranks), jnp.int32),  # send_rdma_head
+        ShapedArray((num_rdma_recv_tokens, NUM_MAX_NVL_PEERS), jnp.int32),  # send_nvl_head
     )
 
 
 ABSTRACT_EVAL_TABLE[moe_internode_dispatch_p] = _moe_internode_dispatch_abstract_eval
 ABSTRACT_EVAL_TABLE[moe_internode_cached_dispatch_p] = _moe_internode_cached_dispatch_abstract_eval
+
 
 # ----------------------------------------
 # Step-4: JIT Lowering
@@ -263,9 +264,7 @@ def _moe_dispatch_lowering(ctx, *args, **kwargs):
 
 
 def _moe_cached_dispatch_lowering(ctx, *args, **kwargs):
-    target = deep_ep_runtime.get_target_name(
-        "moe_cached_dispatch", launch_mode=kwargs.get("launch_mode")
-    )
+    target = deep_ep_runtime.get_target_name("moe_cached_dispatch", launch_mode=kwargs.get("launch_mode"))
     return jax.ffi.ffi_lowering(target, has_side_effect=True)(ctx, *args, **kwargs)
 
 
@@ -277,11 +276,15 @@ def _moe_internode_dispatch_lowering(ctx, *args, **kwargs):
     kwargs = dict(kwargs)
     # Used only by abstract eval to shape recv_src_meta; C++ derives the size itself.
     kwargs.pop("source_meta_bytes", None)
-    return jax.ffi.ffi_lowering("moe_internode_dispatch_per_process", has_side_effect=True)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_dispatch_per_process", has_side_effect=True)(
+        ctx, *args, **kwargs
+    )
 
 
 def _moe_internode_cached_dispatch_lowering(ctx, *args, **kwargs):
-    return jax.ffi.ffi_lowering("moe_internode_cached_dispatch_per_process", has_side_effect=True)(ctx, *args, **kwargs)
+    return jax.ffi.ffi_lowering("moe_internode_cached_dispatch_per_process", has_side_effect=True)(
+        ctx, *args, **kwargs
+    )
 
 
 LOWERING_TABLE[moe_internode_dispatch_p] = _moe_internode_dispatch_lowering
@@ -293,6 +296,8 @@ LOWERING_TABLE[moe_internode_cached_dispatch_p] = _moe_internode_cached_dispatch
 
 
 __all__ = [
-    "moe_dispatch_p", "moe_cached_dispatch_p",
-    "moe_internode_dispatch_p", "moe_internode_cached_dispatch_p",
+    "moe_dispatch_p",
+    "moe_cached_dispatch_p",
+    "moe_internode_dispatch_p",
+    "moe_internode_cached_dispatch_p",
 ]

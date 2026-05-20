@@ -187,9 +187,7 @@ class JaxMultiProcessTestCase:
 
         fn_module = test_fn.__module__
         fn_name = test_fn.__qualname__
-        assert "." not in fn_name, (
-            f"test_fn must be a top-level function, got {fn_module}.{fn_name}"
-        )
+        assert "." not in fn_name, f"test_fn must be a top-level function, got {fn_module}.{fn_name}"
 
         coordinator_port = _find_free_port()
         ctx = mp.get_context("spawn")
@@ -218,10 +216,6 @@ class JaxMultiProcessTestCase:
         for i, p in enumerate(processes):
             if p.is_alive():
                 p.kill()
-                raise AssertionError(
-                    f"Process rank={i} timed out after {self.TIMEOUT}s"
-                )
+                raise AssertionError(f"Process rank={i} timed out after {self.TIMEOUT}s")
             if p.exitcode != 0:
-                raise AssertionError(
-                    f"Process rank={i} exited with code {p.exitcode}"
-                )
+                raise AssertionError(f"Process rank={i} exited with code {p.exitcode}")

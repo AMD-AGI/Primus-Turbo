@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 _ep_group_ranks: Optional[Tuple[int, ...]] = None
 _ep_group_id: Optional[str] = None  # short hash, used as KV-store key suffix
-_ep_fallback_warned: bool = False    # one-shot guard for the "no pin" WARNING
+_ep_fallback_warned: bool = False  # one-shot guard for the "no pin" WARNING
 
 
 def set_ep_group(ep_ranks: Sequence[int]) -> None:
@@ -78,12 +78,12 @@ def set_ep_group(ep_ranks: Sequence[int]) -> None:
     _ep_group_ranks = ranks
     # Stable, collision-resistant id derived from the ordered rank tuple
     # (all members compute the same id locally — no cross-process exchange).
-    _ep_group_id = hashlib.blake2b(
-        ",".join(str(r) for r in ranks).encode(), digest_size=8
-    ).hexdigest()
+    _ep_group_id = hashlib.blake2b(",".join(str(r) for r in ranks).encode(), digest_size=8).hexdigest()
     log.info(
         "Pinned EP group: size=%d, members=%s, id=%s",
-        len(ranks), ranks, _ep_group_id,
+        len(ranks),
+        ranks,
+        _ep_group_id,
     )
 
 
@@ -119,6 +119,7 @@ def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
     # Local import — keep numpy out of the module top-level; matches the
     # rest of this file's "import inside function" style for optional deps.
     import numpy as np  # type: ignore[import-untyped]
+
     expert_axis_idx = mesh.axis_names.index(axis_name)
     devices_arr = np.asarray(mesh.devices)
     my_proc = jax.process_index()
@@ -129,8 +130,7 @@ def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
             break
     if coords_my is None:
         raise RuntimeError(
-            f"jax.process_index()={my_proc} not present in mesh.devices; "
-            "cannot derive EP group."
+            f"jax.process_index()={my_proc} not present in mesh.devices; " "cannot derive EP group."
         )
     ep_ranks: List[int] = []
     for v in range(devices_arr.shape[expert_axis_idx]):
@@ -142,7 +142,8 @@ def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
             "EP group not pinned: %r axis is intra-process "
             "(every peer shares process_index=%d); legacy 'EP == world' "
             "semantics are correct here.",
-            axis_name, my_proc,
+            axis_name,
+            my_proc,
         )
         return
     set_ep_group(ep_ranks)
@@ -276,9 +277,9 @@ def auto_detect_mode() -> None:
     if jax.local_device_count() == 1 and jax.process_count() > 1:
         os.environ[_MODE_ENV_VAR] = "per_process"
         log.info(
-            "Auto-detected per_process mode "
-            "(1 GPU per process, %d JAX processes, ep_group_size=%d)",
-            jax.process_count(), _ep_group_size_or_world(),
+            "Auto-detected per_process mode " "(1 GPU per process, %d JAX processes, ep_group_size=%d)",
+            jax.process_count(),
+            _ep_group_size_or_world(),
         )
 
 
@@ -300,9 +301,7 @@ def get_ep_size(*, lock: bool = False) -> int:
     return get_mode(lock=lock).ep_size
 
 
-def get_target_name(
-    op_name: str, *, launch_mode: Optional[int] = None, lock: bool = False
-) -> str:
+def get_target_name(op_name: str, *, launch_mode: Optional[int] = None, lock: bool = False) -> str:
     return _resolve_mode(launch_mode, lock=lock).target_name(op_name)
 
 
@@ -421,7 +420,8 @@ def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
     root_uid = bytes(all_uids[root_global_rank])
     log.info(
         "rocSHMEM root unique ID gathered: rank=%d, rdma_rank=%d",
-        rank, rdma_rank,
+        rank,
+        rdma_rank,
     )
     return root_uid
 
@@ -501,9 +501,7 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
 
         # KV-store allgather, not multihost_utils.process_allgather: see
         # _kv_allgather_bytes docstring for the XLA/RCCL zero-fill bug.
-        ipc_handles_list = _kv_allgather_bytes(
-            "ipc_handle", bytes(local_ipc_handle), num_ranks, rank
-        )
+        ipc_handles_list = _kv_allgather_bytes("ipc_handle", bytes(local_ipc_handle), num_ranks, rank)
 
         if root_uid is None:
             dep.sync_per_process_buffer(ipc_handles_list)
@@ -524,10 +522,13 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     log.info(
         "Per-process DeepEP buffer ready: rank=%d, num_ranks=%d, "
         "nvl_bytes=%d, rdma_bytes=%d, internode=%s, ep_group_id=%s",
-        rank, num_ranks, num_nvl_bytes, num_rdma_bytes, internode,
+        rank,
+        num_ranks,
+        num_nvl_bytes,
+        num_rdma_bytes,
+        internode,
         _ep_group_id or "(world)",
     )
-   
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +543,7 @@ def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) ->
         return
 
     if hidden_bytes is None or config is None:
-        raise ValueError(
-            "hidden_bytes and config are required for per_process mode bootstrap"
-        )
+        raise ValueError("hidden_bytes and config are required for per_process mode bootstrap")
     _bootstrap_per_process(hidden_bytes=hidden_bytes, config=config)
 
 
@@ -575,9 +574,7 @@ def reset_runtime() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_mode(
-    launch_mode: Optional[int], *, lock: bool = False
-) -> LaunchMode:
+def _resolve_mode(launch_mode: Optional[int], *, lock: bool = False) -> LaunchMode:
     if launch_mode is None:
         return get_mode(lock=lock)
     try:
