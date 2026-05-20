@@ -481,16 +481,29 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         b_in = b if b.is_contiguous() else b.contiguous()
         if (not trans_b):
             # RRR direct path: b stays as [G, N_inner, K_out].
+            # 2026-05-20 Phase 2-C: 3-way autotune mirrors RCR — adds
+            # bn_block ∈ {0, 128}. bn=0 → BLK_M=BLK_N=256 (4 acc, V=256/
+            # spill=61); bn=128 → BLK_M=256, BLK_N=128 (2 acc, V=228/spill=0).
+            # bn=128 gated to N%128==0 (currently true for all production
+            # shapes); bn=128 internally also gates K%128==0 (FUSED_KTAIL
+            # off in bn=128 — auto-falls back to bn=0 at dispatcher).
             n_inner, k_out = b_in.shape[1], b_in.shape[2]
             op = torch.ops.primus_turbo_cpp_extension.hk_grouped_rrr_fp8
+            rrr_bn_choices = (0, 128) if (n_inner % 128 == 0) else (0,)
+            rrr_candidates_3way = tuple(
+                (gm_, xcds_, bn_)
+                for (gm_, xcds_) in _HK_FP8_RRR_CANDIDATES
+                for bn_ in rrr_bn_choices
+            )
+            # 10 fixed args: a, b, a_s, b_s, g_offs, gm, m_per, xcds, dtype, bn
             fixed = (a_in, b_in, a_scales, b_scales, group_offs,
-                     0, avg_m, 0, out_dtype)
-            gm, xcds = _autotune_pick(
-                op, fixed, _HK_FP8_RRR_CANDIDATES, (5, 7),
+                     0, avg_m, 0, out_dtype, 0)
+            gm, xcds, bn = _autotune_pick(
+                op, fixed, rrr_candidates_3way, (5, 7, 9),
                 key=("rrr_fp8", m_total, n_inner, k_out),
             )
             return op(a_in, b_in, a_scales, b_scales, group_offs,
-                      gm, avg_m, xcds, out_dtype)
+                      gm, avg_m, xcds, out_dtype, bn)
         # RCR path (fwd or H4-rerouted dgrad). b is [G, N, K] col-major view.
         n_out, k = b_in.shape[1], b_in.shape[2]
         op = torch.ops.primus_turbo_cpp_extension.hk_grouped_rcr_fp8
