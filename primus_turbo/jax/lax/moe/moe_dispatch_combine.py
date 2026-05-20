@@ -112,11 +112,6 @@ def get_combine_config() -> Config:
     return config_map[num_ranks]
 
 
-def _get_source_meta_bytes() -> int:
-    dep = deep_ep_runtime._get_c_deep_ep()
-    return dep.get_source_meta_bytes()
-
-
 def moe_dispatch(
     x: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
     topk_idx: jnp.ndarray,
@@ -325,8 +320,7 @@ def _moe_dispatch_impl_internode(
     num_worst_tokens,
 ):
     """Internode dispatch path (ep_size > 8)."""
-    x.shape[0]
-    source_meta_bytes = _get_source_meta_bytes()
+    source_meta_bytes = deep_ep_runtime.get_source_meta_bytes()
 
     if handle is not None:
         assert topk_idx is None and topk_weights is None

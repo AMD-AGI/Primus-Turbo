@@ -21,7 +21,6 @@ def initialize():
     global _initialized
     if _initialized:
         return
-    _initialized = True
 
     import jax
     from jax.interpreters import mlir
@@ -44,3 +43,5 @@ def initialize():
 
     for primitive, func in LOWERING_TABLE.items():
         mlir.register_lowering(primitive, func, platform="rocm")
+
+    _initialized = True

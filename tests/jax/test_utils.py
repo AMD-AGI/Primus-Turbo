@@ -8,6 +8,7 @@ import functools
 import importlib
 import multiprocessing as mp
 import os
+import queue
 import socket
 import traceback
 
@@ -202,20 +203,28 @@ class JaxMultiProcessTestCase:
             p.start()
             processes.append(p)
 
-        for p in processes:
-            p.join(timeout=self.TIMEOUT)
+        try:
+            for p in processes:
+                p.join(timeout=self.TIMEOUT)
 
-        errors = []
-        while not error_queue.empty():
-            errors.append(error_queue.get_nowait())
+            errors = []
+            while True:
+                try:
+                    errors.append(error_queue.get_nowait())
+                except queue.Empty:
+                    break
 
-        if errors:
-            msg = "\n".join(f"--- Rank {r} ---\n{tb}" for r, tb in errors)
-            raise AssertionError(f"Multi-process test failed:\n{msg}")
+            if errors:
+                msg = "\n".join(f"--- Rank {r} ---\n{tb}" for r, tb in errors)
+                raise AssertionError(f"Multi-process test failed:\n{msg}")
 
-        for i, p in enumerate(processes):
-            if p.is_alive():
-                p.kill()
-                raise AssertionError(f"Process rank={i} timed out after {self.TIMEOUT}s")
-            if p.exitcode != 0:
-                raise AssertionError(f"Process rank={i} exited with code {p.exitcode}")
+            for i, p in enumerate(processes):
+                if p.is_alive():
+                    raise AssertionError(f"Process rank={i} timed out after {self.TIMEOUT}s")
+                if p.exitcode != 0:
+                    raise AssertionError(f"Process rank={i} exited with code {p.exitcode}")
+        finally:
+            for p in processes:
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=5)

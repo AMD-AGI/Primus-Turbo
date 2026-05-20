@@ -261,6 +261,11 @@ def _check_locked_mode(mode: LaunchMode) -> None:
 def auto_detect_mode() -> None:
     """Set PRIMUS_TURBO_JAX_DEEPEP_MODE if not already set.
 
+    Most users do not need to call this directly: both ``warmup()`` and
+    ``ensure_deepep_runtime()`` invoke it on their behalf before the mode
+    is locked.  It is exposed publicly for setups that want to detect /
+    lock the launch mode early (e.g. before ``set_ep_group``).
+
     When each JAX process owns exactly one GPU (ONE_GPU_PER_PROCESS),
     DeepEP must use inter-process IPC buffers instead of intra-process
     shared memory.  Call this before the first ``get_mode(lock=True)``
@@ -320,6 +325,17 @@ def _get_c_deep_ep():
     from primus_turbo.jax._C import deep_ep as _dep  # type: ignore[import-untyped]
 
     return _dep
+
+
+def get_source_meta_bytes() -> int:
+    """Return the per-token ``recv_src_meta`` byte width used by internode dispatch.
+
+    Public wrapper around the C++ ``deep_ep::internode::get_source_meta_bytes``
+    binding. Exposed here so callers (e.g. ``primus_turbo.jax.lax.moe``) don't
+    need to reach into the private ``_get_c_deep_ep`` helper or the
+    ``primus_turbo.jax._C.deep_ep`` submodule directly.
+    """
+    return _get_c_deep_ep().get_source_meta_bytes()
 
 
 def is_internode(*, lock: bool = False) -> bool:
