@@ -1,9 +1,7 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
 // PyTorch ATen ops for the HipKittens dense GEMM adapters declared in
-// csrc/kernels/grouped_gemm/HipKittens/hk_grouped_gemm{,_bf16}_gfx950.cu
-// (the FP8 / BF16 dense entry points were appended there to share the
-// kernel translation unit with the grouped path).
+// csrc/kernels/gemm/HipKittens/hk_gemm_gfx950.cu (fp8 + bf16 dense).
 
 #include "pytorch/extensions.h"
 #include <ATen/ATen.h>
