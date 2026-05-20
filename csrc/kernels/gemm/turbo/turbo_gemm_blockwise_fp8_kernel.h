@@ -107,13 +107,21 @@ public:
 
     using Mfma = device::mfma_f32_16x16x128_f8f6f4<AType, BType>;
 
-    // Pinned register layout (next_free_vgpr = 252 → 2 wave/SIMD ≤ 2 WG/CU
-    // when LDS allows).
+    // Pinned register layout.
     //
     // VGPR:
-    //   v[0:95]    compiler-managed (96)
-    //   v[96:99]   inner accumulator (4) — VGPR-resident MFMA output
-    //   v[100:103] tmp_outer: AGPR→VGPR shuttle for outer accumulator (4)
+    //   v[0:95]    compiler-managed (96) — hosts the 4 outer-AGPR shuttle
+    //              VGPRs declared as inline-asm operands inside
+    //              ``apply_scale_promotion_16x16`` (so the compiler
+    //              tracks def/use and does not clobber them between
+    //              read/fma/write).
+    //   v[96:99]   inner accumulator A (4) — VGPR-resident MFMA output
+    //              for even-index fragments (frag 0, 2, 4, …, 14)
+    //   v[100:103] inner accumulator B (4) — VGPR-resident MFMA output
+    //              for odd-index fragments (frag 1, 3, 5, …, 15). The
+    //              two buffers enable a 2-deep software pipeline that
+    //              hides the MFMA 32-cycle drain behind the next MFMA's
+    //              MAI window (see ``compute_one_k_iter``).
     //   v[104:119] combined scale buffer (16) — 4 frag_m × 4 scales/lane
     //   v[120:123] b_scale: broadcast B scale (4 — only [0] used, padded)
     //   v[124:155] A data buffer (32) — 64M × 128K FP8
@@ -121,8 +129,8 @@ public:
     //
     // AGPR:
     //   a[0:63]    outer accumulator (16 fragments × 4 AGPR = 64)
-    static constexpr int PIN_INNER     = 96;  // 4 VGPR for inner partial
-    static constexpr int PIN_TMP_OUTER = 100;
+    static constexpr int PIN_INNER_A   = 96;  // 4 VGPR for even-frag inner partial
+    static constexpr int PIN_INNER_B   = 100; // 4 VGPR for odd-frag inner partial
     static constexpr int PIN_S         = 104; // 16 VGPR for combined A*B scales
     static constexpr int PIN_B_SCALE   = 120; // 4 VGPR; only PIN_B_SCALE[0] live
     static constexpr int PIN_A         = 124; // 32 VGPR for A data (64M × 128K)
@@ -278,9 +286,13 @@ public:
     __device__ __forceinline__ void zero_c_agpr() { zero_agpr_range<AGPR_OUTER, AGPR_OUTER + 63>(); }
 
     __device__ __forceinline__ void reserve_pinned_regs() {
-        // Reserve VGPRs that are owned by inline asm.
-        reserve_vgpr_range<PIN_INNER, PIN_INNER + 3>();
-        reserve_vgpr_range<PIN_TMP_OUTER, PIN_TMP_OUTER + 3>();
+        // Reserve VGPRs that are owned by inline asm. The outer-accumulator
+        // shuttle (formerly PIN_TMP_OUTER, v[100..103]) is now declared as
+        // ``uint32_t`` inline-asm operands in ``apply_scale_promotion_16x16``,
+        // so the compiler tracks it directly and no explicit reservation is
+        // needed here.
+        reserve_vgpr_range<PIN_INNER_A, PIN_INNER_A + 3>();
+        reserve_vgpr_range<PIN_INNER_B, PIN_INNER_B + 3>();
         reserve_vgpr_range<PIN_S, PIN_S + 15>();
         reserve_vgpr_range<PIN_B_SCALE, PIN_B_SCALE + 3>();
         reserve_vgpr_range<PIN_A, PIN_A + 31>();
@@ -362,37 +374,103 @@ public:
         }
     }
 
-    // ── Single MFMA + per-fragment promotion ──
-    // outer[FRAG] += (a_scale[FRAG_M] × b_scale) × (A[FRAG_M] · B[FRAG_N])
-    template <int FRAG_M, int FRAG_N>
-    __device__ __forceinline__ static void mfma_and_promote() {
-        constexpr int OUTER = AGPR_OUTER + (FRAG_M * WARP_N_FRAGS + FRAG_N) * 4;
-        // Fresh inner = A * B: zero VGPR before MFMA.
-        zero_vgpr_4<PIN_INNER>();
-        Mfma::template run_pinned_acc_vgpr<PIN_A + FRAG_M * 8, PIN_B + FRAG_N * 8, PIN_INNER>();
-        apply_scale_promotion_16x16<OUTER, PIN_INNER, PIN_TMP_OUTER, PIN_S + FRAG_M * 4>();
+    // ── Pipelined MFMA + per-fragment promotion ──
+    // 16 fragments are walked in row-major order (FRAG_IDX = 0..15) and split
+    // across two inner-accumulator buffers (even FRAG_IDX → PIN_INNER_A, odd
+    // → PIN_INNER_B). A 2-deep software pipeline issues the MFMA for
+    // fragment I in the same step as the promotion for fragment I-2, so each
+    // promotion's first ``v_fmac`` lands ≥ 32 cycles after the matching
+    // MFMA's MAI write and no explicit ``s_nop 15`` drain is required.
+    //
+    // Per-step layout (steady state, FRAG_IDX = 2..15):
+    //   promote_(FRAG_IDX-2)            (12 cycles VALU; reads INNER_(FI-2))
+    //   zero buf_(FRAG_IDX%2)           (6 cycles VALU; overwrites INNER)
+    //   mfma_(FRAG_IDX) -> INNER_(FI%2) (1 cycle issue; MAI runs 32 cycles)
+    //
+    // MFMA throughput (one per 32 cycles on a wave's MAI pipeline) dominates,
+    // so steady-state cadence is 32 cycles per fragment vs. the baseline ~51
+    // cycles per fragment (which serialised drain + promote after every MFMA).
+
+    template <int FRAG_IDX>
+    __device__ __forceinline__ static void pipeline_steady() {
+        constexpr int FRAG_M  = FRAG_IDX / WARP_N_FRAGS;
+        constexpr int FRAG_N  = FRAG_IDX % WARP_N_FRAGS;
+        constexpr int PROMOTE_IDX   = FRAG_IDX - 2;
+        constexpr int PROMOTE_M     = PROMOTE_IDX / WARP_N_FRAGS;
+        constexpr int PROMOTE_N     = PROMOTE_IDX % WARP_N_FRAGS;
+        constexpr int CUR_INNER     = (FRAG_IDX & 1) ? PIN_INNER_B : PIN_INNER_A;
+        constexpr int PROMOTE_INNER = (PROMOTE_IDX & 1) ? PIN_INNER_B : PIN_INNER_A;
+        constexpr int OUTER_PROMOTE = AGPR_OUTER + (PROMOTE_M * WARP_N_FRAGS + PROMOTE_N) * 4;
+        constexpr int SCALE_PROMOTE = PIN_S + PROMOTE_M * 4;
+
+        // Promote frag (FRAG_IDX-2): reads INNER buf last written by
+        // mfma_(FRAG_IDX-2). With a 2-deep pipeline that MFMA was launched
+        // 2 × 32 cycles ago, so its 32-cycle MAI write is long drained.
+        apply_scale_promotion_16x16<OUTER_PROMOTE, PROMOTE_INNER, SCALE_PROMOTE,
+                                    /*DRAIN_MFMA=*/false>();
+        // Zero the same buf in preparation for mfma_(FRAG_IDX). The
+        // (PROMOTE_IDX & 1) == (FRAG_IDX & 1) parity match means we
+        // overwrite the buf that promote just consumed (read-then-overwrite,
+        // so safe).
+        zero_vgpr_4<CUR_INNER>();
+        Mfma::template run_pinned_acc_vgpr<PIN_A + FRAG_M * 8, PIN_B + FRAG_N * 8, CUR_INNER>();
+    }
+
+    template <int FRAG_IDX, bool DRAIN>
+    __device__ __forceinline__ static void pipeline_epilogue() {
+        constexpr int FRAG_M = FRAG_IDX / WARP_N_FRAGS;
+        constexpr int FRAG_N = FRAG_IDX % WARP_N_FRAGS;
+        constexpr int INNER  = (FRAG_IDX & 1) ? PIN_INNER_B : PIN_INNER_A;
+        constexpr int OUTER  = AGPR_OUTER + (FRAG_M * WARP_N_FRAGS + FRAG_N) * 4;
+        constexpr int SCALE  = PIN_S + FRAG_M * 4;
+        apply_scale_promotion_16x16<OUTER, INNER, SCALE, DRAIN>();
     }
 
     __device__ __forceinline__ static void compute_one_k_iter() {
-        // Combined scale precompute: PIN_S[i] = PIN_S[i] * PIN_B_SCALE.
+        // ── Prologue (interleaved with multiply_combined_scale) ──
+        //
+        // 2-deep MFMA prologue gives every steady-state promote a ≥ 32
+        // cycle natural gap from its matching MFMA write so the drain
+        // NOPs inside ``apply_scale_promotion_16x16`` can be skipped.
+        //
+        // ``multiply_combined_scale`` is hoisted INSIDE mfma_0's MAI
+        // window (16 VALU cycles fit in the 32-cycle MFMA pipeline
+        // latency). Its inputs (PIN_S / PIN_B_SCALE) were loaded by the
+        // outer-loop LDS reads and are valid here; its outputs are
+        // first consumed by promote_0 in step 2 (after the whole
+        // prologue), well after mul completes.
+        zero_vgpr_4<PIN_INNER_A>();
+        Mfma::template run_pinned_acc_vgpr<PIN_A + 0 * 8, PIN_B + 0 * 8, PIN_INNER_A>();
         multiply_combined_scale();
-        // 4 × 4 fragments.
-        mfma_and_promote<0, 0>();
-        mfma_and_promote<0, 1>();
-        mfma_and_promote<0, 2>();
-        mfma_and_promote<0, 3>();
-        mfma_and_promote<1, 0>();
-        mfma_and_promote<1, 1>();
-        mfma_and_promote<1, 2>();
-        mfma_and_promote<1, 3>();
-        mfma_and_promote<2, 0>();
-        mfma_and_promote<2, 1>();
-        mfma_and_promote<2, 2>();
-        mfma_and_promote<2, 3>();
-        mfma_and_promote<3, 0>();
-        mfma_and_promote<3, 1>();
-        mfma_and_promote<3, 2>();
-        mfma_and_promote<3, 3>();
+        zero_vgpr_4<PIN_INNER_B>();
+        Mfma::template run_pinned_acc_vgpr<PIN_A + 0 * 8, PIN_B + 1 * 8, PIN_INNER_B>();
+
+        // ── Steady state: 14 paired (promote + mfma) steps ──
+        pipeline_steady<2>();
+        pipeline_steady<3>();
+        pipeline_steady<4>();
+        pipeline_steady<5>();
+        pipeline_steady<6>();
+        pipeline_steady<7>();
+        pipeline_steady<8>();
+        pipeline_steady<9>();
+        pipeline_steady<10>();
+        pipeline_steady<11>();
+        pipeline_steady<12>();
+        pipeline_steady<13>();
+        pipeline_steady<14>();
+        pipeline_steady<15>();
+
+        // ── Epilogue: promote frag 14 and frag 15 ──
+        // - promote_14 follows mfma_14 by ~64 cycles (steady step gap) → safe.
+        // - promote_15 follows mfma_15 by ~30 cycles (step 15 steady cadence
+        //   32 + epilogue<14> VALU 12 + 4 cycle accvgpr_read prefix, minus
+        //   mfma_15's 18-cycle in-step offset). 30 ≥ 11 → in the
+        //   16x16x128_f8f6f4 "11+ OK" drain window, so no explicit drain is
+        //   needed either. Saves 32 cycle/K-iter vs. the conservative
+        //   ``DRAIN=true``.
+        pipeline_epilogue<14, /*DRAIN=*/false>();
+        pipeline_epilogue<15, /*DRAIN=*/false>();
     }
 };
 
@@ -465,9 +543,15 @@ __global__ __launch_bounds__(256, 2) void turbo_gemm_blockwise_fp8_128x128x128_1
     const uint32_t  a_remaining  = (m - pid_m) * k * sizeof(AType);
     const uint32_t  b_remaining  = (n - pid_n) * k * sizeof(BType);
     const uint32_t  as_remaining = (m - pid_m) * scale_cols * sizeof(float);
+    // B-scale SRD base is the full ``b_s_ptr`` (not offset by ``b_scale_row``)
+    // because ``load_b_scale_gmem_to_smem`` already passes
+    // ``b_scale_row * scale_cols * sizeof(float)`` as the ldg-offset. NUM_RECORDS
+    // therefore has to span the full buffer in bytes; otherwise the second
+    // N-tile (b_scale_row >= 1) reads at an offset >= NUM_RECORDS and the
+    // hardware OOB-select returns 0, silently dropping the B scale for that
+    // tile.
     const uint32_t  bs_remaining =
-        ((n + GemmTile::SCALE_BLOCK - 1) / GemmTile::SCALE_BLOCK - b_scale_row) * scale_cols *
-        sizeof(float);
+        ((n + GemmTile::SCALE_BLOCK - 1) / GemmTile::SCALE_BLOCK) * scale_cols * sizeof(float);
     const BufferSRD a_srd(a_base_ptr, a_remaining);
     const BufferSRD b_srd(b_base_ptr, b_remaining);
     const BufferSRD a_s_srd(a_s_base_ptr, as_remaining);

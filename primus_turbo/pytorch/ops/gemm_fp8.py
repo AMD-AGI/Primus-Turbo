@@ -18,7 +18,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
+    gemm_fp8_default_dispatch,
+    gemm_fp8_impl,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
@@ -274,7 +277,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a, a_dtype, axis=0, block_size=ctx.config.block_size
         )
 
-        a_grad = gemm_fp8_impl(
+        # BLOCKWISE backward dgrad (NN) and wgrad (TN) are not covered by the
+        # TURBO forward kernel (NT-only). Route the backward GEMMs through
+        # ``gemm_fp8_default_dispatch`` so the user-selected TURBO backend
+        # does not force a hard failure here; the dispatcher uses the CK
+        # default for the actual computation.
+        a_grad = gemm_fp8_default_dispatch(
             grad_out_fp8_row,
             grad_out_scale_inv_row,
             False,
@@ -283,11 +291,11 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             not ctx.trans_b,
             ctx.out_dtype,
             False,
-            granularity=ctx.config.granularity.value,
-            default_backend=BackendType.CK.value,
+            granularity=ctx.config.granularity,
+            default_backend=BackendType.CK,
         )
 
-        b_grad = gemm_fp8_impl(
+        b_grad = gemm_fp8_default_dispatch(
             a_fp8_col,
             a_scale_inv_col,
             not ctx.trans_a,
@@ -296,8 +304,8 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             False,
             ctx.out_dtype,
             ctx.trans_b,
-            granularity=ctx.config.granularity.value,
-            default_backend=BackendType.CK.value,
+            granularity=ctx.config.granularity,
+            default_backend=BackendType.CK,
         )
 
         return a_grad, b_grad, None, None, None, None

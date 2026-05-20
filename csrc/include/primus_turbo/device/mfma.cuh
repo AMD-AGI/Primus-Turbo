@@ -166,12 +166,21 @@ template <typename AType, typename BType> struct mfma_f32_16x16x128_f8f6f4 {
 
 // ── Zero a 4-VGPR range via v_mov_b32 ──
 // Used to prepare the inner accumulator (VGPR-resident) for a fresh MFMA.
+//
+// gfx950 requires 2 NOPs between a VALU write and an MFMA that reads the
+// same VGPR; otherwise the MFMA latches stale data and silently
+// accumulates the previous promotion partial. The 4 ``v_mov_b32`` writes
+// themselves provide one VALU-pipeline slot each, but the immediately
+// following ``v_mfma_f32_16x16x128_f8f6f4`` runs on the MAI pipeline and
+// is not interlocked. Two explicit NOPs cover the documented requirement.
 template <int PIN_VGPR>
 __device__ __forceinline__ static void zero_vgpr_4() {
     asm volatile("v_mov_b32_e32 v[%0], 0" : : "n"(PIN_VGPR + 0));
     asm volatile("v_mov_b32_e32 v[%0], 0" : : "n"(PIN_VGPR + 1));
     asm volatile("v_mov_b32_e32 v[%0], 0" : : "n"(PIN_VGPR + 2));
     asm volatile("v_mov_b32_e32 v[%0], 0" : : "n"(PIN_VGPR + 3));
+    asm volatile("s_nop 1" ::: "memory");
+    asm volatile("s_nop 1" ::: "memory");
 }
 
 // ── Blockwise FP8 promotion accumulator (16×16×128 fragment) ──
@@ -188,31 +197,68 @@ __device__ __forceinline__ static void zero_vgpr_4() {
 //
 // PIN_OUTER:          AGPR start for outer accumulator (4 AGPRs, in/out).
 // PIN_INNER_VGPR:     VGPR start for inner partial (4 VGPRs, MFMA output).
-// PIN_TMP_OUTER:      4-VGPR scratch range for AGPR→VGPR shuttling of outer.
 // PIN_COMBINED_SCALE: VGPR holding 4 FP32 combined scales for the lane.
-template <int PIN_OUTER, int PIN_INNER_VGPR, int PIN_TMP_OUTER, int PIN_COMBINED_SCALE>
+//
+// Register tracking note:
+//   The AGPR -> VGPR shuttle for the outer accumulator uses 4
+//   compiler-managed VGPRs declared as ``uint32_t`` operands. Earlier
+//   revisions hard-coded the shuttle into a fixed VGPR range (PIN_TMP_OUTER,
+//   v[100..103]); because that range never appeared as an inline-asm
+//   operand the compiler had no def/use chain for it and was free to
+//   reallocate those VGPRs as temporaries between the ``v_accvgpr_read`` and
+//   ``v_accvgpr_write`` instructions. Whenever that happened the per-lane
+//   outer accumulator was overwritten with whatever the compiler scheduled
+//   into v[100..103], producing the characteristic "1/64 of outputs
+//   non-zero" failure mode (only the lanes that happened to retain a
+//   non-zero value survived). Routing the shuttle through real inline-asm
+//   operands forces the compiler to keep these values live across the whole
+//   promotion sequence.
+template <int PIN_OUTER, int PIN_INNER_VGPR, int PIN_COMBINED_SCALE, bool DRAIN_MFMA = true>
 __device__ __forceinline__ static void apply_scale_promotion_16x16() {
 #if defined(__gfx950__)
     // clang-format off
-    // Read outer accumulator AGPR -> VGPR.
-    asm volatile("v_accvgpr_read_b32 v[%0], a[%1]" : : "n"(PIN_TMP_OUTER + 0), "n"(PIN_OUTER + 0));
-    asm volatile("v_accvgpr_read_b32 v[%0], a[%1]" : : "n"(PIN_TMP_OUTER + 1), "n"(PIN_OUTER + 1));
-    asm volatile("v_accvgpr_read_b32 v[%0], a[%1]" : : "n"(PIN_TMP_OUTER + 2), "n"(PIN_OUTER + 2));
-    asm volatile("v_accvgpr_read_b32 v[%0], a[%1]" : : "n"(PIN_TMP_OUTER + 3), "n"(PIN_OUTER + 3));
+    // Drain the preceding ``v_mfma_f32_16x16x128_f8f6f4`` before any VALU
+    // reads its VGPR destination (PIN_INNER_VGPR). The MFMA writes
+    // v[PIN_INNER_VGPR..+3] with a ~32-cycle pipeline latency and gfx950
+    // does not interlock VALU reads of MFMA-destination VGPRs. Without a
+    // drain, the immediately following ``v_fmac_f32_e32`` reads
+    // pre-MFMA (zero) values, so promotion folds ``scale * 0`` into the
+    // outer accumulator and the kernel silently produces all-zero outputs
+    // for short K iteration counts. The 16x16x128_f8f6f4 variant also has
+    // a non-monotonic drain window (4-7 OK, 8-10 STALE, 11+ OK), so the
+    // safe minimum is ``s_nop 15`` (16 cycles); two of them cover the full
+    // ~32-cycle pipeline. A ``memory`` clobber prevents the post-RA
+    // hazard scheduler from coalescing the explicit drain into adjacent
+    // ``s_nop 0`` slots.
+    //
+    // ``DRAIN_MFMA`` lets the software-pipelined caller skip this drain
+    // when it has already arranged ≥ 32 cycles of unrelated work between
+    // the MFMA write and this promotion (e.g. the next fragment's zero +
+    // MFMA issue + the bulk of its 32-cycle pipeline latency).
+    if constexpr (DRAIN_MFMA) {
+        asm volatile("s_nop 15" ::: "memory");
+        asm volatile("s_nop 15" ::: "memory");
+    }
+    uint32_t tmp0, tmp1, tmp2, tmp3;
+    // Read outer accumulator AGPR -> compiler-managed VGPRs.
+    asm volatile("v_accvgpr_read_b32 %0, a[%1]"  : "=v"(tmp0) : "n"(PIN_OUTER + 0));
+    asm volatile("v_accvgpr_read_b32 %0, a[%1]"  : "=v"(tmp1) : "n"(PIN_OUTER + 1));
+    asm volatile("v_accvgpr_read_b32 %0, a[%1]"  : "=v"(tmp2) : "n"(PIN_OUTER + 2));
+    asm volatile("v_accvgpr_read_b32 %0, a[%1]"  : "=v"(tmp3) : "n"(PIN_OUTER + 3));
     // outer += combined_scale * inner_vgpr   (FP32 fma).
-    asm volatile("v_fmac_f32_e32 v[%0], v[%1], v[%2]"
-        : : "n"(PIN_TMP_OUTER + 0), "n"(PIN_COMBINED_SCALE + 0), "n"(PIN_INNER_VGPR + 0));
-    asm volatile("v_fmac_f32_e32 v[%0], v[%1], v[%2]"
-        : : "n"(PIN_TMP_OUTER + 1), "n"(PIN_COMBINED_SCALE + 1), "n"(PIN_INNER_VGPR + 1));
-    asm volatile("v_fmac_f32_e32 v[%0], v[%1], v[%2]"
-        : : "n"(PIN_TMP_OUTER + 2), "n"(PIN_COMBINED_SCALE + 2), "n"(PIN_INNER_VGPR + 2));
-    asm volatile("v_fmac_f32_e32 v[%0], v[%1], v[%2]"
-        : : "n"(PIN_TMP_OUTER + 3), "n"(PIN_COMBINED_SCALE + 3), "n"(PIN_INNER_VGPR + 3));
-    // Write outer back AGPR.
-    asm volatile("v_accvgpr_write_b32 a[%0], v[%1]" : : "n"(PIN_OUTER + 0), "n"(PIN_TMP_OUTER + 0));
-    asm volatile("v_accvgpr_write_b32 a[%0], v[%1]" : : "n"(PIN_OUTER + 1), "n"(PIN_TMP_OUTER + 1));
-    asm volatile("v_accvgpr_write_b32 a[%0], v[%1]" : : "n"(PIN_OUTER + 2), "n"(PIN_TMP_OUTER + 2));
-    asm volatile("v_accvgpr_write_b32 a[%0], v[%1]" : : "n"(PIN_OUTER + 3), "n"(PIN_TMP_OUTER + 3));
+    asm volatile("v_fmac_f32_e32 %0, v[%1], v[%2]"
+        : "+v"(tmp0) : "n"(PIN_COMBINED_SCALE + 0), "n"(PIN_INNER_VGPR + 0));
+    asm volatile("v_fmac_f32_e32 %0, v[%1], v[%2]"
+        : "+v"(tmp1) : "n"(PIN_COMBINED_SCALE + 1), "n"(PIN_INNER_VGPR + 1));
+    asm volatile("v_fmac_f32_e32 %0, v[%1], v[%2]"
+        : "+v"(tmp2) : "n"(PIN_COMBINED_SCALE + 2), "n"(PIN_INNER_VGPR + 2));
+    asm volatile("v_fmac_f32_e32 %0, v[%1], v[%2]"
+        : "+v"(tmp3) : "n"(PIN_COMBINED_SCALE + 3), "n"(PIN_INNER_VGPR + 3));
+    // Write outer back to AGPR.
+    asm volatile("v_accvgpr_write_b32 a[%0], %1" : : "n"(PIN_OUTER + 0), "v"(tmp0));
+    asm volatile("v_accvgpr_write_b32 a[%0], %1" : : "n"(PIN_OUTER + 1), "v"(tmp1));
+    asm volatile("v_accvgpr_write_b32 a[%0], %1" : : "n"(PIN_OUTER + 2), "v"(tmp2));
+    asm volatile("v_accvgpr_write_b32 a[%0], %1" : : "n"(PIN_OUTER + 3), "v"(tmp3));
     // clang-format on
 #else
     static_assert(false, "apply_scale_promotion_16x16 requires gfx950");

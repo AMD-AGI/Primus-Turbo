@@ -379,6 +379,50 @@ def gemm_fp8_impl(
     return GEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
+def gemm_fp8_default_dispatch(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: ScalingGranularity,
+    default_backend: BackendType,
+) -> torch.Tensor:
+    """FP8 GEMM dispatch that ignores the user-selected backend.
+
+    The forward FP8 backends advertise different layout coverage. The TURBO
+    BLOCKWISE kernel, in particular, only handles the NT forward GEMM
+    (``not trans_a and trans_b and not trans_c``), while the autograd
+    backward of a BLOCKWISE FP8 GEMM issues an NN (dgrad) and a TN (wgrad)
+    GEMM. When a user pins the FP8 backend to TURBO via
+    ``GlobalBackendManager.set_gemm_backend`` or ``PRIMUS_TURBO_GEMM_BACKEND``,
+    the regular ``gemm_fp8_impl`` raises because TURBO cannot handle those
+    backward layouts.
+
+    ``gemm_fp8_default_dispatch`` skips the user-backend branch in
+    :class:`GEMMFP8KernelDispatcher` and goes straight to the supplied
+    ``default_backend`` (typically CK for BLOCKWISE backward), keeping the
+    backward path functional while leaving the forward path free to honour
+    the user's backend choice.
+    """
+    return GEMMFP8KernelDispatcher.dispatch(
+        default_backend,
+        None,
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity,
+    )
+
+
 @gemm_fp8_impl.register_fake
 def gemm_fp8_impl_meta(
     a: torch.Tensor,
