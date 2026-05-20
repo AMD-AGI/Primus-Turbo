@@ -15,7 +15,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, QuantizedTensors
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensor,
+    QuantizedTensorPair,
+)
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
 from tests.pytorch.test_utils import compute_snr
@@ -194,19 +197,12 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
         fp4_dtype,
         config.granularity,
         block_size=config.block_size,
-        keep_trans_cache=True,
+        axis=1,
         scaling_recipe=ScalingRecipe(
             use_2d_block=False,
             use_sr=False,
             use_rht=False,
             shuffle_scale=enable_preshuffle(),
-        ),
-        scaling_recipe_for_trans=ScalingRecipe(
-            use_2d_block=False,
-            use_sr=False,
-            use_rht=True,
-            shuffle_scale=enable_preshuffle(),
-            shuffle_out=enable_preshuffle(),
         ),
     )
 
@@ -215,25 +211,18 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
         fp4_dtype,
         config.granularity,
         block_size=config.block_size,
-        keep_trans_cache=True,
+        axis=1,
         scaling_recipe=ScalingRecipe(
-            use_2d_block=False,
+            use_2d_block=True,
             use_sr=False,
             use_rht=False,
             shuffle_scale=enable_preshuffle(),
         ),
-        scaling_recipe_for_trans=ScalingRecipe(
-            use_2d_block=False,
-            use_sr=False,
-            use_rht=True,
-            shuffle_scale=enable_preshuffle(),
-            shuffle_out=enable_preshuffle(),
-        ),
     )
 
     c = gemm_fp4(
-        QuantizedTensors(data=qt_a, data_t=None),
-        QuantizedTensors(data=qt_b, data_t=None),
+        QuantizedTensorPair(data=qt_a, data_t=None),
+        QuantizedTensorPair(data=qt_b, data_t=None),
         trans_a,
         trans_b,
         dtype,

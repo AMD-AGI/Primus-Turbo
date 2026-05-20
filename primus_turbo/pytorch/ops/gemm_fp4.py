@@ -18,7 +18,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
-    QuantizedTensors,
+    QuantizedTensorPair,
     check_quantized_tensor,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
@@ -245,8 +245,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
     ),
 )
 def gemm_fp4(
-    a: Union[torch.Tensor, QuantizedTensors],
-    b: Union[torch.Tensor, QuantizedTensors],
+    a: Union[torch.Tensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensorPair],
     trans_a: bool = False,
     trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
@@ -257,14 +257,14 @@ def gemm_fp4(
     Automatically quantizes inputs to FP4 format during forward and backward passes
     to accelerate training and inference. When ``a`` or ``b`` is already a
     :class:`QuantizedTensor`, its quantized data / scale is reused directly,
-    skipping the forward-direction quantization. If a :class:`QuantizedTensors`
+    skipping the forward-direction quantization. If a :class:`QuantizedTensorPair`
     wrapper is passed instead, the optional ``data_t`` field is also forwarded
     and reused as the col-wise / RHT transpose cache for backward.
 
     Args:
         a: Input matrix a with shape (M, K), must be 2D tensor. The A matrix should be activaton.
             Can also be a pre-quantized :class:`QuantizedTensor` (forward only)
-            or a :class:`QuantizedTensors` carrying both ``data`` and the
+            or a :class:`QuantizedTensorPair` carrying both ``data`` and the
             backward-direction ``data_t``.
         b: Input matrix b with shape (K, N) or (N, K), must be 2D tensor. The B matrix should be weight.
             Same pre-quantized variants as ``a`` are accepted.
@@ -297,12 +297,12 @@ def gemm_fp4(
     if config is None:
         config = Float4QuantConfig()
 
-    if isinstance(a, QuantizedTensors):
+    if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t
     else:
         a_data, a_data_t = a, None
 
-    if isinstance(b, QuantizedTensors):
+    if isinstance(b, QuantizedTensorPair):
         b_data, b_data_t = b.data, b.data_t
     else:
         b_data, b_data_t = b, None

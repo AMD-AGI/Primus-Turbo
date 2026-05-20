@@ -545,25 +545,15 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     torch.cuda.synchronize()
 
     # Externally construct quantized tensors.
-    #   - TENSORWISE: no trans cache (scale_inv is invariant)
-    #   - ROWWISE:    keep_trans_cache=True caches both row-wise and col-wise
-    #                 scales for forward + backward
     fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
-    keep_trans_cache = granularity != ScalingGranularity.TENSORWISE
 
-    qt_a = QuantizedTensor.quantize(
-        a,
-        fwd_dtype,
-        granularity,
-        group_lens=group_lens,
-        keep_trans_cache=keep_trans_cache,
-    )
+    qt_a = QuantizedTensor.quantize(a, fwd_dtype, granularity, group_lens=group_lens, axis=-1)
 
     qt_b = QuantizedTensor.quantize(
         b,
         fwd_dtype,
         granularity,
-        keep_trans_cache=keep_trans_cache,
+        axis=-1 if trans_b else -2,
     )
 
     # Reference
@@ -654,8 +644,7 @@ def test_grouped_gemm_fp8_tensorwise_quantized_tensor(
 def test_grouped_gemm_fp8_rowwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
 ):
-    """ROWWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs
-    (keep_trans_cache=True)."""
+    """ROWWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs"""
     N, K = NK
     _run_grouped_gemm_fp8_quantized_tensor_test(
         B=B,

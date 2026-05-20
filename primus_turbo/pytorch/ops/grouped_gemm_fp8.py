@@ -17,7 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
-    QuantizedTensors,
+    QuantizedTensorPair,
     check_quantized_tensor,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
@@ -501,8 +501,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     ),
 )
 def grouped_gemm_fp8(
-    a: Union[torch.Tensor, QuantizedTensors],
-    b: Union[torch.Tensor, QuantizedTensors],
+    a: Union[torch.Tensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensorPair],
     group_lens: torch.Tensor,
     group_offs: Union[torch.Tensor, None] = None,
     trans_b: bool = True,
@@ -518,7 +518,7 @@ def grouped_gemm_fp8(
     Args:
         a: Input tensor A with shape [bs * m, k] (float16 or bfloat16).
             Can also be a pre-quantized :class:`QuantizedTensor` (grouped), or
-            a :class:`QuantizedTensors` carrying both ``data`` (row-wise) and
+            a :class:`QuantizedTensorPair` carrying both ``data`` (row-wise) and
             the backward-direction ``data_t`` (col-wise) for ROWWISE granularity.
         b: Input tensor B with shape [bs, k, n] or [bs, n, k] if trans_b (float16 or bfloat16).
             Same pre-quantized variants as ``a`` are accepted.
@@ -536,12 +536,12 @@ def grouped_gemm_fp8(
 
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
-    if isinstance(a, QuantizedTensors):
+    if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t
     else:
         a_data, a_data_t = a, None
 
-    if isinstance(b, QuantizedTensors):
+    if isinstance(b, QuantizedTensorPair):
         b_data, b_data_t = b.data, b.data_t
     else:
         b_data, b_data_t = b, None

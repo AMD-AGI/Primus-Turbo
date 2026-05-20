@@ -19,7 +19,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, QuantizedTensors
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensor,
+    QuantizedTensorPair,
+)
 from primus_turbo.pytorch.ops import gemm_fp8
 from tests.pytorch.test_utils import compute_snr
 
@@ -411,12 +414,6 @@ def _run_gemm_fp8_quantized_tensor_test(
         config = Float8QuantConfig(granularity=granularity, format=format)
 
     # Externally construct QuantizedTensor.
-    #   - TENSORWISE: no trans cache (scale_inv is invariant)
-    #   - ROWWISE / BLOCKWISE: keep_trans_cache=True caches both row-wise
-    #     and col-wise scales for forward + backward
-    # Weights (b) commonly use 2D-block scaling for both BLOCKWISE and
-    # MX_BLOCKWISE. In BLOCKWISE with 2D block, the weight scale is symmetric
-    # along row/col so no trans cache is needed.
     fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
 
     # a: activation
@@ -457,8 +454,8 @@ def _run_gemm_fp8_quantized_tensor_test(
     c_ref.backward(grad_c)
 
     c = gemm_fp8(
-        QuantizedTensors(data=qt_a, data_t=None),
-        QuantizedTensors(data=qt_b, data_t=None),
+        QuantizedTensorPair(data=qt_a, data_t=None),
+        QuantizedTensorPair(data=qt_b, data_t=None),
         trans_a,
         trans_b,
         dtype,

@@ -275,6 +275,8 @@ class QuantizedTensor(torch.Tensor):
         return cls(
             data,
             scale_inv,
+            # NOTE: quantize will do padding internally
+            # To keep original shape here is to workaround autograd issues.
             shape=hp_tensor.size(),
             orig_dtype=hp_tensor.dtype,
             dest_dtype=dest_dtype,
@@ -380,7 +382,6 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def quantized_axis(self) -> int:
-
         return _normalize_axis(self._quantized_axis, self._data.ndim)
 
     @torch.no_grad()
@@ -392,7 +393,7 @@ class QuantizedTensor(torch.Tensor):
 
         # TODO(ruibi): add support for grouped dequantization
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
-            return dequantize_fp8(
+            out = dequantize_fp8(
                 self._data,
                 self._orig_dtype,
                 self._granularity,
@@ -402,7 +403,7 @@ class QuantizedTensor(torch.Tensor):
                 scaling_recipe=self._scaling_recipe,
             )
         elif self._dest_dtype == float4_e2m1fn_x2:
-            return dequantize_fp4(
+            out = dequantize_fp4(
                 self._data,
                 self._orig_dtype,
                 self._granularity,
@@ -414,20 +415,15 @@ class QuantizedTensor(torch.Tensor):
         else:
             assert False, "Unsupported dtype"
 
-    # ------------------------------------------------------------------
-    # Repr
-    # ------------------------------------------------------------------
-    def __repr__(self) -> str:
-        grouped_part = (
-            f"group_lens={self._group_lens.tolist()}, "
-            if self._is_grouped_tensor and self._group_lens is not None
-            else ""
-        )
-        return (
-            f"QuantizedTensor(shape={list(self.shape)}, "
-            f"{grouped_part}orig_dtype={self._orig_dtype}, "
-            f"real_dtype={self._data.dtype}, granularity={self._granularity.name})"
-        )
+        # TODO(ruibin): fused unpad in dequantize kernel
+        if out.ndim == 2:
+            out = out[:, : self.size(-1)].contiguous()
+        elif out.ndim == 3:
+            out = out[:, :, : self.size(-1)].contiguous()
+        else:
+            assert False, "Unsupported ndim"
+
+        return out
 
     # ------------------------------------------------------------------
     # Serialisation (torch.compile / FSDP)
@@ -519,17 +515,21 @@ class QuantizedTensor(torch.Tensor):
         align = _get_padding_align_size(tensor)
         padded_target_shape = _pad_inner_dim(target_shape, align)
 
-        assert (
-            tensor._data.numel() == torch.Size(padded_target_shape).numel()
-        ), "data numel and padded_target_shape must have the same number of elements"
+        packing = _get_packing_factor(tensor)
+        assert padded_target_shape[-1] % packing == 0, (
+            f"padded inner dim {padded_target_shape[-1]} must be divisible by " f"packing factor {packing}"
+        )
+        data_target_shape = (
+            *padded_target_shape[:-1],
+            padded_target_shape[-1] // packing,
+        )
 
-        out_data = op(tensor._data, *padded_target_shape)
+        out_data = op(tensor._data, *data_target_shape)
 
         out_scale_inv = tensor._scale_inv
         if tensor._granularity == ScalingGranularity.MX_BLOCKWISE and tensor._scale_inv is not None:
             block_size = tensor._block_size
-            packing = _get_packing_factor(tensor)
-            scale_target_shape = _compute_scale_shape(padded_target_shape, block_size, packing)
+            scale_target_shape = _compute_scale_shape(data_target_shape, block_size, packing)
             out_scale_inv = op(tensor._scale_inv, *scale_target_shape)
 
         return out_data, out_scale_inv, out_shape
@@ -624,7 +624,7 @@ class _ReshapeFunc(torch.autograd.Function):
         return grad.reshape(ctx.shape), None
 
 
-class QuantizedTensors(NamedTuple):
+class QuantizedTensorPair(NamedTuple):
     """
     Wrapper for quantized tensors.
 

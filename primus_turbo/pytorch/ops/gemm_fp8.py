@@ -20,7 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
-    QuantizedTensors,
+    QuantizedTensorPair,
     check_quantized_tensor,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
@@ -561,8 +561,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
     ),
 )
 def gemm_fp8(
-    a: Union[torch.Tensor, QuantizedTensors],
-    b: Union[torch.Tensor, QuantizedTensors],
+    a: Union[torch.Tensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensorPair],
     trans_a: bool = False,
     trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
@@ -612,12 +612,12 @@ def gemm_fp8(
     if config is None:
         config = Float8QuantConfig()
 
-    if isinstance(a, QuantizedTensors):
+    if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t
     else:
         a_data, a_data_t = a, None
 
-    if isinstance(b, QuantizedTensors):
+    if isinstance(b, QuantizedTensorPair):
         b_data, b_data_t = b.data, b.data_t
     else:
         b_data, b_data_t = b, None
