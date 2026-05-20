@@ -36,6 +36,7 @@ void hk_grouped_rrr_fp8(
     const float* sa_ptr, const float* sb_ptr,
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
+    int bn_block,
     hipStream_t stream);
 
 void hk_grouped_rcr_bf16(
@@ -136,7 +137,7 @@ at::Tensor hk_grouped_var_k_crr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_
 at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                               at::Tensor &b_scales, at::Tensor &group_offs,
                               int64_t group_m, int64_t m_per_group, int64_t num_xcds,
-                              at::ScalarType out_dtype) {
+                              at::ScalarType out_dtype, int64_t bn_block) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && group_offs.is_cuda(),
                 "hk_grouped_rrr_fp8: tensors must be on cuda");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && group_offs.is_contiguous(),
@@ -158,6 +159,7 @@ at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
         group_offs.data_ptr<int64_t>(), G,
         static_cast<int>(group_m), static_cast<int>(m_per_group),
         static_cast<int>(num_xcds),
+        static_cast<int>(bn_block),
         current_stream());
     return out;
 }

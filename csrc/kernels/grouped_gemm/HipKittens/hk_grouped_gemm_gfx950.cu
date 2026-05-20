@@ -82,6 +82,8 @@ void hk_grouped_rcr_fp8(
 }
 
 // FP8 grouped RRR (dense-style, alternative dgrad path).
+// bn_block: 0 (default) = BLK_M=BLK_N=256; 128 = bn128 variant (BLK_M=256, BLK_N=128)
+// — fewer accumulators + zero spill; see HK 9590230d.
 void hk_grouped_rrr_fp8(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int G_b, int bK_, int bN,
@@ -89,6 +91,7 @@ void hk_grouped_rrr_fp8(
     const float* sa_ptr, const float* sb_ptr,
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
+    int bn_block,
     hipStream_t stream)
 {
     hk_fp8_kernel::grouped_layout_globals g{
@@ -103,6 +106,7 @@ void hk_grouped_rrr_fp8(
         /*fast_n*/0, /*fast_k*/0,
         m_per_group, /*num_slots*/0, /*chunk_size*/0, /*fuse_ktail_off*/0,
         /*sk_split_n*/0, nullptr,
+        bn_block,
     };
     hk_fp8_kernel::dispatch_grouped_rrr(g);
 }
