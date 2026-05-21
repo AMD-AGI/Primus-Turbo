@@ -40,6 +40,12 @@ class MegaMoEConfig:
     num_max_pool_tokens: int
     num_padded_sf_pool_tokens: int
 
+    # LDS swizzle mode for activations / weights (analogous to DG's TMA
+    # swizzle mode; 0 means no swizzle and the kernel falls back to the
+    # default layout).
+    swizzle_acts_mode: int
+    swizzle_weights_mode: int
+
     # Persistent-CTA wave granularity.
     num_experts_per_wave: int
 
@@ -61,6 +67,8 @@ class MegaMoEConfig:
             f"sf_block_m={self.sf_block_m}, sf_block_n={self.sf_block_n}, "
             f"num_max_pool_tokens={self.num_max_pool_tokens}, "
             f"num_padded_sf_pool_tokens={self.num_padded_sf_pool_tokens}, "
+            f"swizzle_acts_mode={self.swizzle_acts_mode}, "
+            f"swizzle_weights_mode={self.swizzle_weights_mode}, "
             f"num_experts_per_wave={self.num_experts_per_wave}, "
             f"num_stages={self.num_stages}, smem_size={self.smem_size}, "
             f"num_dispatch_threads={self.num_dispatch_threads}, "
@@ -162,6 +170,10 @@ def get_mega_moe_config(
         sf_block_n=block_n,
         num_max_pool_tokens=num_max_pool_tokens,
         num_padded_sf_pool_tokens=num_padded_sf_pool_tokens,
+        # FP8 activations + FP4 weights (unpacked to 8-bit in LDS) both
+        # use 128-byte swizzle.  Matches DG's SM100 reference.
+        swizzle_acts_mode=128,
+        swizzle_weights_mode=128,
         num_experts_per_wave=num_per_wave,
         num_stages=4,
         smem_size=0,

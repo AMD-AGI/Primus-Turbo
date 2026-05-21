@@ -14,8 +14,10 @@ This module is the Python-side counterpart of DeepGEMM's
   raises ``NotImplementedError`` when invoked on shapes that the
   device kernel does not yet support).
 
-The kernel-side implementation is intentionally a stub; the Python API
-surface is the focus of this skeleton.
+Function names mirror DeepGEMM's ``deep_gemm.mega`` API surface 1:1 so
+existing call sites in DeepSeek-style MoE pipelines can switch
+backends with minimal diff.  The kernel-side implementation is
+intentionally a stub.
 """
 
 from __future__ import annotations
@@ -27,9 +29,9 @@ import torch
 
 __all__ = [
     "SymmBufferLayout",
-    "fp8_mega_moe_impl",
-    "get_symm_buffer_layout",
-    "get_token_alignment",
+    "fp8_fp4_mega_moe_impl",
+    "get_symm_buffer_size_for_mega_moe",
+    "get_token_alignment_for_mega_moe",
     "transform_l1_weights_for_mega_moe",
     "transform_l2_weights_for_mega_moe",
 ]
@@ -44,10 +46,13 @@ def _cpp_extension():
     return torch.ops.primus_turbo_cpp_extension
 
 
-def get_token_alignment() -> int:
-    """Return the per-rank token count alignment required by the layout."""
+def get_token_alignment_for_mega_moe() -> int:
+    """Return the per-rank token count alignment required by the layout.
 
-    return int(_cpp_extension().mega_moe_get_token_alignment())
+    Mirrors DeepGEMM's ``deep_gemm._C.get_token_alignment_for_mega_moe``.
+    """
+
+    return int(_cpp_extension().get_token_alignment_for_mega_moe())
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +86,7 @@ class SymmBufferLayout:
     combine_buffer_offset: int
 
 
-def get_symm_buffer_layout(
+def get_symm_buffer_size_for_mega_moe(
     *,
     num_ranks: int,
     num_experts: int,
@@ -91,9 +96,16 @@ def get_symm_buffer_layout(
     intermediate_hidden: int,
     use_fp8_dispatch: bool = True,
 ) -> SymmBufferLayout:
-    """Compute the symmetric memory layout for one mega-MoE allocation."""
+    """Compute the symmetric memory layout for one mega-MoE allocation.
 
-    raw = _cpp_extension().mega_moe_get_symm_buffer_layout(
+    Mirrors DeepGEMM's ``deep_gemm._C.get_symm_buffer_size_for_mega_moe``.
+    DG returns ``(num_bytes, slice_callback)``; here we return the
+    full ``SymmBufferLayout`` so the Python ``SymmBuffer`` wrapper can
+    do the slicing itself (the C++ binding lives behind
+    ``torch.library``).
+    """
+
+    raw = _cpp_extension().get_symm_buffer_size_for_mega_moe(
         int(num_ranks),
         int(num_experts),
         int(num_max_tokens_per_rank),
@@ -192,7 +204,7 @@ def transform_l2_weights_for_mega_moe(
 # ---------------------------------------------------------------------------
 
 
-def fp8_mega_moe_impl(
+def fp8_fp4_mega_moe_impl(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -207,11 +219,12 @@ def fp8_mega_moe_impl(
     hidden: int,
     intermediate_hidden: int,
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 32),
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
 ) -> None:
-    """Forward to the C++ mega-MoE launcher.
+    """Forward to the C++ ``fp8_fp4_mega_moe`` launcher.
 
     The kernel itself is currently a no-op stub: it validates arguments
     and returns without writing to ``y``.  Once the device kernel lands
@@ -220,7 +233,11 @@ def fp8_mega_moe_impl(
     """
 
     if activation != "swiglu":
-        raise NotImplementedError(f"mega_moe currently supports activation='swiglu', got {activation!r}")
+        raise NotImplementedError(
+            f"fp8_fp4_mega_moe currently supports activation='swiglu', got {activation!r}"
+        )
+    if len(recipe) != 3:
+        raise ValueError(f"fp8_fp4_mega_moe: recipe must be a length-3 tuple, got {recipe}")
     clamp = float("inf") if activation_clamp is None else float(activation_clamp)
     if clamp < 0:
         raise ValueError(f"activation_clamp must be non-negative, got {activation_clamp}")
@@ -228,7 +245,7 @@ def fp8_mega_moe_impl(
     l1_w, l1_sf = l1_weights
     l2_w, l2_sf = l2_weights
 
-    _cpp_extension().mega_moe_fp8(
+    _cpp_extension().fp8_fp4_mega_moe(
         y,
         l1_w,
         l1_sf,
@@ -244,6 +261,7 @@ def fp8_mega_moe_impl(
         int(num_tokens),
         int(hidden),
         int(intermediate_hidden),
+        [int(recipe[0]), int(recipe[1]), int(recipe[2])],
         str(activation),
         clamp,
         bool(fast_math),

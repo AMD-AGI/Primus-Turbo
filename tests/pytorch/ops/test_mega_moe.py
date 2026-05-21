@@ -20,8 +20,8 @@ import torch
 from primus_turbo.pytorch.kernels.mega_moe import (
     MegaMoEConfig,
     get_mega_moe_config,
-    get_symm_buffer_layout,
-    get_token_alignment,
+    get_symm_buffer_size_for_mega_moe,
+    get_token_alignment_for_mega_moe,
     transform_l1_weights_for_mega_moe,
     transform_l2_weights_for_mega_moe,
 )
@@ -53,26 +53,32 @@ class MegaMoELayoutTest(unittest.TestCase):
     def setUp(self) -> None:
         self.num_ranks = 8
         self.num_experts = 64
-        self.num_max_tokens_per_rank = 128
+        # 384 == LCM(kCandidateBlockM); see ``get_token_alignment_for_mega_moe``.
+        self.num_max_tokens_per_rank = 384
         self.num_topk = 6
         self.hidden = 512
         self.intermediate_hidden = 256
 
     @unittest.skipUnless(
-        _cpp_extension_has("mega_moe_get_token_alignment"),
+        _cpp_extension_has("get_token_alignment_for_mega_moe"),
         "primus_turbo C extension is not built with mega_moe symbols.",
     )
     def test_token_alignment(self) -> None:
-        align = get_token_alignment()
+        align = get_token_alignment_for_mega_moe()
         self.assertGreater(align, 0)
-        self.assertEqual(align & (align - 1), 0, "token alignment should be a power of two")
+        # DG uses LCM(kCandidateBlockM) = 384, which is not a power of two.
+        # Validate it is divisible by every candidate block_m instead.
+        for candidate in (8, 16, 32, 64, 96, 128, 192):
+            self.assertEqual(
+                align % candidate, 0, f"token alignment must be divisible by candidate block_m={candidate}"
+            )
 
     @unittest.skipUnless(
-        _cpp_extension_has("mega_moe_get_symm_buffer_layout"),
+        _cpp_extension_has("get_symm_buffer_size_for_mega_moe"),
         "primus_turbo C extension is not built with mega_moe symbols.",
     )
     def test_symm_buffer_layout_offsets_monotonic(self) -> None:
-        layout = get_symm_buffer_layout(
+        layout = get_symm_buffer_size_for_mega_moe(
             num_ranks=self.num_ranks,
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_tokens_per_rank,
@@ -155,7 +161,7 @@ class MegaMoEEndToEndTest(unittest.TestCase):
         buffer.topk_idx[:n].copy_(topk_idx)
         buffer.topk_weights[:n].copy_(topk_weights)
         y = torch.empty((n, hidden), dtype=torch.bfloat16, device='cuda')
-        fp8_mega_moe(y, l1, l2, buffer)
+        fp8_fp4_mega_moe(y, l1, l2, buffer)
     """
 
     def test_e2e(self) -> None:

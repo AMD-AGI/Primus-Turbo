@@ -7,9 +7,9 @@
 from .heuristics import MegaMoEConfig, get_mega_moe_config
 from .mega_moe_impl import (
     SymmBufferLayout,
-    fp8_mega_moe_impl,
-    get_symm_buffer_layout,
-    get_token_alignment,
+    fp8_fp4_mega_moe_impl,
+    get_symm_buffer_size_for_mega_moe,
+    get_token_alignment_for_mega_moe,
     transform_l1_weights_for_mega_moe,
     transform_l2_weights_for_mega_moe,
 )
@@ -17,10 +17,10 @@ from .mega_moe_impl import (
 __all__ = [
     "MegaMoEConfig",
     "SymmBufferLayout",
-    "fp8_mega_moe_impl",
+    "fp8_fp4_mega_moe_impl",
     "get_mega_moe_config",
-    "get_symm_buffer_layout",
-    "get_token_alignment",
+    "get_symm_buffer_size_for_mega_moe",
+    "get_token_alignment_for_mega_moe",
     "transform_l1_weights_for_mega_moe",
     "transform_l2_weights_for_mega_moe",
 ]

@@ -5,14 +5,14 @@
 ###############################################################################
 """Public API for the fused Mega MoE FFN kernel.
 
-Mirrors DeepGEMM's ``deep_gemm.mega`` API surface so existing call
+Mirrors DeepGEMM's ``deep_gemm.mega`` API surface 1:1 so existing call
 sites in DeepSeek-style MoE pipelines can switch backends with minimal
 diff:
 
-* :class:`MegaMoESymmBuffer`           — symmetric memory + tensor views
-* :func:`get_symm_buffer_for_mega_moe` — factory matching the DG name
+* :class:`SymmBuffer`                    — symmetric memory + tensor views
+* :func:`get_symm_buffer_for_mega_moe`   — factory matching the DG name
 * :func:`transform_weights_for_mega_moe` — weight pre-processing
-* :func:`fp8_mega_moe`                 — fused dispatch + GG1 + SwiGLU + GG2 + combine
+* :func:`fp8_fp4_mega_moe`               — fused dispatch + GG1 + SwiGLU + GG2 + combine
 
 The underlying GPU kernel is a stub in this revision; the Python layer
 already wires up symmetric memory rendezvous, buffer slicing and shape
@@ -30,16 +30,16 @@ import torch.distributed as dist
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 from primus_turbo.pytorch.kernels.mega_moe import (
     SymmBufferLayout,
-    fp8_mega_moe_impl,
-    get_symm_buffer_layout,
-    get_token_alignment,
+    fp8_fp4_mega_moe_impl,
+    get_symm_buffer_size_for_mega_moe,
+    get_token_alignment_for_mega_moe,
     transform_l1_weights_for_mega_moe,
     transform_l2_weights_for_mega_moe,
 )
 
 __all__ = [
-    "MegaMoESymmBuffer",
-    "fp8_mega_moe",
+    "SymmBuffer",
+    "fp8_fp4_mega_moe",
     "get_symm_buffer_for_mega_moe",
     "transform_weights_for_mega_moe",
 ]
@@ -54,14 +54,20 @@ def _align_up(value: int, multiple: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoESymmBuffer:
+class SymmBuffer:
     """Container holding the symmetric memory allocation + tensor views.
 
     Equivalent of DeepGEMM's ``deep_gemm.mega.SymmBuffer``.  Each rank
     in ``group`` calls into this class with the same arguments; the
     constructor rendezvous'es IPC handles internally and exposes
     per-region tensor views that the caller can copy inputs into
-    before invoking :func:`fp8_mega_moe`.
+    before invoking :func:`fp8_fp4_mega_moe`.
+
+    The exposed views mirror DG's ``slice_input_buffers`` exactly:
+    ``(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts,
+    l2_acts_sf)``.  Internal regions (per-expert weight columns,
+    BF16 combine buffer) are not exposed — the kernel addresses them
+    directly through ``sym_buffer_ptrs``.
     """
 
     def __init__(
@@ -77,9 +83,7 @@ class MegaMoESymmBuffer:
         activation: str = "swiglu",
     ) -> None:
         if activation != "swiglu":
-            raise NotImplementedError(
-                f"MegaMoESymmBuffer only supports activation='swiglu', got {activation!r}"
-            )
+            raise NotImplementedError(f"SymmBuffer only supports activation='swiglu', got {activation!r}")
 
         self.group = group
         self.num_experts = int(num_experts)
@@ -91,10 +95,12 @@ class MegaMoESymmBuffer:
         self.activation = activation
 
         # Per-rank token count must be aligned.
-        self.num_max_tokens_per_rank = _align_up(self.num_max_tokens_per_rank, get_token_alignment())
+        self.num_max_tokens_per_rank = _align_up(
+            self.num_max_tokens_per_rank, get_token_alignment_for_mega_moe()
+        )
 
         # Compute the layout (offsets + total bytes).
-        self.layout: SymmBufferLayout = get_symm_buffer_layout(
+        self.layout: SymmBufferLayout = get_symm_buffer_size_for_mega_moe(
             num_ranks=group.size(),
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_tokens_per_rank,
@@ -114,7 +120,7 @@ class MegaMoESymmBuffer:
             dtype=torch.int8,
         )
 
-        # Create per-region tensor views.
+        # Create per-region tensor views (mirrors DG's 8-tuple).
         (
             self.x,
             self.x_sf,
@@ -122,10 +128,8 @@ class MegaMoESymmBuffer:
             self.topk_weights,
             self.l1_acts,
             self.l1_acts_sf,
-            self.l1_weights_column,
             self.l2_acts,
             self.l2_acts_sf,
-            self.combine_acts,
         ) = self._slice_views()
 
         # Initialise to zero and barrier so peers see a clean buffer.
@@ -163,7 +167,7 @@ class MegaMoESymmBuffer:
         """Return a typed view over the local symmetric buffer."""
         if offset_bytes % dtype.itemsize != 0:
             raise ValueError(
-                f"MegaMoESymmBuffer: offset {offset_bytes} is not aligned to "
+                f"SymmBuffer: offset {offset_bytes} is not aligned to "
                 f"dtype {dtype} (itemsize={dtype.itemsize})"
             )
         storage_offset = offset_bytes // dtype.itemsize
@@ -174,16 +178,14 @@ class MegaMoESymmBuffer:
     def _slice_views(
         self,
     ) -> Tuple[
-        torch.Tensor,  # x         FP8  [N, H]
-        torch.Tensor,  # x_sf      int  [N, H/128]
-        torch.Tensor,  # topk_idx  int64 [N, K]
-        torch.Tensor,  # topk_w    f32   [N, K]
-        torch.Tensor,  # l1_acts   FP8   [P, H]
-        torch.Tensor,  # l1_acts_sf int  [P_sf, H/128]
-        torch.Tensor,  # l1_topk_w  f32  [P]
-        torch.Tensor,  # l2_acts    FP8  [P, I]
-        torch.Tensor,  # l2_acts_sf int  [P_sf, I/128]
-        torch.Tensor,  # combine    BF16 [K, N, H]
+        torch.Tensor,  # x          FP8   [N, H]
+        torch.Tensor,  # x_sf       int   [N, H/128]
+        torch.Tensor,  # topk_idx   int64 [N, K]
+        torch.Tensor,  # topk_w     f32   [N, K]
+        torch.Tensor,  # l1_acts    FP8   [P, H]
+        torch.Tensor,  # l1_acts_sf int   [P_sf, H/128]
+        torch.Tensor,  # l2_acts    FP8   [P, I]
+        torch.Tensor,  # l2_acts_sf int   [P_sf, I/128]
     ]:
         layout = self.layout
 
@@ -220,11 +222,6 @@ class MegaMoESymmBuffer:
             shape=(layout.num_padded_sf_pool_tokens, self.hidden // 128),
             dtype=torch.int32,
         )
-        l1_weights_column = self._view_at(
-            layout.l1_pool_weights_offset,
-            shape=(layout.num_max_pool_tokens,),
-            dtype=torch.float32,
-        )
         l2_acts = self._view_at(
             layout.l2_pool_x_offset,
             shape=(layout.num_max_pool_tokens, self.intermediate_hidden),
@@ -235,11 +232,6 @@ class MegaMoESymmBuffer:
             shape=(layout.num_padded_sf_pool_tokens, self.intermediate_hidden // 128),
             dtype=torch.int32,
         )
-        combine_acts = self._view_at(
-            layout.combine_buffer_offset,
-            shape=(self.num_topk, self.num_max_tokens_per_rank, self.hidden),
-            dtype=torch.bfloat16,
-        )
         return (
             x,
             x_sf,
@@ -247,10 +239,8 @@ class MegaMoESymmBuffer:
             topk_weights,
             l1_acts,
             l1_acts_sf,
-            l1_weights_column,
             l2_acts,
             l2_acts_sf,
-            combine_acts,
         )
 
     def destroy(self) -> None:
@@ -263,10 +253,8 @@ class MegaMoESymmBuffer:
             "topk_weights",
             "l1_acts",
             "l1_acts_sf",
-            "l1_weights_column",
             "l2_acts",
             "l2_acts_sf",
-            "combine_acts",
             "buffer",
         ):
             setattr(self, attr, None)
@@ -290,10 +278,13 @@ def get_symm_buffer_for_mega_moe(
     intermediate_hidden: int,
     use_fp8_dispatch: bool = True,
     activation: str = "swiglu",
-) -> MegaMoESymmBuffer:
-    """Allocate the symmetric buffer used by :func:`fp8_mega_moe`."""
+) -> SymmBuffer:
+    """Allocate the symmetric buffer used by :func:`fp8_fp4_mega_moe`.
 
-    return MegaMoESymmBuffer(
+    Mirrors DG's ``deep_gemm.mega.get_symm_buffer_for_mega_moe``.
+    """
+
+    return SymmBuffer(
         group,
         num_experts=num_experts,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -324,11 +315,11 @@ def transform_weights_for_mega_moe(
     )
 
 
-def fp8_mega_moe(
+def fp8_fp4_mega_moe(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
-    sym_buffer: MegaMoESymmBuffer,
+    sym_buffer: SymmBuffer,
     *,
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     recipe: Tuple[int, int, int] = (1, 1, 32),
@@ -338,6 +329,9 @@ def fp8_mega_moe(
 ) -> None:
     """Run the fused mega-MoE FFN (dispatch + GG1 + SwiGLU + GG2 + combine).
 
+    FP8 activations × FP4 weights variant.  Mirrors DG's
+    ``deep_gemm.mega.fp8_fp4_mega_moe`` API surface 1:1.
+
     Args:
         y: BF16 output tensor of shape ``[num_tokens, hidden]``.  This
             rank's combined per-token output is written in-place.
@@ -345,7 +339,7 @@ def fp8_mega_moe(
             already be in the kernel-native layout (use
             :func:`transform_weights_for_mega_moe`).
         l2_weights: ``(weight, sf)`` pair for the down-projection.
-        sym_buffer: A :class:`MegaMoESymmBuffer` previously allocated by
+        sym_buffer: A :class:`SymmBuffer` previously allocated by
             :func:`get_symm_buffer_for_mega_moe`.  The caller is
             expected to copy ``x``, ``x_sf``, ``topk_idx`` and
             ``topk_weights`` into the buffer views before invoking.
@@ -362,22 +356,23 @@ def fp8_mega_moe(
     """
 
     if recipe != (1, 1, 32):
-        raise NotImplementedError(f"fp8_mega_moe currently supports recipe=(1, 1, 32), got {recipe}")
+        raise NotImplementedError(f"fp8_fp4_mega_moe currently supports recipe=(1, 1, 32), got {recipe}")
     if y.dim() != 2:
-        raise ValueError(f"fp8_mega_moe: y must be 2D, got shape {tuple(y.shape)}")
+        raise ValueError(f"fp8_fp4_mega_moe: y must be 2D, got shape {tuple(y.shape)}")
     if y.size(1) != sym_buffer.hidden:
         raise ValueError(
-            f"fp8_mega_moe: y hidden dim ({y.size(1)}) does not match buffer hidden " f"({sym_buffer.hidden})"
+            f"fp8_fp4_mega_moe: y hidden dim ({y.size(1)}) does not match buffer hidden "
+            f"({sym_buffer.hidden})"
         )
 
     num_tokens = int(y.size(0))
     if num_tokens > sym_buffer.num_max_tokens_per_rank:
         raise ValueError(
-            f"fp8_mega_moe: num_tokens ({num_tokens}) exceeds "
+            f"fp8_fp4_mega_moe: num_tokens ({num_tokens}) exceeds "
             f"num_max_tokens_per_rank ({sym_buffer.num_max_tokens_per_rank})"
         )
 
-    fp8_mega_moe_impl(
+    fp8_fp4_mega_moe_impl(
         y,
         l1_weights,
         l2_weights,
@@ -391,6 +386,7 @@ def fp8_mega_moe(
         hidden=sym_buffer.hidden,
         intermediate_hidden=sym_buffer.intermediate_hidden,
         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+        recipe=recipe,
         activation=activation,
         activation_clamp=activation_clamp,
         fast_math=fast_math,
