@@ -217,7 +217,7 @@ def _fp8_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
 
@@ -236,7 +236,7 @@ def _fp8_persistent_gemm_kernel(
                 B_BASE = tl.multiple_of(B_BASE, (1, 16))
             a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
         # Apply per-tensor scale
         acc *= scale
@@ -514,7 +514,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
 
@@ -533,7 +533,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
                 B_BASE = tl.multiple_of(B_BASE, (1, 16))
             a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
         # Apply per-row/per-col vector scales
         a_scale = tl.load(A_scale_ptr + rm)
@@ -957,7 +957,7 @@ def _blockwise_fp8_unified_kernel(
                 a = tl.load(a_ptrs, mask=mask_k_col, other=0.0, cache_modifier=".ca")
                 b = tl.load(b_ptrs, mask=mask_k_row, other=0.0, cache_modifier=".ca")
 
-            partial = tl.dot(a, b, input_precision="ieee")
+            partial = tl.dot(a, b)
 
             a_s = tl.load(as_ptrs + ki * stride_as_k)
 
