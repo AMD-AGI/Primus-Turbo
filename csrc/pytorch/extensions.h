@@ -237,6 +237,52 @@ at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 
 //==================================================================
+//  Mega MoE — fused EP dispatch + L1 GEMM + activation + L2 GEMM +
+//  EP combine, mirroring DeepGEMM's ``deep_gemm.mega`` API surface.
+//
+//  The actual device kernel is currently a stub.  These bindings are
+//  provided so the Python frontend, autograd wiring and distributed
+//  buffer layout can be exercised end-to-end ahead of the kernel
+//  implementation.
+//==================================================================
+
+int64_t mega_moe_get_token_alignment();
+
+int64_t mega_moe_get_token_alignment_meta();
+
+at::Tensor mega_moe_get_symm_buffer_layout(const int64_t num_ranks, const int64_t num_experts,
+                                           const int64_t num_max_tokens_per_rank,
+                                           const int64_t num_topk, const int64_t hidden,
+                                           const int64_t intermediate_hidden,
+                                           const bool    use_fp8_dispatch);
+
+at::Tensor mega_moe_get_symm_buffer_layout_meta(const int64_t num_ranks, const int64_t num_experts,
+                                                const int64_t num_max_tokens_per_rank,
+                                                const int64_t num_topk, const int64_t hidden,
+                                                const int64_t intermediate_hidden,
+                                                const bool    use_fp8_dispatch);
+
+void mega_moe_fp8(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
+                  at::Tensor l2_weights, at::Tensor l2_weights_sf,
+                  c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
+                  at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
+                  const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
+                  const int64_t num_experts, const int64_t num_topk, const int64_t num_tokens,
+                  const int64_t hidden, const int64_t intermediate_hidden,
+                  const std::string &activation, const double activation_clamp,
+                  const bool fast_math);
+
+void mega_moe_fp8_meta(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
+                       at::Tensor l2_weights, at::Tensor l2_weights_sf,
+                       c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
+                       at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
+                       const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
+                       const int64_t num_experts, const int64_t num_topk, const int64_t num_tokens,
+                       const int64_t hidden, const int64_t intermediate_hidden,
+                       const std::string &activation, const double activation_clamp,
+                       const bool fast_math);
+
+//==================================================================
 //  Runtime
 //==================================================================
 
