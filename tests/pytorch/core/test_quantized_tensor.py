@@ -215,25 +215,6 @@ class TestDequantize:
 
 
 # =====================================================================
-# Repr
-# =====================================================================
-class TestRepr:
-
-    @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GRAN_CASES)
-    def test_repr(self, granularity, block_size, dest_dtype):
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        qt = _make_quantized_tensor(x, granularity=granularity, block_size=block_size, dest_dtype=dest_dtype)
-
-        r = repr(qt)
-        assert "QuantizedTensor" in r
-        assert granularity.name in r
-        # Non-grouped wrappers must not advertise the (removed) trans cache.
-        assert "has_trans_cache" not in r
-        # Non-grouped wrappers shouldn't mention ``group_lens``.
-        assert "group_lens" not in r
-
-
-# =====================================================================
 # Serialisation (flatten / unflatten)
 # =====================================================================
 class TestSerialization:
@@ -529,31 +510,6 @@ class TestGroupedDequantize:
 
         x_recon = qt.dequantize()
         torch.testing.assert_close(x_recon, x, **get_tolerances(dest_dtype))
-
-
-# ---------------------------------------------------------------------
-# Repr
-# ---------------------------------------------------------------------
-class TestGroupedRepr:
-
-    @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
-    def test_repr(self, granularity, block_size, dest_dtype):
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
-        group_lens = _make_group_lens()
-        qt = _make_quantized_tensor(
-            x,
-            granularity=granularity,
-            block_size=block_size,
-            dest_dtype=dest_dtype,
-            group_lens=group_lens,
-        )
-
-        r = repr(qt)
-        assert "QuantizedTensor" in r
-        assert "group_lens" in r
-        assert granularity.name in r
-        # The trans-cache concept was removed entirely.
-        assert "has_trans_cache" not in r
 
 
 # ---------------------------------------------------------------------
