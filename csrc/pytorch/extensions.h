@@ -243,44 +243,48 @@ at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 //  The actual device kernel is currently a stub.  These bindings are
 //  provided so the Python frontend, autograd wiring and distributed
 //  buffer layout can be exercised end-to-end ahead of the kernel
-//  implementation.
+//  implementation.  Naming mirrors DG's
+//  ``get_token_alignment_for_mega_moe`` / ``get_symm_buffer_size_for_mega_moe``
+//  / ``fp8_fp4_mega_moe`` 1:1.
 //==================================================================
 
-int64_t mega_moe_get_token_alignment();
+int64_t get_token_alignment_for_mega_moe();
 
-int64_t mega_moe_get_token_alignment_meta();
+int64_t get_token_alignment_for_mega_moe_meta();
 
-at::Tensor mega_moe_get_symm_buffer_layout(const int64_t num_ranks, const int64_t num_experts,
-                                           const int64_t num_max_tokens_per_rank,
-                                           const int64_t num_topk, const int64_t hidden,
-                                           const int64_t intermediate_hidden,
-                                           const bool    use_fp8_dispatch);
+at::Tensor get_symm_buffer_size_for_mega_moe(const int64_t num_ranks, const int64_t num_experts,
+                                             const int64_t num_max_tokens_per_rank,
+                                             const int64_t num_topk, const int64_t hidden,
+                                             const int64_t intermediate_hidden,
+                                             const bool    use_fp8_dispatch);
 
-at::Tensor mega_moe_get_symm_buffer_layout_meta(const int64_t num_ranks, const int64_t num_experts,
-                                                const int64_t num_max_tokens_per_rank,
-                                                const int64_t num_topk, const int64_t hidden,
-                                                const int64_t intermediate_hidden,
-                                                const bool    use_fp8_dispatch);
+at::Tensor get_symm_buffer_size_for_mega_moe_meta(const int64_t num_ranks,
+                                                  const int64_t num_experts,
+                                                  const int64_t num_max_tokens_per_rank,
+                                                  const int64_t num_topk, const int64_t hidden,
+                                                  const int64_t intermediate_hidden,
+                                                  const bool    use_fp8_dispatch);
 
-void mega_moe_fp8(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
-                  at::Tensor l2_weights, at::Tensor l2_weights_sf,
-                  c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
-                  at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
-                  const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
-                  const int64_t num_experts, const int64_t num_topk, const int64_t num_tokens,
-                  const int64_t hidden, const int64_t intermediate_hidden,
-                  const std::string &activation, const double activation_clamp,
-                  const bool fast_math);
+void fp8_fp4_mega_moe(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
+                      at::Tensor l2_weights, at::Tensor l2_weights_sf,
+                      c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
+                      at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
+                      const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
+                      const int64_t num_experts, const int64_t num_topk, const int64_t num_tokens,
+                      const int64_t hidden, const int64_t intermediate_hidden,
+                      const std::vector<int64_t> &recipe, const std::string &activation,
+                      const double activation_clamp, const bool fast_math);
 
-void mega_moe_fp8_meta(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
-                       at::Tensor l2_weights, at::Tensor l2_weights_sf,
-                       c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
-                       at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
-                       const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
-                       const int64_t num_experts, const int64_t num_topk, const int64_t num_tokens,
-                       const int64_t hidden, const int64_t intermediate_hidden,
-                       const std::string &activation, const double activation_clamp,
-                       const bool fast_math);
+void fp8_fp4_mega_moe_meta(at::Tensor y, at::Tensor l1_weights, at::Tensor l1_weights_sf,
+                           at::Tensor l2_weights, at::Tensor l2_weights_sf,
+                           c10::optional<at::Tensor> cumulative_local_expert_recv_stats,
+                           at::Tensor sym_buffer, const std::vector<int64_t> &sym_buffer_ptrs,
+                           const int64_t rank_idx, const int64_t num_max_tokens_per_rank,
+                           const int64_t num_experts, const int64_t num_topk,
+                           const int64_t num_tokens, const int64_t hidden,
+                           const int64_t intermediate_hidden, const std::vector<int64_t> &recipe,
+                           const std::string &activation, const double activation_clamp,
+                           const bool fast_math);
 
 //==================================================================
 //  Runtime

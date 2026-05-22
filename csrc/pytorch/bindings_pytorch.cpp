@@ -81,16 +81,17 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 
     // ********* Mega MoE *********
-    m.def("mega_moe_get_token_alignment() -> int");
-    m.def("mega_moe_get_symm_buffer_layout(int num_ranks, int num_experts, "
+    // Names mirror DeepGEMM's ``deep_gemm::mega`` API surface 1:1.
+    m.def("get_token_alignment_for_mega_moe() -> int");
+    m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, "
           "int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, "
           "bool use_fp8_dispatch) -> Tensor");
-    m.def("mega_moe_fp8(Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "
+    m.def("fp8_fp4_mega_moe(Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "
           "Tensor l2_weights, Tensor l2_weights_sf, "
           "Tensor? cumulative_local_expert_recv_stats, "
           "Tensor sym_buffer, int[] sym_buffer_ptrs, int rank_idx, "
           "int num_max_tokens_per_rank, int num_experts, int num_topk, int num_tokens, "
-          "int hidden, int intermediate_hidden, str activation, "
+          "int hidden, int intermediate_hidden, int[] recipe, str activation, "
           "float activation_clamp, bool fast_math) -> ()");
 }
 
@@ -132,9 +133,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
 
     // ********* Mega MoE *********
-    m.impl("mega_moe_get_token_alignment", mega_moe_get_token_alignment);
-    m.impl("mega_moe_get_symm_buffer_layout", mega_moe_get_symm_buffer_layout);
-    m.impl("mega_moe_fp8", mega_moe_fp8);
+    m.impl("get_token_alignment_for_mega_moe", get_token_alignment_for_mega_moe);
+    m.impl("get_symm_buffer_size_for_mega_moe", get_symm_buffer_size_for_mega_moe);
+    m.impl("fp8_fp4_mega_moe", fp8_fp4_mega_moe);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -175,9 +176,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
 
     // ********* Mega MoE *********
-    m.impl("mega_moe_get_token_alignment", mega_moe_get_token_alignment_meta);
-    m.impl("mega_moe_get_symm_buffer_layout", mega_moe_get_symm_buffer_layout_meta);
-    m.impl("mega_moe_fp8", mega_moe_fp8_meta);
+    m.impl("get_token_alignment_for_mega_moe", get_token_alignment_for_mega_moe_meta);
+    m.impl("get_symm_buffer_size_for_mega_moe", get_symm_buffer_size_for_mega_moe_meta);
+    m.impl("fp8_fp4_mega_moe", fp8_fp4_mega_moe_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

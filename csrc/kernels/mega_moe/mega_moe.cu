@@ -2,57 +2,73 @@
 //
 // See LICENSE for license information.
 //
-// Mega MoE kernel — fused EP dispatch + L1 GEMM + activation + L2
-// GEMM + EP combine.  This file currently provides a stub launcher;
-// the actual warp-specialized device kernel will be implemented in
-// a follow-up patch and slotted in via ``launch_fp8_mega_moe``.
+// Mega MoE host launcher — fused EP dispatch + L1 GEMM + activation +
+// L2 GEMM + EP combine.  Mirrors DeepGEMM's host wrapper
+// ``deep_gemm::mega::fp8_fp4_mega_moe`` (csrc/apis/mega.hpp) and uses
+// the kernel-level C++ layout helpers in ``layout/`` (a 1:1 port of
+// ``deep_gemm/include/deep_gemm/layout/mega_moe.cuh``) to compute
+// buffer offsets that both host and device agree on.
+//
+// The ``__global__`` device kernel itself (per-CTA dispatch / MFMA /
+// combine warps) lives in ``impls/gfx950_fp8_fp4_mega_moe.cuh`` and is
+// implemented in a follow-up patch; this host file only wires the
+// public ``launch_fp8_fp4_mega_moe`` entry point and the binding-layer
+// helpers ``get_symm_buffer_size_for_mega_moe`` / ``get_mega_moe_config``.
+
+#include <algorithm>
 
 #include <hip/hip_runtime.h>
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/mega_moe.h"
 
+#include "layout/mega_moe.cuh"
+
 namespace primus_turbo {
 namespace mega_moe {
 
 namespace {
 
-// Smallest token-pool capacity needed to absorb all top-k fan-out
-// from every rank without spilling.  Mirrors the layout helper in
-// DeepGEMM's ``layout/mega_moe.cuh`` but keeps the formula on the
-// host side until the device-side scheduler is wired up.
-inline int compute_num_max_pool_tokens(int num_ranks, int num_max_tokens_per_rank, int num_topk,
-                                       int num_experts_per_rank) {
-    // Worst case: every token in the global batch is routed top-k
-    // times to this rank's experts.
-    const int global_max_tokens = num_ranks * num_max_tokens_per_rank;
-    const int worst_recv        = global_max_tokens * num_topk;
-    // Cap at the local expert pool capacity (top-k * tokens / experts).
-    PRIMUS_TURBO_CHECK(num_experts_per_rank > 0, "num_experts_per_rank must be > 0");
-    return ALIGN<int>(worst_recv, kTokenAlignment);
-}
-
-inline int align_padded_sf_pool_tokens(int num_max_pool_tokens) {
-    // SF tile size requires 4-element alignment along the token axis
-    // (UE8M0 is packed 4-wide).
-    constexpr int kSfTokenAlignment = 4;
-    return ALIGN<int>(num_max_pool_tokens, kSfTokenAlignment);
+// Maximum SF padded pool token count across all candidate ``block_m``
+// values — so the symmetric buffer is large enough for whichever tile
+// the heuristic eventually picks.  Mirrors the
+// ``for (int block_m: layout::kCandidateBlockM) { ... std::max ... }``
+// loop in DG's ``get_symm_buffer_size_for_mega_moe``.
+inline int max_num_padded_sf_pool_tokens(int num_max_pool_tokens) {
+    int result = 0;
+    for (int i = 0; i < kNumCandidateBlockMs; ++i) {
+        result = std::max(result, layout::get_num_padded_sf_pool_tokens<int>(num_max_pool_tokens,
+                                                                             kCandidateBlockM[i]));
+    }
+    return result;
 }
 
 } // anonymous namespace
 
-MegaMoEBufferLayout get_symm_buffer_layout(int num_ranks, int num_experts,
-                                           int num_max_tokens_per_rank, int num_topk, int hidden,
-                                           int intermediate_hidden, bool /*use_fp8_dispatch*/) {
+MegaMoEBufferLayout get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts,
+                                                      int num_max_tokens_per_rank, int num_topk,
+                                                      int hidden, int intermediate_hidden,
+                                                      bool /*use_fp8_dispatch*/) {
     PRIMUS_TURBO_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     PRIMUS_TURBO_CHECK(hidden % 128 == 0, "hidden must be divisible by 128");
     PRIMUS_TURBO_CHECK(intermediate_hidden % 128 == 0,
                        "intermediate_hidden must be divisible by 128");
 
     const int num_experts_per_rank = num_experts / num_ranks;
-    const int num_max_pool_tokens  = compute_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank,
-                                                                 num_topk, num_experts_per_rank);
-    const int num_padded_sf_pool_tokens = align_padded_sf_pool_tokens(num_max_pool_tokens);
+
+    // Use the DG-aligned layout helpers so the pool capacity matches
+    // ``deep_gemm::layout::Workspace`` byte-for-byte.
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens<int>(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    const int num_padded_sf_pool_tokens = max_num_padded_sf_pool_tokens(num_max_pool_tokens);
+
+    // Workspace region: barrier pad, per-expert send/recv counters,
+    // arrival masks, dispatch-pulling source indices, combine source
+    // metadata.  ``layout::Workspace::get_num_bytes()`` mirrors DG.
+    const layout::Workspace workspace(
+        /*base=*/nullptr, static_cast<uint32_t>(num_ranks), static_cast<uint32_t>(num_experts),
+        static_cast<uint32_t>(num_max_tokens_per_rank), static_cast<uint32_t>(num_topk));
+    const int64_t workspace_bytes = static_cast<int64_t>(workspace.get_num_bytes());
 
     // Element sizes (in bytes) for each region.
     const int64_t fp8_token_bytes    = static_cast<int64_t>(hidden);              // FP8
@@ -64,7 +80,7 @@ MegaMoEBufferLayout get_symm_buffer_layout(int num_ranks, int num_experts,
     const int64_t topk_weights_bytes = static_cast<int64_t>(num_topk) * sizeof(float);
 
     // Tightly pack regions; alignment requirements (e.g. 1024 B for
-    // shared/atomic regions) will be applied during a future refactor.
+    // shared/atomic regions) are applied via the 256-byte bump cursor.
     auto bump = [](int64_t &cursor, int64_t bytes) -> int64_t {
         const int64_t aligned = ALIGN<int64_t>(cursor, 256);
         cursor                = aligned + bytes;
@@ -75,8 +91,7 @@ MegaMoEBufferLayout get_symm_buffer_layout(int num_ranks, int num_experts,
     int64_t             cursor = 0;
 
     // Workspace (signal pad, per-expert counters, etc.).
-    constexpr int64_t kWorkspaceBytes = 1 << 20; // 1 MiB placeholder
-    out.workspace_offset              = bump(cursor, kWorkspaceBytes);
+    out.workspace_offset = bump(cursor, workspace_bytes);
 
     // Input region (single rank's untransformed tokens).
     out.input_x_offset            = bump(cursor, num_max_tokens_per_rank * fp8_token_bytes);
@@ -126,8 +141,8 @@ MegaMoEConfig get_mega_moe_config(int num_ranks, int /*num_experts*/, int num_ex
     // Trivial wave heuristic: process every local expert in one wave.
     config.num_experts_per_wave = num_experts_per_rank;
 
-    // Pipeline placeholder; real heuristic will solve for max stages
-    // that fit in LDS / scratch.
+    // Pipeline placeholder; the real heuristic will solve for the max
+    // number of stages that fit in LDS / scratch.
     config.num_stages = 4;
     config.smem_size  = 0; // computed once we know per-stage tile sizes
 
@@ -143,25 +158,25 @@ MegaMoEConfig get_mega_moe_config(int num_ranks, int /*num_experts*/, int num_ex
     return config;
 }
 
-void launch_fp8_mega_moe(const MegaMoEArgs &args) {
-    // TODO: launch the warp-specialized mega MoE kernel here.  The
-    // skeleton exists so that the PyTorch binding and Python frontend
-    // can be exercised end-to-end (return NotImplementedError) without
-    // having to stub them out individually.
+void launch_fp8_fp4_mega_moe(const MegaMoEArgs &args) {
     PRIMUS_TURBO_CHECK(args.y_ptr != nullptr, "Mega MoE: output tensor is null");
     PRIMUS_TURBO_CHECK(args.sym_buffer_ptrs != nullptr,
                        "Mega MoE: symmetric buffer pointers are null");
     PRIMUS_TURBO_CHECK(args.num_ranks > 0, "Mega MoE: num_ranks must be > 0");
 
-    // Intentionally a no-op so callers can wire up the full pipeline
-    // (allocations, layout, distributed setup) before the kernel
-    // lands.  Real launch will look like:
-    //
-    //     hipLaunchKernelGGL(mega_moe_kernel,
-    //                        dim3(num_persistent_ctas), dim3(num_threads),
-    //                        args.config.smem_size, args.stream,
-    //                        device_args);
-    (void) args;
+    // The DG-aligned device kernel (impls/gfx950_fp8_fp4_mega_moe.cuh)
+    // is not yet wired into the AOT dispatch table.  The kernel-level
+    // C++ API is fully aligned with DeepGEMM; specializations for
+    // concrete shape tuples land alongside the gfx950 device kernel
+    // implementation.
+    PRIMUS_TURBO_ERROR("Mega MoE launcher: device kernel is not yet implemented for shape ",
+                       "(max_tokens=", args.num_max_tokens_per_rank, ", hidden=", args.hidden,
+                       ", intermediate=", args.intermediate_hidden, ", experts=", args.num_experts,
+                       ", topk=", args.num_topk, ", ranks=", args.num_ranks,
+                       ").  The kernel-level C++ API (layout::Workspace, layout::SymBuffer, "
+                       "sched::MegaMoEScheduler, impls::launch_fp8_fp4_mega_moe_impl) is "
+                       "aligned with DeepGEMM; the gfx950 device kernel body will be "
+                       "added in a follow-up patch.");
 }
 
 } // namespace mega_moe

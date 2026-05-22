@@ -30,12 +30,25 @@ namespace primus_turbo {
 
 namespace mega_moe {
 
+// Candidate values of ``block_m`` the heuristic can pick from.  Mirrors
+// DeepGEMM's ``deep_gemm::layout::kCandidateBlockM`` so the token-pool
+// layout stays compatible across both implementations.
+constexpr int kNumCandidateBlockMs                   = 7;
+constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
+constexpr int kMaxCandidateBlockM                    = 192;
+constexpr int kMinCandidateBlockM                    = 8;
+
 // Token granularity constraint enforced by the symmetric memory layout.
 // All ``num_max_tokens_per_rank`` values must be aligned to this value.
-constexpr int kTokenAlignment = 128;
+// Mirrors DG's ``kLCMCandidateBlockM`` (LCM of ``kCandidateBlockM``) so
+// every candidate ``block_m`` cleanly divides the per-rank token count.
+constexpr int kTokenAlignment = 384;
 
 // Per-expert SF granularity along the K axis (UE8M0 packing factor).
 constexpr int kScaleGroupK = 32;
+
+// SF tile is laid out in groups of 128 along the MN axis.
+constexpr int kScaleBlockMN = 128;
 
 //------------------------------------------------------------------
 //  Heuristic config selected by the host before launching the kernel.
@@ -57,6 +70,12 @@ struct MegaMoEConfig {
     // after fan-out across topk) and the SF padded variant.
     int num_max_pool_tokens       = 0;
     int num_padded_sf_pool_tokens = 0;
+
+    // LDS swizzle mode for activations / weights (analogous to DG's
+    // TMA swizzle mode; 0 means no swizzle and the kernel falls back
+    // to the default layout).
+    int swizzle_acts_mode    = 0;
+    int swizzle_weights_mode = 0;
 
     // Number of experts processed per persistent wave.
     int num_experts_per_wave = 0;
@@ -83,8 +102,8 @@ struct MegaMoEConfig {
 //        l1_pool_weights | l2_pool_x | l2_pool_x_sf |
 //        combine_buffer ]
 //
-//  The exact offsets are computed by ``get_symm_buffer_layout`` so
-//  that both host and device agree on the addressing scheme.
+//  The exact offsets are computed by ``get_symm_buffer_size_for_mega_moe``
+//  so that both host and device agree on the addressing scheme.
 //------------------------------------------------------------------
 struct MegaMoEBufferLayout {
     int64_t workspace_offset          = 0;
@@ -106,10 +125,14 @@ struct MegaMoEBufferLayout {
 };
 
 // Returns the layout (offsets + total bytes) of the symmetric buffer
-// for a given MoE configuration.
-MegaMoEBufferLayout get_symm_buffer_layout(int num_ranks, int num_experts,
-                                           int num_max_tokens_per_rank, int num_topk, int hidden,
-                                           int intermediate_hidden, bool use_fp8_dispatch);
+// for a given MoE configuration.  Mirrors DG's
+// ``deep_gemm::mega::get_symm_buffer_size_for_mega_moe`` (DG returns
+// ``(num_bytes, slice_callback)``; the slicing is done in our Python
+// frontend instead).
+MegaMoEBufferLayout get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts,
+                                                      int num_max_tokens_per_rank, int num_topk,
+                                                      int hidden, int intermediate_hidden,
+                                                      bool use_fp8_dispatch);
 
 // Returns the selected configuration for a given runtime shape.
 MegaMoEConfig get_mega_moe_config(int num_ranks, int num_experts, int num_experts_per_rank,
@@ -150,6 +173,12 @@ struct MegaMoEArgs {
     int hidden                  = 0;
     int intermediate_hidden     = 0;
 
+    // SF recipe along (M, N, K).  Mirrors DG's ``recipe`` tuple; only
+    // ``(1, 1, 32)`` is supported at the moment.
+    int recipe_m = 1;
+    int recipe_n = 1;
+    int recipe_k = kScaleGroupK;
+
     // Activation options.  Only ``swiglu`` is supported by the
     // skeleton API; the clamp value (``inf`` when unused) and the
     // ``fast_math`` flag map to the device-side activation impl.
@@ -163,9 +192,11 @@ struct MegaMoEArgs {
     hipStream_t stream = nullptr;
 };
 
-// Launches the fused mega MoE kernel.  This is currently a stub:
-// the real implementation will land alongside the device-side kernel.
-void launch_fp8_mega_moe(const MegaMoEArgs &args);
+// Launches the fused mega MoE kernel (FP8 activations × FP4 weights).
+// Mirrors DG's ``sm100_fp8_fp4_mega_moe`` host launcher.  This is
+// currently a stub: the real implementation will land alongside the
+// device-side kernel.
+void launch_fp8_fp4_mega_moe(const MegaMoEArgs &args);
 
 } // namespace mega_moe
 } // namespace primus_turbo
