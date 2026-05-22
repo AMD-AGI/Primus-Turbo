@@ -131,7 +131,7 @@ _HK_FP8_RRR_CANDIDATES: tuple[tuple[int, int], ...] = (
 )
 
 _AUTOTUNE_WARMUP_ITERS = 5
-_AUTOTUNE_TIMED_ITERS = 50  # 2026-05-19 confirmed 100-iter gives same picks as
+_AUTOTUNE_TIMED_ITERS = int(os.environ.get("HK_FP8_AUTOTUNE_ITERS", "50"))  # 2026-05-22 R4: env override, default 50
 # 50-iter (geomean within 0.3% noise); the brute-force probe's 298us outlier
 # was not reproducible in autotune context — reverted to 50/5 to save first-call
 # cost. 2026-05-15: bumped 15→50 + warmup 3→5 because
