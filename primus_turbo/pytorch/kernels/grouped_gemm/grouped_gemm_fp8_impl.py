@@ -5,6 +5,7 @@
 ###############################################################################
 
 
+import os
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -195,6 +196,8 @@ def _autotune_pick(
             best_ms = ms
             best_cfg = cfg
     _HK_FP8_AUTOTUNE[key] = best_cfg
+    if os.environ.get("HK_FP8_DUMP_AUTOTUNE"):
+        print(f"[HK_AUTOTUNE] key={key} pick={best_cfg} ms={best_ms:.3f}", flush=True)
     return best_cfg
 
 
