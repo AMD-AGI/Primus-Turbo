@@ -458,7 +458,7 @@ def _grouped_fp8_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
 
@@ -476,7 +476,7 @@ def _grouped_fp8_persistent_gemm_kernel(
                 B_LAST = tl.multiple_of(B_LAST, (1, 16))
             a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
         # ── Apply per-tensor scale and store ──
         acc *= scale
@@ -811,7 +811,7 @@ def _grouped_fp8_rowwise_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER_B)
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
 
@@ -829,7 +829,7 @@ def _grouped_fp8_rowwise_persistent_gemm_kernel(
                 B_LAST = tl.multiple_of(B_LAST, (1, 16))
             a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER_A)
             b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
         # ── Apply per-row/per-col vector scales and store ──
         a_scale = tl.load(A_scale_ptr + (m_start_g + rm).to(tl.int64))
@@ -1083,7 +1083,7 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
                     cache_modifier=CACHE_MODIFIER_B,
                 )
 
-            acc += tl.dot(a, b, input_precision="ieee")
+            acc += tl.dot(a, b)
 
             LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
             RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
@@ -1322,7 +1322,7 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
             else:
                 b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
 
-            partial = tl.dot(a, b, input_precision="ieee")
+            partial = tl.dot(a, b)
 
             # Block-wise scales: a_s is [BLOCK_M] vector, b_s is scalar
             a_s = tl.load(as_ptrs_base + ki * stride_as_k)
@@ -1347,7 +1347,7 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
                 B_LAST = tl.multiple_of(B_LAST, (1, 16))
             a = tl.load(A_LAST, mask=rk_last[None, :] < K, other=0.0, cache_modifier=CACHE_MODIFIER)
             b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER)
-            partial = tl.dot(a, b, input_precision="ieee")
+            partial = tl.dot(a, b)
             a_s = tl.load(as_ptrs_base + loop_k * stride_as_k)
             b_s = tl.load(bs_ptr_base + loop_k * stride_bs_k)
             acc += partial * (a_s * b_s)[:, None]
@@ -1492,7 +1492,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
                     cache_modifier=CACHE_MODIFIER,
                 )
 
-            partial = tl.dot(a, b, input_precision="ieee")
+            partial = tl.dot(a, b)
 
             # 1D+1D block-wise scales
             scale_row = scale_row_start + k
