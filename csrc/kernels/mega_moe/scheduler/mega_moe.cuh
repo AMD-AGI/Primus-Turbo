@@ -100,13 +100,43 @@ struct MegaMoEScheduler {
         return detail::align_up(current_local_expert_idx + 1, kNumExpertsPerWave);
     }
 
-    // Per-lane expert -> token count exchange.  Device-only; left as a
-    // declaration here because the AMD wave64 implementation lives in
-    // the gfx950 device kernel (see impls/).
-    __device__ uint32_t get_num_tokens(const uint32_t &expert_idx) const;
+    // Per-lane expert -> token count exchange.  Direct AMD wave64 port
+    // of DG's wave32 version: each lane caches every (i * warpSize +
+    // lane_idx) expert, then we broadcast the matching value via
+    // ``__shfl`` (wave64) instead of NVIDIA's wave32 ``ptx::exchange``.
+    __device__ uint32_t get_num_tokens(const uint32_t &expert_idx) const {
+        // NOTES: ``valid_value`` is intentionally read before the if to
+        // mirror DG's pattern (the predicate selects, then we broadcast
+        // across the wave so every lane holds the answer).
+        uint32_t valid_value = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
+            const uint32_t lane = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
+            const uint32_t e    = i * warpSize + lane;
+            if (expert_idx == e)
+                valid_value = stored_num_tokens_per_expert[i];
+        }
+        return __shfl(valid_value, static_cast<int>(expert_idx & (warpSize - 1u)));
+    }
 
-    // Per-lane expert -> pool block offset reduction.  See note above.
-    __device__ uint32_t get_pool_block_offset(const uint32_t &expert_idx);
+    // Per-lane expert -> pool block offset reduction.  AMD wave64 port
+    // using ``__reduce_add_sync`` semantics emulated via ``ds_swizzle`` -
+    // backed cross-lane reductions (HIP exposes ``__reduce_add`` only on
+    // newer toolchains; we fall back to a manual butterfly).
+    __device__ uint32_t get_pool_block_offset(const uint32_t &expert_idx) {
+        const uint32_t lane       = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
+        uint32_t       num_blocks = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
+            if (i * warpSize + lane < expert_idx)
+                num_blocks += detail::constexpr_ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+        }
+        // Wave64 butterfly sum (matches ``__reduce_add_sync(0xffffffff,..)``).
+#pragma unroll
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            num_blocks += __shfl_xor(num_blocks, offset);
+        return num_blocks;
+    }
 
     __device__ void advance_expert_idx() {
         current_pool_block_offset += get_current_num_m_blocks();
@@ -205,9 +235,27 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0u, 0u, 0u};
     }
 
-    // Wait for all expert counters to be finalized; device-only.  See
-    // note above ``get_num_tokens``.
-    __device__ void fetch_expert_recv_count();
+    // Wait for all expert counters to be finalized.  Direct AMD wave64
+    // port of DG's wave32 spin loop (``ptx::ld_volatile`` -> HIP
+    // ``__atomic_load_n`` with ``__ATOMIC_RELAXED``; the high 32 bits
+    // of the counter track how many SMs × Ranks have arrived).
+    __device__ void fetch_expert_recv_count() {
+        const uint32_t lane = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
+#pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
+            const uint32_t expert_idx = i * warpSize + lane;
+            uint64_t       value      = 0;
+            if (expert_idx < kNumExpertsPerRank) {
+                auto *ptr = workspace.get_expert_recv_count_sum_ptr(expert_idx);
+                do {
+                    value = __atomic_load_n(reinterpret_cast<unsigned long long *>(ptr),
+                                            __ATOMIC_RELAXED);
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+            }
+            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
 
     template <typename Func> __device__ void for_each_block(Func &&func) {
         fetch_expert_recv_count();

@@ -16,6 +16,7 @@
 // match the Python reference byte-for-byte.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -146,32 +147,205 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 }
 
 // ---------------------------------------------------------------------
-//  Stub kernel launcher.  The DG-aligned device kernel body has not
-//  yet been implemented; the Python test calls this only to confirm
-//  the host launcher template instantiates cleanly under hipcc.
-//  Returns a sentinel error code so callers can ``skip`` gracefully.
+//  Compile-time "smoke" shape that the JIT TU pre-instantiates.  Mirrors
+//  the SymBuffer layout used by ``test_mega_moe_jit_perf.py`` and is
+//  small enough to compile + launch on a single MI355X with
+//  ``num_processes == 1``.  Larger shapes (matching DG defaults such as
+//  ``hidden=7168, intermediate=3072, experts=384, topk=6``) will be
+//  added as additional template instantiations once the runtime path
+//  (partial barriers + MFMA tile body) lands.
+// ---------------------------------------------------------------------
+namespace smoke {
+constexpr uint32_t kNumMaxTokensPerRank = 384u; // aligned to kLCMCandidateBlockM
+constexpr uint32_t kHidden              = 256u;
+constexpr uint32_t kIntermediateHidden  = 128u;
+constexpr uint32_t kNumExperts          = 8u;
+constexpr uint32_t kNumTopk             = 2u;
+constexpr uint32_t kNumExpertsPerWave   = 8u;
+constexpr uint32_t kBLOCK_M             = 128u;
+constexpr uint32_t kBLOCK_N             = 128u;
+constexpr uint32_t kBLOCK_K             = 128u;
+constexpr uint32_t kSTORE_BLOCK_M       = 32u;
+constexpr uint32_t kSF_BLOCK_M          = 128u;
+constexpr uint32_t kSF_BLOCK_N          = 128u;
+// align_up(1*384*min(2,8) + 8*(192-1), 384) = 2304
+constexpr uint32_t kNumMaxPoolTokens = 2304u;
+// max over candidate block_ms of (2304//bm)*align_up(bm,128) = 36864 (bm=8)
+constexpr uint32_t kNumPaddedSFPoolTokens = 36864u;
+constexpr uint32_t kNumStages             = 4u;
+constexpr uint32_t kNumDispatchThreads    = 128u;
+constexpr uint32_t kNumNonEpilogueThreads = 128u;
+constexpr uint32_t kNumEpilogueThreads    = 256u;
+constexpr uint32_t kNumSMs                = 64u;
+constexpr uint32_t kNumRanks              = 1u;
+} // namespace smoke
+
+// ---------------------------------------------------------------------
+//  DG-aligned runtime entry point.  Accepts raw device pointers (typed
+//  via ``int64_t`` so it can be called directly with ``Tensor.data_ptr()``
+//  from Python) and dispatches the gfx950 mega-MoE kernel.
+//
+//  Only the compile-time ``smoke`` shape above is currently supported;
+//  the runtime shape arguments are validated against the template
+//  instantiation and a non-zero error code is returned on mismatch so
+//  the Python test can print a helpful diagnostic.
+//
+//  Return codes:
+//    0   -> launch + sync succeeded.
+//    -1  -> shape mismatch vs. the JIT-instantiated template.
+//    >0  -> ``hipError_t`` reported by ``hipLaunchKernelGGL`` /
+//           ``hipDeviceSynchronize`` (cast to int).
+// ---------------------------------------------------------------------
+extern "C" int mega_moe_jit_run_mega_moe(int64_t sym_buffer_base, int rank_idx, int num_tokens,
+                                         int num_max_tokens_per_rank, int hidden,
+                                         int intermediate_hidden, int num_experts, int num_topk,
+                                         int num_ranks, int64_t y_ptr, int64_t l1_weights_ptr,
+                                         int64_t l1_weights_sf_ptr, int64_t l2_weights_ptr,
+                                         int64_t l2_weights_sf_ptr, int64_t recv_stats_ptr,
+                                         float activation_clamp, int fast_math) {
+    if (num_max_tokens_per_rank != static_cast<int>(smoke::kNumMaxTokensPerRank) ||
+        hidden != static_cast<int>(smoke::kHidden) ||
+        intermediate_hidden != static_cast<int>(smoke::kIntermediateHidden) ||
+        num_experts != static_cast<int>(smoke::kNumExperts) ||
+        num_topk != static_cast<int>(smoke::kNumTopk) ||
+        num_ranks != static_cast<int>(smoke::kNumRanks)) {
+        return -1;
+    }
+    (void) fast_math; // captured at compile time via the smoke template
+    (void) activation_clamp;
+
+    std::array<int64_t, 1>          sym_ptrs{sym_buffer_base};
+    ly::SymBuffer<smoke::kNumRanks> sym_buffer(sym_ptrs, static_cast<uint32_t>(rank_idx));
+
+    const hipError_t launch_err = mm::impls::launch_fp8_fp4_mega_moe_impl<
+        mm::impls::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
+        smoke::kIntermediateHidden, smoke::kNumExperts, smoke::kNumTopk, smoke::kNumExpertsPerWave,
+        smoke::kBLOCK_M, smoke::kBLOCK_N, smoke::kBLOCK_K, smoke::kSTORE_BLOCK_M,
+        smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,
+        smoke::kNumPaddedSFPoolTokens, smoke::kNumStages, smoke::kNumDispatchThreads,
+        smoke::kNumNonEpilogueThreads, smoke::kNumEpilogueThreads, smoke::kNumSMs, smoke::kNumRanks,
+        /*kActivationClamp=*/0.0f, /*kFastMath=*/true>(
+        reinterpret_cast<void *>(y_ptr), reinterpret_cast<int *>(recv_stats_ptr),
+        static_cast<uint32_t>(num_tokens), sym_buffer, reinterpret_cast<void *>(l1_weights_ptr),
+        reinterpret_cast<void *>(l1_weights_sf_ptr), reinterpret_cast<void *>(l2_weights_ptr),
+        reinterpret_cast<void *>(l2_weights_sf_ptr),
+        /*stream=*/0);
+    const hipError_t sync_err = hipDeviceSynchronize();
+
+    if (launch_err != hipSuccess)
+        return static_cast<int>(launch_err);
+    if (sync_err != hipSuccess)
+        return static_cast<int>(sync_err);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+//  Launch probe.  Actually dispatches the gfx950 mega-MoE kernel with
+//  ``num_tokens == 0`` so the Python smoke test can confirm that:
+//    1. The launcher template parses cleanly under hipcc.
+//    2. ``hipLaunchKernelGGL`` accepts the kernel symbol (i.e., the
+//       ``__global__`` body emitted for ``--offload-arch=gfx950`` has
+//       valid ISA).
+//    3. The kernel actually runs end-to-end on the device and the
+//       early-exit path for ``num_tokens == 0`` terminates cleanly.
+//
+//  Return codes:
+//    0  -> launch succeeded + ``hipDeviceSynchronize`` returned success.
+//    >0 -> ``hipError_t`` value reported by HIP (cast to int).  Non-zero
+//          values propagate the failing stage so the Python side can
+//          print a meaningful diagnostic.
 // ---------------------------------------------------------------------
 extern "C" int mega_moe_jit_run_stub() {
-    // Touch the impls/ template by referencing its symbol type — this
-    // ensures the header parses under hipcc but does not emit a device
-    // kernel until the body is supplied.
-    using LauncherT = decltype(&mm::impls::launch_fp8_fp4_mega_moe_impl<
-                               mm::impls::MegaMoEArch::Gfx950,
-                               /*kNumMaxTokensPerRank=*/64u,
-                               /*kHidden=*/256u, /*kIntermediateHidden=*/128u,
-                               /*kNumExperts=*/8u, /*kNumTopk=*/2u,
-                               /*kNumExpertsPerWave=*/8u,
-                               /*BLOCK_M=*/128u, /*BLOCK_N=*/128u, /*BLOCK_K=*/128u,
-                               /*STORE_BLOCK_M=*/32u,
-                               /*SF_BLOCK_M=*/128u, /*SF_BLOCK_N=*/128u,
-                               /*kNumMaxPoolTokens=*/384u,
-                               /*kNumPaddedSFPoolTokens=*/384u,
-                               /*kNumStages=*/4u,
-                               /*kNumDispatchThreads=*/128u, /*kNumNonEpilogueThreads=*/128u,
-                               /*kNumEpilogueThreads=*/256u,
-                               /*kNumSMs=*/64u, /*kNumRanks=*/1u,
-                               /*kActivationClamp=*/0.0f, /*kFastMath=*/true>);
-    (void) sizeof(LauncherT);
-    // Sentinel: 1 == kernel not implemented yet (matches Python check).
-    return 1;
+    // Reuse the ``smoke`` namespace constants so we share a single
+    // template instantiation with ``mega_moe_jit_run_mega_moe``.
+
+    // Symmetric buffer: one contiguous device allocation that hosts the
+    // workspace + all per-rank pools.  For the smoke test we
+    // overallocate a fixed 8 MiB — the kernel's early-exit path returns
+    // before touching any byte outside the workspace header.
+    constexpr size_t kSymBytes = static_cast<size_t>(8) * 1024u * 1024u;
+
+    void *d_sym = nullptr;
+    if (hipError_t err = hipMalloc(&d_sym, kSymBytes); err != hipSuccess)
+        return static_cast<int>(err);
+    if (hipError_t err = hipMemset(d_sym, 0, kSymBytes); err != hipSuccess) {
+        (void) hipFree(d_sym);
+        return static_cast<int>(err);
+    }
+
+    void            *d_y           = nullptr;
+    void            *d_l1_w        = nullptr;
+    void            *d_l1_w_sf     = nullptr;
+    void            *d_l2_w        = nullptr;
+    void            *d_l2_w_sf     = nullptr;
+    constexpr size_t kAuxBytes     = 1024u * 1024u;
+    auto             alloc_or_fail = [&](void **p) -> int {
+        if (hipError_t err = hipMalloc(p, kAuxBytes); err != hipSuccess)
+            return static_cast<int>(err);
+        return static_cast<int>(hipMemset(*p, 0, kAuxBytes));
+    };
+    auto cleanup_all = [&]() {
+        if (d_sym)
+            (void) hipFree(d_sym);
+        if (d_y)
+            (void) hipFree(d_y);
+        if (d_l1_w)
+            (void) hipFree(d_l1_w);
+        if (d_l1_w_sf)
+            (void) hipFree(d_l1_w_sf);
+        if (d_l2_w)
+            (void) hipFree(d_l2_w);
+        if (d_l2_w_sf)
+            (void) hipFree(d_l2_w_sf);
+    };
+    if (int rc = alloc_or_fail(&d_y); rc != hipSuccess) {
+        cleanup_all();
+        return rc;
+    }
+    if (int rc = alloc_or_fail(&d_l1_w); rc != hipSuccess) {
+        cleanup_all();
+        return rc;
+    }
+    if (int rc = alloc_or_fail(&d_l1_w_sf); rc != hipSuccess) {
+        cleanup_all();
+        return rc;
+    }
+    if (int rc = alloc_or_fail(&d_l2_w); rc != hipSuccess) {
+        cleanup_all();
+        return rc;
+    }
+    if (int rc = alloc_or_fail(&d_l2_w_sf); rc != hipSuccess) {
+        cleanup_all();
+        return rc;
+    }
+
+    std::array<int64_t, 1>          sym_ptrs{reinterpret_cast<int64_t>(d_sym)};
+    ly::SymBuffer<smoke::kNumRanks> sym_buffer(sym_ptrs, /*rank_idx=*/0u);
+
+    const hipError_t launch_err = mm::impls::launch_fp8_fp4_mega_moe_impl<
+        mm::impls::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
+        smoke::kIntermediateHidden, smoke::kNumExperts, smoke::kNumTopk, smoke::kNumExpertsPerWave,
+        smoke::kBLOCK_M, smoke::kBLOCK_N, smoke::kBLOCK_K, smoke::kSTORE_BLOCK_M,
+        smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,
+        smoke::kNumPaddedSFPoolTokens, smoke::kNumStages, smoke::kNumDispatchThreads,
+        smoke::kNumNonEpilogueThreads, smoke::kNumEpilogueThreads, smoke::kNumSMs, smoke::kNumRanks,
+        /*kActivationClamp=*/0.0f,
+        /*kFastMath=*/true>(d_y, /*cumulative_local_expert_recv_stats=*/nullptr,
+                            /*num_tokens=*/0u, sym_buffer, d_l1_w, d_l1_w_sf, d_l2_w, d_l2_w_sf,
+                            /*stream=*/0);
+
+    const hipError_t sync_err = hipDeviceSynchronize();
+
+    (void) hipFree(d_sym);
+    (void) hipFree(d_y);
+    (void) hipFree(d_l1_w);
+    (void) hipFree(d_l1_w_sf);
+    (void) hipFree(d_l2_w);
+    (void) hipFree(d_l2_w_sf);
+
+    if (launch_err != hipSuccess)
+        return static_cast<int>(launch_err);
+    if (sync_err != hipSuccess)
+        return static_cast<int>(sync_err);
+    return 0;
 }
