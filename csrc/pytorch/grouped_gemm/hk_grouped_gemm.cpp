@@ -40,7 +40,26 @@ void hk_grouped_var_k_crr_fp8(
     int group_m, int num_xcds,
     hipStream_t stream);
 
+void hk_grouped_var_k_crr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int bM_, int bN,
+    void* c_ptr,       int G_c, int cN, int cK,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int num_xcds,
+    hipStream_t stream);
+
 void hk_grouped_rrr_fp8(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int G_b, int bK_, int bN,
+    void* c_ptr,       int cM, int cN,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int m_per_group, int num_xcds,
+    int bn_block,
+    hipStream_t stream);
+
+void hk_grouped_rrr_fp8_new(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int G_b, int bK_, int bN,
     void* c_ptr,       int cM, int cN,
@@ -173,6 +192,30 @@ at::Tensor hk_grouped_var_k_crr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_
     return out;
 }
 
+// Campaign D v2 entry (PLAN_V2.md P3.0). Routes through hk_fp8_kernel_v2.
+at::Tensor hk_grouped_var_k_crr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                        at::Tensor &b_scales, at::Tensor &group_offs,
+                                        int64_t group_m, int64_t num_xcds,
+                                        at::ScalarType out_dtype) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(),
+                "hk_grouped_var_k_crr_fp8_new: tensors must be on cuda");
+    const int M_total = static_cast<int>(a.size(0));
+    const int aK      = static_cast<int>(a.size(1));
+    const int bM_     = static_cast<int>(b.size(0));
+    const int bN      = static_cast<int>(b.size(1));
+    const int G       = static_cast<int>(group_offs.numel()) - 1;
+    auto out = at::empty({G, aK, bN}, a.options().dtype(out_dtype));
+    primus_turbo::hk::hk_grouped_var_k_crr_fp8_new(
+        a.data_ptr(), M_total, aK,
+        b.data_ptr(), bM_, bN,
+        out.data_ptr(), G, aK, bN,
+        a_scales.data_ptr<float>(), b_scales.data_ptr<float>(),
+        group_offs.data_ptr<int64_t>(), G,
+        static_cast<int>(group_m), static_cast<int>(num_xcds),
+        current_stream());
+    return out;
+}
+
 // FP8 grouped RRR (dgrad direct path — no transpose reroute).
 // a (grad_out): [M_total, N_inner] fp8e4m3
 // b (weight):   [G, N_inner, K_out] fp8e4m3 (already in row-major K-then-N order
@@ -196,6 +239,37 @@ at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
     const int G       = static_cast<int>(group_offs.numel()) - 1;
     auto out = at::empty({M_total, bN}, a.options().dtype(out_dtype));
     primus_turbo::hk::hk_grouped_rrr_fp8(
+        a.data_ptr(), M_total, aK,
+        b.data_ptr(), G_b, bK_, bN,
+        out.data_ptr(), M_total, bN,
+        a_scales.data_ptr<float>(), b_scales.data_ptr<float>(),
+        group_offs.data_ptr<int64_t>(), G,
+        static_cast<int>(group_m), static_cast<int>(m_per_group),
+        static_cast<int>(num_xcds),
+        static_cast<int>(bn_block),
+        current_stream());
+    return out;
+}
+
+// Campaign D v2 entry (PLAN_V2.md P2.0). Routes through hk_fp8_kernel_v2.
+at::Tensor hk_grouped_rrr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                  at::Tensor &b_scales, at::Tensor &group_offs,
+                                  int64_t group_m, int64_t m_per_group, int64_t num_xcds,
+                                  at::ScalarType out_dtype, int64_t bn_block) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && group_offs.is_cuda(),
+                "hk_grouped_rrr_fp8_new: tensors must be on cuda");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && group_offs.is_contiguous(),
+                "hk_grouped_rrr_fp8_new: a, b, group_offs must be contiguous");
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 3,
+                "hk_grouped_rrr_fp8_new: a [M,K] / b [G,K,N] required");
+    const int M_total = static_cast<int>(a.size(0));
+    const int aK      = static_cast<int>(a.size(1));
+    const int G_b     = static_cast<int>(b.size(0));
+    const int bK_     = static_cast<int>(b.size(1));
+    const int bN      = static_cast<int>(b.size(2));
+    const int G       = static_cast<int>(group_offs.numel()) - 1;
+    auto out = at::empty({M_total, bN}, a.options().dtype(out_dtype));
+    primus_turbo::hk::hk_grouped_rrr_fp8_new(
         a.data_ptr(), M_total, aK,
         b.data_ptr(), G_b, bK_, bN,
         out.data_ptr(), M_total, bN,

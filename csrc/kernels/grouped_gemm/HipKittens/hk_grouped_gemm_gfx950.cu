@@ -157,6 +157,34 @@ void hk_grouped_rrr_fp8(
     hk_fp8_kernel::dispatch_grouped_rrr(g);
 }
 
+// FP8 grouped RRR v2 (Campaign D rewrite, PLAN_V2.md P2.0).
+void hk_grouped_rrr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int G_b, int bK_, int bN,
+    void* c_ptr,       int cM, int cN,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int m_per_group, int num_xcds,
+    int bn_block,
+    hipStream_t stream)
+{
+    hk_fp8_kernel_v2::grouped_layout_globals g{
+        make_fp8_gl_v2(a_ptr, 1, 1, M_total, aK),
+        make_fp8_gl_v2(b_ptr, 1, G_b, bK_, bN),
+        make_bf16_gl_for_fp8_v2(c_ptr, 1, 1, cM, cN),
+        0.f, 0.f,
+        sa_ptr, sb_ptr,
+        group_offs_ptr, stream,
+        G, /*n*/0, /*k*/0, /*ki*/0, /*bpc*/0,
+        group_m, num_xcds, /*M_total*/0,
+        /*fast_n*/0, /*fast_k*/0,
+        m_per_group, /*num_slots*/0, /*chunk_size*/0, /*fuse_ktail_off*/0,
+        /*sk_split_n*/0, nullptr,
+        bn_block,
+    };
+    hk_fp8_kernel_v2::dispatch_grouped_rrr(g);
+}
+
 // FP8 grouped variable-K CRR (wgrad).
 // a: [M_total, K] fp8e4m3, b: [M_total, N] fp8e4m3, c: [G, N, K] bf16.
 void hk_grouped_var_k_crr_fp8(
@@ -181,6 +209,30 @@ void hk_grouped_var_k_crr_fp8(
         num_xcds, /*num_slots*/0, /*chunk_size*/0,
     };
     hk_fp8_kernel::dispatch_grouped_var_k_fp8(g);
+}
+
+// FP8 grouped variable-K CRR v2 (Campaign D rewrite, PLAN_V2.md P3.0).
+void hk_grouped_var_k_crr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int bM_, int bN,
+    void* c_ptr,       int G_c, int cN, int cK,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int num_xcds,
+    hipStream_t stream)
+{
+    hk_fp8_kernel_v2::grouped_var_k_layout_globals_fp8 g{
+        make_fp8_gl_v2(a_ptr, 1, 1, M_total, aK),
+        make_fp8_gl_v2(b_ptr, 1, 1, bM_, bN),
+        make_bf16_gl_for_fp8_v2(c_ptr, 1, G_c, cN, cK),
+        0.f, 0.f,
+        sa_ptr, sb_ptr,
+        group_offs_ptr, stream,
+        G, /*M_total*/0, /*n*/0, /*k*/0, group_m,
+        /*bpr*/0, /*bpc*/0, /*fast_n*/0, /*fast_k*/0,
+        num_xcds, /*num_slots*/0, /*chunk_size*/0,
+    };
+    hk_fp8_kernel_v2::dispatch_grouped_var_k_fp8(g);
 }
 
 // ============================================================================
