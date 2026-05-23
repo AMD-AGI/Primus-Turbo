@@ -198,14 +198,7 @@ __device__ __forceinline__ bool elect_one() {
     return lane_idx() == 0u;
 }
 
-// Aligned/unaligned barriers.  AMD has only one ``__syncthreads`` flavour,
-// but we accept the DG-style ``count`` parameter so the call sites match.
-__device__ __forceinline__ void sync_aligned(uint32_t /*count*/, uint32_t /*barrier_id*/) {
-    __syncthreads();
-}
-__device__ __forceinline__ void sync_unaligned(uint32_t /*count*/, uint32_t /*barrier_id*/) {
-    __syncthreads();
-}
+// Per-warp wave barrier (s_barrier within a single wave64).
 __device__ __forceinline__ void sync_warp() {
     __builtin_amdgcn_wave_barrier();
 }
@@ -213,6 +206,70 @@ __device__ __forceinline__ void sync_warp() {
 // Cluster sync - no AMD equivalent; collapse to ``__syncthreads``.
 __device__ __forceinline__ void cluster_sync() {
     __syncthreads();
+}
+
+// ---------------------------------------------------------------------
+// Software-emulated NVPTX ``bar.sync id, count`` (named barrier).
+//
+// AMD gfx950 has no equivalent of CUDA's ``bar.sync`` / NVPTX
+// ``barrier.sync`` that synchronises an arbitrary *subset* of waves in
+// the workgroup.  ``__syncthreads()`` requires *all* threads in the CTA
+// to arrive, which deadlocks when one role (dispatch / loader / MMA /
+// epilogue) tries to sync only its own waves.
+//
+// We emulate the named barrier with one LDS counter per ``bar_id`` plus
+// a per-thread ``expected[bar_id]`` arrival register, following the
+// pattern from ``primus_turbo/csrc/kernels/deep_ep/utils.cuh``
+// (``BARRIER_SYNC_INIT`` / ``BARRIER_SYNC``).  The deep_ep macros use a
+// scalar ``___bar_sync_wg_expected_reg`` because each thread there
+// sticks to a single ``bar_id`` (its ``responsible_rank``); mega-MoE
+// dispatch threads call multiple bar_ids, so we widen ``expected`` to a
+// per-thread array.  ``num_threads`` is the *total* participant count
+// across all calling roles - both producer and consumer roles must pass
+// the same value so the per-thread expected counters match.
+// ---------------------------------------------------------------------
+constexpr uint32_t kNumMaxNamedBars = 8u;
+
+struct NamedBarrierWg {
+    int *state;                      // [kNumMaxNamedBars] in LDS
+    int  expected[kNumMaxNamedBars]; // per-thread arrival accumulator
+
+    __device__ __forceinline__ void init(int *smem_state) {
+        state = smem_state;
+        if (threadIdx.x < kNumMaxNamedBars)
+            state[threadIdx.x] = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kNumMaxNamedBars; ++i)
+            expected[i] = 0;
+        // Bring-up sync so every wave sees a zero-initialised counter
+        // pad before the first arrive.
+        __syncthreads();
+    }
+
+    __device__ __forceinline__ void arrive_and_wait(uint32_t bar_id, uint32_t num_threads) {
+        const int num_waves = static_cast<int>(num_threads / warpSize);
+        expected[bar_id] += num_waves;
+        // Make preceding LDS / register writes visible to peer waves
+        // before the atomic - mirrors deep_ep's ``__fence`` argument.
+        __threadfence_block();
+        if ((threadIdx.x & (warpSize - 1u)) == 0u) {
+            __hip_atomic_fetch_add(state + bar_id, 1, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_WORKGROUP);
+            while (__hip_atomic_load(state + bar_id, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_WORKGROUP) < expected[bar_id])
+                __builtin_amdgcn_s_sleep(1);
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
+};
+
+// Replace DG's ``sync_aligned`` / ``sync_unaligned`` (which are PTX
+// ``bar.sync.aligned`` / ``bar.sync`` underneath) with the named-barrier
+// emulation.  Call sites that previously passed ``kNumDispatchThreads``
+// only need to thread the workgroup's ``NamedBarrierWg`` reference in.
+__device__ __forceinline__ void sync_named(NamedBarrierWg &bar, uint32_t bar_id,
+                                           uint32_t num_threads) {
+    bar.arrive_and_wait(bar_id, num_threads);
 }
 
 // Cross-lane broadcast for inter-iteration phase tracking.
@@ -249,12 +306,28 @@ struct Mbarrier {
 // ---------------------------------------------------------------------
 namespace comm {
 
+// NOTES on the named-barrier arguments:
+//   * ``named_bar`` is the workgroup-shared NamedBarrierWg; both grid
+//     sync flanks below replace DG's PTX ``bar.sync`` with our
+//     emulation.
+//   * ``bar_id`` identifies the LDS counter to use - must be distinct
+//     from any concurrently-active bar on the SAME wave set.
+//   * ``num_threads`` is the *participating* thread count (the calling
+//     role's wave count x warpSize).  This is also what bumps each
+//     thread's ``expected[bar_id]``, so every thread in the role must
+//     pass the same value.
+//   * ``leader_thread_idx`` is the absolute ``threadIdx.x`` of the
+//     first participating thread.  DG hard-codes ``thread_idx == 0``
+//     because PTX bar.sync internally picks a leader; on AMD we need
+//     an explicit per-role leader because ``threadIdx.x == 0`` belongs
+//     to the dispatch role and is never executed by the epilogue path.
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0>
-__device__ __forceinline__ void grid_sync(const layout::Workspace &workspace, uint32_t sm_idx,
-                                          uint32_t thread_idx) {
+__device__ __forceinline__ void
+grid_sync(const layout::Workspace &workspace, hip_prims::NamedBarrierWg &named_bar, uint32_t bar_id,
+          uint32_t num_threads, uint32_t leader_thread_idx, uint32_t sm_idx, uint32_t thread_idx) {
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
-    __syncthreads();
-    if (thread_idx == 0) {
+    hip_prims::sync_named(named_bar, bar_id, num_threads);
+    if (thread_idx == leader_thread_idx) {
         auto          *count_ptr = workspace.get_grid_sync_count_ptr(kGridSyncIndex);
         const uint32_t old_value = hip_prims::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1u)) : 1u);
@@ -263,22 +336,28 @@ __device__ __forceinline__ void grid_sync(const layout::Workspace &workspace, ui
             new_value = hip_prims::ld_acq(count_ptr);
         } while (((new_value ^ old_value) & kFinishSumTag) == 0u);
     }
-    __syncthreads();
+    hip_prims::sync_named(named_bar, bar_id, num_threads);
 }
 
 template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex,
           uint32_t kTag>
 __device__ __forceinline__ void
 nvlink_barrier(const layout::Workspace &workspace, const layout::SymBuffer<kNumRanks> &sym_buffer,
+               hip_prims::NamedBarrierWg &named_bar, uint32_t bar_id, uint32_t leader_thread_idx,
                uint32_t sm_idx, uint32_t thread_idx, bool sync_prologue = true,
                bool sync_epilogue = true) {
     if (sync_prologue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx);
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, named_bar, bar_id, kNumThreads,
+                                           leader_thread_idx, sm_idx, thread_idx);
 
     if constexpr (kNumRanks > 1) {
         if (sm_idx == 0) {
-            auto      *counter_ptr  = workspace.get_nvl_barrier_counter_ptr();
-            const auto status       = (*counter_ptr) & 3u;
+            auto *counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+            // NOTES: ``counter_ptr`` is shared across SMs and gets
+            // incremented below via an atomic RMW.  A naked ``*counter_ptr``
+            // load races with that RMW under ROCm's memory model; use
+            // a relaxed atomic load so the value is well-defined.
+            const auto status       = hip_prims::ld_volatile(counter_ptr) & 3u;
             const auto signal_phase = status & 1u;
             const auto signal_sign  = status >> 1u;
             auto      *signal_ptr   = workspace.get_nvl_barrier_signal_ptr(signal_phase);
@@ -286,9 +365,9 @@ nvlink_barrier(const layout::Workspace &workspace, const layout::SymBuffer<kNumR
             if (thread_idx < kNumRanks)
                 hip_prims::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx),
                                            signal_sign ? -1 : 1);
-            __syncthreads();
+            hip_prims::sync_named(named_bar, bar_id, kNumThreads);
 
-            if (thread_idx == 0) {
+            if (thread_idx == leader_thread_idx) {
                 hip_prims::red_add(reinterpret_cast<int *>(counter_ptr), 1);
                 const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
                 while (hip_prims::ld_acq_sys(signal_ptr) != target) {
@@ -300,7 +379,8 @@ nvlink_barrier(const layout::Workspace &workspace, const layout::SymBuffer<kNumR
     }
 
     if (sync_epilogue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx);
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, named_bar, bar_id, kNumThreads,
+                                           leader_thread_idx, sm_idx, thread_idx);
 }
 
 } // namespace comm
@@ -346,7 +426,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     void *y, int *cumulative_local_expert_recv_stats, const uint32_t num_tokens,
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer, void *l1_weights,
     void *l1_weights_sf, void *l2_weights, void *l2_weights_sf) {
-#if defined(__gfx950__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx950__)
     using namespace hip_prims;
 
     // ---- Wave / thread role indices (wave64 on AMD) ----
@@ -431,9 +511,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     (void) LOAD_BLOCK_N;
 
     // ---- Per-stage LDS region sizes (mirrors SM100 byte-for-byte) ----
-    constexpr uint32_t L1_OUT_BLOCK_N          = BLOCK_N / 2u;
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE   = LOAD_BLOCK_M * BLOCK_K * 1u; // FP8
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE   = LOAD_BLOCK_N * BLOCK_K * 1u; // FP4 packed
+    constexpr uint32_t L1_OUT_BLOCK_N        = BLOCK_N / 2u;
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * 1u; // FP8 (1B/elt)
+    // NOTES: B is FP4 but stored UNPACKED in LDS (1B per element), mirroring
+    // SM100's ``float_e2m1_unpacksmem_t`` (sizeof == 1).  The MFMA reads
+    // packed FP4 from VGPRs, but staging in LDS keeps 1 element per byte.
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE   = LOAD_BLOCK_N * BLOCK_K * 1u; // FP4 unpacked-in-LDS
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     (void) SMEM_A_SIZE_PER_STAGE;
@@ -450,6 +533,31 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         reinterpret_cast<Mbarrier *>(smem_buffer + sizeof(uint32_t) * kNumExperts + 16u);
     auto smem_send_buffer = reinterpret_cast<uint8_t *>(smem_barriers + 32u);
     (void) smem_send_buffer;
+
+    // Named-barrier LDS state (software-emulated PTX ``bar.sync``).  One
+    // counter per ``bar_id``; the workgroup-shared ``NamedBarrierWg``
+    // wraps it with a per-thread ``expected`` accumulator.
+    __shared__ int            smem_named_bar_state[hip_prims::kNumMaxNamedBars];
+    hip_prims::NamedBarrierWg named_bar;
+    named_bar.init(smem_named_bar_state); // includes __syncthreads()
+
+    // Per-role bar_id allocation.  Each ``bar_id`` couples a fixed
+    // ``num_threads`` value (the calling role's wave count x warpSize),
+    // so distinct ``(num_threads, role)`` tuples must use distinct ids.
+    //   0 : dispatch-only internal sync  (num_threads = kNumDispatchThreads)
+    //   1 : dispatch + epilogue cross sync (kNumDispatchThreads + kNumEpilogueThreads)
+    //   2 : dispatch role grid_sync / nvlink_barrier internal
+    //   3 : epilogue role grid_sync / nvlink_barrier internal
+    constexpr uint32_t kBarDispLocal = 0u;
+    constexpr uint32_t kBarDispEpi   = 1u;
+    constexpr uint32_t kBarDispGrid  = 2u;
+    constexpr uint32_t kBarEpiGrid   = 3u;
+
+    // Role leader threads (absolute ``threadIdx.x``).  PTX bar.sync
+    // implicitly picks a leader; on AMD we have to name one explicitly
+    // because ``thread_idx == 0`` belongs to the dispatch role.
+    constexpr uint32_t kDispLeader = 0u;
+    constexpr uint32_t kEpiLeader  = (kNumDispatchWaves + kNumLoadWaves) * kWaveSize;
 
     // Single bring-up sync so the dispatch/loader/MMA/epilogue waves all
     // see a consistent LDS state before they start.
@@ -492,8 +600,14 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     //  to a pure local copy.
     // =================================================================
     if (warp_id < kNumDispatchWaves) {
-        constexpr uint32_t kNumTokensPerWarp = 32u / kNumTopk;
+        // NOTES: DG uses 32 because SM100 is wave32; on AMD wave64 we
+        // pack twice as many (token, topk) pairs per wave so all 64 lanes
+        // do useful work.  ``kNumActivateLanes = kNumTokensPerWarp *
+        // kNumTopk`` must be <= warpSize.
+        constexpr uint32_t kNumTokensPerWarp = kWaveSize / kNumTopk;
         constexpr uint32_t kNumGlobalWarps   = kNumSMs * kNumDispatchWaves;
+        static_assert(kNumTokensPerWarp * kNumTopk <= kWaveSize,
+                      "kNumTopk does not divide wave size");
 
         // Pass 1: count per-expert dispatched tokens.
         for (uint32_t i = (sm_idx * kNumDispatchWaves + warp_id) * kNumTokensPerWarp;
@@ -507,7 +621,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             }
             sync_warp();
         }
-        sync_aligned(kNumDispatchThreads, 0u);
+        sync_named(named_bar, kBarDispLocal, kNumDispatchThreads);
 
         // Pass 2: post the per-expert send count into the workspace.
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
@@ -515,7 +629,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             smem_expert_count[i]      = static_cast<uint32_t>(
                 atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
         }
-        sync_aligned(kNumDispatchThreads, 0u);
+        sync_named(named_bar, kBarDispLocal, kNumDispatchThreads);
 
         // Pass 3: write source ``(token, topk)`` indices.
         for (uint32_t i = (sm_idx * kNumDispatchWaves + warp_id) * kNumTokensPerWarp;
@@ -537,7 +651,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         }
 
         // Grid sync, then post per-rank recv counts (only SM0 touches them).
-        comm::grid_sync<kNumSMs, 0>(workspace, sm_idx, thread_idx);
+        comm::grid_sync<kNumSMs, 0>(workspace, named_bar, kBarDispGrid, kNumDispatchThreads,
+                                    kDispLeader, sm_idx, thread_idx);
 
         if (sm_idx == 0u) {
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
@@ -553,12 +668,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                     expert_status);
             }
         }
-        sync_aligned(kNumDispatchThreads, 0u);
+        sync_named(named_bar, kBarDispLocal, kNumDispatchThreads);
 
         // NVLink barrier (collapses to grid sync for kNumRanks==1).
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, 0, 1>(
-            workspace, sym_buffer, sm_idx, thread_idx, /*sync_prologue=*/false,
-            /*sync_epilogue=*/true);
+            workspace, sym_buffer, named_bar, kBarDispGrid, kDispLeader, sm_idx, thread_idx,
+            /*sync_prologue=*/false, /*sync_epilogue=*/true);
 
         // Pass 4: pull tokens + SFs into the local L1 pool.  For the
         // kNumRanks==1 fast path this is a coalesced local copy.
@@ -641,8 +756,13 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             sync_warp();
         }
 
-        // Workspace cleanup for the next launch.
-        sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, 1u);
+        // Workspace cleanup for the next launch.  This is a cross-role
+        // sync: it waits for the epilogue waves to finish spinning on
+        // the L1/L2 arrival counters/masks before we wipe them.  The
+        // epilogue side has a matching ``sync_named(named_bar,
+        // kBarDispEpi, ...)`` call placed after its ``for_each_block``
+        // (see below in the epilogue branch).
+        sync_named(named_bar, kBarDispEpi, kNumDispatchThreads + kNumEpilogueThreads);
         if (sm_idx == 0u) {
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0u;
@@ -653,7 +773,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                 const uint32_t num_recv_m_blocks = (num_recv_tokens + BLOCK_M - 1u) / BLOCK_M;
                 expert_pool_block_offset         = scheduler.get_pool_block_offset(i);
 
-                sync_aligned(kNumDispatchThreads, 0u);
+                sync_named(named_bar, kBarDispLocal, kNumDispatchThreads);
                 if (warp_id == 0u && elect_one())
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0u;
                 else if (warp_id == 1u && elect_one() &&
@@ -674,7 +794,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         }
 
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, 0, 3>(
-            workspace, sym_buffer, sm_idx, thread_idx,
+            workspace, sym_buffer, named_bar, kBarDispGrid, kDispLeader, sm_idx, thread_idx,
             /*sync_prologue=*/true, /*sync_epilogue=*/false);
         return;
     }
@@ -746,9 +866,14 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             }
         });
 
+        // Pair the dispatch cleanup cross-sync (``kBarDispEpi``) so the
+        // dispatch waves can safely wipe the L1/L2 arrival counters
+        // once every epilogue wave has exited ``for_each_block``.
+        sync_named(named_bar, kBarDispEpi, kNumDispatchThreads + kNumEpilogueThreads);
+
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads, 1, 2>(
-            workspace, sym_buffer, sm_idx, thread_idx, /*sync_prologue=*/true,
-            /*sync_epilogue=*/true);
+            workspace, sym_buffer, named_bar, kBarEpiGrid, kEpiLeader, sm_idx, thread_idx,
+            /*sync_prologue=*/true, /*sync_epilogue=*/true);
 
         // ----------------------------------------------------------------
         // Combine: per-token reduce across topk into the output buffer.
@@ -863,6 +988,17 @@ hipError_t launch_fp8_fp4_mega_moe_impl(void *y, int *cumulative_local_expert_re
         kNumMaxPoolTokens, kNumPaddedSFPoolTokens, kNumStages, kNumDispatchThreads,
         kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, kActivationClamp,
         kFastMath>;
+
+    // ROCm's default per-launch dynamic LDS cap is 64 KiB.  Opt in to the
+    // CU's 160 KiB pool (MI355X) for the 96 KiB carve-out below; without
+    // this attribute the launch fails with ``hipErrorInvalidValue``.
+    if constexpr (kSmemBytes > 64u * 1024u) {
+        const auto attr_err = hipFuncSetAttribute(reinterpret_cast<const void *>(kernel),
+                                                  hipFuncAttributeMaxDynamicSharedMemorySize,
+                                                  static_cast<int>(kSmemBytes));
+        if (attr_err != hipSuccess)
+            return attr_err;
+    }
 
     hipLaunchKernelGGL(kernel, grid, block, kSmemBytes, stream, y,
                        cumulative_local_expert_recv_stats, num_tokens, sym_buffer,
