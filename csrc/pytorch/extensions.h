@@ -220,17 +220,6 @@ at::Tensor hk_grouped_rcr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
                                   int64_t group_m, int64_t m_per_group, int64_t num_xcds,
                                   at::ScalarType out_dtype, int64_t bn_block = 0);
 
-at::Tensor hk_grouped_var_k_crr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
-                                        at::Tensor &b_scales, at::Tensor &group_offs,
-                                        int64_t group_m, int64_t num_xcds,
-                                        at::ScalarType out_dtype);
-
-at::Tensor hk_grouped_rrr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
-                                  at::Tensor &b_scales, at::Tensor &group_offs,
-                                  int64_t group_m, int64_t m_per_group, int64_t num_xcds,
-                                  at::ScalarType out_dtype,
-                                  int64_t bn_block);
-
 at::Tensor hk_grouped_var_k_crr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                     at::Tensor &b_scales, at::Tensor &group_offs,
                                     int64_t group_m, int64_t num_xcds,

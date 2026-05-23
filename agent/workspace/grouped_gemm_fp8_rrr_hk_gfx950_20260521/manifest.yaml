@@ -1,0 +1,94 @@
+target_op: grouped_gemm_fp8_rrr
+target_backend: HK
+target_lang: HIP
+target_gpu: gfx950
+execution_mode: repo
+project_skill: primus-turbo-develop
+performance_target: "primary_score >= 0.95 AND min_ratio >= 0.95 on all 20 target shapes (i.e. grouped/dense gap < 5% everywhere). gpt_oss-down 6 cases dropped per 2026-05-21 user (N=2880 unsupported by HK); M_g=2048 10 cases dropped per 2026-05-21 user (dense underutilized inflates ratio)."
+primary_metric: "primary_score = geomean(grouped_TFLOPS / dense_TFLOPS) across 20 target shapes (ratio>1.0 cases ALSO count toward score — user 2026-05-21); min_ratio = min(grouped_TFLOPS / dense_TFLOPS) is per-shape regression gate (any -5% step triggers rollback). Dense baseline uses HK gemm_rrr when N%256==0; falls back to PT high-level gemm_fp8 (auto-picks backend, typically hipBLASLt) when N%256!=0 (gpt-up shapes)."
+
+# Models (hidden, inter) — N/K derived per op
+models:
+  - name: dsv3       # deepseekv3
+    hidden: 7168
+    inter: 2048
+  - name: qwen235b
+    hidden: 4096
+    inter: 1536
+  - name: gpt_oss    # gpt_oss 20B
+    hidden: 2880
+    inter: 2880
+
+# Op recipes — N/K formula per model dimension
+# up:   N = 2*inter (gated factor 2), K = hidden    → A:[M_total,hidden]   × B^T:[2*inter,hidden]
+# down: N = hidden,                  K = inter      → A:[M_total,inter]    × B^T:[hidden,inter]
+ops:
+  up:   {N: "2*inter", K: "hidden"}
+  down: {N: "hidden",  K: "inter"}
+
+B_values:  [4, 16]
+M_g_values: [4096, 8192]  # M_g=2048 dropped 2026-05-21: dense too small, ratio polluted
+
+# 20 case enumerated (3 model × 2 op × 2 B × 2 M_g, minus gpt-down 4 = 20)
+target_shapes:
+  # dsv3 (hidden=7168, inter=2048): up N=4096 K=7168 ; down N=7168 K=2048
+  - {label: "dsv3-up-B4-M4096",    model: dsv3,    op: up,   B: 4,  M_g: 4096,  N: 4096, K: 7168}
+  - {label: "dsv3-up-B4-M8192",    model: dsv3,    op: up,   B: 4,  M_g: 8192,  N: 4096, K: 7168}
+  - {label: "dsv3-up-B16-M4096",   model: dsv3,    op: up,   B: 16, M_g: 4096,  N: 4096, K: 7168}
+  - {label: "dsv3-up-B16-M8192",   model: dsv3,    op: up,   B: 16, M_g: 8192,  N: 4096, K: 7168}
+  - {label: "dsv3-down-B4-M4096",  model: dsv3,    op: down, B: 4,  M_g: 4096,  N: 7168, K: 2048}
+  - {label: "dsv3-down-B4-M8192",  model: dsv3,    op: down, B: 4,  M_g: 8192,  N: 7168, K: 2048}
+  - {label: "dsv3-down-B16-M4096", model: dsv3,    op: down, B: 16, M_g: 4096,  N: 7168, K: 2048}
+  - {label: "dsv3-down-B16-M8192", model: dsv3,    op: down, B: 16, M_g: 8192,  N: 7168, K: 2048}
+  # qwen235b (hidden=4096, inter=1536): up N=3072 K=4096 ; down N=4096 K=1536
+  - {label: "qwen-up-B4-M4096",    model: qwen235b, op: up,   B: 4,  M_g: 4096,  N: 3072, K: 4096}
+  - {label: "qwen-up-B4-M8192",    model: qwen235b, op: up,   B: 4,  M_g: 8192,  N: 3072, K: 4096}
+  - {label: "qwen-up-B16-M4096",   model: qwen235b, op: up,   B: 16, M_g: 4096,  N: 3072, K: 4096}
+  - {label: "qwen-up-B16-M8192",   model: qwen235b, op: up,   B: 16, M_g: 8192,  N: 3072, K: 4096}
+  - {label: "qwen-down-B4-M4096",  model: qwen235b, op: down, B: 4,  M_g: 4096,  N: 4096, K: 1536}
+  - {label: "qwen-down-B4-M8192",  model: qwen235b, op: down, B: 4,  M_g: 8192,  N: 4096, K: 1536}
+  - {label: "qwen-down-B16-M4096", model: qwen235b, op: down, B: 16, M_g: 4096,  N: 4096, K: 1536}
+  - {label: "qwen-down-B16-M8192", model: qwen235b, op: down, B: 16, M_g: 8192,  N: 4096, K: 1536}
+  # gpt_oss (hidden=2880, inter=2880): up N=5760 K=2880 only — down N=2880 dropped (HK unsupported)
+  - {label: "gpt-up-B4-M4096",     model: gpt_oss, op: up,   B: 4,  M_g: 4096,  N: 5760, K: 2880}
+  - {label: "gpt-up-B4-M8192",     model: gpt_oss, op: up,   B: 4,  M_g: 8192,  N: 5760, K: 2880}
+  - {label: "gpt-up-B16-M4096",    model: gpt_oss, op: up,   B: 16, M_g: 4096,  N: 5760, K: 2880}
+  - {label: "gpt-up-B16-M8192",    model: gpt_oss, op: up,   B: 16, M_g: 8192,  N: 5760, K: 2880}
+
+# 6 representative shapes selected after round-1 BASELINE (revised 2026-05-21)
+# Picked to: (a) cover all 3 models + up/down + B={4,16}, (b) include the worst gap shapes,
+# (c) include the SNR FAIL shapes so debugging stays visible, (d) include the fallback-dense gpt-up shapes.
+representative_shapes:
+  - {label: "qwen-down-B4-M4096",  model: qwen235b, op: down, B: 4,  M_g: 4096,  N: 4096, K: 1536}  # smallest K, down baseline
+  - {label: "qwen-down-B16-M8192", model: qwen235b, op: down, B: 16, M_g: 8192,  N: 4096, K: 1536}  # B16 + K_min — current SNR FAIL & gap 14.76%
+  - {label: "dsv3-up-B4-M4096",    model: dsv3,    op: up,   B: 4,  M_g: 4096,  N: 4096, K: 7168}  # worst gap 17.77%
+  - {label: "dsv3-up-B16-M8192",   model: dsv3,    op: up,   B: 16, M_g: 8192,  N: 4096, K: 7168}  # B16 + K_max
+  - {label: "gpt-up-B4-M8192",     model: gpt_oss, op: up,   B: 4,  M_g: 8192,  N: 5760, K: 2880}  # M_max + fallback dense
+  - {label: "gpt-up-B16-M4096",    model: gpt_oss, op: up,   B: 16, M_g: 4096,  N: 5760, K: 2880}  # B16 + fallback dense
+
+kernel_source: HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp
+# Also lives at Primus-Turbo/3rdparty/HipKittens/analysis/fp8_gemm/mi350x/kernel_fp8_layouts.cpp — dual HK path mandate
+
+test_command: "ssh compute_node_new 'docker exec mlperf_gptoss bash -lc \"cd /workspace/code/Primus-Turbo && HIP_VISIBLE_DEVICES=4 python -m pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -v -k rrr\"'"
+benchmark_command: "ssh compute_node_new 'docker exec mlperf_gptoss bash -lc \"cd /workspace/code/Primus-Turbo && HIP_VISIBLE_DEVICES=4 python agent/workspace/grouped_gemm_fp8_rrr_hk_gfx950_20260521/quick_test_bench.py --shapes full --summary-csv agent/workspace/grouped_gemm_fp8_rrr_hk_gfx950_20260521/rounds/round-1/artifacts/benchmark.csv\"'"
+quick_command: "ssh compute_node_new 'docker exec mlperf_gptoss bash -lc \"cd /workspace/code/Primus-Turbo && HIP_VISIBLE_DEVICES=4 python agent/workspace/grouped_gemm_fp8_rrr_hk_gfx950_20260521/quick_test_bench.py --shapes representative\"'"
+
+related_work_file: agent/workspace/grouped_gemm_fp8_rrr_hk_gfx950_20260521/related_work.md
+tips_file: agent/historical_experience/gfx950/grouped_gemm_fp8_rrr/hk/tips.md
+
+git_commit: true
+git_push: false
+git_branch: none  # Stay on current branch; dual HK path makes branch-switching fragile
+max_iterations: null
+max_duration: null
+created: 2026-05-21 06:38
+revised_targets: 2026-05-21 07:00  # expanded 6 single-proxy → 36 real model shapes per user 2026-05-21 instruction
+
+# Hard constraints (also in /wekafs/kyle/code2/remote_sync/CLAUDE.md §1)
+constraints:
+  - "No W2/W3 caches (id(activation)/id(grad_out)-keyed)"
+  - "No CK fallback for worst-shape routing"
+  - "Dual HK path: every HipKittens/ edit must immediately cp to Primus-Turbo/3rdparty/HipKittens/<same path>"
+  - "Edit /wekafs/kyle/code2/remote_sync/<repo> only"
+  - "Remote container: chi2811 mlperf_gptoss, GPU 4 by default"
+  - "User-facing replies in Chinese"
