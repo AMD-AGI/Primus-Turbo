@@ -20,6 +20,17 @@ void hk_grouped_rcr_fp8(
     int bn_block,
     hipStream_t stream);
 
+void hk_grouped_rcr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int G_b, int bN, int bK,
+    void* c_ptr,       int cM, int cN,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int m_per_group, int num_xcds,
+    int num_slots, int chunk_size, int fuse_ktail_off,
+    int bn_block,
+    hipStream_t stream);
+
 void hk_grouped_var_k_crr_fp8(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int bM_, int bN,
@@ -90,6 +101,39 @@ at::Tensor hk_grouped_rcr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
     const int G       = static_cast<int>(group_offs.numel()) - 1;
     auto out = at::empty({M_total, bN}, a.options().dtype(out_dtype));
     primus_turbo::hk::hk_grouped_rcr_fp8(
+        a.data_ptr(), M_total, aK,
+        b.data_ptr(), G_b, bN, bK,
+        out.data_ptr(), M_total, bN,
+        a_scales.data_ptr<float>(), b_scales.data_ptr<float>(),
+        group_offs.data_ptr<int64_t>(), G,
+        static_cast<int>(group_m), static_cast<int>(m_per_group),
+        static_cast<int>(num_xcds),
+        /*num_slots*/0, /*chunk_size*/0, /*fuse_ktail_off*/0,
+        static_cast<int>(bn_block),
+        current_stream());
+    return out;
+}
+
+// Campaign D v2 entry point. Mirrors hk_grouped_rcr_fp8; routes through
+// hk_fp8_kernel_v2 namespace (kernel_fp8_layouts2.cpp).
+at::Tensor hk_grouped_rcr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                  at::Tensor &b_scales, at::Tensor &group_offs,
+                                  int64_t group_m, int64_t m_per_group, int64_t num_xcds,
+                                  at::ScalarType out_dtype, int64_t bn_block) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && a_scales.is_cuda() && b_scales.is_cuda(),
+                "hk_grouped_rcr_fp8_new: tensors must be on cuda");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && group_offs.is_contiguous(),
+                "hk_grouped_rcr_fp8_new: a, b, group_offs must be contiguous");
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 3,
+                "hk_grouped_rcr_fp8_new: a [M,K] / b [G,N,K] required");
+    const int M_total = static_cast<int>(a.size(0));
+    const int aK      = static_cast<int>(a.size(1));
+    const int G_b     = static_cast<int>(b.size(0));
+    const int bN      = static_cast<int>(b.size(1));
+    const int bK      = static_cast<int>(b.size(2));
+    const int G       = static_cast<int>(group_offs.numel()) - 1;
+    auto out = at::empty({M_total, bN}, a.options().dtype(out_dtype));
+    primus_turbo::hk::hk_grouped_rcr_fp8_new(
         a.data_ptr(), M_total, aK,
         b.data_ptr(), G_b, bN, bK,
         out.data_ptr(), M_total, bN,

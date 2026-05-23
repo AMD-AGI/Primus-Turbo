@@ -21,8 +21,15 @@
 // kernel symbols — see hk_gemm_gfx950.cu for the explanation.
 namespace {
 namespace hk_fp8_kernel {
-#include "kernel_fp8_layouts.cpp"   // fp8: dispatch_grouped_*, grouped_layout_globals
+#include "kernel_fp8_layouts.cpp"   // fp8 v1: dispatch_grouped_*, grouped_layout_globals
 }  // namespace hk_fp8_kernel
+
+// v2 path for Campaign D rewrite. PLAN_V2.md milestone P1.0: 1:1 copy of v1,
+// dual-run for SNR + perf parity validation. Subsequent milestones (P1.1+)
+// will diverge from v1 in this TU only.
+namespace hk_fp8_kernel_v2 {
+#include "kernel_fp8_layouts2.cpp"  // fp8 v2: dispatch_grouped_*, grouped_layout_globals
+}  // namespace hk_fp8_kernel_v2
 
 namespace hk_bf16_kernel {
 #include "kernel_bf16_dynamic.cpp"  // bf16: dispatch_grouped, dispatch_grouped_var_k
@@ -40,6 +47,14 @@ inline hk_fp8_kernel::_gl_fp8 make_fp8_gl(const void* ptr, int b, int d, int r, 
 inline hk_fp8_kernel::_gl_bf16 make_bf16_gl_for_fp8(void* ptr, int b, int d, int r, int c) {
     return hk_fp8_kernel::_gl_bf16(
         reinterpret_cast<hk_fp8_kernel::bf16*>(ptr), b, d, r, c);
+}
+inline hk_fp8_kernel_v2::_gl_fp8 make_fp8_gl_v2(const void* ptr, int b, int d, int r, int c) {
+    return hk_fp8_kernel_v2::_gl_fp8(
+        reinterpret_cast<hk_fp8_kernel_v2::fp8e4m3*>(const_cast<void*>(ptr)), b, d, r, c);
+}
+inline hk_fp8_kernel_v2::_gl_bf16 make_bf16_gl_for_fp8_v2(void* ptr, int b, int d, int r, int c) {
+    return hk_fp8_kernel_v2::_gl_bf16(
+        reinterpret_cast<hk_fp8_kernel_v2::bf16*>(ptr), b, d, r, c);
 }
 using BFGL = hk_bf16_kernel::_gl;
 inline BFGL make_bf16_gl(void* ptr, int b, int d, int r, int c) {
@@ -79,6 +94,37 @@ void hk_grouped_rcr_fp8(
         bn_block,
     };
     hk_fp8_kernel::dispatch_grouped_rcr(g);
+}
+
+// FP8 grouped RCR v2 (Campaign D rewrite, PLAN_V2.md milestone P1.0).
+// 1:1 copy of v1 at this milestone; subsequent P1.1+ diverge inside
+// kernel_fp8_layouts2.cpp only. Signature mirrors hk_grouped_rcr_fp8.
+void hk_grouped_rcr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int G_b, int bN, int bK,
+    void* c_ptr,       int cM, int cN,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int m_per_group, int num_xcds,
+    int num_slots, int chunk_size, int fuse_ktail_off,
+    int bn_block,
+    hipStream_t stream)
+{
+    hk_fp8_kernel_v2::grouped_layout_globals g{
+        make_fp8_gl_v2(a_ptr, 1, 1, M_total, aK),
+        make_fp8_gl_v2(b_ptr, 1, G_b, bN, bK),
+        make_bf16_gl_for_fp8_v2(c_ptr, 1, 1, cM, cN),
+        0.f, 0.f,
+        sa_ptr, sb_ptr,
+        group_offs_ptr, stream,
+        G, /*n*/0, /*k*/0, /*ki*/0, /*bpc*/0,
+        group_m, num_xcds, /*M_total*/0,
+        /*fast_n*/0, /*fast_k*/0,
+        m_per_group, num_slots, chunk_size, fuse_ktail_off,
+        /*sk_split_n*/0, /*sk_partial_buf*/nullptr,
+        bn_block,
+    };
+    hk_fp8_kernel_v2::dispatch_grouped_rcr(g);
 }
 
 // FP8 grouped RRR (dense-style, alternative dgrad path).
