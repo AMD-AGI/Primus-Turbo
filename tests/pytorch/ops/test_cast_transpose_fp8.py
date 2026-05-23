@@ -13,6 +13,7 @@ import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.kernels.quantization.cast_transpose_fp8 import (
     bias_gelu_cast_transpose_fp8,
     cast_transpose_fp8_triton,
+    dbias_dgelu_cast_transpose_fp8,
 )
 from tests.pytorch.test_utils import get_tolerances
 
@@ -293,3 +294,154 @@ def test_bias_gelu_cast_transpose_compile(orig_dtype, dest_dtype, shape):
     torch.testing.assert_close(cast_compiled, cast_eager, atol=0, rtol=0)
     torch.testing.assert_close(trans_compiled, trans_eager, atol=0, rtol=0)
     torch.testing.assert_close(si_compiled, si_eager, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Fused dGELU backward + bias_grad + cast_transpose tests
+# ---------------------------------------------------------------------------
+
+def _gelu_tanh_backward_ref(grad_out, x_plus_bias):
+    """Reference dGELU backward in fp32, matching the Triton kernel's math."""
+    v = x_plus_bias.float()
+    g = grad_out.float()
+    k = 0.7978845608028654
+    v_sq = v * v
+    inner = k * v * (1.0 + 0.044715 * v_sq)
+    tanh_inner = torch.tanh(inner)
+    dtanh = 1.0 - tanh_inner * tanh_inner
+    d_inner = k * (1.0 + 3.0 * 0.044715 * v_sq)
+    dgelu = 0.5 * (1.0 + tanh_inner + v * dtanh * d_inner)
+    return g * dgelu
+
+
+DBIAS_SHAPES = [
+    (4096, 3072),
+    (8192, 12288),
+    (2048, 3072),
+    (64, 64),
+    (33, 65),
+    (1, 128),
+]
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e5m2, turbo.float8_e4m3])
+@pytest.mark.parametrize("shape", DBIAS_SHAPES)
+def test_dbias_dgelu_cast_transpose_correctness(orig_dtype, dest_dtype, shape):
+    """Fused dGELU backward + FP8 cast_transpose matches fp32 reference."""
+    torch.manual_seed(42)
+    M, N = shape
+    grad_output = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    x = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    bias = torch.randn(N, device=DEVICE, dtype=orig_dtype)
+
+    dact_ref = _gelu_tanh_backward_ref(grad_output, x.float() + bias.float())
+    scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
+    fp8_max = torch.finfo(dest_dtype).max
+    ref_scaled = (dact_ref * scale.item()).clamp(-fp8_max, fp8_max)
+    cast_ref = ref_scaled.to(dest_dtype)
+    trans_ref = cast_ref.t().contiguous()
+
+    amax_fused = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    dact_fp8, dact_t_fp8, si_fused, grad_bias = dbias_dgelu_cast_transpose_fp8(
+        grad_output, x, bias, dest_dtype, scale, amax_fused,
+    )
+
+    assert dact_fp8.shape == (M, N)
+    assert dact_t_fp8.shape == (N, M)
+    assert grad_bias.shape == (N,)
+
+    diff = (dact_fp8.float() - cast_ref.float()).abs()
+    mismatch_frac = (diff > 0).float().mean().item()
+    assert mismatch_frac < 1e-5, (
+        f"Cast mismatch fraction {mismatch_frac:.6f} exceeds 0.001% threshold"
+    )
+    diff_t = (dact_t_fp8.float() - trans_ref.float()).abs()
+    mismatch_frac_t = (diff_t > 0).float().mean().item()
+    assert mismatch_frac_t < 1e-5, (
+        f"Trans mismatch fraction {mismatch_frac_t:.6f} exceeds 0.001% threshold"
+    )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e5m2])
+@pytest.mark.parametrize("shape", DBIAS_SHAPES)
+def test_dbias_dgelu_cast_transpose_bias_grad(orig_dtype, dest_dtype, shape):
+    """Fused kernel computes correct bias gradient.
+
+    The Triton kernel accumulates partial row-sums in tiles then reduces,
+    while the reference does a single sum(dim=0). For large M the fp32
+    accumulation order differs, so we use relative tolerance scaled by sqrt(M).
+    """
+    torch.manual_seed(42)
+    M, N = shape
+    grad_output = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    x = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    bias = torch.randn(N, device=DEVICE, dtype=orig_dtype)
+
+    dact_ref = _gelu_tanh_backward_ref(grad_output, x.float() + bias.float())
+    expected_grad_bias = dact_ref.sum(dim=0)
+
+    scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
+    _, _, _, grad_bias = dbias_dgelu_cast_transpose_fp8(
+        grad_output, x, bias, dest_dtype, scale,
+    )
+
+    torch.testing.assert_close(grad_bias, expected_grad_bias, rtol=1e-4, atol=5e-3)
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e5m2])
+@pytest.mark.parametrize("shape", DBIAS_SHAPES)
+def test_dbias_dgelu_cast_transpose_amax(orig_dtype, dest_dtype, shape):
+    """Fused kernel captures correct amax of the dGELU activation gradient."""
+    torch.manual_seed(42)
+    M, N = shape
+    grad_output = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    x = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    bias = torch.randn(N, device=DEVICE, dtype=orig_dtype)
+
+    dact_ref = _gelu_tanh_backward_ref(grad_output, x.float() + bias.float())
+    expected_amax = dact_ref.abs().amax()
+
+    scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
+    amax_out = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    dbias_dgelu_cast_transpose_fp8(
+        grad_output, x, bias, dest_dtype, scale, amax_out,
+    )
+
+    torch.testing.assert_close(amax_out, expected_amax, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e5m2])
+@pytest.mark.parametrize("shape", [(64, 64), (100, 200)])
+def test_dbias_dgelu_cast_transpose_compile(orig_dtype, dest_dtype, shape):
+    """Fused dbias_dgelu_cast_transpose_fp8 works under torch.compile."""
+    torch.manual_seed(42)
+    M, N = shape
+    grad_output = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    x = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    bias = torch.randn(N, device=DEVICE, dtype=orig_dtype)
+    scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
+    amax_buf = torch.zeros((), dtype=torch.float32, device=DEVICE)
+
+    dact_eager, dact_t_eager, si_eager, gb_eager = dbias_dgelu_cast_transpose_fp8(
+        grad_output, x, bias, dest_dtype, scale, amax_buf,
+    )
+
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph=True)
+    def fn(grad_output, x, bias, scale, amax_buf):
+        return dbias_dgelu_cast_transpose_fp8(
+            grad_output, x, bias, dest_dtype, scale, amax_buf,
+        )
+
+    amax_compiled = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    dact_c, dact_t_c, si_c, gb_c = fn(grad_output, x, bias, scale, amax_compiled)
+
+    torch.testing.assert_close(dact_c, dact_eager, atol=0, rtol=0)
+    torch.testing.assert_close(dact_t_c, dact_t_eager, atol=0, rtol=0)
+    torch.testing.assert_close(si_c, si_eager, atol=0, rtol=0)
+    torch.testing.assert_close(gb_c, gb_eager, atol=0, rtol=0)
