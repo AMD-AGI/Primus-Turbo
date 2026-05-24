@@ -109,6 +109,31 @@ void hk_grouped_rcr_fp8_new(
     hk_fp8_kernel_v2::dispatch_grouped_rcr_v2(g_v2);
 }
 
+// R473: v2 RRR entry — mirrors hk_grouped_rrr_fp8 signature but routes through
+// v2 dispatcher (kernel_fp8_layouts2.cpp::dispatch_grouped_rrr_v2). Initially
+// forwards to v1; future commits replace with vacc body for +8pp R167-pattern.
+void hk_grouped_rrr_fp8_new(
+    const void* a_ptr, int M_total, int aK,
+    const void* b_ptr, int G_b, int bK_, int bN,
+    void* c_ptr,       int cM, int cN,
+    const float* sa_ptr, const float* sb_ptr,
+    const int64_t* group_offs_ptr, int G,
+    int group_m, int m_per_group, int num_xcds,
+    int bn_block,
+    hipStream_t stream)
+{
+    hk_fp8_kernel_v2::grouped_layout_globals_v2_rrr g_v2{
+        a_ptr, b_ptr, c_ptr,
+        M_total, G_b, bK_, bN, cM, cN,
+        sa_ptr, sb_ptr,
+        group_offs_ptr, stream,
+        G, group_m, m_per_group, num_xcds,
+        /*num_slots*/0, /*chunk_size*/0,
+        bn_block,
+    };
+    hk_fp8_kernel_v2::dispatch_grouped_rrr_v2(g_v2);
+}
+
 // FP8 grouped RRR (dense-style, alternative dgrad path).
 // bn_block: 0 (default) = BLK_M=BLK_N=256; 128 = bn128 variant (BLK_M=256, BLK_N=128)
 // — fewer accumulators + zero spill; see HK 9590230d.

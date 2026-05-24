@@ -84,6 +84,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hk_grouped_rrr_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
           "ScalarType out_dtype, int bn_block=0) -> Tensor");
+    m.def("hk_grouped_rrr_fp8_new(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
+          "ScalarType out_dtype, int bn_block=0) -> Tensor");
     m.def("hk_grouped_rcr_bf16(Tensor a, Tensor b, Tensor group_offs, "
           "int group_m, int m_per_group, int num_xcds) -> Tensor");
     m.def("hk_grouped_rrr_bf16(Tensor a, Tensor b, Tensor group_offs, "
@@ -139,6 +142,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hk_grouped_rcr_fp8_new", hk_grouped_rcr_fp8_new);
     m.impl("hk_grouped_var_k_crr_fp8", hk_grouped_var_k_crr_fp8);
     m.impl("hk_grouped_rrr_fp8", hk_grouped_rrr_fp8);
+    m.impl("hk_grouped_rrr_fp8_new", hk_grouped_rrr_fp8_new);
     m.impl("hk_grouped_rcr_bf16", hk_grouped_rcr_bf16);
     m.impl("hk_grouped_rrr_bf16", hk_grouped_rrr_bf16);
     m.impl("hk_grouped_var_k_crr_bf16", hk_grouped_var_k_crr_bf16);
