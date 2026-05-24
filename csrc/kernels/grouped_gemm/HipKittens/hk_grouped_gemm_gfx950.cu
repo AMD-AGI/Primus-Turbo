@@ -70,21 +70,19 @@ void hk_grouped_rcr_fp8(
     int bn_block,
     hipStream_t stream)
 {
-    hk_fp8_kernel::grouped_layout_globals g{
-        make_fp8_gl(a_ptr, 1, 1, M_total, aK),
-        make_fp8_gl(b_ptr, 1, G_b, bN, bK),
-        make_bf16_gl_for_fp8(c_ptr, 1, 1, cM, cN),
-        0.f, 0.f,
+    // R444 INTEGRATION: production path forwards to v2 (kernel_fp8_layouts2.cpp,
+    // R167 +8pp baseline + R429/R433 P1.2 progress). Previously v2 was opt-in
+    // via `hk_grouped_rcr_fp8_new`, leaving production on v1 — official bench
+    // 0/24 ≥ 1.15× reflected v1 perf, not v2.
+    hk_fp8_kernel_v2::grouped_layout_globals_v2 g_v2{
+        a_ptr, b_ptr, c_ptr,
+        M_total, G_b, bN, bK, cM, cN,
         sa_ptr, sb_ptr,
         group_offs_ptr, stream,
-        G, /*n*/0, /*k*/0, /*ki*/0, /*bpc*/0,
-        group_m, num_xcds, /*M_total*/0,
-        /*fast_n*/0, /*fast_k*/0,
-        m_per_group, num_slots, chunk_size, fuse_ktail_off,
-        /*sk_split_n*/0, /*sk_partial_buf*/nullptr,
-        bn_block,
+        G, group_m, m_per_group, num_xcds,
+        num_slots, chunk_size,
     };
-    hk_fp8_kernel::dispatch_grouped_rcr(g);
+    hk_fp8_kernel_v2::dispatch_grouped_rcr_v2(g_v2);
 }
 
 // Campaign D v2 entry — fresh mxfp8-pattern RCR kernel (see
