@@ -134,9 +134,8 @@ void hk_grouped_rrr_fp8_new(
     hk_fp8_kernel_v2::dispatch_grouped_rrr_v2(g_v2);
 }
 
-// FP8 grouped RRR (dense-style, alternative dgrad path).
-// bn_block: 0 (default) = BLK_M=BLK_N=256; 128 = bn128 variant (BLK_M=256, BLK_N=128)
-// — fewer accumulators + zero spill; see HK 9590230d.
+// R556: production RRR routes through v2 (mirror R444 RCR routing).
+// v2 dispatch handles bn=128 fallback to v1 internally (R486).
 void hk_grouped_rrr_fp8(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int G_b, int bK_, int bN,
@@ -147,21 +146,16 @@ void hk_grouped_rrr_fp8(
     int bn_block,
     hipStream_t stream)
 {
-    hk_fp8_kernel::grouped_layout_globals g{
-        make_fp8_gl(a_ptr, 1, 1, M_total, aK),
-        make_fp8_gl(b_ptr, 1, G_b, bK_, bN),
-        make_bf16_gl_for_fp8(c_ptr, 1, 1, cM, cN),
-        0.f, 0.f,
+    hk_fp8_kernel_v2::grouped_layout_globals_v2_rrr g_v2{
+        a_ptr, b_ptr, c_ptr,
+        M_total, G_b, bK_, bN, cM, cN,
         sa_ptr, sb_ptr,
         group_offs_ptr, stream,
-        G, /*n*/0, /*k*/0, /*ki*/0, /*bpc*/0,
-        group_m, num_xcds, /*M_total*/0,
-        /*fast_n*/0, /*fast_k*/0,
-        m_per_group, /*num_slots*/0, /*chunk_size*/0, /*fuse_ktail_off*/0,
-        /*sk_split_n*/0, nullptr,
+        G, group_m, m_per_group, num_xcds,
+        /*num_slots*/0, /*chunk_size*/0,
         bn_block,
     };
-    hk_fp8_kernel::dispatch_grouped_rrr(g);
+    hk_fp8_kernel_v2::dispatch_grouped_rrr_v2(g_v2);
 }
 
 // FP8 grouped variable-K CRR (wgrad).
