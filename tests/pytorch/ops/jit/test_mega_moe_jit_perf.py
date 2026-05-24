@@ -41,6 +41,7 @@ Usage (layout parity only, no kernel launch):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -232,13 +233,54 @@ def python_symm_buffer_layout(cfg: ShapeCfg) -> _Layout:
 
 
 _JIT_MODULE = None
+_JIT_MODULE_KEY = None
 
 
-def load_mega_moe_jit():
-    """JIT-loads the layout-helper TU.  Returns the loaded pybind module."""
-    global _JIT_MODULE
+# Mapping from Python keyword -> MEGA_MOE_JIT_K<NAME> macro that
+# overrides the matching entry in the ``smoke`` namespace inside
+# ``mega_moe_jit_launch.cu``.  Only these knobs are wired through;
+# secondary tile/thread params keep their .cu-side defaults unless added
+# here.  See the ``#ifndef`` block at the top of the .cu for the
+# full list of overridable symbols.
+_JIT_SHAPE_MACROS = {
+    "num_max_tokens_per_rank": "MEGA_MOE_JIT_KNUMMAXTOKENSPERRANK",
+    "hidden": "MEGA_MOE_JIT_KHIDDEN",
+    "intermediate_hidden": "MEGA_MOE_JIT_KINTERMEDIATEHIDDEN",
+    "num_experts": "MEGA_MOE_JIT_KNUMEXPERTS",
+    "num_topk": "MEGA_MOE_JIT_KNUMTOPK",
+    "num_ranks": "MEGA_MOE_JIT_KNUMRANKS",
+}
+
+
+def load_mega_moe_jit(shape: "dict | None" = None):
+    """JIT-loads the layout-helper TU.  ``shape`` is a dict of
+    ``{key: int}`` whose keys are a subset of ``_JIT_SHAPE_MACROS``;
+    each entry becomes ``-DMEGA_MOE_JIT_K<NAME>=<value>u`` so the
+    ``smoke::`` namespace in ``mega_moe_jit_launch.cu`` is re-bound at
+    compile time.  Shapes not listed fall back to the .cu defaults.
+    A per-shape extension name (hash-suffixed) keeps PyTorch's ninja
+    cache from reusing a stale build when the shape changes.
+    """
+    global _JIT_MODULE, _JIT_MODULE_KEY
+    # ``shape=None`` means "give me whatever is cached, or build with
+    # .cu defaults if nothing has been loaded yet".  An explicit shape
+    # must match the cached one — passing a second, different shape in
+    # the same process is a programming error (PyTorch's ext cache is
+    # per-process keyed on extension name, not on define values).
+    if shape is None:
+        if _JIT_MODULE is not None:
+            return _JIT_MODULE
+        norm_shape = {}
+    else:
+        norm_shape = {k: int(v) for k, v in shape.items() if k in _JIT_SHAPE_MACROS}
+    cache_key = tuple(sorted(norm_shape.items()))
     if _JIT_MODULE is not None:
-        return _JIT_MODULE
+        if _JIT_MODULE_KEY == cache_key:
+            return _JIT_MODULE
+        raise RuntimeError(
+            f"load_mega_moe_jit called with conflicting shapes: cached={_JIT_MODULE_KEY}, "
+            f"new={cache_key}. Pass the same shape to every call within a process."
+        )
 
     from torch.utils.cpp_extension import load as cpp_load
 
@@ -250,21 +292,36 @@ def load_mega_moe_jit():
         "-U__HIP_NO_HALF_OPERATORS__",
         "-U__HIP_NO_HALF_CONVERSIONS__",
     ]
+    shape_defines = [f"-D{_JIT_SHAPE_MACROS[k]}={v}u" for k, v in sorted(norm_shape.items())]
+
+    if shape_defines:
+        # Hash the override set into the extension name so each shape
+        # gets its own ninja build directory; otherwise PyTorch reuses
+        # the cached .so and silently ignores the new -D flags.
+        ext_suffix = hashlib.sha1(
+            ";".join(f"{k}={v}" for k, v in sorted(norm_shape.items())).encode()
+        ).hexdigest()[:12]
+        ext_name = f"mega_moe_jit_layout_probe_{ext_suffix}"
+    else:
+        ext_name = "mega_moe_jit_layout_probe"
+
     _JIT_MODULE = cpp_load(
-        name="mega_moe_jit_layout_probe",
+        name=ext_name,
         sources=sources,
         extra_include_paths=[CSRC_INCLUDE, CSRC_ROOT],
-        extra_cflags=["-O3", "-std=c++20"] + half_undefs,
+        extra_cflags=["-O3", "-std=c++20"] + half_undefs + shape_defines,
         extra_cuda_cflags=[
             "-O3",
             "-std=c++20",
             "--offload-arch=gfx950",
             "-fno-gpu-rdc",
         ]
-        + half_undefs,
+        + half_undefs
+        + shape_defines,
         with_cuda=True,
         verbose=True,
     )
+    _JIT_MODULE_KEY = cache_key
     return _JIT_MODULE
 
 
@@ -522,9 +579,15 @@ def dist_print(s: str = "", once_in_node: bool = False) -> None:
 
 
 class MegaMoEBuffer:
-    """Wraps a contiguous CUDA tensor matching the DG-aligned mega-MoE
-    symmetric buffer layout.  Single-rank only (no symm_mem rendezvous);
-    multi-rank support will be added once XGMI handle exchange is wired.
+    """Wraps a CUDA buffer matching the DG-aligned mega-MoE symmetric layout.
+
+    Single-rank (``num_ranks == 1``) uses a plain ``torch.empty`` allocation
+    and exposes that pointer as the sole entry in ``sym_buffer_ptrs``.
+
+    Multi-rank uses ``primus_turbo.pytorch.core.symm_mem.SymmetricMemory`` to
+    rendezvous a hipMalloc-backed buffer across all peers, exposing each
+    peer's mapped base pointer in ``sym_buffer_ptrs`` (length == num_ranks).
+    Local tensor views are zero-copy slices of *this* rank's buffer.
     """
 
     def __init__(
@@ -558,9 +621,24 @@ class MegaMoEBuffer:
         self.num_max_pool_tokens = int(num_max_pool_tokens)
         self.num_padded_sf_pool_tokens = int(num_padded_sf_pool_tokens)
 
-        self.buffer = torch.empty(self.total_bytes, dtype=torch.int8, device="cuda")
-        self.buffer.zero_()
-        torch.cuda.synchronize()
+        self.symm = None
+        if num_ranks <= 1:
+            self.buffer = torch.empty(self.total_bytes, dtype=torch.int8, device="cuda")
+            self.buffer.zero_()
+            torch.cuda.synchronize()
+            self.sym_buffer_ptrs = [int(self.buffer.data_ptr())]
+        else:
+            from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
+            print(f"[r{rank_idx}] BEFORE SymmetricMemory(total_bytes={self.total_bytes})", flush=True)
+            self.symm = SymmetricMemory(group, self.total_bytes)
+            print(f"[r{rank_idx}] AFTER SymmetricMemory ctor", flush=True)
+            # SymmetricMemory zeros via hipMemset and barriers across the group;
+            # local rank's view is buffer_ptrs[rank_idx].
+            self.buffer = self.symm.get_buffer(
+                self.rank_idx, (self.total_bytes,), torch.int8, storage_offset=0
+            )
+            self.sym_buffer_ptrs = list(self.symm.buffer_ptrs)
 
         # Carve named tensor views into the symmetric buffer.
         (
@@ -596,8 +674,14 @@ class MegaMoEBuffer:
         for d in shape:
             nelem *= d
         nbytes = nelem * elem_size
-        byte_view = self.buffer.narrow(0, offset, nbytes)
-        return byte_view.view(dtype).view(*shape)
+        if self.symm is None:
+            byte_view = self.buffer.narrow(0, offset, nbytes)
+            return byte_view.view(dtype).view(*shape)
+        # SymmetricMemory: storage_offset is in *elements* of `dtype`.
+        assert (
+            offset % elem_size == 0
+        ), f"layout offset {offset} not aligned to dtype {dtype} elem_size {elem_size}"
+        return self.symm.get_buffer(self.rank_idx, shape, dtype, storage_offset=offset // elem_size)
 
     def destroy(self):
         self.buffer = None
@@ -606,6 +690,10 @@ class MegaMoEBuffer:
         self.x_sf = None
         self.topk_idx = None
         self.topk_weights = None
+        self.sym_buffer_ptrs = None
+        if self.symm is not None:
+            self.symm.destroy()
+            self.symm = None
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +748,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
     ep_ranks = getattr(args, "ep_ranks", None) or num_ranks
     ep_experts_per_rank = num_experts // ep_ranks
 
+    # JIT-compile the kernel with the requested shape baked in via
+    # ``-DMEGA_MOE_JIT_K*`` overrides.  Done up front so the parity
+    # check and buffer allocation reuse the same cached module.
+    jit_shape = {
+        "num_max_tokens_per_rank": num_max_tokens_per_rank,
+        "hidden": hidden,
+        "intermediate_hidden": intermediate_hidden,
+        "num_experts": num_experts,
+        "num_topk": num_topk,
+        "num_ranks": num_ranks,
+    }
+    load_mega_moe_jit(jit_shape)
+
     # Run parity sanity check first so any layout-math regression fails
     # *before* we pay for kernel JIT compile.
     if local_rank == 0 and not args.skip_parity:
@@ -701,7 +802,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
     probe_l1 = torch.empty(1, dtype=torch.int8, device="cuda")
     probe_l2 = torch.empty(1, dtype=torch.int8, device="cuda")
     probe_status = jit.run_mega_moe(
-        buffer.buffer,
+        buffer.sym_buffer_ptrs,
         rank_idx,
         0,
         buffer.num_max_tokens_per_rank,
@@ -770,7 +871,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
 
         y = torch.empty((max(num_tokens, 1), hidden), dtype=torch.bfloat16, device="cuda")
         status = jit.run_mega_moe(
-            buffer.buffer,
+            buffer.sym_buffer_ptrs,
             rank_idx,
             num_tokens,
             buffer.num_max_tokens_per_rank,
@@ -898,9 +999,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
     approx_factor = _safe_div(t_fused, t_fused - t_reduction) if t_fused else 1.0
 
-    # Print summary in DG format
-    dist_print("Performance:", once_in_node=True)
-    if t_fused is not None:
+    # Print summary in DG format.  When ``num_recv_tokens == 0`` the
+    # kernel takes the early-exit path (or every token was masked) so
+    # ``t_fused`` reflects pure launch overhead, not GEMM compute.
+    # Reporting "0 TFLOPS" under a "Performance:" header would be
+    # misleading — relabel and print only the latency.  The MFMA body
+    # itself is also still scaffolding (see MegaKernel/TODO.md §B.2)
+    # so even non-zero token counts cannot produce real perf yet;
+    # callers that want actual numbers must wait on the A/B loader.
+    if t_fused is not None and num_recv_tokens == 0:
+        dist_print("Launch overhead (stub kernel, no compute):", once_in_node=True)
+        dist_print(
+            f" > EP: {rank_idx:2}/{num_ranks} | "
+            f"{t_fused * 1e6:4.0f} us launch+sync | "
+            f"recv_tokens=0 (early-exit path)",
+            once_in_node=True,
+        )
+    elif t_fused is not None:
+        dist_print("Performance:", once_in_node=True)
         dist_print(
             f" > EP: {rank_idx:2}/{num_ranks} | "
             f"{tflops:4.0f} TFLOPS | "
@@ -913,6 +1029,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
             once_in_node=True,
         )
     else:
+        dist_print("Performance:", once_in_node=True)
         dist_print(
             f" > EP: {rank_idx:2}/{num_ranks} (target EP{ep_ranks}) | "
             f"recv_tokens: {num_recv_tokens} | "
@@ -951,7 +1068,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-processes",
         type=int,
-        default=1,
+        default=8,
         help="Number of processes to spawn (default: 1 for single-GPU smoke test; "
         "use 8 to mirror DG's default)",
     )
@@ -976,7 +1093,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=0,
+        default=128,
         help="Number of tokens per rank (0 = early-exit smoke; None = max minus removed)",
     )
     parser.add_argument(

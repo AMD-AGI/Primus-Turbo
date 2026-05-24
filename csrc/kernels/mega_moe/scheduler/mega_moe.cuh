@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
+#include "../impls/prims.cuh"
 #include "../layout/mega_moe.cuh"
 
 namespace primus_turbo {
@@ -65,12 +66,14 @@ struct MegaMoEScheduler {
     static_assert(L2_SHAPE_K % BLOCK_K == 0, "Invalid L2 K shape");
     static_assert(kNumExpertsPerRank % kNumExpertsPerWave == 0, "Invalid wave config");
 
-    // NOTES: 2-CTA cluster requires even N block counts so that two
-    // adjacent CTAs always land on the same ``m_block_idx`` with
-    // ``n_block_idx`` differing by 1.
-    static_assert(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
-    static_assert(kNumL1BlockNs % 2 == 0, "L1 N block count must be even for 2-CTA cluster");
-    static_assert(kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
+    // NOTES: SM100 ran in a 2-CTA cluster where adjacent CTAs shared a
+    // single ``m_block_idx`` with ``n_block_idx`` differing by 1, which
+    // required ``kNumSMs`` and ``kNum{L1,L2}BlockNs`` to all be even.
+    // The AMD port collapses the cluster to a single CTA per tile, so
+    // the iteration walks every (m, n) block independently — there is
+    // no pairing constraint to maintain. The asserts were dropped to
+    // unlock e.g. ``BLOCK_N=192`` with ``hidden=7168`` (an odd N-block
+    // count). See TODO.md Section A item 10.
 
     // Arrival counts owned by the kernel-level workspace.
     const layout::Workspace &workspace;
@@ -100,23 +103,16 @@ struct MegaMoEScheduler {
         return detail::align_up(current_local_expert_idx + 1, kNumExpertsPerWave);
     }
 
-    // Per-lane expert -> token count exchange.  Direct AMD wave64 port
-    // of DG's wave32 version: each lane caches every (i * warpSize +
-    // lane_idx) expert, then we broadcast the matching value via
-    // ``__shfl`` (wave64) instead of NVIDIA's wave32 ``ptx::exchange``.
+    // Per-lane expert -> token count exchange.  All call sites pass a
+    // wave-uniform ``expert_idx`` (driven by the scheduler's persistent
+    // state), so the per-lane equality scan in DG's original wave32
+    // pattern collapses to a direct array lookup + ``__shfl`` broadcast.
+    // The lane that holds ``expert_idx``'s count is ``expert_idx %
+    // kWarpSize``; the slot inside its per-lane cache is
+    // ``expert_idx / kWarpSize``.  See TODO.md Section A item 12.
     __device__ uint32_t get_num_tokens(const uint32_t &expert_idx) const {
-        // NOTES: ``valid_value`` is intentionally read before the if to
-        // mirror DG's pattern (the predicate selects, then we broadcast
-        // across the wave so every lane holds the answer).
-        uint32_t valid_value = 0;
-#pragma unroll
-        for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
-            const uint32_t lane = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
-            const uint32_t e    = i * warpSize + lane;
-            if (expert_idx == e)
-                valid_value = stored_num_tokens_per_expert[i];
-        }
-        return __shfl(valid_value, static_cast<int>(expert_idx & (warpSize - 1u)));
+        return __shfl(stored_num_tokens_per_expert[expert_idx / prims::kWarpSize],
+                      static_cast<int>(expert_idx & (prims::kWarpSize - 1u)));
     }
 
     // Per-lane expert -> pool block offset reduction.  AMD wave64 port
@@ -124,16 +120,16 @@ struct MegaMoEScheduler {
     // backed cross-lane reductions (HIP exposes ``__reduce_add`` only on
     // newer toolchains; we fall back to a manual butterfly).
     __device__ uint32_t get_pool_block_offset(const uint32_t &expert_idx) {
-        const uint32_t lane       = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
+        const uint32_t lane       = prims::get_lane_idx();
         uint32_t       num_blocks = 0;
 #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
-            if (i * warpSize + lane < expert_idx)
+            if (i * prims::kWarpSize + lane < expert_idx)
                 num_blocks += detail::constexpr_ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
         }
         // Wave64 butterfly sum (matches ``__reduce_add_sync(0xffffffff,..)``).
 #pragma unroll
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        for (int offset = prims::kWarpSize / 2; offset > 0; offset >>= 1)
             num_blocks += __shfl_xor(num_blocks, offset);
         return num_blocks;
     }
@@ -239,17 +235,35 @@ struct MegaMoEScheduler {
     // port of DG's wave32 spin loop (``ptx::ld_volatile`` -> HIP
     // ``__atomic_load_n`` with ``__ATOMIC_RELAXED``; the high 32 bits
     // of the counter track how many SMs × Ranks have arrived).
+    //
+    // Memory-scope rationale (mirrors the policy in
+    // ``impls/gfx950_fp8_fp4_mega_moe.cuh`` head comment):
+    //   * Single-rank (``kNumRanks == 1``): all writers are local SMs
+    //     on the same agent (see the ``atomic_add_sys`` at the dispatch
+    //     write site - in single-rank, ``sym_buffer.map(ptr, 0)``
+    //     resolves to a local pointer).  AGENT scope is sufficient and
+    //     avoids a system-wide cache invalidate on every poll, which
+    //     would otherwise serialize all CTAs through Infinity Fabric
+    //     and inflate the spin from microseconds to seconds.
+    //   * Multi-rank (``kNumRanks > 1``): the counter is incremented
+    //     via XGMI by remote ranks, so SYSTEM scope is required for
+    //     the reader to observe those remote writes.
     __device__ void fetch_expert_recv_count() {
-        const uint32_t lane = __builtin_amdgcn_workitem_id_x() & (warpSize - 1u);
+        const uint32_t lane = prims::get_lane_idx();
 #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
-            const uint32_t expert_idx = i * warpSize + lane;
+            const uint32_t expert_idx = i * prims::kWarpSize + lane;
             uint64_t       value      = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 auto *ptr = workspace.get_expert_recv_count_sum_ptr(expert_idx);
                 do {
-                    value = __atomic_load_n(reinterpret_cast<unsigned long long *>(ptr),
-                                            __ATOMIC_RELAXED);
+                    if constexpr (kNumRanks == 1u) {
+                        value = __hip_atomic_load(reinterpret_cast<unsigned long long *>(ptr),
+                                                  __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+                    } else {
+                        value = __hip_atomic_load(reinterpret_cast<unsigned long long *>(ptr),
+                                                  __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                    }
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);

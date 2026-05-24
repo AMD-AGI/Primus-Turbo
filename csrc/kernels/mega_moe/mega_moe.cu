@@ -174,7 +174,7 @@ void launch_fp8_fp4_mega_moe(const MegaMoEArgs &args) {
                        ", intermediate=", args.intermediate_hidden, ", experts=", args.num_experts,
                        ", topk=", args.num_topk, ", ranks=", args.num_ranks,
                        ").  The kernel-level C++ API (layout::Workspace, layout::SymBuffer, "
-                       "sched::MegaMoEScheduler, impls::launch_fp8_fp4_mega_moe_impl) is "
+                       "sched::MegaMoEScheduler, launch_fp8_fp4_mega_moe_impl) is "
                        "aligned with DeepGEMM; the gfx950 device kernel body will be "
                        "added in a follow-up patch.");
 }

@@ -19,6 +19,7 @@
 #include <array>
 #include <cstdint>
 #include <hip/hip_runtime.h>
+#include <vector>
 
 #include "primus_turbo/mega_moe.h"
 
@@ -148,36 +149,121 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 
 // ---------------------------------------------------------------------
 //  Compile-time "smoke" shape that the JIT TU pre-instantiates.  Mirrors
-//  the SymBuffer layout used by ``test_mega_moe_jit_perf.py`` and is
-//  small enough to compile + launch on a single MI355X with
-//  ``num_processes == 1``.  Larger shapes (matching DG defaults such as
-//  ``hidden=7168, intermediate=3072, experts=384, topk=6``) will be
-//  added as additional template instantiations once the runtime path
-//  (partial barriers + MFMA tile body) lands.
+//  the SymBuffer layout used by ``test_mega_moe_jit_perf.py``.  Each
+//  constant below can be overridden from the Python loader by passing
+//  ``-DMEGA_MOE_JIT_K<NAME>=<value>`` in ``extra_cuda_cflags`` so a
+//  single TU can be re-JIT'd for arbitrary DG-style shapes (e.g.
+//  ``hidden=7168, intermediate=3072, experts=384, topk=6``).  The
+//  ``MEGA_MOE_JIT_KNUMRANKS`` override is driven by the Python
+//  ``--num-processes`` argument; the device kernel currently
+//  ``static_assert``-s ``kNumRanks == 1u`` (impls/gfx950 head comment),
+//  so picking ``num_processes > 1`` will fail the JIT compile with a
+//  clear diagnostic until TODO.md §A.14 (multi-rank dispatch
+//  round-robin) lands.
 // ---------------------------------------------------------------------
+#ifndef MEGA_MOE_JIT_KNUMMAXTOKENSPERRANK
+#define MEGA_MOE_JIT_KNUMMAXTOKENSPERRANK 384u // aligned to kLCMCandidateBlockM
+#endif
+#ifndef MEGA_MOE_JIT_KHIDDEN
+#define MEGA_MOE_JIT_KHIDDEN 256u
+#endif
+#ifndef MEGA_MOE_JIT_KINTERMEDIATEHIDDEN
+#define MEGA_MOE_JIT_KINTERMEDIATEHIDDEN 128u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMEXPERTS
+#define MEGA_MOE_JIT_KNUMEXPERTS 8u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMTOPK
+#define MEGA_MOE_JIT_KNUMTOPK 2u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMRANKS
+#define MEGA_MOE_JIT_KNUMRANKS 1u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMEXPERTSPERWAVE
+#define MEGA_MOE_JIT_KNUMEXPERTSPERWAVE 8u
+#endif
+#ifndef MEGA_MOE_JIT_KBLOCK_M
+#define MEGA_MOE_JIT_KBLOCK_M 128u
+#endif
+#ifndef MEGA_MOE_JIT_KBLOCK_N
+#define MEGA_MOE_JIT_KBLOCK_N 128u
+#endif
+#ifndef MEGA_MOE_JIT_KBLOCK_K
+#define MEGA_MOE_JIT_KBLOCK_K 128u
+#endif
+#ifndef MEGA_MOE_JIT_KSTORE_BLOCK_M
+#define MEGA_MOE_JIT_KSTORE_BLOCK_M 32u
+#endif
+#ifndef MEGA_MOE_JIT_KSF_BLOCK_M
+#define MEGA_MOE_JIT_KSF_BLOCK_M 128u
+#endif
+#ifndef MEGA_MOE_JIT_KSF_BLOCK_N
+#define MEGA_MOE_JIT_KSF_BLOCK_N 128u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMSTAGES
+#define MEGA_MOE_JIT_KNUMSTAGES 4u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMDISPATCHTHREADS
+#define MEGA_MOE_JIT_KNUMDISPATCHTHREADS 128u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS
+#define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 128u
+#endif
+#ifndef MEGA_MOE_JIT_KNUMEPILOGUETHREADS
+#define MEGA_MOE_JIT_KNUMEPILOGUETHREADS 256u
+#endif
+// MI355X exposes 256 CUs (8 XCDs x 32 CUs).  Keep as a multiple of 8 to
+// preserve per-XCD locality of the scheduler state machine.
+#ifndef MEGA_MOE_JIT_KNUMSMS
+#define MEGA_MOE_JIT_KNUMSMS 256u
+#endif
+
 namespace smoke {
-constexpr uint32_t kNumMaxTokensPerRank = 384u; // aligned to kLCMCandidateBlockM
-constexpr uint32_t kHidden              = 256u;
-constexpr uint32_t kIntermediateHidden  = 128u;
-constexpr uint32_t kNumExperts          = 8u;
-constexpr uint32_t kNumTopk             = 2u;
-constexpr uint32_t kNumExpertsPerWave   = 8u;
-constexpr uint32_t kBLOCK_M             = 128u;
-constexpr uint32_t kBLOCK_N             = 128u;
-constexpr uint32_t kBLOCK_K             = 128u;
-constexpr uint32_t kSTORE_BLOCK_M       = 32u;
-constexpr uint32_t kSF_BLOCK_M          = 128u;
-constexpr uint32_t kSF_BLOCK_N          = 128u;
-// align_up(1*384*min(2,8) + 8*(192-1), 384) = 2304
-constexpr uint32_t kNumMaxPoolTokens = 2304u;
-// max over candidate block_ms of (2304//bm)*align_up(bm,128) = 36864 (bm=8)
-constexpr uint32_t kNumPaddedSFPoolTokens = 36864u;
-constexpr uint32_t kNumStages             = 4u;
-constexpr uint32_t kNumDispatchThreads    = 128u;
-constexpr uint32_t kNumNonEpilogueThreads = 128u;
-constexpr uint32_t kNumEpilogueThreads    = 256u;
-constexpr uint32_t kNumSMs                = 64u;
-constexpr uint32_t kNumRanks              = 1u;
+constexpr uint32_t kNumMaxTokensPerRank   = MEGA_MOE_JIT_KNUMMAXTOKENSPERRANK;
+constexpr uint32_t kHidden                = MEGA_MOE_JIT_KHIDDEN;
+constexpr uint32_t kIntermediateHidden    = MEGA_MOE_JIT_KINTERMEDIATEHIDDEN;
+constexpr uint32_t kNumExperts            = MEGA_MOE_JIT_KNUMEXPERTS;
+constexpr uint32_t kNumTopk               = MEGA_MOE_JIT_KNUMTOPK;
+constexpr uint32_t kNumRanks              = MEGA_MOE_JIT_KNUMRANKS;
+constexpr uint32_t kBLOCK_M               = MEGA_MOE_JIT_KBLOCK_M;
+constexpr uint32_t kBLOCK_N               = MEGA_MOE_JIT_KBLOCK_N;
+constexpr uint32_t kBLOCK_K               = MEGA_MOE_JIT_KBLOCK_K;
+constexpr uint32_t kSTORE_BLOCK_M         = MEGA_MOE_JIT_KSTORE_BLOCK_M;
+constexpr uint32_t kSF_BLOCK_M            = MEGA_MOE_JIT_KSF_BLOCK_M;
+constexpr uint32_t kSF_BLOCK_N            = MEGA_MOE_JIT_KSF_BLOCK_N;
+constexpr uint32_t kNumStages             = MEGA_MOE_JIT_KNUMSTAGES;
+constexpr uint32_t kNumDispatchThreads    = MEGA_MOE_JIT_KNUMDISPATCHTHREADS;
+constexpr uint32_t kNumNonEpilogueThreads = MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS;
+constexpr uint32_t kNumEpilogueThreads    = MEGA_MOE_JIT_KNUMEPILOGUETHREADS;
+constexpr uint32_t kNumSMs                = MEGA_MOE_JIT_KNUMSMS;
+static_assert(kNumExperts % kNumRanks == 0,
+              "MEGA_MOE_JIT_KNUMEXPERTS must be divisible by MEGA_MOE_JIT_KNUMRANKS");
+constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+// Clamp the requested wave size to ``kNumExpertsPerRank``.  The scheduler
+// enforces ``kNumExpertsPerRank % kNumExpertsPerWave == 0``; when the
+// caller hands us a config with fewer experts per rank than the default
+// wave width (e.g. EP8 + 8 experts -> 1 expert/rank), shrink the wave
+// to 1 so the kernel still instantiates.
+constexpr uint32_t kNumExpertsPerWave = MEGA_MOE_JIT_KNUMEXPERTSPERWAVE < kNumExpertsPerRank
+                                            ? MEGA_MOE_JIT_KNUMEXPERTSPERWAVE
+                                            : kNumExpertsPerRank;
+
+// Derived pool sizing - constexpr-computed from the shape constants
+// above so callers only need to override the primary knobs.
+constexpr uint32_t kNumMaxPoolTokens = ly::get_num_max_pool_tokens<uint32_t>(
+    kNumRanks, kNumMaxTokensPerRank, kNumTopk, kNumExpertsPerRank);
+
+constexpr uint32_t compute_num_padded_sf_pool_tokens(uint32_t pool_tokens) {
+    uint32_t result = 0;
+    for (int i = 0; i < mm::kNumCandidateBlockMs; ++i) {
+        const uint32_t v = ly::get_num_padded_sf_pool_tokens<uint32_t>(
+            pool_tokens, static_cast<uint32_t>(mm::kCandidateBlockM[i]));
+        if (v > result)
+            result = v;
+    }
+    return result;
+}
+constexpr uint32_t kNumPaddedSFPoolTokens = compute_num_padded_sf_pool_tokens(kNumMaxPoolTokens);
 } // namespace smoke
 
 // ---------------------------------------------------------------------
@@ -196,13 +282,14 @@ constexpr uint32_t kNumRanks              = 1u;
 //    >0  -> ``hipError_t`` reported by ``hipLaunchKernelGGL`` /
 //           ``hipDeviceSynchronize`` (cast to int).
 // ---------------------------------------------------------------------
-extern "C" int mega_moe_jit_run_mega_moe(int64_t sym_buffer_base, int rank_idx, int num_tokens,
-                                         int num_max_tokens_per_rank, int hidden,
-                                         int intermediate_hidden, int num_experts, int num_topk,
-                                         int num_ranks, int64_t y_ptr, int64_t l1_weights_ptr,
-                                         int64_t l1_weights_sf_ptr, int64_t l2_weights_ptr,
-                                         int64_t l2_weights_sf_ptr, int64_t recv_stats_ptr,
-                                         float activation_clamp, int fast_math) {
+extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int num_sym_buffer_bases,
+                                         int rank_idx, int num_tokens, int num_max_tokens_per_rank,
+                                         int hidden, int intermediate_hidden, int num_experts,
+                                         int num_topk, int num_ranks, int64_t y_ptr,
+                                         int64_t l1_weights_ptr, int64_t l1_weights_sf_ptr,
+                                         int64_t l2_weights_ptr, int64_t l2_weights_sf_ptr,
+                                         int64_t recv_stats_ptr, float activation_clamp,
+                                         int fast_math) {
     if (num_max_tokens_per_rank != static_cast<int>(smoke::kNumMaxTokensPerRank) ||
         hidden != static_cast<int>(smoke::kHidden) ||
         intermediate_hidden != static_cast<int>(smoke::kIntermediateHidden) ||
@@ -211,14 +298,18 @@ extern "C" int mega_moe_jit_run_mega_moe(int64_t sym_buffer_base, int rank_idx, 
         num_ranks != static_cast<int>(smoke::kNumRanks)) {
         return -1;
     }
+    // Caller must pass exactly ``smoke::kNumRanks`` peer pointers (one
+    // per rank, IPC-rendezvous'd into this process's address space).
+    if (num_sym_buffer_bases != static_cast<int>(smoke::kNumRanks))
+        return -1;
     (void) fast_math; // captured at compile time via the smoke template
     (void) activation_clamp;
 
-    std::array<int64_t, 1>          sym_ptrs{sym_buffer_base};
+    std::vector<int64_t> sym_ptrs(sym_buffer_bases, sym_buffer_bases + num_sym_buffer_bases);
     ly::SymBuffer<smoke::kNumRanks> sym_buffer(sym_ptrs, static_cast<uint32_t>(rank_idx));
 
-    const hipError_t launch_err = mm::impls::launch_fp8_fp4_mega_moe_impl<
-        mm::impls::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
+    const hipError_t launch_err = mm::launch_fp8_fp4_mega_moe_impl<
+        mm::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
         smoke::kIntermediateHidden, smoke::kNumExperts, smoke::kNumTopk, smoke::kNumExpertsPerWave,
         smoke::kBLOCK_M, smoke::kBLOCK_N, smoke::kBLOCK_K, smoke::kSTORE_BLOCK_M,
         smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,
@@ -319,11 +410,11 @@ extern "C" int mega_moe_jit_run_stub() {
         return rc;
     }
 
-    std::array<int64_t, 1>          sym_ptrs{reinterpret_cast<int64_t>(d_sym)};
+    std::vector<int64_t>            sym_ptrs(smoke::kNumRanks, reinterpret_cast<int64_t>(d_sym));
     ly::SymBuffer<smoke::kNumRanks> sym_buffer(sym_ptrs, /*rank_idx=*/0u);
 
-    const hipError_t launch_err = mm::impls::launch_fp8_fp4_mega_moe_impl<
-        mm::impls::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
+    const hipError_t launch_err = mm::launch_fp8_fp4_mega_moe_impl<
+        mm::MegaMoEArch::Gfx950, smoke::kNumMaxTokensPerRank, smoke::kHidden,
         smoke::kIntermediateHidden, smoke::kNumExperts, smoke::kNumTopk, smoke::kNumExpertsPerWave,
         smoke::kBLOCK_M, smoke::kBLOCK_N, smoke::kBLOCK_K, smoke::kSTORE_BLOCK_M,
         smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,

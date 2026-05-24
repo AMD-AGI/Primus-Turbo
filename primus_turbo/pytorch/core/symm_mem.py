@@ -134,13 +134,19 @@ class SymmetricMemory:
         buffer_ptr = None
         signal_pad_ptr = None
         try:
+            print(f"[r{self.rank}] symm: hipMalloc(buffer) start", flush=True)
             buffer_ptr = self.lib.hipMalloc(alloc_size)
+            print(f"[r{self.rank}] symm: hipMalloc(signal_pad) start", flush=True)
             signal_pad_ptr = self.lib.hipMalloc(self.signal_pad_size)
+            print(f"[r{self.rank}] symm: hipMemset start", flush=True)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
 
+            print(f"[r{self.rank}] symm: _rendezvous(buffer) start", flush=True)
             self.buffer_ptrs = self._rendezvous(buffer_ptr)
+            print(f"[r{self.rank}] symm: _rendezvous(signal_pad) start", flush=True)
             self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
+            print(f"[r{self.rank}] symm: _rendezvous done", flush=True)
         except Exception:
             if not self.buffer_ptrs and buffer_ptr is not None:
                 self._try_free(buffer_ptr)
@@ -182,10 +188,13 @@ class SymmetricMemory:
         Returns a ``list[int]`` of device-pointer values (one per rank),
         uniformly typed to avoid mixed c_void_p / int issues downstream.
         """
+        print(f"[r{self.rank}] _rendezvous: hipIpcGetMemHandle", flush=True)
         mem_handle = self.lib.hipIpcGetMemHandle(ptr)
         mem_handle_bytes = self.lib.mem_handle_to_bytes(mem_handle)
         mem_handle_list = [None] * self.world_size
+        print(f"[r{self.rank}] _rendezvous: all_gather_object start", flush=True)
         dist.all_gather_object(mem_handle_list, mem_handle_bytes, group=self.group)
+        print(f"[r{self.rank}] _rendezvous: all_gather_object done", flush=True)
 
         ptr_list: list[int] = [0] * self.world_size
         opened_ranks: list[int] = []
@@ -194,6 +203,7 @@ class SymmetricMemory:
                 if rank == self.rank:
                     ptr_list[rank] = self._c_void_p_to_int(ptr)
                 else:
+                    print(f"[r{self.rank}] _rendezvous: hipIpcOpenMemHandle(rank={rank})", flush=True)
                     ipc_ptr = self.lib.hipIpcOpenMemHandle(mem_handle_list[rank])
                     ptr_list[rank] = self._c_void_p_to_int(ipc_ptr)
                     opened_ranks.append(rank)
@@ -204,6 +214,7 @@ class SymmetricMemory:
                 except Exception:
                     pass
             raise
+        print(f"[r{self.rank}] _rendezvous: all handles opened", flush=True)
         return ptr_list
 
     def _try_free(self, ptr):

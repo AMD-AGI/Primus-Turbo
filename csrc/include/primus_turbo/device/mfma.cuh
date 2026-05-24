@@ -90,4 +90,39 @@ template <typename AType, typename BType> struct mfma_scale_f32_16x16x128_f8f6f4
     }
 };
 
+// ── v_mfma_scale_f32_32x32x64_f8f6f4 (gfx950) ──
+// Scaled MFMA: D = A * B * scale, with microscaling (MX) support.
+//   AType/BType: FP8 element types (determines cbsz/blgp encoding)
+//   M=32, N=32, K=64, output f32x16 per lane (1024 / 64 lanes = 16).
+//
+// Preferred default over the 16x16x128 variant for L1/L2 GEMM tiles
+// because the accumulator footprint is 16 AGPRs/lane (vs 4 AGPRs/lane
+// for 16x16x128 — but the 16x16x128 variant needs 64 calls/lane for a
+// 128x128 output tile, exhausting all 256 AGPRs and forcing 1 wave/SIMD
+// occupancy).  With 32x32x64 the same 128x128 tile needs 16 calls/lane
+// × 16 floats = 256 AGPRs — same total footprint per-tile, but
+// distributed across fewer MFMA calls so pipeline slack and
+// occupancy improve.  See TODO.md item 4 for the AGPR budget rationale.
+template <typename AType, typename BType> struct mfma_scale_f32_32x32x64_f8f6f4 {
+    static constexpr int cbsz = fp8_format_code<AType>;
+    static constexpr int blgp = fp8_format_code<BType>;
+
+    // Builtin path: compiler-managed registers.
+    // A/B are packed FP8 data (8 x int32 = 128 FP8 elements; for K=64
+    // the lower 4 dwords are consumed but the intrinsic accepts the
+    // same int32x8 operand type as the 16x16x128 variant).
+    // c is the accumulator (input & output) of 16 floats per lane.
+    __device__ __forceinline__ static dtype::float32x16 run(dtype::int32x8 a, dtype::int32x8 b,
+                                                            dtype::float32x16 c, uint32_t scale_a,
+                                                            uint32_t scale_b) {
+#if defined(__gfx950__)
+        return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, c, cbsz, blgp, 0, scale_a, 0,
+                                                               scale_b);
+#else
+        static_assert(false, "mfma_scale_f32_32x32x64_f8f6f4 requires gfx950");
+        return c;
+#endif
+    }
+};
+
 } // namespace primus_turbo::device
