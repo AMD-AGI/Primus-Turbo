@@ -82,6 +82,10 @@ _HK_FP8_RCR_CANDIDATES: tuple[tuple[int, int], ...] = (
     # gpt_oss fwd shape). Adding to the candidate set; autotune will pick
     # it where it actually wins.
     (12, 2),
+    # R464: gm=16 xcds=2 wins for dsv3_down_B16_M4096 (1.177×) and
+    # dsv3_up_B16_M2048 (1.118×) in v2 post-R444 routing. Per-shape sweep
+    # confirmed +5pp vs default config on dsv3_down.
+    (16, 2),
 )
 _HK_FP8_VARK_CANDIDATES: tuple[tuple[int, int], ...] = (
     (1, 0), (4, 0), (4, 4), (8, 0), (8, 4),
@@ -515,7 +519,10 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
         # → 256x128 (bn128) variant. Both kernels now carry the ceil_div
         # bpr_g + per-group shifted gl view + masked store fix (2026-05-18),
         # so unbalanced / M_g < BLOCK_SIZE shapes are correct in either.
-        bn_choices = (0, 128)
+        # R466: post-R444 production binding forwards to v2 (kernel_fp8_layouts2.cpp)
+        # which only supports BLK=256x256. bn=128 arg is ignored. Limiting bn_choices
+        # to (0,) eliminates redundant autotune candidates (was (0, 128) for v1).
+        bn_choices = (0,)
         candidates_3way = tuple(
             (gm_, xcds_, bn_)
             for (gm_, xcds_) in _HK_FP8_RCR_CANDIDATES
