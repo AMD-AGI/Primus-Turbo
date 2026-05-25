@@ -1037,8 +1037,11 @@ def gemm_fp8_blockwise_triton_kernel(
 ) -> torch.Tensor:
     """Unified block-wise FP8 GEMM Triton kernel.
 
-    Interface consistent with the CK blockwise backend.
-    Dispatches internally by (trans_a, trans_b) to the optimal layout.
+    Interface consistent with the CK blockwise backend. Internally normalises
+    the operands to a `[M, K] @ [K, N]` view and dispatches to one of three
+    layout-specialised autotune wrappers (NT/NN/TN); only the scale-tensor
+    layout, autotune wrapper, and a few constexpr flags differ between
+    layouts.
 
     Supported layouts:
       NT/RCR (forward):  trans_a=False, trans_b=True
@@ -1047,7 +1050,7 @@ def gemm_fp8_blockwise_triton_kernel(
 
       NN/RRR (grad_X):   trans_a=False, trans_b=False
         A: [M, K], A_scales: [M, K//128]
-        B: [N, K], B_scales: [N//128, K//128]  (2D, transposed internally)
+        B: [K, N], B_scales: [N//128, K//128]  (2D, transposed internally)
 
       TN/CRR (grad_W):   trans_a=True, trans_b=False
         A: [K, M], A_scales: [K//128, M]
@@ -1056,9 +1059,9 @@ def gemm_fp8_blockwise_triton_kernel(
     Args:
         a: FP8 input matrix.
         a_scale_inv: Block-wise scale for A, shape depends on layout.
-        trans_a: Whether A is transposed.
         b: FP8 input matrix.
         b_scale_inv: Block-wise scale for B, shape depends on layout.
+        trans_a: Whether A is transposed.
         trans_b: Whether B is transposed.
         out_dtype: Output dtype (default bfloat16).
         trans_c: If True, return transposed output.
@@ -1066,39 +1069,70 @@ def gemm_fp8_blockwise_triton_kernel(
     Returns:
         C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
     """
-    if not trans_a and trans_b:
-        return _blockwise_nt(a, a_scale_inv, b, b_scale_inv, out_dtype, trans_c)
-    elif not trans_a and not trans_b:
-        return _blockwise_nn(a, a_scale_inv, b, b_scale_inv, out_dtype, trans_c)
-    elif trans_a and not trans_b:
-        return _blockwise_tn(a, a_scale_inv, b, b_scale_inv, out_dtype, trans_c)
-    else:
+    if (trans_a, trans_b) not in {(False, True), (False, False), (True, False)}:
         raise ValueError(f"Unsupported layout for blockwise FP8 Triton: trans_a={trans_a}, trans_b={trans_b}")
 
+    # ── Operand views: always [M, K] @ [K, N] inside the kernel.
+    A_view = a.T if trans_a else a
+    B_view = b.T if trans_b else b
+    M, K = A_view.shape
+    _, N = B_view.shape
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Internal layout-specific helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _blockwise_nt(
-    a: torch.Tensor,
-    a_scale_inv: torch.Tensor,
-    b: torch.Tensor,
-    b_scale_inv: torch.Tensor,
-    out_dtype: torch.dtype,
-    trans_c: bool,
-) -> torch.Tensor:
-    """NT/RCR forward: C = A[M,K] @ B[N,K].T, 2D B_scales."""
+    # AMD knobs: gfx950 always sets the gfx950 knobs; on gfx942 NT/NN benefit
+    # from use_async_copy/scalarize_packed_fops while TN/wgrad regresses 5-8%.
+    is_tn = trans_a and not trans_b
     if _is_gfx950():
         _set_knobs_gfx950()
     else:
-        _set_amd_knobs(enable=True)
+        _set_amd_knobs(enable=not is_tn)
 
-    M, K = a.shape
-    N = b.shape[0]
-    num_k = (K + 127) // 128
+    # ── Layout-specialised settings.
+    # The only true per-layout differences are: how A/B scales are laid out
+    # for the kernel, which autotune wrapper owns the search space/cache, and
+    # the three constexpr flags (SCALE_2D_B / EVEN_K / TRANS_C_STORE).
+    #
+    # TN safety notes (Round-6 P2-#7.6):
+    #   * `TRANS_C_STORE=True` lets the BF16 epilogue coalesce into dwordx4
+    #     under the `(N, M)` output buffer; without it the wgrad path emits
+    #     64×buffer_store_short per tile.
+    #   * `EVEN_K=False` keeps the mask-load path for the dual strided-K
+    #     loads, the matched-pair safety net for the Triton 3.7
+    #     `Begin <= End` LLVM-backend assertion (the TN autotune wrapper
+    #     already drops `num_stages=3`).
+    if not trans_a and trans_b:
+        # NT
+        A_scales_arg = a_scale_inv.T.contiguous()  # [K//128, M]
+        B_scales_arg = b_scale_inv  # [N//128, K//128]
+        autotune_kernel = _blockwise_fp8_nt_kernel
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
+    elif not trans_a and not trans_b:
+        # NN — kernel expects [N_output_blocks, K_inner_blocks] for B_scales,
+        # while quantization stores it as [N//128, K//128] over the original
+        # weight; the .T.contiguous() rebuilds the indexing the kernel reads.
+        A_scales_arg = a_scale_inv.T.contiguous()
+        B_scales_arg = b_scale_inv.T.contiguous()
+        autotune_kernel = _blockwise_fp8_nn_kernel
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
+    else:
+        # TN
+        A_scales_arg = a_scale_inv
+        B_scales_arg = b_scale_inv
+        autotune_kernel = _blockwise_fp8_tn_kernel
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = False, False, True
 
+    # Scale strides:
+    #   * SCALE_2D_B=True  (NT/NN): A_scales/B_scales are stored as [outer, inner],
+    #     so stride(0)/stride(1) directly map to (outer, inner) the kernel needs.
+    #   * SCALE_2D_B=False (TN):    B_scales is [K//128, N] but the kernel addresses
+    #     it as `pn * stride_bs_0 + ki * stride_bs_1` (N-step then K-step), hence
+    #     the (1, 0) swap.
+    stride_as_k, stride_as_m = A_scales_arg.stride(0), A_scales_arg.stride(1)
+    if SCALE_2D_B:
+        stride_bs_0, stride_bs_1 = B_scales_arg.stride(0), B_scales_arg.stride(1)
+    else:
+        stride_bs_0, stride_bs_1 = B_scales_arg.stride(1), B_scales_arg.stride(0)
+
+    # ── Output buffer (handle trans_c by swapping strides on a (N, M) buffer).
     if trans_c:
         out = torch.empty((N, M), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(1), out.stride(0)
@@ -1106,179 +1140,34 @@ def _blockwise_nt(
         out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm, stride_cn = out.stride(0), out.stride(1)
 
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
-    B_t = b.T  # view [K, N]
-
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
-
-    _blockwise_fp8_nt_kernel[(NUM_SMS,)](
-        a,
-        B_t,
-        out,
-        A_scales_t,
-        b_scale_inv,
-        M,
-        N,
-        K,
-        a.stride(0),
-        1,  # stride_ak_val unused: A_K_CONTIGUOUS=True
-        1,  # stride_bk_val unused: B_K_CONTIGUOUS=True
-        B_t.stride(1),
-        stride_cm,
-        stride_cn,
-        A_scales_t.stride(0),
-        A_scales_t.stride(1),
-        b_scale_inv.stride(0),
-        b_scale_inv.stride(1),
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=True,
-        SCALE_2D_B=True,
-        EVEN_K=(K % 128) == 0,
-        TRANS_C_STORE=False,
-    )
-    return out
-
-
-def _blockwise_nn(
-    a: torch.Tensor,
-    a_scale_inv: torch.Tensor,
-    b: torch.Tensor,
-    b_scale_inv: torch.Tensor,
-    out_dtype: torch.dtype,
-    trans_c: bool,
-) -> torch.Tensor:
-    """NN/RRR grad_X: C = A[M,K] @ B[K,N], 2D B_scales (transposed internally)."""
-    if _is_gfx950():
-        _set_knobs_gfx950()
-    else:
-        _set_amd_knobs(enable=True)
-
-    M, K = a.shape
-    _, N = b.shape
     num_k = (K + 127) // 128
+    NUM_SMS = ((M + 127) // 128) * ((N + 127) // 128)
 
-    if trans_c:
-        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(1), out.stride(0)
-    else:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(0), out.stride(1)
-
-    A_scales_t = a_scale_inv.T.contiguous()  # [K//128, M]
-    # B_scales from quantization: [dim0_blocks, dim1_blocks] for weight stored as [N_fwd, K_fwd].
-    # Kernel expects [N_output_blocks, K_inner_blocks] indexing → transpose.
-    b_scale_inv_t = b_scale_inv.T.contiguous()
-
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
-
-    _blockwise_fp8_nn_kernel[(NUM_SMS,)](
-        a,
-        b,
-        out,
-        A_scales_t,
-        b_scale_inv_t,
-        M,
-        N,
-        K,
-        a.stride(0),
-        1,  # stride_ak_val unused: A_K_CONTIGUOUS=True
-        b.stride(0),
-        b.stride(1),
-        stride_cm,
-        stride_cn,
-        A_scales_t.stride(0),
-        A_scales_t.stride(1),
-        b_scale_inv_t.stride(0),
-        b_scale_inv_t.stride(1),
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=True,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=True,
-        EVEN_K=(K % 128) == 0,
-        TRANS_C_STORE=False,
-    )
-    return out
-
-
-def _blockwise_tn(
-    a: torch.Tensor,
-    a_scale_inv: torch.Tensor,
-    b: torch.Tensor,
-    b_scale_inv: torch.Tensor,
-    out_dtype: torch.dtype,
-    trans_c: bool,
-) -> torch.Tensor:
-    """TN/CRR grad_W: C = A[K,M].T @ B[K,N], 1D+1D B_scales.
-
-    Scale layouts (from axis=0 / column-wise quantization):
-      a_scale_inv: [K//128, M]
-      b_scale_inv: [K//128, N]
-    """
-    if _is_gfx950():
-        _set_knobs_gfx950()
-    else:
-        _set_amd_knobs(enable=False)
-
-    K, M = a.shape
-    _, N = b.shape
-    num_k = (K + 127) // 128
-
-    if trans_c:
-        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(1), out.stride(0)
-    else:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(0), out.stride(1)
-
-    A_view = a.T  # [M, K] view with strided K
-
-    num_m = (M + 127) // 128
-    num_n = (N + 127) // 128
-    NUM_SMS = num_m * num_n
-
-    # Round-6 (P2-#7.6): wgrad runs under `trans_c=True` (output buffer is
-    # `(N, M)` with `stride_cm=1, stride_cn=N`). The shared kernel emits an
-    # element-wise `buffer_store_short[_d16_hi]` epilogue under that layout
-    # (64 store instructions per tile in dev). The unified kernel routes TN
-    # through the `TRANS_C_STORE=True` epilogue, which transposes `acc` before
-    # storing so BM is the innermost axis and the compiler can pack the BF16
-    # write into dwordx4. EVEN_K is forced to False here so this kernel keeps
-    # the historical mask-load path for the dual strided-K loads (avoids the
-    # Triton 3.7 `Begin <= End` LLVM-backend assertion that fired only on
-    # dual-strided + ns=3; the TN autotune wrapper already drops ns=3, but
-    # leaving EVEN_K=False is the matched-pair safety net).
-    _blockwise_fp8_tn_kernel[(NUM_SMS,)](
+    autotune_kernel[(NUM_SMS,)](
         A_view,
-        b,
+        B_view,
         out,
-        a_scale_inv,
-        b_scale_inv,
+        A_scales_arg,
+        B_scales_arg,
         M,
         N,
         K,
         A_view.stride(0),
         A_view.stride(1),
-        b.stride(0),
-        b.stride(1),
+        B_view.stride(0),
+        B_view.stride(1),
         stride_cm,
         stride_cn,
-        a_scale_inv.stride(0),
-        a_scale_inv.stride(1),  # [K//128, M]: stride_as_k=M, stride_as_m=1
-        b_scale_inv.stride(1),
-        b_scale_inv.stride(0),  # [K//128, N]: stride_bs_0=1(rn), stride_bs_1=N(ki)
+        stride_as_k,
+        stride_as_m,
+        stride_bs_0,
+        stride_bs_1,
         NUM_SMS,
         num_k,
-        A_K_CONTIGUOUS=False,
-        B_K_CONTIGUOUS=False,
-        SCALE_2D_B=False,
-        EVEN_K=False,
-        TRANS_C_STORE=True,
+        A_K_CONTIGUOUS=not trans_a,
+        B_K_CONTIGUOUS=trans_b,
+        SCALE_2D_B=SCALE_2D_B,
+        EVEN_K=EVEN_K,
+        TRANS_C_STORE=TRANS_C_STORE,
     )
     return out
