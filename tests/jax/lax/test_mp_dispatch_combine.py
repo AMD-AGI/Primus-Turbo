@@ -9,7 +9,9 @@ Multi-process (1 GPU per process) MoE dispatch/combine tests using DeepEP
 
 Tests spawn N child processes (one per local GPU), set
 ``PRIMUS_TURBO_JAX_DEEPEP_MODE=per_process``, initialise JAX distributed,
-and exercise dispatch/combine through the IPC-based buffer path.
+call ``primus_turbo.jax.lax.moe.setup`` (strict-freeze contract — required
+before the first ``moe_dispatch`` / ``moe_combine``), and exercise
+dispatch/combine through the IPC-based buffer path.
 
 Mirrors the verification logic of ``tests/jax/lax/test_dispatch_combine.py``
 (the inproc / pmap variant), adapted for multi-process execution.
@@ -49,7 +51,16 @@ def _calc_diff(x, y):
 
 
 def _init_per_process():
-    """Set env, initialise JAX distributed, return ``(jax, jnp, np)``."""
+    """Set env, initialise JAX distributed, return ``(jax, jnp, np)``.
+
+    DeepEP ``setup()`` is deliberately *not* called here so each worker
+    can size buffers from its own per-test hidden_bytes (and call
+    ``reset_runtime`` first if the test needs to override the prior
+    snapshot).  Every worker that calls ``moe_dispatch`` /
+    ``moe_combine`` must invoke ``_setup_deepep_for_worker`` (or its own
+    ``setup``) before the first dispatch — the strict-freeze contract
+    raises ``RuntimeError`` otherwise.
+    """
     import os
 
     os.environ["PRIMUS_TURBO_JAX_DEEPEP_MODE"] = "per_process"
@@ -62,6 +73,31 @@ def _init_per_process():
 
     primus_turbo.jax.initialize()
     return jax, jnp, np
+
+
+def _setup_deepep_for_worker(hidden: int = _HIDDEN) -> None:
+    """Per-worker DeepEP ``setup()`` for PER_PROCESS mode.
+
+    Buffer-sizing convention is ``hidden * max(dtype_itemsize, 2)``
+    (the same formula primus_turbo uses internally to size the C++ NVL
+    / RDMA buffer).  We pick bf16 as the canonical dtype: workers run
+    both bf16 (``itemsize=2``) and fp8 e4m3 (``itemsize=1``) over the
+    same ``hidden`` dim, and ``max(itemsize, 2)`` collapses both to 2,
+    so a bf16-sized buffer covers both dispatches.  The C++ buffer
+    grows-only, so re-running with a larger ``hidden`` is fine; tests
+    needing a smaller ``hidden`` should still pass their own value
+    rather than relying on the leftover from a previous run.
+
+    ``reset_runtime()`` first keeps state clean across re-entries in
+    the same subprocess (each worker is its own process, but the
+    function is also safe to call twice).
+    """
+    import jax.numpy as jnp
+
+    from primus_turbo.jax.lax.moe import reset_runtime, setup
+
+    reset_runtime()
+    setup(hidden_bytes=hidden * max(jnp.dtype(jnp.bfloat16).itemsize, 2))
 
 
 def _generate(rank, world_size):
@@ -193,12 +229,14 @@ def _dispatch_and_check(rank, world_size, use_fp8):
 def _worker_dispatch_combine_fwd_bf16(rank, world_size):
     """BF16 forward: dispatch correctness + topk_idx validity + combine round-trip."""
     _init_per_process()
+    _setup_deepep_for_worker()
     _dispatch_and_check(rank, world_size, use_fp8=False)
 
 
 def _worker_dispatch_combine_fwd_fp8(rank, world_size):
     """FP8 forward: dispatch correctness + topk_idx validity + combine round-trip."""
     _init_per_process()
+    _setup_deepep_for_worker()
     _dispatch_and_check(rank, world_size, use_fp8=True)
 
 
@@ -212,6 +250,7 @@ def _worker_dispatch_combine_bwd_bf16(rank, world_size):
     import jax.numpy as jnp
 
     _init_per_process()
+    _setup_deepep_for_worker()
     from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
 
     x, topk_idx, topk_weights, num_experts = _generate(rank, world_size)
@@ -233,47 +272,22 @@ def _worker_dispatch_combine_bwd_bf16(rank, world_size):
     assert bwd_diff < 5e-6, f"Rank {rank}: backward diff={bwd_diff}"
 
 
-def _worker_eval_shape(rank, world_size):
-    """Verify jax.eval_shape traces dispatch/combine without crashing.
+def _worker_eval_shape_after_setup(rank, world_size):
+    """Verify ``jax.eval_shape`` traces dispatch/combine without crashing.
 
-    Reproduces the TracerArrayConversionError that occurred when
-    jax.eval_shape traced through moe_dispatch -> ensure_deepep_runtime
-    -> process_allgather -> np.asarray(tracer).
+    Reproduces (in regression form) the ``TracerArrayConversionError`` that
+    occurred when ``jax.eval_shape`` traced through
+    ``moe_dispatch -> ensure_deepep_runtime -> process_allgather ->
+    np.asarray(tracer)``.
 
-    The fix requires:
-      1. warmup() before tracing (eagerly bootstraps IPC buffers), and
-      2. Tracer guard inside _moe_dispatch_impl (skips bootstrap during tracing).
+    Under the strict-freeze contract, the trace-path call to
+    ``ensure_deepep_runtime`` is gone entirely: dispatch/combine read
+    only the frozen state from ``setup()``, so there is no path from
+    a Tracer to an allgather inside ``moe_dispatch``.  This test pins
+    that invariant.
     """
     jax_mod, jnp, np = _init_per_process()
-    from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, warmup
-
-    num_experts = _EXPERTS_PER_RANK * world_size
-
-    hidden_bytes = _HIDDEN * jnp.dtype(jnp.bfloat16).itemsize
-    warmup(hidden_bytes)
-
-    def model_fn(x, topk_idx, topk_weights):
-        recv_x, _, _, handle = moe_dispatch(x, topk_idx, topk_weights, num_experts)
-        combined_x = moe_combine(recv_x, handle)
-        return combined_x
-
-    x_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _HIDDEN), jnp.bfloat16)
-    idx_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.int32)
-    weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
-
-    out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
-    assert (
-        out_shape.shape[1] == _HIDDEN
-    ), f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
-
-
-def _worker_eval_shape_no_warmup(rank, world_size):
-    """Verify that eval_shape WITHOUT warmup also does not crash.
-
-    The tracer guard alone should prevent the TracerArrayConversionError.
-    IPC buffers won't be ready, but eval_shape only needs shapes, not data.
-    """
-    jax_mod, jnp, np = _init_per_process()
+    _setup_deepep_for_worker()
     from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
 
     num_experts = _EXPERTS_PER_RANK * world_size
@@ -326,13 +340,8 @@ class TestPerProcessDispatchCombine(JaxMultiProcessTestCase):
         self.run_multiprocess(_worker_dispatch_combine_bwd_bf16)
 
     @pytest.mark.multigpu
-    def test_eval_shape_with_warmup(self):
-        """jax.eval_shape after warmup(): shape inference without TracerArrayConversionError."""
+    def test_eval_shape_after_setup(self):
+        """``jax.eval_shape`` after ``setup()``: shape inference with no
+        Tracer leak into the C++ bootstrap path."""
         self._skip_if_insufficient_gpus()
-        self.run_multiprocess(_worker_eval_shape)
-
-    @pytest.mark.multigpu
-    def test_eval_shape_no_warmup(self):
-        """jax.eval_shape without warmup(): tracer guard alone prevents crash."""
-        self._skip_if_insufficient_gpus()
-        self.run_multiprocess(_worker_eval_shape_no_warmup)
+        self.run_multiprocess(_worker_eval_shape_after_setup)

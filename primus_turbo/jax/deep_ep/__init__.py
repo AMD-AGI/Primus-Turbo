@@ -3,37 +3,25 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+"""Low-level DeepEP runtime constants.
 
-from .runtime import (
-    MODE_INPROC,
-    MODE_PER_PROCESS,
-    LaunchMode,
-    auto_detect_mode,
-    ensure_deepep_runtime,
-    get_ep_group_ranks,
-    get_ep_size,
-    get_launch_mode,
-    get_mode,
-    get_source_meta_bytes,
-    get_target_name,
-    pin_ep_group_from_jax_mesh,
-    reset_runtime,
-    set_ep_group,
-)
+Most users want :mod:`primus_turbo.jax.lax.moe` instead, which provides
+the high-level ``setup`` / ``moe_dispatch`` / ``moe_combine`` API.
+
+This package's ``__init__`` exposes only the small set of constants and
+enums that framework code (e.g. MaxText mode-validation checks, custom
+shardings) needs at import time.  Advanced callers can reach into the
+underlying module with::
+
+    from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
+    deep_ep_runtime.pin_ep_group_from_jax_mesh(mesh)  # etc.
+"""
+
+from .runtime import MODE_INPROC, MODE_PER_PROCESS, NUM_MAX_NVL_PEERS, LaunchMode
 
 __all__ = [
     "LaunchMode",
     "MODE_INPROC",
     "MODE_PER_PROCESS",
-    "auto_detect_mode",
-    "ensure_deepep_runtime",
-    "get_ep_group_ranks",
-    "get_ep_size",
-    "get_launch_mode",
-    "get_mode",
-    "get_source_meta_bytes",
-    "get_target_name",
-    "pin_ep_group_from_jax_mesh",
-    "reset_runtime",
-    "set_ep_group",
+    "NUM_MAX_NVL_PEERS",
 ]

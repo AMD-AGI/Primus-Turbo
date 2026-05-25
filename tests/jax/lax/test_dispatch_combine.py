@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from primus_turbo.jax.core.low_precision import float8_e4m3
-from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
+from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, reset_runtime, setup
 from tests.jax.test_utils import skip_if_lt_x_gpu
 
 key = jax.random.PRNGKey(123)
@@ -97,6 +97,15 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts, use_fp8
       2. recv_topk_idx validity - values in [-1, num_experts_per_rank).
       3. Combine round-trip - combine(dispatch(x)) approx x after normalisation.
     """
+    # Strict-freeze contract: every test owns its own setup().  INPROC
+    # mode ignores hidden_bytes (the in-process buffer pool sizes itself
+    # lazily on first dispatch), so no per-test sizing argument is
+    # needed here — matching the pre-strict-freeze behavior where INPROC
+    # callers never passed it.  reset_runtime() at the top makes the
+    # test safe to run in any order.
+    reset_runtime()
+    setup()
+
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
     @jax.pmap
@@ -190,6 +199,9 @@ def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts
       https://github.com/NVIDIA/Megatron-LM/blob/fe5291fa/tests/unit_tests/
       transformer/moe/test_token_dispatcher.py#L116
     """
+    reset_runtime()
+    setup()
+
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
     @jax.pmap

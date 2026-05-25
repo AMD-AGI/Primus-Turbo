@@ -148,23 +148,25 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     }
 }
 
-Buffer::~Buffer() noexcept(false) {
-    if (not explicitly_destroy_) {
+Buffer::~Buffer() noexcept {
+    // Destructors must not propagate exceptions: pybind11 can collect ``Buffer``
+    // while a Python exception is unwinding the stack, and throwing here would
+    // call ``std::terminate()``. Run cleanup as a fallback so we don't leak
+    // NVL/RDMA resources, and swallow any failure with a WARNING. Callers that
+    // need the failure surfaced must invoke ``Destroy()`` explicitly from
+    // Python; that path still throws normally.
+    if (destroyed_) {
+        return;
+    }
+    try {
         Destroy();
-    } else if (not destroyed_) {
-        // Caller forgot to call Destroy() before the buffer went out of scope.
-        // Run cleanup as a fallback so we don't leak NVL/RDMA resources, and
-        // swallow any exception so the destructor itself stays well-behaved.
-        try {
-            Destroy();
-        } catch (const std::exception &e) {
-            printf("WARNING: Destroy() failed during DeepEP buffer destruction: %s\n", e.what());
-            fflush(stdout);
-        } catch (...) {
-            printf("WARNING: Destroy() failed during DeepEP buffer destruction with an unknown "
-                   "exception.\n");
-            fflush(stdout);
-        }
+    } catch (const std::exception &e) {
+        printf("WARNING: Destroy() failed during DeepEP buffer destruction: %s\n", e.what());
+        fflush(stdout);
+    } catch (...) {
+        printf("WARNING: Destroy() failed during DeepEP buffer destruction with an unknown "
+               "exception.\n");
+        fflush(stdout);
     }
 }
 

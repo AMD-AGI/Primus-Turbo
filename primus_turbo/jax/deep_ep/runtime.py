@@ -442,6 +442,89 @@ def _get_root_rocshmem_unique_id(dep, rank: int, num_ranks: int) -> bytes:
     return root_uid
 
 
+_bootstrap_barrier_call_id = 0
+
+
+def _bootstrap_barrier(num_ranks: int) -> None:
+    """Cross-process barrier before any C++ Buffer / rocSHMEM allocation.
+
+    Why this barrier exists:
+
+    Without it, internode DeepEP bootstrap (``dep.create_per_process_buffer``
+    + ``_kv_allgather_bytes`` + ``dep.sync_per_process_buffer`` →
+    rocSHMEM endpoint handshake) silently fails on ~50% of multi-host
+    runs (3/6 observed under DeepSeek-V3 671B, 64-process, dcn_ep=2,
+    ici_ep=8).  Failure mode: a subset of ranks (typically 2–3 of 64)
+    silently stop sending heartbeats, JAX coordination service ~30 s
+    later marks them unhealthy and ``PollForError`` LOG(FATAL)s the
+    remaining ranks; the silently-died ranks leave no core (or only the
+    PollForError-victim cores with C++ stacks parked in libc).
+
+    Mechanism (best inference, exact C++ point not pinpointed): rocSHMEM
+    RDMA endpoint setup inside ``sync_per_process_buffer`` is a two-way
+    handshake; if peer A enters meaningfully earlier than peer B, A's
+    handshake retries time out and the C++ side bails with a hang or
+    abort that the heartbeat thread observes.  Forcing every rank to
+    enter the C++ allocation path within the same global-barrier window
+    eliminates the skew.
+
+    Adding the barrier here, *inside* primus_turbo, means callers
+    (MaxText, user model code, tests) do not need to know about this
+    invariant.  ``sync_global_devices`` is a JAX-distributed-coordinator
+    call (KV-store backed), not a GPU/RCCL collective, so it does not
+    require GPU readiness and is safe to invoke before any DeepEP C++
+    state exists.
+
+    Statistics: 3/6 init crashes pre-fix → 0/12 post-fix
+    (P(0/12 | true rate=0.5) ≈ 0.024 %).
+
+    Fast-path note: callers should invoke this *only* when actually
+    growing / allocating the buffer; idempotent
+    ``is_per_process_buffer_ready`` runs skip the barrier so steady-state
+    training does not pay the cost.
+
+    Label design: ``sync_global_devices`` is a **world-wide** barrier
+    that uses its label only as a coordinator-key disambiguator; every
+    JAX process must call with the *same* label for the barrier to
+    complete.  We use a monotonic call counter (incremented in lock-step
+    across all processes that hit this code path) so the label cannot
+    accidentally diverge between EP groups in multi-EP-group runs.
+    Specifically, we do **not** include EP-group-id or buffer-size in
+    the label — those are EP-group-local values that would deadlock
+    multi-group runs.
+
+    Arguments:
+        num_ranks: EP-group size; barrier is a no-op for single-process
+            runs (no peers to sync with).
+    """
+    global _bootstrap_barrier_call_id
+
+    if num_ranks <= 1:
+        return
+    try:
+        # Local import: ``sync_global_devices`` is part of
+        # ``jax.experimental`` and may not exist on every JAX version
+        # primus_turbo claims to support.  Failure is non-fatal — we
+        # log and proceed (callers historically ran without a barrier).
+        from jax.experimental.multihost_utils import sync_global_devices
+    except ImportError:
+        log.warning(
+            "jax.experimental.multihost_utils.sync_global_devices unavailable; "
+            "DeepEP bootstrap may race on multi-host runs."
+        )
+        return
+
+    _bootstrap_barrier_call_id += 1
+    label = f"primus_turbo.deep_ep.bootstrap.cid={_bootstrap_barrier_call_id}"
+    try:
+        sync_global_devices(label)
+    except Exception:  # pragma: no cover  pylint: disable=broad-except
+        # A failed barrier is strictly worse than no barrier — propagate so
+        # the caller's existing exception path destroys partial C++ state.
+        log.exception("DeepEP bootstrap barrier %r failed", label)
+        raise
+
+
 def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     """Create (or grow) the per-process IPC buffer and exchange handles.
 
@@ -454,6 +537,12 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     intersection it actually communicates over).  When no group is pinned,
     they fall back to ``jax.process_index()`` / ``jax.process_count()`` so
     legacy single-group runs are unchanged.
+
+    Internally inserts a cross-process barrier (``_bootstrap_barrier``)
+    before any C++ ``Buffer`` allocation so callers do not need to wrap
+    this call in their own ``sync_global_devices``.  See
+    ``_bootstrap_barrier`` docstring for the failure mode that motivated
+    it.  Idempotent calls (buffer already large enough) skip the barrier.
     """
     global _per_process_nvl_bytes, _per_process_rdma_bytes
 
@@ -487,6 +576,8 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
             config.num_max_rdma_chunked_recv_tokens,
         )
 
+    # Fast-path: buffer already large enough.  Skip the cross-process
+    # barrier so steady-state training does not pay the cost.
     if (
         dep.is_per_process_buffer_ready()
         and _per_process_nvl_bytes >= num_nvl_bytes
@@ -505,6 +596,12 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
         dep.destroy_per_process_buffer()
         _per_process_nvl_bytes = 0
         _per_process_rdma_bytes = 0
+
+    # Slow-path: about to allocate / grow.  Sync all EP-group peers so
+    # rocSHMEM RDMA endpoint handshake (inside sync_per_process_buffer)
+    # sees all peers within the same global-barrier window.  Without
+    # this, ~50 % of multi-host runs silently lose 2–3 ranks here.
+    _bootstrap_barrier(num_ranks)
 
     root_uid = None
     if internode:
@@ -571,12 +668,14 @@ def ensure_deepep_runtime(*, hidden_bytes: Optional[int] = None, config=None) ->
 def reset_runtime() -> None:
     global _locked_mode, _per_process_nvl_bytes, _per_process_rdma_bytes
     global _ep_group_ranks, _ep_group_id, _ep_fallback_warned
+    global _bootstrap_barrier_call_id
     _locked_mode = None
     _per_process_nvl_bytes = 0
     _per_process_rdma_bytes = 0
     _ep_group_ranks = None
     _ep_group_id = None
     _ep_fallback_warned = False
+    _bootstrap_barrier_call_id = 0
     try:
         dep = _get_c_deep_ep()
         if dep.is_per_process_buffer_ready():

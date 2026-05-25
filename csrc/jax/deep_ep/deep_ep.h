@@ -25,7 +25,7 @@ public:
     explicit Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes,
                     bool explicitly_destroy);
 
-    ~Buffer() noexcept(false);
+    ~Buffer() noexcept;
 
     void Destroy();
 
