@@ -3,40 +3,39 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""DG-aligned correctness + performance test for the gfx950 mega-MoE kernel,
+"""Numerical-verification test for the gfx950 mega-MoE kernel,
 JIT-loaded from ``tests/pytorch/ops/jit/mega_moe_jit_*``.
 
-This file mirrors the structure of
-``3rdparty/DeepGEMM/tests/test_mega_moe.py`` (argparser, distributed
-spawn, ``create_inputs`` / ``run_fused`` / benchmark + report) while
-keeping the Turbo-specific bits:
+Three gates (all hard pass/fail — process exits non-zero on any fail):
 
-  * The kernel is loaded via ``torch.utils.cpp_extension.load`` from the
-    sibling ``mega_moe_jit_*.cu`` / ``.cpp`` TUs rather than from a
-    pre-compiled wheel.
-  * The symmetric buffer is a plain CUDA tensor (single-rank fast path)
-    or a ``torch.distributed._symmetric_memory`` allocation when run
-    across multiple ranks.
-  * The layout-parity sanity checks from the previous test_mega_moe_jit
-    iteration are preserved and run automatically before any kernel
-    launch, to confirm the C++ <-> Python buffer-offset math stays in
-    lock-step.
+  1. Layout parity (C++ <-> Python buffer offsets agree across 4 shapes)
+     plus a ``num_tokens == 0`` early-exit smoke kernel launch.
 
-Usage (single GPU, smoke-test shape — exercises the actual kernel):
+  2. Non-zero token kernel launch that actually exercises the dispatch
+     path, followed by **byte-exact numerical verification of the L1
+     pool contents** (token bytes + UE8M0 SF + topk weights) against a
+     Python reference built from the inputs.
 
-    python tests/pytorch/ops/jit/test_mega_moe_jit_perf.py \\
-        --num-processes 1 --num-max-tokens-per-rank 64 --hidden 256 \\
-        --intermediate-hidden 128 --num-experts 8 --num-topk 2
+  3. **Kernel y precision standard.**  End-to-end fused-MoE numerics
+     comparison of the kernel's ``y`` output against a Python reference
+     that mirrors the kernel pipeline (FP8 GEMM → SwiGLU → FP8 quantise
+     → FP8 GEMM → BF16 topk-sum).  PASS requires both
+     ``cos_sim >= 0.99`` AND ``rel_rmse <= 0.05`` (production-grade FP8
+     tolerance — see ``_GATE_3_*`` constants).  Gate 3 currently FAILS
+     because the kernel's GEMM body has at least one structural bug
+     beyond the documented L2 SF placeholder (cos_sim ≈ 0); see
+     ``project_megamoe_y_numerics_uncorrelated.md`` for the suspect
+     ranking and bisection plan.
 
-Usage (DG-default shape — runs the full input pipeline + config print
-but the kernel call is skipped because the JIT TU currently only
-instantiates the smoke template):
+Usage:
 
-    python tests/pytorch/ops/jit/test_mega_moe_jit_perf.py
-
-Usage (layout parity only, no kernel launch):
-
+    # gate 1: parity + early-exit smoke (num_tokens=0 path)
     python tests/pytorch/ops/jit/test_mega_moe_jit_perf.py --parity-only
+
+    # gate 2: kernel launch + dispatch numerical verification
+    python tests/pytorch/ops/jit/test_mega_moe_jit_perf.py \\
+        --num-tokens 64 --num-max-tokens-per-rank 384 --hidden 256 \\
+        --intermediate-hidden 128 --num-experts 8 --num-topk 2
 """
 from __future__ import annotations
 
@@ -46,7 +45,6 @@ import os
 import random
 import sys
 from dataclasses import dataclass
-from typing import Optional
 
 # Force the JIT compiler to only target gfx950 — PyTorch's HIP backend
 # otherwise pre-pends every visible arch (incl. gfx942) and that fails
@@ -66,7 +64,7 @@ CSRC_ROOT = os.path.join(REPO_ROOT, "csrc")
 
 
 # ---------------------------------------------------------------------------
-# Shape config (kept for the existing layout-parity tests)
+# Shape config (kept for the layout-parity tests)
 # ---------------------------------------------------------------------------
 
 
@@ -86,9 +84,7 @@ class ShapeCfg:
 
 
 # ---------------------------------------------------------------------------
-# Python reference for the DG-aligned layout helpers.  Naming + formulas
-# mirror ``deep_gemm::layout`` / ``primus_turbo::mega_moe::layout`` so the
-# parity check exercises the same code path the device kernel will see.
+# Python reference for the DG-aligned layout helpers.
 # ---------------------------------------------------------------------------
 
 # Mirrors ``primus_turbo::mega_moe::kCandidateBlockM``.
@@ -98,6 +94,12 @@ _K_MIN_CANDIDATE_BLOCK_M = min(_K_CANDIDATE_BLOCK_M)
 _K_TOKEN_ALIGNMENT = 384  # == LCM(_K_CANDIDATE_BLOCK_M); kLCMCandidateBlockM in DG.
 _K_SCALE_GROUP_K = 32
 _K_SCALE_BLOCK_MN = 128
+
+# Compile-time tile geometry the JIT smoke template instantiates.  Must
+# stay in sync with the MEGA_MOE_JIT_KBLOCK_M / MEGA_MOE_JIT_KSF_BLOCK_M
+# defaults in ``mega_moe_jit_launch.cu``.
+_K_LOADER_BLOCK_M = 128
+_K_LOADER_SF_BLOCK_M = 128
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -226,9 +228,42 @@ def python_symm_buffer_layout(cfg: ShapeCfg) -> _Layout:
 
 
 # ---------------------------------------------------------------------------
-# JIT loader (cached across all ``ShapeCfg`` invocations — the TU is
-# shape-agnostic and parameterizes everything at runtime via the
-# extern "C" entry points).
+# Workspace inner-offset helpers (Python port of layout::Workspace
+# pointer arithmetic).  Used by the dispatch-numerical-verifier to read
+# back ``src_token_topk_idx`` and ``token_src_metadata`` after the
+# kernel finishes.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _WorkspaceInner:
+    src_token_topk_idx_offset: int  # relative to workspace base
+    token_src_metadata_offset: int
+
+
+def python_workspace_inner_layout(
+    num_ranks: int, num_experts: int, num_max_tokens_per_rank: int, num_topk: int
+) -> _WorkspaceInner:
+    num_experts_per_rank = num_experts // num_ranks
+    num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank
+    num_max_pool_tokens = py_get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank
+    )
+    num_max_pool_blocks = num_max_pool_tokens // _K_MIN_CANDIDATE_BLOCK_M
+
+    off = 32  # barrier signal pad
+    off += num_experts * 8 * 2  # send + recv counts (uint64 each)
+    off += num_experts_per_rank * 8  # recv_count_sum
+    off += _align_up(num_max_pool_blocks, 2) * 4  # l1_arrival_count
+    off += num_max_pool_blocks * 8  # l2_arrival_mask
+    src_off = off
+    off += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * 4
+    md_off = off
+    return _WorkspaceInner(src_token_topk_idx_offset=src_off, token_src_metadata_offset=md_off)
+
+
+# ---------------------------------------------------------------------------
+# JIT loader (cached across all ``ShapeCfg`` invocations).
 # ---------------------------------------------------------------------------
 
 
@@ -236,12 +271,6 @@ _JIT_MODULE = None
 _JIT_MODULE_KEY = None
 
 
-# Mapping from Python keyword -> MEGA_MOE_JIT_K<NAME> macro that
-# overrides the matching entry in the ``smoke`` namespace inside
-# ``mega_moe_jit_launch.cu``.  Only these knobs are wired through;
-# secondary tile/thread params keep their .cu-side defaults unless added
-# here.  See the ``#ifndef`` block at the top of the .cu for the
-# full list of overridable symbols.
 _JIT_SHAPE_MACROS = {
     "num_max_tokens_per_rank": "MEGA_MOE_JIT_KNUMMAXTOKENSPERRANK",
     "hidden": "MEGA_MOE_JIT_KHIDDEN",
@@ -253,20 +282,8 @@ _JIT_SHAPE_MACROS = {
 
 
 def load_mega_moe_jit(shape: "dict | None" = None):
-    """JIT-loads the layout-helper TU.  ``shape`` is a dict of
-    ``{key: int}`` whose keys are a subset of ``_JIT_SHAPE_MACROS``;
-    each entry becomes ``-DMEGA_MOE_JIT_K<NAME>=<value>u`` so the
-    ``smoke::`` namespace in ``mega_moe_jit_launch.cu`` is re-bound at
-    compile time.  Shapes not listed fall back to the .cu defaults.
-    A per-shape extension name (hash-suffixed) keeps PyTorch's ninja
-    cache from reusing a stale build when the shape changes.
-    """
+    """JIT-loads the layout-helper TU."""
     global _JIT_MODULE, _JIT_MODULE_KEY
-    # ``shape=None`` means "give me whatever is cached, or build with
-    # .cu defaults if nothing has been loaded yet".  An explicit shape
-    # must match the cached one — passing a second, different shape in
-    # the same process is a programming error (PyTorch's ext cache is
-    # per-process keyed on extension name, not on define values).
     if shape is None:
         if _JIT_MODULE is not None:
             return _JIT_MODULE
@@ -295,9 +312,6 @@ def load_mega_moe_jit(shape: "dict | None" = None):
     shape_defines = [f"-D{_JIT_SHAPE_MACROS[k]}={v}u" for k, v in sorted(norm_shape.items())]
 
     if shape_defines:
-        # Hash the override set into the extension name so each shape
-        # gets its own ninja build directory; otherwise PyTorch reuses
-        # the cached .so and silently ignores the new -D flags.
         ext_suffix = hashlib.sha1(
             ";".join(f"{k}={v}" for k, v in sorted(norm_shape.items())).encode()
         ).hexdigest()[:12]
@@ -326,7 +340,7 @@ def load_mega_moe_jit(shape: "dict | None" = None):
 
 
 # ---------------------------------------------------------------------------
-# Layout parity checks (preserved from the previous test iteration)
+# Layout parity checks
 # ---------------------------------------------------------------------------
 
 
@@ -341,9 +355,9 @@ def _check_pool_token_helpers(cfg: ShapeCfg, jit) -> None:
     for bm in _K_CANDIDATE_BLOCK_M:
         py_sf = py_get_num_padded_sf_pool_tokens(py_pool, bm)
         cpp_sf = jit.num_padded_sf_pool_tokens(py_pool, bm)
-        assert py_sf == cpp_sf, (
-            f"get_num_padded_sf_pool_tokens mismatch for {cfg}, block_m={bm}: " f"py={py_sf}, cpp={cpp_sf}"
-        )
+        assert (
+            py_sf == cpp_sf
+        ), f"get_num_padded_sf_pool_tokens mismatch for {cfg}, block_m={bm}: py={py_sf}, cpp={cpp_sf}"
 
 
 def _check_workspace_bytes(cfg: ShapeCfg, jit) -> None:
@@ -429,7 +443,7 @@ def run_parity_checks() -> int:
 
 
 # ---------------------------------------------------------------------------
-# DG-aligned helpers (ported from ``DeepGEMM/deep_gemm/utils/math.py``)
+# DG-aligned FP8 cast (kept for input quantization)
 # ---------------------------------------------------------------------------
 
 
@@ -465,134 +479,29 @@ def per_token_cast_to_fp8(x, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m
     return x_fp8, _pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
 
 
-def _quantize_to_fp4_e2m1(x):
-    import torch
-
-    ax = x.abs().clamp_max(6.0)
-    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device, dtype=ax.dtype)
-    idx = torch.bucketize(ax, boundaries)
-    code = idx.to(torch.uint8)
-    sign = (x < 0) & (idx != 0)
-    code = code | (sign.to(torch.uint8) << 3)
-    return code.view(torch.int8)
-
-
-def per_token_cast_to_fp4(x, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m0: bool = False):
-    """Port of DG's ``per_token_cast_to_fp4``."""
-    import torch
-
-    m, n = x.shape
-    assert n % 2 == 0
-    assert not use_packed_ue8m0 or use_ue8m0
-    padded_n = _align_up(n, gran_k)
-    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
-    x_padded[:, :n] = x
-    x_view = x_padded.view(m, -1, gran_k)
-    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
-    sf = x_amax / 6.0
-    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = x_view * (1.0 / sf.unsqueeze(2))
-    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
-    codes2 = codes.view(m, padded_n // 2, 2)
-    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
-    return packed[:, : n // 2].contiguous(), _pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
-
-
-def cast_grouped_weights_to_fp4(bf16_weights, gran_k: int = 32, use_ue8m0: bool = True):
-    """Per-expert FP4 cast for ``(num_groups, n, k)`` weight tensors."""
-    import torch
-
-    num_groups, n, k = bf16_weights.shape
-    assert k % gran_k == 0
-    w = torch.empty((num_groups, n, k // 2), device=bf16_weights.device, dtype=torch.int8)
-    w_sf = torch.empty((num_groups, n, k // gran_k), device=bf16_weights.device, dtype=torch.float)
-    for i in range(num_groups):
-        w_i, w_sf_i = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=use_ue8m0, gran_k=gran_k)
-        w[i] = w_i
-        w_sf[i] = w_sf_i.view(torch.float) if w_sf_i.dtype != torch.float else w_sf_i
-    return w, w_sf
-
-
 # ---------------------------------------------------------------------------
-# Distributed helpers (with a single-rank fallback so the test runs
-# end-to-end on a single MI355X without an NCCL group).
+# Single-rank init helper (the kernel template static_asserts kNumRanks==1)
 # ---------------------------------------------------------------------------
 
 
-_LOCAL_RANK: Optional[int] = None
-
-
-def init_dist(local_rank: int, num_local_ranks: int):
-    """Mirrors ``deep_gemm.utils.dist.init_dist`` with a no-op fallback
-    for ``num_local_ranks == 1`` (single-GPU smoke tests)."""
+def init_single_rank(local_rank: int = 0):
     import torch
 
-    global _LOCAL_RANK
-    _LOCAL_RANK = local_rank
-
-    if num_local_ranks <= 1:
-        torch.set_default_device("cuda")
-        torch.cuda.set_device(local_rank)
-        return 0, 1, None
-
-    import inspect
-
-    import torch.distributed as dist
-
-    ip = os.getenv("MASTER_ADDR", "127.0.0.1")
-    port = int(os.getenv("MASTER_PORT", "8361"))
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
-    node_rank = int(os.getenv("RANK", 0))
-
-    sig = inspect.signature(dist.init_process_group)
-    params = {
-        "backend": "nccl",
-        "init_method": f"tcp://{ip}:{port}",
-        "world_size": num_nodes * num_local_ranks,
-        "rank": node_rank * num_local_ranks + local_rank,
-    }
-    if "device_id" in sig.parameters:
-        params["device_id"] = torch.device(f"cuda:{local_rank}")
-    dist.init_process_group(**params)
     torch.set_default_device("cuda")
     torch.cuda.set_device(local_rank)
-    group = dist.new_group(list(range(num_local_ranks * num_nodes)))
-    return dist.get_rank(), dist.get_world_size(), group
-
-
-def dist_print(s: str = "", once_in_node: bool = False) -> None:
-    """Mirrors ``deep_gemm.utils.dist.dist_print``."""
-    if _LOCAL_RANK is None or not once_in_node or _LOCAL_RANK == 0:
-        print(s, flush=True)
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            dist.barrier()
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
-# Symmetric buffer (Turbo-side, mirrors DG's ``SymmBuffer``)
+# Symmetric buffer (single-rank only, since the JIT template only
+# instantiates kNumRanks==1 today).
 # ---------------------------------------------------------------------------
 
 
 class MegaMoEBuffer:
-    """Wraps a CUDA buffer matching the DG-aligned mega-MoE symmetric layout.
-
-    Single-rank (``num_ranks == 1``) uses a plain ``torch.empty`` allocation
-    and exposes that pointer as the sole entry in ``sym_buffer_ptrs``.
-
-    Multi-rank uses ``primus_turbo.pytorch.core.symm_mem.SymmetricMemory`` to
-    rendezvous a hipMalloc-backed buffer across all peers, exposing each
-    peer's mapped base pointer in ``sym_buffer_ptrs`` (length == num_ranks).
-    Local tensor views are zero-copy slices of *this* rank's buffer.
-    """
+    """Single-rank symmetric buffer that mirrors the DG-aligned layout."""
 
     def __init__(
         self,
-        group,
         num_experts: int,
         num_max_tokens_per_rank: int,
         num_topk: int,
@@ -603,7 +512,7 @@ class MegaMoEBuffer:
     ):
         import torch
 
-        self.group = group
+        assert num_ranks == 1, "numerical verifier only supports kNumRanks==1"
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = _align_up(num_max_tokens_per_rank, _K_TOKEN_ALIGNMENT)
         self.num_topk = num_topk
@@ -611,6 +520,7 @@ class MegaMoEBuffer:
         self.intermediate_hidden = intermediate_hidden
         self.num_ranks = num_ranks
         self.rank_idx = rank_idx
+        self.num_experts_per_rank = num_experts // num_ranks
 
         jit = load_mega_moe_jit()
         offsets, total_bytes, num_max_pool_tokens, num_padded_sf_pool_tokens = jit.compute_layout(
@@ -621,26 +531,11 @@ class MegaMoEBuffer:
         self.num_max_pool_tokens = int(num_max_pool_tokens)
         self.num_padded_sf_pool_tokens = int(num_padded_sf_pool_tokens)
 
-        self.symm = None
-        if num_ranks <= 1:
-            self.buffer = torch.empty(self.total_bytes, dtype=torch.int8, device="cuda")
-            self.buffer.zero_()
-            torch.cuda.synchronize()
-            self.sym_buffer_ptrs = [int(self.buffer.data_ptr())]
-        else:
-            from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+        self.buffer = torch.empty(self.total_bytes, dtype=torch.int8, device="cuda")
+        self.buffer.zero_()
+        torch.cuda.synchronize()
+        self.sym_buffer_ptrs = [int(self.buffer.data_ptr())]
 
-            print(f"[r{rank_idx}] BEFORE SymmetricMemory(total_bytes={self.total_bytes})", flush=True)
-            self.symm = SymmetricMemory(group, self.total_bytes)
-            print(f"[r{rank_idx}] AFTER SymmetricMemory ctor", flush=True)
-            # SymmetricMemory zeros via hipMemset and barriers across the group;
-            # local rank's view is buffer_ptrs[rank_idx].
-            self.buffer = self.symm.get_buffer(
-                self.rank_idx, (self.total_bytes,), torch.int8, storage_offset=0
-            )
-            self.sym_buffer_ptrs = list(self.symm.buffer_ptrs)
-
-        # Carve named tensor views into the symmetric buffer.
         (
             workspace_off,
             input_x_off,
@@ -657,14 +552,62 @@ class MegaMoEBuffer:
 
         M = self.num_max_tokens_per_rank
         fp8_sf_n = hidden // _K_SCALE_GROUP_K
-        # `x`: FP8 dispatched tokens, (M, hidden)
+        # Input views (host writes these before kernel launch).
         self.x = self._slice_view(input_x_off, (M, hidden), torch.float8_e4m3fn)
-        # `x_sf`: packed UE8M0 SF, stored as int32 with hidden/gran_k/4 lanes.
         self.x_sf = self._slice_view(input_x_sf_off, (M, fp8_sf_n // 4), torch.int32)
-        # `topk_idx`: int64
         self.topk_idx = self._slice_view(input_topk_idx_off, (M, num_topk), torch.int64)
-        # `topk_weights`: float32
         self.topk_weights = self._slice_view(input_topk_weights_off, (M, num_topk), torch.float32)
+
+        # L1 pool views (kernel writes these; host reads after sync).
+        self.l1_pool_x = self._slice_view(l1_pool_x_off, (self.num_max_pool_tokens, hidden), torch.uint8)
+        # SF is transposed: kernel writes uint32 stride such that
+        # l1_pool_sf_u32[j, sf_pool_token_idx] = input_x_sf_u32[src, j],
+        # with j in [0, hidden/128).
+        self.num_sf_uint32_per_token = hidden // 128
+        self.l1_pool_sf_u32 = self._slice_view(
+            l1_pool_x_sf_off,
+            (self.num_sf_uint32_per_token, self.num_padded_sf_pool_tokens),
+            torch.int32,
+        )
+        self.l1_pool_weights = self._slice_view(
+            l1_pool_weights_off, (self.num_max_pool_tokens,), torch.float32
+        )
+
+        # L2 pool SF view + host-side pre-fill (TODO §B.2 workaround).
+        #
+        # The kernel's Linear1 writeback in
+        # ``gfx950_fp8_fp4_mega_moe.cuh`` writes the per-element FP8 byte
+        # to the L2 pool but does NOT write the paired UE8M0 scale into
+        # ``l2_sf_buffer`` (see the "Real UE8M0 per-block scale (vs the
+        # fixed 1.0 placeholder)" comment in the loader-role writeback).
+        # Without this write the L2 SFA dword read by Linear2 stays at
+        # 0x00000000 (post-zero-init), which the MFMA expands as
+        # ``0x7f7f7f00`` (low byte == 0) → 2^(-127) ≈ subnormal flush on
+        # half the K lanes and 1.0 on the other half, halving Linear2.
+        # Pre-filling the L2 SF region with 0x7F bytes makes every read
+        # return UE8M0 1.0 regardless of what (if anything) the kernel
+        # writes there, matching the Python reference's SF=1.0
+        # assumption.
+        self.num_sf_uint32_per_l2_pool_token = max(intermediate_hidden // 128, 1)
+        l2_sf_nbytes = self.num_sf_uint32_per_l2_pool_token * self.num_padded_sf_pool_tokens * 4
+        self.l2_pool_sf = self.buffer.narrow(0, l2_pool_x_sf_off, l2_sf_nbytes).view(torch.uint8)
+        self.l2_pool_sf.fill_(0x7F)
+        torch.cuda.synchronize()
+
+        # Workspace inner views.
+        inner = python_workspace_inner_layout(num_ranks, num_experts, self.num_max_tokens_per_rank, num_topk)
+        num_max_recv = num_ranks * self.num_max_tokens_per_rank
+        self.src_token_topk_idx = self._slice_view(
+            workspace_off + inner.src_token_topk_idx_offset,
+            (self.num_experts_per_rank, num_ranks, num_max_recv),
+            torch.int32,
+        )
+        # token_src_metadata: 3 × uint32 per pool token (rank, token, topk).
+        self.token_src_metadata = self._slice_view(
+            workspace_off + inner.token_src_metadata_offset,
+            (self.num_max_pool_tokens, 3),
+            torch.int32,
+        )
 
     def _slice_view(self, offset: int, shape, dtype):
         import torch
@@ -674,62 +617,373 @@ class MegaMoEBuffer:
         for d in shape:
             nelem *= d
         nbytes = nelem * elem_size
-        if self.symm is None:
-            byte_view = self.buffer.narrow(0, offset, nbytes)
-            return byte_view.view(dtype).view(*shape)
-        # SymmetricMemory: storage_offset is in *elements* of `dtype`.
-        assert (
-            offset % elem_size == 0
-        ), f"layout offset {offset} not aligned to dtype {dtype} elem_size {elem_size}"
-        return self.symm.get_buffer(self.rank_idx, shape, dtype, storage_offset=offset // elem_size)
+        byte_view = self.buffer.narrow(0, offset, nbytes)
+        return byte_view.view(dtype).view(*shape)
 
     def destroy(self):
         self.buffer = None
-        self.group = None
         self.x = None
         self.x_sf = None
         self.topk_idx = None
         self.topk_weights = None
+        self.l1_pool_x = None
+        self.l1_pool_sf_u32 = None
+        self.l1_pool_weights = None
+        self.l2_pool_sf = None
+        self.src_token_topk_idx = None
+        self.token_src_metadata = None
         self.sym_buffer_ptrs = None
-        if self.symm is not None:
-            self.symm.destroy()
-            self.symm = None
 
 
 # ---------------------------------------------------------------------------
-# DG-aligned test entry
+# Dispatch reference + verifier
 # ---------------------------------------------------------------------------
 
 
-def _safe_div(a: float, b: float) -> float:
-    return float("nan") if b == 0 else a / b
-
-
-def _estimate_ep_recv_tokens(
-    num_tokens: int, num_topk: int, num_experts: int, num_ranks: int, masked_ratio: float = 0.0
+def _transform_sf_token_idx(
+    t: int, block_m: int = _K_LOADER_BLOCK_M, sf_block_m: int = _K_LOADER_SF_BLOCK_M
 ) -> int:
-    """Analytically estimate ``num_recv_tokens`` for a given EP config.
-
-    In EP-N, the total tokens across the cluster = ``num_tokens * num_ranks``.
-    Each token is routed to ``num_topk`` experts out of ``num_experts``.
-    Each rank owns ``num_experts // num_ranks`` experts.  On average each
-    rank receives ``total_tokens * num_topk * (experts_per_rank / num_experts)``
-    = ``num_tokens * num_topk`` (token, expert) pairs — independent of
-    ``num_ranks``.
-    """
-    effective_topk = num_topk * (1.0 - masked_ratio)
-    return int(num_tokens * effective_topk)
+    """Python port of the lambda in ``gfx950_fp8_fp4_mega_moe.cuh``."""
+    idx = t % block_m
+    return (t // block_m) * sf_block_m + (idx & ~127) + (idx & 31) * 4 + ((idx >> 5) & 3)
 
 
-def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
-    """DG-aligned per-rank entry, mirrors the structure of
-    ``DeepGEMM/tests/test_mega_moe.py::test``.
+def verify_dispatch(
+    buffer: MegaMoEBuffer,
+    x_fp8,
+    x_sf_u32,
+    topk_idx,
+    topk_weights,
+    num_tokens: int,
+    num_topk: int,
+    num_experts: int,
+    num_experts_per_rank: int,
+    num_ranks: int,
+    rank_idx: int,
+    block_m: int = _K_LOADER_BLOCK_M,
+) -> None:
+    """Byte-exact verification of the dispatch path's L1 pool writes.
+
+    For each local expert ``e``, the kernel:
+      * Populated ``src_token_topk_idx[e, rank, :count_e]`` with the
+        flat ``(token, topk)`` indices that routed to ``e`` from ``rank``.
+        Slot order is non-deterministic (Pass 3 uses ``atomic_add_block``),
+        so we compare as a *set*.
+      * Filled pool slots ``[pool_block_offset[e]*BLOCK_M,
+        pool_block_offset[e]*BLOCK_M + count_e)`` with copies of the
+        source tokens' FP8 bytes, packed UE8M0 SF (transposed), and
+        topk weights.  We use ``token_src_metadata`` (also written by
+        Pass 4) to recover the per-slot ``(src_token, src_topk)`` and
+        check each piece byte-for-byte.
     """
     import torch
 
-    rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    torch.manual_seed(rank_idx)
-    random.seed(rank_idx)
+    # Local copies on CPU for set/dict operations.
+    topk_idx_cpu = topk_idx.cpu().numpy()  # (num_tokens, num_topk)
+    topk_weights_cpu = topk_weights.cpu().numpy()  # (num_tokens, num_topk)
+    x_fp8_bytes_cpu = x_fp8.view(torch.uint8).cpu().numpy()  # (num_tokens, hidden)
+    x_sf_u32_cpu = x_sf_u32.cpu().numpy()  # (num_tokens, num_sf_uint32)
+
+    # ---- Per-expert: expected set of (token, topk) and count.
+    expected_per_expert: "list[list[tuple[int, int]]]" = [[] for _ in range(num_experts_per_rank)]
+    rank_offset = rank_idx * num_experts_per_rank
+    for t in range(num_tokens):
+        for k in range(num_topk):
+            e = int(topk_idx_cpu[t, k])
+            if e < 0:
+                continue
+            if rank_offset <= e < rank_offset + num_experts_per_rank:
+                expected_per_expert[e - rank_offset].append((t, k))
+
+    # ---- Pool block offsets per expert (loader's running prefix sum).
+    pool_block_offsets = [0]
+    for e in range(num_experts_per_rank):
+        cnt = len(expected_per_expert[e])
+        pool_block_offsets.append(pool_block_offsets[-1] + (cnt + block_m - 1) // block_m)
+
+    # ---- 1) src_token_topk_idx set check.
+    src_idx_cpu = buffer.src_token_topk_idx.cpu().numpy()  # (E, R, num_max_recv)
+    for e in range(num_experts_per_rank):
+        expected_flat = {t * num_topk + k for (t, k) in expected_per_expert[e]}
+        actual_flat = set()
+        for r in range(num_ranks):
+            cnt_r = (
+                sum(1 for (t, k) in expected_per_expert[e])  # single-rank: all from rank 0
+                if r == rank_idx
+                else 0
+            )
+            # For kNumRanks==1, all routed tokens land in src_idx_cpu[e, 0, :count].
+            # For multi-rank we'd compare per (e, r); kNumRanks==1 here.
+            for s in range(cnt_r):
+                actual_flat.add(int(src_idx_cpu[e, r, s]))
+        assert expected_flat == actual_flat, (
+            f"src_token_topk_idx mismatch for expert {e}:\n"
+            f"  expected={sorted(expected_flat)}\n  actual  ={sorted(actual_flat)}"
+        )
+
+    # ---- 2) Per-slot byte-exact check via token_src_metadata.
+    md_cpu = buffer.token_src_metadata.cpu().numpy()  # (num_max_pool_tokens, 3)
+    l1_pool_x_cpu = buffer.l1_pool_x.cpu().numpy()  # (num_max_pool_tokens, hidden)
+    l1_pool_sf_u32_cpu = buffer.l1_pool_sf_u32.cpu().numpy()  # (num_sf_u32, num_padded_sf_pool_tokens)
+    l1_pool_w_cpu = buffer.l1_pool_weights.cpu().numpy()  # (num_max_pool_tokens,)
+
+    for e in range(num_experts_per_rank):
+        base_pool = pool_block_offsets[e] * block_m
+        cnt = len(expected_per_expert[e])
+        if cnt == 0:
+            continue
+        for s in range(cnt):
+            pool_idx = base_pool + s
+            md_rank = int(md_cpu[pool_idx, 0])
+            md_token = int(md_cpu[pool_idx, 1])
+            md_topk = int(md_cpu[pool_idx, 2])
+
+            # Validate the metadata is consistent.
+            assert md_rank == rank_idx, (
+                f"expert {e} slot {s} (pool_idx={pool_idx}): "
+                f"metadata rank={md_rank} != rank_idx={rank_idx}"
+            )
+            assert 0 <= md_token < num_tokens, (
+                f"expert {e} slot {s} (pool_idx={pool_idx}): "
+                f"metadata token={md_token} out of range [0,{num_tokens})"
+            )
+            assert 0 <= md_topk < num_topk, (
+                f"expert {e} slot {s} (pool_idx={pool_idx}): "
+                f"metadata topk={md_topk} out of range [0,{num_topk})"
+            )
+            routed_expert = int(topk_idx_cpu[md_token, md_topk])
+            assert routed_expert == e + rank_offset, (
+                f"expert {e} slot {s} (pool_idx={pool_idx}): metadata "
+                f"({md_token},{md_topk}) routes to expert {routed_expert}, expected {e + rank_offset}"
+            )
+
+            # L1 pool x bytes == input x bytes for src_token.
+            expected_bytes = x_fp8_bytes_cpu[md_token]
+            actual_bytes = l1_pool_x_cpu[pool_idx]
+            if not (actual_bytes == expected_bytes).all():
+                ne_idx = (actual_bytes != expected_bytes).nonzero()[0][:10]
+                raise AssertionError(
+                    f"L1 pool x byte mismatch for expert {e} slot {s} (pool_idx={pool_idx}, "
+                    f"src_token={md_token}): first diff indices={ne_idx.tolist()}, "
+                    f"expected={expected_bytes[ne_idx].tolist()}, actual={actual_bytes[ne_idx].tolist()}"
+                )
+
+            # L1 pool SF (transposed, one uint32 per 128 hidden elems).
+            sf_pool_idx = pool_block_offsets[e] * _K_LOADER_SF_BLOCK_M + _transform_sf_token_idx(s)
+            for j in range(buffer.num_sf_uint32_per_token):
+                exp_sf = int(x_sf_u32_cpu[md_token, j])
+                act_sf = int(l1_pool_sf_u32_cpu[j, sf_pool_idx])
+                assert exp_sf == act_sf, (
+                    f"L1 pool SF mismatch for expert {e} slot {s} (pool_idx={pool_idx}, "
+                    f"sf_pool_idx={sf_pool_idx}, j={j}, src_token={md_token}): "
+                    f"expected=0x{exp_sf & 0xffffffff:08x}, actual=0x{act_sf & 0xffffffff:08x}"
+                )
+
+            # L1 pool topk weight.
+            exp_w = float(topk_weights_cpu[md_token, md_topk])
+            act_w = float(l1_pool_w_cpu[pool_idx])
+            assert exp_w == act_w, (
+                f"L1 pool weight mismatch for expert {e} slot {s} (pool_idx={pool_idx}, "
+                f"src=({md_token},{md_topk})): expected={exp_w}, actual={act_w}"
+            )
+
+    total_routed = sum(len(g) for g in expected_per_expert)
+    print(
+        f"[mega_moe-jit] dispatch verification: PASS "
+        f"(experts={num_experts_per_rank}, routed_pairs={total_routed})",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end fused-MoE reference + verifier (TODO §B.2 numerics gate)
+# ---------------------------------------------------------------------------
+
+
+def _unpack_ue8m0_from_int32(packed_u32, gran_k: int = _K_SCALE_GROUP_K):
+    """Unpack the int32-packed UE8M0 scales back to per-(M, K/gran_k) FP32 multipliers.
+
+    ``per_token_cast_to_fp8(..., use_packed_ue8m0=True)`` packs 4 consecutive
+    UE8M0 bytes per int32 (one byte = ``2 ** (sf - 127)``).  Returns a float32
+    tensor of shape ``(M, K/gran_k)``.
+    """
+    import torch
+
+    assert packed_u32.dtype == torch.int32
+    m, k_div4 = packed_u32.shape
+    bytes_u8 = packed_u32.view(torch.uint8).reshape(m, k_div4 * 4)
+    exponent = bytes_u8.to(torch.int32) - 127
+    return torch.pow(torch.tensor(2.0, device=packed_u32.device), exponent.float())
+
+
+def _dequant_fp8_with_ue8m0(fp8_u8, sf_factors, gran_k: int = _K_SCALE_GROUP_K):
+    """``fp8_u8`` viewed as e4m3fn × per-(K_group) UE8M0 factor → fp32.
+
+    ``fp8_u8``     shape: ``(M, K)`` uint8 (bytes are valid e4m3fn encodings).
+    ``sf_factors`` shape: ``(M, K/gran_k)`` float32 multipliers.
+    """
+    import torch
+
+    fp8_view = fp8_u8.view(torch.float8_e4m3fn)
+    fp32 = fp8_view.float()
+    m, k = fp32.shape
+    sf_broadcast = sf_factors.unsqueeze(-1).expand(m, k // gran_k, gran_k).reshape(m, k)
+    return fp32 * sf_broadcast
+
+
+def reference_y(
+    *,
+    x_fp8,
+    x_sf_packed_u32,
+    topk_idx,
+    topk_weights,
+    l1_w_fp8,
+    l2_w_fp8,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    num_experts_per_rank: int,
+    rank_idx: int,
+    gran_k: int = _K_SCALE_GROUP_K,
+):
+    """End-to-end fused-MoE reference matching the gfx950 kernel's pipeline.
+
+    Per ``(token, k in [0, num_topk))`` the kernel:
+      1. Dequantises x with the per-token UE8M0 SF.
+      2. Runs Linear1 ``h1 = x @ W1[expert].T``   (W1 SF is fixed 1.0).
+      3. SwiGLU: ``h = silu(h1[:I]) * h1[I:2I]``.
+      4. Quantises ``h`` to FP8 e4m3 with implicit SF=1.0 (Linear2 SFA).
+      5. Runs Linear2 ``y_partial = h_fp8.float() @ W2[expert].T`` (W2 SF=1.0).
+      6. Casts ``y_partial`` to BF16, pushes into the combine slot.
+      7. Epilogue sums BF16 partials across topk experts (no topk_weight
+         multiplication — the kernel mirrors DG and applies the weight
+         outside).
+
+    Returns ``y`` of shape ``(num_tokens, hidden)`` in BF16 to match the
+    kernel's output tensor dtype.
+    """
+    import torch
+
+    x_sf_factors = _unpack_ue8m0_from_int32(x_sf_packed_u32, gran_k=gran_k)[:num_tokens, : hidden // gran_k]
+    x_deq = _dequant_fp8_with_ue8m0(
+        x_fp8.view(torch.uint8)[:num_tokens, :hidden], x_sf_factors, gran_k=gran_k
+    )  # (num_tokens, hidden)
+
+    # Weight SFs are fixed 1.0 so we just float-cast the e4m3 bytes.
+    l1_w_f32 = l1_w_fp8.view(torch.float8_e4m3fn).float()  # (E, 2I, H)
+    l2_w_f32 = l2_w_fp8.view(torch.float8_e4m3fn).float()  # (E, H, I)
+
+    topk_idx_cpu = topk_idx.cpu()
+    rank_offset = rank_idx * num_experts_per_rank
+    y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device=x_fp8.device)
+
+    for t in range(num_tokens):
+        x_row = x_deq[t]  # (H,)
+        for k in range(num_topk):
+            e_global = int(topk_idx_cpu[t, k])
+            if e_global < 0:
+                continue
+            if not (rank_offset <= e_global < rank_offset + num_experts_per_rank):
+                continue
+            e_local = e_global - rank_offset
+            W1 = l1_w_f32[e_local]  # (2I, H)
+            h1 = torch.matmul(W1, x_row)  # (2I,)
+            gate = h1[:intermediate_hidden]
+            up = h1[intermediate_hidden:]
+            silu_gate = gate / (1.0 + torch.exp(-gate))
+            h = silu_gate * up  # (I,)
+
+            # Kernel quantises ``h`` to e4m3 (single-byte, scale-1.0) for
+            # the L2 input; mirror that rounding here.
+            h_fp8 = h.to(torch.float8_e4m3fn).float()
+
+            W2 = l2_w_f32[e_local]  # (H, I)
+            y_partial = torch.matmul(W2, h_fp8)  # (H,)
+
+            # Cast each topk partial to BF16 before summing (mirrors the
+            # combine buffer's BF16 storage); then accumulate in FP32 like
+            # the epilogue's ``reduced[l].x += fp32.x``.
+            y[t] += y_partial.bfloat16().float()
+
+    return y.bfloat16()
+
+
+# Gate 3 thresholds — FP8 GEMM numerics standard (see CLAUDE.md gate 3).
+# Production-grade FP8 fused-MoE precision: tight enough to catch structural
+# bugs in the loader / SwiGLU / writeback / combine paths, loose enough to
+# tolerate FP8 quantisation + BF16 round-off noise in the topk reduction.
+_GATE_3_COS_SIM_MIN = 0.99
+_GATE_3_REL_RMSE_MAX = 0.05
+
+
+def verify_y(
+    y_kernel,
+    y_ref,
+    *,
+    cos_sim_min: float = _GATE_3_COS_SIM_MIN,
+    rel_rmse_max: float = _GATE_3_REL_RMSE_MAX,
+    name: str = "y",
+) -> bool:
+    """Gate 3 — kernel-vs-reference numerics check (hard pass/fail).
+
+    Returns ``True`` if both ``cos_sim >= cos_sim_min`` and
+    ``rel_rmse <= rel_rmse_max``; otherwise prints a FAIL line and returns
+    ``False`` (the caller is expected to ``raise SystemExit(1)`` so the
+    process exit code propagates the gate failure to CI / shells).
+
+    Always reports max|diff|, RMSE, rel_RMSE, and cosine similarity so
+    that future bisection work can watch each statistic move
+    independently as kernel fixes land.
+    """
+    import torch
+
+    y_k = y_kernel.detach().float().contiguous()
+    y_r = y_ref.detach().float().contiguous()
+    diff = (y_k - y_r).abs()
+    max_abs = diff.max().item()
+    rmse = diff.pow(2).mean().sqrt().item()
+    denom = max(y_r.abs().mean().item(), 1e-8)
+    rel_rmse = rmse / denom
+    cos = torch.nn.functional.cosine_similarity(y_k.reshape(1, -1), y_r.reshape(1, -1)).item()
+    print(
+        f"[mega_moe-jit] {name} numerics report: "
+        f"max|diff|={max_abs:.4f}  rmse={rmse:.4f}  rel_rmse={rel_rmse:.4f}  "
+        f"cos_sim={cos:.4f}  (ref|y|_mean={denom:.4f})",
+        flush=True,
+    )
+    passed = (cos >= cos_sim_min) and (rel_rmse <= rel_rmse_max)
+    if passed:
+        print(
+            f"[mega_moe-jit] gate 3 ({name}) PASS "
+            f"(cos_sim>={cos_sim_min:.4f} & rel_rmse<={rel_rmse_max:.4f})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[mega_moe-jit] gate 3 ({name}) FAIL "
+            f"(need cos_sim>={cos_sim_min:.4f} & rel_rmse<={rel_rmse_max:.4f}; "
+            f"got cos_sim={cos:.4f}, rel_rmse={rel_rmse:.4f}). "
+            f"See TODO §B.2 + memory project_megamoe_y_numerics_uncorrelated.md "
+            f"for the open structural GEMM-body bug.",
+            flush=True,
+        )
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# Test entry
+# ---------------------------------------------------------------------------
+
+
+def test(args: argparse.Namespace) -> None:
+    import torch
+
+    init_single_rank(0)
+    rank_idx = 0
+    num_ranks = 1
+    torch.manual_seed(0)
+    random.seed(0)
 
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     if args.num_tokens is not None:
@@ -741,16 +995,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
     num_experts_per_rank = num_experts // num_ranks
     assert num_tokens <= num_max_tokens_per_rank
 
-    # The ``--ep-ranks`` argument specifies the intended EP width for
-    # metric computation.  When running on fewer GPUs than the target EP
-    # width (e.g. single-GPU testing EP8 shapes), we still compute the
-    # theoretical metrics as if the full EP cluster were present.
-    ep_ranks = getattr(args, "ep_ranks", None) or num_ranks
-    ep_experts_per_rank = num_experts // ep_ranks
-
-    # JIT-compile the kernel with the requested shape baked in via
-    # ``-DMEGA_MOE_JIT_K*`` overrides.  Done up front so the parity
-    # check and buffer allocation reuse the same cached module.
     jit_shape = {
         "num_max_tokens_per_rank": num_max_tokens_per_rank,
         "hidden": hidden,
@@ -761,15 +1005,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
     }
     load_mega_moe_jit(jit_shape)
 
-    # Run parity sanity check first so any layout-math regression fails
-    # *before* we pay for kernel JIT compile.
-    if local_rank == 0 and not args.skip_parity:
+    if not args.skip_parity:
         if run_parity_checks() != 0:
             raise SystemExit(1)
 
-    # Allocate symmetric memory (single-rank fast path).
     buffer = MegaMoEBuffer(
-        group,
         num_experts=num_experts,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
         num_topk=num_topk,
@@ -779,28 +1019,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
         rank_idx=rank_idx,
     )
 
-    dist_print("Config:", once_in_node=True)
-    dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
-    dist_print(f" > Hidden: {hidden}", once_in_node=True)
-    dist_print(f" > Intermediate: {intermediate_hidden}", once_in_node=True)
-    dist_print(
-        f" > Experts: {num_topk}/{num_experts} (EP{ep_ranks}, {ep_experts_per_rank}/rank)", once_in_node=True
-    )
-    dist_print(f" > Buffer: {buffer.total_bytes / 2 ** 30:.4f} GiB", once_in_node=True)
-    dist_print(f" > Ranks: {rank_idx}/{num_ranks}", once_in_node=True)
-    dist_print(once_in_node=True)
+    print("Config:", flush=True)
+    print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", flush=True)
+    print(f" > Hidden: {hidden}", flush=True)
+    print(f" > Intermediate: {intermediate_hidden}", flush=True)
+    print(f" > Experts: {num_topk}/{num_experts} ({num_experts_per_rank}/rank)", flush=True)
+    print(f" > Buffer: {buffer.total_bytes / 2 ** 30:.4f} GiB", flush=True)
+    print(f" > Ranks: {rank_idx}/{num_ranks}", flush=True)
+    print(flush=True)
 
-    # Decide whether we can actually run the kernel (shape must match
-    # the JIT-instantiated smoke template).  If not, we skip tensor
-    # creation for weights (could be huge in single-rank mode with
-    # hundreds of experts) and go straight to analytical metrics.
     jit = load_mega_moe_jit()
 
-    # Probe whether the kernel shape matches the smoke template by
-    # doing a quick zero-token call.
+    # Probe: zero-token kernel call to confirm the shape matches the
+    # JIT-instantiated smoke template.
     probe_y = torch.empty((1, hidden), dtype=torch.bfloat16, device="cuda")
-    probe_l1 = torch.empty(1, dtype=torch.int8, device="cuda")
-    probe_l2 = torch.empty(1, dtype=torch.int8, device="cuda")
+    probe_aux = torch.zeros(1, dtype=torch.uint8, device="cuda")
     probe_status = jit.run_mega_moe(
         buffer.sym_buffer_ptrs,
         rank_idx,
@@ -812,65 +1045,82 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
         num_topk,
         num_ranks,
         probe_y,
-        probe_l1,
-        probe_l1,
-        probe_l2,
-        probe_l2,
+        probe_aux,
+        probe_aux,
+        probe_aux,
+        probe_aux,
         None,
         args.activation_clamp,
         bool(args.fast_math),
     )
-    del probe_y, probe_l1, probe_l2
-    kernel_available = probe_status == 0
-
-    def create_inputs():
-        nonlocal_state = {}
-        nonlocal_state["x_bf16"] = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        nonlocal_state["l1_weights_bf16"] = torch.randn(
-            (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device="cuda"
+    del probe_y, probe_aux
+    if probe_status != 0:
+        print(
+            f" > Launch status: FAIL hipError_t={probe_status} (probe at num_tokens=0; "
+            f"shape may not match the JIT-instantiated smoke template)",
+            flush=True,
         )
-        nonlocal_state["l2_weights_bf16"] = torch.randn(
-            (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device="cuda"
-        )
-        scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
-        topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-        nonlocal_state["topk_weights"] = topk_weights
-        nonlocal_state["topk_idx"] = topk_idx
-        nonlocal_state["recv_stats"] = torch.randint(
-            0, 100, (num_experts_per_rank,), dtype=torch.int, device="cuda"
-        )
+        buffer.destroy()
+        raise SystemExit(1)
 
-        if args.masked_ratio > 0:
-            rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
-            topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
-            topk_weights.masked_fill_(topk_idx < 0, 0)
+    # ---- Build inputs.
+    x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    x_fp8, x_sf_u32 = per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
-        assert hidden % 128 == 0
-        assert intermediate_hidden % 128 == 0
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
+    topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+    if args.masked_ratio > 0:
+        rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
+        topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
+        topk_weights.masked_fill_(topk_idx < 0, 0)
 
-        x_fp8, x_sf = per_token_cast_to_fp8(
-            nonlocal_state["x_bf16"], use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
-        )
-        nonlocal_state["x_fp8"] = x_fp8
-        nonlocal_state["x_sf"] = x_sf
+    # Weight + SF buffers in *kernel-readable* layouts.  Shapes/dtypes
+    # mirror the kernel's reads:
+    #   L1 weights:  (E_per_rank, 2*intermediate, hidden)        FP8 bytes (uint8 view of e4m3fn)
+    #   L1 SF:       (E_per_rank, 2*intermediate, hidden / 32)   uint8 (E8M0)
+    #   L2 weights:  (E_per_rank, hidden, intermediate)          FP8 bytes (uint8 view of e4m3fn)
+    #   L2 SF:       (E_per_rank, hidden, intermediate / 32)     uint8 (E8M0)
+    #
+    # All weight SFs are set to 0x7F (UE8M0 1.0) so the Python reference
+    # only has to dequant the FP8 byte itself; the kernel's per-tile
+    # ``sfb_byte`` reads land on 0x7F → factor 1.0.  Weights are small
+    # bf16 randn values quantised to e4m3fn so every byte is a valid
+    # finite e4m3 (avoids NaN encodings 0x7F / 0xFF in the raw uint8
+    # path).
+    def _rand_fp8_weights(shape):
+        bf = torch.randn(shape, dtype=torch.bfloat16, device="cuda") * 0.1
+        return bf.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
 
-        nonlocal_state["l1_w_fp4"], nonlocal_state["l1_w_sf"] = cast_grouped_weights_to_fp4(
-            nonlocal_state["l1_weights_bf16"]
-        )
-        nonlocal_state["l2_w_fp4"], nonlocal_state["l2_w_sf"] = cast_grouped_weights_to_fp4(
-            nonlocal_state["l2_weights_bf16"]
-        )
-        return nonlocal_state
+    l1_w_fp8 = _rand_fp8_weights((num_experts_per_rank, 2 * intermediate_hidden, hidden))
+    l1_w_sf = torch.full(
+        (num_experts_per_rank, 2 * intermediate_hidden, hidden // _K_SCALE_GROUP_K),
+        0x7F,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    l2_w_fp8 = _rand_fp8_weights((num_experts_per_rank, hidden, intermediate_hidden))
+    l2_w_sf = torch.full(
+        (num_experts_per_rank, hidden, intermediate_hidden // _K_SCALE_GROUP_K),
+        0x7F,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    recv_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int32, device="cuda")
 
-    def run_fused(inputs):
-        if num_tokens > 0:
-            buffer.x[:num_tokens].copy_(inputs["x_fp8"])
-            buffer.x_sf[:num_tokens, : inputs["x_sf"].shape[1]].copy_(inputs["x_sf"])
-            buffer.topk_idx[:num_tokens].copy_(inputs["topk_idx"])
-            buffer.topk_weights[:num_tokens].copy_(inputs["topk_weights"])
+    # ---- Copy inputs into the symmetric buffer.
+    if num_tokens > 0:
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens, : x_sf_u32.shape[1]].copy_(x_sf_u32)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+    torch.cuda.synchronize()
 
-        y = torch.empty((max(num_tokens, 1), hidden), dtype=torch.bfloat16, device="cuda")
-        status = jit.run_mega_moe(
+    # ---- Launch.
+    print("Running fused kernel:", flush=True)
+    y = torch.empty((max(num_tokens, 1), hidden), dtype=torch.bfloat16, device="cuda")
+
+    def _launch():
+        return jit.run_mega_moe(
             buffer.sym_buffer_ptrs,
             rank_idx,
             num_tokens,
@@ -881,176 +1131,106 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
             num_topk,
             num_ranks,
             y,
-            inputs["l1_w_fp4"],
-            inputs["l1_w_sf"],
-            inputs["l2_w_fp4"],
-            inputs["l2_w_sf"],
-            inputs["recv_stats"],
+            l1_w_fp8,
+            l1_w_sf,
+            l2_w_fp8,
+            l2_w_sf,
+            recv_stats,
             args.activation_clamp,
             bool(args.fast_math),
         )
-        return y, inputs["recv_stats"], status
 
-    # ---------------------------------------------------------------
-    # Compute num_recv_tokens and num_touched_experts.
-    # When the kernel is available and inputs are created, use the
-    # actual topk_idx.  Otherwise, use analytical estimates with the
-    # intended EP width.
-    # ---------------------------------------------------------------
-    t_fused = None
-    if kernel_available:
-        inputs = create_inputs()
-
-        if num_tokens > 0:
-            topk_idx = inputs["topk_idx"]
-            if num_ranks == 1:
-                num_recv_tokens = int((topk_idx != -1).sum().item())
-                num_touched_experts = int(torch.unique(topk_idx[topk_idx >= 0]).numel())
-            else:
-                try:
-                    from deep_gemm.utils.dist import uneven_all_gather as _all_gather
-
-                    gathered_topk_idx = _all_gather(topk_idx, group=group)
-                except ImportError:
-                    gathered_topk_idx = topk_idx
-                gathered_topk_idx[
-                    (gathered_topk_idx < rank_idx * num_experts_per_rank)
-                    | (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)
-                ] = -1
-                num_recv_tokens = int((gathered_topk_idx != -1).sum().item())
-                num_touched_experts = int(torch.unique(gathered_topk_idx.flatten()).numel()) - 1
-        else:
-            num_recv_tokens = 0
-            num_touched_experts = 0
-
-        # Warmup + status check
-        dist_print("Running fused kernel:", once_in_node=True)
-        _, _, status = run_fused(inputs)
-        torch.cuda.synchronize()
-        if status == 0:
-            dist_print(" > Launch status: OK", once_in_node=True)
-        else:
-            dist_print(f" > Launch status: FAIL hipError_t={status}", once_in_node=True)
-            buffer.destroy()
-            raise SystemExit(1)
-
-        if args.ncu_profile_only:
-            dist_print(" > Done, exiting (NCU profile mode)", once_in_node=True)
-            buffer.destroy()
-            return
-
-        # Benchmark
-        num_iters = max(1, args.num_perf_iters)
-        for _ in range(max(1, args.num_warmup_iters)):
-            run_fused(inputs)
-        torch.cuda.synchronize()
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        for _ in range(num_iters):
-            run_fused(inputs)
-        end_event.record()
-        torch.cuda.synchronize()
-        t_fused = start_event.elapsed_time(end_event) / num_iters / 1e3
-
+    status = _launch()
+    torch.cuda.synchronize()
+    if status == 0:
+        print(" > Launch status: OK", flush=True)
     else:
-        # Kernel shape does not match the JIT-instantiated template.
-        # Use analytical estimates for the intended EP configuration.
-        num_recv_tokens = _estimate_ep_recv_tokens(
-            num_tokens, num_topk, num_experts, ep_ranks, args.masked_ratio
-        )
-        num_touched_experts = min(ep_experts_per_rank, num_recv_tokens) if num_recv_tokens > 0 else 0
+        print(f" > Launch status: FAIL hipError_t={status}", flush=True)
+        buffer.destroy()
+        raise SystemExit(1)
 
-        dist_print("Running fused kernel:", once_in_node=True)
-        dist_print(
-            " > Launch status: SKIPPED (shape not yet JIT-instantiated; "
-            f"using analytical estimates for EP{ep_ranks})",
-            once_in_node=True,
+    # ---- Timing: warmup + N timed iterations via HIP events.
+    num_warmup = max(int(getattr(args, "num_warmup", 5)), 0)
+    num_iters = max(int(getattr(args, "num_iters", 20)), 1)
+    for _ in range(num_warmup):
+        _launch()
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(num_iters):
+        _launch()
+    end_evt.record()
+    torch.cuda.synchronize()
+    per_launch_ms = start_evt.elapsed_time(end_evt) / num_iters
+    per_launch_us = per_launch_ms * 1000.0
+    # Fused-MoE FLOPs (proxy): 2 GEMMs per (token,topk) → L1 + L2.
+    #   L1: y_l1 = x @ W1.T          [N=intermediate_hidden, K=hidden]
+    #   L2: y    = act(y_l1) @ W2.T  [N=hidden,              K=intermediate_hidden]
+    # FLOPs per (token,topk) pair = 2 * (N1*K1 + N2*K2) = 4 * hidden * intermediate_hidden.
+    flops = 4.0 * num_tokens * num_topk * hidden * intermediate_hidden
+    tflops = flops / (per_launch_ms * 1e-3) / 1e12 if per_launch_ms > 0 else 0.0
+
+    # ---- Dispatch numerical verification (only meaningful for num_tokens > 0).
+    if num_tokens > 0:
+        verify_dispatch(
+            buffer=buffer,
+            x_fp8=x_fp8,
+            x_sf_u32=x_sf_u32,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=num_experts,
+            num_experts_per_rank=num_experts_per_rank,
+            num_ranks=num_ranks,
+            rank_idx=rank_idx,
         )
 
-    # ---------------------------------------------------------------
-    # Performance metrics (DG PR #316 format)
-    # ---------------------------------------------------------------
-    # TFLOPS: 3 matmuls (L1 gate, L1 up, L2), each 2 * M * N * K
-    tflops = (
-        _safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
-        if t_fused
-        else float("nan")
+        # Gate 3 — end-to-end fused MoE numerics (kernel y vs Python ref).
+        # Hard gate: cos_sim >= 0.99 AND rel_rmse <= 0.05.  See CLAUDE.md
+        # gate 3 + ``verify_y`` thresholds (``_GATE_3_*``).  A FAIL here is
+        # NOT bypassed by ``--skip-parity`` or any other flag — the test
+        # exits non-zero so CI / shells catch a regression in the GEMM /
+        # SwiGLU / writeback / combine paths.
+        y_ref = reference_y(
+            x_fp8=x_fp8,
+            x_sf_packed_u32=x_sf_u32,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            l1_w_fp8=l1_w_fp8,
+            l2_w_fp8=l2_w_fp8,
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+            num_experts_per_rank=num_experts_per_rank,
+            rank_idx=rank_idx,
+        )
+        _GATE_3_PASSED = verify_y(y[:num_tokens], y_ref, name="y")
+    else:
+        print(
+            "[mega_moe-jit] dispatch verification: SKIPPED (num_tokens=0 early-exit path)",
+            flush=True,
+        )
+        _GATE_3_PASSED = True  # Gate 3 is N/A on the early-exit path.
+
+    print("Performance:", flush=True)
+    print(
+        f" > EP: {rank_idx:2}/{num_ranks} | num_tokens={num_tokens} | "
+        f"avg latency = {per_launch_us:.2f} us over {num_iters} iters "
+        f"(warmup {num_warmup}) | FLOPs proxy = {tflops:.2f} TFLOPS "
+        f"(GEMM body still scaffolding, TODO §B.2)",
+        flush=True,
+    )
+    print(
+        " > dispatch verified byte-exactly; gate 3 (kernel y numerics) " "result printed above",
+        flush=True,
     )
 
-    # HBM bytes: weights (FP4 = 0.5B) + activations (FP8 = 1B) + output (BF16 = 2B)
-    num_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden // 2  # L1 weights (FP4)
-        + num_touched_experts * hidden * intermediate_hidden // 2  # L2 weights (FP4)
-        + num_recv_tokens * hidden  # L1 acts read (FP8)
-        + num_recv_tokens * intermediate_hidden  # L1 output write (FP8)
-        + num_recv_tokens * intermediate_hidden  # L2 acts read (FP8)
-        + num_recv_tokens * hidden * 2  # L2 output write (BF16)
-    )
-    hbm_gbs = _safe_div(num_hbm_bytes / 1e9, t_fused) if t_fused else float("nan")
-
-    # Interconnect bytes: dispatch pull + combine write-back
-    # (NVLink on DG, XGMI on AMD — same formula)
-    num_interconnect_bytes = num_recv_tokens * hidden * 3
-    interconnect_gbs = _safe_div(num_interconnect_bytes / 1e9, t_fused) if t_fused else float("nan")
-
-    # Combine reduction (serial) time approximation
-    t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
-    approx_factor = _safe_div(t_fused, t_fused - t_reduction) if t_fused else 1.0
-
-    # Print summary in DG format.  When ``num_recv_tokens == 0`` the
-    # kernel takes the early-exit path (or every token was masked) so
-    # ``t_fused`` reflects pure launch overhead, not GEMM compute.
-    # Reporting "0 TFLOPS" under a "Performance:" header would be
-    # misleading — relabel and print only the latency.  The MFMA body
-    # itself is also still scaffolding (see MegaKernel/TODO.md §B.2)
-    # so even non-zero token counts cannot produce real perf yet;
-    # callers that want actual numbers must wait on the A/B loader.
-    if t_fused is not None and num_recv_tokens == 0:
-        dist_print("Launch overhead (stub kernel, no compute):", once_in_node=True)
-        dist_print(
-            f" > EP: {rank_idx:2}/{num_ranks} | "
-            f"{t_fused * 1e6:4.0f} us launch+sync | "
-            f"recv_tokens=0 (early-exit path)",
-            once_in_node=True,
-        )
-    elif t_fused is not None:
-        dist_print("Performance:", once_in_node=True)
-        dist_print(
-            f" > EP: {rank_idx:2}/{num_ranks} | "
-            f"{tflops:4.0f} TFLOPS | "
-            f"overlap: "
-            f"{tflops * approx_factor:4.0f} TFLOPS, "
-            f"HBM {hbm_gbs * approx_factor:4.0f} GB/s, "
-            f"XGMI {interconnect_gbs * approx_factor:3.0f} GB/s | "
-            f"{t_fused * 1e6:4.0f} us, "
-            f"reduction: {t_reduction * 1e6:4.1f} us",
-            once_in_node=True,
-        )
-    else:
-        dist_print("Performance:", once_in_node=True)
-        dist_print(
-            f" > EP: {rank_idx:2}/{num_ranks} (target EP{ep_ranks}) | "
-            f"recv_tokens: {num_recv_tokens} | "
-            f"touched_experts: {num_touched_experts}/{ep_experts_per_rank} | "
-            f"compute: {2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12:.3f} TFLOP | "
-            f"HBM: {num_hbm_bytes / 1e9:.3f} GB | "
-            f"interconnect: {num_interconnect_bytes / 1e9:.3f} GB | "
-            f"reduction: {t_reduction * 1e6:.1f} us",
-            once_in_node=True,
-        )
-
-    # Exit
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            dist.barrier()
-            dist.destroy_process_group()
-    except Exception:
-        pass
     buffer.destroy()
+    if not _GATE_3_PASSED:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1059,90 +1239,48 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> Non
 
 
 def _build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DG-aligned mega-MoE JIT correctness + perf test (gfx950)")
+    parser = argparse.ArgumentParser(
+        description="Numerical-verification test for the gfx950 mega-MoE JIT kernel"
+    )
 
-    # Resource settings
-    parser.add_argument(
-        "--ncu-profile-only", action="store_true", help="Only run a single iteration (NCU profile mode)"
-    )
-    parser.add_argument(
-        "--num-processes",
-        type=int,
-        default=8,
-        help="Number of processes to spawn (default: 1 for single-GPU smoke test; "
-        "use 8 to mirror DG's default)",
-    )
     parser.add_argument(
         "--parity-only",
         action="store_true",
-        help="Only run layout-parity checks, skip the full DG-aligned test",
+        help="Only run layout-parity + zero-token kernel smoke",
     )
     parser.add_argument(
-        "--skip-parity", action="store_true", help="Skip layout-parity sanity check before the kernel test"
+        "--skip-parity",
+        action="store_true",
+        help="Skip layout-parity sanity check before the kernel test",
     )
 
-    # Model settings (defaults match DG-aligned smoke shape so the JIT
-    # kernel can actually run; pass DG defaults via CLI to mirror DG's
-    # config print without running the kernel)
-    parser.add_argument(
-        "--num-max-tokens-per-rank",
-        type=int,
-        default=384,
-        help="Number of maximum tokens per rank (smoke default: 384; DG: 8192)",
-    )
+    # Shape knobs.  Defaults match the JIT smoke template so the
+    # ``--parity-only`` and default invocations both exercise the
+    # pre-instantiated kernel without re-JIT.
+    parser.add_argument("--num-max-tokens-per-rank", type=int, default=384)
     parser.add_argument(
         "--num-tokens",
         type=int,
         default=128,
-        help="Number of tokens per rank (0 = early-exit smoke; None = max minus removed)",
+        help="Tokens per rank (0 = early-exit smoke path; default 128)",
     )
-    parser.add_argument(
-        "--num-max-removed-tokens",
-        type=int,
-        default=0,
-        help="Maximum number of tokens to remove from num_max_tokens_per_rank",
-    )
-    parser.add_argument("--hidden", type=int, default=256, help="Hidden size (smoke default: 256; DG: 7168)")
-    parser.add_argument(
-        "--intermediate-hidden",
-        type=int,
-        default=128,
-        help="Intermediate hidden size (smoke default: 128; DG: 3072)",
-    )
-    parser.add_argument("--activation-clamp", type=float, default=10.0, help="Clamp value for activation")
-    parser.add_argument(
-        "--num-experts", type=int, default=8, help="Number of experts (smoke default: 8; DG: 384)"
-    )
-    parser.add_argument(
-        "--num-topk", type=int, default=2, help="Number of expert selections (smoke default: 2; DG: 6)"
-    )
-    parser.add_argument("--masked-ratio", type=float, default=0.0, help="Mask some expert selections")
-    parser.add_argument("--fast-math", type=int, default=1, help="Enable fast math (0 or 1, default: 1)")
+    parser.add_argument("--num-max-removed-tokens", type=int, default=0)
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--intermediate-hidden", type=int, default=128)
+    parser.add_argument("--activation-clamp", type=float, default=10.0)
+    parser.add_argument("--num-experts", type=int, default=8)
+    parser.add_argument("--num-topk", type=int, default=2)
+    parser.add_argument("--masked-ratio", type=float, default=0.0)
+    parser.add_argument("--fast-math", type=int, default=1)
 
-    # EP settings
-    parser.add_argument(
-        "--ep-ranks",
-        type=int,
-        default=None,
-        help="Intended EP width for metric computation (e.g. 8 for EP8). "
-        "Defaults to --num-processes. Allows computing EP8 metrics on a single GPU.",
-    )
-
-    # Test settings
-    parser.add_argument("--num-warmup-iters", type=int, default=3, help="Warmup iterations")
-    parser.add_argument("--num-perf-iters", type=int, default=10, help="Timed iterations")
-    parser.add_argument(
-        "--dump-profile-traces",
-        type=str,
-        default="",
-        help="Dump profiling trace JSONs (currently unused; DG-API compat)",
-    )
-    parser.add_argument(
-        "--local-rank-idx",
-        type=int,
-        default=None,
-        help="Run as single process with this local rank (e.g. for NCU prof)",
-    )
+    # Compatibility no-ops (kept so existing CI invocations don't break).
+    parser.add_argument("--num-processes", type=int, default=1)
+    parser.add_argument("--ep-ranks", type=int, default=None)
+    parser.add_argument("--num-warmup-iters", type=int, default=0)
+    parser.add_argument("--num-perf-iters", type=int, default=0)
+    parser.add_argument("--ncu-profile-only", action="store_true")
+    parser.add_argument("--dump-profile-traces", type=str, default="")
+    parser.add_argument("--local-rank-idx", type=int, default=None)
     return parser
 
 
@@ -1150,27 +1288,30 @@ def main() -> int:
     parser = _build_argparser()
     args = parser.parse_args()
 
-    # Path 1: parity-only — preserves the previous test_mega_moe_jit
-    # behavior so CI can keep its low-overhead layout sanity gate.
+    if args.num_processes > 1:
+        print(
+            "[mega_moe-jit] --num-processes > 1 is not supported by the numerical verifier; "
+            "the JIT smoke template instantiates kNumRanks==1 only.",
+            flush=True,
+        )
+        return 1
+
     if args.parity_only:
+        # Parity-only path keeps the same JIT cache key as the default
+        # test() path: build with the requested shape so the run_stub
+        # call inside run_parity_checks hits the same instantiation.
+        jit_shape = {
+            "num_max_tokens_per_rank": args.num_max_tokens_per_rank,
+            "hidden": args.hidden,
+            "intermediate_hidden": args.intermediate_hidden,
+            "num_experts": args.num_experts,
+            "num_topk": args.num_topk,
+            "num_ranks": 1,
+        }
+        load_mega_moe_jit(jit_shape)
         return 1 if run_parity_checks() != 0 else 0
 
-    # Path 2: DG-aligned test.  Single-rank in-process, or
-    # ``torch.multiprocessing.spawn`` for multi-rank.
-    if args.dump_profile_traces:
-        os.makedirs(args.dump_profile_traces, exist_ok=True)
-
-    if args.local_rank_idx is not None:
-        test(args.local_rank_idx, args.num_processes, args)
-        return 0
-
-    if args.num_processes <= 1:
-        test(0, 1, args)
-        return 0
-
-    import torch.multiprocessing as mp
-
-    mp.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)
+    test(args)
     return 0
 
 

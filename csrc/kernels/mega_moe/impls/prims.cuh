@@ -29,13 +29,14 @@
 
 namespace primus_turbo::mega_moe::prims {
 
-// Compile-time wave size.  Sourced from ``__AMDGCN_WAVEFRONT_SIZE`` so
-// the value tracks ``--offload-arch`` (wave64 on gfx9xx, wave32 on RDNA)
-// instead of being hard-coded.  HIP's builtin ``warpSize`` is an ``int``
-// variable, not constexpr, so it cannot appear in template parameters,
+// Compile-time wave size.  HIP's builtin ``warpSize`` is an ``int``
+// variable (not constexpr), so it cannot appear in template parameters,
 // ``static_assert``, or array sizes — use ``kWarpSize`` for those.
-inline constexpr int kWarpSize = __AMDGCN_WAVEFRONT_SIZE;
-static_assert(kWarpSize == 64, "gfx950 mega-MoE assumes wave64");
+// Hard-coded to 64: this kernel is gfx950-only (wave64), matching the
+// pattern in ``primus_turbo/deep_ep/configs.h``.  ``__AMDGCN_WAVEFRONT_SIZE``
+// would have been the arch-tracking alternative, but it is not exposed
+// as a constant-expression in the ROCm toolchain we build against.
+inline constexpr int kWarpSize = 64;
 
 // ---------------------------------------------------------------------
 //  Lane / warp id helpers (mirror ``ptx::get_lane_idx`` / friends).
@@ -281,4 +282,8 @@ __device__ __forceinline__ void sync_unaligned(NamedBarrierWg &bar, uint32_t num
     bar.arrive_and_wait(bar_id, num_threads);
 }
 
+template <typename T>
+__device__ __forceinline__ void atomicAdd_block(T *ptr, std::type_identity_t<T> val) {
+    __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+}
 } // namespace primus_turbo::mega_moe::prims

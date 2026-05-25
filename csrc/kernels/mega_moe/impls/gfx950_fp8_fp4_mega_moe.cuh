@@ -65,6 +65,7 @@
 #define __grid_constant__
 #endif
 
+#include "primus_turbo/device/lds_swizzle.cuh"
 #include "primus_turbo/device/memory.cuh"
 #include "primus_turbo/device/mfma.cuh"
 #include "primus_turbo/dtype.h"
@@ -285,31 +286,46 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
 
     // ---- Workspaces / per-pool buffers (1:1 from DG) ----
+    //
+    // Inter-buffer base pointers are 256-byte aligned so the device-side
+    // chain matches the host launcher's ``bump`` cursor in
+    // ``mega_moe.cu::get_symm_buffer_size_for_mega_moe`` (and the JIT
+    // probe in ``mega_moe_jit_launch.cu::mega_moe_jit_compute_layout``).
+    // Without this, the dispatch path reads ``input_topk_idx`` from a
+    // shifted (mostly-zero) region, routing all tokens to expert 0.
+    constexpr uint64_t kInterBufAlign = 256u;
+    auto               align256       = [](void *p) -> void                     *{
+        const auto v = reinterpret_cast<uintptr_t>(p);
+        return reinterpret_cast<void *>((v + kInterBufAlign - 1u) &
+                                                            ~uintptr_t(kInterBufAlign - 1u));
+    };
+
     const auto workspace = layout::Workspace(sym_buffer.get_base_ptr(), kNumRanks, kNumExperts,
                                              kNumMaxTokensPerRank, kNumTopk);
 
-    const auto input_token_buffer =
-        layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
-    const auto input_sf_buffer =
-        layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank, input_token_buffer.get_end_ptr());
+    const auto input_token_buffer    = layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank,
+                                                      align256(workspace.get_end_ptr()));
+    const auto input_sf_buffer       = layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank,
+                                                      align256(input_token_buffer.get_end_ptr()));
     const auto input_topk_idx_buffer = layout::Buffer(
-        input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
-    const auto input_topk_weights_buffer = layout::Buffer(
-        input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
+        input_topk_idx_layout, 1, kNumMaxTokensPerRank, align256(input_sf_buffer.get_end_ptr()));
+    const auto input_topk_weights_buffer =
+        layout::Buffer(input_topk_weights_layout, 1, kNumMaxTokensPerRank,
+                       align256(input_topk_idx_buffer.get_end_ptr()));
 
-    const auto l1_token_buffer = layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens,
-                                                input_topk_weights_buffer.get_end_ptr());
-    const auto l1_sf_buffer =
-        layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-    const auto l1_topk_weights_buffer =
-        layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
+    const auto l1_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens,
+                                                       align256(input_topk_weights_buffer.get_end_ptr()));
+    const auto l1_sf_buffer           = layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens,
+                                                       align256(l1_token_buffer.get_end_ptr()));
+    const auto l1_topk_weights_buffer = layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens,
+                                                       align256(l1_sf_buffer.get_end_ptr()));
 
     const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens,
-                                                l1_topk_weights_buffer.get_end_ptr());
+                                                align256(l1_topk_weights_buffer.get_end_ptr()));
     const auto l2_sf_buffer = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens,
-                                             l2_token_buffer.get_end_ptr());
+                                             align256(l2_token_buffer.get_end_ptr()));
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+        bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, align256(l2_sf_buffer.get_end_ptr()));
 
     // ---- SF transpose helper (UTCCP 4x32 on SM100 - we keep the same
     //      index transform so the SF byte layout matches DG byte-for-byte).
@@ -361,6 +377,120 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     auto smem_send_buffer = reinterpret_cast<uint8_t *>(smem_barriers + 32u);
     (void) smem_send_buffer;
 
+    // ---- Per-loader-wave LDS staging slot (single stage today).
+    //
+    // Real cooperative ``(A | B | SFA | SFB | sink)`` carve-out: each
+    // loader wave owns
+    //   A : kRowsPerLoaderWave × BLOCK_K bytes from l{1,2}_token_buffer
+    //   B : kColsPerLoaderWave × BLOCK_K bytes from l{1,2}_weights
+    //   SFA / SFB : ``kLoaderSFBytes`` each (placeholder until real
+    //               UE8M0 SF loads land - TODO §B.2 deferred item 4).
+    //   sink : ``kSubTilesPerWave`` × ``float32x16`` accumulators
+    //          drained to LDS at end-of-role so the optimiser cannot
+    //          collapse the MFMA chain (numerics still scaffold-only).
+    //
+    // The MFMA loop walks the *real* output partition the production
+    // kernel needs:
+    //   for k_block in num_k_blocks:               // outer GEMM K
+    //     stage A + B for this (m,n,k) tile via buffer_load_lds
+    //     for k_inner in BLOCK_K / 64:             // inner-K of one block
+    //       for sub in (kSubTilesM × kSubTilesN):  // wave-owned 32×32 tiles
+    //         mfma_scale_f32_32x32x64_f8f6f4(...)
+    //
+    // Lane→tile-coordinate mapping for the LDS read on the MFMA path
+    // is still a scaffold (lane reads its consecutive int32x8 from
+    // LDS, which does not match the MFMA's lane→data convention) -
+    // tracked as TODO §B.2 deferred item 5.  Switching to
+    // ``ds_read_pinned`` with the MFMA convention is a follow-up patch
+    // that also unlocks correct numerics once the SFA/SFB loads
+    // (deferred item 4) and the SwiGLU/quant/BF16 writeback (deferred
+    // item 3) land alongside.
+    constexpr uint32_t kMfmaM       = 32u;              // MFMA 32x32x64 output rows
+    constexpr uint32_t kMfmaN       = 32u;              // MFMA 32x32x64 output cols
+    constexpr uint32_t kMfmaK       = 64u;              // MFMA 32x32x64 K reduction
+    constexpr uint32_t kInnerKIters = BLOCK_K / kMfmaK; // 2 for BLOCK_K=128
+    static_assert(BLOCK_K % kMfmaK == 0u, "BLOCK_K must be a multiple of MFMA K");
+    // Partition the (M, N) output across loader waves along the M axis
+    // ONLY.  Per the §B.4 design note, splitting along both axes turns
+    // the wave-private output into a checkerboard (wave 0 owns
+    // (M0..M_half, N0..N_half); wave 1 owns (M_half..M, N_half..N)) and
+    // leaves the off-diagonal quadrants un-computed.  Split-along-M
+    // keeps each wave responsible for the full N width of its M slice,
+    // which matches both the DG SM100 partition and the writeback the
+    // epilogue role expects.
+    static_assert(BLOCK_M % kNumMMANonEpilogueWarps == 0u,
+                  "BLOCK_M must be evenly partitionable across loader waves");
+    constexpr uint32_t kRowsPerLoaderWave = BLOCK_M / kNumMMANonEpilogueWarps; // 64 today
+    constexpr uint32_t kColsPerLoaderWave = BLOCK_N;                           // 128 today
+    static_assert(kRowsPerLoaderWave % kMfmaM == 0u,
+                  "loader wave row partition must be a multiple of MFMA M");
+    static_assert(kColsPerLoaderWave % kMfmaN == 0u,
+                  "loader wave col partition must be a multiple of MFMA N");
+    constexpr uint32_t kSubTilesM       = kRowsPerLoaderWave / kMfmaM;
+    constexpr uint32_t kSubTilesN       = kColsPerLoaderWave / kMfmaN;
+    constexpr uint32_t kSubTilesPerWave = kSubTilesM * kSubTilesN;
+
+    // Per-tile size in LDS = (rows or cols owned by wave) × BLOCK_K bytes.
+    // The cooperative ``buffer_load_lds<16>`` covers 64 lanes × 16 B = 1024 B
+    // per call, so the number of loader calls per tile per K iteration is
+    // ``kTileBytes / 1024``.  For 64 rows × 128 K bytes this is 8 calls.
+    constexpr uint32_t kATileBytes       = kRowsPerLoaderWave * BLOCK_K;
+    constexpr uint32_t kBTileBytes       = kColsPerLoaderWave * BLOCK_K;
+    constexpr uint32_t kLaneLoadBytes    = 16u; // ds_read_b128 / buffer_load_lds width
+    constexpr uint32_t kBytesPerLoadCall = kWarpSize * kLaneLoadBytes; // 1024 B
+    static_assert(kATileBytes % kBytesPerLoadCall == 0u,
+                  "A tile must be a multiple of one cooperative load call");
+    static_assert(kBTileBytes % kBytesPerLoadCall == 0u,
+                  "B tile must be a multiple of one cooperative load call");
+    constexpr uint32_t kATileLoadsPerWave = kATileBytes / kBytesPerLoadCall;
+    constexpr uint32_t kBTileLoadsPerWave = kBTileBytes / kBytesPerLoadCall;
+
+    constexpr uint32_t kLoaderSFBytes = 64u; // placeholder SFA / SFB slot
+    constexpr uint32_t kLoaderSinkBytes =
+        kSubTilesPerWave * sizeof(dtype::float32x16); // one fragment per sub-tile
+
+    // Per-stage carve-out for one (A | B | SFA | SFB) tile.  The sink
+    // is NOT staged - it lives once per wave at the tail of the
+    // wave-private carve-out so the persistent accumulator bank is not
+    // duplicated across stages.
+    constexpr uint32_t kStagedBytesPerStage = kATileBytes + kBTileBytes + kLoaderSFBytes * 2u;
+    constexpr uint32_t kLoaderBaseBytes =
+        ((sizeof(uint32_t) * kNumExperts + 16u + 32u * sizeof(Mbarrier) + 1023u) / 1024u) * 1024u;
+
+    // kLoaderStages: bounded by both the host's kNumStages and the LDS
+    // budget.  Each loader wave's carve-out is
+    //   kLoaderStages * kStagedBytesPerStage + kLoaderSinkBytes
+    // and the two waves together must fit under ``kSmemBytes -
+    // kLoaderBaseBytes``.  For the smoke shape (BLOCK_M=BLOCK_N=BLOCK_K=128,
+    // kNumMMANonEpilogueWarps=2): kStagedBytesPerStage = 24704 B, so the
+    // 140 KiB budget supports up to 2 stages × 2 waves ≈ 100 KiB; raising
+    // to 3 stages would overflow.  We let the host pin kNumStages = 4
+    // for the rest of the kernel (scheduler, future writeback) and clamp
+    // the loader's effective stage count locally.
+    static constexpr uint32_t kSmemBytesBudget = 140u * 1024u;
+    static_assert(kLoaderBaseBytes + kNumMMANonEpilogueWarps * kLoaderSinkBytes < kSmemBytesBudget,
+                  "loader sink + base already exceed kSmemBytes budget");
+    constexpr uint32_t kMaxLoaderStagesByLds =
+        (kSmemBytesBudget - kLoaderBaseBytes - kNumMMANonEpilogueWarps * kLoaderSinkBytes) /
+        (kNumMMANonEpilogueWarps * kStagedBytesPerStage);
+    static_assert(kMaxLoaderStagesByLds >= 1u,
+                  "loader staged carve-out too large for one stage even - shrink BLOCK_K?");
+    constexpr uint32_t kLoaderStages =
+        (kNumStages < kMaxLoaderStagesByLds) ? kNumStages : kMaxLoaderStagesByLds;
+
+    // Per-wave carve-out: kLoaderStages staged (A | B | SFA | SFB) regions
+    // followed by one sink region for the persistent accumulator bank.
+    constexpr uint32_t kLoaderWaveBytes = kLoaderStages * kStagedBytesPerStage + kLoaderSinkBytes;
+    static_assert(kLoaderBaseBytes + kNumMMANonEpilogueWarps * kLoaderWaveBytes <= kSmemBytesBudget,
+                  "loader tile carve-out exceeds kSmemBytes budget");
+
+    // Cooperative load count per stage (A loads + B loads), used to size
+    // the s_waitcnt vmcnt window for double-buffered prefetch below.
+    constexpr uint32_t kLoadsPerStage = kATileLoadsPerWave + kBTileLoadsPerWave;
+    // vmcnt field is 6 bits on CDNA - the prefetch window must fit.
+    static_assert(kLoadsPerStage < 63u,
+                  "kLoadsPerStage exceeds vmcnt range - reduce per-stage loads");
+
     // Fast-exit path for ``num_tokens == 0``.  The JIT smoke test (see
     // ``tests/pytorch/ops/jit/test_mega_moe_jit_perf.py``) invokes the
     // launcher with zero tokens just to confirm the kernel symbol is
@@ -394,34 +524,28 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     // ``num_threads`` value (the calling role's wave count x warpSize),
     // so distinct ``(num_threads, role)`` tuples must use distinct ids.
     //   0 : dispatch-only internal sync  (num_threads = kNumDispatchThreads)
-    //   1 : dispatch + epilogue cross sync (kNumDispatchThreads + kNumEpilogueThreads)
+    //   1 : dispatch + loader + epilogue cross sync (full CTA = kNumThreads)
     //   2 : dispatch role grid_sync / nvlink_barrier internal
     //   3 : epilogue role grid_sync / nvlink_barrier internal
+    //   4 : dispatch + epilogue serializer for nvl_barrier_counter access
+    //       (disp+epi only - loader has already exited).  Without this,
+    //       dispatch's nvlink_barrier-2 (L897) and epi's nvlink_barrier-epi
+    //       (L1755) race on the shared nvl_barrier_counter + signal slots:
+    //       kBarDispEpi at L868/L1753 forces both roles to arrive
+    //       simultaneously, both read the same counter value, both compute
+    //       (phase, sign) identically, and both red_add_rel_sys +1 to the
+    //       SAME signal[phase] on each remote rank.  Each rank then
+    //       receives 2*kNumRanks increments instead of kNumRanks, so the
+    //       leader spin ``while(signal != kNumRanks)`` never matches.
+    //       On SM100 the heavy MFMA/combine work between the equivalent
+    //       cross-role sync and the two nvlink_barriers naturally
+    //       desynchronizes them; our scaffold has no such work, so the
+    //       race fires reliably under EP>=2.
     constexpr uint32_t kBarDispLocal = 0u;
     constexpr uint32_t kBarDispEpi   = 1u;
     constexpr uint32_t kBarDispGrid  = 2u;
     constexpr uint32_t kBarEpiGrid   = 3u;
-
-    // Canonical (bar_id -> num_threads) registry (TODO.md Section A
-    // item 11).  Every named-barrier sync below derives ``num_threads``
-    // from this table - never spell the count out by hand at the call
-    // site.  Centralising the binding means a future role-count change
-    // updates exactly one place; the alternative (each callsite
-    // independently spelling out e.g. ``kNumDispatchThreads +
-    // kNumEpilogueThreads``) would silently produce a (counter,
-    // expected) mismatch and deadlock on the first drift.
-    constexpr uint32_t kBarThreads[prims::kNumMaxNamedBars] = {
-        /*[kBarDispLocal] =*/kNumDispatchThreads,
-        /*[kBarDispEpi]   =*/kNumDispatchThreads + kNumEpilogueThreads,
-        /*[kBarDispGrid]  =*/kNumDispatchThreads,
-        /*[kBarEpiGrid]   =*/kNumEpilogueThreads,
-        0u,
-        0u,
-        0u,
-        0u,
-    };
-    static_assert(prims::kNumMaxNamedBars >= 4u,
-                  "Named-barrier registry needs at least 4 slots for the current role map");
+    constexpr uint32_t kBarDispEpi2  = 4u;
 
     // Role leader threads (absolute ``threadIdx.x``).  PTX bar.sync
     // implicitly picks a leader; on AMD we have to name one explicitly
@@ -481,9 +605,9 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
 
         // Count experts' tokens
         read_topk_idx([&](const uint32_t &token_topk_idx, const int &expert_idx) {
-            atomicAdd(smem_expert_count + expert_idx, 1);
+            atomicAdd_block(smem_expert_count + expert_idx, 1);
         });
-        sync_aligned(named_bar, kBarThreads[kBarDispLocal], kBarDispLocal);
+        sync_aligned(named_bar, kNumDispatchThreads, kBarDispLocal);
 
         // Pass 2: post the per-expert send count into the workspace.
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
@@ -491,7 +615,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             smem_expert_count[i]      = static_cast<uint32_t>(
                 atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
         }
-        sync_aligned(named_bar, kBarThreads[kBarDispLocal], kBarDispLocal);
+        sync_aligned(named_bar, kNumDispatchThreads, kBarDispLocal);
 
         // Pass 3: write source ``(token, topk)`` indices.
         for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
@@ -519,7 +643,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         // RELEASE atomic_add even though the writer (other ranks' SM0)
         // completed it.  See the note on ``atomic_add_sys`` above.
         // Grid sync, then post per-rank recv counts (only SM0 touches them).
-        comm::grid_sync<kNumSMs, 0>(workspace, named_bar, kBarDispGrid, kBarThreads[kBarDispGrid],
+        comm::grid_sync<kNumSMs, 0>(workspace, named_bar, kBarDispGrid, kNumDispatchThreads,
                                     kDispLeader, sm_idx, thread_idx);
 
         if (sm_idx == 0u) {
@@ -549,17 +673,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                     expert_status);
             }
         }
-        sync_aligned(named_bar, kBarThreads[kBarDispLocal], kBarDispLocal);
+        sync_aligned(named_bar, kNumDispatchThreads, kBarDispLocal);
 
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] pre-nvlink_barrier-1\n", sym_buffer.rank_idx);
         // NVLink barrier (collapses to grid sync for kNumRanks==1).
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kBarThreads[kBarDispGrid], 0, 1>(
+        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, 0, 1>(
             workspace, sym_buffer, named_bar, kBarDispGrid, kDispLeader, sm_idx, thread_idx,
             /*sync_prologue=*/false, /*sync_epilogue=*/true);
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] post-nvlink_barrier-1, pre-fetch_expert_recv_count\n",
-                   sym_buffer.rank_idx);
 
         // Pass 4: pull tokens + SFs into the local L1 pool.
         //
@@ -577,8 +696,6 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         // rank, length == stored_rank_count[0]), so the fast-path
         // numerics are preserved.
         scheduler.fetch_expert_recv_count();
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] post-fetch_expert_recv_count, pre-pass4\n", sym_buffer.rank_idx);
 
         constexpr uint32_t kNumRanksPerLane = (kNumRanks + kWarpSize - 1u) / kWarpSize;
 
@@ -760,19 +877,19 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             sync_warp();
         }
 
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] post-pass4, pre-sync_unaligned(kBarDispEpi)\n", sym_buffer.rank_idx);
         // Workspace cleanup for the next launch.  This is a cross-role
-        // sync: it waits for the epilogue waves to finish spinning on
-        // the L1/L2 arrival counters/masks before we wipe them.  The
-        // epilogue side has a matching ``sync_unaligned(named_bar,
-        // kBarThreads[kBarDispEpi], kBarDispEpi)`` call placed after its
-        // ``for_each_block`` (see below in the epilogue branch).  Mirrors
-        // DG ``ptx::sync_unaligned(..., kDispatchWithEpilogueBarrierIdx)``
-        // - the two roles arrive from non-contiguous warp groups.
-        sync_unaligned(named_bar, kBarThreads[kBarDispEpi], kBarDispEpi);
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] post-sync_unaligned(kBarDispEpi)\n", sym_buffer.rank_idx);
+        // sync: it waits for the loader/MMA AND epilogue waves to
+        // finish using the L1/L2 arrival counters/masks before we wipe
+        // them.  Loader threads spin on ``l1_arrival_count`` /
+        // ``l2_arrival_mask`` inside ``for_each_block`` (see L1004,
+        // L1009); if they have not yet observed ``expected`` for a
+        // later block when cleanup zeros the counter, the spin reads 0
+        // forever - hipDeviceSynchronize hangs.  ALL three roles
+        // (dispatch + loader/MMA + epilogue) must arrive, so the
+        // participant count is the full CTA (``kNumThreads``).
+        // The matching arrivals are below: loader at end of its
+        // for_each_block, epi after its (empty) for_each_block body.
+        sync_unaligned(named_bar, kNumThreads, kBarDispEpi);
 
         // Stats-only pass (no mutation of shared workspace state): the
         // per-expert ``red_add`` into ``cumulative_local_expert_recv_stats``
@@ -801,13 +918,18 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
         // ``kBarDispEpi`` window (the original DG SM100 layout) lets
         // SM1..N-1 race ahead and zero ``recv_count_sum[i]`` while SM0
         // is still spinning on it inside ``scheduler.fetch_expert_recv_count``.
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] pre-nvlink_barrier-2\n", sym_buffer.rank_idx);
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kBarThreads[kBarDispGrid], 0, 3>(
+        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, 0, 3>(
             workspace, sym_buffer, named_bar, kBarDispGrid, kDispLeader, sm_idx, thread_idx,
             /*sync_prologue=*/true, /*sync_epilogue=*/false);
-        if (sm_idx == 0u && thread_idx == kDispLeader)
-            printf("[r%u/disp] post-nvlink_barrier-2\n", sym_buffer.rank_idx);
+
+        // Serializer with epi's nvlink_barrier-epi: forces epi to observe
+        // the counter increment from nvlink_barrier-2 above, so the two
+        // barriers land on different (phase, sign) pairs and write to
+        // different signal slots.  See the bar-id allocation note on
+        // ``kBarDispEpi2`` at the top of the kernel.  Participants are
+        // disp + epi only (loader has already exited via its kBarDispEpi
+        // arrival at L1717).
+        sync_unaligned(named_bar, kNumDispatchThreads + kNumEpilogueThreads, kBarDispEpi2);
 
         // Workspace cleanup for the next launch.  Safe here: the
         // ``nvlink_barrier-2`` above guarantees all SMs (on all ranks)
@@ -851,15 +973,63 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     //  in AGPRs for the duration of one block.
     // =================================================================
     if (warp_idx >= kNumDispatchWarps && warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+        // Loader-role-local wave index (0-based within the loader band).
+        const uint32_t loader_warp_local = warp_idx - kNumDispatchWarps;
+
+        // Per-wave LDS slot offsets.  Lane-invariant uint32_t addresses
+        // suitable for ``buffer_load_lds`` / ``ds_read``.
+        //
+        // Layout (per loader wave):
+        //   wave_base
+        //     stage 0 : [A | B | SFA | SFB]    (kStagedBytesPerStage)
+        //     stage 1 : [A | B | SFA | SFB]
+        //     ...
+        //     stage S-1
+        //     sink    : kSubTilesPerWave × float32x16
+        //
+        // The stage index walks (0 .. kLoaderStages-1) and wraps as the
+        // outer K loop advances - the ring-buffer that the in-flight
+        // ``buffer_load_lds`` prefetch uses to overlap stage N+1's GMEM
+        // read with stage N's MFMA consumption.
+        const uint32_t wave_base_byte = kLoaderBaseBytes + loader_warp_local * kLoaderWaveBytes;
+        const uint32_t sink_off       = wave_base_byte + kLoaderStages * kStagedBytesPerStage;
+
+        // LDS-segment base addresses for stage 0 (lane-invariant); other
+        // stages are reached by adding ``stage * kStagedBytesPerStage``.
+        // ``a_lds_base`` / ``b_lds_base`` are uint32 SMEM addresses
+        // suitable for the ``raw.buffer.load.lds`` intrinsic.
+        // HIP: ``extern __shared__`` lives in address space 3; the LDS
+        // byte offset is just the low 32 bits of the pointer (no CUDA
+        // ``__cvta_generic_to_shared`` builtin on AMDGPU).
+        const uint32_t a_lds_stage0 =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_buffer + wave_base_byte));
+        const uint32_t b_lds_stage0 = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(smem_buffer + wave_base_byte + kATileBytes));
+
+        // BufferSRDs over both the activation pools and weight tensors.
+        // ``l{1,2}_token_buffer.get_base_ptr()`` lives inside the
+        // symmetric workspace (the dispatch role filled it via
+        // ``sym_buffer.map``); ``l{1,2}_weights`` is the per-expert
+        // weight tensor passed in by the host.  ``num_bytes`` defaults
+        // to ``0xffffffffu`` (no hardware bounds check) — the loader
+        // never issues an offset that escapes the corresponding
+        // tensor's actual allocation because every per-tile address
+        // below is anchored by the scheduler's pool / expert / block
+        // indices.
+        device::BufferSRD srd_l1_a(l1_token_buffer.get_base_ptr<void>());
+        device::BufferSRD srd_l2_a(l2_token_buffer.get_base_ptr<void>());
+        device::BufferSRD srd_l1_b(l1_weights);
+        device::BufferSRD srd_l2_b(l2_weights);
+
+        // Per-wave accumulator bank.  One float32x16 per output sub-tile
+        // owned by this wave (``kSubTilesM × kSubTilesN``).  Lives in
+        // registers/AGPRs across all ``for_each_block`` visits so the
+        // entire MFMA chain stays observably alive.
+        dtype::float32x16 acc[kSubTilesPerWave] = {};
+
         scheduler.for_each_block([&](sched::BlockPhase phase, uint32_t local_expert_idx,
                                      uint32_t num_k_blocks, uint32_t m_block_idx,
                                      uint32_t n_block_idx) {
-            // For the alignment pass we only walk the iteration space -
-            // the per-block tile staging + MFMA issue path lives in the
-            // epilogue branch below so a single wave drives both load and
-            // compute.  This keeps the kernel compilable while preserving
-            // DG's exact for_each_block iteration order (the per-wave
-            // scheduling property the user explicitly called out).
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             if (phase == sched::BlockPhase::Linear1) {
                 // Wait for L1 token arrivals from the dispatch warps.
@@ -873,9 +1043,663 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                 while (ld_acq_gpu(ptr) != expected) {
                 }
             }
-            (void) local_expert_idx;
-            (void) n_block_idx;
+
+            // ----------------------------------------------------------
+            //  Real cooperative (A | B) tile staging + MFMA partition.
+            //
+            //  Per-phase tile geometry:
+            //    A row stride (bytes)         = kHidden (L1) | kIntermediateHidden (L2)
+            //    B row stride (bytes)         = L1_SHAPE_K (L1) | L2_SHAPE_K (L2)
+            //    B per-expert stride (bytes)  = L1_SHAPE_N*L1_SHAPE_K (L1)
+            //                                 | L2_SHAPE_N*L2_SHAPE_K (L2)
+            //
+            //  Each loader wave covers ``kRowsPerLoaderWave`` rows of A
+            //  starting at ``pool_block_idx*BLOCK_M + loader_warp_local*
+            //  kRowsPerLoaderWave`` and ``kColsPerLoaderWave`` cols of B
+            //  starting at ``n_block_idx*BLOCK_N + loader_warp_local*
+            //  kColsPerLoaderWave``.
+            //
+            //  Lane mapping for the cooperative ``buffer_load_lds<16>``:
+            //    call C ∈ [0, kATileLoadsPerWave): lane L writes
+            //      A row  = C*8 + L/8  at K byte (L%8)*16
+            //    same shape for B.
+            //  8 lanes/row × 16 B/lane = 128 B = BLOCK_K, exactly one
+            //  full row per 8 lanes, 8 rows per 64-lane call, 8 calls
+            //  per 64-row tile.
+            //
+            //  Outer K loop walks the ``num_k_blocks`` BLOCK_K-wide K
+            //  iterations the scheduler hands us (kNumL1BlockKs for
+            //  Linear1, kNumL2BlockKs for Linear2) and accumulates the
+            //  MFMA result into the persistent ``acc[]`` bank.
+            //
+            //  B is FP4 packed-in-GMEM in production but for the
+            //  scaffold pass we treat the weight tensor as 1 B/elt
+            //  (matching what the JIT smoke test allocates); the
+            //  GMEM→LDS transfer therefore mirrors A's 1 B/elt layout.
+            //  FP4 unpacking is part of TODO §B.2 deferred item 1.
+            // ----------------------------------------------------------
+            const auto &srd_a = (phase == sched::BlockPhase::Linear1) ? srd_l1_a : srd_l2_a;
+            const auto &srd_b = (phase == sched::BlockPhase::Linear1) ? srd_l1_b : srd_l2_b;
+
+            const uint32_t a_row_stride_bytes =
+                (phase == sched::BlockPhase::Linear1) ? kHidden : kIntermediateHidden;
+            const uint32_t b_row_stride_bytes =
+                (phase == sched::BlockPhase::Linear1) ? L1_SHAPE_K : L2_SHAPE_K;
+            const uint32_t b_expert_stride_bytes = (phase == sched::BlockPhase::Linear1)
+                                                       ? L1_SHAPE_N * L1_SHAPE_K
+                                                       : L2_SHAPE_N * L2_SHAPE_K;
+
+            // Tile base GMEM byte offsets (uniform across the wave -
+            // only the lane's intra-tile address varies per call).
+            const uint32_t a_wave_row0 =
+                pool_block_idx * BLOCK_M + loader_warp_local * kRowsPerLoaderWave;
+            const uint32_t a_tile_base_bytes = a_wave_row0 * a_row_stride_bytes;
+            // Each loader wave covers the full N width of B for its M
+            // slice (split-along-M partition); n_block_idx selects which
+            // BLOCK_N stripe of the per-expert weight tensor this CTA is
+            // working on, but both waves load the same B columns.
+            // Mutable so the SwiGLU pairing below (Linear1 only) can
+            // override the N-stripe between the gate and up passes.
+            // Linear2 and the single-pass Linear1 fallback leave this
+            // at its n_block_idx-derived value.
+            uint32_t b_wave_col0 = n_block_idx * BLOCK_N;
+            uint32_t b_tile_base_bytes =
+                local_expert_idx * b_expert_stride_bytes + b_wave_col0 * b_row_stride_bytes;
+
+            // E8M0 scales of 1.0 packed into a uint32_t (0x7f per byte).
+            // Kept as a fall-back when an out-of-range SF address would
+            // be queried (e.g. the m_in_block / n_global guards below).
+            constexpr uint32_t kScaleOne = 0x7f7f7f7fu;
+
+            // ------------------------------------------------------------
+            //  Per-tile SFA / SFB pointers (TODO §B.2 deferred item 3).
+            //
+            //  The MFMA-issue role consumes one E8M0 scale byte per
+            //  ``mfma_scale_f32_32x32x64_f8f6f4`` lane per 32 K elements.
+            //  Per Triton's ``chooseScaledMfmaScaleLayout``
+            //  (lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
+            //  function body around the ``lanes = LinearLayout({{kLane,
+            //  {{0,1},{0,2},{0,4},{0,8},{0,16},{1,0}}}, ...)``
+            //  construction), the per-lane scale partition for fp8 single-
+            //  rate at MFMA 32x32x64 is
+            //
+            //      m_scale = lane & 31
+            //      k_scale = (lane >> 5) & 1       // 0..1 inside one
+            //                                       // 64-wide K chunk
+            //
+            //  i.e. lanes [0..31] take the K[0:32] half of A's 32 rows
+            //  and lanes [32..63] take K[32:64].  One scale byte per
+            //  (lane, sub_m, k_inner) for A; same shape for B with the
+            //  N axis replacing M.
+            //
+            //  Source pointers per phase:
+            //    Linear1 A SF   :  ``l1_sf_buffer`` (pool buffer, written
+            //                       by the dispatch role with the
+            //                       ``transform_sf_token_idx`` transpose).
+            //                       Layout per uint32: index by
+            //                         (k_byte / 128) * kNumPaddedSFPoolTokens
+            //                         + transform_sf_token_idx(token_in_block)
+            //                       Each uint32 packs 4 E8M0 bytes
+            //                       (one per 32 K elements).
+            //    Linear1 B SF   :  ``l1_weights_sf`` (per-expert tensor).
+            //                       Production layout: ``(E, N, K/32)``
+            //                       of E8M0 bytes.  The smoke test
+            //                       allocates ``float`` (4 B/scale) for
+            //                       simplicity - the byte we read lands
+            //                       inside that 4× larger buffer, so the
+            //                       address is in-bounds even though the
+            //                       scale value itself is FP32 mantissa
+            //                       garbage.  Numerics-gate work that
+            //                       reconciles the test's allocation
+            //                       width with the production format is
+            //                       tracked alongside the Python
+            //                       reference GEMM (TODO §B.2 follow-up).
+            //    Linear2 A SF   :  ``l2_sf_buffer`` (pool buffer, written
+            //                       by the Linear1 writeback below).
+            //                       Same layout shape as Linear1 SFA
+            //                       with kIntermediateHidden replacing
+            //                       kHidden.
+            //    Linear2 B SF   :  ``l2_weights_sf`` (per-expert tensor).
+            // ------------------------------------------------------------
+            const auto    *sfa_pool_base = (phase == sched::BlockPhase::Linear1)
+                                               ? l1_sf_buffer.get_base_ptr<uint32_t>()
+                                               : l2_sf_buffer.get_base_ptr<uint32_t>();
+            const uint8_t *sfb_weights_base =
+                (phase == sched::BlockPhase::Linear1)
+                    ? reinterpret_cast<const uint8_t *>(l1_weights_sf)
+                    : reinterpret_cast<const uint8_t *>(l2_weights_sf);
+            const uint32_t sfa_pool_token_idx_base = pool_block_idx * SF_BLOCK_M;
+            const uint32_t sfb_n_stride_bytes =
+                (phase == sched::BlockPhase::Linear1) ? L1_SHAPE_K / kGranK : L2_SHAPE_K / kGranK;
+            const uint32_t sfb_expert_stride_bytes = (phase == sched::BlockPhase::Linear1)
+                                                         ? (L1_SHAPE_N * L1_SHAPE_K) / kGranK
+                                                         : (L2_SHAPE_N * L2_SHAPE_K) / kGranK;
+            // Mutable for the same reason as ``b_tile_base_bytes``.
+            uint32_t sfb_n_global_base = n_block_idx * BLOCK_N;
+
+            // ------------------------------------------------------------
+            //  Ring-buffered ``buffer_load_lds`` -> MFMA pipeline.
+            //
+            //  We carry ``kLoaderStages`` LDS slots per wave and prefetch
+            //  stage N+1's GMEM into LDS while stage N's MFMA chain runs.
+            //  Concretely, for each outer K iteration ``k_block`` we
+            //
+            //    1. wait until stage ``k_block``'s GMEM transfer is done
+            //       AND its LDS write has retired (lgkmcnt drain),
+            //    2. ds_read stage ``k_block``'s tile into VGPRs,
+            //    3. issue stage ``k_block + kLoaderStages``'s GMEM read
+            //       BEFORE running MFMA so the GMEM bandwidth overlaps
+            //       the MFMA latency (vmcnt counter absorbs the
+            //       in-flight prefetch),
+            //    4. run the inner-K × sub-tile MFMA chain consuming the
+            //       VGPRs from step 2.
+            //
+            //  The initial fill of stages [0 .. min(num_k_blocks,
+            //  kLoaderStages) - 1] happens before the consumer loop
+            //  starts.  Lane→tile-coordinate mapping for the MFMA
+            //  operand is still scaffold-quality (the ``ds_read``
+            //  ignores the MFMA's lane→data convention, TODO §B.2
+            //  deferred item 4); switching to ``ds_read_pinned`` with
+            //  the MFMA convention is the follow-up patch that also
+            //  unlocks correct numerics.
+            // ------------------------------------------------------------
+            const auto issue_stage = [&](uint32_t stage, uint32_t k_block) {
+                const uint32_t a_k_offset_bytes = k_block * BLOCK_K;
+                const uint32_t b_k_offset_bytes = k_block * BLOCK_K;
+                const uint32_t a_lds            = a_lds_stage0 + stage * kStagedBytesPerStage;
+                const uint32_t b_lds            = b_lds_stage0 + stage * kStagedBytesPerStage;
+#pragma unroll
+                for (uint32_t c = 0u; c < kATileLoadsPerWave; ++c) {
+                    const uint32_t m_in_wave      = c * 8u + lane_idx / 8u;
+                    const uint32_t k_byte_in_tile = (lane_idx % 8u) * kLaneLoadBytes;
+                    const uint32_t ldg_offset = a_tile_base_bytes + m_in_wave * a_row_stride_bytes +
+                                                a_k_offset_bytes + k_byte_in_tile;
+                    const uint32_t lds_offset =
+                        device::a_tile_smem_byte_offset<kRowsPerLoaderWave, BLOCK_K>(
+                            0u, m_in_wave, k_byte_in_tile);
+                    device::load_gmem_to_smem_srd<16>(srd_a, ldg_offset, a_lds + lds_offset,
+                                                      /*soffset=*/0);
+                }
+#pragma unroll
+                for (uint32_t c = 0u; c < kBTileLoadsPerWave; ++c) {
+                    const uint32_t n_in_wave      = c * 8u + lane_idx / 8u;
+                    const uint32_t k_byte_in_tile = (lane_idx % 8u) * kLaneLoadBytes;
+                    const uint32_t ldg_offset = b_tile_base_bytes + n_in_wave * b_row_stride_bytes +
+                                                b_k_offset_bytes + k_byte_in_tile;
+                    const uint32_t lds_offset =
+                        device::b_tile_smem_byte_offset<kColsPerLoaderWave, BLOCK_K>(
+                            0u, n_in_wave, k_byte_in_tile);
+                    device::load_gmem_to_smem_srd<16>(srd_b, ldg_offset, b_lds + lds_offset,
+                                                      /*soffset=*/0);
+                }
+            };
+
+            // ------------------------------------------------------------
+            //  K-loop wrapped in a closure so the SwiGLU pairing path
+            //  below (Linear1 only) can invoke it twice -- once for the
+            //  gate N-stripe and once for the up N-stripe -- with the
+            //  same SMEM ring buffer and the same persistent ``acc[]``
+            //  bank.  The closure captures by reference, so callers can
+            //  mutate ``b_tile_base_bytes`` / ``sfb_n_global_base``
+            //  between invocations to retarget the B side.  Linear2
+            //  invokes it once with the n_block_idx-derived defaults.
+            // ------------------------------------------------------------
+            auto run_k_loop = [&]() {
+            // Reset the accumulator bank to zero for this pass.
+            // ``acc[]`` is persistent across scheduler iterations so
+            // the optimiser cannot collapse the MFMA chain, but we
+            // need a fresh zero start every time we walk K --
+            // whether that is a new (m_block, n_block) iteration or
+            // the up-pass of the dual-pass SwiGLU pairing.
+#pragma unroll
+                for (uint32_t s = 0u; s < kSubTilesPerWave; ++s)
+                    acc[s] = dtype::float32x16{};
+
+                // Prime stage 0.  Subsequent stages are prefetched at
+                // the tail of each consumer iteration so stage N+1's
+                // GMEM read overlaps with stage N's MFMA chain.
+                if (num_k_blocks > 0u)
+                    issue_stage(0u, 0u);
+
+                for (uint32_t k_block = 0u; k_block < num_k_blocks; ++k_block) {
+                    const uint32_t this_stage = k_block % kLoaderStages;
+                    const uint32_t a_stage_byte =
+                        wave_base_byte + this_stage * kStagedBytesPerStage;
+                    const uint32_t b_stage_byte = a_stage_byte + kATileBytes;
+
+                    // Wait for THIS stage's prefetched tile to land in LDS.
+                    // AMD ``buffer_load_lds`` decrements BOTH ``vmcnt`` and
+                    // ``lgkmcnt`` at LDS-write completion (CDNA ISA: the
+                    // GMEM-side completion is the vector-memory event AND
+                    // the LDS-write completion is the lgkm event for the
+                    // same load), so a single ``vmcnt(0)`` here is enough
+                    // to guarantee the upcoming ds_reads see the freshly
+                    // written bytes.  No ``lgkmcnt(0)`` drain is needed.
+                    //
+                    // The next-stage prefetch issued AFTER the ds_reads
+                    // below stays in flight (its loads sit in vmcnt while
+                    // the MFMA chain runs); the next iteration's
+                    // ``vmcnt(0)`` waits only on it specifically.
+                    //
+                    // hipcc's AMDGPUInsertWaitcnts pass tracks the builtin
+                    // ds_read precisely, so the ``lgkmcnt(N)`` it inserts
+                    // before the first MFMA waits only on THIS stage's
+                    // ds_reads -- the prefetch's lgkmcnt scoreboard slot is
+                    // newer and stays pending across MFMA issue.  No
+                    // ``sync_warp`` either: the loader role is single
+                    // wave-per-role and wave64 is naturally lockstep.
+                    device::wait_vmcnt<0>();
+
+                    // Issue the next prefetch (stage ``k_block + 1``) into
+                    // its ring slot BEFORE running MFMA.  The GMEM
+                    // transaction queues behind the MFMA chain below; even
+                    // with the pessimistic drain above, ``vmcnt`` lets the
+                    // GMEM bus stay busy while MFMA runs.
+                    if (k_block + 1u < num_k_blocks) {
+                        issue_stage((k_block + 1u) % kLoaderStages, k_block + 1u);
+                    }
+
+                    // Inner-K + sub-tile MFMA partition with the
+                    // ``mfma_scale_f32_32x32x64_f8f6f4`` operand convention.
+                    //
+                    // Per Triton's ``chooseScaledMfmaScaleLayout`` (the
+                    // authoritative AMD MFMA scaled-fp8 layout reference, see
+                    // ``Triton-distributed/3rdparty/triton/lib/Dialect/
+                    // TritonGPU/IR/LinearLayoutConversions.cpp``):
+                    //
+                    //   for 32x32x64 f8f6f4, each lane takes 32 K elements
+                    //   from A (and from B, treating its M as N).  Lanes
+                    //   [0..31] collectively handle A[0..31][0..31]; lanes
+                    //   [32..63] handle A[0..31][32..63].  Per-lane:
+                    //     m_in_subtile = lane & 31
+                    //     k_base       = ((lane >> 5) & 1) * 32
+                    //   The lane then consumes 32 consecutive K bytes
+                    //   starting at ``k_base``.
+                    //
+                    // Because the LDS is 128 B / 64-bank swizzled with a
+                    // 16 B quantisation (``swizzle_offset_128b_64bank``), the
+                    // 32 K bytes per lane straddle TWO 16 B swizzle chunks
+                    // that are NOT guaranteed to land contiguously in LDS.
+                    // Issue two ``ds_read_b128`` (one per chunk) per lane and
+                    // concatenate them into the ``int32x8`` operand.  This is
+                    // the gfx950 analogue of CUTLASS's two-half-tile read for
+                    // SM100 swizzle.
+                    //
+                    // The output partition is (sub_m, sub_n) where sub_m ∈
+                    // [0, kSubTilesM) and sub_n ∈ [0, kSubTilesN).  A is
+                    // reused across sub_n (load once per sub_m); B is reused
+                    // across sub_m (load once per sub_n); the MFMA grid then
+                    // walks all kSubTilesM × kSubTilesN tiles.
+                    auto read_int32x8 = [&](uint32_t base_byte, uint32_t off_lo, uint32_t off_hi) {
+                        dtype::int32x8 v;
+                        const auto     lo =
+                            *reinterpret_cast<const uint4 *>(smem_buffer + base_byte + off_lo);
+                        const auto hi =
+                            *reinterpret_cast<const uint4 *>(smem_buffer + base_byte + off_hi);
+                        reinterpret_cast<uint4 *>(&v)[0] = lo;
+                        reinterpret_cast<uint4 *>(&v)[1] = hi;
+                        return v;
+                    };
+
+#pragma unroll
+                    for (uint32_t k_inner = 0u; k_inner < kInnerKIters; ++k_inner) {
+                        const uint32_t k_base_in_subtile =
+                            k_inner * kMfmaK + ((lane_idx >> 5u) & 1u) * 32u;
+                        const uint32_t m_in_subtile = lane_idx & 31u;
+
+                        dtype::int32x8 a_vec[kSubTilesM];
+#pragma unroll
+                        for (uint32_t sub_m = 0u; sub_m < kSubTilesM; ++sub_m) {
+                            const uint32_t m_in_wave = sub_m * kMfmaM + m_in_subtile;
+                            const uint32_t off_lo =
+                                device::a_tile_smem_byte_offset<kRowsPerLoaderWave, BLOCK_K>(
+                                    0u, m_in_wave, k_base_in_subtile);
+                            const uint32_t off_hi =
+                                device::a_tile_smem_byte_offset<kRowsPerLoaderWave, BLOCK_K>(
+                                    0u, m_in_wave, k_base_in_subtile + 16u);
+                            a_vec[sub_m] = read_int32x8(a_stage_byte, off_lo, off_hi);
+                        }
+
+                        dtype::int32x8 b_vec[kSubTilesN];
+#pragma unroll
+                        for (uint32_t sub_n = 0u; sub_n < kSubTilesN; ++sub_n) {
+                            const uint32_t n_in_wave = sub_n * kMfmaN + m_in_subtile;
+                            const uint32_t off_lo =
+                                device::b_tile_smem_byte_offset<kColsPerLoaderWave, BLOCK_K>(
+                                    0u, n_in_wave, k_base_in_subtile);
+                            const uint32_t off_hi =
+                                device::b_tile_smem_byte_offset<kColsPerLoaderWave, BLOCK_K>(
+                                    0u, n_in_wave, k_base_in_subtile + 16u);
+                            b_vec[sub_n] = read_int32x8(b_stage_byte, off_lo, off_hi);
+                        }
+
+                        // Per-lane SF bytes for this k_inner.  Each lane
+                        // covers 32 K elements of A (and 32 K elements of B
+                        // along its N axis), so we read ONE byte per
+                        // (lane, sub_m, k_inner) for SFA and ONE per
+                        // (lane, sub_n, k_inner) for SFB.  The MFMA only
+                        // looks at the low byte of the uint32_t when both
+                        // operand types are fp8 single-rate; the upper 3
+                        // bytes are don't-care (set to 0x7f = E8M0 1.0 so
+                        // any latent broadcast on different op-type combos
+                        // stays well-defined).
+                        //
+                        // Outer K offset (in bytes) of this MFMA's K[0:32]
+                        // half.  k_block * BLOCK_K + k_inner * 64 + 32 for
+                        // lanes with (lane >> 5) == 1, +0 otherwise.
+                        const uint32_t k_byte_outer =
+                            k_block * BLOCK_K + k_inner * kMfmaK + ((lane_idx >> 5u) & 1u) * 32u;
+                        // SFA pool dword index: each uint32_t covers 128
+                        // K elements (4 E8M0 bytes); for BLOCK_K == 128 the
+                        // outer k_block selects the dword index.  Byte
+                        // inside the dword is the 32-K group inside the
+                        // 128-K block: ``(k_byte_outer & 127) / 32``.
+                        const uint32_t sfa_dword_idx     = k_byte_outer / 128u;
+                        const uint32_t sfa_byte_in_dword = ((k_byte_outer & 127u) >> 5u);
+
+                        uint32_t sfb_byte[kSubTilesN];
+#pragma unroll
+                        for (uint32_t sub_n = 0u; sub_n < kSubTilesN; ++sub_n) {
+                            const uint32_t n_in_wave = sub_n * kMfmaN + m_in_subtile;
+                            // Split-along-M partition: both loader waves
+                            // cover the full N width of the BLOCK_N stripe,
+                            // so n_in_block == n_in_wave (no per-wave N
+                            // offset).
+                            const uint32_t n_global = sfb_n_global_base + n_in_wave;
+                            const uint32_t sfb_byte_offset =
+                                local_expert_idx * sfb_expert_stride_bytes +
+                                n_global * sfb_n_stride_bytes + k_byte_outer / kGranK;
+                            const uint8_t raw = __ldg(sfb_weights_base + sfb_byte_offset);
+                            sfb_byte[sub_n]   = 0x7f7f7f00u | static_cast<uint32_t>(raw);
+                        }
+
+#pragma unroll
+                        for (uint32_t sub_m = 0u; sub_m < kSubTilesM; ++sub_m) {
+                            const uint32_t m_in_block = loader_warp_local * kRowsPerLoaderWave +
+                                                        sub_m * kMfmaM + m_in_subtile;
+                            const uint32_t sf_token_idx =
+                                sfa_pool_token_idx_base + transform_sf_token_idx(m_in_block);
+                            const uint32_t sfa_dword =
+                                __ldg(sfa_pool_base + sfa_dword_idx * kNumPaddedSFPoolTokens +
+                                      sf_token_idx);
+                            const uint32_t sfa_raw =
+                                (sfa_dword >> (sfa_byte_in_dword * 8u)) & 0xffu;
+                            const uint32_t scale_a = 0x7f7f7f00u | sfa_raw;
+#pragma unroll
+                            for (uint32_t sub_n = 0u; sub_n < kSubTilesN; ++sub_n) {
+                                const uint32_t sub = sub_m * kSubTilesN + sub_n;
+                                acc[sub]           = device::mfma_scale_f32_32x32x64_f8f6f4<
+                                              __hip_fp8_e4m3, __hip_fp8_e4m3>::run(a_vec[sub_m], b_vec[sub_n],
+                                                                                   acc[sub], scale_a,
+                                                                                   sfb_byte[sub_n]);
+                            }
+                        }
+                    }
+                } // end of for (k_block) inside run_k_loop
+            }; // end of run_k_loop lambda
+
+            // ------------------------------------------------------------
+            //  SwiGLU pairing dispatch (TODO §B.2 deferred follow-up).
+            //
+            //  Linear1's output is gate||up over a 2*kIntermediateHidden
+            //  N dimension; the L2 pool slot consumed by Linear2 is only
+            //  kIntermediateHidden wide and holds ``silu(gate)*up`` per
+            //  element.  Two scheduler n_block callbacks are needed to
+            //  produce one L2 pool row -- the lower half holds gate, the
+            //  upper half holds up.  These two callbacks land on
+            //  DIFFERENT SMs (the scheduler hands every n_block_idx of
+            //  the same (m_block, expert) to a separate SM via
+            //  block_idx += kNumSMs), so we cannot pass partial sums
+            //  between them in registers.
+            //
+            //  Solution: collapse both halves into the same callback by
+            //  having the gate-half callback (n_block_idx in
+            //  [0, kL1GateNBlocks)) walk the K loop twice -- once for
+            //  the gate B-stripe, once for the up B-stripe -- and the
+            //  up-half callback (n_block_idx >= kL1GateNBlocks) return
+            //  early.  Total compute and GMEM traffic are unchanged
+            //  (the original placeholder code computed gate then threw
+            //  it away).  SM utilisation in the L1 phase drops to ~50 %
+            //  because half the n_block callbacks no-op, but this is
+            //  amortised over the many (m_block, expert) iterations
+            //  each SM handles in a persistent CTA lifetime.
+            //
+            //  The L2 arrival mask is set for BOTH bits (gate and up)
+            //  at the end of the writeback so the Linear2 wait
+            //  ``mask == (1<<kNumL1BlockNs)-1`` continues to fire.
+            // ------------------------------------------------------------
+            constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+            static_assert(kNumL1BlockNs >= 2u && kNumL1BlockNs % 2u == 0u,
+                          "L1 N must split evenly into gate||up halves");
+            static_assert(kIntermediateHidden % BLOCK_N == 0u,
+                          "BLOCK_N must divide kIntermediateHidden for SwiGLU pairing");
+            constexpr uint32_t kL1GateNBlocks = kNumL1BlockNs / 2u;
+
+            dtype::float32x16 acc_gate[kSubTilesPerWave];
+            bool              has_gate = false;
+            if (phase == sched::BlockPhase::Linear1) {
+                // Up-half callback is paired into the gate-half callback
+                // -- skip without touching ``acc[]`` (the next iteration
+                // of for_each_block will reset it).
+                if (n_block_idx >= kL1GateNBlocks)
+                    return;
+
+                // Pass 1: gate stripe (current b_tile_base_bytes /
+                // sfb_n_global_base already point at the gate N offset
+                // because n_block_idx is in [0, kL1GateNBlocks)).
+                run_k_loop();
+
+#pragma unroll
+                for (uint32_t s = 0u; s < kSubTilesPerWave; ++s)
+                    acc_gate[s] = acc[s];
+                has_gate = true;
+
+                // Pass 2: up stripe.  Shift B by kIntermediateHidden
+                // columns; same K, same A.
+                b_wave_col0 += kIntermediateHidden;
+                b_tile_base_bytes += kIntermediateHidden * b_row_stride_bytes;
+                sfb_n_global_base += kIntermediateHidden;
+                run_k_loop();
+            } else {
+                run_k_loop();
+            }
+            (void) has_gate;
+
+            // ============================================================
+            //  Writeback (TODO §B.2 deferred item 2).  Drain the
+            //  ``acc[]`` AGPR bank to GMEM per the MFMA 32×32 output
+            //  layout from Triton's ``mfmaToLinearLayout``
+            //  (LinearLayoutConversions.cpp, non-transposed branch):
+            //
+            //      LinearLayout({{kRegister, {{0,1},{0,2},{0,8},{0,16}}},
+            //                    {kLane,    {{1,0},{2,0},{4,0},{8,0},
+            //                                {16,0},{0,4}}}},
+            //                   {kOutM, kOutN});
+            //
+            //  Output dim order is (M, N).  Per lane ``l``, per register
+            //  ``i ∈ [0, 16)``:
+            //      M = lane & 31
+            //      N = ((lane >> 5) & 1) * 4 + kNPattern[i]
+            //      kNPattern[i] = expand 4-bit i with bits 0..3 mapping
+            //                     to N offsets {1, 2, 8, 16} respectively
+            //                  = {0, 1, 2, 3,
+            //                     8, 9, 10, 11,
+            //                     16,17,18,19,
+            //                     24,25,26,27}
+            //
+            //  Per phase:
+            //    Linear1  -> SwiGLU(gate, up) per element, FP8 quantise
+            //                with E8M0 1.0 scale, store to the L2 pool
+            //                slot (m_in_block × kIntermediateHidden).
+            //                ``acc_gate[sub][i]`` holds the gate MFMA
+            //                accumulator from the first run_k_loop pass
+            //                above; ``acc[sub][i]`` holds the up MFMA
+            //                accumulator from the second pass.  Compute
+            //                ``silu(gate) * up`` per (sub, i), cast to
+            //                ``__hip_fp8_e4m3``, and write to the pool
+            //                column ``n_block_idx*BLOCK_N + n_in_wave``
+            //                (every gate-half callback owns one stripe
+            //                of width BLOCK_N).  Mirrors DG's SM100
+            //                SwiGLU body (sm100_fp8_fp4_mega_moe.cuh)
+            //                without the bf16 round trip -- the FP32
+            //                silu suffices here because the bf16 cast
+            //                is a precision detail bound to the
+            //                production SM100 TMEM_LOAD layout, not a
+            //                correctness requirement.
+            //                Real UE8M0 per-block scale (vs the fixed
+            //                1.0 placeholder) lands alongside the
+            //                Python reference numerics gate, see TODO
+            //                §B.2 follow-up.
+            //
+            //    Linear2  -> per-element BF16 cast, push into the
+            //                combine buffer.  Destination is the source
+            //                token's combine slot on the source rank:
+            //                ``combine_token_buffer.get_rank_buffer(
+            //                meta.topk_idx).get_data_buffer(
+            //                meta.token_idx)`` translated through
+            //                ``sym_buffer.map(..., meta.rank_idx)``.
+            //                The epilogue's combine pass reads this
+            //                buffer once the cross-rank push is
+            //                complete.  No explicit loader→epilogue
+            //                sync is required for the smoke test
+            //                (numerics gate already deferred); a
+            //                production patch will add a
+            //                ``red_add_rel(workspace.get_l1_arrival
+            //                _count_ptr, kFinishFlag)``-style signal
+            //                so the combine read does not race.
+            // ============================================================
+            {
+                constexpr uint32_t kNPattern[16] = {
+                    0u, 1u, 2u, 3u, 8u, 9u, 10u, 11u, 16u, 17u, 18u, 19u, 24u, 25u, 26u, 27u,
+                };
+                const uint32_t m_lane      = lane_idx & 31u;
+                const uint32_t n_lane_half = ((lane_idx >> 5u) & 1u) * 4u;
+                const uint32_t valid_m     = scheduler.template get_valid_m<false>();
+
+                if (phase == sched::BlockPhase::Linear1) {
+                    // SwiGLU pairing: acc_gate holds gate, acc holds up.
+                    // Write ``silu(gate)*up`` per element into the L2
+                    // pool slot column ``n_block_idx*BLOCK_N+n_in_wave``
+                    // (already in [0, kIntermediateHidden) because we
+                    // early-returned for n_block_idx >= kL1GateNBlocks).
+                    auto *l2_pool_base = l2_token_buffer.get_base_ptr<uint8_t>();
+
+#pragma unroll
+                    for (uint32_t sub_m = 0u; sub_m < kSubTilesM; ++sub_m) {
+                        const uint32_t m_in_block =
+                            loader_warp_local * kRowsPerLoaderWave + sub_m * kMfmaM + m_lane;
+                        if (m_in_block >= valid_m)
+                            continue;
+                        const uint32_t pool_token_idx = pool_block_idx * BLOCK_M + m_in_block;
+                        auto          *dst_row =
+                            l2_pool_base + pool_token_idx * fp8_intermediate_token_layout.num_bytes;
+#pragma unroll
+                        for (uint32_t sub_n = 0u; sub_n < kSubTilesN; ++sub_n) {
+                            const uint32_t sub = sub_m * kSubTilesN + sub_n;
+#pragma unroll
+                            for (uint32_t i = 0u; i < 16u; ++i) {
+                                const uint32_t n_in_wave =
+                                    sub_n * kMfmaN + n_lane_half + kNPattern[i];
+                                const uint32_t intermediate_col = n_block_idx * BLOCK_N + n_in_wave;
+                                if (intermediate_col >= kIntermediateHidden)
+                                    continue;
+                                const float gate = acc_gate[sub][i];
+                                const float up   = acc[sub][i];
+                                // silu(x) = x / (1 + exp(-x)).  Use the
+                                // fast ``__expf`` HIP intrinsic; DG's
+                                // SM100 path does the same.  No clamp
+                                // here -- the production clamp lives in
+                                // the Python wrapper alongside the
+                                // UE8M0 scale.
+                                const float          silu_gate = gate / (1.0f + __expf(-gate));
+                                const float          swiglu    = silu_gate * up;
+                                const __hip_fp8_e4m3 quant = static_cast<__hip_fp8_e4m3>(swiglu);
+                                dst_row[intermediate_col] =
+                                    reinterpret_cast<const uint8_t &>(quant);
+                            }
+                        }
+                    }
+
+                    // Mark BOTH the gate (n_block_idx) and up
+                    // (n_block_idx + kL1GateNBlocks) stripes complete.
+                    // The Linear2 K-loop waits for
+                    // ``l2_arrival_mask == (1ull << kNumL1BlockNs) - 1``
+                    // before consuming the L2 pool; we own both halves
+                    // of this (m_block, intermediate_col_stripe)
+                    // because the up-half callback short-circuits.
+                    __threadfence();
+                    if (elect_one()) {
+                        constexpr uint64_t kGateBit  = 1ull;
+                        const uint64_t     pair_mask = (kGateBit << n_block_idx) |
+                                                   (kGateBit << (n_block_idx + kL1GateNBlocks));
+                        red_or_rel_gpu(workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                                       pair_mask);
+                    }
+                } else {
+                    // Linear2 -> combine buffer.  Per token, look up the
+                    // source rank / topk / token_idx and push the BF16
+                    // partial sum into the source rank's symmetric slot.
+                    const auto write_combine = [&](uint32_t m_in_block, uint32_t n_global,
+                                                   float val) {
+                        const auto meta = *workspace.get_token_src_metadata_ptr(
+                            pool_block_idx * BLOCK_M + m_in_block);
+                        auto *dst_local = combine_token_buffer.get_rank_buffer(meta.topk_idx)
+                                              .get_data_buffer(meta.token_idx)
+                                              .get_base_ptr<uint8_t>();
+                        auto                *dst_remote = sym_buffer.map(dst_local, meta.rank_idx);
+                        const __hip_bfloat16 bf         = __float2bfloat16(val);
+                        *reinterpret_cast<__hip_bfloat16 *>(dst_remote +
+                                                            n_global * sizeof(__hip_bfloat16)) = bf;
+                    };
+
+#pragma unroll
+                    for (uint32_t sub_m = 0u; sub_m < kSubTilesM; ++sub_m) {
+                        const uint32_t m_in_block =
+                            loader_warp_local * kRowsPerLoaderWave + sub_m * kMfmaM + m_lane;
+                        if (m_in_block >= valid_m)
+                            continue;
+#pragma unroll
+                        for (uint32_t sub_n = 0u; sub_n < kSubTilesN; ++sub_n) {
+                            const uint32_t sub = sub_m * kSubTilesN + sub_n;
+#pragma unroll
+                            for (uint32_t i = 0u; i < 16u; ++i) {
+                                const uint32_t n_in_wave =
+                                    sub_n * kMfmaN + n_lane_half + kNPattern[i];
+                                const uint32_t n_global = n_block_idx * BLOCK_N + n_in_wave;
+                                if (n_global >= kHidden)
+                                    continue;
+                                write_combine(m_in_block, n_global, acc[sub][i]);
+                            }
+                        }
+                    }
+                }
+            }
         });
+
+        // Sink every sub-tile accumulator into LDS so the optimiser
+        // cannot collapse the MFMA loop down to its first iteration.
+        // Only lane 0 writes to keep the sink slot from being a hot
+        // bank - the entire wave's accumulator bank is observable via
+        // that single lane because the wave's MFMA chain depends on
+        // all 64 lanes (each lane contributes its operand fragment to
+        // every MFMA call).
+        if (elect_one()) {
+            auto *sink_ptr = reinterpret_cast<dtype::float32x16 *>(smem_buffer + sink_off);
+#pragma unroll
+            for (uint32_t sub = 0u; sub < kSubTilesPerWave; ++sub)
+                sink_ptr[sub] = acc[sub];
+        }
+
+        // Cross-role gate paired with the dispatch cleanup at L865 and
+        // the epi side at the bottom of its for_each_block.  Holding
+        // the loader here until cleanup has fired is harmless (the
+        // loader is exiting anyway); the load-bearing direction is
+        // that the dispatch cleanup cannot zero ``l1_arrival_count`` /
+        // ``l2_arrival_mask`` until every loader wave on this CTA has
+        // observed its last ``expected`` value.  Without this arrive,
+        // the loader's tight spin (L1004 / L1009) can outlive the
+        // cleanup's plain-store zeros and read 0 forever.
+        sync_unaligned(named_bar, kNumThreads, kBarDispEpi);
         return;
     }
 
@@ -886,8 +1710,6 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
     //  ``scheduler.for_each_block`` so the per-wave scheduling holds.
     // =================================================================
     if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        if (sm_idx == 0u && thread_idx == kEpiLeader)
-            printf("[r%u/epi] pre-for_each_block\n", sym_buffer.rank_idx);
         scheduler.for_each_block([&](sched::BlockPhase phase, uint32_t local_expert_idx,
                                      uint32_t num_k_blocks, uint32_t m_block_idx,
                                      uint32_t n_block_idx) {
@@ -896,34 +1718,35 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
             // (writes into the combine buffer).  We only need to mark
             // arrivals on the workspace at this alignment stage; the
             // tile-level math will be filled in by the next patch.
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            if (phase == sched::BlockPhase::Linear1) {
-                if (elect_one()) {
-                    red_add_rel(workspace.get_l1_arrival_count_ptr(pool_block_idx), 0u);
-                    red_or_rel_gpu(workspace.get_l2_arrival_mask_ptr(pool_block_idx),
-                                   1ull << n_block_idx);
-                }
-            } else {
-                (void) num_k_blocks;
-                (void) local_expert_idx;
-            }
+            // L2 arrival mask used to be set here as a placeholder so
+            // the loader's Linear2 K-loop wait would not deadlock; the
+            // loader role now sets the bit at the end of its Linear1
+            // writeback (after the actual L2 pool data is in place),
+            // so the epilogue's per-block callback no longer needs to.
+            (void) phase;
+            (void) num_k_blocks;
+            (void) local_expert_idx;
+            (void) m_block_idx;
+            (void) n_block_idx;
         });
 
-        if (sm_idx == 0u && thread_idx == kEpiLeader)
-            printf("[r%u/epi] post-for_each_block\n", sym_buffer.rank_idx);
         // Pair the dispatch cleanup cross-sync (``kBarDispEpi``) so the
         // dispatch waves can safely wipe the L1/L2 arrival counters
-        // once every epilogue wave has exited ``for_each_block``.
-        // Mirrors DG ``ptx::sync_unaligned(..., kDispatchWithEpilogueBarrierIdx)``.
-        sync_unaligned(named_bar, kBarThreads[kBarDispEpi], kBarDispEpi);
-        if (sm_idx == 0u && thread_idx == kEpiLeader)
-            printf("[r%u/epi] post-sync_unaligned(kBarDispEpi)\n", sym_buffer.rank_idx);
+        // once every epilogue AND loader/MMA wave has exited
+        // ``for_each_block``.  Participant count is the full CTA
+        // (``kNumThreads``); see the dispatch-side comment above L865.
+        sync_unaligned(named_bar, kNumThreads, kBarDispEpi);
 
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kBarThreads[kBarEpiGrid], 1, 2>(
+        // Serializer with dispatch's nvlink_barrier-2: blocks epi until
+        // dispatch's nvlink_barrier-2 has incremented the shared
+        // nvl_barrier_counter, so this rank's nvlink_barrier-epi below
+        // reads the post-increment value and lands on the next
+        // (phase, sign) pair.  See kBarDispEpi2 allocation note.
+        sync_unaligned(named_bar, kNumDispatchThreads + kNumEpilogueThreads, kBarDispEpi2);
+
+        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads, 1, 2>(
             workspace, sym_buffer, named_bar, kBarEpiGrid, kEpiLeader, sm_idx, thread_idx,
             /*sync_prologue=*/true, /*sync_epilogue=*/true);
-        if (sm_idx == 0u && thread_idx == kEpiLeader)
-            printf("[r%u/epi] post-nvlink_barrier-epi\n", sym_buffer.rank_idx);
 
         // ----------------------------------------------------------------
         // Combine: per-token reduce across topk into the output buffer.
@@ -1040,23 +1863,28 @@ hipError_t launch_fp8_fp4_mega_moe_impl(void *y, int *cumulative_local_expert_re
 
     // LDS budget for the device kernel's ``extern __shared__`` carve-out.
     //
-    // MI355X exposes 160 KiB of LDS per CU (CDNA4).  Once the A/B loader
-    // body lands, ``kNumStages`` ring-buffered stages of A (FP8) + B
-    // (FP4-unpacked) + SFA + SFB tiles dominate the carve-out:
+    // MI355X exposes 160 KiB of LDS per CU (CDNA4).  The loader now
+    // ring-buffers ``kLoaderStages`` × per-stage (A | B | SFA | SFB)
+    // tiles per wave, where ``kLoaderStages`` is the minimum of
+    // ``kNumStages`` and the largest stage count that fits the budget:
     //
     //   per stage  : LOAD_BLOCK_M * BLOCK_K     (A, FP8)   = 8192 B
     //                LOAD_BLOCK_N * BLOCK_K     (B, FP4u)  = 16384 B
     //                SF_BLOCK_M  * sizeof(u32)             = 512 B
     //                SF_BLOCK_N  * sizeof(u32)             = 512 B
     //                                            ~= 25 KiB / stage
-    //   4 stages   ~= 100 KiB
-    //   + scheduler / barrier / expert-count pad ~= 8 KiB
+    //   2 stages × 2 waves   ~=  100 KiB    (smoke shape: kLoaderStages = 2)
+    //   + accumulator sinks × 2 waves      ~=    1 KiB
+    //   + scheduler / barrier / expert-count pad ~= 1 KiB
+    //                                       ====================
+    //                                                  ~=  102 KiB
     //
-    // 96 KiB (the previous setting matching SM100's TMEM-style budget)
-    // overruns the loader carve-out by ~10 KiB.  Bump to 140 KiB - the
-    // largest value that comfortably stays under the 160 KiB cap with
-    // headroom for the named-barrier state, scheduler workspace and
-    // future epilogue staging buffers.  See TODO.md Section B item 3.
+    // The device-side ``static_assert(kLoaderBaseBytes +
+    // kNumMMANonEpilogueWarps * kLoaderWaveBytes <= kSmemBytesBudget)``
+    // enforces this at compile time.  Stays comfortably under the
+    // 160 KiB cap with headroom for the named-barrier state, scheduler
+    // workspace and future epilogue staging buffers.  See TODO.md
+    // Section B item 3.
     constexpr uint32_t kSmemBytes = 140u * 1024u;
 
     const dim3 grid(kNumSMs);

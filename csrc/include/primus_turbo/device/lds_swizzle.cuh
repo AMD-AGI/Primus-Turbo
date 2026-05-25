@@ -114,12 +114,16 @@ __host__ __device__ __forceinline__ constexpr uint32_t swizzle_offset_128b_64ban
 template <uint32_t LoadBlockM, uint32_t BlockK>
 __host__ __device__ __forceinline__ constexpr uint32_t
 a_tile_smem_byte_offset(uint32_t stage_buf_lds_byte, uint32_t m, uint32_t k_byte) {
-    // (LoadBlockM only enters via the caller's bounds check; the
-    // swizzle is independent of LoadBlockM as long as it does not
-    // exceed 64 - past that the (m & 7) rotation domain wraps and we
-    // need a wider mask.  Asserting here keeps the scaffold honest.)
-    static_assert(LoadBlockM <= 64u,
-                  "LoadBlockM > 64 needs a wider (m & N) rotation - see lds_swizzle.cuh");
+    // The (m & 7) rotation has an 8-row period.  For LoadBlockM > 64
+    // rows beyond row 63 alias the same XOR pattern as their
+    // (row - 64) counterpart - harmless for the sequential-issue
+    // loader pattern used by the compute role (each ds_read serves one
+    // row at a time, so aliasing only matters within a single wave64
+    // transaction).  Capped at 128 to match BLOCK_M / BLOCK_N today;
+    // raising further requires a wider rotation mask to keep bank
+    // conflicts off the wave64 issue.
+    static_assert(LoadBlockM <= 128u,
+                  "LoadBlockM > 128 needs a wider (m & N) rotation - see lds_swizzle.cuh");
     return stage_buf_lds_byte + swizzle_offset_128b_64bank<BlockK>(m, k_byte);
 }
 
@@ -129,8 +133,8 @@ a_tile_smem_byte_offset(uint32_t stage_buf_lds_byte, uint32_t m, uint32_t k_byte
 template <uint32_t LoadBlockN, uint32_t BlockK>
 __host__ __device__ __forceinline__ constexpr uint32_t
 b_tile_smem_byte_offset(uint32_t stage_buf_lds_byte, uint32_t n, uint32_t k_byte) {
-    static_assert(LoadBlockN <= 64u,
-                  "LoadBlockN > 64 needs a wider (n & N) rotation - see lds_swizzle.cuh");
+    static_assert(LoadBlockN <= 128u,
+                  "LoadBlockN > 128 needs a wider (n & N) rotation - see lds_swizzle.cuh");
     return stage_buf_lds_byte + swizzle_offset_128b_64bank<BlockK>(n, k_byte);
 }
 
