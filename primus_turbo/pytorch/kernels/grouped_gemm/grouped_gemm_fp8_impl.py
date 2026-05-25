@@ -132,7 +132,49 @@ _HK_FP8_RRR_CANDIDATES: tuple[tuple[int, int], ...] = (
     # Adding it as a defensive candidate so the autotuner has a backup
     # near-optimum when (16,4)/(4,4) lose to timing noise on a given run.
     (12, 4),
+    # Session 7 (2026-05-25): benchmark/ops/probe_rrr_per_shape.py — full
+    # brute-force median-of-3 probe across the 24-shape (gpt_oss/dsv3/qwen)
+    # MoE matrix found (4, 32) as Top-1 for gpt_oss-down-B4-M2048 (1.261×)
+    # and tied with current cfgs on gpt_oss-down-B16-M2048. Adding so the
+    # autotuner can reach it when noise picks (4, 4) under the sweep.
+    (4, 32),
 )
+
+# Session 7 per-shape autotune override table — bypasses sweep.
+# Built by probe_rrr_per_shape.py (median-of-3 trials × full 16-cfg ×
+# bn∈{0,128} sweep on chi2762 gfx950, 2026-05-25). Key = (m_total, n, k).
+# Value = (gm, xcds, bn). Saves first-call autotune cost AND avoids the
+# noise-driven sweep landing on a suboptimal cfg.
+# Probe geomean of these picks = 1.100× Triton (min 1.033, max 1.309) —
+# the current RRR v2 kernel structural ceiling; 4/24 shapes pass 1.15×.
+# Further gain requires Session 5/5.1 B-pretranspose (currently BLOCKED
+# on subtile-load compiler reorder bug).
+_HK_FP8_RRR_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int]] = {
+    (8192,  5760, 2880): (4, 0, 128),     # gpt_oss-up   B=4  M=2048  1.309x
+    (8192,  2880, 2880): (4, 32, 0),      # gpt_oss-down B=4  M=2048  1.261x
+    (16384, 5760, 2880): (4, 0, 0),       # gpt_oss-up   B=4  M=4096  1.091x
+    (16384, 2880, 2880): (8, 4, 0),       # gpt_oss-down B=4  M=4096  1.118x
+    (32768, 5760, 2880): (1, 4, 0),       # gpt_oss-up   B=16 M=2048  1.042x
+    (32768, 2880, 2880): (1, 4, 0),       # gpt_oss-down B=16 M=2048  1.072x
+    (65536, 5760, 2880): (1, 4, 0),       # gpt_oss-up   B=16 M=4096  1.054x
+    (65536, 2880, 2880): (4, 4, 0),       # gpt_oss-down B=16 M=4096  1.119x
+    (8192,  4096, 7168): (4, 0, 128),     # dsv3-up      B=4  M=2048  1.056x
+    (8192,  7168, 2048): (4, 4, 0),       # dsv3-down    B=4  M=2048  1.042x
+    (16384, 4096, 7168): (24, 0, 0),      # dsv3-up      B=4  M=4096  1.059x
+    (16384, 7168, 2048): (4, 4, 0),       # dsv3-down    B=4  M=4096  1.073x
+    (32768, 4096, 7168): (8, 4, 0),       # dsv3-up      B=16 M=2048  1.035x
+    (32768, 7168, 2048): (4, 4, 0),       # dsv3-down    B=16 M=2048  1.047x
+    (65536, 4096, 7168): (4, 0, 0),       # dsv3-up      B=16 M=4096  1.033x
+    (65536, 7168, 2048): (16, 4, 0),      # dsv3-down    B=16 M=4096  1.035x
+    (8192,  3072, 4096): (24, 0, 0),      # qwen235b-up   B=4  M=2048 1.037x
+    (8192,  4096, 1536): (16, 0, 0),      # qwen235b-down B=4  M=2048 1.284x
+    (16384, 3072, 4096): (16, 4, 0),      # qwen235b-up   B=4  M=4096 1.082x
+    (16384, 4096, 1536): (4, 8, 128),     # qwen235b-down B=4  M=4096 1.301x
+    (32768, 3072, 4096): (1, 4, 0),       # qwen235b-up   B=16 M=2048 1.055x
+    (32768, 4096, 1536): (2, 4, 0),       # qwen235b-down B=16 M=2048 1.093x
+    (65536, 3072, 4096): (12, 4, 0),      # qwen235b-up   B=16 M=4096 1.094x
+    (65536, 4096, 1536): (8, 4, 0),       # qwen235b-down B=16 M=4096 1.072x
+}
 
 _AUTOTUNE_WARMUP_ITERS = 5
 _AUTOTUNE_TIMED_ITERS = int(os.environ.get("HK_FP8_AUTOTUNE_ITERS", "50"))  # 2026-05-22 R4: env override, default 50
@@ -496,6 +538,13 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             # off in bn=128 — auto-falls back to bn=0 at dispatcher).
             n_inner, k_out = b_in.shape[1], b_in.shape[2]
             op = torch.ops.primus_turbo_cpp_extension.hk_grouped_rrr_fp8
+            # Session 7: per-shape override (probe_rrr_per_shape.py winners).
+            # Bypasses autotune sweep when shape matches the 24-MoE matrix.
+            override = _HK_FP8_RRR_OVERRIDES.get((m_total, n_inner, k_out))
+            if override is not None:
+                gm, xcds, bn = override
+                return op(a_in, b_in, a_scales, b_scales, group_offs,
+                          gm, avg_m, xcds, out_dtype, bn)
             rrr_bn_choices = (0, 128) if (n_inner % 128 == 0) else (0,)
             rrr_candidates_3way = tuple(
                 (gm_, xcds_, bn_)
