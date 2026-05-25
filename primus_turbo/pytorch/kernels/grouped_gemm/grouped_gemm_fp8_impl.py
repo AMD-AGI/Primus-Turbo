@@ -160,31 +160,35 @@ _HK_FP8_RRR_CHUNK_CHOICES: tuple[int, ...] = tuple(
     int(x) for x in os.environ.get("HK_FP8_RRR_CHUNK_CHOICES", "0").split(",") if x
 )
 
-_HK_FP8_RRR_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int]] = {
-    (8192,  5760, 2880): (4, 0, 128),     # gpt_oss-up   B=4  M=2048  1.309x
-    (8192,  2880, 2880): (4, 32, 0),      # gpt_oss-down B=4  M=2048  1.261x
-    (16384, 5760, 2880): (4, 0, 0),       # gpt_oss-up   B=4  M=4096  1.091x
-    (16384, 2880, 2880): (8, 4, 0),       # gpt_oss-down B=4  M=4096  1.118x
-    (32768, 5760, 2880): (1, 4, 0),       # gpt_oss-up   B=16 M=2048  1.042x
-    (32768, 2880, 2880): (1, 4, 0),       # gpt_oss-down B=16 M=2048  1.072x
-    (65536, 5760, 2880): (1, 4, 0),       # gpt_oss-up   B=16 M=4096  1.054x
-    (65536, 2880, 2880): (4, 4, 0),       # gpt_oss-down B=16 M=4096  1.119x
-    (8192,  4096, 7168): (4, 0, 128),     # dsv3-up      B=4  M=2048  1.056x
-    (8192,  7168, 2048): (4, 4, 0),       # dsv3-down    B=4  M=2048  1.042x
-    (16384, 4096, 7168): (24, 0, 0),      # dsv3-up      B=4  M=4096  1.059x
-    (16384, 7168, 2048): (4, 4, 0),       # dsv3-down    B=4  M=4096  1.073x
-    (32768, 4096, 7168): (8, 4, 0),       # dsv3-up      B=16 M=2048  1.035x
-    (32768, 7168, 2048): (4, 4, 0),       # dsv3-down    B=16 M=2048  1.047x
-    (65536, 4096, 7168): (4, 0, 0),       # dsv3-up      B=16 M=4096  1.033x
-    (65536, 7168, 2048): (16, 4, 0),      # dsv3-down    B=16 M=4096  1.035x
-    (8192,  3072, 4096): (24, 0, 0),      # qwen235b-up   B=4  M=2048 1.037x
-    (8192,  4096, 1536): (16, 0, 0),      # qwen235b-down B=4  M=2048 1.284x
-    (16384, 3072, 4096): (16, 4, 0),      # qwen235b-up   B=4  M=4096 1.082x
-    (16384, 4096, 1536): (4, 8, 128),     # qwen235b-down B=4  M=4096 1.301x
-    (32768, 3072, 4096): (1, 4, 0),       # qwen235b-up   B=16 M=2048 1.055x
-    (32768, 4096, 1536): (2, 4, 0),       # qwen235b-down B=16 M=2048 1.093x
-    (65536, 3072, 4096): (12, 4, 0),      # qwen235b-up   B=16 M=4096 1.094x
-    (65536, 4096, 1536): (8, 4, 0),       # qwen235b-down B=16 M=4096 1.072x
+_HK_FP8_RRR_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    # Session 11 (2026-05-25): upgraded to 4-tuple (gm, xcds, bn, chunk).
+    # Source = probe_rrr_per_shape.py 24-shape × 16 cfg × {bn=0,128} × {chunk=0,32,48,64,96}
+    # = 160 cfg/shape brute-force on chi2762 (gfx950), median-of-3 trials × 30 iters.
+    # Each line: (m_total, n_inner, k_out) → (gm, xcds, bn, chunk) # model-op B=b M=m ratio
+    (8192,  5760, 2880): (1, 4,  128, 32),  # gpt_oss-up    B=4  M=2048  1.372x
+    (8192,  2880, 2880): (1, 4,  0,   32),  # gpt_oss-down  B=4  M=2048  1.266x
+    (16384, 5760, 2880): (8, 4,  0,   64),  # gpt_oss-up    B=4  M=4096  1.089x
+    (16384, 2880, 2880): (4, 0,  0,   32),  # gpt_oss-down  B=4  M=4096  1.142x
+    (32768, 5760, 2880): (8, 0,  0,   32),  # gpt_oss-up    B=16 M=2048  1.059x
+    (32768, 2880, 2880): (16, 0, 0,   32),  # gpt_oss-down  B=16 M=2048  1.082x
+    (65536, 5760, 2880): (8, 4,  0,   64),  # gpt_oss-up    B=16 M=4096  1.044x
+    (65536, 2880, 2880): (4, 4,  0,   64),  # gpt_oss-down  B=16 M=4096  1.081x
+    (8192,  4096, 7168): (12, 4, 0,   64),  # dsv3-up       B=4  M=2048  1.123x
+    (8192,  7168, 2048): (4, 4,  0,   64),  # dsv3-down     B=4  M=2048  1.084x
+    (16384, 4096, 7168): (16, 4, 0,   64),  # dsv3-up       B=4  M=4096  1.043x
+    (16384, 7168, 2048): (4, 0,  0,   64),  # dsv3-down     B=4  M=4096  1.082x
+    (32768, 4096, 7168): (8, 0,  0,   32),  # dsv3-up       B=16 M=2048  1.057x
+    (32768, 7168, 2048): (4, 8,  0,   32),  # dsv3-down     B=16 M=2048  1.051x
+    (65536, 4096, 7168): (8, 0,  0,   32),  # dsv3-up       B=16 M=4096  1.060x
+    (65536, 7168, 2048): (1, 4,  0,   64),  # dsv3-down     B=16 M=4096  1.037x
+    (8192,  3072, 4096): (4, 32, 0,   96),  # qwen235b-up   B=4  M=2048  1.129x
+    (8192,  4096, 1536): (4, 32, 0,   96),  # qwen235b-down B=4  M=2048  1.304x
+    (16384, 3072, 4096): (4, 0,  0,   64),  # qwen235b-up   B=4  M=4096  1.056x
+    (16384, 4096, 1536): (16, 0, 128, 0),   # qwen235b-down B=4  M=4096  1.349x
+    (32768, 3072, 4096): (2, 4,  0,   0),   # qwen235b-up   B=16 M=2048  1.076x
+    (32768, 4096, 1536): (4, 0,  0,   32),  # qwen235b-down B=16 M=2048  1.074x
+    (65536, 3072, 4096): (2, 4,  0,   96),  # qwen235b-up   B=16 M=4096  1.084x
+    (65536, 4096, 1536): (8, 4,  0,   64),  # qwen235b-down B=16 M=4096  1.060x
 }
 
 _AUTOTUNE_WARMUP_ITERS = 5
@@ -553,10 +557,11 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             # Bypasses autotune sweep when shape matches the 24-MoE matrix.
             override = _HK_FP8_RRR_OVERRIDES.get((m_total, n_inner, k_out))
             if override is not None:
-                gm, xcds, bn = override
-                # Session 10: chunk_size=0 sentinel routes to dispatcher heuristic.
+                gm, xcds, bn, chunk = override
+                # Session 11: override is now 4-tuple (gm,xcds,bn,chunk) from
+                # probe_rrr_per_shape.py 160-cfg sweep. chunk=0 = heuristic.
                 return op(a_in, b_in, a_scales, b_scales, group_offs,
-                          gm, avg_m, xcds, out_dtype, bn, 0)
+                          gm, avg_m, xcds, out_dtype, bn, chunk)
             rrr_bn_choices = (0, 128) if (n_inner % 128 == 0) else (0,)
             # Session 10: 4-dim autotune (gm, xcds, bn, chunk). Chunk sweep is
             # env-gated; default ("0") keeps first-call cost identical to the
