@@ -94,4 +94,12 @@ at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens) {
     return group_offs;
 }
 
+std::vector<at::Tensor> grouped_gemm_compute_padded_group_offs_meta(at::Tensor &group_lens,
+                                                                     const int64_t /*block_size*/) {
+    const int64_t G = group_lens.numel();
+    at::Tensor padded_lens = at::empty({G}, group_lens.options());
+    at::Tensor padded_offs = at::empty({G + 1}, group_lens.options());
+    return {padded_lens, padded_offs};
+}
+
 } // namespace primus_turbo::pytorch

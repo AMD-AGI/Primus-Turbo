@@ -111,4 +111,9 @@ template <typename IndexType>
 void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
                         const int64_t group_num, hipStream_t stream);
 
+template <typename IndexType>
+void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padded_lens_ptr,
+                                IndexType *padded_offs_ptr, const int64_t group_num,
+                                const IndexType block_size, hipStream_t stream);
+
 } // namespace primus_turbo

@@ -68,7 +68,7 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
     return {
         at::empty({M, N}, fp8_meta),
         at::empty({M_padded_max, N}, fp8_meta),
-        at::empty({M, (N + block_size - 1) / block_size}, fp32_meta),
+        at::empty({(N + block_size - 1) / block_size, M}, fp32_meta),  // pshuffled
         at::empty({(M_padded_max + block_size - 1) / block_size, N}, fp32_meta),
         at::empty({num_groups}, i64_meta),
         at::empty({num_groups + 1}, i64_meta),

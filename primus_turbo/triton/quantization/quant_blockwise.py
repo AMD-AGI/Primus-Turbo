@@ -284,8 +284,9 @@ def quant_fp8_blockwise_segment_m_row_col_kernel(
 
     row_scale_inv = tl.reshape(1.0 / row_scale, BLOCK_SIZE)
     row_scale_mask = (offs_m_in >= orig_start) & (offs_m_in < orig_end) & (offs_m_in < M_in)
+    # Pshuffled [N_blocks, M_in]: matches the persistent fwd GEMM's scale order.
     tl.store(
-        x_scales_row_ptr + offs_m_in * tl.cdiv(N, BLOCK_SIZE) + pid_n,
+        x_scales_row_ptr + pid_n * M_in + offs_m_in,
         row_scale_inv,
         mask=row_scale_mask,
     )

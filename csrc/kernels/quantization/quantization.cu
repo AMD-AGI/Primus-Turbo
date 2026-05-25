@@ -721,7 +721,6 @@ void quant_fp8_blockwise_segment_m_row_col_kernel(
     const int64_t pad_start  = padded_group_offs_ptr[group_id];
 
     const int64_t col_start      = col_blk * BLOCK_SIZE;
-    const int64_t scale_n_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     const float   clip_lo = -static_cast<float>(fp8_max);
     const float   clip_hi =  static_cast<float>(fp8_max);
 
@@ -783,7 +782,8 @@ void quant_fp8_blockwise_segment_m_row_col_kernel(
                 }
             }
             if (pack_idx == 0) {
-                x_scales_row_ptr[in_m * scale_n_blocks + col_blk] = 1.0f / row_scale;
+                // Pshuffled [N_blocks, M_in]: matches persistent fwd GEMM scale order.
+                x_scales_row_ptr[col_blk * M_in + in_m] = 1.0f / row_scale;
             }
         }
     }

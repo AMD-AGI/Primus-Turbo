@@ -2,6 +2,7 @@
 //
 // See LICENSE for license information.
 
+#include "primus_turbo/grouped_gemm.h"
 #include "primus_turbo/quantization.h"
 #include "primus_turbo/reduce.h"
 #include "primus_turbo/shuffle.h"
@@ -251,20 +252,28 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(
     const int64_t N = input.size(1);
     const int     num_groups = static_cast<int>(group_lens.size(0));
 
-    auto var_k_group_lens = at::div(group_lens + (block_size - 1), block_size, "floor") * block_size;
-    auto var_k_group_offs = at::zeros({num_groups + 1}, group_lens.options());
-    var_k_group_offs.slice(0, 1, num_groups + 1) = at::cumsum(var_k_group_lens, 0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Fused replacement for at::div + at::zeros + at::cumsum (~30us per call).
+    auto var_k_group_lens = at::empty({num_groups}, group_lens.options());
+    auto var_k_group_offs = at::empty({num_groups + 1}, group_lens.options());
+    compute_padded_group_offs<int64_t>(
+        reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
+        reinterpret_cast<int64_t *>(var_k_group_lens.data_ptr()),
+        reinterpret_cast<int64_t *>(var_k_group_offs.data_ptr()),
+        num_groups, block_size, stream);
 
     const int64_t M_padded_max = M + num_groups * block_size;
 
-    auto x_fp8_row             = at::zeros({M, N}, input.options().dtype(dest_dtype));
-    auto x_fp8_col_padded      = at::zeros({M_padded_max, N}, input.options().dtype(dest_dtype));
-    auto x_scales_row          = at::zeros({M, (N + block_size - 1) / block_size},
+    // Kernel mask-writes cover every position downstream reads, so skip zero-init.
+    // Row scales emitted in pshuffled [N_blocks, M] to match the fwd GEMM layout.
+    auto x_fp8_row             = at::empty({M, N}, input.options().dtype(dest_dtype));
+    auto x_fp8_col_padded      = at::empty({M_padded_max, N}, input.options().dtype(dest_dtype));
+    auto x_scales_row          = at::empty({(N + block_size - 1) / block_size, M},
                                            input.options().dtype(at::kFloat));
-    auto x_scales_col_padded   = at::zeros({(M_padded_max + block_size - 1) / block_size, N},
+    auto x_scales_col_padded   = at::empty({(M_padded_max + block_size - 1) / block_size, N},
                                            input.options().dtype(at::kFloat));
 
-    auto        stream  = at::cuda::getCurrentCUDAStream();
     const float fp8_max = get_float8_max(dest_dtype);
     TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
         TORCH_TYPE_SWITCH_FP8(x_fp8_row.scalar_type(), QType, {

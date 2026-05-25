@@ -668,4 +668,43 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::fp8_t, ck_
 
 template void compute_group_offs<int64_t>(const int64_t *group_lens_ptr, int64_t *group_offs_ptr,
                                           const int64_t group_num, hipStream_t stream);
+
+// Fused per-group padded length + prefix-sum offsets in one launch.
+template <typename IndexType>
+__global__ void compute_padded_group_offs_device(const IndexType       *group_lens_ptr,
+                                                  IndexType             *padded_lens_ptr,
+                                                  IndexType             *padded_offs_ptr,
+                                                  const ck_tile::index_t group_num,
+                                                  const IndexType        block_size) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0) padded_offs_ptr[0] = 0;
+    if (idx < group_num) {
+        IndexType cumsum = 0;
+        for (ck_tile::index_t i = 0; i < idx; ++i) {
+            const IndexType padded_i = ((group_lens_ptr[i] + block_size - 1) / block_size) * block_size;
+            cumsum += padded_i;
+        }
+        const IndexType padded_self = ((group_lens_ptr[idx] + block_size - 1) / block_size) * block_size;
+        padded_lens_ptr[idx]    = padded_self;
+        padded_offs_ptr[idx + 1] = cumsum + padded_self;
+    }
+}
+
+template <typename IndexType>
+void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padded_lens_ptr,
+                                IndexType *padded_offs_ptr, const int64_t group_num,
+                                const IndexType block_size, hipStream_t stream) {
+    const int threads_per_block = 256;
+    const int blocks = static_cast<int>((group_num + threads_per_block - 1) / threads_per_block);
+    hipLaunchKernelGGL((compute_padded_group_offs_device<IndexType>),
+        dim3(blocks), dim3(threads_per_block), 0, stream,
+        group_lens_ptr, padded_lens_ptr, padded_offs_ptr, group_num, block_size);
+}
+
+template void compute_padded_group_offs<int64_t>(const int64_t *group_lens_ptr,
+                                                  int64_t *padded_lens_ptr,
+                                                  int64_t *padded_offs_ptr,
+                                                  const int64_t group_num,
+                                                  const int64_t block_size,
+                                                  hipStream_t stream);
 } // namespace primus_turbo

@@ -1255,8 +1255,8 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned(
     stride_cm,  # C row stride
     stride_cn,  # C col stride
     # A_scales strides (pre-transposed: [K//128, M_total])
-    stride_as_k,  # A_scales_t.stride(0)
-    stride_as_m,  # A_scales_t.stride(1)
+    stride_as_k,  # a_scales.stride(0)
+    stride_as_m,  # a_scales.stride(1)
     # B_scales strides
     stride_bs_g,  # B_scales.stride(0) — group stride
     stride_bs_n,  # stride along N-block dimension
@@ -1414,7 +1414,7 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     A_scales_ptr,
     B_scales_ptr,
     group_offs_ptr,
-    G,
+    G: tl.constexpr,
     N,
     K,
     stride_am,
@@ -1448,10 +1448,15 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    total_tiles: tl.int32 = 0
-    for _g in range(G):
-        m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-        total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+    # Vectorise the per-group cumsum so the per-tile group lookup is a single
+    # masked compare+reduce instead of an O(G) carry-dependent scan.
+    g_arange = tl.arange(0, G)
+    g_starts  = tl.load(group_offs_ptr + g_arange)
+    g_ends    = tl.load(group_offs_ptr + g_arange + 1)
+    m_per_g_v = (g_ends - g_starts).to(tl.int32)
+    tiles_per_g_v = tl.cdiv(m_per_g_v, BLOCK_SIZE_M) * num_pid_n
+    cum_incl_v = tl.cumsum(tiles_per_g_v, axis=0)
+    total_tiles = tl.sum(tiles_per_g_v, axis=0)
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -1463,22 +1468,14 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     acc_dtype = tl.float32
 
     for global_tile_id in range(pid, total_tiles, NUM_SMS):
-        group_idx: tl.int32 = 0
-        tile_start: tl.int32 = 0
-        cumsum: tl.int32 = 0
-        for _g in range(G):
-            m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
-            new_cumsum = cumsum + tiles_g
-            if global_tile_id >= new_cumsum:
-                group_idx = _g + 1
-                tile_start = new_cumsum
-            cumsum = new_cumsum
-
-        local_tile = global_tile_id - tile_start
-        m_start_g = tl.load(group_offs_ptr + group_idx)
-        M_g = (tl.load(group_offs_ptr + group_idx + 1) - m_start_g).to(tl.int32)
+        # group_idx via vector compare; gather (m_start, M_g, tile_start) via mask+sum.
+        group_idx = tl.sum((cum_incl_v <= global_tile_id).to(tl.int32), axis=0)
+        is_cur = (g_arange == group_idx).to(tl.int32)
+        m_start_g = tl.sum(g_starts.to(tl.int32) * is_cur, axis=0)
+        M_g = tl.sum(m_per_g_v * is_cur, axis=0)
         tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
+        tile_start = tl.sum(tl.where(g_arange < group_idx, tiles_per_g_v, 0), axis=0)
+        local_tile = global_tile_id - tile_start
 
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         swizzle_group = local_tile // num_pid_in_group
@@ -1722,7 +1719,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Args:
         a: [M_total, K] FP8 input (trans_a=False always).
         b: [G, N, K] (if trans_b=True) or [G, K, N] FP8 weights.
-        a_scales: [M_total, K//128] float32, block-wise scale for A.
+        a_scales: [K//128, M_total] float32, block-wise scale for A (pre-shuffled).
         b_scales: [G, ceil(N/128), ceil(K/128)] or [G, ceil(K/128), ceil(N/128)] float32.
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
@@ -1760,7 +1757,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     stride_ak = a.stride(1)
 
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
-    A_scales_t = a_scales.T.contiguous()
+    # a_scales arrives pre-shuffled as [K_blocks, M_total]; no runtime .T.contiguous().
     num_sms = _get_num_cus()
 
     aligned = K % 128 == 0
@@ -1781,11 +1778,11 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
             if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
                 triton.knobs.amd.use_async_copy = False
             _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
-                a, b, out_warm, A_scales_t, b_scales, bal_offs,
+                a, b, out_warm, a_scales, b_scales, bal_offs,
                 G, N, K,
                 a.stride(0), stride_bg, stride_bn,
                 out_warm.stride(0), out_warm.stride(1),
-                A_scales_t.stride(0), A_scales_t.stride(1),
+                a_scales.stride(0), a_scales.stride(1),
                 b_scales.stride(0), stride_bs_n, stride_bs_k,
                 stride_ak=stride_ak, stride_bk=stride_bk,
                 SCALE_BLOCK_K=128,
@@ -1795,11 +1792,11 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
             )
         else:
             _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
-                a, b, out_warm, A_scales_t, b_scales, bal_offs,
+                a, b, out_warm, a_scales, b_scales, bal_offs,
                 G, N, K,
                 a.stride(0), stride_bg, stride_bn,
                 out_warm.stride(0), out_warm.stride(1),
-                A_scales_t.stride(0), A_scales_t.stride(1),
+                a_scales.stride(0), a_scales.stride(1),
                 b_scales.stride(0), stride_bs_n, stride_bs_k,
                 stride_ak=stride_ak, stride_bk=stride_bk,
                 NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
@@ -1811,11 +1808,11 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
         _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
-            a, b, out, A_scales_t, b_scales, group_offs,
+            a, b, out, a_scales, b_scales, group_offs,
             G, N, K,
             a.stride(0), stride_bg, stride_bn,
             out.stride(0), out.stride(1),
-            A_scales_t.stride(0), A_scales_t.stride(1),
+            a_scales.stride(0), a_scales.stride(1),
             b_scales.stride(0), stride_bs_n, stride_bs_k,
             stride_ak=stride_ak, stride_bk=stride_bk,
             SCALE_BLOCK_K=128,
@@ -1825,11 +1822,11 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
         )
     else:
         _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
-            a, b, out, A_scales_t, b_scales, group_offs,
+            a, b, out, a_scales, b_scales, group_offs,
             G, N, K,
             a.stride(0), stride_bg, stride_bn,
             out.stride(0), out.stride(1),
-            A_scales_t.stride(0), A_scales_t.stride(1),
+            a_scales.stride(0), a_scales.stride(1),
             b_scales.stride(0), stride_bs_n, stride_bs_k,
             stride_ak=stride_ak, stride_bk=stride_bk,
             NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,

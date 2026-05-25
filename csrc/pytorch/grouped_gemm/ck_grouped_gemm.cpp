@@ -79,6 +79,22 @@ at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens) {
     return group_offs;
 }
 
+std::vector<at::Tensor> grouped_gemm_compute_padded_group_offs(at::Tensor &group_lens,
+                                                                const int64_t block_size) {
+    PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong,
+                       "group_lens must be of type Long (int64_t)");
+    const int64_t G = group_lens.numel();
+    at::Tensor padded_lens = at::empty({G}, group_lens.options());
+    at::Tensor padded_offs = at::empty({G + 1}, group_lens.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    compute_padded_group_offs<int64_t>(
+        reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
+        reinterpret_cast<int64_t *>(padded_lens.data_ptr()),
+        reinterpret_cast<int64_t *>(padded_offs.data_ptr()),
+        G, block_size, stream);
+    return {padded_lens, padded_offs};
+}
+
 uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
     auto    stream     = at::cuda::getCurrentCUDAStream();
     int32_t cus        = get_multi_processor_count(stream.device_index());

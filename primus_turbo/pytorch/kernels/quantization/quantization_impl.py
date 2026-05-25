@@ -216,14 +216,19 @@ _HIP_SEGMENT_GEMM_FLOPS_THRESHOLD = 70_000_000_000
 def _triton_segment_m_row_col(x, dtype, block_size, group_lens, group_offs):
     M, N = x.shape
     num_groups = group_lens.size(0)
-    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
-    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
-    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+    # Fused replacement for at::div + at::zeros + at::cumsum (~30us per call).
+    var_k_group_lens, var_k_group_offs = (
+        torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_padded_group_offs(
+            group_lens, block_size
+        )
+    )
     M_padded_max = M + num_groups * block_size
-    x_fp8_row = torch.zeros((M, N), dtype=dtype, device=x.device)
-    x_fp8_col_padded = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
-    x_scales_row = torch.zeros((M, triton.cdiv(N, block_size)), dtype=torch.float32, device=x.device)
-    x_scales_col_padded = torch.zeros(
+    # Kernel mask-writes cover all positions read downstream; skip zero-init.
+    # x_scales_row in pshuffled [N_blocks, M] matches the fwd GEMM scale order.
+    x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
+    x_fp8_col_padded = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales_row = torch.empty((triton.cdiv(N, block_size), M), dtype=torch.float32, device=x.device)
+    x_scales_col_padded = torch.empty(
         (triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device,
     )
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))

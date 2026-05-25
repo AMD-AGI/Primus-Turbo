@@ -262,6 +262,12 @@ at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);
 
+std::vector<at::Tensor> grouped_gemm_compute_padded_group_offs(at::Tensor &group_lens,
+                                                                const int64_t block_size);
+
+std::vector<at::Tensor> grouped_gemm_compute_padded_group_offs_meta(at::Tensor &group_lens,
+                                                                     const int64_t block_size);
+
 //==================================================================
 //  Runtime
 //==================================================================
