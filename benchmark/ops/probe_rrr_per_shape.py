@@ -41,6 +41,9 @@ RRR_CANDIDATES = [
     (12, 4),
 ]
 
+# Session 10: chunk_size sweep. 0 = use dispatcher heuristic.
+CHUNK_CHOICES = [0, 32, 48, 64, 96]
+
 
 def make_shapes():
     out = []
@@ -107,14 +110,15 @@ def probe_one_shape(B, Mg, N, K):
     times = {}
     for gm, xcds in RRR_CANDIDATES:
         for bn in bn_choices:
-            call = lambda gm=gm, xcds=xcds, bn=bn: op(
-                go_fp8, b_fp8, go_s, b_s, g_offs,
-                gm, avg_m, xcds, torch.bfloat16, bn)
-            try:
-                t = time_call_median(call)
-            except Exception as ex:
-                t = float("inf")
-            times[(gm, xcds, bn)] = t
+            for ck in CHUNK_CHOICES:
+                call = lambda gm=gm, xcds=xcds, bn=bn, ck=ck: op(
+                    go_fp8, b_fp8, go_s, b_s, g_offs,
+                    gm, avg_m, xcds, torch.bfloat16, bn, ck)
+                try:
+                    t = time_call_median(call)
+                except Exception as ex:
+                    t = float("inf")
+                times[(gm, xcds, bn, ck)] = t
 
     best_cfg, best_t = min(times.items(), key=lambda kv: kv[1])
     return {
@@ -123,14 +127,14 @@ def probe_one_shape(B, Mg, N, K):
         "best_cfg": best_cfg,
         "best_hk_ms": best_t,
         "ratio_best": t_triton / best_t,
-        "all_times": {f"{k[0]}_{k[1]}_{k[2]}": v for k, v in times.items()},
+        "all_times": {f"{k[0]}_{k[1]}_{k[2]}_{k[3]}": v for k, v in times.items()},
     }
 
 
 def main():
     shapes = make_shapes()
     results = []
-    hdr = f"{'idx':>3} {'model':<10} {'op':<5} {'B':>3} {'M':>5} {'N':>5} {'K':>5} | {'best (gm,xc,bn)':>16} | {'HK ms':>8} {'TR ms':>8} {'ratio':>6} | {'pass≥1.15':>8}"
+    hdr = f"{'idx':>3} {'model':<10} {'op':<5} {'B':>3} {'M':>5} {'N':>5} {'K':>5} | {'best (gm,xc,bn,ck)':>22} | {'HK ms':>8} {'TR ms':>8} {'ratio':>6} | {'pass≥1.15':>8}"
     print(hdr); print('-' * len(hdr))
     n_pass = 0
     for i, (model, op, B, Mg, N, K) in enumerate(shapes):
@@ -141,7 +145,7 @@ def main():
         passed = ratio >= 1.15
         n_pass += int(passed)
         print(f"{i:>3} {model:<10} {op:<5} {B:>3} {Mg:>5} {N:>5} {K:>5} | "
-              f"{str(r['best_cfg']):>16} | {r['best_hk_ms']:>8.3f} {r['triton_ms']:>8.3f} {ratio:>6.3f}x | "
+              f"{str(r['best_cfg']):>22} | {r['best_hk_ms']:>8.3f} {r['triton_ms']:>8.3f} {ratio:>6.3f}x | "
               f"{'PASS' if passed else 'fail':>8}")
     print('-' * len(hdr))
     ratios = [r["ratio_best"] for r in results]

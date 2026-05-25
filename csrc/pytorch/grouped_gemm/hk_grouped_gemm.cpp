@@ -48,6 +48,7 @@ void hk_grouped_rrr_fp8(
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
     int bn_block,
+    int chunk_size,
     hipStream_t stream);
 
 // R473: v2 RRR forward declaration.
@@ -59,6 +60,7 @@ void hk_grouped_rrr_fp8_new(
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
     int bn_block,
+    int chunk_size,
     hipStream_t stream);
 
 void hk_grouped_rcr_bf16(
@@ -192,7 +194,8 @@ at::Tensor hk_grouped_var_k_crr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_
 at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                               at::Tensor &b_scales, at::Tensor &group_offs,
                               int64_t group_m, int64_t m_per_group, int64_t num_xcds,
-                              at::ScalarType out_dtype, int64_t bn_block) {
+                              at::ScalarType out_dtype, int64_t bn_block,
+                              int64_t chunk_size) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && group_offs.is_cuda(),
                 "hk_grouped_rrr_fp8: tensors must be on cuda");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && group_offs.is_contiguous(),
@@ -215,6 +218,7 @@ at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
         static_cast<int>(group_m), static_cast<int>(m_per_group),
         static_cast<int>(num_xcds),
         static_cast<int>(bn_block),
+        static_cast<int>(chunk_size),
         current_stream());
     return out;
 }
@@ -223,7 +227,8 @@ at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
 at::Tensor hk_grouped_rrr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                   at::Tensor &b_scales, at::Tensor &group_offs,
                                   int64_t group_m, int64_t m_per_group, int64_t num_xcds,
-                                  at::ScalarType out_dtype, int64_t bn_block) {
+                                  at::ScalarType out_dtype, int64_t bn_block,
+                                  int64_t chunk_size) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && group_offs.is_cuda(),
                 "hk_grouped_rrr_fp8_new: tensors must be on cuda");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && group_offs.is_contiguous(),
@@ -246,6 +251,7 @@ at::Tensor hk_grouped_rrr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_sc
         static_cast<int>(group_m), static_cast<int>(m_per_group),
         static_cast<int>(num_xcds),
         static_cast<int>(bn_block),
+        static_cast<int>(chunk_size),
         current_stream());
     return out;
 }

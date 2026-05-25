@@ -112,6 +112,8 @@ void hk_grouped_rcr_fp8_new(
 // R473: v2 RRR entry — mirrors hk_grouped_rrr_fp8 signature but routes through
 // v2 dispatcher (kernel_fp8_layouts2.cpp::dispatch_grouped_rrr_v2). Initially
 // forwards to v1; future commits replace with vacc body for +8pp R167-pattern.
+// Session 10 (2026-05-25): add chunk_size param. 0 = run dispatcher heuristic
+// (k>=4096 && n>=4096 ? 48 : 64); positive value overrides per autotune.
 void hk_grouped_rrr_fp8_new(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int G_b, int bK_, int bN,
@@ -119,7 +121,7 @@ void hk_grouped_rrr_fp8_new(
     const float* sa_ptr, const float* sb_ptr,
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
-    int bn_block,
+    int bn_block, int chunk_size,
     hipStream_t stream)
 {
     hk_fp8_kernel_v2::grouped_layout_globals_v2_rrr g_v2{
@@ -128,7 +130,7 @@ void hk_grouped_rrr_fp8_new(
         sa_ptr, sb_ptr,
         group_offs_ptr, stream,
         G, group_m, m_per_group, num_xcds,
-        /*num_slots*/0, /*chunk_size*/0,
+        /*num_slots*/0, chunk_size,
         bn_block,
     };
     hk_fp8_kernel_v2::dispatch_grouped_rrr_v2(g_v2);
@@ -136,6 +138,7 @@ void hk_grouped_rrr_fp8_new(
 
 // R556: production RRR routes through v2 (mirror R444 RCR routing).
 // v2 dispatch handles bn=128 fallback to v1 internally (R486).
+// Session 10 (2026-05-25): add chunk_size param. Same semantics as _new.
 void hk_grouped_rrr_fp8(
     const void* a_ptr, int M_total, int aK,
     const void* b_ptr, int G_b, int bK_, int bN,
@@ -143,7 +146,7 @@ void hk_grouped_rrr_fp8(
     const float* sa_ptr, const float* sb_ptr,
     const int64_t* group_offs_ptr, int G,
     int group_m, int m_per_group, int num_xcds,
-    int bn_block,
+    int bn_block, int chunk_size,
     hipStream_t stream)
 {
     hk_fp8_kernel_v2::grouped_layout_globals_v2_rrr g_v2{
@@ -152,7 +155,7 @@ void hk_grouped_rrr_fp8(
         sa_ptr, sb_ptr,
         group_offs_ptr, stream,
         G, group_m, m_per_group, num_xcds,
-        /*num_slots*/0, /*chunk_size*/0,
+        /*num_slots*/0, chunk_size,
         bn_block,
     };
     hk_fp8_kernel_v2::dispatch_grouped_rrr_v2(g_v2);

@@ -229,14 +229,16 @@ at::Tensor hk_grouped_rrr_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales
                               at::Tensor &b_scales, at::Tensor &group_offs,
                               int64_t group_m, int64_t m_per_group, int64_t num_xcds,
                               at::ScalarType out_dtype,
-                              int64_t bn_block);
+                              int64_t bn_block,
+                              int64_t chunk_size);
 
 // R473: v2 RRR entry — mirror of hk_grouped_rrr_fp8 routing through v2 path.
 at::Tensor hk_grouped_rrr_fp8_new(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                   at::Tensor &b_scales, at::Tensor &group_offs,
                                   int64_t group_m, int64_t m_per_group, int64_t num_xcds,
                                   at::ScalarType out_dtype,
-                                  int64_t bn_block);
+                                  int64_t bn_block,
+                                  int64_t chunk_size);
 
 // HipKittens BF16 grouped GEMM (gfx950 only — adapter in
 // csrc/kernels/grouped_gemm/HipKittens/hk_grouped_gemm_bf16_gfx950.cu).

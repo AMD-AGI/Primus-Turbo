@@ -149,6 +149,17 @@ _HK_FP8_RRR_CANDIDATES: tuple[tuple[int, int], ...] = (
 # the current RRR v2 kernel structural ceiling; 4/24 shapes pass 1.15×.
 # Further gain requires Session 5/5.1 B-pretranspose (currently BLOCKED
 # on subtile-load compiler reorder bug).
+# Session 10 (2026-05-25): chunk_size becomes 4th autotune dim. ABI extends
+# `hk_grouped_rrr_fp8(..., bn_block, chunk_size)`; sentinel 0 = dispatcher
+# heuristic `(k>=4096 && n>=4096) ? 48 : 64`. Override values stay 3-tuple
+# `(gm, xcds, bn)` for legacy entries — chunk defaults to 0. Wider sweep gated
+# on env knob to keep first-call cost bounded:
+#   HK_FP8_RRR_CHUNK_CHOICES="0"         → heuristic only (default, fast)
+#   HK_FP8_RRR_CHUNK_CHOICES="0,32,48,64" → autotune dim 4-tuple sweep
+_HK_FP8_RRR_CHUNK_CHOICES: tuple[int, ...] = tuple(
+    int(x) for x in os.environ.get("HK_FP8_RRR_CHUNK_CHOICES", "0").split(",") if x
+)
+
 _HK_FP8_RRR_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int]] = {
     (8192,  5760, 2880): (4, 0, 128),     # gpt_oss-up   B=4  M=2048  1.309x
     (8192,  2880, 2880): (4, 32, 0),      # gpt_oss-down B=4  M=2048  1.261x
@@ -543,23 +554,28 @@ class GroupedGEMMFP8HipKittenBackend(KernelBackend):
             override = _HK_FP8_RRR_OVERRIDES.get((m_total, n_inner, k_out))
             if override is not None:
                 gm, xcds, bn = override
+                # Session 10: chunk_size=0 sentinel routes to dispatcher heuristic.
                 return op(a_in, b_in, a_scales, b_scales, group_offs,
-                          gm, avg_m, xcds, out_dtype, bn)
+                          gm, avg_m, xcds, out_dtype, bn, 0)
             rrr_bn_choices = (0, 128) if (n_inner % 128 == 0) else (0,)
-            rrr_candidates_3way = tuple(
-                (gm_, xcds_, bn_)
+            # Session 10: 4-dim autotune (gm, xcds, bn, chunk). Chunk sweep is
+            # env-gated; default ("0") keeps first-call cost identical to the
+            # pre-Session-10 3-way sweep.
+            rrr_candidates_4way = tuple(
+                (gm_, xcds_, bn_, ck_)
                 for (gm_, xcds_) in _HK_FP8_RRR_CANDIDATES
                 for bn_ in rrr_bn_choices
+                for ck_ in _HK_FP8_RRR_CHUNK_CHOICES
             )
-            # 10 fixed args: a, b, a_s, b_s, g_offs, gm, m_per, xcds, dtype, bn
+            # 11 fixed args: a, b, a_s, b_s, g_offs, gm, m_per, xcds, dtype, bn, chunk
             fixed = (a_in, b_in, a_scales, b_scales, group_offs,
-                     0, avg_m, 0, out_dtype, 0)
-            gm, xcds, bn = _autotune_pick(
-                op, fixed, rrr_candidates_3way, (5, 7, 9),
+                     0, avg_m, 0, out_dtype, 0, 0)
+            gm, xcds, bn, chunk = _autotune_pick(
+                op, fixed, rrr_candidates_4way, (5, 7, 9, 10),
                 key=("rrr_fp8", m_total, n_inner, k_out),
             )
             return op(a_in, b_in, a_scales, b_scales, group_offs,
-                      gm, avg_m, xcds, out_dtype, bn)
+                      gm, avg_m, xcds, out_dtype, bn, chunk)
         # RCR path (fwd or H4-rerouted dgrad). b is [G, N, K] col-major view.
         n_out, k = b_in.shape[1], b_in.shape[2]
         op = torch.ops.primus_turbo_cpp_extension.hk_grouped_rcr_fp8

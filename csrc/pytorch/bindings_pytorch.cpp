@@ -83,10 +83,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor group_offs, int group_m, int num_xcds, ScalarType out_dtype) -> Tensor");
     m.def("hk_grouped_rrr_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
-          "ScalarType out_dtype, int bn_block=0) -> Tensor");
+          "ScalarType out_dtype, int bn_block=0, int chunk_size=0) -> Tensor");
     m.def("hk_grouped_rrr_fp8_new(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_offs, int group_m, int m_per_group, int num_xcds, "
-          "ScalarType out_dtype, int bn_block=0) -> Tensor");
+          "ScalarType out_dtype, int bn_block=0, int chunk_size=0) -> Tensor");
     m.def("hk_grouped_rcr_bf16(Tensor a, Tensor b, Tensor group_offs, "
           "int group_m, int m_per_group, int num_xcds) -> Tensor");
     m.def("hk_grouped_rrr_bf16(Tensor a, Tensor b, Tensor group_offs, "
