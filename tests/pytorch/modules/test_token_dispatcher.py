@@ -51,6 +51,7 @@ def _run_dispatch_combine(
     deepep_use_cuda_num_tokens_per_expert=False,
     deepep_num_worst_tokens=0,
     num_permuted_tokens=0,
+    pad_multiple=0,
     expert_capacity_factor=None,
     deepep_use_comm_stream=False,
 ):
@@ -63,6 +64,7 @@ def _run_dispatch_combine(
         deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
         deepep_num_worst_tokens=deepep_num_worst_tokens,
         num_permuted_tokens=num_permuted_tokens,
+        pad_multiple=pad_multiple,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
     )
@@ -149,6 +151,22 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 num_permuted_tokens=num_permuted_tokens,
+            )
+
+    # ------------------------------------------------------------------
+    # pad_multiple > 0 (requires deepep_use_cuda_num_tokens_per_expert)
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    @parametrize("pad_multiple", [128, 256])
+    def test_pad_multiple(self, backend, pad_multiple):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+                deepep_use_cuda_num_tokens_per_expert=True,
+                pad_multiple=pad_multiple,
             )
 
     # ------------------------------------------------------------------

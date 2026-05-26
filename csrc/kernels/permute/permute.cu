@@ -441,18 +441,24 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
 
     const int E                     = num_local_experts;
     const int row_stride            = 2 * E + 1;
-    const int num_dispatched_tokens = *num_dispatched_tokens_ptr + pad_multiple;
+    const int actual_dispatched     = *num_dispatched_tokens_ptr;
+    const int num_dispatched_tokens = actual_dispatched + pad_multiple;
 
     if (token_id >= num_dispatched_tokens)
         return;
+
+    // Padding rows (token_id >= actual_dispatched) have no backing storage in
+    // tokens / scaling_factor / probs - loads there can fault when the
+    // allocator places those buffers near unmapped VA. Skip the loads.
+    const bool is_padding_token = token_id >= actual_dispatched;
 
     const int *row      = row_id_map + token_id * row_stride;
     const int  n_routed = row[2 * E];
 
     // Hidden chunk: load once, scatter to every routed destination.
     if (j < hidden_int4) {
-        const int4 src_pack = __ldg(tokens + token_id * hidden_int4 + j);
         const int4 zero4    = make_int4(0, 0, 0, 0);
+        const int4 src_pack = is_padding_token ? zero4 : __ldg(tokens + token_id * hidden_int4 + j);
         for (int idx = 0; idx < n_routed; ++idx) {
             const int dst_row = row[idx];
             if (dst_row > 0)
@@ -470,9 +476,12 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
         for (int idx = 0; idx < n_routed; ++idx) {
             const int dst_row = row[idx];
             if (dst_row > 0) {
-                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks)
-                    permuted_scaling_factor[(dst_row - 1) * scales_per_token + sj] =
-                        scaling_factor[token_id * scales_per_token + sj];
+                for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks) {
+                    const scalar_t v = is_padding_token
+                                           ? scalar_t{0}
+                                           : scaling_factor[token_id * scales_per_token + sj];
+                    permuted_scaling_factor[(dst_row - 1) * scales_per_token + sj] = v;
+                }
             } else {
                 for (int sj = lane_id; sj < scales_per_token; sj += kBlockHiddenPacks)
                     permuted_scaling_factor[(-dst_row - 1) * scales_per_token + sj] = scalar_t{0};
@@ -485,7 +494,8 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
             const int dst_row   = row[idx];
             const int probs_col = row[E + idx];
             if (dst_row > 0)
-                permuted_probs[dst_row - 1] = probs[token_id * probs_stride + probs_col];
+                permuted_probs[dst_row - 1] =
+                    is_padding_token ? prob_t{0} : probs[token_id * probs_stride + probs_col];
             else
                 permuted_probs[-dst_row - 1] = prob_t{0};
         }

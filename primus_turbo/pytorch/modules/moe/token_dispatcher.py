@@ -141,6 +141,13 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         tp_ep_group: the group to use for tensor-expert parallism.
         expert_capacity_factor: The capacity factor for each expert, None means no token will be dropped.
         permute_fusion: use permuate fusion kernel when ``permute_fusion`` is True.
+        pad_multiple: pad each expert's permuted token count up to a multiple of this
+            value inside ``moe_permute``. Set to the turbo grouped-GEMM tile size
+            (``BLOCK_M``, default ``256`` on the Triton backend used by
+            ``turbo.ops.grouped_gemm``) so every expert occupies whole tiles and the
+            kernel avoids partial-tile waste. ``0`` disables padding. Requires
+            ``deepep_use_cuda_num_tokens_per_expert=True`` — DeepEP's host
+            ``tokens_per_expert`` does not reflect the padding the permute kernel emits.
         num_permuted_tokens: caller-provided upper bound on the number of permuted
             rows. ``> 0`` removes the ``tokens_per_expert.sum().item()`` host sync
             inside ``moe_permute`` (the cu kernel uses this as the allocation
@@ -170,6 +177,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         tp_ep_group: Optional[dist.ProcessGroup] = None,
         expert_capacity_factor: Optional[float] = None,
         permute_fusion: bool = False,
+        pad_multiple: int = 256,
         num_permuted_tokens: int = 0,
         deepep_async_finish: bool = True,
         deepep_allocate_on_comm_stream: bool = True,
@@ -184,6 +192,13 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         if deepep_num_worst_tokens > 0 and not deepep_use_cuda_num_tokens_per_expert:
             raise ValueError(
                 "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
+            )
+
+        if pad_multiple > 0 and not deepep_use_cuda_num_tokens_per_expert:
+            raise ValueError(
+                "pad_multiple > 0 requires deepep_use_cuda_num_tokens_per_expert=True: "
+                "the host tokens_per_expert from DeepEP does not reflect the per-expert "
+                "padding the permute kernel emits."
             )
 
         if num_permuted_tokens > 0 and not deepep_use_cuda_num_tokens_per_expert:
@@ -204,6 +219,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         # permute
         self.permute_fusion = permute_fusion
+        self.pad_multiple = pad_multiple
         self.num_permuted_tokens = num_permuted_tokens
 
         # deepep
@@ -303,6 +319,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             self.dispatched_indices,
             num_local_experts=self.num_local_experts,
             num_topk=self.router_topk,
+            pad_multiple=self.pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             probs=dispatched_probs,
         )
