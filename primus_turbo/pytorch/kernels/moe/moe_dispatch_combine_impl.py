@@ -7,6 +7,7 @@
 
 import inspect
 import os
+import warnings
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -70,6 +71,13 @@ def set_buffer_global_config(
 
     This is typically called once by the token dispatcher during ``__init__``.
 
+    If a backend has already allocated a buffer against the previous config,
+    we *warn* on any actual change: the live buffer is sized to the old config
+    and may be referenced by a captured CUDA graph, so silently swapping in a
+    new ``num_sms`` would either re-trigger reallocation on the next
+    ``_ensure_buffer`` (invalidating the captured pointer) or be ignored
+    entirely. Equal configs are a no-op.
+
     Args:
         num_use_cu: Number of SMs (compute units) for high-throughput kernels.
         autotune_config: Legacy parameter — a ``(dispatch_config, combine_config)``
@@ -78,11 +86,24 @@ def set_buffer_global_config(
     """
     global _buffer_config
     dispatch_cfg, combine_cfg = autotune_config if autotune_config is not None else (None, None)
-    _buffer_config = EPBufferConfig(
+    new_config = EPBufferConfig(
         num_sms=num_use_cu,
         dispatch_config=dispatch_cfg,
         combine_config=combine_cfg,
     )
+    if new_config != _buffer_config:
+        for name, backend in _backend_instances.items():
+            if getattr(backend, "_buffer", None) is not None:
+                warnings.warn(
+                    f"set_buffer_global_config called with a different config after "
+                    f"backend '{name}' was already initialized "
+                    f"(old={_buffer_config!r}, new={new_config!r}). Previously-captured "
+                    "CUDA graphs continue to reference the old buffer; the new config "
+                    "only takes effect when the buffer is next reallocated.",
+                    stacklevel=2,
+                )
+                break
+    _buffer_config = new_config
 
 
 # =========================================================================
@@ -406,8 +427,22 @@ _backend_instances: Dict[str, EPBackend] = {}
 
 
 def clear_backend_instances():
-    global _backend_instances
+    """Wipe cached backend singletons.
 
+    Refuses to clear if any backend already has an initialized buffer — that
+    buffer may be referenced by a captured CUDA graph or by an in-flight
+    dispatch/combine on another stream. Call this only at process start, before
+    any dispatch has run (or in tests after explicitly tearing down all
+    captured graphs).
+    """
+    global _backend_instances
+    for name, backend in _backend_instances.items():
+        if getattr(backend, "_buffer", None) is not None:
+            raise RuntimeError(
+                f"Refusing to clear EP backend cache: backend '{name}' already has an "
+                "initialized buffer. Dropping it now would invalidate buffer pointers "
+                "referenced by captured CUDA graphs or in-flight kernels."
+            )
     _backend_instances.clear()
 
 

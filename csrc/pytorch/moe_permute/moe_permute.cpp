@@ -36,10 +36,18 @@ template <typename T> static inline T *opt_data_ptr(const c10::optional<at::Tens
     return reinterpret_cast<T *>(t->data_ptr());
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_token_tensor,
-                      int64_t num_local_experts, int64_t num_topk, int64_t pad_multiple,
-                      int64_t num_permuted_tokens) {
+// Returns ``(row_id_map, tokens_per_expert, overflow_flag,
+// num_dispatched_tokens)``. The trailing ``num_dispatched_tokens`` is a
+// 1-element int32 CUDA tensor populated by the cu kernel itself by scanning
+// ``expert_map`` for non-padding rows — DeepEP's worst-case dispatch buffer
+// uses ``-1`` (topk_idx) / all-false (routing_map) padding, so the count is
+// recoverable on-device without a host sync. Downstream ``permute`` /
+// ``unpermute`` consume this tensor in place of the legacy caller-provided
+// ``num_dispatched_token_tensor``.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64_t num_topk,
+                      int64_t pad_multiple, int64_t num_permuted_tokens,
+                      int64_t probs_topk_stride) {
     PRIMUS_TURBO_CHECK(expert_map.is_cuda(), "routing_map must be CUDA");
     PRIMUS_TURBO_CHECK(expert_map.scalar_type() == at::kBool ||
                            expert_map.scalar_type() == at::kInt ||
@@ -47,54 +55,49 @@ permute_preprocessing(torch::Tensor expert_map, torch::Tensor num_dispatched_tok
                        "expert_map must be bool or int or int64");
     PRIMUS_TURBO_CHECK(expert_map.dim() == 2, "expert_map must be 2D");
     PRIMUS_TURBO_CHECK(expert_map.is_contiguous(), "expert_map must be contiguous");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_cuda(),
-                       "num_dispatched_token_tensor must be CUDA");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.scalar_type() == at::kInt,
-                       "num_dispatched_token_tensor must be int32");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_contiguous(),
-                       "num_dispatched_token_tensor must be contiguous");
-    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.numel() == 1,
-                       "num_dispatched_token_tensor must contain exactly one element");
 
     if (expert_map.scalar_type() == at::kBool) {
         PRIMUS_TURBO_CHECK(expert_map.size(1) == num_local_experts,
                            "bool expert_map second dimension must equal num_local_experts");
+        PRIMUS_TURBO_CHECK(probs_topk_stride == 0,
+                           "probs_topk_stride > 0 (topk-aligned probs) requires the topk_idx "
+                           "expert_map code path; routing_map mode only supports multihot probs");
     } else {
         PRIMUS_TURBO_CHECK(expert_map.size(1) == num_topk,
                            "index expert_map second dimension must equal num_topk");
+        PRIMUS_TURBO_CHECK(probs_topk_stride == 0 || probs_topk_stride == num_topk,
+                           "probs_topk_stride must be 0 (multihot probs) or equal to num_topk "
+                           "(topk-aligned probs)");
     }
 
     auto max_num_dispatched_tokens = expert_map.size(0);
-    auto num_dispatched_token_cpu =
-        num_dispatched_token_tensor.to(at::TensorOptions().dtype(at::kInt).device(at::kCPU));
-    auto num_dispatched_tokens = num_dispatched_token_cpu.item<int>();
-    PRIMUS_TURBO_CHECK(num_dispatched_tokens >= 0,
-                       "num_dispatched_token_tensor value must be non-negative");
-    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_dispatched_tokens) <= max_num_dispatched_tokens,
-                       "num_dispatched_token_tensor value must not exceed expert_map.size(0)");
-
-    auto device   = expert_map.device();
-    auto int_opts = at::TensorOptions().dtype(at::kInt).device(device);
+    auto device                    = expert_map.device();
+    auto int_opts                  = at::TensorOptions().dtype(at::kInt).device(device);
 
     auto row_id_map = at::empty(
         {static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple), 2 * num_local_experts + 1},
         int_opts);
     auto tokens_per_expert = at::empty({num_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
+    // ``at::zeros`` so the kernel only does atomicAdd; the memset is
+    // CUDA-graph capturable (all subsequent host→device traffic stays on
+    // the stream).
+    auto num_dispatched_tokens = at::zeros({1}, int_opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
 #define DISPATCH_EXPERT_MAP_TYPE(expert_map_type)                                                  \
     permute_preprocessing_impl<expert_map_type>(                                                   \
         reinterpret_cast<expert_map_type *>(expert_map.data_ptr()), num_topk,                      \
-        num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),          \
+        num_dispatched_tokens.data_ptr<int>(), static_cast<int>(num_local_experts),                \
         static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),               \
         tokens_per_expert.data_ptr<int>(), row_id_map.data_ptr<int>(),                             \
-        overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens), stream);
+        overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens),                  \
+        static_cast<int>(probs_topk_stride), stream);
 
     SWITCH_EXPERT_MAP_TYPE(DISPATCH_EXPERT_MAP_TYPE);
 
-    return std::make_tuple(row_id_map, tokens_per_expert, overflow_flag);
+    return std::make_tuple(row_id_map, tokens_per_expert, overflow_flag, num_dispatched_tokens);
 }
 
 // -----------------------------------------------------------------------------
@@ -112,11 +115,15 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
              c10::optional<torch::Tensor> output_probs, torch::Tensor row_id_map,
              torch::Tensor num_dispatched_token_tensor, int64_t pad_multiple,
              int64_t num_local_experts, int64_t hidden_size, int64_t scales_per_token, bool use_fp8,
-             bool with_probs, int64_t num_permuted_token) {
+             bool with_probs, int64_t num_permuted_token, int64_t probs_stride) {
     PRIMUS_TURBO_CHECK(num_permuted_token >= 0, "num_permuted_token must be >= 0");
     if (num_permuted_token == 0) {
         return; // nothing to do
     }
+    // ``probs_stride == 0`` means "use the legacy ``num_local_experts`` row
+    // stride" (multihot probs); a positive value lets the caller pass topk-
+    // aligned probs directly without the indices_to_multihot conversion.
+    PRIMUS_TURBO_CHECK(probs_stride >= 0, "probs_stride must be >= 0");
 
     PRIMUS_TURBO_CHECK(tokens.is_cuda() && output_tokens.is_cuda(),
                        "permute: tokens / output_tokens must be CUDA");
@@ -162,6 +169,13 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
         PRIMUS_TURBO_CHECK(probs->is_cuda() && probs->is_contiguous() &&
                                probs->scalar_type() == at::kFloat,
                            "permute: probs must be contiguous float32 CUDA tensor");
+        if (with_probs) {
+            const int64_t effective_stride = probs_stride > 0 ? probs_stride : num_local_experts;
+            PRIMUS_TURBO_CHECK(probs->dim() == 2, "permute: probs must be 2D ([T, probs_stride])");
+            PRIMUS_TURBO_CHECK(probs->size(1) == effective_stride,
+                               "permute: probs.size(1) must equal probs_stride (or "
+                               "num_local_experts when probs_stride == 0)");
+        }
     }
     if (output_probs.has_value()) {
         PRIMUS_TURBO_CHECK(output_probs->is_cuda() && output_probs->is_contiguous() &&
@@ -188,7 +202,8 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
             with_probs ? opt_data_ptr<float>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
             num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(pad_multiple),
             static_cast<int>(num_local_experts), static_cast<int>(hidden_size),
-            static_cast<int>(scales_per_token), num_dispatched_max, stream);
+            static_cast<int>(scales_per_token), num_dispatched_max, static_cast<int>(probs_stride),
+            stream);
     } else {
         PRIMUS_TURBO_CHECK(hidden_size % 8 == 0,
                            "permute (16-bit): hidden_size must be a multiple of 8");
@@ -200,7 +215,8 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
             with_probs ? opt_data_ptr<float>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
             num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(pad_multiple),
             static_cast<int>(num_local_experts), static_cast<int>(hidden_size),
-            static_cast<int>(scales_per_token), num_dispatched_max, stream);
+            static_cast<int>(scales_per_token), num_dispatched_max, static_cast<int>(probs_stride),
+            stream);
     }
 }
 
@@ -216,7 +232,8 @@ void unpermute(torch::Tensor permuted_tokens, torch::Tensor output_tokens,
                c10::optional<torch::Tensor> permuted_probs,
                c10::optional<torch::Tensor> output_probs, torch::Tensor row_id_map,
                torch::Tensor num_dispatched_tokens_tensor, int64_t num_local_experts,
-               int64_t hidden_size, bool with_probs) {
+               int64_t hidden_size, bool with_probs, int64_t probs_stride) {
+    PRIMUS_TURBO_CHECK(probs_stride >= 0, "probs_stride must be >= 0");
     PRIMUS_TURBO_CHECK(permuted_tokens.is_cuda() && output_tokens.is_cuda(),
                        "unpermute: tensors must be CUDA");
     PRIMUS_TURBO_CHECK(permuted_tokens.scalar_type() == at::kBFloat16 ||
@@ -240,6 +257,12 @@ void unpermute(torch::Tensor permuted_tokens, torch::Tensor output_tokens,
                            "unpermute_launcher: with_probs but output_probs is empty");
         PRIMUS_TURBO_CHECK(output_probs->scalar_type() == at::kFloat,
                            "unpermute_launcher: output_probs must be float32");
+        const int64_t effective_stride = probs_stride > 0 ? probs_stride : num_local_experts;
+        PRIMUS_TURBO_CHECK(output_probs->dim() == 2,
+                           "unpermute: output_probs must be 2D ([T, probs_stride])");
+        PRIMUS_TURBO_CHECK(output_probs->size(1) == effective_stride,
+                           "unpermute: output_probs.size(1) must equal probs_stride "
+                           "(or num_local_experts when probs_stride == 0)");
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -254,7 +277,8 @@ void unpermute(torch::Tensor permuted_tokens, torch::Tensor output_tokens,
             with_probs ? opt_data_ptr<const float>(permuted_probs) : nullptr,
             with_probs ? opt_data_ptr<float>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
             num_dispatched_tokens_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),
-            static_cast<int>(hidden_size), num_dispatched_max, stream);
+            static_cast<int>(hidden_size), num_dispatched_max, static_cast<int>(probs_stride),
+            stream);
     } else {
         unpermute_impl<float16, float>(
             reinterpret_cast<const float16 *>(permuted_tokens.data_ptr()),
@@ -262,7 +286,8 @@ void unpermute(torch::Tensor permuted_tokens, torch::Tensor output_tokens,
             with_probs ? opt_data_ptr<const float>(permuted_probs) : nullptr,
             with_probs ? opt_data_ptr<float>(output_probs) : nullptr, row_id_map.data_ptr<int>(),
             num_dispatched_tokens_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),
-            static_cast<int>(hidden_size), num_dispatched_max, stream);
+            static_cast<int>(hidden_size), num_dispatched_max, static_cast<int>(probs_stride),
+            stream);
     }
 }
 

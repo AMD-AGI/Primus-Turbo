@@ -9,5 +9,4 @@ from .indices_converter import *
 from .moe_dispatch_combine import *
 from .moe_permute import *
 from .permutation import *
-from .permute import *
 from .tokens_per_expert_to_mask import *
