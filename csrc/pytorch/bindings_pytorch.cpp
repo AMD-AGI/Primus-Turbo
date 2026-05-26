@@ -68,6 +68,20 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
     m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
 
+    // ********* Permute (MoE token (un)permute) *********
+    m.def("permute_preprocessing(Tensor expert_map, Tensor num_dispatched_token_tensor, "
+          "int num_local_experts, int num_topk, int pad_multiple, "
+          "int num_permuted_tokens) -> (Tensor, Tensor, Tensor)");
+    m.def("permute(Tensor tokens, Tensor output_tokens, Tensor? scaling_factor, "
+          "Tensor? output_scaling_factor, Tensor? probs, Tensor? output_probs, "
+          "Tensor row_id_map, Tensor num_dispatched_token_tensor, "
+          "int pad_multiple, int num_local_experts, int hidden_size, int scales_per_token, "
+          "bool use_fp8, bool with_probs, int num_permuted_token) -> ()");
+    m.def("unpermute(Tensor permuted_tokens, Tensor output_tokens, "
+          "Tensor? permuted_probs, Tensor? output_probs, Tensor row_id_map, "
+          "Tensor num_dispatched_tokens_tensor, int num_local_experts, int hidden_size, "
+          "bool with_probs) -> ()");
+
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
           "bool transB, int? num_cu=None) -> Tensor");
@@ -116,6 +130,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("rmsnorm_fwd", rmsnorm_fwd);
     m.impl("rmsnorm_bwd", rmsnorm_bwd);
 
+    // ********* Permute *********
+    m.impl("permute_preprocessing", permute_preprocessing);
+    m.impl("permute", permute);
+    m.impl("unpermute", unpermute);
+
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm);
     m.impl("ck_grouped_gemm_variable_k", ck_grouped_gemm_variable_k);
@@ -154,6 +173,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* RMSNorm *********
     m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
     m.impl("rmsnorm_bwd", rmsnorm_bwd_meta);
+
+    // ********* Permute *********
+    m.impl("permute_preprocessing", permute_preprocessing_meta);
+    m.impl("permute", permute_meta);
+    m.impl("unpermute", unpermute_meta);
 
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm_meta);
