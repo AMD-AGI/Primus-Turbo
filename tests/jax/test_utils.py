@@ -120,7 +120,16 @@ def assert_allclose(actual, expected, rtol=1e-5, atol=1e-8):
 
 
 def _find_free_port():
-    """Return an ephemeral port that is (momentarily) free on localhost."""
+    """
+    Return an ephemeral port that is (momentarily) free on localhost.
+
+    NOTE: there is a TOCTOU race between this call returning and any later
+    bind against the returned port (see PR #344 Copilot review thread).
+    For multi-process tests on a busy host this can be flaky; tracked as a
+    follow-up to add a retry-on-EADDRINUSE wrapper around
+    ``jax.distributed.initialize``. The race window is small in practice
+    and acceptable for the current test workload.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

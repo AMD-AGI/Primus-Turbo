@@ -28,8 +28,10 @@ static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::Config &config) {
 
-    PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS and
-                       "DeepEP only support intranode communication on Jax!");
+    PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS,
+                       "DeepEP inproc mode only supports intranode communication on JAX "
+                       "(num_ranks must be <= NUM_MAX_NVL_PEERS); use per_process mode for "
+                       "internode runs.");
 
     int device_id = -1;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
@@ -81,7 +83,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     num_nvl_ranks_  = std::min(num_ranks, NUM_MAX_NVL_PEERS);
 
 #ifdef DISABLE_ROCSHMEM
-    PRIMUS_TURBO_CHECK(num_rdma_ranks_ == 1 and
+    PRIMUS_TURBO_CHECK(num_rdma_ranks_ == 1,
                        "rocSHMEM is disabled during compilation, please install rocSHMEM by "
                        "following docs/install_dependencies.md");
 #endif
@@ -800,7 +802,7 @@ void Buffer::InternodeDispatch(
         num_channels, false);
 
 #else
-    PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled; internode unavailable");
+    PRIMUS_TURBO_CHECK(false, "rocSHMEM is disabled; internode unavailable");
 #endif
 }
 
@@ -895,14 +897,13 @@ void Buffer::InternodeCombine(
         config.num_max_nvl_chunked_recv_tokens, rank_, num_ranks_, stream, num_channels, false);
 
 #else
-    PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled; internode unavailable");
+    PRIMUS_TURBO_CHECK(false, "rocSHMEM is disabled; internode unavailable");
 #endif
 }
 
 pybind11::bytearray Buffer::get_local_ipc_handle() const {
     PRIMUS_TURBO_CHECK(num_nvl_bytes_ > 0);
-    PRIMUS_TURBO_CHECK(explicitly_destroy_ &&
-                       "IPC handle is only exported for per_process buffers");
+    PRIMUS_TURBO_CHECK(explicitly_destroy_, "IPC handle is only exported for per_process buffers");
     return {ipc_handles_[nvl_rank_].reserved, HIP_IPC_HANDLE_SIZE};
 }
 
@@ -914,29 +915,48 @@ void Buffer::SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytear
 
     if (num_nvl_bytes_ > 0) {
         int offset = rdma_rank_ * num_nvl_ranks_;
-        for (int i = 0; i < num_nvl_ranks_; ++i) {
-            PRIMUS_TURBO_CHECK(all_handles[offset + i].has_value());
-            auto handle_str = std::string(all_handles[offset + i].value());
-            PRIMUS_TURBO_CHECK(handle_str.size() == HIP_IPC_HANDLE_SIZE);
-            if (offset + i != rank_) {
-                hipIpcMemHandle_t remote_handle;
-                std::memcpy(remote_handle.reserved, handle_str.c_str(), HIP_IPC_HANDLE_SIZE);
-                PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(&buffer_ptrs_[i], remote_handle,
-                                                           hipIpcMemLazyEnablePeerAccess));
-                barrier_signal_ptrs_[i] = reinterpret_cast<int *>(
-                    static_cast<uint8_t *>(buffer_ptrs_[i]) + num_nvl_bytes_);
-            } else {
-                PRIMUS_TURBO_CHECK(std::memcmp(ipc_handles_[i].reserved, handle_str.c_str(),
-                                               HIP_IPC_HANDLE_SIZE) == 0);
+        // Strong exception safety: if hipIpcOpenMemHandle or the trailing
+        // hipMemcpy / hipDeviceSynchronize fails partway, close any IPC
+        // handles already opened by this loop before propagating the error.
+        // ``ipc_synced_`` is *not* set on failure, so ``Destroy()`` would
+        // otherwise skip these mappings and leak them for the lifetime of
+        // the process. ``buffer_ptrs_`` is zero-initialised in the ctor,
+        // so any non-null peer slot (other than our own) is one we opened.
+        try {
+            for (int i = 0; i < num_nvl_ranks_; ++i) {
+                PRIMUS_TURBO_CHECK(all_handles[offset + i].has_value());
+                auto handle_str = std::string(all_handles[offset + i].value());
+                PRIMUS_TURBO_CHECK(handle_str.size() == HIP_IPC_HANDLE_SIZE);
+                if (offset + i != rank_) {
+                    hipIpcMemHandle_t remote_handle;
+                    std::memcpy(remote_handle.reserved, handle_str.c_str(), HIP_IPC_HANDLE_SIZE);
+                    PRIMUS_TURBO_CHECK_HIP(hipIpcOpenMemHandle(&buffer_ptrs_[i], remote_handle,
+                                                               hipIpcMemLazyEnablePeerAccess));
+                    barrier_signal_ptrs_[i] = reinterpret_cast<int *>(
+                        static_cast<uint8_t *>(buffer_ptrs_[i]) + num_nvl_bytes_);
+                } else {
+                    PRIMUS_TURBO_CHECK(std::memcmp(ipc_handles_[i].reserved, handle_str.c_str(),
+                                                   HIP_IPC_HANDLE_SIZE) == 0);
+                }
             }
-        }
 
-        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
-                                         sizeof(void *) * NUM_MAX_NVL_PEERS,
-                                         hipMemcpyHostToDevice));
-        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
-                                         sizeof(int *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
-        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+            PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
+                                             sizeof(void *) * NUM_MAX_NVL_PEERS,
+                                             hipMemcpyHostToDevice));
+            PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
+                                             sizeof(int *) * NUM_MAX_NVL_PEERS,
+                                             hipMemcpyHostToDevice));
+            PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+        } catch (...) {
+            for (int i = 0; i < num_nvl_ranks_; ++i) {
+                if (i != nvl_rank_ && buffer_ptrs_[i] != nullptr) {
+                    (void) hipIpcCloseMemHandle(buffer_ptrs_[i]);
+                    buffer_ptrs_[i]         = nullptr;
+                    barrier_signal_ptrs_[i] = nullptr;
+                }
+            }
+            throw;
+        }
     }
 
     ipc_synced_ = true;
@@ -953,7 +973,7 @@ void Buffer::SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytear
 
         rdma_buffer_ptr_ =
             primus_turbo::deep_ep::internode::alloc(num_rdma_bytes_, NUM_BUFFER_ALIGNMENT_BYTES);
-        PRIMUS_TURBO_CHECK(rdma_buffer_ptr_ != nullptr &&
+        PRIMUS_TURBO_CHECK(rdma_buffer_ptr_ != nullptr,
                            "rocshmem_malloc returned NULL: symmetric heap exhausted or not "
                            "initialised on this PE");
         PRIMUS_TURBO_CHECK_HIP(hipMemset(rdma_buffer_ptr_, 0, num_rdma_bytes_));

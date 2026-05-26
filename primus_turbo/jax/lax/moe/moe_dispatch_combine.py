@@ -295,7 +295,19 @@ def setup(
 
     # ----- Internode divisibility check (before any C++ alloc) -----
     ep_size = deep_ep_runtime.get_ep_size(lock=True)
-    is_internode = ep_size > NUM_MAX_NVL_PEERS
+    # Internode only makes sense under PER_PROCESS: the C++ INPROC buffer
+    # pool hard-rejects num_ranks > NUM_MAX_NVL_PEERS and internode FFI
+    # handlers require launch_mode==PER_PROCESS. Reject the combination
+    # here so the failure is a clear ValueError from setup() instead of an
+    # opaque C++ assertion deeper in the stack.
+    if locked_mode is not MODE_PER_PROCESS and ep_size > NUM_MAX_NVL_PEERS:
+        raise ValueError(
+            f"INPROC mode cannot use ep_size={ep_size} > {NUM_MAX_NVL_PEERS}; "
+            f"internode / RDMA requires PER_PROCESS mode. Set "
+            f"PRIMUS_TURBO_JAX_DEEPEP_MODE=per_process or call "
+            f"setup(mode='per_process')."
+        )
+    is_internode = locked_mode is MODE_PER_PROCESS and ep_size > NUM_MAX_NVL_PEERS
     if is_internode and ep_size % NUM_MAX_NVL_PEERS != 0:
         raise ValueError(
             f"Internode mode requires ep_size %% {NUM_MAX_NVL_PEERS} == 0; " f"got ep_size={ep_size}."
