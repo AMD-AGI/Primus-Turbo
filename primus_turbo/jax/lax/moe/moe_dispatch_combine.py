@@ -50,6 +50,9 @@ import jax.numpy as jnp
 
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.deep_ep.runtime import (
+    MODE_INPROC,  # re-export for callers that introspect mode (e.g. tests)
+)
+from primus_turbo.jax.deep_ep.runtime import (
     MODE_PER_PROCESS,
     NUM_MAX_NVL_PEERS,
     LaunchMode,
@@ -70,6 +73,7 @@ from .moe_utils import Config
 __all__ = [
     "Config",
     "get_ep_size",
+    "is_internode",
     "moe_combine",
     "moe_dispatch",
     "reset_runtime",
@@ -141,12 +145,52 @@ def get_ep_size() -> int:
     return _require_frozen().ep_size
 
 
+def is_internode() -> bool:
+    """Return True iff the EP group spans multiple nodes (``ep_size > 8``).
+
+    Reads from the frozen state captured by :func:`setup`; raises
+    ``RuntimeError`` if ``setup()`` has not been called.  Use this when
+    handle-interpretation logic (e.g. extracting ``num_recv`` from the
+    dispatch handle) needs to branch on internode vs intranode without
+    re-querying the lower-level ``deep_ep.runtime`` module.
+    """
+    return _require_frozen().is_internode
+
+
 def reset_runtime() -> None:
     """Reset all DeepEP state — frozen snapshot + EP group + C++ buffer.
 
     Required between distinct ``setup()`` configurations (e.g. tests that
     exercise multiple EP sizes in the same Python process).  After
     ``reset_runtime()``, ``setup()`` may be called again.
+
+    **Caveat — INPROC mode is only partially resettable.**  The C++
+    in-process buffer pool is allocated lazily on the first
+    :func:`moe_dispatch` and persists for the lifetime of the process;
+    it does *not* expose a destroy API.  ``reset_runtime()`` therefore
+    only clears the Python-side state (frozen snapshot, locked mode,
+    EP-group pin, env-var override) under INPROC — the underlying pool
+    keeps whatever shape / dtype hints the first dispatch primed it
+    with.  Two practical consequences:
+
+      * Within a single Python process, every INPROC dispatch must be
+        compatible with the pool primed by the first one.  Calling
+        ``setup()`` again with different ep_size / num_sms is silently
+        ineffective for the pool itself.
+      * Tearing the runtime down between consecutive INPROC dispatches
+        (``dispatch → reset_runtime() → setup() → dispatch``) is *not*
+        a no-op even though the Python state ends up equivalent: the
+        env-var pop + ``_locked_mode = None`` + re-lock sequence has
+        been observed to deadlock the second dispatch when mixed with
+        the JAX FFI cache (e.g. bf16 followed by fp8).  Use a single
+        module-scope ``setup()`` for INPROC test suites with identical
+        configuration; reserve per-test ``reset_runtime()`` for
+        PER_PROCESS runs (where the per-process buffer *is* destroyed
+        here) or for API-level validation tests.
+
+    Under PER_PROCESS mode the C++ per-process buffer is destroyed via
+    ``destroy_per_process_buffer()``, so ``reset_runtime()`` there is
+    a full reset.
     """
     global _frozen, _default_num_sms
     _frozen = None

@@ -259,11 +259,24 @@ jobs:
           command: pytest -v tests/jax -n 8 --log-cli-level=INFO
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      # Keep in-process multi-GPU tests and distributed/per-process tests in
+      # separate pytest invocations. The JAX DeepEP in-process path keeps GPU
+      # runtime state inside the pytest process, while the MP tests spawn their
+      # own worker processes; collecting/running both together can pollute that
+      # state and make later parameterized cases hang.
+      - name: Run in-process multi-GPU tests
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          command: pytest -v tests/jax --dist-only --ignore=tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
+        env:
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 30
           max_attempts: 2
-          command: pytest -v tests/jax --dist-only --log-cli-level=INFO
+          command: pytest -v tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"

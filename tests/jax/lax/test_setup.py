@@ -146,3 +146,42 @@ def test_get_ep_size_without_setup_raises():
 
     with pytest.raises(RuntimeError, match="setup\\(\\) must be called"):
         get_ep_size()
+
+
+def test_is_internode_without_setup_raises():
+    """Public ``is_internode`` is frozen-state-only; raises before ``setup()``."""
+    from primus_turbo.jax.lax.moe import is_internode
+
+    with pytest.raises(RuntimeError, match="setup\\(\\) must be called"):
+        is_internode()
+
+
+def test_is_internode_reads_frozen_state():
+    """``is_internode`` returns the value cached at ``setup()`` time."""
+    from primus_turbo.jax.lax.moe import is_internode
+
+    mdc._frozen = mdc.FrozenRuntimeState(
+        mode=mdc.MODE_PER_PROCESS,
+        launch_mode=int(mdc.MODE_PER_PROCESS),
+        ep_size=16,
+        is_internode=True,
+        num_sms=32,
+        source_meta_bytes=80,
+    )
+    try:
+        assert is_internode() is True
+    finally:
+        mdc._frozen = None
+
+    mdc._frozen = mdc.FrozenRuntimeState(
+        mode=mdc.MODE_INPROC,
+        launch_mode=int(mdc.MODE_INPROC),
+        ep_size=8,
+        is_internode=False,
+        num_sms=64,
+        source_meta_bytes=0,
+    )
+    try:
+        assert is_internode() is False
+    finally:
+        mdc._frozen = None

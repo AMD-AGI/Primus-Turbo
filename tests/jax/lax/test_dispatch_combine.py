@@ -18,6 +18,41 @@ num_ranks = jax.local_device_count()
 
 
 # ============================================================================
+# Fixtures
+# ============================================================================
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _setup_runtime_once():
+    """One-shot DeepEP bootstrap for the whole module.
+
+    Every test in this file targets INPROC mode with the *same* setup()
+    configuration (single process, all local GPUs, default num_sms,
+    hidden_bytes ignored).  ``setup()``'s strict-freeze contract states:
+    "one-call bootstrap, required exactly once before the first
+    moe_dispatch ... subsequent calls with the same configuration are
+    no-ops".  Module-scope is therefore the natural pytest match — it
+    realises that "once per process" semantics under pytest's collection
+    model, and avoids per-test ``reset_runtime() + setup()`` churn,
+    which is explicitly flagged in ``reset_runtime()``'s docstring as an
+    anti-pattern under INPROC (the C++ in-process buffer pool persists
+    for the process lifetime and has no destroy API).
+
+    Tests that exercise *distinct* setup() configurations belong
+    elsewhere:
+      * Multi-process / PER_PROCESS tests live in
+        ``test_mp_dispatch_combine.py`` and ``setup()`` per worker
+        (workers fork fresh, so per-worker bootstrap is fundamental).
+      * Strict-freeze API validation lives in ``test_setup.py`` (where
+        per-test ``reset_runtime() + setup()`` is the system under test).
+    """
+    reset_runtime()
+    setup()
+    yield
+    reset_runtime()
+
+
+# ============================================================================
 # Helpers
 # ============================================================================
 
@@ -97,15 +132,6 @@ def test_moe_dispatch_combine(num_tokens, hidden, num_topk, num_experts, use_fp8
       2. recv_topk_idx validity - values in [-1, num_experts_per_rank).
       3. Combine round-trip - combine(dispatch(x)) approx x after normalisation.
     """
-    # Strict-freeze contract: every test owns its own setup().  INPROC
-    # mode ignores hidden_bytes (the in-process buffer pool sizes itself
-    # lazily on first dispatch), so no per-test sizing argument is
-    # needed here — matching the pre-strict-freeze behavior where INPROC
-    # callers never passed it.  reset_runtime() at the top makes the
-    # test safe to run in any order.
-    reset_runtime()
-    setup()
-
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
     @jax.pmap
@@ -199,9 +225,6 @@ def test_moe_dispatch_combine_backward(num_tokens, hidden, num_topk, num_experts
       https://github.com/NVIDIA/Megatron-LM/blob/fe5291fa/tests/unit_tests/
       transformer/moe/test_token_dispatcher.py#L116
     """
-    reset_runtime()
-    setup()
-
     x, scores, topk_weights = _generate(num_tokens, hidden, num_topk, num_experts)
 
     @jax.pmap
