@@ -124,7 +124,7 @@ def check_quantized_tensor(
     )
 
     if axis is not None:
-        normalized_axis = _normalize_axis(axis, quantized_tensor.data.ndim)
+        normalized_axis = _normalize_axis(axis, quantized_tensor.qdata.ndim)
         assert (
             quantized_tensor.quantized_axis == normalized_axis
         ), f"QuantizedTensor quantized_axis {quantized_tensor.quantized_axis} does not match axis={normalized_axis}"
@@ -337,8 +337,9 @@ class QuantizedTensor(torch.Tensor):
     # Public properties
     # ------------------------------------------------------------------
     @property
-    def data(self) -> torch.Tensor:
-        assert self._data is not None, "data is None. Please call quantize() to quantize the data."
+    def qdata(self) -> torch.Tensor:
+        """Quantized inner data buffer."""
+        assert self._data is not None, "qdata is None. Please call quantize() to quantize the data."
 
         return self._data
 
@@ -504,7 +505,7 @@ class QuantizedTensor(torch.Tensor):
     @staticmethod
     def _view_data_and_scale_inv(tensor: QuantizedTensor, target_shape: torch.Size, op: Callable):
         """Apply *op* (``view`` or ``reshape``) to ``_data``, ``_scale_inv``"""
-        assert len(target_shape) == tensor.data.ndim
+        assert len(target_shape) == tensor.qdata.ndim
 
         out_shape = torch.Size(target_shape)
         wrapper_shape = tensor.shape

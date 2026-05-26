@@ -242,8 +242,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             )
 
         out = grouped_gemm_fp8_impl(
-            quantized_a.data,
-            quantized_b.data,
+            quantized_a.qdata,
+            quantized_b.qdata,
             quantized_a.scale_inv,
             quantized_b.scale_inv,
             group_lens,
@@ -284,8 +284,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             )
 
         ctx.save_for_backward(
-            quantized_a_t.data,
-            quantized_b_t.data,
+            quantized_a_t.qdata,
+            quantized_b_t.qdata,
             quantized_a_t.scale_inv,
             quantized_b_t.scale_inv,
             group_lens,
@@ -316,7 +316,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         )
 
         grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             b_fp8_col,
             quantized_grad_out.scale_inv,
             b_scale_inv_col,
@@ -342,7 +342,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8_col,
-            quantized_grad_out_t.data,
+            quantized_grad_out_t.qdata,
             a_scale_inv_col,
             quantized_grad_out_t.scale_inv,
             group_lens,
@@ -411,8 +411,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             )
 
         out = grouped_gemm_fp8_impl(
-            quantized_a.data,
-            quantized_b.data,
+            quantized_a.qdata,
+            quantized_b.qdata,
             quantized_a.scale_inv,
             quantized_b.scale_inv,
             group_lens,
@@ -427,8 +427,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         )
 
         ctx.save_for_backward(
-            quantized_a.data,
-            quantized_b.data,
+            quantized_a.qdata,
+            quantized_b.qdata,
             quantized_a.scale_inv,
             quantized_b.scale_inv,
             group_lens,
@@ -457,7 +457,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         )
 
         grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             b_fp8,
             quantized_grad_out.scale_inv,
             b_scale_inv,
@@ -473,7 +473,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8,
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             a_scale_inv,
             quantized_grad_out.scale_inv,
             group_lens,

@@ -19,7 +19,6 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorPair,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
 from tests.pytorch.test_utils import compute_snr
 
@@ -202,7 +201,6 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
             use_2d_block=False,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=enable_preshuffle(),
         ),
     )
 
@@ -216,7 +214,6 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
             use_2d_block=True,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=enable_preshuffle(),
         ),
     )
 

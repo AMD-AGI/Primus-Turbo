@@ -112,16 +112,6 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         )
 
 
-def enable_preshuffle() -> bool:
-    # NOTE: When auto-tune backend is disabled and gemm backend is AITER, we enable preshuffle for better performance.
-    is_aiter_backend = (
-        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.AITER
-        and GlobalBackendManager.auto_tune_enabled() is False
-    )
-
-    return is_aiter_backend
-
-
 class GEMMFP4AITERBackend(KernelBackend):
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.MX_BLOCKWISE,
@@ -175,10 +165,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        if enable_preshuffle():
-            # NOTE: When enable preshuffle, the input tensor is already shuffled.
-            return aiter.gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
-
+        # NOTE: AITER FP4 GEMM requires shuffled scale and B
         a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv, [16, 16])
         b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv, [16, 16])
         b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b, [16, 16])

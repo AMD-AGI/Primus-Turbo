@@ -123,7 +123,7 @@ class TestQuantizedTensorBasic:
 
         assert qt.dtype == dtype
         assert qt.real_dtype == dest_dtype
-        assert qt.data is not None
+        assert qt.qdata is not None
         assert qt.scale_inv is not None
         assert qt.shape == torch.Size([M, N])
         assert qt.device.type == "cuda"
@@ -417,7 +417,7 @@ class TestGroupedQuantizedTensorBasic:
 
         assert qt.dtype == dtype
         assert qt.real_dtype == dest_dtype
-        assert qt.data is not None
+        assert qt.qdata is not None
         assert qt.scale_inv is not None
         assert qt.shape == torch.Size([M, N])
         assert qt.device.type == "cuda"

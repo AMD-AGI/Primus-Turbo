@@ -21,10 +21,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
-    enable_preshuffle,
-    gemm_fp4_impl,
-)
+from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
 
 __all__ = ["gemm_fp4"]
 
@@ -60,7 +57,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_2d_block=False,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=enable_preshuffle(),
         )
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
@@ -80,7 +76,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_2d_block=True,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=enable_preshuffle(),
         )
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
@@ -98,10 +93,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         # NT layout
         out = gemm_fp4_impl(
-            a_fp4.data,
+            a_fp4.qdata,
             a_fp4.scale_inv,
             False,
-            b_fp4.data,
+            b_fp4.qdata,
             b_fp4.scale_inv,
             True,
             out_dtype,
@@ -120,8 +115,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=True,
-                shuffle_scale=enable_preshuffle(),
-                shuffle_out=enable_preshuffle(),
             )
             quantized_a_t = QuantizedTensor.quantize(
                 a_fp4.dequantize(),
@@ -139,8 +132,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 use_2d_block=True,
                 use_sr=False,
                 use_rht=True,
-                shuffle_scale=enable_preshuffle(),
-                shuffle_out=enable_preshuffle(),
             )
             quantized_b_t = QuantizedTensor.quantize(
                 b_fp4.dequantize(),
@@ -151,7 +142,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 scaling_recipe=b_t_scaling_recipe,
             )
         ctx.save_for_backward(
-            quantized_a_t.data, quantized_a_t.scale_inv, quantized_b_t.data, quantized_b_t.scale_inv
+            quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
         )
 
         ctx.trans_a = trans_a
@@ -176,7 +167,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_2d_block=False,
             use_sr=False,
             use_rht=True,
-            shuffle_scale=enable_preshuffle(),
         )
 
         quantized_grad_out = QuantizedTensor.quantize(
@@ -190,7 +180,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
         grad_a = gemm_fp4_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
             b_fp4_t,
@@ -206,7 +196,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_2d_block=False,
             use_sr=False,
             use_rht=True,
-            shuffle_scale=enable_preshuffle(),
         )
         quantized_grad_out_t = QuantizedTensor.quantize(
             grad_out,
@@ -219,7 +208,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
         grad_b = gemm_fp4_impl(
-            quantized_grad_out_t.data,
+            quantized_grad_out_t.qdata,
             quantized_grad_out_t.scale_inv,
             False,
             a_fp4_t,

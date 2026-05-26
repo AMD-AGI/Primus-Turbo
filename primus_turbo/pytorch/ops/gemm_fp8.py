@@ -78,10 +78,10 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             )
 
         out = gemm_fp8_impl(
-            quantized_a.data,
+            quantized_a.qdata,
             quantized_a.scale_inv,
             trans_a,
-            quantized_b.data,
+            quantized_b.qdata,
             quantized_b.scale_inv,
             trans_b,
             out_dtype,
@@ -90,7 +90,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
         ctx.save_for_backward(
-            quantized_a.data, quantized_a.scale_inv, quantized_b.data, quantized_b.scale_inv
+            quantized_a.qdata, quantized_a.scale_inv, quantized_b.qdata, quantized_b.scale_inv
         )
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -114,7 +114,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         )
 
         a_grad = gemm_fp8_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
             b_fp8_data,
@@ -130,7 +130,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             a_fp8_data,
             a_scale_inv,
             not ctx.trans_a,
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
             ctx.out_dtype,
@@ -211,10 +211,10 @@ class FP8GemmRowFunction(torch.autograd.Function):
             quantized_b_t = b_t
 
         out = gemm_fp8_impl(
-            quantized_a.data,
+            quantized_a.qdata,
             quantized_a.scale_inv,
             trans_a,
-            quantized_b.data,
+            quantized_b.qdata,
             quantized_b.scale_inv,
             trans_b,
             out_dtype,
@@ -223,9 +223,9 @@ class FP8GemmRowFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        # a_fp8.data = axis=-1 (row-wise), a_fp8.t() = axis=-2 (col-wise / transposed)
+        # a_fp8.qdata = axis=-1 (row-wise), a_fp8.t() = axis=-2 (col-wise / transposed)
         ctx.save_for_backward(
-            quantized_a_t.data, quantized_a_t.scale_inv, quantized_b_t.data, quantized_b_t.scale_inv
+            quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
         )
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -253,7 +253,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
 
         # NT
         a_grad = gemm_fp8_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
             b_fp8_t,
@@ -274,7 +274,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             a_fp8_t,
             a_t_scale_inv,
             not ctx.trans_a,
-            quantized_grad_out_t.data,
+            quantized_grad_out_t.qdata,
             quantized_grad_out_t.scale_inv,
             False,
             ctx.out_dtype,
@@ -469,10 +469,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # NT layout
         out = gemm_fp8_impl(
-            quantized_a.data,
+            quantized_a.qdata,
             quantized_a.scale_inv,
             False,
-            quantized_b.data,
+            quantized_b.qdata,
             quantized_b.scale_inv,
             True,
             out_dtype,
@@ -482,7 +482,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
         )
 
         ctx.save_for_backward(
-            quantized_a_t.data, quantized_a_t.scale_inv, quantized_b_t.data, quantized_b_t.scale_inv
+            quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
         )
 
         ctx.trans_a = trans_a
@@ -511,7 +511,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
         grad_a = gemm_fp8_impl(
-            quantized_grad_out.data,
+            quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
             b_fp8_t,
@@ -535,7 +535,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout.
         grad_b = gemm_fp8_impl(
-            quantized_grad_out_t.data,
+            quantized_grad_out_t.qdata,
             quantized_grad_out_t.scale_inv,
             False,
             a_fp8_t,
