@@ -579,6 +579,16 @@ class QuantizedTensor(torch.Tensor):
             if isinstance(tensor, QuantizedTensor):
                 return func(tensor._data, *args[1:], **(kwargs or {}))
 
+        if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+            tensor = args[0]
+            if isinstance(tensor, QuantizedTensor):
+                return cls._make_like(
+                    tensor,
+                    data=tensor._data.detach(),
+                    scale_inv=tensor._scale_inv.detach(),
+                    shape=tensor.shape,
+                )
+
         raise NotImplementedError(f"Unsupported dispatch: {func}")
 
     __torch_function__ = torch._C._disabled_torch_function_impl
