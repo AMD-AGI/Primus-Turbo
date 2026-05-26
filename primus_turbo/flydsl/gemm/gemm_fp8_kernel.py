@@ -18,11 +18,11 @@ at module load time. If FlyDSL is missing, `_FLYDSL_OK = False` and the
 backend's `can_handle` (which calls `flydsl_available()`) returns False -- the
 kernel factory + wrapper become unusable stubs.
 
-Algorithm: 8-wave (512 thread WG, wave_m=2 × wave_n=4) NT-layout fp8 GEMM,
-BLOCK_M=BLOCK_N=256, BLOCK_K=128, LDS_BLOCK_M=LDS_BLOCK_N=128, 2×2 mma ping-pong
-(c00/c01/c10/c11 per wave), `mfma_f32_16x16x128_f8f6f4`. Includes the c10/c11
-"stale a_cur1" pipeline fix in epilog 1 so epilog-2's a1_frag reads K_ITERS-1
-data instead of older K-iter data.
+Algorithm: 8-wave (512 thread WG, wave_m=2 × wave_n=4), BLOCK_M=BLOCK_N=256,
+BLOCK_K=128, LDS_BLOCK_M=LDS_BLOCK_N=128, 2×2 mma ping-pong (c00/c01/c10/c11
+per wave), `mfma_f32_16x16x128_f8f6f4`. NN B-operand load uses
+ds_read_b64_tr_b8 transpose-load (S2RLoaderTr); NT shares the FlyDSL repo's
+S2RLoader. Includes the c10/c11 "stale a_cur1" pipeline fix in epilog 1.
 
 Constraints:
   - K % 128 == 0     (BLOCK_K=128, K_ITERS compile-time constant, K_ITERS >= 2)
@@ -38,11 +38,8 @@ import sys
 import torch
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Module-load-time FlyDSL discovery. We try a direct import first; if FlyDSL is
-# installed but its repo root isn't on sys.path (the `kernels.*` package isn't
-# pip-installed), infer the root from `flydsl.__file__` and inject it.
-# ──────────────────────────────────────────────────────────────────────────────
+# Module-load-time FlyDSL discovery. `@flyc.kernel` needs FlyDSL utils as
+# module globals (not closure cells); inject FlyDSL repo root if missing.
 
 _FLYDSL_OK = False
 try:
@@ -54,9 +51,7 @@ try:
             StoreC,
             ceildiv,
             compute_global_swizzle,
-            divmod,
             make_fp8_buffer_tensor,
-            pack_i32x4_i32x8,
             swizzle_128,
             wait_barrier,
         )
@@ -75,9 +70,7 @@ try:
             StoreC,
             ceildiv,
             compute_global_swizzle,
-            divmod,
             make_fp8_buffer_tensor,
-            pack_i32x4_i32x8,
             swizzle_128,
             wait_barrier,
         )
@@ -86,8 +79,7 @@ try:
     import flydsl.expr as fx
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.compiler.kernel_function import CompilationContext as _CompilationContext
-    from flydsl.expr import buffer_ops as _buffer_ops, const_expr, range_constexpr, rocdl
+    from flydsl.expr import buffer_ops as _buffer_ops, range_constexpr, rocdl
     from flydsl.expr.utils.arith import ArithValue
     from flydsl.expr.arith import _to_raw as _raw
     from flydsl.expr.typing import T, Vector as Vec
@@ -102,28 +94,14 @@ def flydsl_available() -> bool:
     return _FLYDSL_OK
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Our own dense fp8 NT kernel factory. The @flyc.kernel decorated function
-# references the FlyDSL utils as module globals (above) so its co_freevars is
-# empty / matches what FlyDSL's AST rewriter expects.
-# ──────────────────────────────────────────────────────────────────────────────
-
 if _FLYDSL_OK:
 
     @functools.lru_cache(maxsize=128)
-    def _compile_dense_nt(K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, GROUP_M: int = 1):
-        """Build & cache the (K, BLOCK_M, BLOCK_N, GROUP_M)-specialised launch function.
-
-        ``GROUP_M`` controls tile-id swizzle for L2 reuse:
-          - ``GROUP_M == 1`` (default): row-major (block_m, block_n) scan = legacy.
-          - ``GROUP_M > 1``: Triton-style super-block grouping; WG-ids advance
-            ``block_m`` first within a ``GROUP_M × n_blocks`` super-block before
-            stepping ``block_n``, so consecutive WGs reuse B-columns in L2.
-        """
+    def _compile_dense_nt(K: int, BLOCK_M: int = 256, BLOCK_N: int = 256):
+        """Build & cache the (K, BLOCK_M, BLOCK_N)-specialised launch function."""
         BLOCK_K = 128
         assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
         assert K % BLOCK_K == 0
-        assert GROUP_M >= 1
 
         K_ITERS = K // BLOCK_K
         assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= 256"
@@ -185,17 +163,9 @@ if _FLYDSL_OK:
             wave_id = fx.thread_idx.x // 64
             wave_m = wave_id // 4
             wave_n = wave_id % 4
-            # Triton-style super-block tile-id swizzle. GROUP_M=1 collapses to
-            # row-major (block_m = pid // n_blocks, block_n = pid % n_blocks).
-            # GROUP_M>1: consecutive WGs share block_n, reusing B-columns in L2.
             pid = fx.block_idx.x
-            num_pid_in_group = GROUP_M * n_blocks
-            group_id = pid // num_pid_in_group
-            pid_in_group = pid % num_pid_in_group
-            pid_m_inner = pid_in_group % GROUP_M
-            pid_n = pid_in_group // GROUP_M
-            block_m = group_id * GROUP_M + pid_m_inner
-            block_n = pid_n
+            block_m = pid // n_blocks
+            block_n = pid % n_blocks
 
             A0_gl_offset = (block_m * BLOCK_M) * K
             A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
@@ -523,34 +493,12 @@ if _FLYDSL_OK:
         K: int,
         BLOCK_M: int = 256,
         BLOCK_N: int = 256,
-        WAVES_PER_EU: int = 2,
-        SETPRIO_HIGH: int = 1,
-        SCHED_HINT: int = 0,
-        GROUP_M: int = 1,
-        MAXNREG: int = 0,
+        GROUP_M: int = 4,
     ):
-        """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
-
-        Phase B2 knobs (default reproduces B1 baseline behavior):
-          WAVES_PER_EU  - rocdl.waves_per_eu attribute (1/2/4)
-          SETPRIO_HIGH  - main-loop mfma s_setprio raise value; 0 = no setprio
-                          (NN setprio is load-bearing per
-                          [[flydsl-nn-setprio-load-bearing]], 0 expected to
-                          regress; sweep included for completeness)
-          SCHED_HINT    - 0 = off (default); 1 = sched_group_barrier(mfma) anchor
-                          after each mfma in main loop; 2 = mfma+vmem+dsrd tight
-                          group (mirror A4 NT T3 mask set)
-
-        Phase B3 knob:
-          GROUP_M       - Triton-style super-block tile-id swizzle for L2 reuse.
-                          GROUP_M=1 (default) = row-major scan = B1 baseline.
-                          GROUP_M>1: consecutive WGs share block_n, reusing the
-                          B[K, block_n_cols] strip in L2. Mirror of NT GROUP_M.
-        """
+        """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N]."""
         BLOCK_K = 128
         assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
         assert K % BLOCK_K == 0
-        assert GROUP_M >= 1
 
         K_ITERS = K // BLOCK_K
         assert K_ITERS >= 2
@@ -612,8 +560,7 @@ if _FLYDSL_OK:
             wave_id = fx.thread_idx.x // 64
             wave_m = wave_id // 4
             wave_n = wave_id % 4
-            # B3: Triton-style super-block swizzle. GROUP_M=1 collapses to
-            # row-major (matches divmod(pid, n_blocks)).
+            # Triton-style super-block swizzle for L2 reuse (GM=4 default).
             pid = fx.block_idx.x
             num_pid_in_group = GROUP_M * n_blocks
             group_id = pid // num_pid_in_group
@@ -654,26 +601,6 @@ if _FLYDSL_OK:
             c10_frag = [mfma.zero_value] * N_ACCUMS
             c11_frag = [mfma.zero_value] * N_ACCUMS
 
-            # B2 closure constants — trace at Python time, fold into IR.
-            _NN_SP = SETPRIO_HIGH
-            _NN_SH = SCHED_HINT
-
-            def _prio_raise():
-                if _NN_SP > 0:
-                    rocdl.s_setprio(_NN_SP)
-
-            def _prio_drop():
-                if _NN_SP > 0:
-                    rocdl.s_setprio(0)
-
-            def _sched_after_mfma():
-                if _NN_SH == 1:
-                    rocdl.sched_group_barrier(rocdl.mask_mfma, N_ACCUMS, 0)
-                elif _NN_SH == 2:
-                    rocdl.sched_group_barrier(rocdl.mask_mfma, N_ACCUMS, 0)
-                    rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, 1)
-                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 2)
-
             # Prelude.
             b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K * c_n)
             a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
@@ -698,39 +625,35 @@ if _FLYDSL_OK:
                 a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                 rocdl.s_barrier()
 
-                _prio_raise()
+                rocdl.s_setprio(1)
                 c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-                _prio_drop()
-                _sched_after_mfma()
+                rocdl.s_setprio(0)
                 rocdl.s_barrier()
 
                 b1_frag = b_s2r.load(b_cur1)
                 b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
                 rocdl.s_barrier()
 
-                _prio_raise()
+                rocdl.s_setprio(1)
                 c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-                _prio_drop()
-                _sched_after_mfma()
+                rocdl.s_setprio(0)
                 rocdl.s_barrier()
 
                 a1_frag = a_s2r.load(a_cur1)
                 a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
                 rocdl.s_barrier()
 
-                _prio_raise()
+                rocdl.s_setprio(1)
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-                _prio_drop()
-                _sched_after_mfma()
+                rocdl.s_setprio(0)
                 rocdl.s_barrier()
 
                 b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
                 wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-                _prio_raise()
+                rocdl.s_setprio(1)
                 c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-                _prio_drop()
-                _sched_after_mfma()
+                rocdl.s_setprio(0)
                 rocdl.s_barrier()
 
                 a_cur0, a_next0 = a_next0, a_cur0
@@ -835,15 +758,7 @@ if _FLYDSL_OK:
                 B_scale,
                 c_m,
                 c_n,
-                value_attrs=(
-                    {
-                        "rocdl.waves_per_eu": WAVES_PER_EU,
-                        "rocdl.flat_work_group_size": "512,512",
-                        "passthrough": [["amdgpu-num-vgpr", str(MAXNREG)]],
-                    }
-                    if MAXNREG > 0
-                    else {"rocdl.waves_per_eu": WAVES_PER_EU, "rocdl.flat_work_group_size": "512,512"}
-                ),
+                value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "512,512"},
             ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
         return launch_dense_nn
@@ -857,33 +772,18 @@ else:
         K: int,
         BLOCK_M: int = 256,
         BLOCK_N: int = 256,
-        WAVES_PER_EU: int = 2,
-        SETPRIO_HIGH: int = 1,
-        SCHED_HINT: int = 0,
-        GROUP_M: int = 1,
+        GROUP_M: int = 4,
     ):
         raise ImportError("FlyDSL is not available -- this entry should be gated by can_handle.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Compiled-callable cache. Avoids paying the `flyc.compile` cost on every call
-# (single-test benchmarks bind compiled = flyc.compile(...) once and reuse).
-# ──────────────────────────────────────────────────────────────────────────────
 
 _COMPILED_DENSE_CACHE: dict = {}
 
 
-def _get_compiled_dense(launch, args, maxnreg: int = 0):
-    """Return a cached compiled launcher whose signature matches `args`.
-    Caches by tuple of (shape, dtype) per tensor + int values, so different
-    M/N/K trigger a fresh compile but identical shapes reuse the kernel object.
-
-    `maxnreg > 0` injects `--amdgpu-num-vgpr=<maxnreg>` via FlyDSL
-    CompilationContext.compile_hints (forces backend to spill VGPR accumulators
-    into AGPR when V budget is squeezed). `maxnreg == 0` = no LLVM hint = B3
-    baseline behavior.
-    """
-    key_parts = [id(launch), ("maxnreg", maxnreg)]
+def _get_compiled_dense(launch, args):
+    """Cache compiled launcher by (shape, dtype, int-arg) tuple."""
+    key_parts = [id(launch)]
     for a in args:
         if isinstance(a, torch.Tensor):
             key_parts.append((tuple(a.shape), a.dtype))
@@ -894,18 +794,9 @@ def _get_compiled_dense(launch, args, maxnreg: int = 0):
     key = tuple(key_parts)
     cached = _COMPILED_DENSE_CACHE.get(key)
     if cached is None:
-        if maxnreg > 0:
-            with _CompilationContext.compile_hints({"maxnreg": maxnreg}):
-                cached = flyc.compile(launch, *args)
-        else:
-            cached = flyc.compile(launch, *args)
+        cached = flyc.compile(launch, *args)
         _COMPILED_DENSE_CACHE[key] = cached
     return cached
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers shared with the layer-2 backend.
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:
@@ -915,17 +806,10 @@ def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:
 
 
 def _broadcast_scale(scale: torch.Tensor, length: int, device: torch.device) -> torch.Tensor:
-    # C5.1 wrap-overhead lever: scalar path uses expand+contiguous on GPU
-    # (no host sync), saving ~26us/call vs the previous .item()+torch.full path.
-    # Verified correctness-equivalent (produces same (length,) fp32 tensor).
-    if scale.numel() == 1:
-        s = scale.to(dtype=torch.float32, device=device).view(1)
-        return s.expand(length).contiguous()
-    if scale.numel() == length:
-        return scale.to(dtype=torch.float32, device=device).contiguous().view(-1)
-    raise ValueError(
-        f"per-tensor wrapper expected scale.numel() in {{1, {length}}}, got {scale.shape}"
-    )
+    # Tensorwise scalar → (length,) fp32 via expand+contiguous (no host sync,
+    # avoids ~26us/call vs .item()+torch.full).
+    assert scale.numel() == 1, f"per-tensor expects scalar, got {scale.shape}"
+    return scale.to(dtype=torch.float32, device=device).view(1).expand(length).contiguous()
 
 
 def _canonicalize_nt(
@@ -949,81 +833,15 @@ def _canonicalize_nt(
     return a_nt, b_nt, M, N, K_a
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# A5 per-shape GROUP_M autotune table (verdict: PARTIAL_REJECT — see docstring).
-#
-# Methodology lesson:
-#   rocprofv3 kernel-only probe (single-shape process, GPU 4 / chi2762,
-#   200-iter median, /tmp/a5_gm_summary.csv) showed 13/16 K-align shapes
-#   winning with GM=4 by 0.31-4.10%. Full 24-shape bench 3-run median REJECTED
-#   that conclusion:
-#       GM=1 pure              → fly/tri 0.9507 ✓ (winner)
-#       GM=4 all shapes        → fly/tri 0.9488 (-0.2pp, noise tie)
-#       GM=8 for (3072,4096)   → fly/tri 0.9376 (-1.3pp, regression)
-#   Bench run-to-run noise ≈3pp dominates any per-shape probe-claimed win
-#   (which were all <5%). Cross-shape L2 pollution + per-shape allocator
-#   interference flip probe winners under bench protocol.
-#
-#   GROUP_M plumbing kept in `_compile_dense_nt` for future per-shape
-#   overrides, but no override is active. Default GM=1 (row-major scan)
-#   matches A1 baseline behavior and is empirically robust.
-# ──────────────────────────────────────────────────────────────────────────────
-_NT_GROUP_M_OVERRIDE: dict[tuple[int, int], int] = {}
-_NT_GROUP_M_DEFAULT = 1
 
 
-def _pick_group_m(N: int, K: int) -> int:
-    return _NT_GROUP_M_OVERRIDE.get((N, K), _NT_GROUP_M_DEFAULT)
+# NN super-block GROUP_M (Triton-style tile-id swizzle for L2 reuse).
+# B3.3 bench-validated (2026-05-25, 3-run median × 16 K-align shapes): GM=4
+# beats GM=1 on every shape (Δ +1.4 to +7.9pp, geomean +3.19pp), GM=8 has
+# 3 shapes with -7..-15pp regression so not safe as default.
+_NN_GROUP_M = 4
 
 
-# B3 — per-shape NN GROUP_M autotune table. Default empty + GM=1 reproduces
-# B1 baseline behavior. Populated by B3 sweep if any (N, K) shape proves a
-# 3-run-bench-validated win > noise floor (~3pp). Mirror of NT GROUP_M
-# infra (kept separate because NN tile-id swizzle has different L2 reuse
-# pattern: GROUP_M groups WGs along block_m, NN reuses B[K, block_n_cols]
-# strip — same conceptual lever but different physical access pattern).
-_NN_GROUP_M_OVERRIDE: dict[tuple[int, int], int] = {}
-# B3.3 bench-validated (2026-05-25): 3-run median of bench_rrr_3way_tensorwise.py
-# × 16 K-align shapes shows GM=4 strictly dominates GM=1 — all 16 shapes
-# Δ +1.4 to +7.9pp, 0 regressions, geomean fly/tri 0.8577 → 0.8896 = +3.19pp.
-# GM=8 has 3 shapes with -7..-15pp regression, not safe as default.
-_NN_GROUP_M_DEFAULT = 4
-# B3 validation knob: FLYDSL_NN_GROUP_M_FORCE > 0 overrides per-shape table.
-# 0 = honor _NN_GROUP_M_OVERRIDE + _NN_GROUP_M_DEFAULT (production).
-_NN_GROUP_M_FORCE = int(os.environ.get("FLYDSL_NN_GROUP_M_FORCE", "0"))
-
-
-def _pick_group_m_nn(N: int, K: int) -> int:
-    if _NN_GROUP_M_FORCE > 0:
-        return _NN_GROUP_M_FORCE
-    return _NN_GROUP_M_OVERRIDE.get((N, K), _NN_GROUP_M_DEFAULT)
-
-
-# Phase B2 NN-path sched/setprio/waves_per_eu sweep knobs. Default values
-# reproduce the B1 baseline kernel (waves_per_eu=2, setprio raise/drop pair,
-# no sched_group_barrier hint). Variants are evaluated by `_b2_run_sweep.sh`
-# via env override before module import; per A4 NT lessons all three are
-# expected to be ≤ noise.
-_NN_WAVES_PER_EU = int(os.environ.get("FLYDSL_NN_WAVES_PER_EU", "2"))
-_NN_SETPRIO_HIGH = int(os.environ.get("FLYDSL_NN_SETPRIO_HIGH", "1"))
-_NN_SCHED_HINT = int(os.environ.get("FLYDSL_NN_SCHED_HINT", "0"))
-# B4 — NN VGPR-cap hook via MLIR llvm.passthrough{"amdgpu-num-vgpr"="N"}.
-# 0 (default) = no cap, B3 baseline V=256/A=0 mfma accumulator. When >0,
-# the attribute reaches LLVM IR attr block #0 (verified by 20_llvm_ir.ll
-# dump) and `next_free_vgpr` rounds up to nearest 32-aligned ≤N. **However:
-# force-AGPR hypothesis REJECTED**. mfma instructions emitted by DSL are
-# `v_mfma_f32_16x16x128_f8f6f4 v[..], v[..], v[..]` (VGPR-dest variants),
-# so LLVM regalloc resolves V-cap by spilling to scratch, NOT shifting D
-# accumulators to AGPRs. ISA evidence (chi2762, 2026-05-25):
-#   mnr=  0 → V=256 A=0 spill=0     scratch=0   (natural)
-#   mnr= 96 → V=192 A=0 spill=427   scratch=544 (cap → all-scratch)
-#   mnr=112 → V=224 A=0 spill=47    scratch=172 (cap → some-scratch)
-#   mnr≥144 → V=256 A=0 spill=0                 (cap ≥ natural = no-op)
-# AGPR is NEVER chosen. To actually force AGPR-accum, DSL must emit
-# AGPR-dest mfma intrinsic variants (upstream FlyDSL change). Hook
-# plumbing kept for future use (or to study scratch-spill perf curve);
-# default 0 has 0 overhead and reproduces B3 baseline bit-exactly.
-_NN_MAXNREG = int(os.environ.get("FLYDSL_NN_MAXNREG", "0"))
 
 
 
@@ -1073,15 +891,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         a_scale_v = _broadcast_scale(a_scale_inv, M, a.device)
         b_scale_v = _broadcast_scale(b_scale_inv, N, a.device)
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-        gm_nn = _pick_group_m_nn(N, K)
-        launch = _compile_dense_nn(
-            K=K, BLOCK_M=256, BLOCK_N=256,
-            WAVES_PER_EU=_NN_WAVES_PER_EU,
-            SETPRIO_HIGH=_NN_SETPRIO_HIGH,
-            SCHED_HINT=_NN_SCHED_HINT,
-            GROUP_M=gm_nn,
-            MAXNREG=_NN_MAXNREG,
-        )
+        launch = _compile_dense_nn(K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=_NN_GROUP_M)
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
@@ -1092,7 +902,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             N,
             torch.cuda.current_stream(),
         )
-        _get_compiled_dense(launch, args, maxnreg=_NN_MAXNREG)(*args)
+        _get_compiled_dense(launch, args)(*args)
     else:
         # NT native OR TT via host canonicalisation.
         a_nt, b_nt, M, N, K = _canonicalize_nt(a, b, trans_a, trans_b)
@@ -1103,8 +913,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         a_scale_v = _broadcast_scale(a_scale_inv, M, a.device)
         b_scale_v = _broadcast_scale(b_scale_inv, N, a.device)
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-        gm = _pick_group_m(N, K)
-        launch = _compile_dense_nt(K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=gm)
+        launch = _compile_dense_nt(K=K, BLOCK_M=256, BLOCK_N=256)
         args = (
             _as_i8_flat(a_nt),
             _as_i8_flat(b_nt),
