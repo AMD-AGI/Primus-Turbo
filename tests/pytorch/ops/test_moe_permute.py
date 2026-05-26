@@ -537,6 +537,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
         ndtt_pad,
         restore_shape=tokens_pad.shape,
         num_local_experts=num_experts,
+        pad_multiple=pad_multiple,
     )
     assert unp_out_pad.shape == (num_tokens, hidden_size)
     torch.testing.assert_close(unp_out_pad, unp_out_ref, **tol)

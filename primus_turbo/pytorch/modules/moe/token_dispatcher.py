@@ -350,6 +350,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             self.num_dispatched_token_tensor,
             restore_shape=self.hidden_shape_before_permute,
             num_local_experts=self.num_local_experts,
+            pad_multiple=self.pad_multiple,
         )
         return hidden_states
 
