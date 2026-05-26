@@ -501,8 +501,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     ),
 )
 def grouped_gemm_fp8(
-    a: Union[torch.Tensor, QuantizedTensorPair],
-    b: Union[torch.Tensor, QuantizedTensorPair],
+    a: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
     group_lens: torch.Tensor,
     group_offs: Union[torch.Tensor, None] = None,
     trans_b: bool = True,

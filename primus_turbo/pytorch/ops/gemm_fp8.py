@@ -590,8 +590,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
     ),
 )
 def gemm_fp8(
-    a: Union[torch.Tensor, QuantizedTensorPair],
-    b: Union[torch.Tensor, QuantizedTensorPair],
+    a: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
     trans_a: bool = False,
     trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
