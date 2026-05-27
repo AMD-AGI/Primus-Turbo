@@ -38,6 +38,12 @@ enum class QuantizeMode { ROWWISE, COLWISE };
 constexpr int MXFP4_BLOCK_SIZE = 32;
 constexpr int MXFP8_BLOCK_SIZE = 32;
 
+// Padding alignment expected for the public ``padding_align_size`` op argument.
+// Must stay in sync with ``MXFP4_PADDING_ALIGN_SIZE`` / ``MXFP8_PADDING_ALIGN_SIZE``
+// declared in ``primus_turbo/pytorch/core/low_precision.py``.
+constexpr int MXFP4_PADDING_ALIGN_SIZE = 128;
+constexpr int MXFP8_PADDING_ALIGN_SIZE = 128;
+
 struct ScalingRecipe {
     bool use_2d_block = false;
     bool use_sr       = false;
@@ -69,9 +75,6 @@ constexpr float FP8E4M3_FNUZ_MAX             = 240.0;
 constexpr int   FP8E4M3_FNUZ_TARGET_MAX_POW2 = 7;
 
 constexpr int E8M0_EXPONENT_BIAS = 127;
-
-constexpr int MXFP4_PADDING_ALIGN_SIZE = 128;
-constexpr int MXFP8_PADDING_ALIGN_SIZE = 128;
 
 } // namespace detail
 
@@ -111,5 +114,19 @@ void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
 template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,
                                 hipStream_t stream);
+
+// Rowwise dequantize when the per-row dim is the innermost (last) dim.
+// scale_inv has shape [outer_len] (one scalar per row).
+template <typename FType, typename QType, typename ComputeType = float>
+void dequantize_rowwise_row_major_impl(const QType *x, const float *scale_inv, FType *y,
+                                       const int64_t outer_len, const int64_t inner_len,
+                                       hipStream_t stream);
+
+// Rowwise dequantize when the per-row dim is a middle dim.
+// Input is viewed as [B, M, N], scale_inv has shape [B, N] (broadcast across M).
+template <typename FType, typename QType, typename ComputeType = float>
+void dequantize_rowwise_col_major_impl(const QType *x, const float *scale_inv, FType *y,
+                                       const int64_t batch, const int64_t m, const int64_t n,
+                                       hipStream_t stream);
 
 } // namespace primus_turbo

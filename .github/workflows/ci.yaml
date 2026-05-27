@@ -174,11 +174,11 @@ jobs:
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 95
+          timeout_minutes: 135
           max_attempts: 2
           # use timeout to terminate pytest and its workers on timeout
           command: >
-            timeout -k 60s 90m
+            timeout -k 60s 130m
             bash -lc
             "exec pytest -v tests/pytorch -n 8 --log-cli-level=INFO"
         env:

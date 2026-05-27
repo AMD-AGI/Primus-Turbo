@@ -25,13 +25,13 @@ def _lb_group_lens(group_lens: torch.Tensor, total: int) -> torch.Tensor:
     return out
 
 
-def _group_offs_from_lens(group_lens: torch.Tensor) -> torch.Tensor:
+def group_offs_from_lens(group_lens: torch.Tensor) -> torch.Tensor:
     """Compute prefix-sum offsets from group lengths."""
-    lens = group_lens.to(dtype=torch.int64)
-    offs = torch.empty((lens.numel() + 1,), dtype=torch.int64, device=lens.device)
-    offs[0] = 0
-    offs[1:] = torch.cumsum(lens, dim=0)
-    return offs
+    assert group_lens.is_cuda, "group_lens must be on CUDA"
+
+    group_offs = torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(group_lens)
+
+    return group_offs
 
 
 class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
@@ -57,7 +57,7 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
         a: torch.Tensor = kwargs["a"]
         group_lens: torch.Tensor = kwargs["group_lens"]
         lb_group_lens = _lb_group_lens(group_lens, int(a.size(0)))
-        lb_group_offs = _group_offs_from_lens(lb_group_lens)
+        lb_group_offs = group_offs_from_lens(lb_group_lens)
 
         prof_kwargs = dict(kwargs)
         prof_kwargs["group_lens"] = lb_group_lens
@@ -121,7 +121,7 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
 
         total_k = int(lhs.size(0) if trans_lhs else lhs.size(1))
         lb_group_lens = _lb_group_lens(group_lens, total_k)
-        lb_group_offs = _group_offs_from_lens(lb_group_lens)
+        lb_group_offs = group_offs_from_lens(lb_group_lens)
 
         prof_kwargs = dict(kwargs)
         prof_kwargs["group_lens"] = lb_group_lens
