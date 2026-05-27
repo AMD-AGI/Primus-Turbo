@@ -117,8 +117,7 @@ class _MoEPermute(torch.autograd.Function):
             )
         )
 
-        # Prefer caller-provided cap to avoid host sync.
-        if num_permuted_tokens >= 0:
+        if num_permuted_tokens > 0:
             num_permuted_alloc = int(num_permuted_tokens)
         else:
             num_permuted_alloc = int(tokens_per_expert.sum().item())
@@ -203,7 +202,7 @@ class _MoEPermute(torch.autograd.Function):
             permuted_probs_grad = None
             grad_probs = None
 
-        if not (ctx.num_dispatched == 0 or grad_permuted_tokens.shape[0] == 0):
+        if ctx.num_dispatched > 0:
             torch.ops.primus_turbo_cpp_extension.unpermute(
                 grad_permuted_tokens,
                 grad_tokens,

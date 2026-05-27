@@ -11,17 +11,9 @@ static inline constexpr size_t kVsmemCacheLineSize = 128;
     do {                                                                                           \
         switch (hidden) {                                                                          \
         case 4096:                                                                                 \
-            launch_macro(512);                                                                     \
-            break;                                                                                 \
         case 5120:                                                                                 \
-            launch_macro(512);                                                                     \
-            break;                                                                                 \
         case 6144:                                                                                 \
-            launch_macro(512);                                                                     \
-            break;                                                                                 \
         case 7168:                                                                                 \
-            launch_macro(512);                                                                     \
-            break;                                                                                 \
         case 8192:                                                                                 \
             launch_macro(512);                                                                     \
             break;                                                                                 \

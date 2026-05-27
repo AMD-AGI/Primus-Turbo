@@ -23,16 +23,8 @@ using ::primus_turbo::deep_ep::st_na_global;
 using ::primus_turbo::dtype::bfloat16;
 using ::primus_turbo::dtype::float16;
 
-// Local non-temporal int4 store. The shared `st_na_global` in
-// deep_ep/utils.cuh has a TODO since import noting the int4 specialization
-// is a plain store with default cache policy; the permute kernels stream
-// every int4 store exactly once per kernel so allocating those lines in
-// L2 only wastes capacity and the L2-fabric pipe identified as bottleneck
-// by profile/baseline_v1/REPORT.md §1. `__builtin_nontemporal_store` on a
-// 4-int clang ext_vector lowers to `global_store_dwordx4 ... slc:1` on
-// gfx950, matching the "store-with-no-L2-allocate" we want. Loads are
-// left as `__ldg` (load-side NT was tried in D3 and is neutral on
-// average — the gather pattern's adjacent-j sharing keeps L2 useful).
+// Streamed stores: lowers to `global_store_dwordx4 ... slc:1` on gfx950,
+// bypassing L2 allocation since each line is written exactly once.
 typedef int int4_v __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ void st_nt_int4(int4 *ptr, const int4 &val) {
@@ -97,15 +89,13 @@ __launch_bounds__(kNumThreads, 1) __global__
                                       int probs_topk_stride, TempStorageLayout layout) {
     using BlockScan   = hipcub::BlockScan<int32_t, kNumThreads>;
     using BlockReduce = hipcub::BlockReduce<int32_t, kNumThreads>;
-    // Scan and reduce are never live at the same time; alias to save LDS.
+    // Scan and reduce are never live simultaneously; alias to save LDS.
     union SharedTemp {
         typename BlockScan::TempStorage   scan;
         typename BlockReduce::TempStorage reduce;
     };
     __shared__ SharedTemp shared_temp;
 
-    // Per-block real-row count accumulator, plus the grid-wide total
-    // published by the col-E lookback (consumed by the last block).
     __shared__ int s_block_dispatched;
     __shared__ int s_total_dispatched;
 
@@ -122,7 +112,6 @@ __launch_bounds__(kNumThreads, 1) __global__
 
     uint64_t *tile_state = layout.tile_state;
 
-    // Per-block scratch: LDS, or a slice of the global vsmem fallback.
     int *temp_storage  = get_temp_storage<int>(dyn_shmem, layout.vsmem);
     int *s_tile        = temp_storage;
     int *s_acc         = s_tile + kNumItemsPerTile * E;
@@ -130,20 +119,16 @@ __launch_bounds__(kNumThreads, 1) __global__
     int *s_tpe_prefix  = s_excl_prefix + E;
     int *s_num_padded  = s_tpe_prefix + E;
 
-    // Worst-case row range: padding rows trip the [0, E) guard in
-    // fill_s_tile_* and end up with all-zero masks (n_routed == 0).
     const int N               = max_num_dispatched_tokens;
     const int num_token_tiles = (N + kNumItemsPerTile - 1) / kNumItemsPerTile;
     const int tiles_per_block = (num_token_tiles + grid_size - 1) / grid_size;
     const int tile_begin      = block_id * tiles_per_block;
     const int tile_end        = min(tile_begin + tiles_per_block, num_token_tiles);
-    // Single-tile blocks keep s_tile in LDS through the compact step and
-    // skip the row_id_map spill / read-back.
+    // Single-tile blocks keep s_tile in LDS and skip row_id_map spill/read-back.
     const bool single_tile = (tile_end - tile_begin) == 1;
 
-    const int npt = num_permuted_tokens < 0 ? INT_MAX : static_cast<int>(num_permuted_tokens);
+    const int npt = num_permuted_tokens <= 0 ? INT_MAX : static_cast<int>(num_permuted_tokens);
 
-    // ----- init -----
     if (block_id == 0 && thread_id == 0)
         *overflow_flag = 0;
     if (thread_id == 0) {
@@ -154,7 +139,6 @@ __launch_bounds__(kNumThreads, 1) __global__
         s_acc[i] = 0;
     __syncthreads();
 
-    // ----- per-tile: count real rows, then per-expert exclusive scan -----
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
         const int tile_offset = tile_idx * kNumItemsPerTile;
 
@@ -162,7 +146,7 @@ __launch_bounds__(kNumThreads, 1) __global__
                                                kNumItemsPerTile, N);
         __syncthreads();
 
-        // Count real rows while s_tile still holds the raw 0/1 mask.
+        // Count real rows before the per-expert scan overwrites s_tile.
         {
             int       local_real = 0;
             const int t = thread_id, gtoken = tile_offset + t;
@@ -177,10 +161,10 @@ __launch_bounds__(kNumThreads, 1) __global__
             const int tile_total = BlockReduce(shared_temp.reduce).Sum(local_real);
             if (thread_id == 0)
                 s_block_dispatched += tile_total;
-            __syncthreads(); // reduce → scan union re-use.
+            __syncthreads(); // reduce → scan union reuse
         }
 
-        // Per-expert ExclusiveSum: rewrite mask to slot index (1-based).
+        // Rewrite mask to 1-based slot index per expert.
         for (int e = 0; e < E; ++e) {
             const int local = s_tile[thread_id * E + e];
             int       excl_block, scan_total;
@@ -210,13 +194,10 @@ __launch_bounds__(kNumThreads, 1) __global__
     } else if (thread_id == E) {
         const int32_t agg  = s_block_dispatched;
         const int32_t excl = decoupled_lookback(tile_state, block_id, tile_state_stride, E, agg);
-        // Inclusive prefix at this block; the last block's value is the
-        // grid-wide dispatched-row count.
-        s_total_dispatched = excl + agg;
+        s_total_dispatched = excl + agg; // last block's value == grid-wide total
     }
     __syncthreads();
 
-    // ----- pull grid totals from the last block, build padded base offsets -----
     if (thread_id < E) {
         TileState s;
         do {
@@ -240,8 +221,7 @@ __launch_bounds__(kNumThreads, 1) __global__
     }
     __syncthreads();
 
-    // ----- compact: rewrite per-token slot indices into the dense row layout -----
-    // One thread per token; in-place write is WAR-safe because n <= e.
+    // One thread per token; in-place compact write is WAR-safe because n <= e.
     auto patch = [&](int local, int expert) -> int {
         if (local == 0)
             return 0;
@@ -262,8 +242,7 @@ __launch_bounds__(kNumThreads, 1) __global__
                 continue;
             row_id_map[row_base + n] = s;
             int aux_val              = e;
-            // Topk-aligned probs: aux is the k such that topk_idx[gtoken,k]==e.
-            // O(num_topk); compiled out for the routing_map (bool) path.
+            // Topk-aligned probs: aux is the k with topk_idx[gtoken,k]==e.
             if constexpr (!std::is_same_v<expert_map_t, bool>) {
                 if (probs_topk_stride > 0) {
                     for (int k = 0; k < num_topk; ++k) {
@@ -303,7 +282,7 @@ __launch_bounds__(kNumThreads, 1) __global__
         }
     }
 
-    // ----- block 0: emit padding rows (negative 1-indexed offsets) -----
+    // Padding rows use negative 1-indexed offsets.
     if (block_id == 0) {
         for (int i = thread_id; i < pad_multiple; i += kNumThreads) {
             const int64_t row_base = (static_cast<int64_t>(N) + i) * row_stride;
@@ -324,7 +303,6 @@ __launch_bounds__(kNumThreads, 1) __global__
         }
     }
 
-    // ----- last block: finalise tokens_per_expert, publish total, clear prev -----
     if (block_id == grid_size - 1) {
         if (thread_id < E) {
             const int tokens_for_expert = s_acc[thread_id] + s_num_padded[thread_id];
@@ -339,7 +317,7 @@ __launch_bounds__(kNumThreads, 1) __global__
     }
 }
 
-// Per-stream double-buffered tile_state + optional vsmem region.
+// Per-stream double-buffered tile_state cache + optional vsmem region.
 static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
                                                         size_t vsmem_bytes_per_block,
                                                         size_t grid_size, hipStream_t stream) {
@@ -355,8 +333,9 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
 
     LookbackCache &c = cache[stream];
 
-    if (c.ptr == nullptr || c.total < total_bytes || c.buf_bytes != buf_bytes) {
-        if (c.total < total_bytes) {
+    const bool grow = c.total < total_bytes;
+    if (grow || c.buf_bytes != buf_bytes) {
+        if (grow) {
             if (c.ptr != nullptr)
                 PRIMUS_TURBO_CHECK_HIP(hipFreeAsync(c.ptr, stream));
             PRIMUS_TURBO_CHECK_HIP(hipMallocAsync(&c.ptr, total_bytes, stream));
@@ -374,7 +353,7 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
     layout.tile_state       = reinterpret_cast<uint64_t *>(base + cur * buf_bytes);
     layout.prev_tile_state  = reinterpret_cast<uint64_t *>(base + nxt * buf_bytes);
     layout.num_memset_int64 = buf_bytes / sizeof(uint64_t);
-    // gmem_ptr == nullptr signals the kernel to use LDS instead of vsmem.
+    // Null gmem_ptr signals the kernel to use LDS instead of vsmem.
     layout.vsmem.gmem_ptr        = (vsmem_bytes_per_block > 0) ? (base + 2 * buf_bytes) : nullptr;
     layout.vsmem.bytes_per_block = vsmem_bytes;
 
@@ -382,7 +361,6 @@ static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
     return layout;
 }
 
-// Host launcher shared by routing_map (bool) and topk_idx (int/int64) inputs.
 template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_out, int num_local_experts,
@@ -392,13 +370,11 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 hipStream_t stream) {
     constexpr int kNumThreads = 512;
     PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
-    // Strict ``<``: the kernel uses thread ``E`` for the dispatched-count
-    // lookback column. Production MoE configs sit well below this bound.
+    // Strict ``<``: thread E owns the dispatched-count lookback column.
     PRIMUS_TURBO_CHECK(num_local_experts < kNumThreads, "num_local_experts must be < kNumThreads");
     PRIMUS_TURBO_CHECK(max_num_dispatched_tokens >= 0, "max_num_dispatched_tokens must be >= 0");
 
     if (max_num_dispatched_tokens == 0) {
-        // Nothing to do; satisfy output contract via memset.
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
             tokens_per_expert, 0, num_local_experts * sizeof(*tokens_per_expert), stream));
         PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(overflow_flag, 0, sizeof(*overflow_flag), stream));
@@ -414,20 +390,17 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
 
     const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
 
-    // Per-block scratch: s_tile (T * E) + s_acc + s_excl_prefix +
-    // s_tpe_prefix + s_num_padded.
+    // (T + 4) * E ints: s_tile (T*E) + s_acc + s_excl_prefix + s_tpe_prefix + s_num_padded.
     const size_t required_temp_storage_bytes =
-        (static_cast<size_t>(kNumThreads) * num_local_experts +
-         4 * static_cast<size_t>(num_local_experts)) *
-        sizeof(int);
-    // Spill to global memory (vsmem) when LDS is too small for E.
+        static_cast<size_t>(num_local_experts) * (kNumThreads + 4) * sizeof(int);
+    // Spill to vsmem when LDS is too small.
     const bool   use_vsmem = required_temp_storage_bytes > static_cast<size_t>(max_shmem_per_block);
     const size_t kernel_lds_bytes       = use_vsmem ? 0 : required_temp_storage_bytes;
     const size_t vshmem_bytes_per_block = use_vsmem ? required_temp_storage_bytes : 0;
 
     const int grid_size = std::min(num_token_tiles, num_cu);
 
-    // (E + 1) lookback cols per block: [0, E) per-expert, E dispatched-count.
+    // (E + 1) lookback cols per block: [0, E) per-expert + col E for dispatched count.
     const size_t lookback_workspace_bytes =
         static_cast<size_t>(grid_size) * (num_local_experts + 1) * sizeof(uint64_t);
 
@@ -452,17 +425,10 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
                         int num_local_experts, int hidden_int4, int scales_per_token,
                         int probs_stride) {
     const int lane_id = static_cast<int>(threadIdx.x);
-    // E12: shape-conditional decomposition selected at launch via kNumChunks.
-    //   kNumChunks == 1 -> E7p collapsed form: 1 block per token, per-thread
-    //                      inner loop strides through hidden_int4. Wins on
-    //                      partial-chunk shapes (5120/6144/7168) by avoiding
-    //                      the redundant per-token preamble of multi-chunk
-    //                      decomposition.
-    //   kNumChunks >= 2 -> chunked form: 1 block per (token, chunk) pair,
-    //                      single iteration per thread. Wins on
-    //                      exact-divisor shapes (2048/4096/8192) where the
-    //                      collapsed inner loop has no waste but adds
-    //                      loop-construct overhead and serializes per-thread.
+    // kNumChunks == 1: collapsed form (1 block/token, stride inner loop) —
+    //                  wins on partial-chunk shapes (5120/6144/7168).
+    // kNumChunks >= 2: chunked form (1 block/(token,chunk), single iter/thread)
+    //                  — wins on exact-divisor shapes (2048/4096/8192).
     int token_id, chunk_id;
     if constexpr (kNumChunks == 1) {
         token_id = static_cast<int>(blockIdx.x);
@@ -485,38 +451,28 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
     const int *row      = row_id_map + token_id * row_stride;
     const int  n_routed = row[2 * E];
 
-    const int4 zero4 = make_int4(0, 0, 0, 0);
+    const int4 zero4        = make_int4(0, 0, 0, 0);
+    auto       scatter_pack = [&](int j) {
+        const int4 src_pack = is_padding_token ? zero4 : __ldg(tokens + token_id * hidden_int4 + j);
+        for (int idx = 0; idx < n_routed; ++idx) {
+            const int dst_row = row[idx];
+            if (dst_row > 0)
+                st_nt_int4(permuted_tokens + (dst_row - 1) * hidden_int4 + j, src_pack);
+            else
+                st_nt_int4(permuted_tokens + (-dst_row - 1) * hidden_int4 + j, zero4);
+        }
+    };
     if constexpr (kNumChunks == 1) {
-// E7p form: stride loop over all packs (1 to ceil(N/B) iters/thread).
 #pragma unroll
-        for (int j = lane_id; j < hidden_int4; j += kBlockHiddenPacks) {
-            const int4 src_pack =
-                is_padding_token ? zero4 : __ldg(tokens + token_id * hidden_int4 + j);
-            for (int idx = 0; idx < n_routed; ++idx) {
-                const int dst_row = row[idx];
-                if (dst_row > 0)
-                    st_nt_int4(permuted_tokens + (dst_row - 1) * hidden_int4 + j, src_pack);
-                else
-                    st_nt_int4(permuted_tokens + (-dst_row - 1) * hidden_int4 + j, zero4);
-            }
-        }
+        for (int j = lane_id; j < hidden_int4; j += kBlockHiddenPacks)
+            scatter_pack(j);
     } else {
-        // Chunked form: one int4 pack per thread, guarded for ragged tail.
         const int j = chunk_id * kBlockHiddenPacks + lane_id;
-        if (j < hidden_int4) {
-            const int4 src_pack =
-                is_padding_token ? zero4 : __ldg(tokens + token_id * hidden_int4 + j);
-            for (int idx = 0; idx < n_routed; ++idx) {
-                const int dst_row = row[idx];
-                if (dst_row > 0)
-                    st_nt_int4(permuted_tokens + (dst_row - 1) * hidden_int4 + j, src_pack);
-                else
-                    st_nt_int4(permuted_tokens + (-dst_row - 1) * hidden_int4 + j, zero4);
-            }
-        }
+        if (j < hidden_int4)
+            scatter_pack(j);
     }
 
-    // scaling_factor / probs are per-token: chunk_id==0 only when chunked.
+    // scaling_factor / probs are per-token; only chunk_id==0 emits them.
     if constexpr (kNumChunks > 1) {
         if (chunk_id != 0)
             return;
@@ -597,17 +553,10 @@ __launch_bounds__(kNumThreads, 4) __global__
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
 
     const int lane_id = static_cast<int>(threadIdx.x);
-    // Grid layout (matches LAUNCH_UNPERMUTE):
-    //   kNumChunks==1: blockIdx.x = token, no Y dim
-    //   kNumChunks∈{2,3,4}: blockIdx.x = token*kNumChunks + chunk, no Y dim
-    //                       (1-D dispatch avoids gfx950 2-D walker overhead)
-    //   kNumChunks==0:  fallback for >4 chunks; blockIdx.x = token,
-    //                   blockIdx.y = chunk
+    // kNumChunks∈[1,4]: 1-D dispatch (avoids gfx950 2-D walker overhead).
+    // kNumChunks==0:    >4 chunks fallback via 2-D dispatch.
     int token_id, chunk_id;
-    if constexpr (kNumChunks == 1) {
-        token_id = static_cast<int>(blockIdx.x);
-        chunk_id = 0;
-    } else if constexpr (kNumChunks >= 2 && kNumChunks <= 4) {
+    if constexpr (kNumChunks >= 1 && kNumChunks <= 4) {
         token_id = static_cast<int>(blockIdx.x) / kNumChunks;
         chunk_id = static_cast<int>(blockIdx.x) % kNumChunks;
     } else {
@@ -651,7 +600,6 @@ __launch_bounds__(kNumThreads, 4) __global__
         st_nt_int4(tokens + token_id * hidden_int4 + j, out_pack);
     }
 
-    // Probs scatter: only chunk_id == 0 emits the per-token probs row.
     if (probs != nullptr && permuted_probs != nullptr && chunk_id == 0) {
         for (int p_j = lane_id; p_j < probs_stride; p_j += kNumThreads)
             probs[token_id * probs_stride + p_j] = prob_t{0};
@@ -664,10 +612,6 @@ __launch_bounds__(kNumThreads, 4) __global__
         }
     }
 }
-
-// =============================================================================
-// Host-side permute / unpermute launchers.
-// =============================================================================
 
 template <typename dtype_t, typename prob_t, typename scalar_t>
 void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_t *scaling_factor,
@@ -697,19 +641,12 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
 
 #define LAUNCH_PERMUTE(num_hidden_per_block)                                                       \
     do {                                                                                           \
-        /* E12: route exact-divisor shapes (e.g. hidden_int4 == N*B) to chunked      */            \
-        /* form (1 block per (token, chunk), one int4 per thread); partial-chunk     */            \
-        /* shapes stay on E7p collapsed form (1 block per token, stride inner loop). */            \
-        const bool exact         = (hidden_int4 % (num_hidden_per_block) == 0);                    \
-        const int  n_full_chunks = hidden_int4 / (num_hidden_per_block);                           \
-        if (exact && n_full_chunks == 2) {                                                         \
+        /* hidden_int4 == 2*B uses the 2-chunk form; everything else collapses to 1. */            \
+        const bool use_2chunk = (hidden_int4 == 2 * (num_hidden_per_block));                       \
+        if (use_2chunk) {                                                                          \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max) * 2u);                         \
             LAUNCH_PERMUTE_NC(num_hidden_per_block, 2, grid);                                      \
-        } else if (exact && n_full_chunks == 1) {                                                  \
-            dim3 grid(static_cast<unsigned int>(num_dispatched_max));                              \
-            LAUNCH_PERMUTE_NC(num_hidden_per_block, 1, grid);                                      \
         } else {                                                                                   \
-            /* partial chunk (5120/6144/7168) or n_full_chunks > 2: E7p form. */                   \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max));                              \
             LAUNCH_PERMUTE_NC(num_hidden_per_block, 1, grid);                                      \
         }                                                                                          \
@@ -741,12 +678,9 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
 
     const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
 
-    // ``unpermute_kernel_e1`` hard-codes a row width of 1 for ``probs``; it is
-    // only valid for the legacy multihot path (probs == [T, 1]). With
-    // topk-aligned probs the row width is ``num_topk`` even when
-    // ``num_local_experts == 1``, so we fall back to the general kernel.
+    // unpermute_kernel_e1 hard-codes probs row width == 1, valid only for the
+    // legacy multihot path. Topk-aligned probs use num_topk even at E=1.
     if (num_local_experts == 1 && effective_probs_stride == 1) {
-        // E=1 path keeps the persistent-block design (one warp per token).
         constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;
         const int     e1_grid       = blocks_needed;
@@ -792,38 +726,19 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
-// =============================================================================
 // Explicit template instantiations consumed by csrc/pytorch/moe_permute/moe_permute.cpp.
-// =============================================================================
+#define INSTANTIATE(fn, ...) template decltype(fn<__VA_ARGS__>) fn<__VA_ARGS__>
 
-#define INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(expert_map_t)                                       \
-    template void permute_preprocessing_impl<expert_map_t>(                                        \
-        const expert_map_t *expert_map, int num_topk, int *num_dispatched_tokens_out,              \
-        int num_local_experts, int max_num_dispatched_tokens, int pad_multiple,                    \
-        int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,                           \
-        int64_t num_permuted_tokens, int probs_topk_stride, hipStream_t stream)
+INSTANTIATE(permute_preprocessing_impl, bool);
+INSTANTIATE(permute_preprocessing_impl, int);
+INSTANTIATE(permute_preprocessing_impl, int64_t);
 
-#define INSTANTIATE_UNPERMUTE_IMPL(dtype_t, prob_t)                                                \
-    template void unpermute_impl<dtype_t, prob_t>(const dtype_t *, dtype_t *, const prob_t *,      \
-                                                  prob_t *, const int *, const int *, int, int,    \
-                                                  int, int, hipStream_t)
-#define INSTANTIATE_PERMUTE_IMPL(dtype_t, prob_t, scalar_t)                                        \
-    template void permute_impl<dtype_t, prob_t, scalar_t>(                                         \
-        const dtype_t *, dtype_t *, const scalar_t *, scalar_t *, const prob_t *, prob_t *,        \
-        const int *, const int *, int, int, int, int, int, int, hipStream_t)
+INSTANTIATE(permute_impl, uint8_t, float, float);
+INSTANTIATE(permute_impl, uint16_t, float, float);
 
-INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(bool);
-INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(int);
-INSTANTIATE_PERMUTE_PREPROCESSING_IMPL(int64_t);
+INSTANTIATE(unpermute_impl, bfloat16, float);
+INSTANTIATE(unpermute_impl, float16, float);
 
-INSTANTIATE_PERMUTE_IMPL(uint8_t, float, float);
-INSTANTIATE_PERMUTE_IMPL(uint16_t, float, float);
-
-INSTANTIATE_UNPERMUTE_IMPL(bfloat16, float);
-INSTANTIATE_UNPERMUTE_IMPL(float16, float);
-
-#undef INSTANTIATE_PERMUTE_PREPROCESSING_IMPL
-#undef INSTANTIATE_UNPERMUTE_IMPL
-#undef INSTANTIATE_PERMUTE_IMPL
+#undef INSTANTIATE
 
 } // namespace primus_turbo
