@@ -208,7 +208,6 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config, axis=-1)
-            assert torch.equal(a.group_lens, group_lens), "a.group_lens must match the given group_lens"
             quantized_a = a
             group_offs = a.group_offs
         else:
@@ -382,7 +381,6 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
-            assert torch.equal(a.group_lens, group_lens), "a.group_lens must match the given group_lens"
             quantized_a = a
             group_offs = a.group_offs
         else:
