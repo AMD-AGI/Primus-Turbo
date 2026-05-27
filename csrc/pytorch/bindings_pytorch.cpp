@@ -64,10 +64,6 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
     m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
 
-    // ********* RMSNorm *********
-    m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
-    m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
-
     // ********* Permute (MoE token (un)permute) *********
     m.def("permute_preprocessing(Tensor expert_map, Tensor num_dispatched_token_tensor, "
           "int num_local_experts, int num_topk, int pad_multiple, "
@@ -126,10 +122,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("shuffle_scale", shuffle_scale_impl);
     m.impl("shuffle_weight", shuffle_weight_impl);
 
-    // ********* RMSNorm *********
-    m.impl("rmsnorm_fwd", rmsnorm_fwd);
-    m.impl("rmsnorm_bwd", rmsnorm_bwd);
-
     // ********* Permute *********
     m.impl("permute_preprocessing", permute_preprocessing);
     m.impl("permute", permute);
@@ -169,10 +161,6 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
     m.impl("shuffle_weight", shuffle_weight_impl_meta);
-
-    // ********* RMSNorm *********
-    m.impl("rmsnorm_fwd", rmsnorm_fwd_meta);
-    m.impl("rmsnorm_bwd", rmsnorm_bwd_meta);
 
     // ********* Permute *********
     m.impl("permute_preprocessing", permute_preprocessing_meta);
