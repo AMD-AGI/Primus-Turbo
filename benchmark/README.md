@@ -10,7 +10,7 @@ This document presents performance benchmarks for **Primus-Turbo**.
 ### 1. benchmark intranode
 
 ```bash
-python benchmark/ops/deep_ep/bench_intranode.py
+python benchmark/ops/deep_ep/test_intranode.py
 ```
 
 
@@ -22,5 +22,5 @@ export NODE_RANK=
 export MASTER_ADDR=
 export MASTER_PORT=
 
-torchrun --nproc_per_node 1 --nnodes "${NNODES}" -node_rank "${NODE_RANK}" --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}"  benchmark/ops/deep_ep/bench_internode.py
+torchrun --nproc_per_node 1 --nnodes "${NNODES}" -node_rank "${NODE_RANK}" --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}"  benchmark/ops/deep_ep/test_internode.py
 ```

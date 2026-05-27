@@ -76,6 +76,12 @@ def _is_distributed_test(item):
         return True
     if hasattr(item, "cls") and item.cls is not None:
         return any(
-            cls.__name__ in ["MultiProcessTestCase", "MultiProcContinuousTest"] for cls in item.cls.__mro__
+            cls.__name__
+            in [
+                "MultiProcessTestCase",
+                "MultiProcContinuousTest",
+                "JaxMultiProcessTestCase",
+            ]
+            for cls in item.cls.__mro__
         )
     return False

@@ -10,11 +10,46 @@ import numpy as np
 import pytest
 
 from primus_turbo.jax.core.low_precision import float8_e4m3
-from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
+from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, reset_runtime, setup
 from tests.jax.test_utils import skip_if_lt_x_gpu
 
 key = jax.random.PRNGKey(123)
 num_ranks = jax.local_device_count()
+
+
+# ============================================================================
+# Fixtures
+# ============================================================================
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _setup_runtime_once():
+    """One-shot DeepEP bootstrap for the whole module.
+
+    Every test in this file targets INPROC mode with the *same* setup()
+    configuration (single process, all local GPUs, default num_sms,
+    hidden_bytes ignored).  ``setup()``'s strict-freeze contract states:
+    "one-call bootstrap, required exactly once before the first
+    moe_dispatch ... subsequent calls with the same configuration are
+    no-ops".  Module-scope is therefore the natural pytest match — it
+    realises that "once per process" semantics under pytest's collection
+    model, and avoids per-test ``reset_runtime() + setup()`` churn,
+    which is explicitly flagged in ``reset_runtime()``'s docstring as an
+    anti-pattern under INPROC (the C++ in-process buffer pool persists
+    for the process lifetime and has no destroy API).
+
+    Tests that exercise *distinct* setup() configurations belong
+    elsewhere:
+      * Multi-process / PER_PROCESS tests live in
+        ``test_mp_dispatch_combine.py`` and ``setup()`` per worker
+        (workers fork fresh, so per-worker bootstrap is fundamental).
+      * Strict-freeze API validation lives in ``test_setup.py`` (where
+        per-test ``reset_runtime() + setup()`` is the system under test).
+    """
+    reset_runtime()
+    setup()
+    yield
+    reset_runtime()
 
 
 # ============================================================================
