@@ -14,7 +14,8 @@ This page shows usage of **Primus-Turbo**.
   - [3.1 Quantization Config](#31-quantization-config)
   - [3.2 FP8 GEMM](#32-fp8-gemm)
   - [3.3 FP8 GroupedGEMM](#33-fp8-groupedgemm)
-  - [3.4 FP4 GEMM](#34-fp4-gemm)
+  - [3.4 MXFP8 GEMM](#34-mxfp8-gemm)
+  - [3.5 MXFP4 GEMM](#35-mxfp4-gemm)
 - [4. DeepEP](#4-deepep)
 - [5. Backend and AutoTune](#5-backend-and-autotune)
   - [5.1 Backend Selection](#51-backend-selection)
@@ -170,12 +171,16 @@ print(output.shape)
 
 ## 3. Low-Precision
 
-This section introduces the **FP8/FP4 quantization config** and usage of **FP8/FP4 GEMM** and **FP8 GroupedGEMM** in Primus-Turbo.
+This section introduces the **FP8 and FP4 quantization configs** and usage of **FP8 GEMM**, **FP8 GroupedGEMM**, **MXFP8 GEMM**, and **MXFP4 GEMM** in Primus-Turbo.
 
+> **Hardware requirements:**
+> - **FP8** (TENSORWISE / ROWWISE / BLOCKWISE): `gfx942` or higher.
+> - **MXFP8** (`MX_BLOCKWISE` granularity for `Float8QuantConfig`): `gfx950` or higher.
+> - **MXFP4** (`Float4QuantConfig`): `gfx950` or higher.
 
 ### 3.1 Quantization Config
 
-FP8 quantization is configured through `Float8QuantConfig`:
+FP8 (including **MXFP8**) quantization is configured through `Float8QuantConfig`:
 
 - **format**
   - `Format.E4M3` (default)
@@ -185,25 +190,25 @@ FP8 quantization is configured through `Float8QuantConfig`:
   - `ScalingGranularity.TENSORWISE` (default)
   - `ScalingGranularity.ROWWISE`
   - `ScalingGranularity.BLOCKWISE`
-  - `ScalingGranularity.MX_BLOCKWISE`
+  - `ScalingGranularity.MX_BLOCKWISE` &nbsp;— selects **MXFP8** (requires `block_size=32`, `scale_dtype=ScaleDtype.E8M0`)
 - **scale dtype**
   - `ScaleDtype.FP32` (default)
-  - `ScaleDtype.E8M0` (for mx)
+  - `ScaleDtype.E8M0` (required for MXFP8)
 - **block_size**
-  - Specifies the size of each block when using BLOCKWISE and MX_BLOCKWISE granularity.
+  - Specifies the size of each block when using `BLOCKWISE` or `MX_BLOCKWISE` granularity.
   - This parameter must be explicitly specified in BLOCKWISE and MX_BLOCKWISE mode; otherwise, an error will be raised.
+  - For `MX_BLOCKWISE`, only `block_size=32` is supported.
 
-FP4 quantization is configured through `Float4QuantConfig`:
+FP4 (i.e. **MXFP4**) quantization is configured through `Float4QuantConfig`:
 
 - **format**
-  - `Format.E2M1_X2` (default)
+  - `Format.E2M1_X2` (default, two FP4 values packed per byte)
 - **granularity**
-  - `ScalingGranularity.MX_BLOCKWISE` (default)
+  - `ScalingGranularity.MX_BLOCKWISE` (default, the only supported granularity for FP4)
 - **scale dtype**
   - `ScaleDtype.E8M0` (default)
 - **block_size**
-  - Specifies the size of each block when using MX_BLOCKWISE granularity.
-
+  - Specifies the size of each block when using `MX_BLOCKWISE` granularity. Only `block_size=32` is supported.
 
 ### 3.2 FP8 GEMM
 
@@ -230,7 +235,6 @@ M, N, K = 128, 256, 512
 a = torch.randn((M, K), dtype=dtype, device=device)
 # b [N, K]
 b = torch.randn((N, K), dtype=dtype, device=device)
-# c [M, N]
 
 # Set quant config through Float8QuantConfig class.
 fp8_cfg = Float8QuantConfig(
@@ -242,6 +246,21 @@ c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, confi
 print(c)
 print(c.shape) # [128, 256]
 ```
+
+The same `gemm_fp8` entry point also supports `BLOCKWISE` granularity. Just swap the
+`Float8QuantConfig` and keep the rest of the call site unchanged:
+
+```python
+# BLOCKWISE FP8: per-block FP32 scale, block_size must be set explicitly.
+fp8_cfg = Float8QuantConfig(
+    format=Format.E4M3,
+    granularity=ScalingGranularity.BLOCKWISE,
+    block_size=128,
+)
+c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=fp8_cfg)
+```
+
+For `MX_BLOCKWISE` (MXFP8), see [3.4 MXFP8 GEMM](#34-mxfp8-gemm).
 
 ### 3.3 FP8 GroupedGEMM
 
@@ -280,14 +299,70 @@ print(c)
 print(c.shape)  # [128, 256]
 ```
 
-### 3.4 FP4 GEMM
+### 3.4 MXFP8 GEMM
 
-For FP4 GEMM, it will apply some recipe (such as 2D block quantize and random hadamard transform) in quantization. Reference: https://arxiv.org/pdf/2509.25149
+MXFP8 uses the **MX block-wise** scaling recipe defined by the OCP Microscaling spec: each
+contiguous block of 32 elements (`block_size=32`) shares a single E8M0 scale, and the data
+elements are stored in FP8 (E4M3 / E5M2). Compared with TENSORWISE / ROWWISE FP8, MXFP8
+preserves more dynamic range per block while keeping the same 8-bit footprint, which usually
+gives better accuracy on long-tail activations.
 
+> **Note:** MXFP8 GEMM requires **gfx950 or higher**, and `M`, `N`, `K` must be multiples of 16.
+> The internal kernel runs in **NT** layout, so call it with `trans_a=False, trans_b=True`.
 
 Computation flow:
 
-`FP16/BF16 → Quantize → FP4 → GEMM(FP4 × FP4) → FP16/BF16`
+`FP16/BF16 → Quantize (block=32, E8M0 scale) → MXFP8 → GEMM(MXFP8 × MXFP8) → FP16/BF16`
+
+Example:
+
+```python
+import torch
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    Format,
+    ScaleDtype,
+    ScalingGranularity,
+)
+
+device = "cuda:0"
+dtype = torch.bfloat16
+
+# M, N, K must be multiples of 16 for MX_BLOCKWISE.
+M, N, K = 128, 256, 512
+# a [M, K]
+a = torch.randn((M, K), dtype=dtype, device=device)
+# b [N, K]  (NT layout: trans_b=True)
+b = torch.randn((N, K), dtype=dtype, device=device)
+
+# Set quant config through Float8QuantConfig with MX_BLOCKWISE granularity.
+# block_size must be 32 and scale_dtype must be E8M0 for MXFP8.
+mxfp8_cfg = Float8QuantConfig(
+    format=Format.E4M3,                          # or Format.E5M2 / Format.HYBRID
+    granularity=ScalingGranularity.MX_BLOCKWISE,
+    block_size=32,
+    scale_dtype=ScaleDtype.E8M0,
+)
+
+# MXFP8 kernel runs in NT layout, so trans_b=True is required.
+c = turbo.ops.gemm_fp8(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=mxfp8_cfg)
+print(c)
+print(c.shape)  # [128, 256]
+```
+
+### 3.5 MXFP4 GEMM
+
+MXFP4 GEMM stores data in FP4 (`E2M1_X2`, two FP4 values packed per byte) with an E8M0 scale
+per 32-element block, and additionally applies recipe tricks such as **2D block quantization**
+and **random Hadamard transform (RHT)** to recover accuracy at 4-bit precision.
+Reference: https://arxiv.org/pdf/2509.25149
+
+> **Note:** MXFP4 GEMM requires **gfx950 or higher**.
+
+Computation flow:
+
+`FP16/BF16 → Quantize (block=32, E8M0 scale, RHT/2D-block) → MXFP4 → GEMM(MXFP4 × MXFP4) → FP16/BF16`
 
 Example:
 
@@ -297,8 +372,8 @@ import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Format,
-    ScalingGranularity,
     ScaleDtype,
+    ScalingGranularity,
 )
 
 device = "cuda:0"
@@ -307,21 +382,21 @@ dtype = torch.bfloat16
 M, N, K = 128, 256, 512
 # a [M, K]
 a = torch.randn((M, K), dtype=dtype, device=device)
-# b [N, K]
+# b [N, K]  (NT layout: trans_b=True)
 b = torch.randn((N, K), dtype=dtype, device=device)
-# c [M, N]
 
 # Set quant config through Float4QuantConfig class.
-fp4_cfg = Float4QuantConfig(
+# Currently only MX_BLOCKWISE granularity with E2M1_X2 + E8M0 scale is supported.
+mxfp4_cfg = Float4QuantConfig(
     format=Format.E2M1_X2,
     granularity=ScalingGranularity.MX_BLOCKWISE,
     block_size=32,
     scale_dtype=ScaleDtype.E8M0,
 )
 
-c = turbo.ops.gemm_fp4(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=fp4_cfg)
+c = turbo.ops.gemm_fp4(a, b, trans_a=False, trans_b=True, out_dtype=dtype, config=mxfp4_cfg)
 print(c)
-print(c.shape) # [128, 256]
+print(c.shape)  # [128, 256]
 ```
 
 ## 4. DeepEP
