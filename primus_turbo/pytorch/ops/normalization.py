@@ -3,51 +3,119 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+"""Triton-backed RMSNorm ops (standard + fused residual variant).
+
+Public API:
+    - ``rmsnorm(x, gamma, eps=1e-6) -> y``
+    - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
+"""
+from __future__ import annotations
+
+from typing import Tuple
 
 import torch
 
-__all__ = ["rmsnorm"]
+from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import (
+    rmsnorm_bwd_impl,
+    rmsnorm_bwd_residual_impl,
+    rmsnorm_fwd_impl,
+    rmsnorm_fwd_residual_impl,
+)
+
+__all__ = ["rmsnorm", "rmsnorm_residual"]
 
 
-class RMSNormFunction(torch.autograd.Function):
+class _RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
-        y = torch.ops.primus_turbo_cpp_extension.rmsnorm_fwd(x, gamma, eps)
+        assert x.is_cuda and gamma.is_cuda, "rmsnorm: x and gamma must be CUDA tensors"
+        orig_shape = x.shape
+        H = gamma.shape[0]
+        assert (
+            orig_shape[-1] == H
+        ), f"rmsnorm: last dim of x ({orig_shape[-1]}) must equal gamma.shape[0] ({H})"
 
-        ctx.save_for_backward(x, gamma)
+        y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_impl(x, gamma, eps)
+
+        ctx.save_for_backward(x2, gamma, rstd)
         ctx.eps = eps
-        return y
-
-    @staticmethod
-    def backward_torch(ctx, grad_out: torch.Tensor):
-        x, gamma = ctx.saved_tensors
-        eps = ctx.eps
-
-        N = x.size(-1)
-        x_squared = x * x
-        x_squared_sum = x_squared.sum(dim=-1, keepdim=True)
-        x_norm = torch.rsqrt(x_squared_sum / N + eps)
-
-        grad_x_norm = grad_out * gamma  # scale by g
-        grad_x_part1 = grad_x_norm * x_norm  # apply normalized scaling
-
-        grad_x_squared_sum = (-0.5 * (x_squared_sum / N + eps) ** (-1.5)) * (2 * x / N)
-        grad_x_part2 = grad_x_squared_sum * (x * grad_x_norm).sum(dim=-1, keepdim=True)
-
-        grad_x = grad_x_part1 + grad_x_part2
-
-        # Gradient w.r.t. g
-        grad_g = (grad_out * x * x_norm).sum(dim=0)
-
-        return grad_x, grad_g, None
+        ctx.orig_shape = orig_shape
+        ctx.BLOCK_H = BLOCK_H
+        ctx.ROWS = ROWS
+        ctx.num_warps = num_warps
+        ctx.num_stages = num_stages
+        return y.reshape(orig_shape)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, gamma = ctx.saved_tensors
-        eps = ctx.eps
-        grad_x, grad_g = torch.ops.primus_turbo_cpp_extension.rmsnorm_bwd(x, gamma, grad_out, eps)
-        return grad_x, grad_g.sum(dim=0), None
+        x2, gamma, rstd = ctx.saved_tensors
+        dx, dg = rmsnorm_bwd_impl(
+            grad_out,
+            x2,
+            gamma,
+            rstd,
+            ctx.BLOCK_H,
+            ctx.ROWS,
+            ctx.num_warps,
+            ctx.num_stages,
+        )
+        return dx.reshape(ctx.orig_shape), dg, None
+
+
+class _RMSNormResidualFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
+        assert (
+            x.is_cuda and residual.is_cuda and gamma.is_cuda
+        ), "rmsnorm_residual: x, residual and gamma must be CUDA tensors"
+        assert (
+            x.shape == residual.shape
+        ), f"rmsnorm_residual: shape mismatch {tuple(x.shape)} vs {tuple(residual.shape)}"
+        orig_shape = x.shape
+        H = gamma.shape[0]
+        assert orig_shape[-1] == H
+
+        y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_residual_impl(
+            x, residual, gamma, eps
+        )
+
+        ctx.save_for_backward(x_plus_r, gamma, rstd)
+        ctx.eps = eps
+        ctx.orig_shape = orig_shape
+        ctx.BLOCK_H = BLOCK_H
+        ctx.ROWS = ROWS
+        ctx.num_warps = num_warps
+        ctx.num_stages = num_stages
+        return y.reshape(orig_shape), x_plus_r.reshape(orig_shape)
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor, grad_xpr: torch.Tensor):
+        x_plus_r, gamma, rstd = ctx.saved_tensors
+        dx, dg = rmsnorm_bwd_residual_impl(
+            grad_y,
+            grad_xpr,
+            x_plus_r,
+            gamma,
+            rstd,
+            ctx.BLOCK_H,
+            ctx.ROWS,
+            ctx.num_warps,
+            ctx.num_stages,
+        )
+        dx_out = dx.reshape(ctx.orig_shape)
+        # Jacobian of add() is [I, I] -> both x and residual get the same grad.
+        return dx_out, dx_out, dg, None
 
 
 def rmsnorm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return RMSNormFunction.apply(x, gamma, eps)
+    return _RMSNormFunction.apply(x, gamma, eps)
+
+
+def rmsnorm_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _RMSNormResidualFunction.apply(x, residual, gamma, eps)

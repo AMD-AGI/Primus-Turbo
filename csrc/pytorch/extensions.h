@@ -161,20 +161,6 @@ at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
                                bool transB, bool transC, const std::string &granularity);
 
 //==================================================================
-//  Normalization
-//==================================================================
-
-at::Tensor rmsnorm_fwd(const at::Tensor &input, const at::Tensor &gamma, const double eps);
-
-at::Tensor rmsnorm_fwd_meta(const at::Tensor &input, const at::Tensor &gamma, const double eps);
-
-std::vector<at::Tensor> rmsnorm_bwd(const at::Tensor &input, const at::Tensor &gamma,
-                                    const at::Tensor &grad_output, const double eps);
-
-std::vector<at::Tensor> rmsnorm_bwd_meta(const at::Tensor &input, const at::Tensor &gamma,
-                                         const at::Tensor &grad_output, const double eps);
-
-//==================================================================
 //  Grouped GEMM
 //==================================================================
 
