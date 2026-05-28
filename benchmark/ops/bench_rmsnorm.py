@@ -4,9 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Compare RMSNorm fwd+bwd throughput across:
+"""Compare RMSNorm fwd+bwd throughput between:
   - primus_turbo.pytorch.ops.normalization.rmsnorm   (this PR)
-  - transformer_engine.pytorch.module.RMSNorm        (reference)
   - torch.nn.functional.rms_norm                     (eager PyTorch baseline)
 
 Memory-bandwidth bound op, so we report GB/s of effective traffic in addition
@@ -30,15 +29,6 @@ from config import compute_snr, get_platform_info
 from tabulate import tabulate
 
 from primus_turbo.pytorch.ops.normalization import rmsnorm as turbo_rmsnorm
-
-try:
-    from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TE_RMSNorm
-
-    _HAS_TE = True
-except Exception as e:
-    print(f"[warn] TransformerEngine unavailable ({e}); skipping TE rows.")
-    _HAS_TE = False
-
 
 # (tokens, hidden) pairs. Tokens span small (decode-like) to large (training);
 # hidden spans common LLM widths plus a couple of small ones that exercise the
@@ -129,31 +119,6 @@ def _bench_turbo(N, C, dtype, device, warmup, iters):
     return fwd_ms, fwdbwd_ms - fwd_ms
 
 
-def _bench_te(N, C, dtype, device, warmup, iters):
-    if not _HAS_TE:
-        return None, None
-    mod = TE_RMSNorm(C, eps=1e-6, params_dtype=dtype).to(device)
-    x = torch.randn(N, C, device=device, dtype=dtype, requires_grad=True)
-
-    def fwd():
-        return mod(x)
-
-    fwd_ms = _time(fwd, warmup, iters)
-
-    y = fwd()
-    grad_out = torch.randn_like(y)
-
-    def fwd_bwd():
-        x.grad = None
-        for p in mod.parameters():
-            p.grad = None
-        out = mod(x)
-        out.backward(grad_out, retain_graph=False)
-
-    fwdbwd_ms = _time(fwd_bwd, warmup, iters)
-    return fwd_ms, fwdbwd_ms - fwd_ms
-
-
 def _bench_torch(N, C, dtype, device, warmup, iters):
     x = torch.randn(N, C, device=device, dtype=dtype, requires_grad=True)
     g = torch.randn(C, device=device, dtype=dtype, requires_grad=True)
@@ -207,7 +172,6 @@ def main():
         snr_y, snr_dx, snr_dg = _correctness(N, C, dtype, device, atol=0, rtol=0)
 
         t_fwd, t_bwd = _bench_turbo(N, C, dtype, device, args.warmup, args.iters)
-        te_fwd, te_bwd = _bench_te(N, C, dtype, device, args.warmup, args.iters)
         py_fwd, py_bwd = _bench_torch(N, C, dtype, device, args.warmup, args.iters)
 
         row = {
@@ -218,23 +182,16 @@ def main():
             "Turbo bwd µs": f"{t_bwd*1e3:.1f}",
             "Turbo fwd GB/s": f"{_bandwidth_gbps(N, C, dtype, t_fwd, 'fwd'):.0f}",
             "Turbo bwd GB/s": f"{_bandwidth_gbps(N, C, dtype, t_bwd, 'bwd'):.0f}",
+            "torch fwd µs": f"{py_fwd*1e3:.1f}",
+            "torch bwd µs": f"{py_bwd*1e3:.1f}",
+            "fwd speedup": f"{py_fwd / t_fwd:.2f}x",
+            "bwd speedup": f"{py_bwd / t_bwd:.2f}x",
         }
-        if te_fwd is not None:
-            row["TE fwd µs"] = f"{te_fwd*1e3:.1f}"
-            row["TE bwd µs"] = f"{te_bwd*1e3:.1f}"
-            row["fwd speedup"] = f"{te_fwd / t_fwd:.2f}x"
-            row["bwd speedup"] = f"{te_bwd / t_bwd:.2f}x"
-        row["torch fwd µs"] = f"{py_fwd*1e3:.1f}"
-        row["torch bwd µs"] = f"{py_bwd*1e3:.1f}"
         rows.append(row)
         print(
             f"  N={N:6d} C={C:5d}  turbo fwd {t_fwd*1e3:7.1f}µs / bwd {t_bwd*1e3:7.1f}µs"
-            + (
-                f"  TE fwd {te_fwd*1e3:7.1f} / bwd {te_bwd*1e3:7.1f}"
-                f"  speedup fwd {te_fwd/t_fwd:.2f}x bwd {te_bwd/t_bwd:.2f}x"
-                if te_fwd is not None
-                else ""
-            )
+            f"  torch fwd {py_fwd*1e3:7.1f} / bwd {py_bwd*1e3:7.1f}"
+            f"  speedup fwd {py_fwd/t_fwd:.2f}x bwd {py_bwd/t_bwd:.2f}x"
         )
 
     df = pd.DataFrame(rows)
