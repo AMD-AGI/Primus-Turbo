@@ -175,7 +175,7 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, bool kUseCheapFence, typename topk_idx_t>
+template <int kNumRanks, int kNumThreads, typename topk_idx_t>
 __global__ void __launch_bounds__(kNumThreads, 1)
     dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
@@ -363,8 +363,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // NOTES: here all warps should share the same new tail
             BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
-                                                      cached_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -410,8 +409,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by
             // different warps are the same
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx =
-                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx.buffer());
+                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -523,12 +521,9 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
                        std::numeric_limits<int>::max());
 
-    static const bool use_cheap_fence = is_enable_cheap_fence();
-
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
-        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true, topk_idx_t>      \
-                                             : dispatch<ranks, kNumThreads, false, topk_idx_t>;    \
+        auto dispatch_func = dispatch<ranks, kNumThreads, topk_idx_t>;                             \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
             recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
@@ -615,7 +610,7 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template <typename dtype_t, int kNumRanks, int kNumThreads, bool kUseCheapFence>
+template <typename dtype_t, int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x, const float *topk_weights,
             const dtype_t *bias_0, const dtype_t *bias_1, const int *src_idx,
@@ -742,8 +737,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move tail index
             BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
-                                                      current_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -783,8 +777,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     break;
 
                 // Update queue tail
-                channel_tail_idx[lane_id] =
-                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx_ptr);
+                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -938,12 +931,9 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 1024;
 
-    static const bool use_cheap_fence = is_enable_cheap_fence();
-
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
-        auto combine_func = use_cheap_fence ? combine<dtype, ranks, kNumThreads, true>             \
-                                            : combine<dtype, ranks, kNumThreads, false>;           \
+        auto combine_func = combine<dtype, ranks, kNumThreads>;                                    \
         LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, reinterpret_cast<dtype *>(recv_x),       \
                                       recv_topk_weights, reinterpret_cast<const dtype *>(x),       \
                                       topk_weights, reinterpret_cast<const dtype *>(bias_0),       \

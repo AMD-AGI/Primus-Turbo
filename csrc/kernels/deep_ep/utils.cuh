@@ -149,11 +149,7 @@ __device__ __forceinline__ void memory_fence_cta() {
 }
 
 __device__ __forceinline__ void st_relaxed_sys_global(int *ptr, int val) {
-    __builtin_nontemporal_store(val, ptr);
-}
-
-__device__ __forceinline__ void st_release_sys_global(const int *ptr, int val) {
-    __hip_atomic_store(const_cast<int *>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ void st_release_cta(const int *ptr, int val) {
@@ -167,18 +163,6 @@ __device__ __forceinline__ int ld_relaxed_sys_global(const int *ptr) {
 __device__ __forceinline__ int ld_relaxed_sys_global(const uint64_t *ptr) {
     uint64_t ret;
     ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    return ret;
-}
-
-__device__ __forceinline__ int ld_acquire_sys_global(const int *ptr) {
-    int ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-    return ret;
-}
-
-__device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
-    uint64_t ret;
-    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
 
@@ -371,34 +355,22 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
     __syncthreads();
 }
 
-template <bool kUseCheapFence, typename dtype_t>
+template <typename dtype_t>
 __device__ __forceinline__ void st_release_sys_global(const dtype_t *ptr, dtype_t val) {
-
-    if constexpr (kUseCheapFence) {
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
-        __hip_atomic_store(const_cast<dtype_t *>(ptr), val, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    } else {
-        __hip_atomic_store(const_cast<dtype_t *>(ptr), val, __ATOMIC_RELEASE,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+    __hip_atomic_store(const_cast<dtype_t *>(ptr), val, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
-template <bool kUseCheapFence, typename dtype_t>
+template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t *ptr) {
-    dtype_t ret;
-    if constexpr (kUseCheapFence) {
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
-        ret = __hip_atomic_load(const_cast<dtype_t *>(ptr), __ATOMIC_RELAXED,
-                                __HIP_MEMORY_SCOPE_SYSTEM);
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    } else {
-        ret = __hip_atomic_load(const_cast<dtype_t *>(ptr), __ATOMIC_ACQUIRE,
-                                __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+    dtype_t ret =
+        __hip_atomic_load(const_cast<dtype_t *>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
     return ret;
 }
 } // namespace primus_turbo::deep_ep

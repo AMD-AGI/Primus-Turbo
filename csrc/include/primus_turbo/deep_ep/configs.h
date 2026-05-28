@@ -82,13 +82,6 @@ static inline int get_num_cpu_timeout_secs() {
     return timeout;
 }
 
-inline static bool is_enable_cheap_fence() {
-    char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
-    if (!v || v[0] == '\0')
-        return true;
-    return std::stoi(v) == 0;
-}
-
 // When set to 1, EP dispatch/combine kernels run on the caller's current
 // CUDA stream instead of the Buffer's internal comm stream.
 // Default: 0.

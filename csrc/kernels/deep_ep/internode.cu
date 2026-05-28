@@ -637,7 +637,7 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
                 rdma_tail_idx = rdma_send_channel_next_tail[lane_id]++;
                 while (rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens)
                     cached_rdma_channel_head =
-                        static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
+                        static_cast<int>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)));
             }
             syncwarp();
 
@@ -896,7 +896,7 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
                     if (lane_id == src_rdma_rank and
                         cached_rdma_channel_head == cached_rdma_channel_tail)
                         cached_rdma_channel_tail = static_cast<int>(
-                            ld_relaxed_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                            ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
                     if (shfl_sync(cached_rdma_channel_tail > cached_rdma_channel_head,
                                   src_rdma_rank))
                         break;
@@ -991,7 +991,7 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
             // Move tail index
             syncwarp();
             if (lane_id == 0)
-                st_relaxed_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
 
         // Retired
@@ -1087,7 +1087,7 @@ __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarp
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer());
+                cached_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer());
 
                 // Timeout check
                 long long int elapsed_time =
@@ -1650,7 +1650,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
             // Move queue tail
             syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
-                st_relaxed_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
+                st_release_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
         }
     } else {
         auto lane_id = get_lane_id() % kWarpHyb;
@@ -1816,7 +1816,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
                     // num_chunked_tokens` Here, `token_start_idx` is the actual tail
                     int num_used_slots =
                         token_start_idx -
-                        ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank));
+                        ld_acquire_sys_global(rdma_channel_head.buffer(dst_rdma_rank));
                     if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens)
                         break;
 
@@ -1827,7 +1827,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
                         printf("DeepEP combine forwarder (RDMA check) timeout, channel: %d, RDMA: "
                                "%d, nvl: %d, dst RDMA: %d, head: %ld, tail: %d, chunked: %d\n",
                                channel_id, rdma_rank, nvl_rank, dst_rdma_rank,
-                               ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank)),
+                               ld_acquire_sys_global(rdma_channel_head.buffer(dst_rdma_rank)),
                                token_start_idx, num_chunked_tokens);
                         trap();
                     }
@@ -1848,7 +1848,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
                     start_time = wall_clock64();
                     while (cached_nvl_channel_tail_idx <= expected_head) {
                         cached_nvl_channel_tail_idx =
-                            ld_relaxed_sys_global(nvl_channel_tail.buffer(lane_id));
+                            ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
                         // Timeout check
                         long long int elapsed_time =
                             wall_clock64() > start_time ? wall_clock64() - start_time : 0;
@@ -1969,7 +1969,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
                 auto start_time = wall_clock64();
                 while (cached_channel_tail_idx <= expected_head) {
                     cached_channel_tail_idx =
-                        static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
+                        static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
 
                     // Timeout check
                     long long int elapsed_time =
