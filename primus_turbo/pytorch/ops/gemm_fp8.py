@@ -43,21 +43,21 @@ def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
         raise ValueError(f"Unsupported FP8 format: {format}")
 
 
-def _select_tensorwise_default_backend(trans_a: bool, trans_b: bool, config: Float8QuantConfig):
-    is_gfx942 = get_device_compute_capability() == (9, 4)
-
-    layout = ""
-    layout += "T" if trans_a else "N"
-    layout += "T" if trans_b else "N"
-
-    if layout in ["NN", "TN"] and not is_gfx942:
-        # NOTE: gfx950 hipblaslt gemm kernel with non-TN layout has performance issue. Use Triton instead.
-        return BackendType.TRITON.value
-    else:
-        return BackendType.HIPBLASLT.value
-
-
 class FP8GemmTensorFunction(torch.autograd.Function):
+
+    @staticmethod
+    def _select_default_backend(trans_a: bool, trans_b: bool):
+        is_gfx942 = get_device_compute_capability() == (9, 4)
+
+        layout = ""
+        layout += "T" if trans_a else "N"
+        layout += "T" if trans_b else "N"
+
+        if layout in ["NN", "TN"] and not is_gfx942:
+            # NOTE: gfx950 hipblaslt gemm kernel with non-TN layout has performance issue. Use Triton instead.
+            return BackendType.TRITON.value
+        else:
+            return BackendType.HIPBLASLT.value
 
     @staticmethod
     def forward(
@@ -105,7 +105,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=FP8GemmTensorFunction._select_default_backend(trans_a, trans_b),
         )
         ctx.save_for_backward(
             quantized_a.qdata, quantized_a.scale_inv, quantized_b.qdata, quantized_b.scale_inv
@@ -141,7 +141,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_a,
             granularity=ctx.config.granularity.value,
-            default_backend=_select_tensorwise_default_backend(False, not ctx.trans_b, ctx.config),
+            default_backend=FP8GemmTensorFunction._select_default_backend(False, not ctx.trans_b),
         )
 
         b_grad = gemm_fp8_impl(
@@ -154,7 +154,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=_select_tensorwise_default_backend(not ctx.trans_a, False, ctx.config),
+            default_backend=FP8GemmTensorFunction._select_default_backend(not ctx.trans_a, False),
         )
 
         return (a_grad, b_grad, None, None, None, None)
