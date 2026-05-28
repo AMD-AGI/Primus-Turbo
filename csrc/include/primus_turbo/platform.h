@@ -34,9 +34,12 @@
 #endif
 
 //
-// Universal warp size constant (AMD = 64)
+// Warp size and block size constants.
+// THREADS_PER_WARP is AMD-specific (wavefront = 64 on CDNA/RDNA-wave64).
+// MAX_THREADS_PER_BLOCK is the HIP/CUDA architectural cap; 1024 holds across
+// every shipping AMD and NVIDIA GPU.
 //
 namespace primus_turbo {
 constexpr int THREADS_PER_WARP      = 64;
-constexpr int MAX_THREADS_PER_BLOCK = 1024; // TODO: ?
+constexpr int MAX_THREADS_PER_BLOCK = 1024;
 } // namespace primus_turbo

@@ -6,16 +6,20 @@
 
 namespace primus_turbo::pytorch {
 
-at::Tensor rmsnorm_fwd_meta(const at::Tensor &input, const at::Tensor &gamma, const double eps) {
-    return at::empty_like(input, at::device(at::kMeta));
+std::vector<at::Tensor> rmsnorm_fwd_meta(const at::Tensor &input, const at::Tensor &gamma,
+                                         const double eps) {
+    const int64_t inner_len = gamma.numel();
+    const int64_t outer_len = input.numel() / inner_len;
+    auto          output    = at::empty_like(input, at::device(at::kMeta));
+    auto          rs = at::empty({outer_len}, input.options().device(at::kMeta).dtype(at::kFloat));
+    return {output, rs};
 }
 
 std::vector<at::Tensor> rmsnorm_bwd_meta(const at::Tensor &input, const at::Tensor &gamma,
-                                         const at::Tensor &grad_output, const double eps) {
-
-    at::Tensor grad_input = at::empty_like(input, at::device(at::kMeta));
-    at::Tensor grad_gamma = at::empty_like(input, at::device(at::kMeta));
-
+                                         const at::Tensor &grad_output, const at::Tensor &rs,
+                                         const double eps) {
+    auto grad_input = at::empty_like(input, at::device(at::kMeta));
+    auto grad_gamma = at::empty_like(gamma, at::device(at::kMeta));
     return {grad_input, grad_gamma};
 }
 

@@ -12,10 +12,18 @@ from primus_turbo.pytorch.ops.normalization import rmsnorm
 from tests.pytorch.test_utils import get_tolerances
 
 
-# @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dtype", [torch.float32])
+# inner_shape spans:
+#   - tiny aligned (64/128/256/512) → warp-per-row fast path
+#     (fp32 ≤256, fp16/bf16 ≤512)
+#   - 33/513 → unaligned fallback (UNROLL=1)
+#   - 4096..8192 → block-per-row at LDGS=1..2 + iter-3 per-shape UNROLL/2
+#   - 12288/16384 → block-per-row at LDGS=2..4, beyond the iter-3 range; also
+#     exercises the LDGS-cap guard added to launch_{fwd,bwd}_stage0. Without
+#     this coverage a regression at hidden ≥ 12K would slip past unit tests
+#     and only surface in bench/training.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,), (8192,), (16384,)])
-@pytest.mark.parametrize("inner_shape", [33, 513, 4096, 5120, 7168, 8192])
+@pytest.mark.parametrize("inner_shape", [64, 128, 256, 512, 33, 513, 4096, 5120, 7168, 8192, 12288, 16384])
 def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
     torch.manual_seed(1)
     device = "cuda:0"

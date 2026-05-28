@@ -59,8 +59,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
 
     // ********* RMSNorm *********
-    m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor");
-    m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
+    m.def("rmsnorm_fwd(Tensor input, Tensor gamma, float eps) -> Tensor[]");
+    m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, Tensor rs, float eps) "
+          "-> Tensor[]");
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "

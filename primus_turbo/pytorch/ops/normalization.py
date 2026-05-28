@@ -12,15 +12,15 @@ __all__ = ["rmsnorm"]
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
-        y = torch.ops.primus_turbo_cpp_extension.rmsnorm_fwd(x, gamma, eps)
+        y, rs = torch.ops.primus_turbo_cpp_extension.rmsnorm_fwd(x, gamma, eps)
 
-        ctx.save_for_backward(x, gamma)
+        ctx.save_for_backward(x, gamma, rs)
         ctx.eps = eps
         return y
 
     @staticmethod
     def backward_torch(ctx, grad_out: torch.Tensor):
-        x, gamma = ctx.saved_tensors
+        x, gamma, _rs = ctx.saved_tensors
         eps = ctx.eps
 
         N = x.size(-1)
@@ -43,10 +43,11 @@ class RMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, gamma = ctx.saved_tensors
-        eps = ctx.eps
-        grad_x, grad_g = torch.ops.primus_turbo_cpp_extension.rmsnorm_bwd(x, gamma, grad_out, eps)
-        return grad_x, grad_g.sum(dim=0), None
+        x, gamma, rs = ctx.saved_tensors
+        if not grad_out.is_contiguous():
+            grad_out = grad_out.contiguous()
+        grad_x, grad_g = torch.ops.primus_turbo_cpp_extension.rmsnorm_bwd(x, gamma, grad_out, rs, ctx.eps)
+        return grad_x, grad_g, None
 
 
 def rmsnorm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
