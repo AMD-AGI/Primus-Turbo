@@ -315,11 +315,16 @@ class GEMMFP8TurboBackend(KernelBackend):
         )
 
 
+from primus_turbo.pytorch.kernels.gemm.gemm_fp8_flydsl_impl import (  # noqa: E402
+    GEMMFP8FlyDSLBackend,
+)
+
 _GEMM_FP8_BACKENDS = {
     BackendType.TURBO: BackendEntry(GEMMFP8TurboBackend),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP8HipBLASLtBackend),
     BackendType.CK: BackendEntry(GEMMFP8CKBackend),
     BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFP8FlyDSLBackend),
 }
 
 

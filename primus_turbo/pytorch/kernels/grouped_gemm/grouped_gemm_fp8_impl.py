@@ -392,11 +392,18 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         )
 
 
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_flydsl_impl import (  # noqa: E402
+    GroupedGEMMFP8FlyDSLBackend,
+    GroupedGEMMFP8VariableKFlyDSLBackend,
+)
+
+
 class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8FlyDSLBackend),
     }
     _cache = TuneCache(1024)
 
@@ -520,6 +527,7 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8VariableKFlyDSLBackend),
     }
     _cache = TuneCache(1024)
 
