@@ -272,6 +272,39 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# FLYDSL-focused smoke (kept narrow to fit kernel constraints + bound case count)
+#
+# FlyDSL 8-wave constraints exercised here:
+#   - granularity = TENSORWISE (per-tensor scalar scale)
+#   - out_dtype   = bfloat16   (StoreC fixed)
+#   - format      = E4M3       (e4m3 inputs)
+#   - K % 128 == 0             (BLOCK_K=128)
+#   - Layout      = NT (native) + NN (host transpose of B)
+# Yields 2 * 2 * 2 * 2 = 16 cases per run.
+# ──────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("m", [1024, 2048])
+@pytest.mark.parametrize("n", [1024, 2048])
+@pytest.mark.parametrize("k", [1024, 2048])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.parametrize("auto_tune", [False])
+def test_gemm_fp8_tensorwise_flydsl(m, n, k, layout, format, dtype, backend, auto_tune):
+    _run_gemm_fp8_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.TENSORWISE,
+        backend=backend,
+        auto_tune=auto_tune,
+    )
+
+
 @pytest.mark.parametrize("m", [255, 507, 1032, 2056])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
