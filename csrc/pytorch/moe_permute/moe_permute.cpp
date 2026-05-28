@@ -36,14 +36,6 @@ template <typename T> static inline T *opt_data_ptr(const c10::optional<at::Tens
     return reinterpret_cast<T *>(t->data_ptr());
 }
 
-// Returns ``(row_id_map, tokens_per_expert, overflow_flag,
-// num_dispatched_tokens)``. The trailing ``num_dispatched_tokens`` is a
-// 1-element int32 CUDA tensor populated by the cu kernel itself by scanning
-// ``expert_map`` for non-padding rows — DeepEP's worst-case dispatch buffer
-// uses ``-1`` (topk_idx) / all-false (routing_map) padding, so the count is
-// recoverable on-device without a host sync. Downstream ``permute`` /
-// ``unpermute`` consume this tensor in place of the legacy caller-provided
-// ``num_dispatched_token_tensor``.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64_t num_topk,
                       int64_t pad_multiple, int64_t num_permuted_tokens,
@@ -79,9 +71,7 @@ permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64
         int_opts);
     auto tokens_per_expert = at::empty({num_local_experts}, int_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
-    // ``at::zeros`` so the kernel only does atomicAdd; the memset is
-    // CUDA-graph capturable (all subsequent host→device traffic stays on
-    // the stream).
+    // ``at::zeros`` keeps the init CUDA-graph-capturable (no host sync).
     auto num_dispatched_tokens = at::zeros({1}, int_opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -120,9 +110,6 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
     if (num_permuted_token == 0) {
         return; // nothing to do
     }
-    // ``probs_stride == 0`` means "use the legacy ``num_local_experts`` row
-    // stride" (multihot probs); a positive value lets the caller pass topk-
-    // aligned probs directly without the indices_to_multihot conversion.
     PRIMUS_TURBO_CHECK(probs_stride >= 0, "probs_stride must be >= 0");
 
     PRIMUS_TURBO_CHECK(tokens.is_cuda() && output_tokens.is_cuda(),
@@ -185,10 +172,6 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Upper bound on token rows the kernel may visit:
-    // num_dispatched_tokens (runtime) + pad_multiple. row_id_map is allocated
-    // with exactly that height (max_num_dispatched_tokens + pad_multiple), so
-    // its row count is a safe and exact bound for grid.x.
     const int num_dispatched_max = static_cast<int>(row_id_map.size(0));
 
     if (use_fp8) {

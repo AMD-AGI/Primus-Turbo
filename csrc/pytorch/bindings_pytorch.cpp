@@ -63,19 +63,6 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("rmsnorm_bwd(Tensor input, Tensor gamma, Tensor grad_out, float eps) -> Tensor[]");
 
     // ********* Permute (MoE token (un)permute) *********
-    // ``probs_topk_stride`` / ``probs_stride``:
-    //   - ``0`` selects the legacy ``[T, num_local_experts]`` multihot layout
-    //     (aux column in ``row_id_map`` stores ``expert_idx``);
-    //   - a positive value (must equal ``num_topk``) selects the
-    //     ``[T, num_topk]`` topk-aligned layout used by DeepEP /
-    //     ``moe_dispatch``, in which case the aux column stores the
-    //     ``topk_position`` instead. The latter is only valid with the
-    //     ``topk_idx`` expert_map code path.
-    // ``permute_preprocessing`` no longer accepts a caller-provided
-    // ``num_dispatched_token_tensor``: the cu kernel scans ``expert_map`` for
-    // padding (``-1`` in topk_idx mode, all-false in routing_map mode) and
-    // emits the count as the trailing output tensor (1-element int32 CUDA),
-    // which downstream ``permute`` / ``unpermute`` consume.
     m.def("permute_preprocessing(Tensor expert_map, int num_local_experts, int num_topk, "
           "int pad_multiple, int num_permuted_tokens, int probs_topk_stride=0) "
           "-> (Tensor, Tensor, Tensor, Tensor)");

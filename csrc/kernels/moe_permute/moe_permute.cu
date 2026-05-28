@@ -23,8 +23,7 @@ using ::primus_turbo::deep_ep::st_na_global;
 using ::primus_turbo::dtype::bfloat16;
 using ::primus_turbo::dtype::float16;
 
-// Streamed stores: lowers to `global_store_dwordx4 ... slc:1` on gfx950,
-// bypassing L2 allocation since each line is written exactly once.
+// Nontemporal stores: lower to `global_store_dwordx4 ... slc:1` on gfx950, bypassing L2.
 typedef int int4_v __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ void st_nt_int4(int4 *ptr, const int4 &val) {
@@ -385,8 +384,8 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
 
     int device_id = 0;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
-    const int num_cu              = get_multi_processor_count(device_id);
-    const int max_shmem_per_block = get_max_shmem_per_block(device_id);
+    const int num_cu = get_multi_processor_count(device_id);
+    static const int max_shmem_per_block = get_max_shmem_per_block(device_id);
 
     const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
 
@@ -425,10 +424,8 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
                         int num_local_experts, int hidden_int4, int scales_per_token,
                         int probs_stride) {
     const int lane_id = static_cast<int>(threadIdx.x);
-    // kNumChunks == 1: collapsed form (1 block/token, stride inner loop) —
-    //                  wins on partial-chunk shapes (5120/6144/7168).
-    // kNumChunks >= 2: chunked form (1 block/(token,chunk), single iter/thread)
-    //                  — wins on exact-divisor shapes (2048/4096/8192).
+    // kNumChunks == 1: collapsed form (1 block/token, strided inner loop).
+    // kNumChunks >= 2: chunked form (1 block/(token,chunk), single iter/thread).
     int token_id, chunk_id;
     if constexpr (kNumChunks == 1) {
         token_id = static_cast<int>(blockIdx.x);
@@ -553,8 +550,7 @@ __launch_bounds__(kNumThreads, 4) __global__
     constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
 
     const int lane_id = static_cast<int>(threadIdx.x);
-    // kNumChunks∈[1,4]: 1-D dispatch (avoids gfx950 2-D walker overhead).
-    // kNumChunks==0:    >4 chunks fallback via 2-D dispatch.
+    // kNumChunks∈[1,4]: 1-D dispatch (avoids gfx950 2-D walker overhead); else 2-D fallback.
     int token_id, chunk_id;
     if constexpr (kNumChunks >= 1 && kNumChunks <= 4) {
         token_id = static_cast<int>(blockIdx.x) / kNumChunks;
@@ -678,8 +674,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
 
     const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
 
-    // unpermute_kernel_e1 hard-codes probs row width == 1, valid only for the
-    // legacy multihot path. Topk-aligned probs use num_topk even at E=1.
+    // unpermute_kernel_e1 hard-codes probs row width 1 (multihot only); topk path uses num_topk at E=1.
     if (num_local_experts == 1 && effective_probs_stride == 1) {
         constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;

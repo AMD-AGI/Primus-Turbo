@@ -34,8 +34,7 @@ class TokenDispatcher:
 
         self.ep_size = ep_group.size()
         if tp_group is None and tp_ep_group is None:
-            # No-TP: reuse ep_group as the dispatch group rather than creating
-            # a per-rank singleton group (which would be a leaked collective).
+            # No-TP: reuse ep_group instead of leaking a per-rank singleton group.
             self.tp_group = None
             self.tp_ep_group = ep_group
             self.tp_size = 1
@@ -109,45 +108,28 @@ class TokenDispatcher:
 class DeepEPTokenDispatcher(TokenDispatcher):
     """Dispatch tokens to experts (autograd combines gradients on backward).
 
-    ``tokens_per_expert`` always comes from ``moe_permute`` so the count
-    matches the permuted buffer layout including ``pad_multiple`` padding.
+    ``tokens_per_expert`` comes from ``moe_permute`` so the count reflects
+    ``pad_multiple`` padding.
 
-    Fully nosync / CUDA-graph capturable path requires all three:
-      - ``deepep_num_worst_tokens > 0``: fixed-size receive buffer with ``-1`` padding.
-      - ``num_permuted_tokens > 0``: skips ``tokens_per_expert.sum().item()`` in permute.
-      - ``deepep_use_cuda_num_tokens_per_expert=True``: skips the ``.cpu()`` copy.
+    Fully nosync / CUDA-graph capturable requires all three:
+    ``deepep_num_worst_tokens > 0``, ``num_permuted_tokens > 0``,
+    ``deepep_use_cuda_num_tokens_per_expert=True``.
 
     Args:
-        num_experts: number of moe experts.
-        router_topk: experts per token.
-        ep_group / tp_group / tp_ep_group: parallelism groups.
-        expert_capacity_factor: when not None, the dispatcher assumes the caller
-            (router / load-balancer) has already zeroed the prob of every route
-            it wants dropped, and translates those zero-prob entries into
-            DeepEP's ``-1`` drop sentinel before all-to-all. The dispatcher
-            does NOT itself compute or enforce per-expert capacity counts;
-            that decision lives upstream. Mirrors Megatron's
-            ``_DeepepManager`` semantics.
+        expert_capacity_factor: caller must pre-zero probs of routes to drop;
+            this class only translates zero-prob into DeepEP's ``-1`` sentinel
+            (mirrors Megatron's ``_DeepepManager``; capacity itself is upstream).
         permute_fusion: deprecated; ``moe_permute`` is always fused.
-        pad_multiple: pad each expert's permuted count to this multiple
-            (set to grouped-GEMM ``BLOCK_M`` to avoid partial-tile waste).
-        num_permuted_tokens: caller-provided cap on permuted rows; ``> 0``
-            removes ``moe_permute``'s sum-item host sync. See class docstring
-            for the full nosync recipe.
-        deepep_use_comm_stream: when False, pin EP kernels to the current
-            stream via ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1``.
-        deepep_num_use_cu: CUs used by DeepEP.
-        deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode
-            (see ``DeepEP.dispatch``).
-        deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on
-            device (skips ``.cpu()`` on return).
-        deepep_autotune_config: autotuned DeepEP buffer config.
+        pad_multiple: pad per-expert permuted count to this multiple
+            (set to grouped-GEMM ``BLOCK_M``).
+        num_permuted_tokens: caller-provided cap; ``> 0`` removes the sum-item host sync.
+        deepep_use_comm_stream: when False, pin EP kernels to the current stream.
+        deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
+        deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
     """
 
-    # The C++ helper caches the env value in a function-local ``static`` on first
-    # read, so the first dispatcher to opt into current-stream mode wins; later
-    # constructors with a conflicting flag get a warning instead of silently
-    # corrupting the cached backend (which a captured CUDA graph may reference).
+    # C++ helper caches the env once per process; first dispatcher wins, later
+    # conflicting flags only warn (must not silently swap the cached backend).
     _ep_force_current_stream_locked: bool = False
 
     def __init__(
@@ -217,10 +199,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         num_tokens = hidden_states.shape[0]
 
-        # ``probs`` / ``routing_map`` / ``token_indices`` must all live in the
-        # PRE-TP-expansion expert id space (width ``ep_size * num_local_experts``).
-        # The reshape below replicates each value across ``tp_size`` slots; passing
-        # already-expanded inputs silently produces garbage.
+        # Inputs must be in the pre-TP-expansion expert space; the reshape below
+        # replicates across tp_size, so already-expanded inputs silently corrupt.
         original_num_experts = self.ep_size * self.num_local_experts
         assert probs.dim() == 2 and probs.shape == (num_tokens, original_num_experts), (
             f"probs must have shape [num_tokens={num_tokens}, "
@@ -245,9 +225,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         if token_indices is not None:
             if self.tp_size > 1:
-                # probs were TP-expanded above, so caller-supplied indices in the
-                # original-expert space must be remapped into the replicated layout
-                # produced by the (ep_size, tp_size, num_local_experts) reshape.
+                # Remap original-expert indices into the TP-replicated layout.
                 ep_idx = token_indices // self.num_local_experts
                 local_e = token_indices % self.num_local_experts
                 base = ep_idx * (self.tp_size * self.num_local_experts) + local_e
@@ -293,8 +271,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()
 
-        # Discard DeepEP's tokens_per_expert; sourced from moe_permute so the
-        # count reflects pad_multiple padding.
+        # Discard DeepEP's tokens_per_expert; moe_permute's count includes pad_multiple.
         hidden_states, dispatched_indices, dispatched_probs, _, handle = turbo.ops.moe_dispatch(
             hidden_states,
             token_indices=self.token_indices,
@@ -318,8 +295,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
 
-        # Cache num_dispatched_token_tensor so _pre_combine can reuse it
-        # without a host round-trip.
+        # Cache num_dispatched_token_tensor for _pre_combine (avoids a host round-trip).
         (
             hidden_states,
             self.row_id_map,
@@ -362,8 +338,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             async_finish=self.deepep_async_finish,
             allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,
         )
-        # Clear per-dispatch state so a second combine without a fresh dispatch
-        # fails loudly rather than silently reusing stale tensors.
+        # Clear per-dispatch state; a second combine without re-dispatch must fail loudly.
         self.handle = None
         self.row_id_map = None
         self.dispatched_indices = None

@@ -43,8 +43,7 @@ class _MoEPermute(torch.autograd.Function):
         hidden_size = int(tokens.shape[-1])
         num_dispatched = int(tokens.shape[0])
 
-        # Pick probs_stride from probs row width: 0 for [T, num_local_experts]
-        # multihot, num_topk for [T, num_topk] topk-aligned (DeepEP / moe_dispatch).
+        # Infer probs_stride from row width: num_local_experts → multihot (0); num_topk → topk-aligned.
         if probs is None:
             probs_topk_stride = 0
         else:
@@ -250,8 +249,7 @@ class _MoEUnpermute(torch.autograd.Function):
         # restore_shape == (num_dispatched, hidden_size); see moe_unpermute().
         num_dispatched, hidden_size = int(restore_shape[0]), int(restore_shape[1])
 
-        # probs_topk_stride: 0 => multihot [T, num_local_experts]; >0 => topk-aligned
-        # [T, probs_topk_stride]. Must match the row_id_map from forward-permute.
+        # Must match the row_id_map produced by forward-permute (0 = multihot, >0 = topk-aligned).
         probs_row_width = probs_topk_stride if probs_topk_stride > 0 else num_local_experts
 
         ctx.num_permuted = num_permuted
@@ -306,9 +304,7 @@ class _MoEUnpermute(torch.autograd.Function):
         row_id_map, num_dispatched_tokens_tensor = ctx.saved_tensors
         grad_unpermuted_tokens = grad_unpermuted_tokens.contiguous()
         device = grad_unpermuted_tokens.device
-        # empty: backward-permute is called with ctx.pad_multiple so the kernel
-        # itself walks the virtual padding tokens and writes 0 into padded slots
-        # (see moe_permute.hip is_padding_token path), avoiding a full pre-fill.
+        # No pre-fill: kernel zeros padded slots itself (see moe_permute.hip is_padding_token).
         grad_permuted = torch.empty(
             (ctx.num_permuted, ctx.hidden_size),
             dtype=grad_unpermuted_tokens.dtype,
