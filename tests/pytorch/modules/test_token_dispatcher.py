@@ -39,6 +39,41 @@ def _get_backends():
         return ["TURBO"]
 
 
+def _build_tp_groups(tp_size):
+    """Build (ep_group, tp_group, tp_ep_group) for the calling rank.
+
+    Layout for ``world_size = W`` and ``tp_size = T`` (with ``ep_size = W // T``):
+      - ``tp_ep_group``: ``dist.group.WORLD`` (size W).
+      - ``ep_group``:    world split into ``T`` contiguous slabs of size ``ep_size``.
+                         Slab ``s`` holds ranks ``[s*ep_size, (s+1)*ep_size)``.
+      - ``tp_group``:    world split into ``ep_size`` slabs of size ``T``;
+                         slab ``i`` holds ``[i, i+ep_size, i+2*ep_size, ...]``.
+
+    Returns the groups the calling rank belongs to.
+    """
+    world_size = dist.get_world_size()
+    assert world_size % tp_size == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+    ep_size = world_size // tp_size
+    my_rank = dist.get_rank()
+
+    ep_group = None
+    for s in range(tp_size):
+        ranks = list(range(s * ep_size, (s + 1) * ep_size))
+        group = dist.new_group(ranks)
+        if my_rank in ranks:
+            ep_group = group
+
+    tp_group = None
+    for i in range(ep_size):
+        ranks = [i + s * ep_size for s in range(tp_size)]
+        group = dist.new_group(ranks)
+        if my_rank in ranks:
+            tp_group = group
+
+    tp_ep_group = dist.group.WORLD
+    return ep_group, tp_group, tp_ep_group
+
+
 def _run_dispatch_combine(
     rank,
     ep_group,
@@ -47,22 +82,35 @@ def _run_dispatch_combine(
     num_experts=NUM_EXPERTS,
     router_topk=ROUTER_TOPK,
     dtype=torch.bfloat16,
-    permute_fusion=True,
+    permute_fusion=None,
     deepep_use_cuda_num_tokens_per_expert=False,
     deepep_num_worst_tokens=0,
-    permute_max_token_num=0,
+    num_permuted_tokens=0,
+    pad_multiple=0,
     expert_capacity_factor=None,
     deepep_use_comm_stream=False,
+    tp_size=1,
+    routing_map=None,
+    token_indices=None,
 ):
     """Core dispatch-combine logic shared by all test variants."""
+    if tp_size > 1:
+        ep_group, tp_group, tp_ep_group = _build_tp_groups(tp_size)
+    else:
+        tp_group = None
+        tp_ep_group = None
+
     dispatcher = turbo.modules.DeepEPTokenDispatcher(
         num_experts,
         router_topk,
         ep_group,
+        tp_group=tp_group,
+        tp_ep_group=tp_ep_group,
         permute_fusion=permute_fusion,
         deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
         deepep_num_worst_tokens=deepep_num_worst_tokens,
-        permute_max_token_num=permute_max_token_num,
+        num_permuted_tokens=num_permuted_tokens,
+        pad_multiple=pad_multiple,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
     )
@@ -71,10 +119,14 @@ def _run_dispatch_combine(
     ans = hidden_states.clone()
     hidden_states.requires_grad = True
 
-    probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / router_topk
+    # Per-token probs must sum to 1 across routes for the roundtrip identity.
+    # With TP, probs are replicated to tp_size slots, so divide by tp_size too.
+    probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / (
+        router_topk * tp_size
+    )
 
     permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
-        hidden_states, probs
+        hidden_states, probs, routing_map=routing_map, indices=token_indices
     )
 
     permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
@@ -139,8 +191,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # ------------------------------------------------------------------
 
     @parametrize("backend", _get_backends())
-    @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
-    def test_worst_tokens(self, backend, permute_max_token_num):
+    @parametrize("num_permuted_tokens", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
+    def test_worst_tokens(self, backend, num_permuted_tokens):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -148,7 +200,23 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 dist.group.WORLD,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
-                permute_max_token_num=permute_max_token_num,
+                num_permuted_tokens=num_permuted_tokens,
+            )
+
+    # ------------------------------------------------------------------
+    # pad_multiple > 0 (requires deepep_use_cuda_num_tokens_per_expert)
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    @parametrize("pad_multiple", [128, 256])
+    def test_pad_multiple(self, backend, pad_multiple):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                dist.group.WORLD,
+                deepep_use_cuda_num_tokens_per_expert=True,
+                pad_multiple=pad_multiple,
             )
 
     # ------------------------------------------------------------------
@@ -168,6 +236,74 @@ class TestTokenDispatcher(MultiProcContinuousTest):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
+            )
+
+    # ------------------------------------------------------------------
+    # tp_size > 1 coverage
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    def test_tp_size_2(self, backend):
+        if dist.get_world_size() < 2:
+            self.skipTest("requires world_size >= 2")
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                None,
+                num_tokens=512,
+                hidden_size=512,
+                num_experts=32,
+                router_topk=2,
+                tp_size=2,
+            )
+
+    @parametrize("backend", _get_backends())
+    def test_tp_size_2_with_routing_map(self, backend):
+        if dist.get_world_size() < 2:
+            self.skipTest("requires world_size >= 2")
+        self._bind_device()
+        num_tokens = 512
+        num_experts = 32
+        router_topk = 2
+        # Deterministic routing_map: mark the first `router_topk` experts True
+        # for every token (pre-TP-expansion expert id space).
+        routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device="cuda")
+        routing_map[:, :router_topk] = True
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                None,
+                num_tokens=num_tokens,
+                hidden_size=512,
+                num_experts=num_experts,
+                router_topk=router_topk,
+                tp_size=2,
+                routing_map=routing_map,
+            )
+
+    @parametrize("backend", _get_backends())
+    def test_tp_size_2_with_token_indices(self, backend):
+        if dist.get_world_size() < 2:
+            self.skipTest("requires world_size >= 2")
+        self._bind_device()
+        num_tokens = 512
+        num_experts = 32
+        router_topk = 2
+        # token_indices in the pre-expansion expert id space; the dispatcher
+        # is expected to TP-expand them internally.
+        probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / router_topk
+        _, token_indices = torch.topk(probs, router_topk, dim=-1)
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(
+                self.rank,
+                None,
+                num_tokens=num_tokens,
+                hidden_size=512,
+                num_experts=num_experts,
+                router_topk=router_topk,
+                tp_size=2,
+                token_indices=token_indices,
             )
 
 
@@ -219,7 +355,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
             {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8
-            permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
+            num_permuted_tokens = NUM_TOKENS * 8 * ROUTER_TOPK
 
             # clear buffer for reset
             # a trick to reset the backend instance
@@ -231,10 +367,9 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
                 NUM_EXPERTS,
                 ROUTER_TOPK,
                 dist.group.WORLD,
-                permute_fusion=True,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=num_worst_tokens,
-                permute_max_token_num=permute_max_token_num,
+                num_permuted_tokens=num_permuted_tokens,
             )
 
             hidden_states = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
