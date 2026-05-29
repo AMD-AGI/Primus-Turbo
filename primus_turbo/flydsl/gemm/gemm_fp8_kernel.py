@@ -1026,6 +1026,28 @@ if _FLYDSL_OK:
         )
         return [_llvm.extractvalue(v2i32, asm_op.result, [k]) for k in range(N)]
 
+    class _G2SLoaderStride(G2SLoader):
+        """G2SLoader with a tunable per-wave LDS chunk stride (default 1024 =
+        identical to base). A stride of 1056 (=1024+32) makes the per-wave chunk
+        base NOT bank-aligned on gfx950: W*1056/4 % 64 = W*8, so the wave-step
+        dimension W spreads across banks instead of all collapsing to bank 0.
+        This halves the TN transpose-read bank conflict (4-way -> 2-way), since
+        the 4 lane-groups (lane//16, i.e. W=0,2,4,6) then hit 4 distinct banks.
+        The within-chunk data layout (lane*16 from the copy atom) is unchanged;
+        only the chunk base is padded by 32 bytes. Read side (S2RLoaderTr*) must
+        use the SAME chunk_stride."""
+        def __init__(self, *a, chunk_stride=1024, **kw):
+            super().__init__(*a, **kw)
+            self.chunk_stride = chunk_stride
+
+        def _lds_dst_at(self, lds_dst, step):
+            cs = self.chunk_stride
+            step_off = self.wave_id * cs + step * (self.n_waves * cs)
+            base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
+            sum_i32 = base_i32 + fx.Int32(step_off)
+            lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
+            return fx.make_view(lds_ptr, fx.make_layout(1, 1))
+
     def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds):
         """B in NN: [K_inner, N_out] row-major. Each round loads 64 K-rows ×
         128 N-bytes (per wave 8 K-rows × 128 N-bytes via BufferCopyLDS128b).
@@ -1236,7 +1258,8 @@ if _FLYDSL_OK:
         # i32 type belongs to the prior MLIR context and Numeric.from_ir_type
         # can't look it up in the new context's map. Always rebuild per-call.
 
-        def __init__(self, wave_n, n_tiles_b, inline_asm=False, vmcnt_hint=2):
+        def __init__(self, wave_n, n_tiles_b, inline_asm=False, vmcnt_hint=2,
+                     chunk_stride=1024):
             """``inline_asm=True`` switches ds_read_tr8_b64 from rocdl
             intrinsic to inline-asm block. backend SIInsertWaitcnts treats
             inline asm as opaque (not known wave-coop op) so does NOT
@@ -1259,9 +1282,17 @@ if _FLYDSL_OK:
             self.lane_id = fx.thread_idx.x % 64
             self.inline_asm = inline_asm
             self.vmcnt_hint = vmcnt_hint
+            # Per-wave LDS chunk stride (bank-spread; must match G2S writer).
+            # round_stride = n_waves(8) * chunk_stride is the r_step K-sub-round
+            # jump (1024->8192 default; 1056->8448 bank-spread).
+            self.chunk_stride = chunk_stride
+            self.round_stride = 8 * chunk_stride
 
         def load(self, lds_src, preshuffled=False):
-            """Returns list[N_TILES_B] of i32x8 (32 fp8/lane K-contig at N-col)."""
+            """Returns list[N_TILES_B] of i32x8 (32 fp8/lane K-contig at N-col).
+            inline_asm path emits a single trailing separate lgkmcnt(0) drain;
+            correct because mma.call follows at a function-call boundary the
+            backend doesn't reorder across."""
             assert not preshuffled, "S2RLoaderTr does not support preshuffled"
             tr_type = Vec.make_type(2, fx.Int32)
 
@@ -1283,16 +1314,17 @@ if _FLYDSL_OK:
                 swz_K = ((K_log % 16) // 2) * 16
                 tile_N_start = self.wave_n * 32 + tile_i * 16
                 j_chunk = (tile_N_start // 16) ^ (swz_K // 16)
-                return (W * 1024 + r_step * 8192 + K_mod_8 * 128
-                        + j_chunk * 16 + (L_in_sg % 2) * 8)
+                return (W * self.chunk_stride + r_step * self.round_stride
+                        + K_mod_8 * 128 + j_chunk * 16 + (L_in_sg % 2) * 8)
 
+            RS = self.round_stride  # c0->c2 / c1->c3 packed-read jump (r_step+1)
             frag = []
             for tile_i in range_constexpr(self.n_tiles_b):
                 if self.inline_asm:
                     p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_b(0, tile_i)))
                     p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_b(1, tile_i)))
-                    r02 = _packed_ds_read_tr_offsets(p0, [0, 8192], vmcnt_hint=self.vmcnt_hint)
-                    r13 = _packed_ds_read_tr_offsets(p1, [0, 8192], vmcnt_hint=None)
+                    r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
+                    r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
                     # r02 = [c0, c2], r13 = [c1, c3] → reorder to [c0,c1,c2,c3]
                     calls = [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
                 else:
@@ -1310,11 +1342,10 @@ if _FLYDSL_OK:
                 v4_hi = calls[2].shuffle(calls[3], [0, 1, 2, 3])
                 frag.append(v4_lo.shuffle(v4_hi, list(range(8))))
             if self.inline_asm:
-                # ds_read_b64_tr_b8 completes on lgkmcnt (async LDS read). The
-                # opaque inline asm hides this from the backend, so it won't
-                # auto-insert the lgkmcnt wait the consuming mfma needs (the
-                # intrinsic path gets it for free). Drain here. Correctness-
-                # first; perf tuning of the count comes after SNR is green.
+                # ds_read_b64_tr_b8 completes on lgkmcnt (async LDS read); the
+                # opaque asm hides this so the backend won't auto-insert the
+                # wait the mfma needs. Single trailing drain (mma.call follows
+                # at a call boundary the backend doesn't reorder across).
                 _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
                                   constraints="", has_side_effects=True)
             return frag
@@ -1330,7 +1361,8 @@ if _FLYDSL_OK:
 
         _K_BASE = (0, 8, 64, 72)
 
-        def __init__(self, wave_m, n_tiles_a, lds_block_m, inline_asm=False, vmcnt_hint=2):
+        def __init__(self, wave_m, n_tiles_a, lds_block_m, inline_asm=False, vmcnt_hint=2,
+                     chunk_stride=1024):
             """``lds_block_m`` = BLOCK_M // 2 (LDS half-block M-size). Per-wave
             M coverage = lds_block_m / num_wave_m. For 8w with num_wave_m=2:
             BM=256 → lds_block_m=128 → stride=64; BM=128 → lds_block_m=64 → stride=32."""
@@ -1340,6 +1372,8 @@ if _FLYDSL_OK:
             self.lane_id = fx.thread_idx.x % 64
             self.inline_asm = inline_asm
             self.vmcnt_hint = vmcnt_hint
+            self.chunk_stride = chunk_stride       # bank-spread LDS chunk stride
+            self.round_stride = 8 * chunk_stride   # r_step K-sub-round jump
 
         def load(self, lds_src, preshuffled=False):
             assert not preshuffled
@@ -1358,16 +1392,17 @@ if _FLYDSL_OK:
                 # 8w A: wave_m * wave_stride (= LDS_BLOCK_M / num_wave_m)
                 tile_M_start = self.wave_m * self.wave_stride + tile_i * 16
                 j_chunk = (tile_M_start // 16) ^ (swz_K // 16)
-                return (W * 1024 + r_step * 8192 + K_mod_8 * 128
-                        + j_chunk * 16 + (L_in_sg % 2) * 8)
+                return (W * self.chunk_stride + r_step * self.round_stride
+                        + K_mod_8 * 128 + j_chunk * 16 + (L_in_sg % 2) * 8)
 
+            RS = self.round_stride
             frag = []
             for tile_i in range_constexpr(self.n_tiles_a):
                 if self.inline_asm:
                     p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_a(0, tile_i)))
                     p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_a(1, tile_i)))
-                    r02 = _packed_ds_read_tr_offsets(p0, [0, 8192], vmcnt_hint=self.vmcnt_hint)
-                    r13 = _packed_ds_read_tr_offsets(p1, [0, 8192], vmcnt_hint=None)
+                    r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
+                    r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
                     calls = [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
                 else:
                     calls = [Vec(rocdl.ds_read_tr8_b64(
@@ -1837,10 +1872,16 @@ if _FLYDSL_OK:
         N_LDS_STEPS_A = max(LDS_BLOCK_M // 64, 2)  # ≥ 2 for tr8 K=128
         N_LDS_STEPS_B = LDS_BLOCK_N // 64
         N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-        # a_lds_size: 2 G2S rounds × 8 waves × 1024 bytes = 16384 minimum.
-        # For BM=256: LDS_BLOCK_M*BLOCK_K = 16384 same. For BM=128: force 16K.
-        a_lds_size = max(LDS_BLOCK_M * BLOCK_K, 2 * 8 * 1024)
-        b_lds_size = LDS_BLOCK_N * BLOCK_K
+        # Bank-spread LDS chunk stride (gfx950 bank-conflict fix). 1024 = off
+        # (bank-0-aligned per-wave chunk → transpose-read bank conflict). 1056
+        # = +32B pad → W*1056/4%64 = W*8 spreads the wave-step dim across banks.
+        # PMC: SQ_LDS_BANK_CONFLICT/IDX_ACTIVE 0.50 → 0.00 (fully eliminated);
+        # 24-shape TN/NT geomean 0.811 → 0.861 (+5.0pp). Default ON; env can
+        # override. Both G2S writer (_G2SLoaderStride) and S2R reader use it.
+        _LDS_CS = int(os.environ.get("FLYDSL_TN_CHUNK_STRIDE", "1056"))
+        # a_lds_size: N rounds × 8 waves × chunk_stride. Pad to stride.
+        a_lds_size = max(LDS_BLOCK_M * BLOCK_K, 2 * 8 * 1024) // 1024 * _LDS_CS
+        b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _LDS_CS
 
         @fx.struct
         class SharedStorage:
@@ -1903,12 +1944,16 @@ if _FLYDSL_OK:
 
             mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
 
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            a_g2s = _G2SLoaderStride(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id,
+                                      chunk_stride=_LDS_CS)
+            b_g2s = _G2SLoaderStride(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id,
+                                      chunk_stride=_LDS_CS)
             a_s2r = S2RLoaderTr_A(wave_m, N_TILES_A, LDS_BLOCK_M,
-                                   inline_asm=_a_inline, vmcnt_hint=vmcnt_hint)
+                                   inline_asm=_a_inline, vmcnt_hint=vmcnt_hint,
+                                   chunk_stride=_LDS_CS)
             b_s2r = S2RLoaderTr(wave_n, N_TILES_B,
-                                 inline_asm=_b_inline, vmcnt_hint=vmcnt_hint)
+                                 inline_asm=_b_inline, vmcnt_hint=vmcnt_hint,
+                                 chunk_stride=_LDS_CS)
             store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
             c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -2877,6 +2922,9 @@ _TN_CANDIDATES = [
     (128, 2, 32),
     (128, 4, 32),
 ]
+# NOTE: GM=8/32 candidates tested 2026-05-29 — no benefit (worst 28672 shapes
+# stay 0.73; unlike NT, TN's big-N shapes are bound by the double wave-coop
+# ds_read_b64_tr_b8, not L2 super-block reuse). Kept set minimal.
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
@@ -2921,6 +2969,8 @@ def _autotune_tn_dispatch(args, M, N, K):
             continue
     if best is None:
         raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
+    if os.environ.get("FLYDSL_TN_VERBOSE"):
+        print(f"[TN autotune] ({M},{N},{K}) -> cfg(BM,GM,AG)={best[1]} us={best_us:.1f}", flush=True)
     _TN_AUTOTUNE_CACHE[key] = best
     return best
 
