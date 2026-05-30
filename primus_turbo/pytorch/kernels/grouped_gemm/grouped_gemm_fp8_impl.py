@@ -30,6 +30,8 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_rowwise_variable_k_triton_kernel,
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+    grouped_gemm_mxfp8_forward,
+    grouped_gemm_mxfp8_variable_k,
 )
 
 _COMMON_SUPPORTED_DTYPES = (
@@ -321,6 +323,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -342,9 +345,13 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
-        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        if granularity != ScalingGranularity.MX_BLOCKWISE:
+            supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES
+        else:
+            # MXFP8: e4m3/e5m2 operands, NT layout only
+            supported &= trans_b
         return supported
 
     @staticmethod
@@ -362,6 +369,25 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            # b is (G, N, K) NT.  group_offs = padded read offsets; c_group_offs
+            # = real write offsets; total_m_out = real output rows (unpad).
+            N = b.shape[-2]
+            K = b.shape[-1]
+            c_group_offs = kwargs.get("c_group_offs", None)
+            total_m_out = kwargs.get("total_m_out", 0) or None
+            return grouped_gemm_mxfp8_forward(
+                a,
+                a_scales,
+                b,
+                b_scales,
+                group_offs,
+                N,
+                K,
+                c_group_offs=c_group_offs,
+                total_m_out=total_m_out,
+                out_dtype=out_dtype,
+            )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_triton_kernel(
                 a,
@@ -438,6 +464,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -460,9 +487,14 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
-        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_GRANULARITIES
-        supported &= trans_a and not trans_b
+        if granularity != ScalingGranularity.MX_BLOCKWISE:
+            supported &= (
+                a.dtype,
+                b.dtype,
+                out_dtype,
+            ) in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_DTYPES
+            supported &= trans_a and not trans_b
         return supported
 
     @staticmethod
@@ -488,6 +520,24 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
 
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            # wgrad: C[g](OUT_M,OUT_N) = lhs[:,g](OUT_M,M_g) @ rhs[:,g](OUT_N,M_g)^T
+            # lhs = grad_out_col (OUT_M=N, M_total), rhs = a_col (OUT_N=K, M_total).
+            # group_offs = padded per-group offsets along M.
+            OUT_M = lhs.shape[0]
+            OUT_N = rhs.shape[0]
+            G = group_lens.shape[0]
+            return grouped_gemm_mxfp8_variable_k(
+                lhs,
+                lhs_scales,
+                rhs,
+                rhs_scales,
+                group_offs,
+                OUT_M,
+                OUT_N,
+                G,
+                out_dtype=out_dtype,
+            )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
                 lhs,
@@ -568,6 +618,8 @@ def grouped_gemm_fp8_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    c_group_offs: torch.Tensor | None = None,
+    total_m_out: int = 0,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
@@ -586,6 +638,8 @@ def grouped_gemm_fp8_impl(
         granularity=granularity_enum,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
+        c_group_offs=c_group_offs,
+        total_m_out=total_m_out,
     )
 
     return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -648,6 +702,8 @@ def grouped_gemm_fp8_impl_meta(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    c_group_offs: torch.Tensor | None = None,
+    total_m_out: int = 0,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -660,6 +716,8 @@ def grouped_gemm_fp8_impl_meta(
     assert trans_a == False, "Only trans_a=False is supported."
 
     m = a.shape[1] if trans_a else a.shape[0]
+    if total_m_out > 0:
+        m = total_m_out  # MX: padded input → real (unpadded) output rows
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=out_dtype)
 

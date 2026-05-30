@@ -279,9 +279,15 @@ quantize_mxfp8_dual_grouped_meta(const at::Tensor input, const at::Tensor group_
     int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
+    // Mirror host: transposed scale layout (scale_N, rows) when neither side shuffled.
+    const bool do_transpose = !shuffle_rowwise_scale && !shuffle_colwise_scale;
+
     at::Tensor rowwise_scale;
     if (shuffle_rowwise_scale) {
         rowwise_scale = at::empty({rowwise_scale_M_pad, rowwise_scale_N_pad},
+                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else if (do_transpose) {
+        rowwise_scale = at::empty({rowwise_scale_N, M_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
         rowwise_scale = at::empty({M_pad, rowwise_scale_N},
@@ -299,6 +305,9 @@ quantize_mxfp8_dual_grouped_meta(const at::Tensor input, const at::Tensor group_
     if (shuffle_colwise_scale) {
         colwise_scale = at::empty({colwise_scale_M_pad, colwise_scale_N_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else if (do_transpose) {
+        colwise_scale =
+            at::empty({colwise_scale_N, N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
         colwise_scale =
             at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
@@ -340,14 +349,15 @@ std::vector<at::Tensor> quantize_mxfp8_dual_perg_meta(const at::Tensor     input
     int64_t rowwise_scale_N = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t colwise_scale_N = cdiv(M_pad, MXFP8_BLOCK_SIZE);
 
+    // transposed scale layout (G, scale_N, rows) — matches host quantize_mxfp8_dual_perg
     auto rowwise_output =
         at::empty({G, M, N_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     auto rowwise_scale =
-        at::empty({G, M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({G, rowwise_scale_N, M}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     auto colwise_output =
         at::empty({G, N, M_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     auto colwise_scale =
-        at::empty({G, N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({G, colwise_scale_N, N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
     return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
             colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu)};

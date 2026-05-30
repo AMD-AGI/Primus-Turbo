@@ -73,6 +73,8 @@ struct ScalingRecipe {
 
     bool shuffle_scale = false;
     bool shuffle_out   = false;
+
+    bool transpose_scale = false;
 };
 
 constexpr int FP32_MANTISSA_BITS     = 23;

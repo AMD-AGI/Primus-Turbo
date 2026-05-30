@@ -612,8 +612,9 @@ std::vector<at::Tensor> quantize_mxfp8_dual_perg(const at::Tensor     input,
     int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
+    // transposed scale layout (G, scale_N, rows) for coalesced grouped-GEMM load
     auto rowwise_scale =
-        at::empty({G, M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({G, rowwise_scale_N, M}, at::TensorOptions().dtype(at::kByte).device(device));
     auto rowwise_output =
         at::empty({G, M, N_pad}, at::TensorOptions().dtype(at::kByte).device(device));
 
@@ -622,7 +623,7 @@ std::vector<at::Tensor> quantize_mxfp8_dual_perg(const at::Tensor     input,
     int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
 
     auto colwise_scale =
-        at::empty({G, N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({G, colwise_scale_N, N}, at::TensorOptions().dtype(at::kByte).device(device));
     auto colwise_output =
         at::empty({G, N, M_pad}, at::TensorOptions().dtype(at::kByte).device(device));
 
@@ -635,13 +636,13 @@ std::vector<at::Tensor> quantize_mxfp8_dual_perg(const at::Tensor     input,
                 reinterpret_cast<OType *>(colwise_output.data_ptr()),
                 colwise_scale.data_ptr<uint8_t>(), static_cast<int>(G), static_cast<int>(M),
                 static_cast<int>(N), static_cast<int>(M_pad), static_cast<int>(N_pad),
-                static_cast<int>(rowwise_scale_N), static_cast<int>(colwise_scale_N),
+                static_cast<int>(M), static_cast<int>(N), // transposed scale store strides
                 static_cast<int>(rowwise_scale_N), static_cast<int>(rowwise_scale_M_pad),
                 static_cast<int>(rowwise_scale_N_pad), static_cast<int>(N),
                 static_cast<int>(colwise_scale_N), static_cast<int>(colwise_scale_M_pad),
                 static_cast<int>(colwise_scale_N_pad),
-                ScalingRecipe(rowwise_use_2d_block, false, false, false, false),
-                ScalingRecipe(colwise_use_2d_block, false, false, false, false), stream);
+                ScalingRecipe(rowwise_use_2d_block, false, false, false, false, true),
+                ScalingRecipe(colwise_use_2d_block, false, false, false, false, true), stream);
         })});
 
     return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
@@ -728,12 +729,21 @@ quantize_mxfp8_dual_grouped(const at::Tensor input, const at::Tensor group_lens,
     int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
+    // Transposed scale layout (scale_N, rows) for coalesced grouped-GEMM
+    // load — only when neither side is shuffled (the kernel's single
+    // transpose flag drives both rowwise & colwise stores together).
+    const bool do_transpose = !shuffle_rowwise_scale && !shuffle_colwise_scale;
+
     int64_t    rowwise_scale_stride = 1;
     at::Tensor rowwise_scale;
     if (shuffle_rowwise_scale) {
         rowwise_scale = at::full({rowwise_scale_M_pad, rowwise_scale_N_pad}, E8M0_EXPONENT_BIAS,
                                  at::TensorOptions().dtype(at::kByte).device(device));
         rowwise_scale_stride = rowwise_scale.stride(0);
+    } else if (do_transpose) {
+        rowwise_scale        = at::empty({rowwise_scale_N, M_pad},
+                                         at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale_stride = M_pad;
     } else {
         rowwise_scale        = at::empty({M_pad, rowwise_scale_N},
                                          at::TensorOptions().dtype(at::kByte).device(device));
@@ -753,6 +763,10 @@ quantize_mxfp8_dual_grouped(const at::Tensor input, const at::Tensor group_lens,
         colwise_scale = at::full({colwise_scale_M_pad, colwise_scale_N_pad}, E8M0_EXPONENT_BIAS,
                                  at::TensorOptions().dtype(at::kByte).device(device));
         colwise_scale_stride = colwise_scale.stride(0);
+    } else if (do_transpose) {
+        colwise_scale =
+            at::empty({colwise_scale_N, N}, at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale_stride = N;
     } else {
         colwise_scale =
             at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
@@ -775,9 +789,9 @@ quantize_mxfp8_dual_grouped(const at::Tensor input, const at::Tensor group_lens,
                 colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
                 colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
                 ScalingRecipe(rowwise_use_2d_block, false, false, shuffle_rowwise_scale,
-                              shuffle_rowwise),
+                              shuffle_rowwise, do_transpose),
                 ScalingRecipe(colwise_use_2d_block, false, false, shuffle_colwise_scale,
-                              shuffle_colwise),
+                              shuffle_colwise, do_transpose),
                 stream);
         })});
 

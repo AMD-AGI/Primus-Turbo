@@ -513,7 +513,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
     const int colwise_scale_M, const int colwise_scale_N, const int colwise_scale_M_pad,
     const int colwise_scale_N_pad, const bool shuffle_rowwise, const bool shuffle_colwise,
     const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale,
-    const int64_t input_per_group_stride = 0, const int64_t rowwise_fp8_per_group_stride = 0,
+    const bool transpose_scale = false, const int64_t input_per_group_stride = 0,
+    const int64_t rowwise_fp8_per_group_stride   = 0,
     const int64_t rowwise_scale_per_group_stride = 0,
     const int64_t colwise_fp8_per_group_stride   = 0,
     const int64_t colwise_scale_per_group_stride = 0) {
@@ -722,8 +723,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                             }
                         } else {
                             if (scale_col < rowwise_scale_N) {
-                                rowwise_scale[global_row * rowwise_scale_stride + scale_col] =
-                                    r_rowwise_scale_e8m0[pass];
+                                const int64_t soff =
+                                    transpose_scale
+                                        ? (int64_t) scale_col * rowwise_scale_stride + global_row
+                                        : (int64_t) global_row * rowwise_scale_stride + scale_col;
+                                rowwise_scale[soff] = r_rowwise_scale_e8m0[pass];
                             }
                         }
                     }
@@ -874,7 +878,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
 
                 if (scale_col < colwise_scale_N && global_col < N) {
                     const uint8_t scale_val = s_colwise_scale[n_chunk][col_in_chunk][m_chunk];
-                    colwise_scale[global_col * colwise_scale_stride + scale_col] = scale_val;
+                    const int64_t soff =
+                        transpose_scale ? (int64_t) scale_col * colwise_scale_stride + global_col
+                                        : (int64_t) global_col * colwise_scale_stride + scale_col;
+                    colwise_scale[soff] = scale_val;
                 }
             }
         }
@@ -934,7 +941,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grou
     const int rowwise_scale_N, const int rowwise_scale_M_pad, const int rowwise_scale_N_pad,
     const int colwise_scale_M, const int colwise_scale_N, const int colwise_scale_M_pad,
     const int colwise_scale_N_pad, const bool shuffle_rowwise, const bool shuffle_colwise,
-    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale) {
+    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale,
+    const bool transpose_scale = false) {
     constexpr bool kIshalf = std::is_same_v<IType, dtype::float16>;
 
     const int tid           = threadIdx.x;
@@ -1142,8 +1150,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grou
                             }
                         } else {
                             if (scale_col < rowwise_scale_N) {
-                                rowwise_scale[global_row * rowwise_scale_stride + scale_col] =
-                                    r_rowwise_scale_e8m0[pass];
+                                const int64_t soff =
+                                    transpose_scale
+                                        ? (int64_t) scale_col * rowwise_scale_stride + global_row
+                                        : (int64_t) global_row * rowwise_scale_stride + scale_col;
+                                rowwise_scale[soff] = r_rowwise_scale_e8m0[pass];
                             }
                         }
                     }
@@ -1287,7 +1298,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_grou
 
                 if (scale_col < colwise_scale_N && global_col < N) {
                     const uint8_t scale_val = s_colwise_scale[n_chunk][col_in_chunk][m_chunk];
-                    colwise_scale[global_col * colwise_scale_stride + scale_col] = scale_val;
+                    const int64_t soff =
+                        transpose_scale ? (int64_t) scale_col * colwise_scale_stride + global_col
+                                        : (int64_t) global_col * colwise_scale_stride + scale_col;
+                    colwise_scale[soff] = scale_val;
                 }
             }
         }
@@ -1341,7 +1355,7 @@ void quantize_mxfp8_dual_grouped_impl(
         colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad,           \
         colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,                \
         rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out, rowwise_recipe.shuffle_scale,      \
-        colwise_recipe.shuffle_scale
+        colwise_recipe.shuffle_scale, rowwise_recipe.transpose_scale
 
 #define QUANTIZE_MXFP8_DUAL_GROUPED_LAUNCH(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)             \
     quantize_mxfp8_dual_grouped_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>   \
@@ -1420,7 +1434,7 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
         rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
         rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
         colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
-        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale, rowwise_recipe.transpose_scale
 
 #define QUANTIZE_MXFP8_DUAL_LAUNCH_KERNEL(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)              \
     quantize_mxfp8_dual_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>           \
@@ -1519,20 +1533,23 @@ void quantize_mxfp8_dual_perg_impl(
     // colwise stride is ``M_pad`` and the kernel writes the full
     // ``[0, M_pad)`` range (with zero-quant for the M_pad-M padding
     // rows, matching the GEMM kernel's unread region).
-    const int64_t input_per_g_stride         = (int64_t) M * N;
-    const int64_t rowwise_fp8_per_g_stride   = (int64_t) M * N_pad;
-    const int64_t rowwise_scale_per_g_stride = (int64_t) M * rowwise_scale_stride;
+    const int64_t input_per_g_stride       = (int64_t) M * N;
+    const int64_t rowwise_fp8_per_g_stride = (int64_t) M * N_pad;
+    // Per-group scale stride = total e8m0 elements per group, which is
+    // layout-independent (M*scale_N), so it holds for both the row-major
+    // (M, scale_N) and transposed (scale_N, M) buffers.
+    const int64_t rowwise_scale_per_g_stride = (int64_t) M * rowwise_scale_N;
     const int64_t colwise_fp8_per_g_stride   = (int64_t) N * M_pad;
-    const int64_t colwise_scale_per_g_stride = (int64_t) N * colwise_scale_stride;
+    const int64_t colwise_scale_per_g_stride = (int64_t) N * colwise_scale_N;
 
 #define QUANTIZE_MXFP8_DUAL_PERG_ARGS                                                              \
     input, rowwise_output, rowwise_scale, colwise_output, colwise_scale, M, N, M_pad, N_pad,       \
         rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
         rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
         colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
-        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale, input_per_g_stride,            \
-        rowwise_fp8_per_g_stride, rowwise_scale_per_g_stride, colwise_fp8_per_g_stride,            \
-        colwise_scale_per_g_stride
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale,                                \
+        rowwise_recipe.transpose_scale, input_per_g_stride, rowwise_fp8_per_g_stride,              \
+        rowwise_scale_per_g_stride, colwise_fp8_per_g_stride, colwise_scale_per_g_stride
 
 #define QUANTIZE_MXFP8_DUAL_PERG_LAUNCH(ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK)                \
     quantize_mxfp8_dual_kernel<IType, OType, ROWWISE_USE_2D_BLOCK, COLWISE_USE_2D_BLOCK>           \

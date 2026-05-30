@@ -1989,3 +1989,409 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         kpack=2,
     )
     return out
+
+
+# ###########################################################################
+#
+#  PART 3 — MXFP8 (MX_BLOCKWISE) Grouped GEMM
+#
+#  Persistent grouped MXFP8 kernels (gfx950) mirroring the blockwise kernels'
+#  scheduling, but the inner K-loop uses hardware block-scaled MMA via
+#  tl.dot_scaled with E8M0 (VEC_SIZE=32) scales (e4m3 / e5m2 elements). Scales
+#  are stored transposed (K/32, M) / (G, K/32, N) for a coalesced per-K-iter
+#  load, transposed back in-reg for tl.dot_scaled.
+#
+#    forward (NT):   C[g] = A[g] @ B[g]^T
+#    variable-K wgrad: C[g] = LHS[g] @ RHS[g]^T, reduction over the padded M_g
+#
+# ###########################################################################
+
+
+VEC_SIZE = 32
+
+
+@triton.jit
+def _grouped_mxfp8_persistent_gemm_kernel(
+    A,
+    B,
+    C,
+    A_scale,  # (K//32, total_M) uint8 (e8m0, transposed for coalesced load)
+    B_scale,  # (G, K//32, N) uint8 (e8m0, transposed)
+    rd_offs_ptr,  # (G+1) int64 — padded per-group offsets (read A / A_scale along M)
+    out_offs_ptr,  # (G+1) int64 — real per-group offsets (write C, tile count)
+    G,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bg,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bsg,
+    stride_bsn,
+    stride_bsk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CACHE_MODIFIER: tl.constexpr,
+    VEC: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    FP8_FMT: tl.constexpr,  # "e4m3" or "e5m2" (both operands share the format)
+):
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    total_tiles: tl.int32 = 0
+    for _g in range(G):
+        m_g = (tl.load(out_offs_ptr + _g + 1) - tl.load(out_offs_ptr + _g)).to(tl.int32)
+        total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_cm > 0)
+
+    for global_tile_id in range(pid, total_tiles, NUM_SMS):
+        # ── locate group (linear scan) ──
+        group_idx: tl.int32 = 0
+        tile_start: tl.int32 = 0
+        cumsum: tl.int32 = 0
+        for _g in range(G):
+            m_g_i = (tl.load(out_offs_ptr + _g + 1) - tl.load(out_offs_ptr + _g)).to(tl.int32)
+            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
+            new_cumsum = cumsum + tiles_g
+            if global_tile_id >= new_cumsum:
+                group_idx = _g + 1
+                tile_start = new_cumsum
+            cumsum = new_cumsum
+
+        local_tile = global_tile_id - tile_start
+        m_rd = tl.load(rd_offs_ptr + group_idx)  # int64 — padded read base (A / A_scale)
+        m_out = tl.load(out_offs_ptr + group_idx)  # int64 — real write base (C)
+        M_g = (tl.load(out_offs_ptr + group_idx + 1) - m_out).to(tl.int32)
+        tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
+
+        # ── swizzle ──
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        swizzle_group = local_tile // num_pid_in_group
+        first_pid_m = swizzle_group * GROUP_SIZE_M
+        group_size_m = min(tiles_m_g - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
+        pid_n = (local_tile % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rks = tl.arange(0, BLOCK_SIZE_K // VEC)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        # base pointers; B loaded directly as (BK, BN) (K contiguous) — no in-reg
+        # transpose. Scales stored transposed (K/VEC, M)/(G, K/VEC, N) for a
+        # coalesced load, transposed back in-reg for tl.dot_scaled.
+        A_BASE = A + (m_rd + rm[:, None]) * stride_am + rk[None, :] * stride_ak
+        B_BASE = B + group_idx.to(tl.int64) * stride_bg + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        AS_BASE = A_scale + rks[:, None] * stride_ask + (m_rd + rm[None, :]) * stride_asm
+        BS_BASE = (
+            B_scale
+            + group_idx.to(tl.int64) * stride_bsg
+            + rks[:, None] * stride_bsk
+            + rn[None, :] * stride_bsn
+        )
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+        if not EVEN_K:
+            loop_k -= 1  # last partial K-block handled separately (masked)
+        for ki in range(0, loop_k):
+            a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK)
+            b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK, BN)
+            a_s = tl.trans(tl.load(AS_BASE))  # (BK//VEC, BM) -> (BM, BK//VEC)
+            b_s = tl.trans(tl.load(BS_BASE))  # (BK//VEC, BN) -> (BN, BK//VEC)
+            acc = tl.dot_scaled(a, a_s, FP8_FMT, b, b_s, FP8_FMT, acc)
+            A_BASE += BLOCK_SIZE_K * stride_ak
+            B_BASE += BLOCK_SIZE_K * stride_bk
+            AS_BASE += (BLOCK_SIZE_K // VEC) * stride_ask
+            BS_BASE += (BLOCK_SIZE_K // VEC) * stride_bsk
+
+        if not EVEN_K:
+            # Masked tail K-block: A/B padded with 0 (scale buffer is K-padded,
+            # so its tail-block load is in-bounds and the 0 data contributes 0).
+            k_mask = loop_k * BLOCK_SIZE_K + rk < K
+            a = tl.load(
+                tl.multiple_of(A_BASE, (1, 16)),
+                mask=k_mask[None, :],
+                other=0.0,
+                cache_modifier=CACHE_MODIFIER,
+            )
+            b = tl.load(
+                tl.multiple_of(B_BASE, (16, 1)),
+                mask=k_mask[:, None],
+                other=0.0,
+                cache_modifier=CACHE_MODIFIER,
+            )
+            a_s = tl.trans(tl.load(AS_BASE))
+            b_s = tl.trans(tl.load(BS_BASE))
+            acc = tl.dot_scaled(a, a_s, FP8_FMT, b, b_s, FP8_FMT, acc)
+
+        c = acc.to(C.type.element_ty)
+        rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+        rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
+        C_ = C + (m_out + rm_s[:, None]) * stride_cm + rn_s[None, :] * stride_cn
+        tl.store(C_, c, c_mask)
+
+
+def grouped_gemm_mxfp8_forward(
+    a, a_scale, b, b_scale, group_offs, N, K, c_group_offs=None, total_m_out=None, out_dtype=torch.bfloat16
+):
+    """A(M_in,K) @ B(G,N,K)^T → C(total_m_out,N). scales are e8m0 viewed as uint8.
+
+    group_offs: padded per-group offsets to read A/A_scale (M_in layout).
+    c_group_offs: real per-group offsets to write C (defaults to group_offs = no unpad).
+    total_m_out: rows of C (defaults to a.shape[0]).
+    """
+    if c_group_offs is None:
+        c_group_offs = group_offs
+    if total_m_out is None:
+        total_m_out = a.shape[0]
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    G = b.shape[0]
+    c = torch.empty((total_m_out, N), dtype=out_dtype, device=a.device)
+    # scales arrive already transposed from quant: a_scale (K/VEC, M),
+    # b_scale (G, K/VEC, N) — coalesced per-K-iter load, no host copy.
+    a_s = a_scale.view(torch.uint8)
+    b_s = b_scale.view(torch.uint8)
+    fp8_fmt = "e5m2" if a.dtype == torch.float8_e5m2 else "e4m3"
+    cu = torch.cuda.get_device_properties(a.device).multi_processor_count
+    BM, BN, BK = 256, 256, 128
+    avg_m = max(total_m_out // max(G, 1), 1)
+    tiles_n = (N + BN - 1) // BN
+    GM = 8 if min((avg_m + BM - 1) // BM, tiles_n) < 16 else 4
+    total_tiles = ((total_m_out + BM - 1) // BM + G) * tiles_n  # padded upper bound
+    num_sms = min(total_tiles, cu)
+    chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
+    grid = (num_sms,)
+    _grouped_mxfp8_persistent_gemm_kernel[grid](
+        a,
+        b,
+        c,
+        a_s,
+        b_s,
+        group_offs,
+        c_group_offs,
+        G,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        b.stride(2),
+        c.stride(0),
+        c.stride(1),
+        a_s.stride(1),  # stride_asm (M, contiguous)
+        a_s.stride(0),  # stride_ask (K/VEC)
+        b_s.stride(0),  # stride_bsg
+        b_s.stride(2),  # stride_bsn (N, contiguous)
+        b_s.stride(1),  # stride_bsk (K/VEC)
+        BLOCK_SIZE_M=BM,
+        BLOCK_SIZE_N=BN,
+        BLOCK_SIZE_K=BK,
+        GROUP_SIZE_M=GM,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK_SIZE=chunk,
+        CACHE_MODIFIER=".ca",
+        VEC=VEC_SIZE,
+        EVEN_K=(K % BK == 0),
+        FP8_FMT=fp8_fmt,
+        num_warps=8,
+        num_stages=2,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=1,
+    )
+    return c
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Variable-K backward (wgrad): C[g] = LHS[g] @ RHS[g]^T, reduction over M_g (dim1)
+#   LHS = grad_out_col (OUT_M=N, M_total) e4m3, LHS_scale (N, M_total//32) u8
+#   RHS = a_col        (OUT_N=K, M_total) e4m3, RHS_scale (K, M_total//32) u8
+#   C   = (G, N, K)
+#   go_pad: padded per-group offsets along M (each M_g a multiple of 128 → no mask)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@triton.jit
+def _grouped_mxfp8_variable_k_gemm_kernel(
+    LHS,
+    RHS,
+    C,
+    LHS_scale,
+    RHS_scale,
+    go_pad_ptr,
+    G,
+    OUT_M,
+    OUT_N,
+    stride_lm,
+    stride_lk,
+    stride_rm,
+    stride_rk,
+    stride_cg,
+    stride_cm,
+    stride_cn,
+    stride_lsm,
+    stride_lsk,
+    stride_rsm,
+    stride_rsk,
+    BLOCK_SIZE_M: tl.constexpr,  # over OUT_M (N)
+    BLOCK_SIZE_N: tl.constexpr,  # over OUT_N (K)
+    BLOCK_SIZE_K: tl.constexpr,  # reduction over M_g
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CACHE_MODIFIER: tl.constexpr,
+    VEC: tl.constexpr,
+    FP8_FMT: tl.constexpr,  # "e4m3" or "e5m2"
+):
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+    tiles_m = tl.cdiv(OUT_M, BLOCK_SIZE_M)
+    tiles_n = tl.cdiv(OUT_N, BLOCK_SIZE_N)
+    tiles_per_group = tiles_m * tiles_n
+    total_tiles = G * tiles_per_group
+
+    tl.assume(stride_lm > 0)
+    tl.assume(stride_rm > 0)
+    tl.assume(stride_cm > 0)
+
+    for global_tile in range(pid, total_tiles, NUM_SMS):
+        # ── Map to (group, local_tile) ──
+        group_idx = global_tile // tiles_per_group
+        local_tile = global_tile - group_idx * tiles_per_group
+
+        # ── Swizzle local tile → (pid_m, pid_n) ──
+        num_pid_in_group = GROUP_SIZE_M * tiles_n
+        swizzle_group = local_tile // num_pid_in_group
+        first_pid_m = swizzle_group * GROUP_SIZE_M
+        group_size_m = min(tiles_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
+        pid_n = (local_tile % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        # ── Group boundaries (M_g padded to BLOCK_SIZE_K → no K-mask) ──
+        m_start = tl.load(go_pad_ptr + group_idx)  # int64
+        M_g = (tl.load(go_pad_ptr + group_idx + 1) - m_start).to(tl.int32)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % OUT_M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % OUT_N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rks = tl.arange(0, BLOCK_SIZE_K // VEC)
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        # L as (BM, BK), R directly as (BK, BN) (M contiguous) — no in-reg
+        # transpose, which otherwise inflates VGPRs and forces small tiles.
+        L_BASE = LHS + rm[:, None] * stride_lm + (m_start + rk[None, :]) * stride_lk
+        R_BASE = RHS + (m_start + rk[:, None]) * stride_rk + rn[None, :] * stride_rm
+        sk0 = (m_start // VEC).to(tl.int32)
+        # scales transposed (M/VEC, OUT): coalesced load along OUT dim, trans in-reg
+        LS_BASE = LHS_scale + (sk0 + rks[:, None]) * stride_lsk + rm[None, :] * stride_lsm
+        RS_BASE = RHS_scale + (sk0 + rks[:, None]) * stride_rsk + rn[None, :] * stride_rsm
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        loop_k = M_g // BLOCK_SIZE_K  # padded → no mask
+        for _ in range(loop_k):
+            l = tl.load(tl.multiple_of(L_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK)
+            r = tl.load(tl.multiple_of(R_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK, BN)
+            ls = tl.trans(tl.load(LS_BASE))  # (BK//VEC, BM) -> (BM, BK//VEC)
+            rs = tl.trans(tl.load(RS_BASE))
+            acc = tl.dot_scaled(l, ls, FP8_FMT, r, rs, FP8_FMT, acc)
+            L_BASE += BLOCK_SIZE_K * stride_lk
+            R_BASE += BLOCK_SIZE_K * stride_rk
+            LS_BASE += (BLOCK_SIZE_K // VEC) * stride_lsk
+            RS_BASE += (BLOCK_SIZE_K // VEC) * stride_rsk
+
+        c = acc.to(C.type.element_ty)
+        rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        cmask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
+        C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        tl.store(C_, c, cmask)
+
+
+def grouped_gemm_mxfp8_variable_k(
+    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16
+):
+    """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
+    if _is_gfx950():
+        _set_knobs_gfx950()
+    c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
+    ls = lhs_scale.view(torch.uint8)
+    rs = rhs_scale.view(torch.uint8)
+    fp8_fmt = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
+    cu = torch.cuda.get_device_properties(lhs.device).multi_processor_count
+    # Asymmetric 256x128 tile: with the R operand loaded directly as (BK,BN)
+    # (no in-reg transpose) the VGPR budget fits 256x128, matching the
+    # tensorwise variable_k throughput (~3.7x over the old 128x128 + r.T).
+    BM, BN, BK = 256, 128, 128
+    tiles_m = (OUT_M + BM - 1) // BM
+    tiles_n = (OUT_N + BN - 1) // BN
+    GM = 8 if min(tiles_m, tiles_n) < 16 else 4
+    total_tiles = G * tiles_m * tiles_n
+    num_sms = min(total_tiles, cu)
+    chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
+    _grouped_mxfp8_variable_k_gemm_kernel[(num_sms,)](
+        lhs,
+        rhs,
+        c,
+        ls,
+        rs,
+        go_pad,
+        G,
+        OUT_M,
+        OUT_N,
+        lhs.stride(0),
+        lhs.stride(1),
+        rhs.stride(0),
+        rhs.stride(1),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        ls.stride(1),  # stride_lsm (OUT_M, contiguous)
+        ls.stride(0),  # stride_lsk (M/VEC)
+        rs.stride(1),  # stride_rsm (OUT_N, contiguous)
+        rs.stride(0),  # stride_rsk (M/VEC)
+        BLOCK_SIZE_M=BM,
+        BLOCK_SIZE_N=BN,
+        BLOCK_SIZE_K=BK,
+        GROUP_SIZE_M=GM,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        CHUNK_SIZE=chunk,
+        CACHE_MODIFIER=".ca",
+        VEC=VEC_SIZE,
+        FP8_FMT=fp8_fmt,
+        num_warps=8,
+        num_stages=3,
+        waves_per_eu=2,
+        matrix_instr_nonkdim=16,
+        kpack=1,
+    )
+    return c
