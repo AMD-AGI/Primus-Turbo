@@ -225,6 +225,7 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        **kwargs,
     ):
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
             a,
@@ -286,6 +287,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        **kwargs,
     ):
         if trans_c:
             lhs, rhs = b, a
