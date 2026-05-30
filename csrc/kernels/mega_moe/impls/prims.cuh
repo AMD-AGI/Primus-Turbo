@@ -109,6 +109,15 @@ __device__ __forceinline__ void red_or_rel_gpu(uint64_t *ptr, uint64_t value) {
                           static_cast<unsigned long long>(value), __ATOMIC_RELEASE,
                           __HIP_MEMORY_SCOPE_AGENT);
 }
+// Release-ordered 64-bit add, AGENT scope.  Used by the L2 arrival COUNT
+// (R182): every MMA wave that finishes its M-row slice of a pool block
+// increments, so Linear2 only proceeds once ALL waves (not just the first)
+// have written — fixing the read-before-write race that the OR-mask had.
+__device__ __forceinline__ void red_add_rel_gpu(uint64_t *ptr, uint64_t value) {
+    __hip_atomic_fetch_add(reinterpret_cast<unsigned long long *>(ptr),
+                           static_cast<unsigned long long>(value), __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_AGENT);
+}
 // Cross-rank IPC counter update - SYSTEM scope so the remote agent sees it.
 // RELEASE ordering: SM0's preceding plain store of the per-rank token count
 // MUST be observable on the remote agent before the counter increment is,

@@ -131,6 +131,16 @@ class SymmBuffer:
             self.l2_acts,
             self.l2_acts_sf,
         ) = self._slice_views()
+        # Diagnostic-only: view onto the BF16 combine_token_buffer that
+        # the kernel writes from Linear2 (`write_combine`).  Shape
+        # ``[num_topk, num_max_tokens_per_rank, hidden]``.  Exposed so
+        # the test can verify per-(token, topk) BF16 partial sums
+        # before the epilogue collapses them into ``y``.
+        self.combine_buf = self._view_at(
+            self.layout.combine_buffer_offset,
+            shape=(self.num_topk, self.num_max_tokens_per_rank, self.hidden),
+            dtype=torch.bfloat16,
+        )
 
         # Initialise to zero and barrier so peers see a clean buffer.
         self.buffer.zero_()
@@ -189,7 +199,12 @@ class SymmBuffer:
     ]:
         layout = self.layout
 
-        x_dtype = torch.float8_e4m3fnuz if self.use_fp8_dispatch else torch.bfloat16
+        # NOTE: OCP MX E4M3 (what the gfx950 `v_mfma_scale_f32_*_f8f6f4`
+        # interprets) uses bias=7, matching `torch.float8_e4m3fn` (NV).
+        # `torch.float8_e4m3fnuz` is bias=8 (AMD legacy) and would force
+        # PyTorch's copy_() to numerically reinterpret bytes, so the
+        # kernel sees values off by ~2x and large bytes saturate.
+        x_dtype = torch.float8_e4m3fn if self.use_fp8_dispatch else torch.bfloat16
 
         x = self._view_at(
             layout.input_x_offset,

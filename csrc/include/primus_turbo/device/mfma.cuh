@@ -11,13 +11,19 @@
 
 namespace primus_turbo::device {
 
-// ── FP8 format code mapping ──
-// Maps C++ FP8 types to cbsz/blgp encoding for v_mfma_scale_f32_*_f8f6f4:
+// ── FP8/FP6/FP4 format code mapping ──
+// Maps C++ low-precision types to cbsz/blgp encoding for v_mfma_scale_f32_*_f8f6f4:
 //   0 = FP8 e4m3,  1 = FP8 e5m2
-//   2 = FP6 e2m3,  3 = FP6 e3m2,  4 = FP4 e2m1  (future)
+//   2 = FP6 e2m3,  3 = FP6 e3m2,  4 = FP4 e2m1
+// e4m3 is the default (0). e5m2 -> 1. FP4 e2m1 -> 4 (the FP4-weight path: A stays
+// FP8 e4m3, B is float4x2_e2m1 so blgp=4 selects the 4-bit operand on the K=128 MFMA).
+// FP6 (e2m3/e3m2) codes 2/3 are reserved but their C++ types are not defined in this
+// tree, so they are not mapped here (would not compile).
 template <typename T>
 inline constexpr int fp8_format_code =
-    (std::is_same_v<T, __hip_fp8_e5m2> || std::is_same_v<T, dtype::float8_e5m2>) ? 1 : 0;
+    (std::is_same_v<T, __hip_fp8_e5m2> || std::is_same_v<T, dtype::float8_e5m2>)       ? 1
+    : (std::is_same_v<T, __hip_fp4x2_e2m1> || std::is_same_v<T, dtype::float4x2_e2m1>) ? 4
+                                                                                       : 0;
 
 // ── v_mfma_scale_f32_16x16x128_f8f6f4 (gfx950) ──
 // Scaled MFMA: D = A * B * scale, with microscaling (MX) support.

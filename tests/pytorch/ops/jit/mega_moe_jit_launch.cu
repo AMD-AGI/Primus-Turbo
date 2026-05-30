@@ -65,6 +65,10 @@ extern "C" int mega_moe_jit_num_padded_sf_pool_tokens(int num_max_pool_tokens, i
     return ly::get_num_padded_sf_pool_tokens<int>(num_max_pool_tokens, block_m);
 }
 
+extern "C" int mega_moe_jit_get_token_alignment_for_mega_moe() {
+    return static_cast<int>(mm::kTokenAlignment);
+}
+
 // ---------------------------------------------------------------------
 //  Buffer-layout probe.  Replicates the offset math in
 //  ``csrc/kernels/mega_moe/mega_moe.cu::get_symm_buffer_size_for_mega_moe``
@@ -207,10 +211,15 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 #define MEGA_MOE_JIT_KNUMDISPATCHTHREADS 128u
 #endif
 #ifndef MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS
-#define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 128u
+// N6: 256 (4 MMA warps) instead of 128 (2). With the shared-B LDS refactor in
+// gfx950_fp8_fp4_mega_moe.cuh, 4 MMA warps halve the per-thread accumulator
+// (kSubTilesPerWave 8->4, ~256->128 acc-VGPR) to kill the C1 1627-VGPR spill,
+// 2x the MFMA issue width, and keep a deep (>=2) loader pipeline. Epilogue
+// shrinks to 128 to hold the 512-thread/CU budget.
+#define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 256u
 #endif
 #ifndef MEGA_MOE_JIT_KNUMEPILOGUETHREADS
-#define MEGA_MOE_JIT_KNUMEPILOGUETHREADS 256u
+#define MEGA_MOE_JIT_KNUMEPILOGUETHREADS 128u
 #endif
 // MI355X exposes 256 CUs (8 XCDs x 32 CUs).  Keep as a multiple of 8 to
 // preserve per-XCD locality of the scheduler state machine.
@@ -315,7 +324,7 @@ extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int nu
         smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,
         smoke::kNumPaddedSFPoolTokens, smoke::kNumStages, smoke::kNumDispatchThreads,
         smoke::kNumNonEpilogueThreads, smoke::kNumEpilogueThreads, smoke::kNumSMs, smoke::kNumRanks,
-        /*kActivationClamp=*/0.0f, /*kFastMath=*/true>(
+        /*kActivationClamp=*/10.0f, /*kFastMath=*/true>(
         reinterpret_cast<void *>(y_ptr), reinterpret_cast<int *>(recv_stats_ptr),
         static_cast<uint32_t>(num_tokens), sym_buffer, reinterpret_cast<void *>(l1_weights_ptr),
         reinterpret_cast<void *>(l1_weights_sf_ptr), reinterpret_cast<void *>(l2_weights_ptr),
@@ -328,6 +337,86 @@ extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int nu
     if (sync_err != hipSuccess)
         return static_cast<int>(sync_err);
     return 0;
+}
+
+// ---------------------------------------------------------------------
+//  Per-stage in-kernel profiler host hooks.
+//
+//  Active only when this TU is compiled with ``-DMEGA_MOE_PROFILE=1``
+//  (driven by ``MEGAMOE_PROFILE=1`` in the Python loader).  The kernel
+//  records, per pipeline stage, the earliest start / latest end tick of
+//  the device steady counter into the ``mm::g_mega_moe_prof`` device
+//  global.  These hooks let Python:
+//    * branch on whether the profiling build is active,
+//    * learn the stage count + the wall-clock frequency (kHz) so it can
+//      convert ticks -> microseconds,
+//    * reset the [start,end] pairs before each launch, and
+//    * read back the per-stage span (end - start) ticks afterwards.
+// ---------------------------------------------------------------------
+extern "C" int mega_moe_jit_prof_enabled() {
+#if MEGA_MOE_PROFILE
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int mega_moe_jit_prof_num_stages() {
+#if MEGA_MOE_PROFILE
+    return static_cast<int>(mm::kProfNumStages);
+#else
+    return 0;
+#endif
+}
+
+extern "C" int mega_moe_jit_prof_wallclock_khz() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess)
+        return 0;
+    int khz = 0;
+    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess)
+        return 0;
+    return khz;
+}
+
+extern "C" int mega_moe_jit_prof_reset() {
+#if MEGA_MOE_PROFILE
+    unsigned long long host[2u * mm::kProfNumStages];
+    for (uint32_t s = 0u; s < mm::kProfNumStages; ++s) {
+        host[2u * s + 0u] = ~0ull; // earliest start -> +inf
+        host[2u * s + 1u] = 0ull;  // latest end     -> 0
+    }
+    const hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(mm::g_mega_moe_prof), host, sizeof(host));
+    return static_cast<int>(err);
+#else
+    return 0;
+#endif
+}
+
+//  Fills ``out_spans`` with per-stage spans (end - start) in steady-counter
+//  ticks.  Returns the number of stages written, or a negative value on
+//  error / insufficient buffer.
+extern "C" int mega_moe_jit_prof_read(int64_t *out_spans, int max_stages) {
+#if MEGA_MOE_PROFILE
+    const int n = static_cast<int>(mm::kProfNumStages);
+    if (max_stages < n)
+        return -1;
+    unsigned long long host[2u * mm::kProfNumStages];
+    const hipError_t err = hipMemcpyFromSymbol(host, HIP_SYMBOL(mm::g_mega_moe_prof), sizeof(host));
+    if (err != hipSuccess)
+        return -(static_cast<int>(err) + 100);
+    for (int s = 0; s < n; ++s) {
+        const unsigned long long lo = host[2 * s + 0];
+        const unsigned long long hi = host[2 * s + 1];
+        out_spans[s] =
+            (lo != ~0ull && hi > lo) ? static_cast<int64_t>(hi - lo) : static_cast<int64_t>(0);
+    }
+    return n;
+#else
+    (void) out_spans;
+    (void) max_stages;
+    return 0;
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -420,7 +509,7 @@ extern "C" int mega_moe_jit_run_stub() {
         smoke::kSF_BLOCK_M, smoke::kSF_BLOCK_N, smoke::kNumMaxPoolTokens,
         smoke::kNumPaddedSFPoolTokens, smoke::kNumStages, smoke::kNumDispatchThreads,
         smoke::kNumNonEpilogueThreads, smoke::kNumEpilogueThreads, smoke::kNumSMs, smoke::kNumRanks,
-        /*kActivationClamp=*/0.0f,
+        /*kActivationClamp=*/10.0f,
         /*kFastMath=*/true>(d_y, /*cumulative_local_expert_recv_stats=*/nullptr,
                             /*num_tokens=*/0u, sym_buffer, d_l1_w, d_l1_w_sf, d_l2_w, d_l2_w_sf,
                             /*stream=*/0);
