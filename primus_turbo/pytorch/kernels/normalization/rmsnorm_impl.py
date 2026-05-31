@@ -11,9 +11,12 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
+    rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel,
+    rmsnorm_bwd_kernel_grid_stride,
     rmsnorm_bwd_kernel_multi_row,
     rmsnorm_bwd_residual_kernel,
+    rmsnorm_bwd_residual_kernel_grid_stride,
     rmsnorm_bwd_residual_kernel_multi_row,
     rmsnorm_fwd_kernel,
     rmsnorm_fwd_kernel_multi_row,
@@ -41,7 +44,7 @@ def _reshape_batch_hidden(x: torch.Tensor, H: int) -> torch.Tensor:
 
 
 def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
-    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages).
+    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd.
 
     Multi-row mode (ROWS_PER_BLOCK > 1) wins when H is small AND B is huge,
     because the grid size of one program per row becomes the bottleneck.
@@ -57,6 +60,95 @@ def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
     if BLOCK_H <= 4096:
         return BLOCK_H, 1, 8, 2
     return BLOCK_H, 1, 16, 2
+
+
+# MI300/MI325X have 304 CUs. One wave per CU saturates the device for this
+# grid-stride kernel; pushing to 2 waves spreads dg accumulators thinner and
+# inflates the finalize input.
+_NUM_CUS = 304
+
+
+def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
+    """Return (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd.
+
+    Modes:
+    - ``"multi"``: multi-row 2D-tile kernel. GRID_OR_ROWS is ROWS_PER_BLOCK.
+      Good for small H + huge B (q-norm in MoE attention) where launch cost
+      and 2D-tile coalescing both pay off.
+    - ``"grid"``: persistent grid-stride kernel. GRID_OR_ROWS is the number
+      of programs. Each program loops over rows of stride num_programs while
+      keeping the dgamma accumulator live in registers across the loop. This
+      matches the HIP stage-0 approach and minimises the (n_parts, H)
+      dg_partial buffer (n_parts == grid_size, not B).
+    - ``"single"``: one-program-per-row fallback for tiny H/B.
+    """
+    BLOCK_H = _next_pow2(H)
+
+    # Small-H + huge-B: multi-row is great here (tile 2D in one shot).
+    if BLOCK_H <= 256 and B >= 4096:
+        ROWS = 16 if BLOCK_H <= 128 else 8
+        return "multi", BLOCK_H, ROWS, 4, 2
+    if BLOCK_H <= 256:
+        return "single", BLOCK_H, 1, 1, 1
+
+    # Grid-stride for everything wider. Tuned empirically on MI325X:
+    # - grid=304 (= NUM_CUS, 1 wave) is the default — saturates the device.
+    # - grid=152 (= NUM_CUS/2) wins for H=8192 with small B (4096): each
+    #   program gets more rows to chew so the dgamma write amortises and the
+    #   dg_partial cache footprint shrinks.
+    if BLOCK_H >= 16384 and B <= 4096:
+        # Very wide H + small B: full wave, ns=2 lets the compiler hide load
+        # latency despite the huge BLOCK_H.
+        grid = min(B, _NUM_CUS)
+        num_warps = 8
+        num_stages = 2
+    elif BLOCK_H >= 8192 and B <= 4096:
+        # H=8192, small B: half-wave gives each program more rows to chew so
+        # the dgamma write amortises better.
+        grid = min(B, _NUM_CUS // 2)
+        num_warps = 8
+        num_stages = 1
+    elif BLOCK_H >= 8192:
+        # Wide H, larger B: full wave, drop ns to relieve register pressure.
+        grid = min(B, _NUM_CUS)
+        num_warps = 4
+        num_stages = 2
+    else:
+        # H in (256, 4096]: full wave, nw=8 amortises BLOCK_H per program.
+        grid = min(B, _NUM_CUS)
+        num_warps = 8 if BLOCK_H >= 2048 else 4
+        num_stages = 2
+
+    return "grid", BLOCK_H, grid, num_warps, num_stages
+
+
+def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
+    """Reduce a [n_parts, H] fp32 partial buffer to dgamma[H] in ``gamma_dtype``.
+
+    Uses a column-major coalesced Triton reduction (one program per BLOCK_H
+    tile of H, walks n_parts rows in BLOCK_N-sized chunks with tl.sum tree
+    reduction). Much faster than the generic ``dg_partial.sum(dim=0).to(...)``
+    when n_parts is large.
+    """
+    n_parts, H = dg_partial.shape
+    dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
+    # 256 hits the sweet spot for coalesced bf16/fp16 stores on MI300/325X.
+    BLOCK_H = 256 if H >= 256 else _next_pow2(H)
+    # BLOCK_N=16 gives a (16,256)=4KB fp32 tile per iter, keeps reg pressure
+    # tiny, and bounds the sequential add chain to ceil(n_parts/16) levels.
+    BLOCK_N = 16 if n_parts >= 16 else _next_pow2(max(n_parts, 1))
+    grid = ((H + BLOCK_H - 1) // BLOCK_H,)
+    rmsnorm_bwd_finalize_kernel[grid](
+        dg_partial,
+        dg,
+        n_parts,
+        H=H,
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=1,
+    )
+    return dg
 
 
 def rmsnorm_fwd_impl(
@@ -122,12 +214,18 @@ def rmsnorm_bwd_impl(
     num_warps: int,
     num_stages: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward launcher. Returns ``(dx [B, H], dgamma [H])``."""
+    """Backward launcher. Returns ``(dx [B, H], dgamma [H])``.
+
+    The fwd's chosen ``(BLOCK_H, ROWS, num_warps, num_stages)`` are accepted
+    for API compatibility but ignored — bwd re-picks a config tuned for its
+    own arithmetic intensity (see ``_pick_bwd_config``).
+    """
     H = gamma.shape[0]
     B = x2.shape[0]
     dy2 = _reshape_batch_hidden(dy, H)
     dx = torch.empty_like(x2)
-    if ROWS == 1:
+    mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
+    if mode == "single":
         dg_partial = torch.empty(B, H, device=x2.device, dtype=torch.float32)
         rmsnorm_bwd_kernel[(B,)](
             dy2,
@@ -148,11 +246,11 @@ def rmsnorm_bwd_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    else:
+    elif mode == "multi":
+        ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
-        grid = (num_programs,)
-        rmsnorm_bwd_kernel_multi_row[grid](
+        rmsnorm_bwd_kernel_multi_row[(num_programs,)](
             dy2,
             x2,
             gamma,
@@ -173,7 +271,31 @@ def rmsnorm_bwd_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    dg = dg_partial.sum(dim=0).to(gamma.dtype)
+    else:  # "grid": persistent grid-stride
+        num_programs = GR
+        dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
+        rmsnorm_bwd_kernel_grid_stride[(num_programs,)](
+            dy2,
+            x2,
+            gamma,
+            rstd,
+            dx,
+            dg_partial,
+            x2.stride(0),
+            x2.stride(1),
+            dy2.stride(0),
+            dy2.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            dg_partial.stride(0),
+            B=B,
+            H=H,
+            BLOCK_H=BLOCK_H,
+            num_programs=num_programs,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
 
 
@@ -270,7 +392,8 @@ def rmsnorm_bwd_residual_impl(
     else:
         dxpr2 = _reshape_batch_hidden(dxpr, H)
     dx = torch.empty_like(x_plus_r)
-    if ROWS == 1:
+    mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
+    if mode == "single":
         dg_partial = torch.empty(B, H, device=x_plus_r.device, dtype=torch.float32)
         rmsnorm_bwd_residual_kernel[(B,)](
             dy2,
@@ -294,11 +417,11 @@ def rmsnorm_bwd_residual_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    else:
+    elif mode == "multi":
+        ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
-        grid = (num_programs,)
-        rmsnorm_bwd_residual_kernel_multi_row[grid](
+        rmsnorm_bwd_residual_kernel_multi_row[(num_programs,)](
             dy2,
             dxpr2,
             x_plus_r,
@@ -322,5 +445,32 @@ def rmsnorm_bwd_residual_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    dg = dg_partial.sum(dim=0).to(gamma.dtype)
+    else:  # "grid": persistent grid-stride
+        num_programs = GR
+        dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
+        rmsnorm_bwd_residual_kernel_grid_stride[(num_programs,)](
+            dy2,
+            dxpr2,
+            x_plus_r,
+            gamma,
+            rstd,
+            dx,
+            dg_partial,
+            x_plus_r.stride(0),
+            x_plus_r.stride(1),
+            dy2.stride(0),
+            dy2.stride(1),
+            dxpr2.stride(0),
+            dxpr2.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            dg_partial.stride(0),
+            B=B,
+            H=H,
+            BLOCK_H=BLOCK_H,
+            num_programs=num_programs,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg

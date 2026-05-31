@@ -359,6 +359,156 @@ def rmsnorm_bwd_residual_kernel(
     tl.store(dgp_ptrs, dgp, mask=mask)
 
 
+# ---------------------------------------------------------------------------
+# Backward — grid-stride variant. Each program processes one row per loop
+# step and grid-strides (row += num_programs) until it has covered its
+# share of B. A per-program fp32 dgamma accumulator is kept live in
+# registers across all rows and a single partial slab (one per program) is
+# written at exit. This matches the HIP stage-0 pattern and drastically
+# shrinks the dg_partial buffer (n_parts == grid_size, not B).
+# ---------------------------------------------------------------------------
+@triton.jit
+def rmsnorm_bwd_kernel_grid_stride(
+    DY_ptr,
+    X_ptr,
+    G_ptr,
+    RSTD_ptr,
+    DX_ptr,
+    DG_PART_ptr,
+    stride_xb,
+    stride_xh,
+    stride_dyb,
+    stride_dyh,
+    stride_dxb,
+    stride_dxh,
+    stride_dgp,
+    B,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    num_programs: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+
+    # Load gamma once; reused across every row this program touches.
+    g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+
+    # Per-program dgamma accumulator stays in registers/LDS for the whole loop.
+    dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    # Grid-stride over rows. Each program covers ceil(B / num_programs) rows.
+    for row in range(pid, B, num_programs):
+        x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
+        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
+        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
+
+        x = tl.load(x_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+
+        x_hat = x * rstd
+        dxhat = dy * g
+        m = tl.sum(dxhat * x_hat, axis=0) / H
+        dx = (dxhat - x_hat * m) * rstd
+        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+
+        dg_acc += dy * x_hat
+
+    dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
+    tl.store(dgp_ptrs, dg_acc, mask=h_mask)
+
+
+@triton.jit
+def rmsnorm_bwd_residual_kernel_grid_stride(
+    DY_ptr,
+    DXPR_ptr,
+    XPR_ptr,
+    G_ptr,
+    RSTD_ptr,
+    DX_ptr,
+    DG_PART_ptr,
+    stride_xprb,
+    stride_xprh,
+    stride_dyb,
+    stride_dyh,
+    stride_dxprb,
+    stride_dxprh,
+    stride_dxb,
+    stride_dxh,
+    stride_dgp,
+    B,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    num_programs: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+
+    g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for row in range(pid, B, num_programs):
+        xpr_ptrs = XPR_ptr + row * stride_xprb + h_offs * stride_xprh
+        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
+        dxpr_ptrs = DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh
+        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
+
+        xpr = tl.load(xpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+
+        x_hat = xpr * rstd
+        dxhat = dy * g
+        m = tl.sum(dxhat * x_hat, axis=0) / H
+        dx_norm = (dxhat - x_hat * m) * rstd
+        dx = dx_norm + dxpr
+        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+
+        dg_acc += dy * x_hat
+
+    dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
+    tl.store(dgp_ptrs, dg_acc, mask=h_mask)
+
+
+# ---------------------------------------------------------------------------
+# Backward — finalize: reduce the (n_parts, H) fp32 partial buffer down to
+# the final dgamma[H] in the gamma dtype. Each program owns BLOCK_H columns
+# and walks the n_parts rows. Coalesced column loads, single launch.
+# ---------------------------------------------------------------------------
+@triton.jit
+def rmsnorm_bwd_finalize_kernel(
+    DGP_ptr,
+    DG_ptr,
+    n_parts,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Tree-reduce a (n_parts, H) fp32 partial buffer to dgamma[H].
+
+    Tiling: each program owns one BLOCK_H column tile. It walks the rows in
+    chunks of BLOCK_N, loads a (BLOCK_N, BLOCK_H) tile, and uses ``tl.sum``
+    along axis=0 — that gives a tree reduction inside the tile and keeps the
+    error chain depth ~ log2(n_parts) instead of linear, matching PyTorch's
+    ``sum(dim=0)`` fp32 accuracy.
+    """
+    pid = tl.program_id(0)
+    h_offs = pid * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    n_offs = tl.arange(0, BLOCK_N)
+    for p in range(0, n_parts, BLOCK_N):
+        rows = p + n_offs
+        row_mask = rows < n_parts
+        ptrs = DGP_ptr + rows[:, None] * H + h_offs[None, :]
+        tile = tl.load(ptrs, mask=row_mask[:, None] & h_mask[None, :], other=0.0)
+        acc += tl.sum(tile, axis=0)
+    tl.store(DG_ptr + h_offs, acc.to(DG_ptr.dtype.element_ty), mask=h_mask)
+
+
 @triton.jit
 def rmsnorm_bwd_residual_kernel_multi_row(
     DY_ptr,
