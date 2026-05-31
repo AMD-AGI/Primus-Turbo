@@ -67,10 +67,6 @@ def _make_tensors(N, C, dtype, device, requires_grad):
 
 
 def _time(stmt_fn, warmup, iters):
-    # Use torch's benchmark.Timer — it handles GPU clock-ramp via adaptive
-    # autorange. The `iters` arg becomes the floor on the number of inner runs
-    # per measurement; blocked_autorange picks the actual count based on the
-    # observed per-call latency so even tiny kernels get a stable µs reading.
     timer = benchmark.Timer(stmt="fn()", globals={"fn": stmt_fn})
     for _ in range(warmup):
         stmt_fn()
@@ -144,10 +140,8 @@ def _bench_torch(N, C, dtype, device, warmup, iters):
 def _bandwidth_gbps(N, C, dtype, ms, kind):
     nbytes = _bytes(dtype)
     if kind == "fwd":
-        # read x, write y
         total = 2 * N * C * nbytes
     else:
-        # read x, dy; write dx; reduce dg (counted once per col)
         total = 4 * N * C * nbytes
     return (total / (ms * 1e-3)) / 1e9
 
@@ -168,7 +162,6 @@ def main():
 
     rows = []
     for N, C in SHAPES:
-        # correctness check vs F.rms_norm (signal-to-noise ratio in dB)
         snr_y, snr_dx, snr_dg = _correctness(N, C, dtype, device, atol=0, rtol=0)
 
         t_fwd, t_bwd = _bench_turbo(N, C, dtype, device, args.warmup, args.iters)
