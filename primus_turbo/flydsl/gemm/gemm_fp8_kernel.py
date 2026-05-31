@@ -1920,6 +1920,7 @@ if _FLYDSL_OK:
         b_inline_asm: int = -1,         # ditto
         vmcnt_hint: int = 2,
         asm_mma: int = 0,               # 0 = env TN_ASM_MMA; 1/2 = AGPR-asm MFMA (2=AGPR accum)
+        group_n: int = 0,               # 0 = 1D GROUP_M swizzle; >0 = 2D band (width group_n)
     ):
         """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
         Both A and B are K-row strided → wave-coop ds_read_b64_tr_b8 on both
@@ -2004,6 +2005,37 @@ if _FLYDSL_OK:
                 B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
                 B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+        def _tn_block_mn(pid, num_pid_m, n_blocks, GM, GN):
+            """Tile-id -> (block_m, block_n). Plain Python so the GN>0 branch is
+            resolved at trace time (not as a kernel `if`). GN==0: 1D GROUP_M
+            super-row swizzle (block_m inner, all-N sweep). GN>0: 2D band — N
+            split into width-GN bands, GROUP_M 1D inside each band. Both dims
+            blocked → A[block_m] reused GN×, B[block_n] reused GROUP_M× so the
+            working set (GROUP_M·A_slab + GN·B_slab) stays L2-resident, cutting
+            the big-N B re-stream. Always a bijection (full bands take
+            num_pid_m·GN pids; remainder = narrower last band). det-neutral."""
+            if GN > 0:
+                band_tiles = num_pid_m * GN
+                band = pid // band_tiles
+                pid_in_band = pid % band_tiles
+                band_n0 = band * GN
+                rem_n = n_blocks - band_n0
+                band_w = arith.select(rem_n < GN, rem_n, fx.Int32(GN))
+                nig = GM * band_w
+                gid = pid_in_band // nig
+                pig = pid_in_band % nig
+                fpm = gid * GM
+                rem_m = num_pid_m - fpm
+                gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+                return fpm + (pig % gsm), band_n0 + (pig // gsm)
+            nig = GM * n_blocks
+            gid = pid // nig
+            pig = pid % nig
+            fpm = gid * GM
+            rem_m = num_pid_m - fpm
+            gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+            return fpm + (pig % gsm), pig // gsm
+
         @flyc.kernel(known_block_size=[512, 1, 1])
         def kernel_dense_tn(
             A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
@@ -2032,14 +2064,11 @@ if _FLYDSL_OK:
 
             num_pid_m = ceildiv(c_m, BLOCK_M)
             pid = fx.block_idx.x
-            num_pid_in_group = GROUP_M * n_blocks
-            group_id = pid // num_pid_in_group
-            pid_in_group = pid % num_pid_in_group
-            first_pid_m = group_id * GROUP_M
-            remaining_m = num_pid_m - first_pid_m
-            group_size_m = arith.select(remaining_m < GROUP_M, remaining_m, fx.Int32(GROUP_M))
-            block_m = first_pid_m + (pid_in_group % group_size_m)
-            block_n = pid_in_group // group_size_m
+            # Swizzle via plain-Python helper (NOT a kernel `if`: @flyc.kernel
+            # wraps each if-branch in its own fn so vars defined inside aren't
+            # visible after — see prelude note). Helper builds the expr graph
+            # for one Python-selected path (1D GROUP_M or 2D band).
+            block_m, block_n = _tn_block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
             # TN A stored [K, M] row-major: stride M per K-row.
             A0_gl_offset = block_m * BLOCK_M + 0
@@ -3229,6 +3258,46 @@ def _autotune_tn_dispatch(args, M, N, K):
                     best_us = us; best = (launch, (bm, gm, ag, _bmask))
             except Exception:
                 continue
+    # 2D super-block (band) swizzle for big-N: when N is large the 1D GROUP_M
+    # sweep re-streams all of B per M-group → L2 hit ~51% (vs ~66% on square
+    # shapes), the dominant gap to the big-K ceiling (rocprof: latency-bound,
+    # dep-wait 63%, VMEM 3% — NOT bandwidth). Tiling N into width-GN bands
+    # blocks both operands into L2 (GM·A_slab + GN·B_slab resident). On
+    # 8192x28672x8192 GM4×GN14 = 2706 TF vs 1D 2411 (+12%), det=0 over 1000
+    # runs (pure tile permutation). GN≈n_blocks/8 (band count = #XCD) is the
+    # sweet spot. Only helps when M is tall enough for GROUP_M banding to pay
+    # (M small → 1D wins, so bench-gated). See scripts2/_tn_bigN_2d_confirm.py.
+    n_blocks = (N + 255) // 256
+    # Gate on M too: 2D banding only pays when there are enough M-blocks for
+    # GROUP_M grouping (M small → too few groups, 1D wins). mpid>=16 (M>=4096).
+    if n_blocks >= 32 and (M // 256) >= 16:
+        for gm2 in (4, 2):
+            for gn2 in (n_blocks // 8, n_blocks // 16):
+                if gn2 < 2 or M % 256 != 0:
+                    continue
+                try:
+                    launch = _compile_dense_tn(
+                        K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=gm2,
+                        agpr_alloc=32, inline_asm_load=False,
+                        a_inline_asm=0, b_inline_asm=1, barrier_mask=0x7F,
+                        group_n=gn2,
+                    )
+                    c = _get_compiled_dense(launch, args)
+                    c(*args); _torch.cuda.synchronize()
+                    sample = out_view.view(-1)[:1024].float()
+                    if not _torch.isfinite(sample).all().item():
+                        continue
+                    for _ in range(2): c(*args)
+                    _torch.cuda.synchronize()
+                    e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
+                    _torch.cuda.synchronize(); e0.record()
+                    for _ in range(20): c(*args)
+                    e1.record(); _torch.cuda.synchronize()
+                    us = e0.elapsed_time(e1)*1000.0/20
+                    if us < best_us:
+                        best_us = us; best = (launch, (256, gm2, 32, 0x7F))
+                except Exception:
+                    continue
     # Big-K (K>=28672) drain-removal win config: BOTH A+B path-J (removes the
     # A-side tr8 vmcnt(0) drain the 0x7F comment above flags as the ceiling),
     # agpr_alloc=0 (compiler-decided AGPR; guard bypassed via asm_mma=2),
@@ -3237,18 +3306,27 @@ def _autotune_tn_dispatch(args, M, N, K):
     # A-intrinsic candidates above). vmcnt_hint=3 is the det=0 sweet spot:
     # vh=2 also det=0 but 2710-2734; vh>=4 RACES (det 1.5e-5 at 500-run). bench
     # picks this only if fastest (loses on N-major / non-big-K → not added there).
+    # winK + (optional) 2D band: GROUP_M=1/group_n=0 is the original big-K win
+    # (2768 TF); stacking the 2D band swizzle on top recovers the last L2 slack
+    # even when it's already good — 8192x8192x28672 winK GM4×GN4 = 2799 TF
+    # (+1.1%, hits the ~2800 ceiling), det=0 over 500-run. Benched, fastest wins.
     if K >= 28672 and M % 256 == 0:
-        try:
-            wlaunch = _compile_dense_tn(
-                K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=1,
-                agpr_alloc=0, inline_asm_load=False,
-                a_inline_asm=1, b_inline_asm=1, barrier_mask=0x7F,
-                vmcnt_hint=3, asm_mma=2,
-            )
-            c = _get_compiled_dense(wlaunch, args)
-            c(*args); _torch.cuda.synchronize()
-            sample = out_view.view(-1)[:1024].float()
-            if _torch.isfinite(sample).all().item():
+        _wk = [(1, 0)]
+        if n_blocks >= 32:
+            _wk += [(4, n_blocks // 8), (4, n_blocks // 4)]
+        for _wgm, _wgn in _wk:
+            try:
+                wlaunch = _compile_dense_tn(
+                    K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=_wgm,
+                    agpr_alloc=0, inline_asm_load=False,
+                    a_inline_asm=1, b_inline_asm=1, barrier_mask=0x7F,
+                    vmcnt_hint=3, asm_mma=2, group_n=_wgn,
+                )
+                c = _get_compiled_dense(wlaunch, args)
+                c(*args); _torch.cuda.synchronize()
+                sample = out_view.view(-1)[:1024].float()
+                if not _torch.isfinite(sample).all().item():
+                    continue
                 for _ in range(2): c(*args)
                 _torch.cuda.synchronize()
                 e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
@@ -3257,9 +3335,9 @@ def _autotune_tn_dispatch(args, M, N, K):
                 e1.record(); _torch.cuda.synchronize()
                 us = e0.elapsed_time(e1)*1000.0/20
                 if us < best_us:
-                    best_us = us; best = (wlaunch, (256, 1, 0, 0x7F))
-        except Exception:
-            pass
+                    best_us = us; best = (wlaunch, (256, _wgm, 0, 0x7F))
+            except Exception:
+                continue
     if best is None:
         raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
     if os.environ.get("FLYDSL_TN_VERBOSE"):
