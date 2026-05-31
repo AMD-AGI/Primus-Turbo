@@ -118,6 +118,32 @@ if _FLYDSL_OK:
             ]
         return d
 
+    def _asm_mma_do(a, b, c, mode="2"):
+        """fp8 16x16x128 MFMA via inline asm. Replaces `mma_atom_call_ssa`
+        (FlyDSL core, untouched) to control the dst register class — the lever
+        the intrinsic path can't express — and so kill the MFMA dst/srcA WAR
+        hazard that makes barrier-reduced TN schedules nondeterministic.
+
+        ``mode`` (param; defaults to env TN_ASM_MMA at the call site):
+          1  `=&v,v,v,0`  VGPR accum + early-clobber: dst forced disjoint from
+             srcA/srcB. Deterministic but the early-clobber also removes the
+             scheduling freedom (and accum eats VGPR → low occupancy).
+          2  `=a,v,v,0`   AGPR accum: dst/srcC in AGPR, srcA/srcB in VGPR —
+             physically separate register files, so dst can NEVER alias srcA
+             (det=0 by construction, no early-clobber needed → full scheduling
+             freedom) AND the accumulators leave the VGPR file (higher occ).
+        """
+        v4f32 = ir.VectorType.get([4], ir.F32Type.get())
+        cons = "=a,v,v,0" if str(mode) == "2" else "=&v,v,v,0"
+        op = _llvm.InlineAsmOp(
+            res=v4f32,
+            operands_=[_raw(a), _raw(b), _raw(c)],
+            asm_string="v_mfma_f32_16x16x128_f8f6f4 $0, $1, $2, $0",
+            constraints=cons,
+            has_side_effects=False,
+        )
+        return Vec(op.result)
+
     @functools.lru_cache(maxsize=256)
     def _compile_dense_nt(
         K: int,
@@ -1048,6 +1074,7 @@ if _FLYDSL_OK:
             lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
             return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
+
     def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds):
         """B in NN: [K_inner, N_out] row-major. Each round loads 64 K-rows ×
         128 N-bytes (per wave 8 K-rows × 128 N-bytes via BufferCopyLDS128b).
@@ -1362,61 +1389,111 @@ if _FLYDSL_OK:
         _K_BASE = (0, 8, 64, 72)
 
         def __init__(self, wave_m, n_tiles_a, lds_block_m, inline_asm=False, vmcnt_hint=2,
-                     chunk_stride=1024):
+                     chunk_stride=1024, n_waves=8, wave_stride=None):
             """``lds_block_m`` = BLOCK_M // 2 (LDS half-block M-size). Per-wave
             M coverage = lds_block_m / num_wave_m. For 8w with num_wave_m=2:
-            BM=256 → lds_block_m=128 → stride=64; BM=128 → lds_block_m=64 → stride=32."""
+            BM=256 → lds_block_m=128 → stride=64; BM=128 → lds_block_m=64 → stride=32.
+            ``n_waves`` = WG wave count (8 default; 16 for the 1024-thread layout
+            where one K-round fills 128 K = 16 waves × 8). ``wave_stride`` overrides
+            the M sub-half stride (16w: each wave owns 64 rows → stride=64)."""
             self.wave_m = wave_m
             self.n_tiles_a = n_tiles_a
-            self.wave_stride = lds_block_m // 2  # 8w: num_wave_m=2
+            self.wave_stride = (lds_block_m // 2) if wave_stride is None else wave_stride
             self.lane_id = fx.thread_idx.x % 64
             self.inline_asm = inline_asm
             self.vmcnt_hint = vmcnt_hint
             self.chunk_stride = chunk_stride       # bank-spread LDS chunk stride
-            self.round_stride = 8 * chunk_stride   # r_step K-sub-round jump
+            self.n_waves = n_waves
+            self.round_stride = n_waves * chunk_stride   # r_step K-sub-round jump
 
-        def load(self, lds_src, preshuffled=False):
-            assert not preshuffled
+        def _ptr_off_a(self, c, tile_i, I, L_in_sg):
+            K_log = I * 16 + S2RLoaderTr_A._K_BASE[c] + (L_in_sg // 2)
+            KW = self.n_waves * 8
+            r_step = K_log // KW
+            W = (K_log % KW) // 8
+            K_mod_8 = K_log % 8
+            swz_K = ((K_log % 16) // 2) * 16
+            # 8w A: wave_m * wave_stride (= LDS_BLOCK_M / num_wave_m)
+            tile_M_start = self.wave_m * self.wave_stride + tile_i * 16
+            j_chunk = (tile_M_start // 16) ^ (swz_K // 16)
+            return (W * self.chunk_stride + r_step * self.round_stride
+                    + K_mod_8 * 128 + j_chunk * 16 + (L_in_sg % 2) * 8)
+
+        # Each inline ds_read_b64_tr_b8 tile issues 4 LDS reads.
+        N_LDS_PER_TILE = 4
+
+        def _issue_one(self, lds_src, tile_i):
+            """Issue the 4 ds_read_b64_tr_b8 of one A tile WITHOUT draining
+            lgkmcnt or assembling the frag. Returns the 4 raw v2i32 Vec. Split
+            from assemble so the caller can software-pipeline: issue tile i+1's
+            reads, then drain a GRADED lgkmcnt before consuming tile i — so
+            tile i+1's LDS reads overlap tile i's mma (mirrors what the backend
+            does for the intrinsic path via lgkmcnt(4/8/12), instead of the
+            per-tile lgkmcnt(0) full-drain that serialised the inline path)."""
             tr_type = Vec.make_type(2, fx.Int32)
             base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
             I = self.lane_id // 16
             L_in_sg = self.lane_id % 16
-            # 1-ptr + offset:8192 packing (mirror HK CRR load_col_from_st_half) —
-            # same fix as B-side; see _packed_ds_read_tr_offsets docstring.
-            def _ptr_off_a(c, tile_i):
-                K_log = I * 16 + S2RLoaderTr_A._K_BASE[c] + (L_in_sg // 2)
-                r_step = K_log // 64
-                W = (K_log % 64) // 8
-                K_mod_8 = K_log % 8
-                swz_K = ((K_log % 16) // 2) * 16
-                # 8w A: wave_m * wave_stride (= LDS_BLOCK_M / num_wave_m)
-                tile_M_start = self.wave_m * self.wave_stride + tile_i * 16
-                j_chunk = (tile_M_start // 16) ^ (swz_K // 16)
-                return (W * self.chunk_stride + r_step * self.round_stride
-                        + K_mod_8 * 128 + j_chunk * 16 + (L_in_sg % 2) * 8)
-
             RS = self.round_stride
-            frag = []
-            for tile_i in range_constexpr(self.n_tiles_a):
-                if self.inline_asm:
-                    p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_a(0, tile_i)))
-                    p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_a(1, tile_i)))
-                    r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
-                    r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
-                    calls = [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
-                else:
-                    calls = [Vec(rocdl.ds_read_tr8_b64(
-                        tr_type, _lds_ptr_from_i32(base_i32 + fx.Int32(_ptr_off_a(c, tile_i)))
-                    ).result) for c in range_constexpr(4)]
-                v4_lo = calls[0].shuffle(calls[1], [0, 1, 2, 3])
-                v4_hi = calls[2].shuffle(calls[3], [0, 1, 2, 3])
-                frag.append(v4_lo.shuffle(v4_hi, list(range(8))))
             if self.inline_asm:
-                # See S2RLoaderTr.load: drain lgkmcnt for async ds_read_b64_tr_b8
-                # the opaque asm hides from the backend's waitcnt insertion.
-                _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
-                                  constraints="", has_side_effects=True)
+                p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off_a(0, tile_i, I, L_in_sg)))
+                p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off_a(1, tile_i, I, L_in_sg)))
+                r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
+                r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
+                return [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
+            return [Vec(rocdl.ds_read_tr8_b64(
+                tr_type, _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off_a(c, tile_i, I, L_in_sg)))
+            ).result) for c in range_constexpr(4)]
+
+        @staticmethod
+        def _assemble(calls):
+            v4_lo = calls[0].shuffle(calls[1], [0, 1, 2, 3])
+            v4_hi = calls[2].shuffle(calls[3], [0, 1, 2, 3])
+            return v4_lo.shuffle(v4_hi, list(range(8)))
+
+        @staticmethod
+        def _wait_lgkmcnt(n):
+            _llvm.inline_asm(res=None, operands_=[], asm_string=f"s_waitcnt lgkmcnt({n})",
+                              constraints="", has_side_effects=True)
+
+        def load_one(self, lds_src, tile_i):
+            """Single-A-tile wave-coop tr8 load → one i32x8 frag (caps peak
+            A-fragment liveness at 1 tile for the interleaved BM=256 inline
+            path; see main-loop comment)."""
+            calls = self._issue_one(lds_src, tile_i)
+            frag = self._assemble(calls)
+            if self.inline_asm:
+                self._wait_lgkmcnt(0)
             return frag
+
+        def load_pipelined(self, lds_src, consume):
+            """Software-pipelined (depth-2) load of all n_tiles_a tiles for the
+            inline path. ``consume(tile_i, frag)`` is called once per tile with
+            its assembled frag, in order; the caller emits the mma there. Caps
+            raw-read liveness at 2 tiles while letting tile i+1's ds_read overlap
+            tile i's mma via graded lgkmcnt. Falls back to per-tile drain for the
+            intrinsic path (which schedules its own waits)."""
+            nt = self.n_tiles_a
+            if not self.inline_asm:
+                for i in range_constexpr(nt):
+                    consume(i, self._assemble(self._issue_one(lds_src, i)))
+                return
+            raw = self._issue_one(lds_src, 0)
+            for i in range_constexpr(nt):
+                if i + 1 < nt:
+                    raw_next = self._issue_one(lds_src, i + 1)
+                    # tile i+1 just issued: 8 LDS in flight; wait until only
+                    # tile i+1's 4 remain (tile i retired, LDS completes in order).
+                    self._wait_lgkmcnt(self.N_LDS_PER_TILE)
+                else:
+                    self._wait_lgkmcnt(0)
+                consume(i, self._assemble(raw))
+                if i + 1 < nt:
+                    raw = raw_next
+
+        def load(self, lds_src, preshuffled=False):
+            assert not preshuffled
+            return [self.load_one(lds_src, tile_i) for tile_i in range_constexpr(self.n_tiles_a)]
 
     class S2RLoaderTr_4w:
         """4-wave variant of S2RLoaderTr. Geometry differs from 8w version:
@@ -1639,6 +1716,8 @@ if _FLYDSL_OK:
             gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS)
 
             mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+            if os.environ.get("TN_ASM_MMA", "0") in ("1", "2"):
+                mfma._do_mma = _asm_mma_do
 
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -1840,6 +1919,7 @@ if _FLYDSL_OK:
         a_inline_asm: int = -1,         # -1 = use inline_asm_load; else 0/1 override
         b_inline_asm: int = -1,         # ditto
         vmcnt_hint: int = 2,
+        asm_mma: int = 0,               # 0 = env TN_ASM_MMA; 1/2 = AGPR-asm MFMA (2=AGPR accum)
     ):
         """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
         Both A and B are K-row strided → wave-coop ds_read_b64_tr_b8 on both
@@ -1848,8 +1928,30 @@ if _FLYDSL_OK:
         geometry) can feed A operand directly. Path J inline-asm on both."""
         # Resolve per-side inline_asm flags (default to inline_asm_load).
         _a_inline = bool(inline_asm_load) if a_inline_asm < 0 else bool(a_inline_asm)
+        _use_interleave = bool(int(os.environ.get("TN_INTERLEAVE", "0")))
         _b_inline = bool(inline_asm_load) if b_inline_asm < 0 else bool(b_inline_asm)
-        if (_a_inline or _b_inline) and agpr_alloc == 0:
+        # Single-buffer LDS: drop the double-buffer `next` slots, halving LDS
+        # (132KB→66KB) so 2 workgroups fit per CU (occ 25%→50%). Profiling
+        # (MfmaUtil 57%, MemUnitStalled≈0, OccupancyPercent 24%) shows 2515 is
+        # occupancy-limited by LDS capacity, NOT mem/MFMA-throughput-bound — the
+        # 2nd resident block hides the LDS-read latency the lone block can't.
+        # load→barrier→compute→barrier, same buffer reused each K-iter.
+        _use_single = bool(int(os.environ.get("TN_SINGLE_BUF", "0")))
+        # HK-CRR schedule port: 4 barriers/iter (vs 7) + graded waitcnt, both-B
+        # upfront. The 2515→2734 gap is barrier-skew cost; HK's 4-barrier CRR
+        # schedule is det=0 by design (load layout matched to barriers), unlike
+        # naively dropping barriers from the 7-barrier else loop (leaves WAR
+        # gaps → race). Reuses prologue/epilogue/store (same 4 G2S per iter).
+        _use_crr = bool(int(os.environ.get("TN_CRR", "0")))
+        _CRR_VMCNT = int(os.environ.get("TN_CRR_VMCNT", "-1"))
+        _CRR_LGKM = int(os.environ.get("TN_CRR_LGKM", "3"))
+        # asm_mma resolved from param (production) or env (probing).
+        _asm_mma_mode = str(asm_mma) if asm_mma in (1, 2) else os.environ.get("TN_ASM_MMA", "0")
+        _asm_mma = _asm_mma_mode in ("1", "2")
+        # asm-mma mode 1 pins accumulators to VGPR (`v`) so it REQUIRES
+        # agpr_alloc==0; mode 2 uses an explicit `a` (AGPR) constraint. Either
+        # way bypass the intrinsic-path inline-asm-load agpr guard.
+        if (_a_inline or _b_inline) and agpr_alloc == 0 and not _asm_mma:
             raise ValueError(
                 "inline_asm requires agpr_alloc > 0 (=v constraint conflict)"
             )
@@ -1883,16 +1985,24 @@ if _FLYDSL_OK:
         a_lds_size = max(LDS_BLOCK_M * BLOCK_K, 2 * 8 * 1024) // 1024 * _LDS_CS
         b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _LDS_CS
 
-        @fx.struct
-        class SharedStorage:
-            A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-            A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-            A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-            A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-            B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-            B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-            B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-            B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        if _use_single:
+            @fx.struct
+            class SharedStorage:
+                A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+                B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        else:
+            @fx.struct
+            class SharedStorage:
+                A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+                B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+                B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+                B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+                B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
         @flyc.kernel(known_block_size=[512, 1, 1])
         def kernel_dense_tn(
@@ -1905,9 +2015,15 @@ if _FLYDSL_OK:
             n_blocks = ceildiv(c_n, BLOCK_N)
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             a_cur0 = lds.A_lds_cur_0; a_cur1 = lds.A_lds_cur_1
-            a_next0 = lds.A_lds_next_0; a_next1 = lds.A_lds_next_1
             b_cur0 = lds.B_lds_cur_0; b_cur1 = lds.B_lds_cur_1
-            b_next0 = lds.B_lds_next_0; b_next1 = lds.B_lds_next_1
+            # Ternary (NOT an `if` stmt) so handles are always bound in the kernel
+            # scope: @flyc.kernel wraps each `if` branch in its own function, so a
+            # var defined inside one `if` is invisible to a sibling `if`. Python
+            # short-circuit avoids touching the missing next-slot fields when single.
+            a_next0 = a_cur0 if _use_single else lds.A_lds_next_0
+            a_next1 = a_cur1 if _use_single else lds.A_lds_next_1
+            b_next0 = b_cur0 if _use_single else lds.B_lds_next_0
+            b_next1 = b_cur1 if _use_single else lds.B_lds_next_1
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
@@ -1967,16 +2083,22 @@ if _FLYDSL_OK:
             b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K * c_n)
             a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K * c_m)
 
-            if wave_m == 1:
-                rocdl.s_barrier()
+            if _use_single:
+                # Symmetric prelude (every wave runs the same barrier): just
+                # drain cur(0) fully + sync. No `next` slot, no wave_m-asymmetric
+                # barrier (that desyncs the single-buffer loop → race).
+                wait_barrier(0)
+            else:
+                if wave_m == 1:
+                    rocdl.s_barrier()
 
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+                wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-            b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K * c_n)
-            a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K * c_m)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K * c_n)
+                b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K * c_n)
+                a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K * c_m)
+                b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K * c_n)
 
-            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
             BR_B1 = bool(barrier_mask & 0x01)
             BR_B2 = bool(barrier_mask & 0x02)
@@ -1986,94 +2108,225 @@ if _FLYDSL_OK:
             BR_B6 = bool(barrier_mask & 0x20)
             BR_B7 = bool(barrier_mask & 0x40)
 
-            for k in range_constexpr(K_ITERS - 2):
+            # Interleaved A-load half (inline path): software-pipeline (depth-2)
+            # the per-tile inline ds_read + mma. Caps A raw-read liveness at 2
+            # tiles (no 350-VGPR spill that otherwise cripples inline_both at
+            # BM=256) AND, crucially, uses GRADED lgkmcnt so tile i+1's LDS read
+            # overlaps tile i's mma — the per-tile lgkmcnt(0) full-drain was the
+            # real serialiser (2243 lgkmcnt(0) vs b_inline's 898 + graded
+            # lgkmcnt(4/8/12)), not the vmcnt(0) drain (inline path: vmcnt0=1).
+            def _mma_half(a_lds, bx0, bx1, cq0, cq1):
+                def _consume(i, a_frag):
+                    rocdl.s_setprio(1)
+                    for j in range_constexpr(N_TILES_B):
+                        cq0[mfma.idx(i, j)] = mfma._do_mma(a_frag, bx0[j], cq0[mfma.idx(i, j)])
+                    for j in range_constexpr(N_TILES_B):
+                        cq1[mfma.idx(i, j)] = mfma._do_mma(a_frag, bx1[j], cq1[mfma.idx(i, j)])
+                    rocdl.s_setprio(0)
+                a_s2r.load_pipelined(a_lds, _consume)
+                return cq0, cq1
+
+            if _use_single:
+                # Single-buffer steady loop: full K_ITERS, same cur buffer reused.
+                #   wait_barrier(0): cur(k) G2S landed (vmcnt0) + cross-wave sync
+                #   s2r + 4-quadrant mma from cur(k)
+                #   s_barrier: all waves done reading cur(k) before overwrite
+                #   tail G2S: prefetch cur(k+1) into the SAME buffer
+                # 2 barriers/iter, no `next` slots → LDS halved → 2 blocks/CU.
+                for k in range_constexpr(K_ITERS):
+                    wait_barrier(0)
+                    b0_frag = b_s2r.load(b_cur0)
+                    b1_frag = b_s2r.load(b_cur1)
+                    a0_frag = a_s2r.load(a_cur0)
+                    a1_frag = a_s2r.load(a_cur1)
+                    rocdl.s_setprio(1)
+                    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+                    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+                    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+                    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+                    rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                    if k + 1 < K_ITERS:
+                        b_g2s.load(b_cur0, B0_gl_offset + (k + 1) * BLOCK_K * c_n)
+                        a_g2s.load(a_cur0, A0_gl_offset + (k + 1) * BLOCK_K * c_m)
+                        b_g2s.load(b_cur1, B1_gl_offset + (k + 1) * BLOCK_K * c_n)
+                        a_g2s.load(a_cur1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+            elif _use_interleave and _a_inline:
+                for k in range_constexpr(K_ITERS - 2):
+                    b0_frag = b_s2r.load(b_cur0)
+                    b1_frag = b_s2r.load(b_cur1)
+                    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+                    rocdl.s_barrier()
+                    c00_frag, c01_frag = _mma_half(a_cur0, b0_frag, b1_frag, c00_frag, c01_frag)
+                    rocdl.s_barrier()
+                    b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+                    a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K * c_m)
+                    rocdl.s_barrier()
+                    c10_frag, c11_frag = _mma_half(a_cur1, b0_frag, b1_frag, c10_frag, c11_frag)
+                    b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+                    wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+                    rocdl.s_barrier()
+                    a_cur0, a_next0 = a_next0, a_cur0
+                    a_cur1, a_next1 = a_next1, a_cur1
+                    b_cur0, b_next0 = b_next0, b_cur0
+                    b_cur1, b_next1 = b_next1, b_cur1
+
+                # Epilog 1.
+                k = K_ITERS - 2
                 b0_frag = b_s2r.load(b_cur0)
-                a0_frag = a_s2r.load(a_cur0)
-                a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
-                if BR_B1: rocdl.s_barrier()
-                rocdl.s_setprio(1)
-                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-                rocdl.s_setprio(0)
-                if BR_B2: rocdl.s_barrier()
                 b1_frag = b_s2r.load(b_cur1)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
-                if BR_B3: rocdl.s_barrier()
-                rocdl.s_setprio(1)
-                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-                rocdl.s_setprio(0)
-                if BR_B4: rocdl.s_barrier()
-                a1_frag = a_s2r.load(a_cur1)
-                a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K * c_m)
-                if BR_B5: rocdl.s_barrier()
-                rocdl.s_setprio(1)
-                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-                rocdl.s_setprio(0)
-                if BR_B6: rocdl.s_barrier()
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
-                wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-                rocdl.s_setprio(1)
-                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-                rocdl.s_setprio(0)
-                if BR_B7: rocdl.s_barrier()
+                rocdl.s_barrier()
+                c00_frag, c01_frag = _mma_half(a_cur0, b0_frag, b1_frag, c00_frag, c01_frag)
+                rocdl.s_barrier()
+                b0_next_frag = b_s2r.load(b_next0)
+                a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+                rocdl.s_barrier()
+                c10_frag, c11_frag = _mma_half(a_cur1, b0_frag, b1_frag, c10_frag, c11_frag)
+                rocdl.s_barrier()
+
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
                 b_cur1, b_next1 = b_next1, b_cur1
 
-            # Epilog 1.
-            k = K_ITERS - 2
-            b0_frag = b_s2r.load(b_cur0)
-            a0_frag = a_s2r.load(a_cur0)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1_frag = b_s2r.load(b_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1_frag = a_s2r.load(a_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b0_frag = b_s2r.load(b_next0)
-            a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+                # Epilog 2.
+                b1_frag = b_s2r.load(b_cur1)
+                wait_barrier(0)
+                c00_frag, c01_frag = _mma_half(a_cur0, b0_next_frag, b1_frag, c00_frag, c01_frag)
+                rocdl.s_barrier()
+                c10_frag, c11_frag = _mma_half(a_cur1, b0_next_frag, b1_frag, c10_frag, c11_frag)
+                rocdl.s_barrier()
+            else:
+                if _use_crr:
+                    # HK-CRR 4-barrier steady loop (port of kernel_fp8_layouts.cpp
+                    # crr_kernel main loop). Both B halves loaded upfront; A half-0
+                    # × {b0,b1} then A half-1 × {b0,b1}; only 4 s_barrier/iter with
+                    # graded lgkm/vmcnt hints + lgkmcnt(0) right before each MMA
+                    # group. Same 4 G2S per iter as the 7-barrier loop → shared epilogs.
+                    _crr_vmcnt = (2 * N_LDS_STEPS_A + N_LDS_STEPS_B) if _CRR_VMCNT < 0 else _CRR_VMCNT
+                    def _lgkm0():
+                        _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
+                                          constraints="", has_side_effects=True)
+                    def _lgkm_barrier(n):
+                        _llvm.inline_asm(res=None, operands_=[],
+                                          asm_string=f"s_waitcnt lgkmcnt({n})\ns_barrier",
+                                          constraints="", has_side_effects=True)
+                    for k in range_constexpr(K_ITERS - 2):
+                        b0_frag = b_s2r.load(b_cur0)
+                        b1_frag = b_s2r.load(b_cur1)
+                        a0_frag = a_s2r.load(a_cur0)
+                        a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+                        _lgkm_barrier(_CRR_LGKM)            # barrier 1
+                        _lgkm0()
+                        rocdl.s_setprio(1)
+                        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+                        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+                        rocdl.s_setprio(0)
+                        rocdl.s_barrier()                   # barrier 2 (MID)
+                        a1_frag = a_s2r.load(a_cur1)
+                        a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K * c_m)
+                        b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+                        wait_barrier(_crr_vmcnt)            # barrier 3 (vmcnt + s_barrier)
+                        _lgkm0()
+                        rocdl.s_setprio(1)
+                        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+                        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+                        rocdl.s_setprio(0)
+                        rocdl.s_barrier()                   # barrier 4
+                        b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+                        a_cur0, a_next0 = a_next0, a_cur0
+                        a_cur1, a_next1 = a_next1, a_cur1
+                        b_cur0, b_next0 = b_next0, b_cur0
+                        b_cur1, b_next1 = b_next1, b_cur1
+                else:
+                    for k in range_constexpr(K_ITERS - 2):
+                        b0_frag = b_s2r.load(b_cur0)
+                        a0_frag = a_s2r.load(a_cur0)
+                        a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+                        if BR_B1: rocdl.s_barrier()
+                        rocdl.s_setprio(1)
+                        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+                        rocdl.s_setprio(0)
+                        if BR_B2: rocdl.s_barrier()
+                        b1_frag = b_s2r.load(b_cur1)
+                        b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+                        if BR_B3: rocdl.s_barrier()
+                        rocdl.s_setprio(1)
+                        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+                        rocdl.s_setprio(0)
+                        if BR_B4: rocdl.s_barrier()
+                        a1_frag = a_s2r.load(a_cur1)
+                        a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K * c_m)
+                        if BR_B5: rocdl.s_barrier()
+                        rocdl.s_setprio(1)
+                        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+                        rocdl.s_setprio(0)
+                        if BR_B6: rocdl.s_barrier()
+                        b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+                        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+                        rocdl.s_setprio(1)
+                        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+                        rocdl.s_setprio(0)
+                        if BR_B7: rocdl.s_barrier()
+                        a_cur0, a_next0 = a_next0, a_cur0
+                        a_cur1, a_next1 = a_next1, a_cur1
+                        b_cur0, b_next0 = b_next0, b_cur0
+                        b_cur1, b_next1 = b_next1, b_cur1
 
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
+                # Epilog 1.
+                k = K_ITERS - 2
+                b0_frag = b_s2r.load(b_cur0)
+                a0_frag = a_s2r.load(a_cur0)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                b1_frag = b_s2r.load(b_cur1)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                a1_frag = a_s2r.load(a_cur1)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                b0_frag = b_s2r.load(b_next0)
+                a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
 
-            # Epilog 2.
-            a0_frag = a_s2r.load(a_cur0)
-            wait_barrier(0)
-            rocdl.s_setprio(1)
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1_frag = b_s2r.load(b_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1_frag = a_s2r.load(a_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+                a_cur0, a_next0 = a_next0, a_cur0
+                a_cur1, a_next1 = a_next1, a_cur1
+                b_cur0, b_next0 = b_next0, b_cur0
+                b_cur1, b_next1 = b_next1, b_cur1
+
+                # Epilog 2.
+                a0_frag = a_s2r.load(a_cur0)
+                wait_barrier(0)
+                rocdl.s_setprio(1)
+                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                b1_frag = b_s2r.load(b_cur1)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                a1_frag = a_s2r.load(a_cur1)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
 
             wave_n_offset = wave_n * (N_TILES_B * 16)
             wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -2919,12 +3172,12 @@ _TN_CANDIDATES = [
     (256, 1, 32),
     (256, 2, 32),
     (256, 16, 32),
-    (128, 2, 32),
-    (128, 4, 32),
 ]
 # NOTE: GM=8/32 candidates tested 2026-05-29 — no benefit (worst 28672 shapes
 # stay 0.73; unlike NT, TN's big-N shapes are bound by the double wave-coop
 # ds_read_b64_tr_b8, not L2 super-block reuse). Kept set minimal.
+# BM=128 (inline_both / a_inline=1) candidates dropped 2026-05-30: spill-free
+# but small-tile compute always loses to BM=256 b_inline on big-N/K shapes.
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
@@ -2936,37 +3189,77 @@ def _autotune_tn_dispatch(args, M, N, K):
         return _TN_AUTOTUNE_CACHE[key]
     out_view = args[2]
     best_us = float("inf"); best = None
+    # 2026-05-30 STRICT det=0 audit: ALL barrier-dropped masks are intermittently
+    # racy at the MFMA-reorder level (~1e-5, snr stays 55.6) under some
+    # GM/occupancy — exposed only by long det gates:
+    #   0x5A vh2 : det~5e-6  (was shipped; this is the BUG being fixed here)
+    #   0x6A/0x6E/0x4E : raced as late as run 192 (8-run checks missed it)
+    #   0x4A vh3 : 2731 TF (+8.8%), det=0 over 1000-run at GM∈{1,2} but GM=16
+    #              raced at run 612 (1.2e-5)
+    # The current loop's racy-ceiling (0x00, no barriers) is only ~2734 TF, so no
+    # barrier config can reach the 2800 target anyway — that needs the A-side tr8
+    # vmcnt(0) drain removed (raises the ceiling), not barrier removal. Until a
+    # strict-det=0 drain-removal lands, ship ONLY the full-barrier 0x7F (robust
+    # det=0 across all GM, 1000-run gated). See scripts2/_tn_e2e_det.py.
     for bm, gm, ag in _TN_CANDIDATES:
         if M % bm != 0:
             continue
-        try:
-            # Per-BM inline selection (verified 2026-05-29 spill probe):
-            #   BM=256 -> N_TILES_A=4: a_inline spills to 206, so B-only.
-            #   BM=128 -> N_TILES_A=2: both A+B inline spill=0, full path-J
-            #     (no vmcnt(0) auto-insert on either operand).
-            a_inl = 1 if bm == 128 else 0
-            launch = _compile_dense_tn(
-                K=K, BLOCK_M=bm, BLOCK_N=256, GROUP_M=gm,
-                agpr_alloc=ag, inline_asm_load=False,
-                a_inline_asm=a_inl, b_inline_asm=1,
-            )
-            c = _get_compiled_dense(launch, args)
-            c(*args); _torch.cuda.synchronize()
-            # SNR gate via finite check on output sample
-            sample = out_view.view(-1)[:1024].float()
-            if not _torch.isfinite(sample).all().item():
+        for _bmask in [0x7F]:
+            try:
+                # A-side stays intrinsic (a_inline @ BM=256 spills V to 350,
+                # @ BM=128 no-spill but small-tile loses); B-side path-J only.
+                launch = _compile_dense_tn(
+                    K=K, BLOCK_M=bm, BLOCK_N=256, GROUP_M=gm,
+                    agpr_alloc=ag, inline_asm_load=False,
+                    a_inline_asm=0, b_inline_asm=1, barrier_mask=_bmask,
+                )
+                c = _get_compiled_dense(launch, args)
+                c(*args); _torch.cuda.synchronize()
+                sample = out_view.view(-1)[:1024].float()
+                if not _torch.isfinite(sample).all().item():
+                    continue
+                for _ in range(2): c(*args)
+                _torch.cuda.synchronize()
+                e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
+                _torch.cuda.synchronize(); e0.record()
+                for _ in range(20): c(*args)
+                e1.record(); _torch.cuda.synchronize()
+                us = e0.elapsed_time(e1)*1000.0/20
+                if us < best_us:
+                    best_us = us; best = (launch, (bm, gm, ag, _bmask))
+            except Exception:
                 continue
-            for _ in range(2): c(*args)
-            _torch.cuda.synchronize()
-            e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
-            _torch.cuda.synchronize(); e0.record()
-            for _ in range(20): c(*args)
-            e1.record(); _torch.cuda.synchronize()
-            us = e0.elapsed_time(e1)*1000.0/20
-            if us < best_us:
-                best_us = us; best = (launch, (bm, gm, ag))
+    # Big-K (K>=28672) drain-removal win config: BOTH A+B path-J (removes the
+    # A-side tr8 vmcnt(0) drain the 0x7F comment above flags as the ceiling),
+    # agpr_alloc=0 (compiler-decided AGPR; guard bypassed via asm_mma=2),
+    # GROUP_M=1, vmcnt_hint=3, full-barrier 0x7F. Validated det=0 over 1000-run
+    # (scripts2/_v3.py / _safe.py) = 2756 TF on 8192x8192x28672 (+6.8% vs the
+    # A-intrinsic candidates above). vmcnt_hint=3 is the det=0 sweet spot:
+    # vh=2 also det=0 but 2710-2734; vh>=4 RACES (det 1.5e-5 at 500-run). bench
+    # picks this only if fastest (loses on N-major / non-big-K → not added there).
+    if K >= 28672 and M % 256 == 0:
+        try:
+            wlaunch = _compile_dense_tn(
+                K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=1,
+                agpr_alloc=0, inline_asm_load=False,
+                a_inline_asm=1, b_inline_asm=1, barrier_mask=0x7F,
+                vmcnt_hint=3, asm_mma=2,
+            )
+            c = _get_compiled_dense(wlaunch, args)
+            c(*args); _torch.cuda.synchronize()
+            sample = out_view.view(-1)[:1024].float()
+            if _torch.isfinite(sample).all().item():
+                for _ in range(2): c(*args)
+                _torch.cuda.synchronize()
+                e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
+                _torch.cuda.synchronize(); e0.record()
+                for _ in range(20): c(*args)
+                e1.record(); _torch.cuda.synchronize()
+                us = e0.elapsed_time(e1)*1000.0/20
+                if us < best_us:
+                    best_us = us; best = (wlaunch, (256, 1, 0, 0x7F))
         except Exception:
-            continue
+            pass
     if best is None:
         raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
     if os.environ.get("FLYDSL_TN_VERBOSE"):
