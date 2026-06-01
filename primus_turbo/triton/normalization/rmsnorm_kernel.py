@@ -203,50 +203,6 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 
-# Backward — one row per program.
-@triton.jit
-def rmsnorm_bwd_kernel(
-    DY_ptr,
-    X_ptr,
-    G_ptr,
-    RSTD_ptr,
-    DX_ptr,
-    DG_PART_ptr,
-    stride_xb,
-    stride_xh,
-    stride_dyb,
-    stride_dyh,
-    stride_dxb,
-    stride_dxh,
-    stride_dgb,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    x_ptrs = X_ptr + row * stride_xb + offs * stride_xh
-    dy_ptrs = DY_ptr + row * stride_dyb + offs * stride_dyh
-    dx_ptrs = DX_ptr + row * stride_dxb + offs * stride_dxh
-    dgp_ptrs = DG_PART_ptr + row * stride_dgb + offs
-    g_ptrs = G_ptr + offs
-
-    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(RSTD_ptr + row).to(tl.float32)
-
-    x_hat = x * rstd
-    dxhat = dy * g
-    m = tl.sum(dxhat * x_hat, axis=0) / H
-    dx = (dxhat - x_hat * m) * rstd
-    dgp = dy * x_hat
-
-    tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=mask)
-    tl.store(dgp_ptrs, dgp, mask=mask)
-
-
 @triton.jit
 def rmsnorm_bwd_kernel_multi_row(
     DY_ptr,
@@ -299,56 +255,6 @@ def rmsnorm_bwd_kernel_multi_row(
     dgp_block = (dy * x_hat) * row_mask[:, None].to(tl.float32)
     dgp_row = tl.sum(dgp_block, axis=0)
     tl.store(dgp_ptrs, dgp_row, mask=h_mask)
-
-
-# Backward — fused residual.
-@triton.jit
-def rmsnorm_bwd_residual_kernel(
-    DY_ptr,
-    DXPR_ptr,
-    XPR_ptr,
-    G_ptr,
-    RSTD_ptr,
-    DX_ptr,
-    DG_PART_ptr,
-    stride_xprb,
-    stride_xprh,
-    stride_dyb,
-    stride_dyh,
-    stride_dxprb,
-    stride_dxprh,
-    stride_dxb,
-    stride_dxh,
-    stride_dgb,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    xpr_ptrs = XPR_ptr + row * stride_xprb + offs * stride_xprh
-    dy_ptrs = DY_ptr + row * stride_dyb + offs * stride_dyh
-    dxpr_ptrs = DXPR_ptr + row * stride_dxprb + offs * stride_dxprh
-    dx_ptrs = DX_ptr + row * stride_dxb + offs * stride_dxh
-    dgp_ptrs = DG_PART_ptr + row * stride_dgb + offs
-    g_ptrs = G_ptr + offs
-
-    xpr = tl.load(xpr_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dxpr = tl.load(dxpr_ptrs, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(RSTD_ptr + row).to(tl.float32)
-
-    x_hat = xpr * rstd
-    dxhat = dy * g
-    m = tl.sum(dxhat * x_hat, axis=0) / H
-    dx_norm = (dxhat - x_hat * m) * rstd
-    dx = dx_norm + dxpr
-    dgp = dy * x_hat
-
-    tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=mask)
-    tl.store(dgp_ptrs, dgp, mask=mask)
 
 
 # Backward — persistent grid-stride. dgamma accumulator stays in registers; n_parts = num_programs.

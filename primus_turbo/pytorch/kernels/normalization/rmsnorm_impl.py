@@ -13,10 +13,8 @@ import torch
 
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_bwd_finalize_kernel,
-    rmsnorm_bwd_kernel,
     rmsnorm_bwd_kernel_grid_stride,
     rmsnorm_bwd_kernel_multi_row,
-    rmsnorm_bwd_residual_kernel,
     rmsnorm_bwd_residual_kernel_grid_stride,
     rmsnorm_bwd_residual_kernel_multi_row,
     rmsnorm_fwd_kernel,
@@ -67,15 +65,15 @@ def _num_cus(device_index: int = 0) -> int:
 def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     """Return (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd."""
     BLOCK_H = _next_pow2(H)
-    if BLOCK_H <= 256 and B >= 4096:
-        if BLOCK_H <= 128:
-            return "multi", BLOCK_H, 64, 4, 3
-        return "multi", BLOCK_H, 8, 4, 2
     if BLOCK_H <= 256:
-        return "single", BLOCK_H, 1, 1, 1
+        # ROWS targets ~half-wave program count; cap by register budget at BLOCK_H=256.
+        cap = 64 if BLOCK_H <= 128 else 8
+        target = max(1, _num_cus() // 2)
+        ROWS = min(cap, max(1, _next_pow2(B // target)))
+        ns = 3 if BLOCK_H <= 128 else 2
+        return "multi", BLOCK_H, ROWS, 4, ns
 
-    # Half-wave grid when each program would otherwise get few rows and the
-    # row is wide. Threshold scales with device CU count.
+    # Half-wave grid when each program would otherwise get few rows and H is wide.
     rows_per_program = max(1, B // _num_cus())
     wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
     half_wave = rows_per_program <= 13 and wide_row
@@ -172,28 +170,7 @@ def rmsnorm_bwd_impl(
     dy2 = _reshape_batch_hidden(dy, H)
     dx = torch.empty_like(x2)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
-    if mode == "single":
-        dg_partial = torch.empty(B, H, device=x2.device, dtype=torch.float32)
-        rmsnorm_bwd_kernel[(B,)](
-            dy2,
-            x2,
-            gamma,
-            rstd,
-            dx,
-            dg_partial,
-            x2.stride(0),
-            x2.stride(1),
-            dy2.stride(0),
-            dy2.stride(1),
-            dx.stride(0),
-            dx.stride(1),
-            dg_partial.stride(0),
-            H=H,
-            BLOCK_H=BLOCK_H,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    elif mode == "multi":
+    if mode == "multi":
         ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
@@ -338,31 +315,7 @@ def rmsnorm_bwd_residual_impl(
         dxpr2 = _reshape_batch_hidden(dxpr, H)
     dx = torch.empty_like(x_plus_r)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
-    if mode == "single":
-        dg_partial = torch.empty(B, H, device=x_plus_r.device, dtype=torch.float32)
-        rmsnorm_bwd_residual_kernel[(B,)](
-            dy2,
-            dxpr2,
-            x_plus_r,
-            gamma,
-            rstd,
-            dx,
-            dg_partial,
-            x_plus_r.stride(0),
-            x_plus_r.stride(1),
-            dy2.stride(0),
-            dy2.stride(1),
-            dxpr2.stride(0),
-            dxpr2.stride(1),
-            dx.stride(0),
-            dx.stride(1),
-            dg_partial.stride(0),
-            H=H,
-            BLOCK_H=BLOCK_H,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    elif mode == "multi":
+    if mode == "multi":
         ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
