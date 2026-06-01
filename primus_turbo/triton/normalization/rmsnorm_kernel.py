@@ -29,6 +29,18 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+# Autotune candidates for the grid-stride bwd kernels. Covers every
+# (num_warps, num_stages) combination the prior hand-tuned MI325X dispatch
+# ever picked. Triton picks the winner per (BLOCK_H, B, num_programs) at
+# first JIT and caches the choice. Drop-in re-tuning on other arches with
+# no source edits.
+_GRID_STRIDE_BWD_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=2),
+]
+
 
 # ---------------------------------------------------------------------------
 # Forward kernel — one row per program. Used when H is large.
@@ -367,6 +379,7 @@ def rmsnorm_bwd_residual_kernel(
 # written at exit. This matches the HIP stage-0 pattern and drastically
 # shrinks the dg_partial buffer (n_parts == grid_size, not B).
 # ---------------------------------------------------------------------------
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_kernel_grid_stride(
     DY_ptr,
@@ -419,6 +432,7 @@ def rmsnorm_bwd_kernel_grid_stride(
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)
 
 
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_residual_kernel_grid_stride(
     DY_ptr,

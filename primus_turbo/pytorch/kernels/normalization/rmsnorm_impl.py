@@ -309,8 +309,6 @@ def rmsnorm_bwd_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
-            num_warps=num_warps,
-            num_stages=num_stages,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
@@ -486,8 +484,6 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
-            num_warps=num_warps,
-            num_stages=num_stages,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
