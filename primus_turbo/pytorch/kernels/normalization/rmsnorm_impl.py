@@ -77,7 +77,11 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     """
     BLOCK_H = _next_pow2(H)
     if BLOCK_H <= 256 and B >= 4096:
-        return "multi", BLOCK_H, 16 if BLOCK_H <= 128 else 8, 4, 2
+        # ROWS=64 at BLOCK_H<=128 keeps the program count <= ~2 waves even at
+        # B=32768, which slashes the dg_partial volume and finalize time.
+        if BLOCK_H <= 128:
+            return "multi", BLOCK_H, 64, 4, 3
+        return "multi", BLOCK_H, 8, 4, 2
     if BLOCK_H <= 256:
         return "single", BLOCK_H, 1, 1, 1
 
