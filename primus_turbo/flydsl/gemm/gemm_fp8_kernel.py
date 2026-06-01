@@ -155,6 +155,7 @@ if _FLYDSL_OK:
         agpr_alloc: int = 0,
         split_barrier: bool = False,
         sched_mask: int = 0,
+        nt_vmcnt: int = 3,              # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
     ):
         """Build & cache the (K, BLOCK_M, BLOCK_N, GROUP_M, barrier_mask)-specialised launch.
 
@@ -361,6 +362,7 @@ if _FLYDSL_OK:
                 rocdl.s_setprio(0)
                 if BR_B7: _barrier_inline()
 
+                if nt_vmcnt >= 0: _llvm.inline_asm(res=None, operands_=[], asm_string=f"s_waitcnt vmcnt({nt_vmcnt})", constraints="", has_side_effects=True)  # end-of-iter G2S drain (race fix)
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
@@ -654,7 +656,7 @@ if _FLYDSL_OK:
     @functools.lru_cache(maxsize=128)
     def _compile_dense_nt_v3(K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, GROUP_M: int = 1,
                               waves_per_eu: int = 2, sched_mid_barriers: bool = False,
-                              add_sched_hints: bool = False, agpr_alloc: int = 0):
+                              add_sched_hints: bool = False, agpr_alloc: int = 0, nt_vmcnt: int = 3):
         """V3 NT kernel: same 8-wave 4-slab cur/next physical structure as
         v1, but each c-quadrant uses _interleaved_cluster pattern (single
         mfma_call_one + single load_one fine-grain interleave, ported from
@@ -886,7 +888,7 @@ if _FLYDSL_OK:
                 rocdl.sched_barrier(0)
 
             for k in range_constexpr(K_ITERS - 2):
-                wait_barrier(2 * N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                wait_barrier(nt_vmcnt if nt_vmcnt >= 0 else (2 * N_LDS_STEPS_A + 2 * N_LDS_STEPS_B))  # tightened vmcnt = race fix (v3 analog of 8w end-of-iter)
                 rocdl.s_setprio(1)
                 c00, b1_frag = _interleaved_cluster(
                     a_cur0, a_g2s, A0_gl_offset + (k + 2) * BLOCK_K,
