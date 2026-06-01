@@ -38,6 +38,20 @@ def quantize_fp8_tensorwise_impl(
     return x_fp8, scale_inv
 
 
+def quantize_fp8_tensorwise_fused_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize FP8 Tensor-Wise (fused amax+scale, 2-kernel path).
+
+    Functionally identical to quantize_fp8_tensorwise_impl but fuses the
+    abs-max reduction and scale computation into a single kernel launch,
+    reducing total kernel launches from 3 to 2 when scale is not provided.
+    """
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(x, out_dtype, scale)
+    return x_fp8, scale_inv
+
+
 def quantize_fp8_rowwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:

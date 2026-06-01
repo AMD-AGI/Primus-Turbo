@@ -21,6 +21,7 @@ from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
     quantize_fp4_with_trans,
+    quantize_fp8_fused,
     quantize_fp8_with_trans,
 )
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
@@ -84,6 +85,70 @@ def test_quantize_fp8_tensorwise_amax_correctness(orig_dtype, dest_dtype, granul
 
     x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
     x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(
+        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
+        x_fp8.to(torch.float32) * x_scale_inv,
+        **get_tolerances(dest_dtype),
+    )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("numel", [8192, 8193, 6 * 1 * 7168 * 8192])
+@pytest.mark.parametrize("torch_compile", [True, False])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+def test_quantize_fp8_tensorwise_fused(orig_dtype, dest_dtype, numel, torch_compile, granularity):
+    """Test fused 2-kernel FP8 tensorwise quantize against reference."""
+    torch.manual_seed(42)
+
+    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    x_ref = x.detach().clone()
+    x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
+
+    if torch_compile is True:
+        torch._dynamo.reset()
+        compiled_func = torch.compile(
+            lambda t: quantize_fp8_fused(t, dest_dtype, granularity=granularity),
+            fullgraph=True,
+            mode="max-autotune",
+        )
+        x_fp8, x_scale_inv = compiled_func(x)
+    else:
+        x_fp8, x_scale_inv = quantize_fp8_fused(x, dest_dtype, granularity=granularity)
+
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(
+        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
+        x_fp8.to(torch.float32) * x_scale_inv,
+        **get_tolerances(dest_dtype),
+    )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
+@pytest.mark.parametrize(
+    "shape,spike_pos",
+    [
+        ((1, 100), -1),
+        ((1, 8193), -1),
+        ((512, 3072), 8300),
+        ((512, 3072), -1),
+        ((1024, 4096), -1),
+    ],
+)
+def test_quantize_fp8_tensorwise_fused_amax_correctness(
+    orig_dtype, dest_dtype, granularity, shape, spike_pos
+):
+    """Regression test: fused amax+scale kernel handles partial tiles correctly."""
+    x = torch.ones(shape, device="cuda", dtype=orig_dtype) * 0.5
+    x.view(-1)[spike_pos] = 100.0
+    x_ref = x.detach().clone()
+
+    x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
+    x_fp8, x_scale_inv = quantize_fp8_fused(x, dest_dtype, granularity=granularity)
 
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(

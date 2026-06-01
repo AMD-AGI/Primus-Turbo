@@ -17,12 +17,13 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
+    quantize_fp8_tensorwise_fused_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
 )
 
-__all__ = ["quantize_fp8", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
+__all__ = ["quantize_fp8", "quantize_fp8_fused", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
 
 MX_BLOCK_SIZE = 32
 
@@ -75,6 +76,25 @@ def quantize_fp8(
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def quantize_fp8_fused(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    FP8 Quantize with fused amax+scale computation (2-kernel path).
+
+    Only supports TENSORWISE granularity. For other granularities, falls
+    back to the standard quantize_fp8 path.
+
+    This variant fuses the abs-max reduction and scale computation into a
+    single kernel launch, reducing total kernel launches from 3 to 2.
+    """
+    if granularity == ScalingGranularity.TENSORWISE:
+        return quantize_fp8_tensorwise_fused_impl(x, out_dtype)
+    return quantize_fp8(x, out_dtype, granularity)
 
 
 def quantize_fp8_with_trans(
