@@ -38,7 +38,9 @@ _GRID_STRIDE_BWD_CONFIGS = [
 ]
 
 
-# Forward — one row per program. Used when H is large.
+# ---------------------------------------------------------------------------
+# Forward — one row per program.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_kernel(
     X_ptr,
@@ -69,7 +71,9 @@ def rmsnorm_fwd_kernel(
     tl.store(RSTD_ptr + row, rstd)
 
 
+# ---------------------------------------------------------------------------
 # Forward — N rows per program.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_kernel_multi_row(
     X_ptr,
@@ -109,7 +113,9 @@ def rmsnorm_fwd_kernel_multi_row(
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 
+# ---------------------------------------------------------------------------
 # Forward — fused residual add.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_residual_kernel(
     X_ptr,
@@ -152,6 +158,9 @@ def rmsnorm_fwd_residual_kernel(
     tl.store(RSTD_ptr + row, rstd)
 
 
+# ---------------------------------------------------------------------------
+# Forward — fused residual add, N rows per program.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_residual_kernel_multi_row(
     X_ptr,
@@ -203,6 +212,10 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 
+# ---------------------------------------------------------------------------
+# Backward — 2D tile over (ROWS_PER_BLOCK, BLOCK_H). Writes one partial
+# dgamma slab per program.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_bwd_kernel_multi_row(
     DY_ptr,
@@ -257,7 +270,10 @@ def rmsnorm_bwd_kernel_multi_row(
     tl.store(dgp_ptrs, dgp_row, mask=h_mask)
 
 
-# Backward — persistent grid-stride. dgamma accumulator stays in registers; n_parts = num_programs.
+# ---------------------------------------------------------------------------
+# Backward — persistent grid-stride. dgamma accumulator stays in registers
+# across the row loop; n_parts == num_programs (not B).
+# ---------------------------------------------------------------------------
 @triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_kernel_grid_stride(
@@ -307,6 +323,9 @@ def rmsnorm_bwd_kernel_grid_stride(
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)
 
 
+# ---------------------------------------------------------------------------
+# Backward — persistent grid-stride, fused residual variant.
+# ---------------------------------------------------------------------------
 @triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_residual_kernel_grid_stride(
@@ -362,7 +381,9 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)
 
 
+# ---------------------------------------------------------------------------
 # Backward finalize — reduces (n_parts, H) fp32 partials to dgamma[H].
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_bwd_finalize_kernel(
     DGP_ptr,
@@ -386,6 +407,9 @@ def rmsnorm_bwd_finalize_kernel(
     tl.store(DG_ptr + h_offs, acc.to(DG_ptr.dtype.element_ty), mask=h_mask)
 
 
+# ---------------------------------------------------------------------------
+# Backward — 2D tile, fused residual variant.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_bwd_residual_kernel_multi_row(
     DY_ptr,
