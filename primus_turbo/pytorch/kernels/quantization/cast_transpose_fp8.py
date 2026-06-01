@@ -28,6 +28,10 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from primus_turbo.triton.utils.triton_lang_helper import tl_extra_shim
+
+_tanh = tl_extra_shim.tanh
+
 
 def _fp8_max(dtype: torch.dtype) -> float:
     return torch.finfo(dtype).max
@@ -188,3 +192,183 @@ def _cast_transpose_fp8_triton_meta(
 
 # Backward-compat alias for existing benchmark / call sites
 cast_transpose_amax = cast_transpose_fp8_triton
+
+
+# ---------------------------------------------------------------------------
+# Fused bias + GELU(tanh) + cast_transpose + amax Triton kernel
+#
+# Identical 2D tiling as _cast_transpose_amax_kernel, but inserts
+#   val = (x + bias); val = 0.5*val*(1+tanh(k*val*(1+0.044715*val^2)))
+# before the FP8 quantize + transpose store.  Eliminates one bf16 GMEM
+# round-trip per MLP fc2 input in the Flux double-stream block.
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "GROUP_M": 1}, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "GROUP_M": 8}, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=8),
+    ],
+    key=["M", "N"],
+)
+@triton.jit
+def _bias_gelu_cast_transpose_kernel(
+    X_ptr,
+    Bias_ptr,
+    C_ptr,
+    T_ptr,
+    stride_xm, stride_xn,
+    stride_cm, stride_cn,
+    stride_tm, stride_tn,
+    M, N,
+    scale_ptr,
+    amax_ptr,
+    scale_inv_ptr,
+    max_fp8: tl.constexpr,
+    COMPUTE_AMAX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    scale = tl.load(scale_ptr)
+
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    rm = pid_m.to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n.to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
+
+    x_ptrs = X_ptr + rm[:, None] * stride_xm + rn[None, :] * stride_xn
+    a = tl.load(x_ptrs, mask=mask)
+    val = a.to(tl.float32)
+
+    # bias add -- bias is [N], broadcast over M
+    bias_mask = rn < N
+    bias = tl.load(Bias_ptr + rn, mask=bias_mask).to(tl.float32)
+    val = val + bias[None, :]
+
+    # GELU tanh approximation: 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2)))
+    # Constants match openai_gelu_no_jit used by Flux.
+    inner = 0.7978845608028654 * val * (1.0 + 0.044715 * val * val)
+    val = 0.5 * val * (1.0 + _tanh(inner))
+
+    # FP8 quantize + row-major store
+    scaled = val * scale
+    scaled = tl.clamp(scaled, -max_fp8, max_fp8)
+    fp8_val = scaled.to(C_ptr.dtype.element_ty)
+
+    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(c_ptrs, fp8_val, mask=mask)
+
+    # Transposed store (coalesced via tl.trans)
+    fp8_val_t = tl.trans(fp8_val)
+    rn2 = pid_n.to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm2 = pid_m.to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_t = (rn2 < N)[:, None] & (rm2 < M)[None, :]
+    t_ptrs = T_ptr + rn2[:, None] * stride_tm + rm2[None, :] * stride_tn
+    tl.store(t_ptrs, fp8_val_t, mask=mask_t)
+
+    if COMPUTE_AMAX:
+        tile_amax = tl.max(tl.abs(val))
+        tl.atomic_max(amax_ptr, tile_amax, sem="relaxed")
+
+    if pid == 0:
+        tl.store(scale_inv_ptr, tl.fdiv(1.0, scale))
+
+
+# ---------------------------------------------------------------------------
+# @triton_op wrapper for bias_gelu_cast_transpose
+# ---------------------------------------------------------------------------
+
+@triton_op("primus_turbo::bias_gelu_cast_transpose_fp8", mutates_args=())
+def bias_gelu_cast_transpose_fp8(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    scale: torch.Tensor,
+    amax_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused bias + GELU(tanh) + FP8 cast + transpose + optional amax.
+
+    Computes GELU(x + bias) then quantizes to FP8, producing both row-major
+    and transposed outputs.  Eliminates the bf16 intermediate that would
+    otherwise be written by separate bias+GELU then read by cast_transpose.
+
+    Args:
+        x: 2D input tensor [M, N] (bf16 or f16), must be contiguous.
+        bias: 1D bias tensor [N].
+        fp8_dtype: Target FP8 dtype (e.g. torch.float8_e4m3fn).
+        scale: Scalar float32 tensor with the quantization scale.
+        amax_out: Optional scalar float32 tensor for amax capture.
+
+    Returns:
+        (cast_out, transpose_out, scale_inv) where:
+          cast_out:      [M, N] FP8 tensor
+          transpose_out: [N, M] FP8 tensor (contiguous transpose)
+          scale_inv:     scalar float32, 1/scale
+    """
+    assert x.ndim == 2, f"Expected 2D input, got {x.ndim}D"
+    assert bias.ndim == 1, f"Expected 1D bias, got {bias.ndim}D"
+    assert bias.shape[0] == x.shape[1], (
+        f"Bias size {bias.shape[0]} != input columns {x.shape[1]}"
+    )
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    M, N = x.shape
+    max_fp8 = _fp8_max(fp8_dtype)
+
+    cast_out = torch.empty((M, N), dtype=fp8_dtype, device=x.device)
+    transpose_out = torch.empty((N, M), dtype=fp8_dtype, device=x.device)
+    scale_inv = torch.empty((), dtype=torch.float32, device=x.device)
+
+    compute_amax = amax_out is not None
+    if not compute_amax:
+        amax_out = torch.empty((), dtype=torch.float32, device=x.device)
+    else:
+        amax_out.zero_()
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    wrap_triton(_bias_gelu_cast_transpose_kernel)[grid](
+        x, bias, cast_out, transpose_out,
+        x.stride(0), x.stride(1),
+        cast_out.stride(0), cast_out.stride(1),
+        transpose_out.stride(0), transpose_out.stride(1),
+        M, N,
+        scale,
+        amax_out,
+        scale_inv,
+        max_fp8,
+        compute_amax,
+    )
+
+    return cast_out, transpose_out, scale_inv
+
+
+@bias_gelu_cast_transpose_fp8.register_fake
+def _bias_gelu_cast_transpose_fp8_meta(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    scale: torch.Tensor,
+    amax_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    return (
+        torch.empty((M, N), dtype=fp8_dtype, device=x.device),
+        torch.empty((N, M), dtype=fp8_dtype, device=x.device),
+        torch.empty((), dtype=torch.float32, device=x.device),
+    )
