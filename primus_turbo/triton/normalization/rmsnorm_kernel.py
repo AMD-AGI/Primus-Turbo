@@ -29,11 +29,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# Autotune candidates for the grid-stride bwd kernels. Covers every
-# (num_warps, num_stages) combination the prior hand-tuned MI325X dispatch
-# ever picked. Triton picks the winner per (BLOCK_H, B, num_programs) at
-# first JIT and caches the choice. Drop-in re-tuning on other arches with
-# no source edits.
+# Grid-stride bwd autotune set. Picked per (BLOCK_H, B, num_programs) at JIT.
 _GRID_STRIDE_BWD_CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=1),
     triton.Config({}, num_warps=4, num_stages=2),

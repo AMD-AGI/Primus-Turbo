@@ -63,95 +63,36 @@ def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
     return BLOCK_H, 1, 16, 2
 
 
-# One wave per CU saturates the device for the grid-stride bwd kernel;
-# pushing to 2 waves spreads dg accumulators thinner and inflates the
-# finalize input. CU count is queried per-device and cached.
 @functools.lru_cache(maxsize=None)
 def _num_cus(device_index: int = 0) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
-    """Return (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd.
+    """Pick (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd.
 
-    Modes:
-    - ``"multi"``: multi-row 2D-tile kernel. GRID_OR_ROWS is ROWS_PER_BLOCK.
-      Good for small H + huge B (q-norm in MoE attention) where launch cost
-      and 2D-tile coalescing both pay off.
-    - ``"grid"``: persistent grid-stride kernel. GRID_OR_ROWS is the number
-      of programs. Each program loops over rows of stride num_programs while
-      keeping the dgamma accumulator live in registers across the loop. This
-      matches the HIP stage-0 approach and minimises the (n_parts, H)
-      dg_partial buffer (n_parts == grid_size, not B).
-    - ``"single"``: one-program-per-row fallback for tiny H/B.
+    Modes: "multi" (2D-tile for small H + huge B), "single" (one row per
+    program for tiny H/B), "grid" (persistent grid-stride for everything
+    wider; num_warps/num_stages are unused — picked by @triton.autotune).
     """
     BLOCK_H = _next_pow2(H)
-
-    # Small-H + huge-B: multi-row is great here (tile 2D in one shot).
     if BLOCK_H <= 256 and B >= 4096:
-        ROWS = 16 if BLOCK_H <= 128 else 8
-        return "multi", BLOCK_H, ROWS, 4, 2
+        return "multi", BLOCK_H, 16 if BLOCK_H <= 128 else 8, 4, 2
     if BLOCK_H <= 256:
         return "single", BLOCK_H, 1, 1, 1
 
-    # Grid-stride for everything wider. Tuned empirically on MI325X:
-    # - grid=304 (= NUM_CUS, 1 wave) is the default — saturates the device.
-    # - grid=152 (= NUM_CUS/2) wins for H=8192 with small B (4096): each
-    #   program gets more rows to chew so the dgamma write amortises and the
-    #   dg_partial cache footprint shrinks.
-    if H >= 16384 and B <= 4096:
-        # Native huge H + small B: half-wave grid (152) wins on MI325X because
-        # each program covers ~27 rows so the dgamma store amortises better
-        # and dg_partial halves to (152, H), making the finalize cheaper.
-        # Sweep on N=4096,C=16384 showed grid=152/nw=8/ns=1 at ~120µs vs
-        # ~126µs for full-wave (grid=304). Gated on the *actual* H (not the
-        # pow2-rounded BLOCK_H) because H=12288 prefers full wave.
-        grid = min(B, _num_cus() // 2)
-        num_warps = 8
-        num_stages = 1
-    elif BLOCK_H >= 16384 and B <= 4096:
-        # H in (8192, 16384) and small B (e.g. H=12288). Full wave wins here.
-        grid = min(B, _num_cus())
-        num_warps = 8
-        num_stages = 2
-    elif BLOCK_H >= 8192 and B <= 4096:
-        # H=8192, small B: half-wave gives each program more rows to chew so
-        # the dgamma write amortises better.
-        grid = min(B, _num_cus() // 2)
-        num_warps = 8
-        num_stages = 1
-    elif BLOCK_H >= 8192:
-        # Wide H, larger B: full wave, drop ns to relieve register pressure.
-        grid = min(B, _num_cus())
-        num_warps = 4
-        num_stages = 2
-    else:
-        # H in (256, 4096]: full wave, nw=8 amortises BLOCK_H per program.
-        grid = min(B, _num_cus())
-        num_warps = 8 if BLOCK_H >= 2048 else 4
-        num_stages = 2
-
-    return "grid", BLOCK_H, grid, num_warps, num_stages
+    # Half-wave grid wins when B is small AND (H==8192 or H>=16384): each
+    # program covers more rows, amortising the dgamma store and shrinking
+    # dg_partial. H=12288 (BLOCK_H rounds to 16384) prefers full wave.
+    half_wave = B <= 4096 and (H >= 16384 or (BLOCK_H == 8192 and H <= 8192))
+    grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
+    return "grid", BLOCK_H, grid, 0, 0
 
 
 def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
-    """Reduce a [n_parts, H] fp32 partial buffer to dgamma[H] in ``gamma_dtype``.
-
-    Uses a column-major coalesced Triton reduction (one program per BLOCK_H
-    tile of H, walks n_parts rows in BLOCK_N-sized chunks with tl.sum tree
-    reduction). Tuned on MI325X: a (64,64) tile with nw=2 dominates the
-    previous (256,16) tile across every shape we ship — the smaller column
-    tile lets more programs run concurrently (more CUs occupied) while the
-    larger BLOCK_N=64 row chunk amortises the launch + dgamma write per
-    program. Also beats ``dg_partial.sum(dim=0).to(...)`` at every (n_parts,
-    H) we care about.
-    """
+    """Reduce [n_parts, H] fp32 partials to dgamma[H] via a coalesced col-tile."""
     n_parts, H = dg_partial.shape
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
-    # (BLOCK_H=64, BLOCK_N=64, nw=2) is the universal winner on MI300/325X
-    # across every (n_parts, H) we sweep. Clamp BLOCK_H to next_pow2(H) so
-    # tiny H doesn't over-pad, and clamp BLOCK_N to a power of two >= 1 so
-    # tl.sum's tree reduction stays legal when n_parts is small.
     BLOCK_H = 64 if H >= 64 else _next_pow2(H)
     BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
     grid = ((H + BLOCK_H - 1) // BLOCK_H,)
