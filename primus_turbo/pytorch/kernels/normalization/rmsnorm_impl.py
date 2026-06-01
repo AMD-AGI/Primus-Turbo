@@ -45,11 +45,7 @@ def _reshape_batch_hidden(x: torch.Tensor, H: int) -> torch.Tensor:
 
 
 def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
-    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd.
-
-    Multi-row mode (ROWS_PER_BLOCK > 1) wins when H is small AND B is huge,
-    because the grid size of one program per row becomes the bottleneck.
-    """
+    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd."""
     BLOCK_H = _next_pow2(H)
     if BLOCK_H <= 256 and B >= 4096:
         ROWS = 16 if BLOCK_H <= 128 else 8
@@ -69,32 +65,26 @@ def _num_cus(device_index: int = 0) -> int:
 
 
 def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
-    """Pick (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd.
-
-    Modes: "multi" (2D-tile for small H + huge B), "single" (one row per
-    program for tiny H/B), "grid" (persistent grid-stride for everything
-    wider; num_warps/num_stages are unused — picked by @triton.autotune).
-    """
+    """Return (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd."""
     BLOCK_H = _next_pow2(H)
     if BLOCK_H <= 256 and B >= 4096:
-        # ROWS=64 at BLOCK_H<=128 keeps the program count <= ~2 waves even at
-        # B=32768, which slashes the dg_partial volume and finalize time.
         if BLOCK_H <= 128:
             return "multi", BLOCK_H, 64, 4, 3
         return "multi", BLOCK_H, 8, 4, 2
     if BLOCK_H <= 256:
         return "single", BLOCK_H, 1, 1, 1
 
-    # Half-wave grid wins when B is small AND (H==8192 or H>=16384): each
-    # program covers more rows, amortising the dgamma store and shrinking
-    # dg_partial. H=12288 (BLOCK_H rounds to 16384) prefers full wave.
-    half_wave = B <= 4096 and (H >= 16384 or (BLOCK_H == 8192 and H <= 8192))
+    # Half-wave grid when each program would otherwise get few rows and the
+    # row is wide. Threshold scales with device CU count.
+    rows_per_program = max(1, B // _num_cus())
+    wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
+    half_wave = rows_per_program <= 13 and wide_row
     grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
     return "grid", BLOCK_H, grid, 0, 0
 
 
 def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
-    """Reduce [n_parts, H] fp32 partials to dgamma[H] via a coalesced col-tile."""
+    """Reduce (n_parts, H) fp32 partials to dgamma[H]."""
     n_parts, H = dg_partial.shape
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
     BLOCK_H = 64 if H >= 64 else _next_pow2(H)
@@ -176,12 +166,7 @@ def rmsnorm_bwd_impl(
     num_warps: int,
     num_stages: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward launcher. Returns ``(dx [B, H], dgamma [H])``.
-
-    The fwd's chosen ``(BLOCK_H, ROWS, num_warps, num_stages)`` are accepted
-    for API compatibility but ignored — bwd re-picks a config tuned for its
-    own arithmetic intensity (see ``_pick_bwd_config``).
-    """
+    """Backward launcher. Returns (dx [B, H], dgamma [H])."""
     H = gamma.shape[0]
     B = x2.shape[0]
     dy2 = _reshape_batch_hidden(dy, H)

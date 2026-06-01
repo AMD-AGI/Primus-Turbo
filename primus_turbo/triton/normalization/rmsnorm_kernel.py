@@ -29,7 +29,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# Grid-stride bwd autotune set. Picked per (BLOCK_H, B, num_programs) at JIT.
+# Autotune candidates for the grid-stride bwd kernels.
 _GRID_STRIDE_BWD_CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=1),
     triton.Config({}, num_warps=4, num_stages=2),
@@ -38,9 +38,7 @@ _GRID_STRIDE_BWD_CONFIGS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Forward kernel — one row per program. Used when H is large.
-# ---------------------------------------------------------------------------
+# Forward — one row per program. Used when H is large.
 @triton.jit
 def rmsnorm_fwd_kernel(
     X_ptr,
@@ -71,10 +69,7 @@ def rmsnorm_fwd_kernel(
     tl.store(RSTD_ptr + row, rstd)
 
 
-# ---------------------------------------------------------------------------
-# Forward kernel — N rows per program (small H, huge B). Reduces grid size,
-# which is critical when the launch / scheduling cost dominates.
-# ---------------------------------------------------------------------------
+# Forward — N rows per program.
 @triton.jit
 def rmsnorm_fwd_kernel_multi_row(
     X_ptr,
@@ -114,13 +109,7 @@ def rmsnorm_fwd_kernel_multi_row(
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 
-# ---------------------------------------------------------------------------
-# Forward kernel — fused residual add. Computes
-#     x_plus_r = x + residual
-#     y        = rmsnorm(x_plus_r) * gamma
-# in one pass and exposes ``x_plus_r`` for the next residual add. Saves
-# ``x_plus_r`` (input dtype) and ``rstd`` (fp32) for backward.
-# ---------------------------------------------------------------------------
+# Forward — fused residual add.
 @triton.jit
 def rmsnorm_fwd_residual_kernel(
     X_ptr,
@@ -214,9 +203,7 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 
-# ---------------------------------------------------------------------------
-# Backward — stage 0: per-row dx + per-row (or per-program) partial dgamma.
-# ---------------------------------------------------------------------------
+# Backward — one row per program.
 @triton.jit
 def rmsnorm_bwd_kernel(
     DY_ptr,
@@ -314,10 +301,7 @@ def rmsnorm_bwd_kernel_multi_row(
     tl.store(dgp_ptrs, dgp_row, mask=h_mask)
 
 
-# ---------------------------------------------------------------------------
-# Backward — fused residual variant. Adds the gradient that flows through
-# ``x_plus_r`` (consumed by the next residual add) to the standard RMSNorm dx.
-# ---------------------------------------------------------------------------
+# Backward — fused residual.
 @triton.jit
 def rmsnorm_bwd_residual_kernel(
     DY_ptr,
@@ -367,14 +351,7 @@ def rmsnorm_bwd_residual_kernel(
     tl.store(dgp_ptrs, dgp, mask=mask)
 
 
-# ---------------------------------------------------------------------------
-# Backward — grid-stride variant. Each program processes one row per loop
-# step and grid-strides (row += num_programs) until it has covered its
-# share of B. A per-program fp32 dgamma accumulator is kept live in
-# registers across all rows and a single partial slab (one per program) is
-# written at exit. This matches the HIP stage-0 pattern and drastically
-# shrinks the dg_partial buffer (n_parts == grid_size, not B).
-# ---------------------------------------------------------------------------
+# Backward — persistent grid-stride. dgamma accumulator stays in registers; n_parts = num_programs.
 @triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_kernel_grid_stride(
@@ -400,13 +377,9 @@ def rmsnorm_bwd_kernel_grid_stride(
     h_offs = tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
 
-    # Load gamma once; reused across every row this program touches.
     g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
-
-    # Per-program dgamma accumulator stays in registers/LDS for the whole loop.
     dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    # Grid-stride over rows. Each program covers ceil(B / num_programs) rows.
     for row in range(pid, B, num_programs):
         x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
         dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
@@ -483,11 +456,7 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)
 
 
-# ---------------------------------------------------------------------------
-# Backward — finalize: reduce the (n_parts, H) fp32 partial buffer down to
-# the final dgamma[H] in the gamma dtype. Each program owns BLOCK_H columns
-# and walks the n_parts rows. Coalesced column loads, single launch.
-# ---------------------------------------------------------------------------
+# Backward finalize — reduces (n_parts, H) fp32 partials to dgamma[H].
 @triton.jit
 def rmsnorm_bwd_finalize_kernel(
     DGP_ptr,
@@ -497,14 +466,6 @@ def rmsnorm_bwd_finalize_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Tree-reduce a (n_parts, H) fp32 partial buffer to dgamma[H].
-
-    Tiling: each program owns one BLOCK_H column tile. It walks the rows in
-    chunks of BLOCK_N, loads a (BLOCK_N, BLOCK_H) tile, and uses ``tl.sum``
-    along axis=0 — that gives a tree reduction inside the tile and keeps the
-    error chain depth ~ log2(n_parts) instead of linear, matching PyTorch's
-    ``sum(dim=0)`` fp32 accuracy.
-    """
     pid = tl.program_id(0)
     h_offs = pid * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
