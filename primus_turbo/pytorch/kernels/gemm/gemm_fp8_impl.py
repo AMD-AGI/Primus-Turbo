@@ -315,11 +315,102 @@ class GEMMFP8TurboBackend(KernelBackend):
         )
 
 
+class GEMMFP8FlyDSLBackend(KernelBackend):
+    """FlyDSL blockscale-preshuffle FP8 GEMM backend (gfx942 / gfx950).
+
+    Handles two BLOCKWISE layouts, both built on the same forward MFMA kernel
+    ``C[M, OUT] = A[M, CON] @ B[OUT, CON]^T`` (1D-block A, 2D-block B):
+
+      - forward / NT (``trans_b=True``):
+            out[M, N] = (a * a_scale) @ (b * b_scale)^T          CON=K, OUT=N
+      - dgrad / NN  (``trans_b=False``):
+            grad_a[M, K] = grad_out[M, N] @ b[N, K]              CON=N, OUT=K
+        (reuses the NT kernel by transposing the 2D-block weight + its scale)
+
+    The wgrad / TN layout (``trans_a=True, trans_b=False, trans_c=True``) uses a
+    dedicated native 1Dx1D blockscale kernel (per-output-column ``scale_b``):
+            grad_b[N, K] = grad_out[M, N]^T @ a[M, K]            CON=M
+        Both operands are column-quantized (1D-block along M).
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.BLOCKWISE}
+
+    # FlyDSL's blockscale MFMA path is e4m3 * e4m3 -> bf16/fp16 only.
+    SUPPORTED_DTYPES = {
+        (float8_e4m3, float8_e4m3, torch.float16),
+        (float8_e4m3, float8_e4m3, torch.bfloat16),
+    }
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ) -> bool:
+        if granularity not in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES:
+            return False
+        if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES:
+            return False
+
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+
+        # Forward NT (trans_b=True) and dgrad NN (trans_b=False): trans_a=False,
+        # trans_c=False. Logical k = contraction (NT: k=K; NN: k=N).
+        if (not trans_a) and (not trans_c):
+            from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+
+            return flydsl_blockwise_gemm_supported(m, n, k)
+
+        # wgrad TN: trans_a=True, trans_b=False, trans_c=True. Logical (m=K, n=N,
+        # k=M) with k = contraction M; native 1Dx1D kernel.
+        if trans_a and (not trans_b) and trans_c:
+            from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+
+            return flydsl_blockwise_wgrad_supported(m, n, k)
+
+        return False
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+    ):
+        # wgrad TN: a=a_col[M,K], b=grad_out_col[M,N], trans_a=True, trans_c=True.
+        if trans_a and trans_c:
+            from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_wgrad
+
+            return gemm_fp8_blockwise_flydsl_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
+        if trans_b:  # forward NT
+            from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl
+
+            return gemm_fp8_blockwise_flydsl(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
+        # dgrad NN: grad_a[M,K] = grad_out[M,N] @ b[N,K]
+        from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_dgrad
+
+        return gemm_fp8_blockwise_flydsl_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
+
 _GEMM_FP8_BACKENDS = {
     BackendType.TURBO: BackendEntry(GEMMFP8TurboBackend),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP8HipBLASLtBackend),
     BackendType.CK: BackendEntry(GEMMFP8CKBackend),
     BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFP8FlyDSLBackend),
 }
 
 

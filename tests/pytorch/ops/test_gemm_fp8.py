@@ -29,6 +29,44 @@ from tests.pytorch.test_utils import compute_snr
 torch.manual_seed(42)
 
 
+def _skip_if_flydsl_unsupported(
+    backend: BackendType | None,
+    granularity: ScalingGranularity,
+    format: Format,
+    layout: str | None = None,
+) -> None:
+    """Skip cases the FLYDSL backend cannot handle.
+
+    FLYDSL is the BLOCKWISE FP8 backend for the production NT-forward training
+    flow:
+      - forward NT (trans_a=F, trans_b=T, trans_c=F)
+      - dgrad NN   (trans_a=F, trans_b=F, trans_c=F)   (autograd of NT-fwd)
+      - wgrad TN   (trans_a=T, trans_b=F, trans_c=T)   (autograd of NT-fwd)
+
+    The NN-forward path (``layout="NN"``) drives its own wgrad to
+    ``trans_a=T, trans_b=F, trans_c=F``, which is not in this set, so those
+    cases are skipped here rather than failing the dispatcher.
+    """
+    if backend != BackendType.FLYDSL:
+        return
+    try:
+        from primus_turbo.flydsl.gemm import is_flydsl_available
+
+        if not is_flydsl_available():
+            pytest.skip("FlyDSL not available on this host")
+    except Exception:
+        pytest.skip("FlyDSL not installed")
+    if granularity != ScalingGranularity.BLOCKWISE:
+        pytest.skip("FLYDSL backend only supports BLOCKWISE granularity")
+    if format != Format.E4M3:
+        pytest.skip("FLYDSL backend only supports E4M3 (no E5M2 / HYBRID)")
+    if layout is not None and layout != "NT":
+        pytest.skip(
+            "FLYDSL backend is built for NT-forward training; "
+            "NN-forward's wgrad layout (T,F,F) is not supported"
+        )
+
+
 def _run_gemm_fp8_test(
     m: int,
     n: int,
@@ -45,6 +83,8 @@ def _run_gemm_fp8_test(
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    _skip_if_flydsl_unsupported(backend, granularity, format, layout)
 
     # Set backend and auto_tune config
     GlobalBackendManager.set_gemm_backend(backend)
@@ -128,6 +168,8 @@ def _run_gemm_fp8_deterministic_test(
     """Determinism + correctness check for gemm_fp8 on a small set of configs."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+    _skip_if_flydsl_unsupported(backend, granularity, format, layout)
 
     # Keep deterministic test focused: no autotune (reduces variability).
     GlobalBackendManager.set_gemm_backend(backend)
@@ -301,7 +343,9 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.FLYDSL]
+)
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
     _run_gemm_fp8_test(
@@ -641,6 +685,31 @@ def test_gemm_fp8_blockwise_deterministic(m, n, k, layout, format, dtype, backen
 @pytest.mark.parametrize("backend", [BackendType.TRITON])
 @pytest.mark.deterministic
 def test_gemm_fp8_blockwise_triton_deterministic(m, n, k, layout, format, dtype, backend):
+    _run_gemm_fp8_deterministic_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        block_size=128,
+    )
+
+
+# FLYDSL backend only supports BLOCKWISE E4M3 -> bf16/fp16; M / N / K must be
+# multiples of 128 so all three layouts (NT / NN / TN) satisfy the kernel's
+# scale-block divisibility constraints in fwd + dgrad + wgrad.
+@pytest.mark.parametrize("m", [256, 512])
+@pytest.mark.parametrize("n", [1024, 4096])
+@pytest.mark.parametrize("k", [1024, 4096])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.deterministic
+def test_gemm_fp8_blockwise_flydsl_deterministic(m, n, k, layout, format, dtype, backend):
     _run_gemm_fp8_deterministic_test(
         m=m,
         n=n,
