@@ -6,6 +6,7 @@
 """Python-side wrappers that launch the Triton RMSNorm kernels."""
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -62,10 +63,12 @@ def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
     return BLOCK_H, 1, 16, 2
 
 
-# MI300/MI325X have 304 CUs. One wave per CU saturates the device for this
-# grid-stride kernel; pushing to 2 waves spreads dg accumulators thinner and
-# inflates the finalize input.
-_NUM_CUS = 304
+# One wave per CU saturates the device for the grid-stride bwd kernel;
+# pushing to 2 waves spreads dg accumulators thinner and inflates the
+# finalize input. CU count is queried per-device and cached.
+@functools.lru_cache(maxsize=None)
+def _num_cus(device_index: int = 0) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
@@ -103,28 +106,28 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
         # Sweep on N=4096,C=16384 showed grid=152/nw=8/ns=1 at ~120µs vs
         # ~126µs for full-wave (grid=304). Gated on the *actual* H (not the
         # pow2-rounded BLOCK_H) because H=12288 prefers full wave.
-        grid = min(B, _NUM_CUS // 2)
+        grid = min(B, _num_cus() // 2)
         num_warps = 8
         num_stages = 1
     elif BLOCK_H >= 16384 and B <= 4096:
         # H in (8192, 16384) and small B (e.g. H=12288). Full wave wins here.
-        grid = min(B, _NUM_CUS)
+        grid = min(B, _num_cus())
         num_warps = 8
         num_stages = 2
     elif BLOCK_H >= 8192 and B <= 4096:
         # H=8192, small B: half-wave gives each program more rows to chew so
         # the dgamma write amortises better.
-        grid = min(B, _NUM_CUS // 2)
+        grid = min(B, _num_cus() // 2)
         num_warps = 8
         num_stages = 1
     elif BLOCK_H >= 8192:
         # Wide H, larger B: full wave, drop ns to relieve register pressure.
-        grid = min(B, _NUM_CUS)
+        grid = min(B, _num_cus())
         num_warps = 4
         num_stages = 2
     else:
         # H in (256, 4096]: full wave, nw=8 amortises BLOCK_H per program.
-        grid = min(B, _NUM_CUS)
+        grid = min(B, _num_cus())
         num_warps = 8 if BLOCK_H >= 2048 else 4
         num_stages = 2
 
