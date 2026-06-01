@@ -12,6 +12,7 @@ Dispatch policy:
 - Backward: use csrc when sink is None; use triton when sink is not None
 """
 
+import inspect
 from typing import Any, Optional, Tuple
 
 import torch
@@ -27,6 +28,8 @@ from aiter.ops.triton.attention.mha import (
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 from primus_turbo.pytorch.core.backend import KernelBackend
+
+_FWD_ACCEPTS_OUT = "out" in inspect.signature(_flash_attn_forward).parameters
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -117,25 +120,21 @@ class AttnFwdAiterBackend(KernelBackend):
             out = torch.empty((batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device)
 
         if sink is None:
-            _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-                q,
-                k,
-                v,
-                dropout_p,
-                softmax_scale,
-                causal,
-                window_size_left,
-                window_size_right,
+            fwd_args = (
+                q, k, v, dropout_p, softmax_scale, causal,
+                window_size_left, window_size_right,
                 0,  # sink_size
-                bias,
-                alibi_slopes,
-                None,  # q_descale
-                None,  # k_descale
-                None,  # v_descale
-                return_lse,
-                return_softmax,
-                out=out,
+                bias, alibi_slopes,
+                None, None, None,  # q/k/v_descale
+                return_lse, return_softmax,
             )
+            if _FWD_ACCEPTS_OUT:
+                _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+                    *fwd_args, out=out,
+                )
+            else:
+                aiter_out, softmax_lse, S_dmask, rng_state = _flash_attn_forward(*fwd_args)
+                out.copy_(aiter_out)
         else:
             if max_seqlen_q is None:
                 max_seqlen_q = q.size(1)
