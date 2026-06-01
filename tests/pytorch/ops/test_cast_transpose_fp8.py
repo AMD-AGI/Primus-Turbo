@@ -341,7 +341,7 @@ def test_dbias_dgelu_cast_transpose_correctness(orig_dtype, dest_dtype, shape):
     trans_ref = cast_ref.t().contiguous()
 
     amax_fused = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    dact_fp8, dact_t_fp8, si_fused, grad_bias = dbias_dgelu_cast_transpose_fp8(
+    dact_fp8, dact_t_fp8, si_fused, grad_bias, dact_bf16 = dbias_dgelu_cast_transpose_fp8(
         grad_output,
         x,
         bias,
@@ -353,6 +353,8 @@ def test_dbias_dgelu_cast_transpose_correctness(orig_dtype, dest_dtype, shape):
     assert dact_fp8.shape == (M, N)
     assert dact_t_fp8.shape == (N, M)
     assert grad_bias.shape == (N,)
+    assert dact_bf16.shape == (M, N)
+    assert dact_bf16.dtype == torch.bfloat16
 
     diff = (dact_fp8.float() - cast_ref.float()).abs()
     mismatch_frac = (diff > 0).float().mean().item()
@@ -382,7 +384,7 @@ def test_dbias_dgelu_cast_transpose_bias_grad(orig_dtype, dest_dtype, shape):
     expected_grad_bias = dact_ref.sum(dim=0)
 
     scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
-    _, _, _, grad_bias = dbias_dgelu_cast_transpose_fp8(
+    _, _, _, grad_bias, _ = dbias_dgelu_cast_transpose_fp8(
         grad_output,
         x,
         bias,
@@ -409,7 +411,7 @@ def test_dbias_dgelu_cast_transpose_amax(orig_dtype, dest_dtype, shape):
 
     scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
     amax_out = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    dbias_dgelu_cast_transpose_fp8(
+    _, _, _, _, _ = dbias_dgelu_cast_transpose_fp8(
         grad_output,
         x,
         bias,
@@ -434,7 +436,7 @@ def test_dbias_dgelu_cast_transpose_compile(orig_dtype, dest_dtype, shape):
     scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
     amax_buf = torch.zeros((), dtype=torch.float32, device=DEVICE)
 
-    dact_eager, dact_t_eager, si_eager, gb_eager = dbias_dgelu_cast_transpose_fp8(
+    dact_eager, dact_t_eager, si_eager, gb_eager, dbf16_eager = dbias_dgelu_cast_transpose_fp8(
         grad_output,
         x,
         bias,
@@ -457,9 +459,61 @@ def test_dbias_dgelu_cast_transpose_compile(orig_dtype, dest_dtype, shape):
         )
 
     amax_compiled = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    dact_c, dact_t_c, si_c, gb_c = fn(grad_output, x, bias, scale, amax_compiled)
+    dact_c, dact_t_c, si_c, gb_c, dbf16_c = fn(grad_output, x, bias, scale, amax_compiled)
 
     torch.testing.assert_close(dact_c, dact_eager, atol=0, rtol=0)
     torch.testing.assert_close(dact_t_c, dact_t_eager, atol=0, rtol=0)
     torch.testing.assert_close(si_c, si_eager, atol=0, rtol=0)
     torch.testing.assert_close(gb_c, gb_eager, atol=0, rtol=0)
+    torch.testing.assert_close(dbf16_c, dbf16_eager, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Dual-output bf16 correctness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e5m2, turbo.float8_e4m3])
+@pytest.mark.parametrize("shape", DBIAS_SHAPES)
+def test_dbias_dgelu_dual_output_bf16_matches_unfused(orig_dtype, dest_dtype, shape):
+    """The bf16 dual output matches the unfused _gelu_tanh_backward path.
+
+    This is the critical test for the merged FusedBiasGeluFP8LinearFunction:
+    the bf16 dact from the fused kernel must match what the unfused backward
+    produces (via _gelu_tanh_backward in bf16), ensuring no convergence
+    degradation from the fusion.
+    """
+    torch.manual_seed(42)
+    M, N = shape
+    grad_output = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    x = torch.randn(shape, device=DEVICE, dtype=orig_dtype)
+    bias = torch.randn(N, device=DEVICE, dtype=orig_dtype)
+
+    dact_ref = _gelu_tanh_backward_ref(grad_output, x.float() + bias.float())
+    dact_ref_bf16 = dact_ref.to(torch.bfloat16)
+
+    scale = _make_scale(dact_ref.to(orig_dtype), dest_dtype)
+    _, _, _, _, dact_bf16 = dbias_dgelu_cast_transpose_fp8(
+        grad_output,
+        x,
+        bias,
+        dest_dtype,
+        scale,
+    )
+
+    # The kernel computes dact in fp32 then truncates to bf16; the reference
+    # also goes fp32 -> bf16. They should differ by at most 1 ULP due to
+    # tanh implementation differences. bf16 ULP is value-dependent (eps * 2^exp);
+    # threshold here is 1 bf16 ULP at the observed magnitude.
+    diff = (dact_bf16.float() - dact_ref_bf16.float()).abs()
+    max_diff = diff.max().item()
+    max_mag = dact_ref_bf16.float().abs().max().item()
+    bf16_eps = torch.finfo(torch.bfloat16).eps
+    # 1 ULP at magnitude m is roughly bf16_eps * 2^floor(log2(m)). We bound by
+    # bf16_eps * max(1, max_mag) to cover both tiny and large value ranges.
+    one_ulp_at_max = bf16_eps * max(1.0, max_mag)
+    assert max_diff <= one_ulp_at_max + 1e-6, (
+        f"Max bf16 dact diff {max_diff} exceeds 1 bf16 ULP at observed magnitude "
+        f"{max_mag} (1 ULP={one_ulp_at_max}, bf16 eps={bf16_eps})"
+    )

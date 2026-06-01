@@ -423,6 +423,7 @@ def _dbias_dgelu_cast_transpose_kernel(
     Bias_ptr,
     C_ptr,
     T_ptr,
+    Dact_bf16_ptr,
     PBias_ptr,
     stride_gm,
     stride_gn,
@@ -432,6 +433,8 @@ def _dbias_dgelu_cast_transpose_kernel(
     stride_cn,
     stride_tm,
     stride_tn,
+    stride_dm,
+    stride_dn,
     stride_pbm,
     stride_pbn,
     M,
@@ -491,6 +494,10 @@ def _dbias_dgelu_cast_transpose_kernel(
     pb_ptrs = PBias_ptr + pid_m.to(tl.int64) * stride_pbm + rn * stride_pbn
     tl.store(pb_ptrs, partial_dbias, mask=bias_mask)
 
+    # bf16 dact store (high-precision gradient for backprop to prior layers)
+    d_ptrs = Dact_bf16_ptr + rm[:, None] * stride_dm + rn[None, :] * stride_dn
+    tl.store(d_ptrs, dact.to(tl.bfloat16), mask=mask)
+
     # FP8 quantize + row-major store
     scaled = dact * scale
     scaled = tl.clamp(scaled, -max_fp8, max_fp8)
@@ -528,11 +535,13 @@ def dbias_dgelu_cast_transpose_fp8(
     fp8_dtype: torch.dtype,
     scale: torch.Tensor,
     amax_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused dGELU(tanh) backward + bias_grad + FP8 cast + transpose + amax.
 
-    Computes GELU'(x + bias) * grad_output, quantizes to FP8, and produces
-    both row-major and transposed outputs plus the bias gradient.
+    Computes GELU'(x + bias) * grad_output in fp32, then produces:
+      - bf16 dact for high-precision gradient backprop to prior layers
+      - FP8 dact (row-major + transposed) for backward GEMMs
+      - bias gradient
 
     Args:
         grad_output: 2D gradient tensor [M, N] (bf16 or f16).
@@ -543,11 +552,12 @@ def dbias_dgelu_cast_transpose_fp8(
         amax_out: Optional scalar float32 tensor for amax capture.
 
     Returns:
-        (dact_fp8, dact_t_fp8, scale_inv, grad_bias) where:
+        (dact_fp8, dact_t_fp8, scale_inv, grad_bias, dact_bf16) where:
           dact_fp8:   [M, N] FP8 tensor (row-major)
           dact_t_fp8: [N, M] FP8 tensor (contiguous transpose)
           scale_inv:  scalar float32, 1/scale
           grad_bias:  [N] float32 bias gradient
+          dact_bf16:  [M, N] bf16 tensor (high-precision dGELU output)
     """
     assert grad_output.ndim == 2, f"Expected 2D grad_output, got {grad_output.ndim}D"
     assert x.ndim == 2, f"Expected 2D x, got {x.ndim}D"
@@ -566,6 +576,7 @@ def dbias_dgelu_cast_transpose_fp8(
 
     dact_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=x.device)
     dact_t_fp8 = torch.empty((N, M), dtype=fp8_dtype, device=x.device)
+    dact_bf16 = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     scale_inv = torch.empty((), dtype=torch.float32, device=x.device)
 
     compute_amax = amax_out is not None
@@ -574,8 +585,6 @@ def dbias_dgelu_cast_transpose_fp8(
     else:
         amax_out.zero_()
 
-    # Allocate for the worst case (smallest BLOCK_M = 64 from autotune configs).
-    # Zero-initialize so that unused rows from larger BLOCK_M don't corrupt the sum.
     max_grid_m = triton.cdiv(M, 64)
     partial_dbias = torch.zeros(
         (max_grid_m, N),
@@ -591,6 +600,7 @@ def dbias_dgelu_cast_transpose_fp8(
         bias,
         dact_fp8,
         dact_t_fp8,
+        dact_bf16,
         partial_dbias,
         grad_output.stride(0),
         grad_output.stride(1),
@@ -600,6 +610,8 @@ def dbias_dgelu_cast_transpose_fp8(
         dact_fp8.stride(1),
         dact_t_fp8.stride(0),
         dact_t_fp8.stride(1),
+        dact_bf16.stride(0),
+        dact_bf16.stride(1),
         partial_dbias.stride(0),
         partial_dbias.stride(1),
         M,
@@ -613,7 +625,7 @@ def dbias_dgelu_cast_transpose_fp8(
 
     grad_bias = partial_dbias.sum(dim=0)
 
-    return dact_fp8, dact_t_fp8, scale_inv, grad_bias
+    return dact_fp8, dact_t_fp8, scale_inv, grad_bias, dact_bf16
 
 
 @dbias_dgelu_cast_transpose_fp8.register_fake
@@ -624,11 +636,12 @@ def _dbias_dgelu_cast_transpose_fp8_meta(
     fp8_dtype: torch.dtype,
     scale: torch.Tensor,
     amax_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = x.shape
     return (
         torch.empty((M, N), dtype=fp8_dtype, device=x.device),
         torch.empty((N, M), dtype=fp8_dtype, device=x.device),
         torch.empty((), dtype=torch.float32, device=x.device),
         torch.empty((N,), dtype=torch.float32, device=x.device),
+        torch.empty((M, N), dtype=torch.bfloat16, device=x.device),
     )
