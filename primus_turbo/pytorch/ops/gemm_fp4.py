@@ -139,13 +139,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(
                 use_2d_block=False,
-                use_sr=False,
+                use_sr=ctx.config.use_gradient_sr,
                 use_rht=False,
                 shuffle_scale=enable_preshuffle(),
             ),
             scaling_recipe_for_trans=ScalingRecipe(
                 use_2d_block=False,
-                use_sr=False,
+                use_sr=ctx.config.use_gradient_sr,
                 use_rht=True,
                 shuffle_scale=enable_preshuffle(),
                 shuffle_out=False,
