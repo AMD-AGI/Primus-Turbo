@@ -96,9 +96,18 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     # - grid=152 (= NUM_CUS/2) wins for H=8192 with small B (4096): each
     #   program gets more rows to chew so the dgamma write amortises and the
     #   dg_partial cache footprint shrinks.
-    if BLOCK_H >= 16384 and B <= 4096:
-        # Very wide H + small B: full wave, ns=2 lets the compiler hide load
-        # latency despite the huge BLOCK_H.
+    if H >= 16384 and B <= 4096:
+        # Native huge H + small B: half-wave grid (152) wins on MI325X because
+        # each program covers ~27 rows so the dgamma store amortises better
+        # and dg_partial halves to (152, H), making the finalize cheaper.
+        # Sweep on N=4096,C=16384 showed grid=152/nw=8/ns=1 at ~120µs vs
+        # ~126µs for full-wave (grid=304). Gated on the *actual* H (not the
+        # pow2-rounded BLOCK_H) because H=12288 prefers full wave.
+        grid = min(B, _NUM_CUS // 2)
+        num_warps = 8
+        num_stages = 1
+    elif BLOCK_H >= 16384 and B <= 4096:
+        # H in (8192, 16384) and small B (e.g. H=12288). Full wave wins here.
         grid = min(B, _NUM_CUS)
         num_warps = 8
         num_stages = 2
@@ -127,16 +136,21 @@ def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torc
 
     Uses a column-major coalesced Triton reduction (one program per BLOCK_H
     tile of H, walks n_parts rows in BLOCK_N-sized chunks with tl.sum tree
-    reduction). Much faster than the generic ``dg_partial.sum(dim=0).to(...)``
-    when n_parts is large.
+    reduction). Tuned on MI325X: a (64,64) tile with nw=2 dominates the
+    previous (256,16) tile across every shape we ship — the smaller column
+    tile lets more programs run concurrently (more CUs occupied) while the
+    larger BLOCK_N=64 row chunk amortises the launch + dgamma write per
+    program. Also beats ``dg_partial.sum(dim=0).to(...)`` at every (n_parts,
+    H) we care about.
     """
     n_parts, H = dg_partial.shape
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
-    # 256 hits the sweet spot for coalesced bf16/fp16 stores on MI300/325X.
-    BLOCK_H = 256 if H >= 256 else _next_pow2(H)
-    # BLOCK_N=16 gives a (16,256)=4KB fp32 tile per iter, keeps reg pressure
-    # tiny, and bounds the sequential add chain to ceil(n_parts/16) levels.
-    BLOCK_N = 16 if n_parts >= 16 else _next_pow2(max(n_parts, 1))
+    # (BLOCK_H=64, BLOCK_N=64, nw=2) is the universal winner on MI300/325X
+    # across every (n_parts, H) we sweep. Clamp BLOCK_H to next_pow2(H) so
+    # tiny H doesn't over-pad, and clamp BLOCK_N to a power of two >= 1 so
+    # tl.sum's tree reduction stays legal when n_parts is small.
+    BLOCK_H = 64 if H >= 64 else _next_pow2(H)
+    BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
     grid = ((H + BLOCK_H - 1) // BLOCK_H,)
     rmsnorm_bwd_finalize_kernel[grid](
         dg_partial,
@@ -145,7 +159,7 @@ def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torc
         H=H,
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=2,
         num_stages=1,
     )
     return dg
