@@ -29,9 +29,17 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+# Autotune candidates for the grid-stride bwd kernels.
+_GRID_STRIDE_BWD_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=2),
+]
+
 
 # ---------------------------------------------------------------------------
-# Forward kernel — one row per program. Used when H is large.
+# Forward — one row per program.
 # ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_kernel(
@@ -64,8 +72,7 @@ def rmsnorm_fwd_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Forward kernel — N rows per program (small H, huge B). Reduces grid size,
-# which is critical when the launch / scheduling cost dominates.
+# Forward — N rows per program.
 # ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_kernel_multi_row(
@@ -107,11 +114,7 @@ def rmsnorm_fwd_kernel_multi_row(
 
 
 # ---------------------------------------------------------------------------
-# Forward kernel — fused residual add. Computes
-#     x_plus_r = x + residual
-#     y        = rmsnorm(x_plus_r) * gamma
-# in one pass and exposes ``x_plus_r`` for the next residual add. Saves
-# ``x_plus_r`` (input dtype) and ``rstd`` (fp32) for backward.
+# Forward — fused residual add.
 # ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_residual_kernel(
@@ -155,6 +158,9 @@ def rmsnorm_fwd_residual_kernel(
     tl.store(RSTD_ptr + row, rstd)
 
 
+# ---------------------------------------------------------------------------
+# Forward — fused residual add, N rows per program.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_fwd_residual_kernel_multi_row(
     X_ptr,
@@ -207,51 +213,9 @@ def rmsnorm_fwd_residual_kernel_multi_row(
 
 
 # ---------------------------------------------------------------------------
-# Backward — stage 0: per-row dx + per-row (or per-program) partial dgamma.
+# Backward — 2D tile over (ROWS_PER_BLOCK, BLOCK_H). Writes one partial
+# dgamma slab per program.
 # ---------------------------------------------------------------------------
-@triton.jit
-def rmsnorm_bwd_kernel(
-    DY_ptr,
-    X_ptr,
-    G_ptr,
-    RSTD_ptr,
-    DX_ptr,
-    DG_PART_ptr,
-    stride_xb,
-    stride_xh,
-    stride_dyb,
-    stride_dyh,
-    stride_dxb,
-    stride_dxh,
-    stride_dgb,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    x_ptrs = X_ptr + row * stride_xb + offs * stride_xh
-    dy_ptrs = DY_ptr + row * stride_dyb + offs * stride_dyh
-    dx_ptrs = DX_ptr + row * stride_dxb + offs * stride_dxh
-    dgp_ptrs = DG_PART_ptr + row * stride_dgb + offs
-    g_ptrs = G_ptr + offs
-
-    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(RSTD_ptr + row).to(tl.float32)
-
-    x_hat = x * rstd
-    dxhat = dy * g
-    m = tl.sum(dxhat * x_hat, axis=0) / H
-    dx = (dxhat - x_hat * m) * rstd
-    dgp = dy * x_hat
-
-    tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=mask)
-    tl.store(dgp_ptrs, dgp, mask=mask)
-
-
 @triton.jit
 def rmsnorm_bwd_kernel_multi_row(
     DY_ptr,
@@ -307,11 +271,64 @@ def rmsnorm_bwd_kernel_multi_row(
 
 
 # ---------------------------------------------------------------------------
-# Backward — fused residual variant. Adds the gradient that flows through
-# ``x_plus_r`` (consumed by the next residual add) to the standard RMSNorm dx.
+# Backward — persistent grid-stride. dgamma accumulator stays in registers
+# across the row loop; n_parts == num_programs (not B).
 # ---------------------------------------------------------------------------
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
-def rmsnorm_bwd_residual_kernel(
+def rmsnorm_bwd_kernel_grid_stride(
+    DY_ptr,
+    X_ptr,
+    G_ptr,
+    RSTD_ptr,
+    DX_ptr,
+    DG_PART_ptr,
+    stride_xb,
+    stride_xh,
+    stride_dyb,
+    stride_dyh,
+    stride_dxb,
+    stride_dxh,
+    stride_dgp,
+    B,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    num_programs: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+
+    g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for row in range(pid, B, num_programs):
+        x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
+        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
+        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
+
+        x = tl.load(x_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+
+        x_hat = x * rstd
+        dxhat = dy * g
+        m = tl.sum(dxhat * x_hat, axis=0) / H
+        dx = (dxhat - x_hat * m) * rstd
+        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+
+        dg_acc += dy * x_hat
+
+    dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
+    tl.store(dgp_ptrs, dg_acc, mask=h_mask)
+
+
+# ---------------------------------------------------------------------------
+# Backward — persistent grid-stride, fused residual variant.
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
+@triton.jit
+def rmsnorm_bwd_residual_kernel_grid_stride(
     DY_ptr,
     DXPR_ptr,
     XPR_ptr,
@@ -327,38 +344,72 @@ def rmsnorm_bwd_residual_kernel(
     stride_dxprh,
     stride_dxb,
     stride_dxh,
-    stride_dgb,
+    stride_dgp,
+    B,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    num_programs: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
+    pid = tl.program_id(0)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
 
-    xpr_ptrs = XPR_ptr + row * stride_xprb + offs * stride_xprh
-    dy_ptrs = DY_ptr + row * stride_dyb + offs * stride_dyh
-    dxpr_ptrs = DXPR_ptr + row * stride_dxprb + offs * stride_dxprh
-    dx_ptrs = DX_ptr + row * stride_dxb + offs * stride_dxh
-    dgp_ptrs = DG_PART_ptr + row * stride_dgb + offs
-    g_ptrs = G_ptr + offs
+    g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    xpr = tl.load(xpr_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
-    dxpr = tl.load(dxpr_ptrs, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+    for row in range(pid, B, num_programs):
+        xpr_ptrs = XPR_ptr + row * stride_xprb + h_offs * stride_xprh
+        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
+        dxpr_ptrs = DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh
+        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
 
-    x_hat = xpr * rstd
-    dxhat = dy * g
-    m = tl.sum(dxhat * x_hat, axis=0) / H
-    dx_norm = (dxhat - x_hat * m) * rstd
-    dx = dx_norm + dxpr
-    dgp = dy * x_hat
+        xpr = tl.load(xpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
 
-    tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=mask)
-    tl.store(dgp_ptrs, dgp, mask=mask)
+        x_hat = xpr * rstd
+        dxhat = dy * g
+        m = tl.sum(dxhat * x_hat, axis=0) / H
+        dx_norm = (dxhat - x_hat * m) * rstd
+        dx = dx_norm + dxpr
+        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+
+        dg_acc += dy * x_hat
+
+    dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
+    tl.store(dgp_ptrs, dg_acc, mask=h_mask)
 
 
+# ---------------------------------------------------------------------------
+# Backward finalize — reduces (n_parts, H) fp32 partials to dgamma[H].
+# ---------------------------------------------------------------------------
+@triton.jit
+def rmsnorm_bwd_finalize_kernel(
+    DGP_ptr,
+    DG_ptr,
+    n_parts,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h_offs = pid * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    n_offs = tl.arange(0, BLOCK_N)
+    for p in range(0, n_parts, BLOCK_N):
+        rows = p + n_offs
+        row_mask = rows < n_parts
+        ptrs = DGP_ptr + rows[:, None] * H + h_offs[None, :]
+        tile = tl.load(ptrs, mask=row_mask[:, None] & h_mask[None, :], other=0.0)
+        acc += tl.sum(tile, axis=0)
+    tl.store(DG_ptr + h_offs, acc.to(DG_ptr.dtype.element_ty), mask=h_mask)
+
+
+# ---------------------------------------------------------------------------
+# Backward — 2D tile, fused residual variant.
+# ---------------------------------------------------------------------------
 @triton.jit
 def rmsnorm_bwd_residual_kernel_multi_row(
     DY_ptr,

@@ -6,14 +6,16 @@
 """Python-side wrappers that launch the Triton RMSNorm kernels."""
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
 
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
-    rmsnorm_bwd_kernel,
+    rmsnorm_bwd_finalize_kernel,
+    rmsnorm_bwd_kernel_grid_stride,
     rmsnorm_bwd_kernel_multi_row,
-    rmsnorm_bwd_residual_kernel,
+    rmsnorm_bwd_residual_kernel_grid_stride,
     rmsnorm_bwd_residual_kernel_multi_row,
     rmsnorm_fwd_kernel,
     rmsnorm_fwd_kernel_multi_row,
@@ -41,11 +43,7 @@ def _reshape_batch_hidden(x: torch.Tensor, H: int) -> torch.Tensor:
 
 
 def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
-    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages).
-
-    Multi-row mode (ROWS_PER_BLOCK > 1) wins when H is small AND B is huge,
-    because the grid size of one program per row becomes the bottleneck.
-    """
+    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd."""
     BLOCK_H = _next_pow2(H)
     if BLOCK_H <= 256 and B >= 4096:
         ROWS = 16 if BLOCK_H <= 128 else 8
@@ -57,6 +55,50 @@ def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
     if BLOCK_H <= 4096:
         return BLOCK_H, 1, 8, 2
     return BLOCK_H, 1, 16, 2
+
+
+@functools.lru_cache(maxsize=None)
+def _num_cus(device_index: int = 0) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
+    """Return (mode, BLOCK_H, GRID_OR_ROWS, num_warps, num_stages) for bwd."""
+    BLOCK_H = _next_pow2(H)
+    if BLOCK_H <= 256:
+        # ROWS targets ~half-wave program count; cap by register budget at BLOCK_H=256.
+        cap = 64 if BLOCK_H <= 128 else 8
+        target = max(1, _num_cus() // 2)
+        ROWS = min(cap, max(1, _next_pow2(B // target)))
+        ns = 3 if BLOCK_H <= 128 else 2
+        return "multi", BLOCK_H, ROWS, 4, ns
+
+    # Half-wave grid when each program would otherwise get few rows and H is wide.
+    rows_per_program = max(1, B // _num_cus())
+    wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
+    half_wave = rows_per_program <= 13 and wide_row
+    grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
+    return "grid", BLOCK_H, grid, 0, 0
+
+
+def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
+    """Reduce (n_parts, H) fp32 partials to dgamma[H]."""
+    n_parts, H = dg_partial.shape
+    dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
+    BLOCK_H = 64 if H >= 64 else _next_pow2(H)
+    BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
+    grid = ((H + BLOCK_H - 1) // BLOCK_H,)
+    rmsnorm_bwd_finalize_kernel[grid](
+        dg_partial,
+        dg,
+        n_parts,
+        H=H,
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=BLOCK_N,
+        num_warps=2,
+        num_stages=1,
+    )
+    return dg
 
 
 def rmsnorm_fwd_impl(
@@ -122,37 +164,17 @@ def rmsnorm_bwd_impl(
     num_warps: int,
     num_stages: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward launcher. Returns ``(dx [B, H], dgamma [H])``."""
+    """Backward launcher. Returns (dx [B, H], dgamma [H])."""
     H = gamma.shape[0]
     B = x2.shape[0]
     dy2 = _reshape_batch_hidden(dy, H)
     dx = torch.empty_like(x2)
-    if ROWS == 1:
-        dg_partial = torch.empty(B, H, device=x2.device, dtype=torch.float32)
-        rmsnorm_bwd_kernel[(B,)](
-            dy2,
-            x2,
-            gamma,
-            rstd,
-            dx,
-            dg_partial,
-            x2.stride(0),
-            x2.stride(1),
-            dy2.stride(0),
-            dy2.stride(1),
-            dx.stride(0),
-            dx.stride(1),
-            dg_partial.stride(0),
-            H=H,
-            BLOCK_H=BLOCK_H,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
+    mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
+    if mode == "multi":
+        ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
-        grid = (num_programs,)
-        rmsnorm_bwd_kernel_multi_row[grid](
+        rmsnorm_bwd_kernel_multi_row[(num_programs,)](
             dy2,
             x2,
             gamma,
@@ -173,7 +195,29 @@ def rmsnorm_bwd_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    dg = dg_partial.sum(dim=0).to(gamma.dtype)
+    else:  # "grid": persistent grid-stride
+        num_programs = GR
+        dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
+        rmsnorm_bwd_kernel_grid_stride[(num_programs,)](
+            dy2,
+            x2,
+            gamma,
+            rstd,
+            dx,
+            dg_partial,
+            x2.stride(0),
+            x2.stride(1),
+            dy2.stride(0),
+            dy2.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            dg_partial.stride(0),
+            B=B,
+            H=H,
+            BLOCK_H=BLOCK_H,
+            num_programs=num_programs,
+        )
+    dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
 
 
@@ -270,35 +314,12 @@ def rmsnorm_bwd_residual_impl(
     else:
         dxpr2 = _reshape_batch_hidden(dxpr, H)
     dx = torch.empty_like(x_plus_r)
-    if ROWS == 1:
-        dg_partial = torch.empty(B, H, device=x_plus_r.device, dtype=torch.float32)
-        rmsnorm_bwd_residual_kernel[(B,)](
-            dy2,
-            dxpr2,
-            x_plus_r,
-            gamma,
-            rstd,
-            dx,
-            dg_partial,
-            x_plus_r.stride(0),
-            x_plus_r.stride(1),
-            dy2.stride(0),
-            dy2.stride(1),
-            dxpr2.stride(0),
-            dxpr2.stride(1),
-            dx.stride(0),
-            dx.stride(1),
-            dg_partial.stride(0),
-            H=H,
-            BLOCK_H=BLOCK_H,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
+    mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
+    if mode == "multi":
+        ROWS = GR
         num_programs = (B + ROWS - 1) // ROWS
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
-        grid = (num_programs,)
-        rmsnorm_bwd_residual_kernel_multi_row[grid](
+        rmsnorm_bwd_residual_kernel_multi_row[(num_programs,)](
             dy2,
             dxpr2,
             x_plus_r,
@@ -322,5 +343,30 @@ def rmsnorm_bwd_residual_impl(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    dg = dg_partial.sum(dim=0).to(gamma.dtype)
+    else:  # "grid": persistent grid-stride
+        num_programs = GR
+        dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
+        rmsnorm_bwd_residual_kernel_grid_stride[(num_programs,)](
+            dy2,
+            dxpr2,
+            x_plus_r,
+            gamma,
+            rstd,
+            dx,
+            dg_partial,
+            x_plus_r.stride(0),
+            x_plus_r.stride(1),
+            dy2.stride(0),
+            dy2.stride(1),
+            dxpr2.stride(0),
+            dxpr2.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            dg_partial.stride(0),
+            B=B,
+            H=H,
+            BLOCK_H=BLOCK_H,
+            num_programs=num_programs,
+        )
+    dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
