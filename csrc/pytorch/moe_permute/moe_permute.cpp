@@ -65,11 +65,12 @@ permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64
     auto max_num_dispatched_tokens = expert_map.size(0);
     auto device                    = expert_map.device();
     auto int_opts                  = at::TensorOptions().dtype(at::kInt).device(device);
+    auto long_opts                 = at::TensorOptions().dtype(at::kLong).device(device);
 
     auto row_id_map = at::empty(
         {static_cast<int64_t>(max_num_dispatched_tokens + pad_multiple), 2 * num_local_experts + 1},
         int_opts);
-    auto tokens_per_expert = at::empty({num_local_experts}, int_opts);
+    auto tokens_per_expert = at::empty({num_local_experts}, long_opts);
     auto overflow_flag     = at::empty({1}, int_opts);
     // ``at::zeros`` keeps the init CUDA-graph-capturable (no host sync).
     auto num_dispatched_tokens = at::zeros({1}, int_opts);
@@ -81,7 +82,7 @@ permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64
         reinterpret_cast<expert_map_type *>(expert_map.data_ptr()), num_topk,                      \
         num_dispatched_tokens.data_ptr<int>(), static_cast<int>(num_local_experts),                \
         static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),               \
-        tokens_per_expert.data_ptr<int>(), row_id_map.data_ptr<int>(),                             \
+        tokens_per_expert.data_ptr<int64_t>(), row_id_map.data_ptr<int>(),                         \
         overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens),                  \
         static_cast<int>(probs_topk_stride), stream);
 

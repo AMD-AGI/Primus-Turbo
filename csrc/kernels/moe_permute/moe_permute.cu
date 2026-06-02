@@ -83,7 +83,7 @@ template <int kNumThreads, typename expert_map_t>
 __launch_bounds__(kNumThreads, 1) __global__
     void permute_preprocessing_kernel(const expert_map_t *expert_map, int max_num_dispatched_tokens,
                                       int *num_dispatched_tokens_out, int num_experts, int num_topk,
-                                      int pad_multiple, int32_t *tokens_per_expert, int *row_id_map,
+                                      int pad_multiple, int64_t *tokens_per_expert, int *row_id_map,
                                       int *overflow_flag, int64_t num_permuted_tokens,
                                       int probs_topk_stride, TempStorageLayout layout) {
     using BlockScan   = hipcub::BlockScan<int32_t, kNumThreads>;
@@ -304,10 +304,10 @@ __launch_bounds__(kNumThreads, 1) __global__
 
     if (block_id == grid_size - 1) {
         if (thread_id < E) {
-            const int tokens_for_expert = s_acc[thread_id] + s_num_padded[thread_id];
-            const int overflow          = tokens_for_expert + s_tpe_prefix[thread_id] - npt;
-            tokens_per_expert[thread_id] =
-                (overflow < 0) ? tokens_for_expert : max(0, tokens_for_expert - overflow);
+            const int tokens_for_expert  = s_acc[thread_id] + s_num_padded[thread_id];
+            const int overflow           = tokens_for_expert + s_tpe_prefix[thread_id] - npt;
+            tokens_per_expert[thread_id] = static_cast<int64_t>(
+                (overflow < 0) ? tokens_for_expert : max(0, tokens_for_expert - overflow));
         }
         if (thread_id == 0)
             *num_dispatched_tokens_out = s_total_dispatched;
@@ -364,7 +364,7 @@ template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
-                                int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
+                                int64_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
                                 int64_t num_permuted_tokens, int probs_topk_stride,
                                 hipStream_t stream) {
     constexpr int kNumThreads = 512;
@@ -384,7 +384,7 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
 
     int device_id = 0;
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
-    const int num_cu = get_multi_processor_count(device_id);
+    const int        num_cu              = get_multi_processor_count(device_id);
     static const int max_shmem_per_block = get_max_shmem_per_block(device_id);
 
     const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
@@ -674,7 +674,8 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
 
     const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
 
-    // unpermute_kernel_e1 hard-codes probs row width 1 (multihot only); topk path uses num_topk at E=1.
+    // unpermute_kernel_e1 hard-codes probs row width 1 (multihot only); topk path uses num_topk at
+    // E=1.
     if (num_local_experts == 1 && effective_probs_stride == 1) {
         constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;

@@ -112,7 +112,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
     ``pad_multiple`` padding.
 
     Fully nosync / CUDA-graph capturable requires all three:
-    ``deepep_num_worst_tokens > 0``, ``num_permuted_tokens > 0``,
+    ``deepep_num_worst_tokens > 0``, ``permute_max_token_num > 0``,
     ``deepep_use_cuda_num_tokens_per_expert=True``.
 
     Args:
@@ -122,7 +122,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         permute_fusion: deprecated; ``moe_permute`` is always fused.
         pad_multiple: pad per-expert permuted count to this multiple
             (set to grouped-GEMM ``BLOCK_M``).
-        num_permuted_tokens: caller-provided cap; ``> 0`` removes the sum-item host sync.
+        permute_max_token_num: caller-provided cap; ``> 0`` removes the sum-item host sync.
         deepep_use_comm_stream: when False, pin EP kernels to the current stream.
         deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
         deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
@@ -142,7 +142,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         expert_capacity_factor: Optional[float] = None,
         permute_fusion: Optional[bool] = None,
         pad_multiple: int = 0,
-        num_permuted_tokens: int = -1,
+        permute_max_token_num: int = -1,
         deepep_async_finish: bool = True,
         deepep_allocate_on_comm_stream: bool = True,
         deepep_use_comm_stream: bool = False,
@@ -181,7 +181,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.capacity_factor = expert_capacity_factor
 
         self.pad_multiple = pad_multiple
-        self.num_permuted_tokens = num_permuted_tokens
+        self.permute_max_token_num = permute_max_token_num
 
         self.deepep_async_finish = deepep_async_finish
         self.deepep_allocate_on_comm_stream = deepep_allocate_on_comm_stream
@@ -290,8 +290,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
         # Both dispatcher and moe_permute use -1 to mean "unspecified" (sync path).
-        num_permuted_tokens = self.num_permuted_tokens
-
         self.hidden_shape_before_permute = hidden_states.shape
         assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
 
@@ -310,7 +308,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             num_local_experts=self.num_local_experts,
             num_topk=self.router_topk,
             pad_multiple=self.pad_multiple,
-            num_permuted_tokens=num_permuted_tokens,
+            num_permuted_tokens=self.permute_max_token_num,
             probs=dispatched_probs,
         )
 
