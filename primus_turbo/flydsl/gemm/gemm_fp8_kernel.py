@@ -1951,6 +1951,15 @@ if _FLYDSL_OK:
         # asm_mma resolved from param (production) or env (probing).
         _asm_mma_mode = str(asm_mma) if asm_mma in (1, 2) else os.environ.get("TN_ASM_MMA", "0")
         _asm_mma = _asm_mma_mode in ("1", "2")
+        # asm-inplace (=a,v,v,0; D aliases C in AGPR): move 128 accum/lane OUT of
+        # VGPR into AGPR. Eliminates the accvgpr-copy + spill (vspill 18→0) on
+        # the asm-MMA path, so the steady loop drops the scratch traffic that
+        # was padding the MFMA dependency chain. det0 (no overlap race; AGPR
+        # accum disjoint from mfma-src). big-K 2747→2809 (+2.3%), big-N marginal
+        # (2D-band already optimal). gated TN_INPLACE; needs an AGPR budget.
+        _inplace = bool(int(os.environ.get("TN_INPLACE", "1"))) and _asm_mma
+        if _inplace and agpr_alloc == 0:
+            agpr_alloc = 128
         # asm-mma mode 1 pins accumulators to VGPR (`v`) so it REQUIRES
         # agpr_alloc==0; mode 2 uses an explicit `a` (AGPR) constraint. Either
         # way bypass the intrinsic-path inline-asm-load agpr guard.
@@ -2090,6 +2099,9 @@ if _FLYDSL_OK:
             gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS)
 
             mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+            if _inplace:
+                _mm = _asm_mma_mode
+                mfma._do_mma = (lambda _a, _b, _c, _m=_mm: _asm_mma_do(_a, _b, _c, mode=_m))
 
             a_g2s = _G2SLoaderStride(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id,
                                       chunk_stride=_LDS_CS)
@@ -3298,6 +3310,36 @@ def _autotune_tn_dispatch(args, M, N, K):
                     us = e0.elapsed_time(e1)*1000.0/20
                     if us < best_us:
                         best_us = us; best = (launch, (256, gm2, 32, 0x7F))
+                except Exception:
+                    continue
+        # big-N inplace candidate: inline-A + asm_mma=2 → asm-inplace MFMA
+        # (accum→AGPR, spill 18→0). Marginal over the intrinsic-A 2D-band path
+        # (2657→2691, ~+1.3%), det0 over 3x2000 fresh-data. Bench picks if
+        # fastest (no-op when 2D-band intrinsic-A wins).
+        for gm2 in (4, 2):
+            for gn2 in (n_blocks // 8, n_blocks // 16):
+                if gn2 < 2 or M % 256 != 0:
+                    continue
+                try:
+                    launch = _compile_dense_tn(
+                        K=K, BLOCK_M=256, BLOCK_N=256, GROUP_M=gm2,
+                        agpr_alloc=0, inline_asm_load=False,
+                        a_inline_asm=1, b_inline_asm=1, barrier_mask=0x7F,
+                        vmcnt_hint=3, asm_mma=2, group_n=gn2,
+                    )
+                    c = _get_compiled_dense(launch, args)
+                    c(*args); _torch.cuda.synchronize()
+                    if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                        continue
+                    for _ in range(2): c(*args)
+                    _torch.cuda.synchronize()
+                    e0 = _torch.cuda.Event(enable_timing=True); e1 = _torch.cuda.Event(enable_timing=True)
+                    _torch.cuda.synchronize(); e0.record()
+                    for _ in range(20): c(*args)
+                    e1.record(); _torch.cuda.synchronize()
+                    us = e0.elapsed_time(e1)*1000.0/20
+                    if us < best_us:
+                        best_us = us; best = (launch, (256, gm2, 0, 0x7F))
                 except Exception:
                     continue
     # Big-K (K>=28672) drain-removal win config: BOTH A+B path-J (removes the
