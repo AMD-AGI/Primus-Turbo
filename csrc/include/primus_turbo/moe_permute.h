@@ -13,7 +13,7 @@ template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
-                                int32_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
+                                int64_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
                                 int64_t num_permuted_tokens, int probs_topk_stride,
                                 hipStream_t stream);
 

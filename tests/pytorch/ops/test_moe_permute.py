@@ -108,7 +108,7 @@ def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hid
     assert int(ndtt.item()) == num_tokens
     torch.testing.assert_close(
         tokens_per_expert.cpu(),
-        routing_map.sum(dim=0).to(torch.int32).cpu(),
+        routing_map.sum(dim=0).to(torch.int64).cpu(),
     )
     permuted_tokens.backward(grad_perm, retain_graph=True)
 

@@ -84,7 +84,7 @@ class _MoEPermute(torch.autograd.Function):
         if num_dispatched == 0:
             int_opts = dict(dtype=torch.int32, device=device)
             row_id_map = torch.zeros((pad_multiple, 2 * num_local_experts + 1), **int_opts)
-            tokens_per_expert = torch.zeros((num_local_experts,), **int_opts)
+            tokens_per_expert = torch.zeros((num_local_experts,), dtype=torch.int64, device=device)
             overflow_flag = torch.zeros((1,), **int_opts)
             num_dispatched_tokens = torch.zeros((1,), **int_opts)
             permuted_tokens = tokens.new_empty((0, hidden_size))
