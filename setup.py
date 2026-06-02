@@ -30,13 +30,6 @@ SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
 # try to found rocshmem in default path or enviorment
 ROCSHMEM_LIBRARY = find_rocshmem_library()
 
-# ---------- AITER COMMIT ------------
-
-# PR: Fix dsink bf16 noise in Triton MHA one-kernel backward (#3070)
-AITER_COMMIT = "b5e03ed191fca11ee423226537ef8d9435e432a6"
-
-# -------------------------------------
-
 
 def get_submodule_folders():
     """Parse .gitmodules and return list of submodule paths."""
@@ -436,14 +429,10 @@ if __name__ == "__main__":
 
     # Entry points and Install Requires
     entry_points = {}
-    install_requires = []
-
-    # Conditionally add amd-aiter if torch_ext is being built and amd-aiter is not already installed
-    if torch_ext is not None and not is_package_installed("amd-aiter"):
-        print("[Primus-Turbo Setup] amd-aiter not found, will be installed automatically.")
-        install_requires.append(f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}")
-    else:
-        print("[Primus-Turbo Setup] Skipping amd-aiter installation.")
+    install_requires = [
+        "scipy",
+        "triton>=3.7.0",
+    ]
 
     if torch_ext is not None:
         if is_package_installed("origami"):

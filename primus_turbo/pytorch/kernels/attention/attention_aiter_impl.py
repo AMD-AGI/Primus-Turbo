@@ -15,18 +15,46 @@ Dispatch policy:
 from typing import Any, Optional, Tuple
 
 import torch
-from aiter.ops.mha import (
-    _flash_attn_backward,
-    _flash_attn_forward,
-    _flash_attn_varlen_backward,
-    _flash_attn_varlen_forward,
-)
-from aiter.ops.triton.attention.mha import (
-    _flash_attn_forward as _triton_flash_attn_forward,
-)
-from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 
+from primus_turbo.common.aiter_utils import (
+    check_aiter_version_once,
+    raise_aiter_missing,
+)
 from primus_turbo.pytorch.core.backend import KernelBackend
+
+_AITER_ATTN_KERNELS = None
+
+
+def _get_aiter_attn_kernels():
+    """Lazily import and cache the aiter attention kernels (see aiter_utils)."""
+    global _AITER_ATTN_KERNELS
+    if _AITER_ATTN_KERNELS is None:
+        try:
+            from aiter.ops.mha import (
+                _flash_attn_backward,
+                _flash_attn_forward,
+                _flash_attn_varlen_backward,
+                _flash_attn_varlen_forward,
+            )
+            from aiter.ops.triton.attention.mha import (
+                _flash_attn_forward as _triton_flash_attn_forward,
+            )
+            from aiter.ops.triton.attention.mha_onekernel_bwd import (
+                flash_attn_onekernel_backward as _triton_flash_attn_onekernel_backward,
+            )
+        except ImportError as exc:
+            raise_aiter_missing(exc)
+        check_aiter_version_once()
+        _AITER_ATTN_KERNELS = {
+            "flash_attn_forward": _flash_attn_forward,
+            "flash_attn_backward": _flash_attn_backward,
+            "flash_attn_varlen_forward": _flash_attn_varlen_forward,
+            "flash_attn_varlen_backward": _flash_attn_varlen_backward,
+            "triton_flash_attn_forward": _triton_flash_attn_forward,
+            "triton_flash_attn_onekernel_backward": _triton_flash_attn_onekernel_backward,
+        }
+    return _AITER_ATTN_KERNELS
+
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -117,7 +145,7 @@ class AttnFwdAiterBackend(KernelBackend):
             out = torch.empty((batch_size, seq_len, num_heads_qk, head_dim_v), dtype=q.dtype, device=q.device)
 
         if sink is None:
-            _, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            _, softmax_lse, S_dmask, rng_state = _get_aiter_attn_kernels()["flash_attn_forward"](
                 q,
                 k,
                 v,
@@ -146,7 +174,9 @@ class AttnFwdAiterBackend(KernelBackend):
                 causal, window_size_left, window_size_right
             )
 
-            out, softmax_lse, S_dmask, philox_seed, philox_offset = _triton_flash_attn_forward(
+            out, softmax_lse, S_dmask, philox_seed, philox_offset = _get_aiter_attn_kernels()[
+                "triton_flash_attn_forward"
+            ](
                 q,
                 k,
                 v,
@@ -235,7 +265,7 @@ class AttnBwdAiterBackend(KernelBackend):
         qkv_format: Optional[str] = "bshd",
     ):
         if sink is None:
-            result = _flash_attn_backward(
+            result = _get_aiter_attn_kernels()["flash_attn_backward"](
                 dout,
                 q,
                 k,
@@ -268,7 +298,7 @@ class AttnBwdAiterBackend(KernelBackend):
             philox_seed = int(rng_state[0].item())
             philox_offset = int(rng_state[1].item())
 
-            result = flash_attn_onekernel_backward(
+            result = _get_aiter_attn_kernels()["triton_flash_attn_onekernel_backward"](
                 dout,
                 q,
                 k,
@@ -540,7 +570,7 @@ class AttnFwdAiterVarlenBackend(KernelBackend):
         return_lse: bool,
         return_softmax: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        out, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+        out, softmax_lse, S_dmask, rng_state = _get_aiter_attn_kernels()["flash_attn_varlen_forward"](
             q,
             k,
             v,
@@ -637,7 +667,7 @@ class AttnBwdAiterVarlenBackend(KernelBackend):
         is_v3_atomic_fp32: bool,
         how_v3_bf16_cvt: int,
     ):
-        _flash_attn_varlen_backward(
+        _get_aiter_attn_kernels()["flash_attn_varlen_backward"](
             dout,
             q,
             k,
