@@ -28,27 +28,15 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import (
-    _is_gfx950,
-    _select_params_origami,
-    _set_knobs_gfx950,
-)
+from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950
+from primus_turbo.triton.utils.origami import origama_select_params
+from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants (lazy init)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NUM_XCDS = 8
-_NUM_CUS: int | None = None
-
-
-def _get_num_cus() -> int:
-    """Lazy initialization of CU count (avoids import-time CUDA calls)."""
-    global _NUM_CUS
-    if _NUM_CUS is None:
-        _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return _NUM_CUS
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Cached config selection (avoids per-call origami / LDS overhead)
@@ -58,7 +46,7 @@ def _get_num_cus() -> int:
 @functools.lru_cache(maxsize=256)
 def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
     """Cached kernel config for BF16 grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         is_tn = not trans_b
         BLOCK_M, BLOCK_N = 256, 256
         if is_tn:
@@ -69,7 +57,7 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             avg_m,
             N,
             K,
@@ -91,7 +79,7 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 64 if num_sms >= NUM_XCDS * 64 else 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             avg_m,
             N,
             K,
@@ -112,14 +100,14 @@ def _get_gg_bf16_fwd_config(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
 @functools.lru_cache(maxsize=256)
 def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms):
     """Cached kernel config for BF16 grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         BLOCK_M, BLOCK_N = 256, 256
         BLOCK_K, num_stages_val = 32, 3
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             OUT_M,
             OUT_N,
             avg_k,
@@ -379,10 +367,10 @@ def grouped_gemm_triton_kernel(
     out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
         _get_gg_bf16_fwd_config(avg_m, N, K, a.dtype, b.dtype, trans_b, G, num_sms)
     )
@@ -615,11 +603,11 @@ def grouped_gemm_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_bf16_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
