@@ -30,6 +30,7 @@ class _MoEPermute(torch.autograd.Function):
         probs: Optional[torch.Tensor] = None,
         scales_per_token: int = 0,
         use_fp8: bool = False,
+        probs_topk_stride: int = 0,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -43,25 +44,7 @@ class _MoEPermute(torch.autograd.Function):
         hidden_size = int(tokens.shape[-1])
         num_dispatched = int(tokens.shape[0])
 
-        # Infer probs_stride from row width: num_local_experts → multihot (0); num_topk → topk-aligned.
-        if probs is None:
-            probs_topk_stride = 0
-        else:
-            w = int(probs.shape[1])
-            if w == num_local_experts == num_topk and num_topk > 0:
-                raise ValueError(
-                    f"moe_permute: ambiguous probs layout (num_local_experts == num_topk == {num_topk}); "
-                    "reshape or pad probs so its row width is distinct from both"
-                )
-            if w == num_local_experts:
-                probs_topk_stride = 0
-            elif num_topk > 0 and w == num_topk:
-                probs_topk_stride = num_topk
-            else:
-                raise ValueError(
-                    f"moe_permute: probs.shape[1]={w} must equal num_local_experts="
-                    f"{num_local_experts} or num_topk={num_topk}"
-                )
+        probs_topk_stride = int(probs_topk_stride) if probs is not None else 0
         probs_row_width = probs_topk_stride if probs_topk_stride > 0 else num_local_experts
 
         ctx.num_dispatched = num_dispatched
@@ -226,6 +209,7 @@ class _MoEPermute(torch.autograd.Function):
             grad_probs,  # probs
             None,  # scales_per_token
             None,  # use_fp8
+            None,  # probs_topk_stride
         )
 
 
@@ -362,6 +346,7 @@ def moe_permute(
     num_permuted_tokens: int = -1,
     scaling_factor: Optional[torch.Tensor] = None,
     probs: Optional[torch.Tensor] = None,
+    probs_layout: str = "topk",
     scales_per_token: int = 0,
     use_fp8: bool = False,
 ) -> Tuple[
@@ -379,6 +364,13 @@ def moe_permute(
     num_dispatched_tokens, permuted_scaling_factor, permuted_probs). Pass
     ``num_dispatched_tokens`` straight to ``moe_unpermute``.
     """
+    if probs_layout not in ("routing_map", "topk"):
+        raise ValueError(f"moe_permute: probs_layout must be 'routing_map' or 'topk', got {probs_layout!r}")
+    if probs_layout == "topk" and num_topk <= 0:
+        raise ValueError("moe_permute: probs_layout='topk' requires num_topk > 0")
+
+    probs_topk_stride = num_topk if probs_layout == "topk" else 0
+
     return _MoEPermute.apply(
         tokens,
         expert_map,
@@ -390,6 +382,7 @@ def moe_permute(
         probs,
         scales_per_token,
         use_fp8,
+        probs_topk_stride,
     )
 
 
