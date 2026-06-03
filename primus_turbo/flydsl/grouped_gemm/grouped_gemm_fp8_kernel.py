@@ -40,7 +40,6 @@ from typing import Tuple
 
 import torch
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Lazy FlyDSL imports (so this module loads even if FlyDSL is not installed;
 # can_handle() in the backend layer is the gate that prevents calling us).
@@ -64,9 +63,7 @@ def _flydsl_kernels():
                 "FlyDSL repo root, then ensure the repo root (containing `kernels/`) "
                 "is on PYTHONPATH."
             ) from e
-        flydsl_root = os.path.abspath(
-            os.path.join(os.path.dirname(flydsl.__file__), "..", "..")
-        )
+        flydsl_root = os.path.abspath(os.path.join(os.path.dirname(flydsl.__file__), "..", ".."))
         if flydsl_root not in sys.path:
             sys.path.insert(0, flydsl_root)
         from kernels.grouped_gemm_fp8_pertensor import (  # noqa: E402
@@ -137,9 +134,7 @@ def _broadcast_scale(scale: torch.Tensor, length: int, device: torch.device) -> 
         return torch.full((length,), scalar, dtype=torch.float32, device=device)
     if scale.numel() == length:
         return scale.to(dtype=torch.float32, device=device).contiguous().view(-1)
-    raise ValueError(
-        f"per-tensor wrapper expected scale.numel() in {{1, {length}}}, got {scale.shape}"
-    )
+    raise ValueError(f"per-tensor wrapper expected scale.numel() in {{1, {length}}}, got {scale.shape}")
 
 
 def _build_routing(
@@ -191,7 +186,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
         )
 
     M_total, K_a = a.shape
-    G = b.shape[0]
+    b.shape[0]
     if trans_b:
         N, K_b = b.shape[1], b.shape[2]
     else:
@@ -200,9 +195,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     K = K_a
 
     if K % 128 != 0:
-        raise NotImplementedError(
-            f"FlyDSL grouped GEMM requires K % 128 == 0 (BLOCK_K=128). Got K={K}."
-        )
+        raise NotImplementedError(f"FlyDSL grouped GEMM requires K % 128 == 0 (BLOCK_K=128). Got K={K}.")
 
     # FlyDSL kernel internally expects B in [G, N, K] (K-contig per N-row).
     # If caller passed [G, K, N] (trans_b=False), pre-transpose on host.
@@ -277,13 +270,9 @@ def grouped_gemm_fp8_tensorwise_variable_k_flydsl_kernel(
         out: [G, K_lhs, N_rhs]
     """
     assert lhs.dim() == 2 and rhs.dim() == 2
-    assert lhs.shape[0] == rhs.shape[0], (
-        f"lhs and rhs must share M_total: lhs {lhs.shape}, rhs {rhs.shape}"
-    )
+    assert lhs.shape[0] == rhs.shape[0], f"lhs and rhs must share M_total: lhs {lhs.shape}, rhs {rhs.shape}"
     if out_dtype != torch.bfloat16:
-        raise NotImplementedError(
-            f"FlyDSL variable_k wrapper only emits bf16. Got {out_dtype}."
-        )
+        raise NotImplementedError(f"FlyDSL variable_k wrapper only emits bf16. Got {out_dtype}.")
 
     M_total, K_lhs = lhs.shape
     _, N_rhs = rhs.shape

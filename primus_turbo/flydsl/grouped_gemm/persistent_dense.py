@@ -25,6 +25,10 @@ import os
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _FLYDSL_OK
 
 if _FLYDSL_OK:
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl._mlir.dialects import llvm as _llvm
+    from flydsl.expr import range_constexpr, rocdl
     from kernels.fp8_gemm_utils import (
         G2SLoader,
         Mfma16x16x128,
@@ -35,20 +39,18 @@ if _FLYDSL_OK:
         make_fp8_buffer_tensor,
         wait_barrier,
     )
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-    from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr import range_constexpr, rocdl
 
     from primus_turbo.flydsl.gemm.gemm_fp8_kernel import (
         S2RLoaderTr,
         compute_global_swizzle_nn,
     )
 
-
     @functools.lru_cache(maxsize=128)
     def _compile_dense_nt_persistent(
-        K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, PERSIST_FACTOR: int = 2,
+        K: int,
+        BLOCK_M: int = 256,
+        BLOCK_N: int = 256,
+        PERSIST_FACTOR: int = 2,
         A11_SAMETILE: bool = False,
     ):
         BLOCK_K = 128
@@ -388,10 +390,12 @@ if _FLYDSL_OK:
     # 8 K-rows × 8 N-cols per call so each lane ends up with K-contig fragments
     # in the mfma B-operand format.
 
-
     @functools.lru_cache(maxsize=128)
     def _compile_dense_nn_persistent(
-        K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, PERSIST_FACTOR: int = 2,
+        K: int,
+        BLOCK_M: int = 256,
+        BLOCK_N: int = 256,
+        PERSIST_FACTOR: int = 2,
         B7_SAMETILE: bool = False,
     ):
         BLOCK_K = 128
@@ -684,17 +688,22 @@ if _FLYDSL_OK:
 
         return launch_dense_nn_persistent
 
-
 else:
 
     def _compile_dense_nt_persistent(
-        K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, PERSIST_FACTOR: int = 2,
+        K: int,
+        BLOCK_M: int = 256,
+        BLOCK_N: int = 256,
+        PERSIST_FACTOR: int = 2,
         A11_SAMETILE: bool = False,
     ):
         raise ImportError("FlyDSL is not available -- this entry should be gated by can_handle.")
 
     def _compile_dense_nn_persistent(
-        K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, PERSIST_FACTOR: int = 2,
+        K: int,
+        BLOCK_M: int = 256,
+        BLOCK_N: int = 256,
+        PERSIST_FACTOR: int = 2,
         B7_SAMETILE: bool = False,
     ):
         raise ImportError("FlyDSL is not available -- this entry should be gated by can_handle.")

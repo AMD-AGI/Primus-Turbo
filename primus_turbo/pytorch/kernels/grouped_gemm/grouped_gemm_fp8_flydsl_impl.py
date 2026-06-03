@@ -34,7 +34,6 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e5m2,
 )
 
-
 # Mirror the dtype tuples from grouped_gemm_fp8_impl.py.
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
