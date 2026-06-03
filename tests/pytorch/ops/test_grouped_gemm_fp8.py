@@ -418,7 +418,9 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
 @pytest.mark.parametrize("balance", [True])  # uniform M_g -> var_k gate passes
 @pytest.mark.parametrize("backend", [BackendType.FLYDSL])
 @pytest.mark.parametrize("auto_tune", [False])
-def test_grouped_gemm_fp8_tensorwise_flydsl(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
+def test_grouped_gemm_fp8_tensorwise_flydsl(
+    B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
+):
     N, K = NK
     _run_grouped_gemm_fp8_test(
         B=B,
