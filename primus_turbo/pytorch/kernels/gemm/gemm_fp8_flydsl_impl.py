@@ -88,6 +88,12 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         # K (contraction) must be a multiple of BLOCK_K=128
         _m, _n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
         supported &= (k % 128) == 0
+        # Tile constraints: BLOCK_M min 128, BLOCK_N 256. Off-tile M/N is not
+        # masked, so gate (fall back to another backend) rather than crash.
+        # TODO(flydsl): support arbitrary M (and N) via byte-level addressing,
+        # as done for the bf16 grouped path; then relax these gates.
+        supported &= (_m % 128) == 0
+        supported &= (_n % 256) == 0
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
