@@ -103,6 +103,7 @@ def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hid
         expert_map,
         num_local_experts=num_experts,
         num_topk=0 if expert_map_kind == "routing_map" else num_topk,
+        probs_layout="routing_map",
     )
     assert int(overflow_flag.item()) == 0
     assert int(ndtt.item()) == num_tokens
@@ -154,12 +155,14 @@ def test_moe_permute_pad_multiple(num_topk, pad_multiple):
         routing_map,
         num_local_experts=num_experts,
         pad_multiple=0,
+        probs_layout="routing_map",
     )
     _, _, padded_per_expert, _, _, _, _ = moe_permute(
         tokens,
         routing_map,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
+        probs_layout="routing_map",
     )
 
     expected = ((base_per_expert + pad_multiple - 1) // pad_multiple) * pad_multiple
@@ -217,6 +220,7 @@ def test_overflow_flag(pad_multiple, cap_kind, expected):
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         num_permuted_tokens=cap,
+        probs_layout="routing_map",
     )
     torch.cuda.synchronize()
 
@@ -256,6 +260,7 @@ def test_moe_permute_empty_input(with_probs, pad_multiple):
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         probs=probs,
+        probs_layout="routing_map",
     )
 
     assert permuted_tokens.shape == (0, hidden_size)
@@ -324,6 +329,7 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple):
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
         probs=probs,
+        probs_layout="routing_map",
     )
     assert int(overflow_flag.item()) == 0
     assert permuted_probs is not None
@@ -372,6 +378,7 @@ def test_moe_unpermute_with_probs_fwd_bwd():
         routing_map,
         num_local_experts=num_experts,
         probs=probs,
+        probs_layout="routing_map",
     )
 
     permuted_probs = permuted_probs.detach().clone().requires_grad_(True)
@@ -433,6 +440,7 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
         tokens_turbo,
         routing_map,
         num_local_experts=num_experts,
+        probs_layout="routing_map",
     )
     assert int(overflow_flag.item()) == 0
     permuted_tokens.backward(grad_perm, retain_graph=True)
@@ -482,6 +490,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
         routing_map,
         num_local_experts=num_experts,
         pad_multiple=0,
+        probs_layout="routing_map",
     )
     grad_perm_ref = torch.randn_like(perm_ref)
     perm_ref.backward(grad_perm_ref, retain_graph=True)
@@ -506,6 +515,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
         routing_map,
         num_local_experts=num_experts,
         pad_multiple=pad_multiple,
+        probs_layout="routing_map",
     )
     src_token_pad, _src_expert_pad, total_pad = expected_permuted_layout(routing_map, pad_multiple)
     real_mask_pad = src_token_pad >= 0

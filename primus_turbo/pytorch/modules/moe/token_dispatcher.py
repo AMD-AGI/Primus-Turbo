@@ -310,6 +310,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             pad_multiple=self.pad_multiple,
             num_permuted_tokens=self.permute_max_token_num,
             probs=dispatched_probs,
+            probs_layout="topk",  # dispatched_probs is [num_dispatched, router_topk]
         )
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
