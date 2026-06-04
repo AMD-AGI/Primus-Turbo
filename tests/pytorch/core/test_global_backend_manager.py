@@ -17,7 +17,7 @@ from primus_turbo.pytorch.core.backend import (
 def clean_backend_state(monkeypatch):
     """Reset backend state and clear env vars before/after each test."""
     GlobalBackendManager.reset()
-    GlobalBackendManager._extract_backend_from_env.cache_clear()
+    GlobalBackendManager._clear_env_cache()
     for key in (
         "PRIMUS_TURBO_GEMM_BACKEND",
         "PRIMUS_TURBO_GROUPED_GEMM_BACKEND",
@@ -27,7 +27,7 @@ def clean_backend_state(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     yield
     GlobalBackendManager.reset()
-    GlobalBackendManager._extract_backend_from_env.cache_clear()
+    GlobalBackendManager._clear_env_cache()
 
 
 class TestGlobalBackendManagerEnvVar:
