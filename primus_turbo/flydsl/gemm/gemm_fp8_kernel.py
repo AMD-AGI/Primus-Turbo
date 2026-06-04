@@ -38,13 +38,16 @@ import torch
 
 # isort: off
 # FlyDSL utils must be importable as module globals (@flyc.kernel needs them as
-# globals, not closure cells). `kernels` lives at the FlyDSL repo root, so put
-# that root on sys.path before importing it.
-import flydsl as _flydsl_pkg
-
-_flydsl_root = os.path.abspath(os.path.join(os.path.dirname(_flydsl_pkg.__file__), "..", ".."))
-if _flydsl_root not in sys.path:
-    sys.path.insert(0, _flydsl_root)
+# globals, not closure cells). The `kernels` package is NOT shipped in the
+# `flydsl` pip wheel (it lives at the FlyDSL repo root), so it is vendored as the
+# `3rdparty/FlyDSL` submodule (pinned to the same tag as the pip `flydsl`); put
+# that submodule root on sys.path before importing `kernels`. The compiled
+# `flydsl` compiler itself still comes from the pip install.
+_flydsl_3p_root = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "3rdparty", "FlyDSL")
+)
+if _flydsl_3p_root not in sys.path:
+    sys.path.insert(0, _flydsl_3p_root)
 
 from kernels.fp8_gemm_utils import (
     G2SLoader,
