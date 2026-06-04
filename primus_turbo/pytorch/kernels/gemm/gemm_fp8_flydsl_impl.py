@@ -26,6 +26,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 # Mirror the dtype tuples from gemm_fp8_impl.py so we don't tightly couple.
 _COMMON_SUPPORTED_DTYPES = (
@@ -77,6 +78,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
+        # gfx950 (CDNA4) only: the kernel uses mfma_f32_16x16x128_f8f6f4, absent
+        # on gfx942 and below. Gate here so the dispatcher never picks FlyDSL off
+        # gfx950 (the backend still imports fine on other archs).
+        supported &= get_device_compute_capability() >= (9, 5)
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         supported &= out_dtype in (torch.bfloat16, torch.float16)
