@@ -4,3 +4,6 @@
 [submodule "3rdparty/hipify_torch"]
 	path = 3rdparty/hipify_torch
 	url = https://github.com/ROCm/hipify_torch.git
+[submodule "3rdparty/FlyDSL"]
+	path = 3rdparty/FlyDSL
+	url = https://github.com/ROCm/FlyDSL.git
