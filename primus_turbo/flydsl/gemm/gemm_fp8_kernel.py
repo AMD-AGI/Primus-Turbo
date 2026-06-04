@@ -8,9 +8,9 @@
 
 This file owns the kernel definition end-to-end; it does NOT delegate to
 `kernels.fp8_gemm_8wave` in the FlyDSL repo. The lower-level FlyDSL helpers
-(G2SLoader, S2RLoader, StoreC, Mfma16x16x128, swizzle math) ARE imported from
+(G2SLoader, S2RLoader, Mfma16x16x128, swizzle math) ARE imported from
 `kernels.fp8_gemm_utils` since those are reusable primitives, not the kernel
-orchestration itself.
+orchestration itself. The output store (_StoreCPerTensor) is defined here.
 
 `@flyc.kernel` decorated functions must reference their dependencies as MODULE
 globals (not as closure cells from an enclosing factory), so FlyDSL is imported
@@ -50,7 +50,6 @@ from kernels.fp8_gemm_utils import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,
-    StoreC,
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
@@ -72,37 +71,48 @@ from flydsl.expr.utils.arith import ArithValue
 # isort: on
 
 
-class StoreC16(StoreC):
-    """f32-accumulator -> fp16 output epilogue.
+class _StoreCPerTensor:
+    """Per-tensor (scalar) scaled output store: out = (acc * a_scale * b_scale).to(out_ty).
 
-    Identical to FlyDSL's read-only ``StoreC`` except the output element type
-    is ``Float16`` instead of ``BFloat16``. The scaled value is produced from
-    the f32 accumulator via a single ``.to(fx.Float16)`` (i.e. f32->fp16,
-    matching CK/Triton ``acc.to(C.type.element_ty)``) -- NOT a bf16->fp16
-    round-trip. FlyDSL source is read-only, so the dtype-specific members are
-    overridden here.
+    TENSORWISE scaling is a single scalar, so the two scales are read ONCE per
+    store from length-1 buffers and applied uniformly -- no per-row/col broadcast
+    (the wrapper passes the scalar scales directly, with no length-M/N buffer to
+    materialize). out_ty selects bf16 / fp16 output, produced from the f32
+    accumulator via a single ``.to(out_ty)`` (matches CK/Triton
+    ``acc.to(out_dtype)``). Tile indexing + the OOB column clamp mirror FlyDSL's
+    read-only StoreC; we don't subclass it because the scale handling differs.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # c_nbytes in the base ctor is c_rows*c_cols*2, already correct for
-        # fp16 (2 bytes); only the copy atom / staging reg dtype change.
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.Float16)
-        self.reg_f16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float16)
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.out_ty = out_ty
+        c_nbytes = c_rows * c_cols * 2  # bf16 / fp16 output = 2 bytes
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
+        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
 
-    def _store_f16(self, value_f16, c_index):
-        fx.memref_store_vec(Vec.filled(1, value_f16, fx.Float16), self.reg_f16_1)
-        fx.copy(self.out_atom_1, self.reg_f16_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+    def _load_scalar(self, div):
+        fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
+        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+
+    def _store_one(self, value, c_index):
+        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
+        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
 
     def store(self, c_frag, base_row, base_col):
-        a_scales = [
-            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
-            for i in range_constexpr(self.n_tiles_a)
-        ]
-        b_scales = [
-            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
-            for i in range_constexpr(self.n_tiles_b)
-        ]
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
@@ -111,9 +121,9 @@ class StoreC16(StoreC):
                 oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.Float16)
+                    scaled = (vec_f32[i] * scale).to(self.out_ty)
                     c_index = (row + i) * self.c_cols + col
-                    self._store_f16(scaled, arith.select(col_valid, c_index, oob))
+                    self._store_one(scaled, arith.select(col_valid, c_index, oob))
 
 
 def _a_tail_mask_vec(lane_id, r):
@@ -216,7 +226,7 @@ def _compile_dense_nt(
     nt_vmcnt: int = 3,  # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
-    out_fp16: bool = False,  # True -> StoreC16 (f32->fp16), else StoreC (f32->bf16)
+    out_fp16: bool = False,  # _StoreCPerTensor out dtype: True -> fp16, else bf16
 ):
     """Build & cache the (K, BLOCK_M, BLOCK_N, GROUP_M)-specialised launch.
 
@@ -359,8 +369,8 @@ def _compile_dense_nt(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        _StoreCls = StoreC16 if out_fp16 else StoreC
-        store_c = _StoreCls(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        store_c = _StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -943,7 +953,7 @@ def _compile_dense_nn(
     vmcnt_hint: int = 2,
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
-    out_fp16: bool = False,  # True -> StoreC16 (f32->fp16), else StoreC (f32->bf16)
+    out_fp16: bool = False,  # _StoreCPerTensor out dtype: True -> fp16, else bf16
 ):
     """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
 
@@ -1069,8 +1079,8 @@ def _compile_dense_nn(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoaderTr(wave_n, N_TILES_B, inline_asm=b_inline_asm_load, vmcnt_hint=vmcnt_hint)
-        _StoreCls = StoreC16 if out_fp16 else StoreC
-        store_c = _StoreCls(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        store_c = _StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -1254,7 +1264,7 @@ def _compile_dense_tn(
     group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D band (width group_n)
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
-    out_fp16: bool = False,  # True -> StoreC16 (f32->fp16), else StoreC (f32->bf16)
+    out_fp16: bool = False,  # _StoreCPerTensor out dtype: True -> fp16, else bf16
 ):
     """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
     Both A and B are K-row strided → wave-coop ds_read_b64_tr_b8 on both
@@ -1411,8 +1421,8 @@ def _compile_dense_tn(
         b_s2r = S2RLoaderTr(
             wave_n, N_TILES_B, inline_asm=_b_inline, vmcnt_hint=vmcnt_hint, chunk_stride=_LDS_CS
         )
-        _StoreCls = StoreC16 if out_fp16 else StoreC
-        store_c = _StoreCls(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        store_c = _StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -1596,24 +1606,23 @@ def _get_compiled_dense(launch, args):
 def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:
     # Zero-copy flat byte view. Recomputed every call (no id()-keyed cache: a
     # freed tensor's id + data_ptr can both be reused, and a recycled pair with a
-    # different numel would alias the wrong length -- the bug class that hit
-    # _broadcast_scale). The view ops are ~1us and allocate nothing.
+    # different numel would alias the wrong length). The view ops are ~1us and
+    # allocate nothing.
     if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
         return t.contiguous().view(torch.int8).view(-1)
     return t.contiguous().view(-1)
 
 
-def _broadcast_scale(scale: torch.Tensor, length: int, device: torch.device) -> torch.Tensor:
-    """Tensorwise scalar → contiguous (length,) fp32 buffer.
+def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Tensorwise scalar -> a length-1 fp32 buffer (no broadcast).
 
-    No caching: an id(scale)-keyed cache is unsafe. Under allocation churn a
-    freed scale tensor's Python id AND its data_ptr can both be reused by a new
-    scale tensor holding a *different* value, producing a false cache hit that
-    returns the stale buffer -> wrong scale -> sporadically corrupted output.
-    Always materialize a fresh buffer.
+    The kernel applies it per-tensor (StoreCPerTensor reads the single value and
+    multiplies uniformly), so there is no per-row/col vector to materialize --
+    just an fp32/device cast (a no-op when the input already matches), avoiding
+    the length-M/N copy kernel the old broadcast incurred every call.
     """
     assert scale.numel() == 1, f"per-tensor expects scalar, got {scale.shape}"
-    return scale.to(dtype=torch.float32, device=device).reshape(1).expand(length).contiguous()
+    return scale.to(dtype=torch.float32, device=device).reshape(1)
 
 
 def _aspect_group_m(M, N, bm, bn=256):
@@ -1652,7 +1661,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     best = None
     for bm, ag in _NN_CANDIDATES:
         # odd-M (M % bm != 0) is fine: the partial last M-tile is
-        # bounded by c_m (StoreC clamp) and the global SRD (HW OOB
+        # bounded by c_m (_StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
         gm = _aspect_group_m(M, N, bm)
         try:
@@ -1728,7 +1737,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     best = None
     for bm, ag in _NT_CANDIDATES:
         # odd-M (M % bm != 0) is fine: the partial last M-tile is
-        # bounded by c_m (StoreC clamp) and the global SRD (HW OOB
+        # bounded by c_m (_StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
         gm = _aspect_group_m(M, N, bm)
         try:
@@ -1875,7 +1884,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
     # Per-operand fp8 format -> MFMA cbsz(srcA)/blgp(srcB): 0=E4M3, 1=E5M2.
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
-    # fp16 output uses StoreC16 (f32->fp16); bf16 uses StoreC (f32->bf16).
+    # fp16 vs bf16 output dtype for _StoreCPerTensor (both from the f32 accumulator).
     out_fp16 = out_dtype == torch.float16
 
     if trans_a and (not trans_b):
@@ -1884,8 +1893,8 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         K_b, N = b.shape
         assert K_a == K_b, f"TN K mismatch: a {a.shape}, b {b.shape}"
         K = K_a
-        a_scale_v = _broadcast_scale(a_scale_inv, M, a.device)
-        b_scale_v = _broadcast_scale(b_scale_inv, N, a.device)
+        a_scale_v = _scalar_scale(a_scale_inv, a.device)
+        b_scale_v = _scalar_scale(b_scale_inv, a.device)
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
         # TN: per-shape autotune over the candidate families (general
         # intrinsic-A, big-N 2D-band swizzle, big-N asm-inplace, winK big-K
@@ -1913,8 +1922,8 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         K_b, N = b.shape
         assert K_a == K_b, f"NN K mismatch: a {a.shape}, b {b.shape}"
         K = K_a
-        a_scale_v = _broadcast_scale(a_scale_inv, M, a.device)
-        b_scale_v = _broadcast_scale(b_scale_inv, N, a.device)
+        a_scale_v = _scalar_scale(a_scale_inv, a.device)
+        b_scale_v = _scalar_scale(b_scale_inv, a.device)
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
         # NN: per-shape runtime autotune over the candidate tiles, caches by
         # (M,N,K). Build args before autotune (it benches against them).
@@ -1936,8 +1945,8 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         N, K_b = b.shape
         assert K_a == K_b, f"NT K mismatch: a {a.shape}, b {b.shape}"
         K = K_a
-        a_scale_v = _broadcast_scale(a_scale_inv, M, a.device)
-        b_scale_v = _broadcast_scale(b_scale_inv, N, a.device)
+        a_scale_v = _scalar_scale(a_scale_inv, a.device)
+        b_scale_v = _scalar_scale(b_scale_inv, a.device)
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
         # NT: per-shape runtime autotune over the 8w/v3 candidate tiles, caches
         # by (M,N,K). Build args before autotune (it benches against them).
