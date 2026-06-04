@@ -667,6 +667,11 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tenso
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
     PRIMUS_TURBO_CHECK(input.dim() == 2);
     PRIMUS_TURBO_CHECK(block_size == 128);
+    for (const auto &t : {group_lens, group_offs}) {
+        PRIMUS_TURBO_CHECK(t.is_cuda(), "group_lens / group_offs must be CUDA tensors");
+        PRIMUS_TURBO_CHECK(t.scalar_type() == at::kLong, "group_lens / group_offs must be int64");
+        PRIMUS_TURBO_CHECK(t.is_contiguous(), "group_lens / group_offs must be contiguous");
+    }
 
     const int64_t M          = input.size(0);
     const int64_t N          = input.size(1);

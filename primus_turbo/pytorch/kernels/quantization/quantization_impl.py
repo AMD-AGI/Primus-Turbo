@@ -223,9 +223,12 @@ def quant_fp8_blockwise_for_weight_impl(
         w = w.contiguous()
 
     # HIP fast path (single C++ call → lower host overhead, identical output layout);
-    # Triton kernel fallback when the C++ extension lacks the op. Benefits both the
-    # grouped and non-grouped blockwise paths that quantize weights through here.
-    if hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"):
+    # only when the C++ op is built and block_size == 128 (its only supported size),
+    # else fall through to the Triton kernel. Benefits both the grouped and
+    # non-grouped blockwise paths that quantize weights through here.
+    if block_size == 128 and hasattr(
+        torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"
+    ):
         return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(w, dtype, block_size)
 
     ori_dims = w.dim()
@@ -317,7 +320,13 @@ def quant_fp8_blockwise_segment_m_row_col_impl(
               var_k_group_lens [B], var_k_group_offs [B+1]).
     """
     assert x.is_contiguous() and x.dim() == 2
-    if gemm_other_dim is not None:
+    # HIP fast path: only when the C++ op is built and block_size == 128 (its
+    # only supported size); otherwise fall through to the Triton kernel below.
+    if (
+        gemm_other_dim is not None
+        and block_size == 128
+        and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_segment_m_row_col")
+    ):
         gemm_flops = x.size(0) * x.size(1) * gemm_other_dim
         if gemm_flops <= _HIP_SEGMENT_GEMM_FLOPS_THRESHOLD:
             return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_segment_m_row_col(

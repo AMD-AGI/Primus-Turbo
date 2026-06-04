@@ -1378,7 +1378,10 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
         # group_idx via vector compare; gather (m_start, M_g, tile_start) via mask+sum.
         group_idx = tl.sum((cum_incl_v <= global_tile_id).to(tl.int32), axis=0)
         is_cur = (g_arange == group_idx).to(tl.int32)
-        m_start_g = tl.sum(g_starts.to(tl.int32) * is_cur, axis=0)
+        # Keep m_start_g int64: it is a row offset into A/C and feeds pointer
+        # arithmetic (m_start_g * stride), which overflows int32 once M_total*K
+        # exceeds 2^31. M_g (per-group rows) stays int32 (bounded).
+        m_start_g = tl.sum(g_starts * is_cur.to(tl.int64), axis=0)
         M_g = tl.sum(m_per_g_v * is_cur, axis=0)
         tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
         tile_start = tl.sum(tl.where(g_arange < group_idx, tiles_per_g_v, 0), axis=0)
