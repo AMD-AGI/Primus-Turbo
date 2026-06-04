@@ -449,7 +449,7 @@ def origama_select_params(
     BLK_K = best_cfg.mt.k
 
     elem_bytes_out = _dtype_bits(out_dtype) // 8
-    sk_grid = _compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, hardware.N_CU, elem_bytes_out)
+    sk_grid = origama_compute_sk_grid(M, N, K, BLK_M, BLK_N, BLK_K, hardware.N_CU, elem_bytes_out)
     wgm_result = origami.select_workgroup_mapping(problem, hardware, best_cfg, sk_grid)
     gsize_m = abs(wgm_result.wgm)
 

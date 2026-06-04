@@ -46,7 +46,7 @@ import triton.language as tl
 from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.triton.gemm.gemm_kernel import NUM_XCDS, _chiplet_transform_chunked
 from primus_turbo.triton.utils.origami import (
-    _compute_sk_grid,
+    origama_compute_sk_grid,
     origama_hardware_info,
     origama_select_params,
 )
@@ -109,7 +109,7 @@ def offline_select_fp8(M, N, K, s_ak, s_bk):
     # tiles <= ~5 waves (cu*5): sk_grid for wave efficiency
     # tiles > ~5 waves: data-parallel (avoids regression at tiles>=1792)
     if total_tiles <= cu_count * 5:
-        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
     else:
         num_sms = total_tiles
 
@@ -350,7 +350,7 @@ def gemm_fp8_tensorwise_triton_kernel(
             if min(om, on) >= 128 and ok == block_k:
                 block_m, block_n, group_m = om, on, ogm
 
-        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
@@ -656,7 +656,7 @@ def gemm_fp8_rowwise_triton_kernel(
             if min(om, on) >= 128 and ok == block_k:
                 block_m, block_n, group_m = om, on, ogm
 
-        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
