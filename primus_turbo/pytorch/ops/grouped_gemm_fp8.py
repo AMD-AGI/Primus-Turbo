@@ -29,8 +29,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
-    quant_fp8_blockwise_impl,
-    quant_fp8_blockwise_segment_m_impl,
+    quant_fp8_blockwise_segment_m_row_col_impl,
 )
 
 __all__ = [
@@ -79,8 +78,14 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
-        a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
-            a, a_dtype, axis=1, block_size=config.block_size
+        # One bf16 read of `a` → row-wise (fwd) + segment-padded col-wise (bwd wgrad).
+        # Row scales are pre-shuffled to the persistent GEMM's scale order. gemm_other_dim
+        # = fwd-GEMM N lets the quant pick the HIP fast path on small GEMMs.
+        gemm_n = b.size(-2) if trans_b else b.size(-1)
+        a_fp8_row, a_fp8_col, a_scale_inv_row, a_scale_inv_col, _, _ = (
+            quant_fp8_blockwise_segment_m_row_col_impl(
+                a, a_dtype, config.block_size, group_lens, group_offs, gemm_other_dim=gemm_n
+            )
         )
 
         b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
@@ -98,10 +103,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             granularity=config.granularity.value,
             num_cu=num_cu,
             default_backend=BackendType.TRITON.value,
-        )
-
-        a_fp8_col, a_scale_inv_col, _, _ = quant_fp8_blockwise_segment_m_impl(
-            a, a_dtype, config.block_size, group_lens, group_offs
         )
 
         ctx.save_for_backward(
@@ -135,9 +136,18 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         block_size = ctx.config.block_size
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # Quantize grad_out in row-wise for dgrad
-        grad_out_fp8_row, grad_out_scale_inv_row = quant_fp8_blockwise_impl(
-            grad_out, grad_out_dtype, axis=1, block_size=block_size
+        # One bf16 read of grad_out → row-wise (dgrad) + segment-padded col-wise (wgrad).
+        # gemm_other_dim = bwd-GEMM K lets the quant pick the HIP fast path on small GEMMs.
+        gemm_k = b_fp8.size(-1) if ctx.trans_b else b_fp8.size(-2)
+        (
+            grad_out_fp8_row,
+            grad_out_fp8_col,
+            grad_out_scale_inv_row,
+            grad_out_scale_inv_col,
+            var_k_group_lens,
+            var_k_group_offs,
+        ) = quant_fp8_blockwise_segment_m_row_col_impl(
+            grad_out, grad_out_dtype, block_size, group_lens, group_offs, gemm_other_dim=gemm_k
         )
 
         # grad_a: grad_out @ b^T
@@ -154,17 +164,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
-        )
-
-        # Quantize grad_out with segment padding for wgrad (colwise quantization)
-        grad_out_fp8_col, grad_out_scale_inv_col, var_k_group_lens, var_k_group_offs = (
-            quant_fp8_blockwise_segment_m_impl(
-                grad_out,
-                grad_out_dtype,
-                block_size,
-                group_lens,
-                group_offs,
-            )
         )
 
         grad_b = grouped_gemm_fp8_variable_k_impl(

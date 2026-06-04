@@ -20,7 +20,7 @@ Contains:
     - grouped_gemm_fp8_rowwise_variable_k_triton_kernel: Backward public API
 
   Blockwise scaling:
-    - _grouped_blockwise_fp8_persistent_gemm_kernel: Forward
+    - _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned: Forward
     - _grouped_blockwise_fp8_variable_k_gemm_kernel: Backward variable-K
     - grouped_gemm_fp8_blockwise_triton_kernel: Forward public API
     - grouped_gemm_fp8_blockwise_variable_k_triton_kernel: Backward public API
@@ -43,6 +43,9 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _select_params_origami,
     _set_knobs_gfx950,
 )
+_grouped_blockwise_warmed: set = set()
+_grouped_blockwise_vk_warmed: set = set()
+
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
@@ -1196,8 +1199,44 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# 8-config curated set covering small/medium/large M and N-major/M-major reductions.
+# All BK=128 (winners). Trimmed from a 32-config sweep that always picked one of these.
+def _get_grouped_blockwise_autotune_configs():
+    # BLOCK_SIZE_N pinned to 128: the persistent kernel loads ONE b_scale per
+    # tile (assumes BN == SCALE_BLOCK_N == 128). With BN=256 the kernel applies
+    # the wrong scale to half the output cols → ~10dB SNR drop. There's also a
+    # known MI300X MFMA layout bug on FP8 e4m3fnuz with BN=64/256.
+    return [
+        # small/medium fallback
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=4, num_stages=2),
+        # large-M, M-major
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 64}, num_warps=8, num_stages=1),
+    ]
+
+
+# Used for K % 128 != 0 (masked-tail path); shares the same config sweep as the aligned
+# kernel so unaligned shapes (e.g. GPT-OSS K=2880) are not artificially restricted.
+def _get_grouped_blockwise_autotune_configs_unaligned():
+    return _get_grouped_blockwise_autotune_configs()
+
+
+@triton.autotune(configs=_get_grouped_blockwise_autotune_configs_unaligned(), key=["G", "N", "K"])
 @triton.jit()
-def _grouped_blockwise_fp8_persistent_gemm_kernel(
+def _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned(
     # Pointers
     A,  # [M_total, K] FP8
     B,  # [G, ?, ?] FP8
@@ -1216,8 +1255,8 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     stride_cm,  # C row stride
     stride_cn,  # C col stride
     # A_scales strides (pre-transposed: [K//128, M_total])
-    stride_as_k,  # A_scales_t.stride(0)
-    stride_as_m,  # A_scales_t.stride(1)
+    stride_as_k,  # a_scales.stride(0)
+    stride_as_m,  # a_scales.stride(1)
     # B_scales strides
     stride_bs_g,  # B_scales.stride(0) — group stride
     stride_bs_n,  # stride along N-block dimension
@@ -1362,41 +1401,193 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Blockwise FP8 Variable-K Backward Kernel (persistent, CPU-sync-free)
-#
-# Computes: C[g] = LHS[g]^T @ RHS[g] with 1D+1D block-wise scales
-# ═══════════════════════════════════════════════════════════════════════════════
+# Blockwise FP8 forward v2: K-loop split into outer (scale block, SCALE_BLOCK_K=128)
+# × inner (compute block, BLOCK_SIZE_K). Requires K % SCALE_BLOCK_K == 0.
+# BLOCK_N pinned to 128 (BN=64/256 have an MFMA layout bug on MI300X FP8 e4m3fnuz).
+# BLOCK_M=256 must use BLOCK_K=128 (same bug otherwise).
+@triton.autotune(configs=_get_grouped_blockwise_autotune_configs(), key=["G", "N", "K"])
+@triton.jit()
+def _grouped_blockwise_fp8_persistent_gemm_kernel(
+    A,
+    B,
+    C,
+    A_scales_ptr,
+    B_scales_ptr,
+    group_offs_ptr,
+    G: tl.constexpr,
+    N,
+    K,
+    stride_am,
+    stride_bg,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_as_k,
+    stride_as_m,
+    stride_bs_g,
+    stride_bs_n,
+    stride_bs_k,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CACHE_MODIFIER: tl.constexpr,
+    G_POW2: tl.constexpr,
+):
+    """Grouped blockwise FP8 v2; needs K % SCALE_BLOCK_K == 0."""
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1:
+        pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+
+    SUB_K_ITERS: tl.constexpr = SCALE_BLOCK_K // BLOCK_SIZE_K
+
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    # Vectorise the per-group cumsum so the per-tile group lookup is a single
+    # masked compare+reduce instead of an O(G) carry-dependent scan. tl.arange
+    # needs a power-of-2 bound, so pad to G_POW2 and mask the tail to 0 tiles
+    # (padded groups contribute nothing to cumsum / group_idx selection).
+    g_arange = tl.arange(0, G_POW2)
+    g_valid = g_arange < G
+    g_starts  = tl.load(group_offs_ptr + g_arange, mask=g_valid, other=0)
+    g_ends    = tl.load(group_offs_ptr + g_arange + 1, mask=g_valid, other=0)
+    m_per_g_v = (g_ends - g_starts).to(tl.int32)
+    tiles_per_g_v = tl.cdiv(m_per_g_v, BLOCK_SIZE_M) * num_pid_n
+    cum_incl_v = tl.cumsum(tiles_per_g_v, axis=0)
+    total_tiles = tl.sum(tiles_per_g_v, axis=0)
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    acc_dtype = tl.float32
+
+    for global_tile_id in range(pid, total_tiles, NUM_SMS):
+        # group_idx via vector compare; gather (m_start, M_g, tile_start) via mask+sum.
+        group_idx = tl.sum((cum_incl_v <= global_tile_id).to(tl.int32), axis=0)
+        is_cur = (g_arange == group_idx).to(tl.int32)
+        m_start_g = tl.sum(g_starts.to(tl.int32) * is_cur, axis=0)
+        M_g = tl.sum(m_per_g_v * is_cur, axis=0)
+        tiles_m_g = tl.cdiv(M_g, BLOCK_SIZE_M)
+        tile_start = tl.sum(tl.where(g_arange < group_idx, tiles_per_g_v, 0), axis=0)
+        local_tile = global_tile_id - tile_start
+
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        swizzle_group = local_tile // num_pid_in_group
+        first_pid_m = swizzle_group * GROUP_SIZE_M
+        group_size_m = min(tiles_m_g - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((local_tile % num_pid_in_group) % group_size_m)
+        pid_n = (local_tile % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        group_offset_b = group_idx.to(tl.int64) * stride_bg
+        A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
+        B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+
+        as_ptrs_base = A_scales_ptr + (m_start_g + rm.to(tl.int64)) * stride_as_m
+        bs_ptr_base = B_scales_ptr + group_idx.to(tl.int64) * stride_bs_g + pid_n * stride_bs_n
+
+        # Outer = scale blocks; inner = SUB_K_ITERS dots sharing one (a_s, b_s).
+        loop_kb = K // SCALE_BLOCK_K
+        tl.assume(loop_kb > 1)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+        for kb in range(0, loop_kb):
+            partial = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+            for sub in tl.static_range(SUB_K_ITERS):
+                if stride_ak == 1:
+                    a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
+                else:
+                    a = tl.load(tl.multiple_of(A_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
+                if stride_bk == 1:
+                    b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
+                else:
+                    b = tl.load(tl.multiple_of(B_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
+                partial += tl.dot(a, b)
+                A_BASE += BLOCK_SIZE_K * stride_ak
+                B_BASE += BLOCK_SIZE_K * stride_bk
+
+            a_s = tl.load(as_ptrs_base + kb * stride_as_k)
+            b_s = tl.load(bs_ptr_base + kb * stride_bs_k)
+            acc += partial * (a_s * b_s)[:, None]
+
+        c = acc.to(C.type.element_ty)
+        rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
+        rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_mask = (rm_s[:, None] < M_g) & (rn_s[None, :] < N)
+        C_ = C + m_start_g * stride_cm + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        tl.store(C_, c, c_mask)
 
 
+# Blockwise FP8 variable-K backward (persistent, CPU-sync-free):
+#   C[g] = LHS[g]^T @ RHS[g] with 1D+1D blockwise scales.
+# Autotune is keyed on shape-stable (G, OUT_M, OUT_N) only — per-group M varies.
+def _bwd_autotune_configs():
+    # 8-config curated set for variable-K wgrad. BK=128 always wins; covers M-major and N-major.
+    return [
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+    ]
+
+
+@triton.autotune(
+    configs=_bwd_autotune_configs(),
+    key=["G", "OUT_M", "OUT_N", "A_K_CONTIGUOUS", "B_K_CONTIGUOUS"],
+)
 @triton.jit()
 def _grouped_blockwise_fp8_variable_k_gemm_kernel(
-    # C[g] = LHS_g^T @ RHS_g * block_scales
-    LHS,  # [M_padded_total, OUT_M] FP8
-    RHS,  # [M_padded_total, OUT_N] FP8
-    C,  # [G, OUT_M, OUT_N]
-    LHS_scales_ptr,  # [ceil(M_padded/128), OUT_M] float32
-    RHS_scales_ptr,  # [ceil(M_padded/128), OUT_N] float32
-    group_offs_ptr,  # [G+1] int64 (padded segment offsets, each aligned to 128)
-    G,  # number of groups
+    LHS,
+    RHS,
+    C,
+    LHS_scales_ptr,
+    RHS_scales_ptr,
+    group_offs_ptr,
+    G,
     OUT_M,
     OUT_N,
-    # Strides
     stride_lhs_m,
     stride_rhs_m,
     stride_cg,
     stride_cm,
     stride_cn,
-    # LHS_scales strides
     stride_ls_0,
     stride_ls_1,
-    # RHS_scales strides
     stride_rs_0,
     stride_rs_1,
-    # Constexpr strides
     stride_lhs_n: tl.constexpr,
     stride_rhs_n: tl.constexpr,
-    # Tile config
+    A_K_CONTIGUOUS: tl.constexpr,
+    B_K_CONTIGUOUS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -1406,15 +1597,8 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
 ):
-    """Persistent grouped block-wise FP8 variable-K GEMM kernel (backward, CPU-sync-free).
-
-    All groups share the same output dims (OUT_M × OUT_N), only the inner product
-    dimension M_g varies per group. 1D+1D scale pattern for TN/CRR layout.
-
-    NOTE: Data is segment-padded to BLOCK_SIZE_K (128) boundaries by
-    quant_fp8_blockwise_segment_m_impl, so M_g is always a multiple of
-    BLOCK_SIZE_K. No masking is needed in the K-loop.
-    """
+    """Variable-K BWD: C[g] = LHS_g^T @ RHS_g. M_g is segment-padded to BLOCK_SIZE_K
+    by quant_fp8_blockwise_segment_m_row_col_impl, so no K-loop masking is needed."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -1459,8 +1643,16 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
         # ── Base pointers ──
-        LHS_BASE = LHS + m_start * stride_lhs_m + rm[:, None] * stride_lhs_n + rk[None, :] * stride_lhs_m
-        RHS_BASE = RHS + m_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :] * stride_rhs_n
+        # K-contig path: LHS layout is [OUT_M, M_padded_max], rk dim has stride 1.
+        # Strided path: LHS layout is [M_padded_total, OUT_M], rk dim has stride OUT_M.
+        if A_K_CONTIGUOUS:
+            LHS_BASE = LHS + m_start + rm[:, None] * stride_lhs_n + rk[None, :]
+        else:
+            LHS_BASE = LHS + m_start * stride_lhs_m + rm[:, None] * stride_lhs_n + rk[None, :] * stride_lhs_m
+        if B_K_CONTIGUOUS:
+            RHS_BASE = RHS + m_start + rk[:, None] + rn[None, :] * stride_rhs_n
+        else:
+            RHS_BASE = RHS + m_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :] * stride_rhs_n
 
         scale_row_start = m_start // BLOCK_SIZE_K
 
@@ -1470,27 +1662,19 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(loop_k):
-            if stride_lhs_n == 1:
-                a = tl.load(
-                    tl.multiple_of(LHS_BASE, (16, 1)),
-                    cache_modifier=CACHE_MODIFIER,
-                )
+            if A_K_CONTIGUOUS:
+                a = tl.load(tl.multiple_of(LHS_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
+            elif stride_lhs_n == 1:
+                a = tl.load(tl.multiple_of(LHS_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
             else:
-                a = tl.load(
-                    tl.multiple_of(LHS_BASE, (1, 16)),
-                    cache_modifier=CACHE_MODIFIER,
-                )
+                a = tl.load(tl.multiple_of(LHS_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
 
-            if stride_rhs_n == 1:
-                b = tl.load(
-                    tl.multiple_of(RHS_BASE, (1, 16)),
-                    cache_modifier=CACHE_MODIFIER,
-                )
+            if B_K_CONTIGUOUS:
+                b = tl.load(tl.multiple_of(RHS_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
+            elif stride_rhs_n == 1:
+                b = tl.load(tl.multiple_of(RHS_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)
             else:
-                b = tl.load(
-                    tl.multiple_of(RHS_BASE, (16, 1)),
-                    cache_modifier=CACHE_MODIFIER,
-                )
+                b = tl.load(tl.multiple_of(RHS_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)
 
             partial = tl.dot(a, b)
 
@@ -1500,8 +1684,14 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
             b_s = tl.load(RHS_scales_ptr + scale_row * stride_rs_0 + rn * stride_rs_1)
             acc += partial * a_s[:, None] * b_s[None, :]
 
-            LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
-            RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
+            if A_K_CONTIGUOUS:
+                LHS_BASE += BLOCK_SIZE_K
+            else:
+                LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
+            if B_K_CONTIGUOUS:
+                RHS_BASE += BLOCK_SIZE_K
+            else:
+                RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
 
         # ── Store output ──
         c = acc.to(C.type.element_ty)
@@ -1533,7 +1723,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Args:
         a: [M_total, K] FP8 input (trans_a=False always).
         b: [G, N, K] (if trans_b=True) or [G, K, N] FP8 weights.
-        a_scales: [M_total, K//128] float32, block-wise scale for A.
+        a_scales: [K//128, M_total] float32, block-wise scale for A (pre-shuffled).
         b_scales: [G, ceil(N/128), ceil(K/128)] or [G, ceil(K/128), ceil(N/128)] float32.
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
@@ -1571,56 +1761,85 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     stride_ak = a.stride(1)
 
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
-    A_scales_t = a_scales.T.contiguous()
+    # a_scales arrives pre-shuffled as [K_blocks, M_total] (quant op + CK both emit
+    # this layout); kernel reads it coalesced with no runtime .T.contiguous().
     num_sms = _get_num_cus()
 
-    blk_m = 256
-    blk_n = 128  # Keep 128 to match B_scale block alignment
-    blk_k = 128
-    even_k = K % blk_k == 0
+    aligned = K % 128 == 0
+    # First call for this (G, N, K, aligned) shape: prime autotune with a balanced
+    # group_offs distribution. Triton's autotune key is (G, N, K) only — group_lens
+    # is not part of the key, so whichever distribution happens to drive the first
+    # call gets baked into the cached config. In MoE training, per-step routing is
+    # uneven and varies, so without this warm-up we'd cache a config tuned to one
+    # accidental imbalance. Run a synthetic balanced-offs trial into a scratch out
+    # so the chosen config generalizes across the lifetime of the process.
+    if (G, N, K, aligned) not in _grouped_blockwise_warmed:
+        _grouped_blockwise_warmed.add((G, N, K, aligned))
+        per = M_total // G
+        bal_offs = torch.arange(G + 1, device=group_offs.device, dtype=group_offs.dtype) * per
+        bal_offs[-1] = M_total
+        out_warm = torch.empty_like(out)
+        if aligned:
+            if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+                triton.knobs.amd.use_async_copy = False
+            _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
+                a, b, out_warm, a_scales, b_scales, bal_offs,
+                G, N, K,
+                a.stride(0), stride_bg, stride_bn,
+                out_warm.stride(0), out_warm.stride(1),
+                a_scales.stride(0), a_scales.stride(1),
+                b_scales.stride(0), stride_bs_n, stride_bs_k,
+                stride_ak=stride_ak, stride_bk=stride_bk,
+                SCALE_BLOCK_K=128,
+                NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+                CACHE_MODIFIER=".ca",
+                G_POW2=triton.next_power_of_2(G),
+                waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+            )
+        else:
+            _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
+                a, b, out_warm, a_scales, b_scales, bal_offs,
+                G, N, K,
+                a.stride(0), stride_bg, stride_bn,
+                out_warm.stride(0), out_warm.stride(1),
+                a_scales.stride(0), a_scales.stride(1),
+                b_scales.stride(0), stride_bs_n, stride_bs_k,
+                stride_ak=stride_ak, stride_bk=stride_bk,
+                NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+                EVEN_K=False, CACHE_MODIFIER=".ca",
+                waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
+            )
 
-    # GROUP_SIZE_M heuristic (match tensorwise)
-    tiles_m_per_group = (M_total + G * blk_m - 1) // (G * blk_m)
-    tiles_n = (N + blk_n - 1) // blk_n
-    group_m = 8 if min(tiles_m_per_group, tiles_n) < 16 else 4
-
-    _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
-        a,
-        b,
-        out,
-        A_scales_t,
-        b_scales,
-        group_offs,
-        G,
-        N,
-        K,
-        a.stride(0),
-        stride_bg,
-        stride_bn,
-        out.stride(0),
-        out.stride(1),
-        A_scales_t.stride(0),
-        A_scales_t.stride(1),
-        b_scales.stride(0),
-        stride_bs_n,
-        stride_bs_k,
-        stride_ak=stride_ak,
-        stride_bk=stride_bk,
-        BLOCK_SIZE_M=blk_m,
-        BLOCK_SIZE_N=blk_n,
-        BLOCK_SIZE_K=blk_k,
-        GROUP_SIZE_M=group_m,
-        NUM_SMS=num_sms,
-        NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
-        EVEN_K=even_k,
-        CACHE_MODIFIER=".ca",
-        num_warps=8,
-        num_stages=1,  # 256×128×128 needs 48KB/stage; 2 stages=96KB > 64KB LDS
-        waves_per_eu=0,
-        matrix_instr_nonkdim=16,
-        kpack=1,
-    )
+    if aligned:
+        if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
+            triton.knobs.amd.use_async_copy = False
+        _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
+            a, b, out, a_scales, b_scales, group_offs,
+            G, N, K,
+            a.stride(0), stride_bg, stride_bn,
+            out.stride(0), out.stride(1),
+            a_scales.stride(0), a_scales.stride(1),
+            b_scales.stride(0), stride_bs_n, stride_bs_k,
+            stride_ak=stride_ak, stride_bk=stride_bk,
+            SCALE_BLOCK_K=128,
+            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+            CACHE_MODIFIER=".ca",
+            G_POW2=triton.next_power_of_2(G),
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        )
+    else:
+        _grouped_blockwise_fp8_persistent_gemm_kernel_unaligned[(num_sms,)](
+            a, b, out, a_scales, b_scales, group_offs,
+            G, N, K,
+            a.stride(0), stride_bg, stride_bn,
+            out.stride(0), out.stride(1),
+            a_scales.stride(0), a_scales.stride(1),
+            b_scales.stride(0), stride_bs_n, stride_bs_k,
+            stride_ak=stride_ak, stride_bk=stride_bk,
+            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+            EVEN_K=False, CACHE_MODIFIER=".ca",
+            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
+        )
     return out
 
 
@@ -1634,6 +1853,10 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     rhs_scales: torch.Tensor,
     group_offs: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    a_k_contig: bool = False,
+    b_k_contig: bool = False,
+    out_M: int = -1,
+    out_N: int = -1,
 ) -> torch.Tensor:
     """Variable-K grouped block-wise FP8 GEMM (backward, 1D+1D scaling) using Triton.
 
@@ -1643,12 +1866,20 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Output: [G, OUT_M, OUT_N].
 
     Args:
-        lhs: [M_padded_total, OUT_M] FP8 (segment-padded, each segment aligned to 128).
-        rhs: [M_padded_total, OUT_N] FP8.
+        lhs: [M_padded_total, OUT_M] FP8 if a_k_contig=False (default).
+             [OUT_M, M_padded_max] FP8 if a_k_contig=True (K-axis contig).
+        rhs: [M_padded_total, OUT_N] or [OUT_N, M_padded_max] (mirror of lhs).
         lhs_scales: [ceil(M_padded/128), OUT_M] float32.
         rhs_scales: [ceil(M_padded/128), OUT_N] float32.
         group_offs: [G+1] int64 padded segment offsets.
         out_dtype: Output dtype (default bfloat16).
+        a_k_contig: If True, lhs is the transposed layout [OUT_M, M_padded_max]
+                    so the K-axis is contiguous → kernel uses vectorized K-contig
+                    loads. Combined with the fused-quant-with-xpose op, replaces
+                    the strided-A pattern at no extra cost.
+        b_k_contig: Same for rhs.
+        out_M, out_N: Required when *_k_contig=True (cannot infer from transposed
+                      shape because it equals OUT_M/N).
 
     Returns:
         [G, OUT_M, OUT_N] output.
@@ -1659,52 +1890,67 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         _set_amd_knobs(enable=False)
 
     assert lhs.ndim == 2 and rhs.ndim == 2
-    assert lhs.shape[0] == rhs.shape[0]
-    OUT_M = lhs.shape[1]
-    OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
+
+    if a_k_contig:
+        OUT_M = out_M if out_M > 0 else lhs.shape[0]
+    else:
+        OUT_M = lhs.shape[1]
+    if b_k_contig:
+        OUT_N = out_N if out_N > 0 else rhs.shape[0]
+    else:
+        OUT_N = rhs.shape[1]
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = _get_num_cus()
 
-    # Use 128x128 tiles to reduce register pressure from double-accumulator
-    # (partial + acc both need full tile VGPRs for blockwise scale application).
-    # With 256x256 tiles + 8 warps, 2 accumulator sets need ~290 VGPRs/wave
-    # which exceeds the 256 limit at 2 waves/SIMD, causing spilling.
-    # 128x128 with 4 warps keeps VGPRs at ~170/wave, fitting 2 waves/SIMD.
+    # K-axis stride: for K-contig, dim 1 of [OUT_M, M_padded_max] = 1.
+    # For strided, dim 0 of [M_padded_total, OUT_M] = OUT_M.
+    stride_lhs_m = lhs.stride(1) if a_k_contig else lhs.stride(0)
+    stride_rhs_m = rhs.stride(1) if b_k_contig else rhs.stride(0)
+    # Output-row stride: for K-contig, dim 0 = M_padded_max. For strided, dim 1 = 1.
+    stride_lhs_n = lhs.stride(0) if a_k_contig else lhs.stride(1)
+    stride_rhs_n = rhs.stride(0) if b_k_contig else rhs.stride(1)
+
+    # Same balanced-warmup logic as the fwd kernel: autotune key is
+    # (G, OUT_M, OUT_N, A_K_CONTIGUOUS, B_K_CONTIGUOUS) — group_offs is not part
+    # of the key, so prime the cache once with a balanced distribution so the
+    # chosen config generalizes across MoE per-step routing variation.
+    warm_key = (G, OUT_M, OUT_N, a_k_contig, b_k_contig)
+    if warm_key not in _grouped_blockwise_vk_warmed:
+        _grouped_blockwise_vk_warmed.add(warm_key)
+        # Padded segment lens for variable-K need to respect BLOCK_K alignment;
+        # use M_padded // G rounded down to BLOCK_K (=128) granularity.
+        M_padded = lhs.shape[1] if a_k_contig else lhs.shape[0]
+        per = max((M_padded // G) // 128 * 128, 128)
+        bal_offs = torch.arange(G + 1, device=group_offs.device, dtype=group_offs.dtype) * per
+        bal_offs[-1] = M_padded
+        out_warm = torch.empty_like(out)
+        _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
+            lhs, rhs, out_warm, lhs_scales, rhs_scales, bal_offs,
+            G, OUT_M, OUT_N,
+            stride_lhs_m, stride_rhs_m,
+            out_warm.stride(0), out_warm.stride(1), out_warm.stride(2),
+            lhs_scales.stride(0), lhs_scales.stride(1),
+            rhs_scales.stride(0), rhs_scales.stride(1),
+            stride_lhs_n=stride_lhs_n, stride_rhs_n=stride_rhs_n,
+            A_K_CONTIGUOUS=a_k_contig, B_K_CONTIGUOUS=b_k_contig,
+            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+            CACHE_MODIFIER=".ca",
+            waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2,
+        )
+
     _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
-        lhs,
-        rhs,
-        out,
-        lhs_scales,
-        rhs_scales,
-        group_offs,
-        G,
-        OUT_M,
-        OUT_N,
-        lhs.stride(0),
-        rhs.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        lhs_scales.stride(0),
-        lhs_scales.stride(1),
-        rhs_scales.stride(0),
-        rhs_scales.stride(1),
-        stride_lhs_n=lhs.stride(1),
-        stride_rhs_n=rhs.stride(1),
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=128,
-        GROUP_SIZE_M=4,
-        NUM_SMS=num_sms,
-        NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=32,
+        lhs, rhs, out, lhs_scales, rhs_scales, group_offs,
+        G, OUT_M, OUT_N,
+        stride_lhs_m, stride_rhs_m,
+        out.stride(0), out.stride(1), out.stride(2),
+        lhs_scales.stride(0), lhs_scales.stride(1),
+        rhs_scales.stride(0), rhs_scales.stride(1),
+        stride_lhs_n=stride_lhs_n, stride_rhs_n=stride_rhs_n,
+        A_K_CONTIGUOUS=a_k_contig, B_K_CONTIGUOUS=b_k_contig,
+        NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
         CACHE_MODIFIER=".ca",
-        num_warps=4,
-        num_stages=2,
-        waves_per_eu=0,
-        matrix_instr_nonkdim=16,
-        kpack=1,
+        waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2,
     )
     return out

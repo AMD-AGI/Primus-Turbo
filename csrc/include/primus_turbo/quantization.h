@@ -19,6 +19,20 @@ template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 
+// Segment-padded group offsets (each segment rounded up to block_size), on-device.
+template <typename IndexType>
+void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padded_lens_ptr,
+                               IndexType *padded_offs_ptr, const int64_t group_num,
+                               const IndexType block_size, hipStream_t stream);
+
+// Fused single-pass row + segment-padded col blockwise FP8 quant (grouped fwd/bwd).
+template <typename FType, typename QType>
+void quantize_blockwise_segment_m_row_col_impl(
+    const FType *x, QType *y_row, QType *y_col_padded, float *scales_row, float *scales_col_padded,
+    const int64_t *group_offs, const int64_t *padded_group_offs, const int64_t M_in,
+    const int64_t N, const int64_t M_padded_max, const int num_groups, const float fp8_max,
+    hipStream_t stream);
+
 template <typename FType, typename QType, typename ComputeType = float,
           bool PreComputeScale = false>
 void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,

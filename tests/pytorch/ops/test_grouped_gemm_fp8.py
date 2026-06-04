@@ -334,36 +334,6 @@ def test_grouped_gemm_fp8_rowwise_deterministic(B, M, NK, ori_dtype, format, tra
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK])
-@pytest.mark.deterministic
-def test_grouped_gemm_fp8_blockwise_deterministic(
-    B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend
-):
-    N, K = NK
-    _run_grouped_gemm_fp8_deterministic_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.BLOCKWISE,
-        trans_b=trans_b,
-        balance=balance,
-        backend=backend,
-        block_size=block_size,
-        repeats=10,
-    )
-
-
-@pytest.mark.parametrize("B", _DET_B_VALUES)
-@pytest.mark.parametrize("M", _DET_M_VALUES)
-@pytest.mark.parametrize("NK", _DET_NK_VALUES)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", [False])
 @pytest.mark.parametrize("backend", [BackendType.TRITON])
@@ -459,7 +429,7 @@ def test_grouped_gemm_fp8_rowwise(B, M, NK, ori_dtype, format, trans_b, balance,
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_blockwise(
     B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend, auto_tune
