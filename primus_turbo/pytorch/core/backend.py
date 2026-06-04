@@ -128,6 +128,17 @@ class GlobalBackendManager:
         return precision_backend_dict
 
     @classmethod
+    def _clear_env_cache(cls) -> None:
+        """Clear the cached parses of backend env vars.
+
+        Replaces the previous ``_extract_backend_from_env.cache_clear()``
+        contract from when this method was wrapped with ``functools.lru_cache``.
+        Tests and any external callers that need to invalidate the cache
+        should call this instead.
+        """
+        cls._env_cache.clear()
+
+    @classmethod
     def set_gemm_backend(
         cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
     ) -> None:
