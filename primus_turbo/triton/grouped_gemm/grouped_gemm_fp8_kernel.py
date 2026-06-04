@@ -44,6 +44,7 @@ from primus_turbo.triton.gemm.gemm_kernel import (
     _select_params_origami,
     _set_knobs_gfx950,
 )
+
 _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
 
@@ -1209,23 +1210,95 @@ def _get_grouped_blockwise_autotune_configs():
     # known MI300X MFMA layout bug on FP8 e4m3fnuz with BN=64/256.
     return [
         # small/medium fallback
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 64,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
         # large-M, M-major
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 64}, num_warps=8, num_stages=1),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=1,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 64,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 64,
+            },
+            num_warps=8,
+            num_stages=1,
+        ),
     ]
 
 
@@ -1285,8 +1358,8 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     # (padded groups contribute nothing to cumsum / group_idx selection).
     g_arange = tl.arange(0, G_POW2)
     g_valid = g_arange < G
-    g_starts  = tl.load(group_offs_ptr + g_arange, mask=g_valid, other=0)
-    g_ends    = tl.load(group_offs_ptr + g_arange + 1, mask=g_valid, other=0)
+    g_starts = tl.load(group_offs_ptr + g_arange, mask=g_valid, other=0)
+    g_ends = tl.load(group_offs_ptr + g_arange + 1, mask=g_valid, other=0)
     m_per_g_v = (g_ends - g_starts).to(tl.int32)
     tiles_per_g_v = tl.cdiv(m_per_g_v, BLOCK_SIZE_M) * num_pid_n
     cum_incl_v = tl.cumsum(tiles_per_g_v, axis=0)
@@ -1390,22 +1463,94 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
 def _bwd_autotune_configs():
     # 8-config curated set for variable-K wgrad. BK=128 always wins; covers M-major and N-major.
     return [
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 4, "CHUNK_SIZE": 32}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-                       "GROUP_SIZE_M": 8, "CHUNK_SIZE": 32}, num_warps=4, num_stages=2),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=1,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=8,
+            num_stages=1,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "CHUNK_SIZE": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
     ]
 
 
@@ -1631,33 +1776,69 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
         if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
             triton.knobs.amd.use_async_copy = False
         _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
-            a, b, out_warm, a_scales, b_scales, bal_offs,
-            G, N, K,
-            a.stride(0), stride_bg, stride_bn,
-            out_warm.stride(0), out_warm.stride(1),
-            a_scales.stride(0), a_scales.stride(1),
-            b_scales.stride(0), stride_bs_n, stride_bs_k,
-            stride_ak=stride_ak, stride_bk=stride_bk,
-            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
-            EVEN_K=aligned, CACHE_MODIFIER=".ca",
+            a,
+            b,
+            out_warm,
+            a_scales,
+            b_scales,
+            bal_offs,
+            G,
+            N,
+            K,
+            a.stride(0),
+            stride_bg,
+            stride_bn,
+            out_warm.stride(0),
+            out_warm.stride(1),
+            a_scales.stride(0),
+            a_scales.stride(1),
+            b_scales.stride(0),
+            stride_bs_n,
+            stride_bs_k,
+            stride_ak=stride_ak,
+            stride_bk=stride_bk,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
+            EVEN_K=aligned,
+            CACHE_MODIFIER=".ca",
             G_POW2=triton.next_power_of_2(G),
-            waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+            waves_per_eu=0,
+            matrix_instr_nonkdim=16,
+            kpack=2,
         )
 
     if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
         triton.knobs.amd.use_async_copy = False
     _grouped_blockwise_fp8_persistent_gemm_kernel[(num_sms,)](
-        a, b, out, a_scales, b_scales, group_offs,
-        G, N, K,
-        a.stride(0), stride_bg, stride_bn,
-        out.stride(0), out.stride(1),
-        a_scales.stride(0), a_scales.stride(1),
-        b_scales.stride(0), stride_bs_n, stride_bs_k,
-        stride_ak=stride_ak, stride_bk=stride_bk,
-        NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
-        EVEN_K=aligned, CACHE_MODIFIER=".ca",
+        a,
+        b,
+        out,
+        a_scales,
+        b_scales,
+        group_offs,
+        G,
+        N,
+        K,
+        a.stride(0),
+        stride_bg,
+        stride_bn,
+        out.stride(0),
+        out.stride(1),
+        a_scales.stride(0),
+        a_scales.stride(1),
+        b_scales.stride(0),
+        stride_bs_n,
+        stride_bs_k,
+        stride_ak=stride_ak,
+        stride_bk=stride_bk,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
+        EVEN_K=aligned,
+        CACHE_MODIFIER=".ca",
         G_POW2=triton.next_power_of_2(G),
-        waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return out
 
@@ -1746,30 +1927,64 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         bal_offs[-1] = M_padded
         out_warm = torch.empty_like(out)
         _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
-            lhs, rhs, out_warm, lhs_scales, rhs_scales, bal_offs,
-            G, OUT_M, OUT_N,
-            stride_lhs_m, stride_rhs_m,
-            out_warm.stride(0), out_warm.stride(1), out_warm.stride(2),
-            lhs_scales.stride(0), lhs_scales.stride(1),
-            rhs_scales.stride(0), rhs_scales.stride(1),
-            stride_lhs_n=stride_lhs_n, stride_rhs_n=stride_rhs_n,
-            A_K_CONTIGUOUS=a_k_contig, B_K_CONTIGUOUS=b_k_contig,
-            NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+            lhs,
+            rhs,
+            out_warm,
+            lhs_scales,
+            rhs_scales,
+            bal_offs,
+            G,
+            OUT_M,
+            OUT_N,
+            stride_lhs_m,
+            stride_rhs_m,
+            out_warm.stride(0),
+            out_warm.stride(1),
+            out_warm.stride(2),
+            lhs_scales.stride(0),
+            lhs_scales.stride(1),
+            rhs_scales.stride(0),
+            rhs_scales.stride(1),
+            stride_lhs_n=stride_lhs_n,
+            stride_rhs_n=stride_rhs_n,
+            A_K_CONTIGUOUS=a_k_contig,
+            B_K_CONTIGUOUS=b_k_contig,
+            NUM_SMS=num_sms,
+            NUM_XCDS=NUM_XCDS,
             CACHE_MODIFIER=".ca",
-            waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=16,
+            kpack=2,
         )
 
     _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
-        lhs, rhs, out, lhs_scales, rhs_scales, group_offs,
-        G, OUT_M, OUT_N,
-        stride_lhs_m, stride_rhs_m,
-        out.stride(0), out.stride(1), out.stride(2),
-        lhs_scales.stride(0), lhs_scales.stride(1),
-        rhs_scales.stride(0), rhs_scales.stride(1),
-        stride_lhs_n=stride_lhs_n, stride_rhs_n=stride_rhs_n,
-        A_K_CONTIGUOUS=a_k_contig, B_K_CONTIGUOUS=b_k_contig,
-        NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS,
+        lhs,
+        rhs,
+        out,
+        lhs_scales,
+        rhs_scales,
+        group_offs,
+        G,
+        OUT_M,
+        OUT_N,
+        stride_lhs_m,
+        stride_rhs_m,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lhs_scales.stride(0),
+        lhs_scales.stride(1),
+        rhs_scales.stride(0),
+        rhs_scales.stride(1),
+        stride_lhs_n=stride_lhs_n,
+        stride_rhs_n=stride_rhs_n,
+        A_K_CONTIGUOUS=a_k_contig,
+        B_K_CONTIGUOUS=b_k_contig,
+        NUM_SMS=num_sms,
+        NUM_XCDS=NUM_XCDS,
         CACHE_MODIFIER=".ca",
-        waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2,
+        waves_per_eu=2,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return out

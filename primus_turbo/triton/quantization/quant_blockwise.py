@@ -179,7 +179,7 @@ def quant_fp8_blockwise_segment_m_row_col_kernel(
     for valid input rows. Row scales are written pre-shuffled as [N_blocks, M_in] so the
     persistent fwd GEMM reads them by stride with no runtime .T.contiguous().
     """
-    pid_m = tl.program_id(axis=0)   # padded M index
+    pid_m = tl.program_id(axis=0)  # padded M index
     pid_n = tl.program_id(axis=1)
 
     M_padded = tl.load(padded_group_offs_ptr + num_groups)
@@ -203,28 +203,18 @@ def quant_fp8_blockwise_segment_m_row_col_kernel(
     offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
     offs_m_in = orig_start + (offs_m_out - pad_start)
 
-    mask_in = (
-        (offs_m_in[:, None] >= orig_start)
-        & (offs_m_in[:, None] < orig_end)
-        & (offs_n[None, :] < N)
-    )
+    mask_in = (offs_m_in[:, None] >= orig_start) & (offs_m_in[:, None] < orig_end) & (offs_n[None, :] < N)
 
-    x = tl.load(
-        x_ptr + offs_m_in[:, None] * N + offs_n[None, :], mask=mask_in, other=0.0
-    ).to(tl.float32)
+    x = tl.load(x_ptr + offs_m_in[:, None] * N + offs_n[None, :], mask=mask_in, other=0.0).to(tl.float32)
     x_abs = tl.abs(x)
 
     col_max = tl.maximum(tl.max(x_abs, axis=0, keep_dims=True), 1e-4)
     col_scale = FP8_MAX / col_max
-    x_fp8_col = tl.clamp(x * col_scale, min=-FP8_MAX, max=FP8_MAX).to(
-        x_fp8_col_padded_ptr.dtype.element_ty
-    )
+    x_fp8_col = tl.clamp(x * col_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_col_padded_ptr.dtype.element_ty)
 
     row_max = tl.maximum(tl.max(x_abs, axis=1, keep_dims=True), 1e-4)
     row_scale = FP8_MAX / row_max
-    x_fp8_row = tl.clamp(x * row_scale, min=-FP8_MAX, max=FP8_MAX).to(
-        x_fp8_row_ptr.dtype.element_ty
-    )
+    x_fp8_row = tl.clamp(x * row_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_row_ptr.dtype.element_ty)
 
     out_mask_pad = (offs_m_out[:, None] < M_padded) & (offs_n[None, :] < N)
     tl.store(

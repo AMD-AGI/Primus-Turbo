@@ -27,11 +27,13 @@ void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padde
 
 // Fused single-pass row + segment-padded col blockwise FP8 quant (grouped fwd/bwd).
 template <typename FType, typename QType>
-void quantize_blockwise_segment_m_row_col_impl(
-    const FType *x, QType *y_row, QType *y_col_padded, float *scales_row, float *scales_col_padded,
-    const int64_t *group_offs, const int64_t *padded_group_offs, const int64_t M_in,
-    const int64_t N, const int64_t M_padded_max, const int num_groups, const float fp8_max,
-    hipStream_t stream);
+void quantize_blockwise_segment_m_row_col_impl(const FType *x, QType *y_row, QType *y_col_padded,
+                                               float *scales_row, float *scales_col_padded,
+                                               const int64_t *group_offs,
+                                               const int64_t *padded_group_offs, const int64_t M_in,
+                                               const int64_t N, const int64_t M_padded_max,
+                                               const int num_groups, const float fp8_max,
+                                               hipStream_t stream);
 
 // Blockwise FP8 weight quant: [B, M, N] (or [M, N]), one scalar scale per [128,128] tile.
 template <typename FType, typename QType>

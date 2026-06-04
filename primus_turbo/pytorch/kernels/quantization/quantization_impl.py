@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
-from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -227,9 +226,7 @@ def quant_fp8_blockwise_for_weight_impl(
     # Triton kernel fallback when the C++ extension lacks the op. Benefits both the
     # grouped and non-grouped blockwise paths that quantize weights through here.
     if hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"):
-        return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(
-            w, dtype, block_size
-        )
+        return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(w, dtype, block_size)
 
     ori_dims = w.dim()
     if ori_dims == 2:
@@ -346,11 +343,27 @@ def quant_fp8_blockwise_segment_m_row_col_impl(
     )
     grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
     quant_fp8_blockwise_segment_m_row_col_kernel[grid](
-        x, x_fp8_row, x_fp8_col_padded, x_scales_row, x_scales_col_padded,
-        group_offs, var_k_group_offs, M, N, num_groups, block_size, torch.finfo(dtype).max,
+        x,
+        x_fp8_row,
+        x_fp8_col_padded,
+        x_scales_row,
+        x_scales_col_padded,
+        group_offs,
+        var_k_group_offs,
+        M,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
     )
-    return (x_fp8_row, x_fp8_col_padded, x_scales_row, x_scales_col_padded,
-            var_k_group_lens, var_k_group_offs)
+    return (
+        x_fp8_row,
+        x_fp8_col_padded,
+        x_scales_row,
+        x_scales_col_padded,
+        var_k_group_lens,
+        var_k_group_offs,
+    )
 
 
 @quant_fp8_blockwise_segment_m_row_col_impl.register_fake
