@@ -36,19 +36,18 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import (
-    _calculate_lds_usage,
-    _get_hardware,
-    _is_gfx950,
-    _select_params_origami,
-    _set_knobs_gfx950,
-)
+from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
-    _get_num_cus,
     _grouped_variable_k_gemm_kernel,
 )
+from primus_turbo.triton.utils.origami import (
+    origama_calculate_lds_usage,
+    origama_hardware_info,
+    origama_select_params,
+)
+from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper
@@ -85,7 +84,7 @@ def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     else:
         group_m = 5
 
-    cu_count = _get_num_cus()
+    cu_count = get_num_cus()
     num_sms = min(total_tiles, cu_count)
     chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
 
@@ -113,7 +112,7 @@ def _get_gg_fp8_tw_fwd_config(
     stride_bk,
 ):
     """Cached kernel config for FP8 tensorwise grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k = 128
         num_stages_val = 2
@@ -122,7 +121,7 @@ def _get_gg_fp8_tw_fwd_config(
         chunk_size = 32
         grid_sms = num_sms
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             avg_m,
             N,
             K,
@@ -140,8 +139,8 @@ def _get_gg_fp8_tw_fwd_config(
                 cache_a, cache_b = oc_a, oc_b
             elif tiles_default < num_sms and min(om, on) >= 64:
                 proposed_stages = 2 if ok >= 128 else 3
-                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
-                if lds <= _get_hardware().lds_capacity:
+                lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= origama_hardware_info().lds_capacity:
                     blk_m, blk_n, blk_k = om, on, ok
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
@@ -152,7 +151,7 @@ def _get_gg_fp8_tw_fwd_config(
         )
         num_stages_val = 2
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             avg_m,
             N,
             K,
@@ -175,14 +174,14 @@ def _get_gg_fp8_tw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 tensorwise grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k, num_stages_val = 64, 3
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             OUT_M,
             OUT_N,
             avg_k,
@@ -201,8 +200,8 @@ def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
                 cache_a, cache_b = oc_a, oc_b
             elif tiles_default < num_sms and min(om, on) >= 64:
                 proposed_stages = 2 if ok >= 128 else 3
-                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
-                if lds <= _get_hardware().lds_capacity:
+                lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= origama_hardware_info().lds_capacity:
                     blk_m, blk_n, blk_k = om, on, ok
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
@@ -233,7 +232,7 @@ def _get_gg_fp8_rw_fwd_config(
     stride_bk,
 ):
     """Cached kernel config for FP8 rowwise grouped GEMM forward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k = 128
         num_stages_val = 2
@@ -241,7 +240,7 @@ def _get_gg_fp8_rw_fwd_config(
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             avg_m,
             N,
             K,
@@ -259,8 +258,8 @@ def _get_gg_fp8_rw_fwd_config(
                 cache_a, cache_b = oc_a, oc_b
             elif tiles_default < num_sms and min(om, on) >= 64:
                 proposed_stages = 2 if ok >= 128 else 3
-                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
-                if lds <= _get_hardware().lds_capacity:
+                lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= origama_hardware_info().lds_capacity:
                     blk_m, blk_n, blk_k = om, on, ok
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
@@ -282,14 +281,14 @@ def _get_gg_fp8_rw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 rowwise grouped GEMM variable-K backward."""
-    if _is_gfx950():
+    if is_gfx950():
         blk_m, blk_n = 256, 256
         blk_k, num_stages_val = 64, 3
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             OUT_M,
             OUT_N,
             avg_k,
@@ -308,8 +307,8 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
                 cache_a, cache_b = oc_a, oc_b
             elif tiles_default < num_sms and min(om, on) >= 64:
                 proposed_stages = 2 if ok >= 128 else 3
-                lds = _calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
-                if lds <= _get_hardware().lds_capacity:
+                lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
+                if lds <= origama_hardware_info().lds_capacity:
                     blk_m, blk_n, blk_k = om, on, ok
                     group_m = ogm
                     cache_a, cache_b = oc_a, oc_b
@@ -542,10 +541,10 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
         _get_gg_fp8_tw_fwd_config(
             avg_m,
@@ -634,10 +633,10 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_tw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -896,10 +895,10 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_fwd_config(
         avg_m,
         N,
@@ -1137,10 +1136,10 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -1542,8 +1541,8 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     else:
         _set_amd_knobs(enable=True)
 
@@ -1572,7 +1571,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
 
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
     A_scales_t = a_scales.T.contiguous()
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
 
     blk_m = 256
     blk_n = 128  # Keep 128 to match B_scale block alignment
@@ -1653,8 +1652,8 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     else:
         _set_amd_knobs(enable=False)
 
@@ -1665,7 +1664,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     G = group_offs.shape[0] - 1
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
-    num_sms = _get_num_cus()
+    num_sms = get_num_cus()
 
     # Use 128x128 tiles to reduce register pressure from double-accumulator
     # (partial + acc both need full tile VGPRs for blockwise scale application).

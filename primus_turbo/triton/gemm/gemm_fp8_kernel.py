@@ -43,15 +43,14 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.triton.gemm.gemm_kernel import (
-    NUM_XCDS,
-    _chiplet_transform_chunked,
-    _compute_sk_grid,
-    _get_hardware,
-    _is_gfx950,
-    _select_params_origami,
-    _set_knobs_gfx950,
+from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.triton.gemm.gemm_kernel import NUM_XCDS, _chiplet_transform_chunked
+from primus_turbo.triton.utils.origami import (
+    origama_compute_sk_grid,
+    origama_hardware_info,
+    origama_select_params,
 )
+from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -104,13 +103,13 @@ def offline_select_fp8(M, N, K, s_ak, s_bk):
     tiles_n = (N + BN - 1) // BN
     total_tiles = tiles_m * tiles_n
 
-    cu_count = _get_hardware().N_CU
+    cu_count = origama_hardware_info().N_CU
 
     # ── NUM_SMS ──
     # tiles <= ~5 waves (cu*5): sk_grid for wave efficiency
     # tiles > ~5 waves: data-parallel (avoids regression at tiles>=1792)
     if total_tiles <= cu_count * 5:
-        num_sms = _compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, BM, BN, BK, cu_count)
     else:
         num_sms = total_tiles
 
@@ -320,8 +319,8 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
 
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
         block_m, block_n, block_k = 256, 256, 128
@@ -334,9 +333,9 @@ def gemm_fp8_tensorwise_triton_kernel(
         is_tn = s_ak == 1 and s_bk == 1
         group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
 
-        cu_count = _get_hardware().N_CU
+        cu_count = origama_hardware_info().N_CU
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             M,
             N,
             K,
@@ -351,14 +350,14 @@ def gemm_fp8_tensorwise_triton_kernel(
             if min(om, on) >= 128 and ok == block_k:
                 block_m, block_n, group_m = om, on, ogm
 
-        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
             M, N, K, s_ak, s_bk
         )
         waves_per_eu = 0
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             M,
             N,
             K,
@@ -626,8 +625,8 @@ def gemm_fp8_rowwise_triton_kernel(
     s_ak = A_view.stride(1)
     s_bk = B_view.stride(0)
 
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
 
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
         block_m, block_n, block_k = 256, 256, 128
@@ -640,9 +639,9 @@ def gemm_fp8_rowwise_triton_kernel(
         is_tn = s_ak == 1 and s_bk == 1
         group_m = 8 if min_tile < 16 else (4 if is_tn else 5)
 
-        cu_count = _get_hardware().N_CU
+        cu_count = origama_hardware_info().N_CU
 
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             M,
             N,
             K,
@@ -657,14 +656,14 @@ def gemm_fp8_rowwise_triton_kernel(
             if min(om, on) >= 128 and ok == block_k:
                 block_m, block_n, group_m = om, on, ogm
 
-        num_sms = _compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
+        num_sms = origama_compute_sk_grid(M, N, K, block_m, block_n, block_k, cu_count)
     else:
         # gfx942 path
         block_m, block_n, block_k, group_m, num_sms, chunk_size, cache_a, cache_b = offline_select_fp8(
             M, N, K, s_ak, s_bk
         )
         waves_per_eu = 0
-        origami_params = _select_params_origami(
+        origami_params = origama_select_params(
             M,
             N,
             K,
@@ -760,7 +759,7 @@ def _get_blockwise_autotune_configs(
             ``None`` keeps the original search space.
     """
     configs = []
-    if _is_gfx950():
+    if is_gfx950():
         num_stage_values = [1, 2, 3] if allow_num_stages_3 else [1, 2]
         block_n_values = [64, 128]
     else:
@@ -1081,8 +1080,8 @@ def gemm_fp8_blockwise_triton_kernel(
     # AMD knobs: gfx950 always sets the gfx950 knobs; on gfx942 NT/NN benefit
     # from use_async_copy/scalarize_packed_fops while TN/wgrad regresses 5-8%.
     is_tn = trans_a and not trans_b
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     else:
         _set_amd_knobs(enable=not is_tn)
 

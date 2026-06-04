@@ -21,7 +21,7 @@ from primus_turbo.common.constants import (
     ENV_MOE_DISPATCH_COMBINE_BACKEND,
 )
 from primus_turbo.common.logger import logger
-from primus_turbo.triton.gemm.gemm_kernel import clear_origami_caches
+from primus_turbo.triton.utils.origami import origami_clear_caches
 
 try:
     HAVE_DEEP_EP = True
@@ -249,7 +249,7 @@ class GlobalBackendManager:
         cls._grouped_gemm_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
-        clear_origami_caches()
+        origami_clear_caches()
 
 
 class KernelBackend(ABC):
