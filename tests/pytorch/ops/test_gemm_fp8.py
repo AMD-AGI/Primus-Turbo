@@ -46,16 +46,6 @@ def _run_gemm_fp8_test(
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
-    # FlyDSL fp8 GEMM (gfx950 only) requires bf16 output, K % 128 == 0, and the
-    # current tile constraints M % 128 == 0 / N % 256 == 0 (mirrors can_handle).
-    # TODO(flydsl): drop the M % 128 gate once odd-M is supported (byte-level
-    # addressing). The m values here (255/507/1032/2056) are all non-multiples,
-    # so FlyDSL is fully skipped in this test until then.
-    if backend == BackendType.FLYDSL and (
-        dtype != torch.bfloat16 or k % 128 != 0 or m % 128 != 0 or n % 256 != 0
-    ):
-        pytest.skip("FlyDSL fp8 GEMM requires bf16 output, K%128==0, M%128==0, N%256==0")
-
     # Set backend and auto_tune config
     GlobalBackendManager.set_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(auto_tune)
@@ -507,7 +497,7 @@ def _run_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL])
 def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """TENSORWISE gemm with pre-quantized QuantizedTensor inputs."""
     _run_gemm_fp8_quantized_tensor_test(
@@ -584,7 +574,9 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.deterministic
 def test_gemm_fp8_tensorwise_deterministic(m, n, k, layout, format, dtype, backend):
     _run_gemm_fp8_deterministic_test(

@@ -11,26 +11,21 @@ Layer-2 backend class; the underlying kernel wrapper lives in
 ``GEMMFP8KernelDispatcher`` via ``_GEMM_FP8_BACKENDS`` in
 ``gemm_fp8_impl.py``.
 
-Supports NT, NN, TN, TT layouts (NT is native; others go through a host
-transpose of the non-canonical operand). trans_c is not supported.
+Supports NT, NN, TN natively (no host transpose); TT is not supported. trans_c
+is supported via a post-hoc output transpose.
 """
 
 from __future__ import annotations
 
 import torch
 
-from primus_turbo.flydsl.gemm.gemm_fp8_kernel import (
-    flydsl_available,
-    gemm_fp8_tensorwise_flydsl_kernel,
-)
+from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.pytorch.core.backend import KernelBackend
 from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     float8_e4m3,
     float8_e5m2,
 )
-
-from .gemm_fp8_impl import get_gemm_logical_shape
 
 # Mirror the dtype tuples from gemm_fp8_impl.py so we don't tightly couple.
 _COMMON_SUPPORTED_DTYPES = (
@@ -50,21 +45,24 @@ _HYBRID_SUPPORTED_DTYPES = (
 class GEMMFP8FlyDSLBackend(KernelBackend):
     """FlyDSL 8-wave fp8 dense GEMM backend.
 
-    Layout support (all four combos):
+    Layout support:
       - NT (native):  trans_a=F, trans_b=T
-      - NN:           trans_a=F, trans_b=F   (host transposes B)
-      - TN:           trans_a=T, trans_b=T   (host transposes A)
-      - TT:           trans_a=T, trans_b=F   (host transposes both)
+      - NN (native):  trans_a=F, trans_b=F
+      - TN (native):  trans_a=T, trans_b=F
+      - TT:           trans_a=T, trans_b=T   (not supported)
 
     Constraints:
       - TENSORWISE per-tensor scaling (a_scale / b_scale scalar)
-      - out_dtype = bf16
-      - K (contraction) % 128 == 0
+      - out_dtype in {bf16, fp16}
+      - arbitrary contraction K, M and N
       (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+    # E4M3 / E5M2 / hybrid, bf16 or fp16 output. Per-operand fp8 format is threaded
+    # into the MFMA via cbsz(srcA)/blgp(srcB) (0=E4M3, 1=E5M2) and the FlyDSL
+    # MFMA_Scale atom dtype; fp16 output is produced from the f32 accumulator.
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES) | set(_HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
     def can_handle(
@@ -78,21 +76,18 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
-        if not flydsl_available():
-            return False
         supported = True
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
-        supported &= out_dtype == torch.bfloat16
-        # K (contraction) must be a multiple of BLOCK_K=128
-        _m, _n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        supported &= (k % 128) == 0
-        # Tile constraints: BLOCK_M min 128, BLOCK_N 256. Off-tile M/N is not
-        # masked, so gate (fall back to another backend) rather than crash.
-        # TODO(flydsl): support arbitrary M (and N) via byte-level addressing,
-        # as done for the bf16 grouped path; then relax these gates.
-        supported &= (_m % 128) == 0
-        supported &= (_n % 256) == 0
+        supported &= out_dtype in (torch.bfloat16, torch.float16)
+        # NT / NN / TN native; TT (trans_a and trans_b) is not supported.
+        supported &= not (trans_a and trans_b)
+        # Contraction K: any value handled by the native K-tail, but the software
+        # pipeline needs K_ITERS = ceil(K/128) >= 2, i.e. K >= 129. (M / N are
+        # arbitrary: the partial last output tile is bounded by the c_m / c_n
+        # StoreC clamp + the global SRD.)
+        k = a.shape[0] if trans_a else a.shape[1]
+        supported &= k >= 129
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
