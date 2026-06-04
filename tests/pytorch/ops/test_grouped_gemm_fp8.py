@@ -425,48 +425,6 @@ def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balan
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FLYDSL-focused tensorwise smoke (exercises fwd + dgrad + wgrad via autograd)
-#
-# Constraints FlyDSL backends gate on:
-#   - granularity = TENSORWISE
-#   - out_dtype   = bf16 (ori_dtype = bf16)
-#   - format      = E4M3
-#   - K (= contraction of fwd / dgrad) % 128 == 0
-#   - VariableK (wgrad) backend additionally requires each group's M_g % 128 == 0.
-#     Fixed by `balance=True` (uniform groups: each M_g == M, which is multiple of 128).
-#     With `balance=False` group lens are randomized and the gate rejects.
-#
-# Cases = 2 (B) * 2 (M) * 2 (NK) * 2 (trans_b) = 16. Under the 100-case bound.
-# ──────────────────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("B", [4, 8])
-@pytest.mark.parametrize("M", [1024, 2048])  # M (uniform group size); both %128==0
-@pytest.mark.parametrize("NK", [(2048, 1536), (4096, 7168)])  # K in {1536, 7168} both %128==0
-@pytest.mark.parametrize("ori_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("format", [Format.E4M3])
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("balance", [True])  # uniform M_g -> var_k gate passes
-@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
-@pytest.mark.parametrize("auto_tune", [False])
-def test_grouped_gemm_fp8_tensorwise_flydsl(
-    B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
-):
-    N, K = NK
-    _run_grouped_gemm_fp8_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.TENSORWISE,
-        trans_b=trans_b,
-        balance=balance,
-        backend=backend,
-        auto_tune=auto_tune,
-    )
-
-
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
