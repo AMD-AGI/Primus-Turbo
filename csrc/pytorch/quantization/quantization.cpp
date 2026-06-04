@@ -710,4 +710,40 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(
             var_k_group_offs};
 }
 
+// Blockwise FP8 weight quant: 2D [M, N] or 3D [B, M, N], one scalar scale per [128,128] tile.
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype,
+                                                          const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3, "weight quant requires 2D or 3D input");
+    PRIMUS_TURBO_CHECK(block_size == 128, "only block_size=128 currently supported");
+
+    const bool    is_2d    = (input.dim() == 2);
+    const int64_t B        = is_2d ? 1 : input.size(0);
+    const int64_t M        = is_2d ? input.size(0) : input.size(1);
+    const int64_t N        = is_2d ? input.size(1) : input.size(2);
+    const int64_t m_blocks = (M + block_size - 1) / block_size;
+    const int64_t n_blocks = (N + block_size - 1) / block_size;
+
+    std::vector<int64_t> out_shape =
+        is_2d ? std::vector<int64_t>{M, N} : std::vector<int64_t>{B, M, N};
+    std::vector<int64_t> scale_shape =
+        is_2d ? std::vector<int64_t>{m_blocks, n_blocks} : std::vector<int64_t>{B, m_blocks, n_blocks};
+    auto output    = at::empty(out_shape, input.options().dtype(dest_dtype));
+    auto scale_inv = at::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_blockwise_for_weight_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()),
+                reinterpret_cast<float *>(scale_inv.data_ptr()), B, M, N, fp8_max, stream);
+        });
+    });
+    return {output, scale_inv};
+}
+
 } // namespace primus_turbo::pytorch

@@ -33,6 +33,12 @@ void quantize_blockwise_segment_m_row_col_impl(
     const int64_t N, const int64_t M_padded_max, const int num_groups, const float fp8_max,
     hipStream_t stream);
 
+// Blockwise FP8 weight quant: [B, M, N] (or [M, N]), one scalar scale per [128,128] tile.
+template <typename FType, typename QType>
+void quantize_blockwise_for_weight_impl(const FType *w, QType *w_fp8, float *w_scales_inv,
+                                        const int64_t B, const int64_t M, const int64_t N,
+                                        const float fp8_max, hipStream_t stream);
+
 template <typename FType, typename QType, typename ComputeType = float,
           bool PreComputeScale = false>
 void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,

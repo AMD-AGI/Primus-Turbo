@@ -41,6 +41,14 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t block_size,
     const at::Tensor group_lens, const at::Tensor group_offs);
 
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype,
+                                                          const int64_t        block_size);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor     input,
+                                                               const at::ScalarType dest_dtype,
+                                                               const int64_t        block_size);
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                              const at::ScalarType dest_dtype, const int64_t axis,
                                              c10::optional<at::Tensor> scale_opt);

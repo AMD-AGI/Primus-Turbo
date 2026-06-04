@@ -223,6 +223,14 @@ def quant_fp8_blockwise_for_weight_impl(
     if not w.is_contiguous():
         w = w.contiguous()
 
+    # HIP fast path (single C++ call → lower host overhead, identical output layout);
+    # Triton kernel fallback when the C++ extension lacks the op. Benefits both the
+    # grouped and non-grouped blockwise paths that quantize weights through here.
+    if hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"):
+        return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(
+            w, dtype, block_size
+        )
+
     ori_dims = w.dim()
     if ori_dims == 2:
         B, M, N = 1, *w.shape

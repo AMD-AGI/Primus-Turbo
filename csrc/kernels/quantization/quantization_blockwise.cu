@@ -3,6 +3,7 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/device/utils.cuh"
 #include "primus_turbo/quantization.h"
 
@@ -236,5 +237,117 @@ DECL_QUANT_BLOCKWISE_SEGM_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
 DECL_QUANT_BLOCKWISE_SEGM_INSTANCE(dtype::float16, dtype::float8_e4m3)
 DECL_QUANT_BLOCKWISE_SEGM_INSTANCE(dtype::float16, dtype::float8_e5m2)
 #undef DECL_QUANT_BLOCKWISE_SEGM_INSTANCE
+
+// Weight blockwise FP8 quant: 3D weight [B, M, N], one scalar scale per [128,128]
+// tile. 256 threads/block; vec-8 packed loads; BlockReduce<AbsMax>.
+template <typename FType, typename QType>
+__launch_bounds__(256) __global__
+void quant_fp8_blockwise_for_weight_kernel(const FType *__restrict__ w_ptr,
+                                           QType *__restrict__ w_fp8_ptr,
+                                           float *__restrict__ w_scales_inv_ptr,
+                                           const int64_t M, const int64_t N,
+                                           const float fp8_max) {
+    constexpr int BLOCK_SIZE = 128;
+    constexpr int PACK       = 8;
+    constexpr int THREADS_PER_ROW = BLOCK_SIZE / PACK;            // 16
+    constexpr int ROWS_PER_ROUND  = 256 / THREADS_PER_ROW;        // 16
+    constexpr int ROUNDS          = BLOCK_SIZE / ROWS_PER_ROUND;  // 8
+
+    const int64_t bid     = blockIdx.x;
+    const int64_t row_blk = blockIdx.y;
+    const int64_t col_blk = blockIdx.z;
+    const int     tid     = threadIdx.x;
+    const int     pack_idx      = tid % THREADS_PER_ROW;
+    const int     load_row_base = tid / THREADS_PER_ROW;
+
+    const int64_t row_start = row_blk * BLOCK_SIZE;
+    const int64_t col_start = col_blk * BLOCK_SIZE;
+    const int64_t batch_off = bid * M * N;
+
+    float vals[ROUNDS][PACK];
+    float amax = 0.f;
+
+    #pragma unroll
+    for (int r = 0; r < ROUNDS; ++r) {
+        const int local_m = load_row_base + r * ROWS_PER_ROUND;
+        const int local_n = pack_idx * PACK;
+        const int64_t gm  = row_start + local_m;
+        const int64_t gn  = col_start + local_n;
+        FType buf[PACK];
+        if (gm < M && gn + PACK <= N) {
+            load_data<FType, PACK>(w_ptr + batch_off + gm * N + gn, buf);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < PACK; ++i) {
+                const int64_t cn = gn + i;
+                buf[i] = (gm < M && cn < N) ? w_ptr[batch_off + gm * N + cn]
+                                            : static_cast<FType>(0.f);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < PACK; ++i) {
+            const float v = static_cast<float>(buf[i]);
+            vals[r][i] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+
+    amax = BlockReduce<AbsMaxOp, float>(amax);
+    // Clamp eps matches Triton reference (tl.maximum(w_tile_max, 1e-4)).
+    const float scale   = static_cast<float>(fp8_max) / fmaxf(amax, 1e-4f);
+    const float clip_lo = -static_cast<float>(fp8_max);
+    const float clip_hi =  static_cast<float>(fp8_max);
+
+    if (tid == 0) {
+        const int64_t sn = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const int64_t sm = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        w_scales_inv_ptr[bid * sm * sn + row_blk * sn + col_blk] = 1.0f / scale;
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROUNDS; ++r) {
+        const int local_m = load_row_base + r * ROWS_PER_ROUND;
+        const int local_n = pack_idx * PACK;
+        const int64_t gm  = row_start + local_m;
+        const int64_t gn  = col_start + local_n;
+        QType out[PACK];
+        #pragma unroll
+        for (int i = 0; i < PACK; ++i) {
+            out[i] = static_cast<QType>(fmaxf(fminf(vals[r][i] * scale, clip_hi), clip_lo));
+        }
+        if (gm < M && gn + PACK <= N) {
+            store_data<QType, PACK>(w_fp8_ptr + batch_off + gm * N + gn, out);
+        } else if (gm < M) {
+            #pragma unroll
+            for (int i = 0; i < PACK; ++i) {
+                const int64_t cn = gn + i;
+                if (cn < N) w_fp8_ptr[batch_off + gm * N + cn] = out[i];
+            }
+        }
+    }
+}
+
+template <typename FType, typename QType>
+void quantize_blockwise_for_weight_impl(const FType *w, QType *w_fp8, float *w_scales_inv,
+                                         const int64_t B, const int64_t M, const int64_t N,
+                                         const float fp8_max, hipStream_t stream) {
+    constexpr int BLOCK_SIZE = 128;
+    const int64_t m_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int64_t n_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    dim3 grid(B, m_blocks, n_blocks);
+    quant_fp8_blockwise_for_weight_kernel<FType, QType>
+        <<<grid, dim3(256), 0, stream>>>(w, w_fp8, w_scales_inv, M, N, fp8_max);
+}
+
+#define DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE(FType, QType)                          \
+    template void quantize_blockwise_for_weight_impl<FType, QType>(                     \
+        const FType *w, QType *w_fp8, float *w_scales_inv,                              \
+        const int64_t B, const int64_t M, const int64_t N,                              \
+        const float fp8_max, hipStream_t stream);
+DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE(dtype::bfloat16, dtype::float8_e4m3)
+DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE(dtype::bfloat16, dtype::float8_e5m2)
+DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE(dtype::float16, dtype::float8_e4m3)
+DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE(dtype::float16, dtype::float8_e5m2)
+#undef DECL_QUANT_BLOCKWISE_FOR_WEIGHT_INSTANCE
 
 } // namespace primus_turbo

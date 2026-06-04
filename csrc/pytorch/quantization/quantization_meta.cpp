@@ -333,4 +333,22 @@ std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
     };
 }
 
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor     input,
+                                                              const at::ScalarType dest_dtype,
+                                                              const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3);
+    const bool    is_2d    = (input.dim() == 2);
+    const int64_t B        = is_2d ? 1 : input.size(0);
+    const int64_t M        = is_2d ? input.size(0) : input.size(1);
+    const int64_t N        = is_2d ? input.size(1) : input.size(2);
+    const int64_t m_blocks = (M + block_size - 1) / block_size;
+    const int64_t n_blocks = (N + block_size - 1) / block_size;
+    auto          fp8_meta  = at::dtype(dest_dtype).device(at::kMeta);
+    auto          fp32_meta = at::dtype(at::kFloat).device(at::kMeta);
+    if (is_2d) {
+        return {at::empty({M, N}, fp8_meta), at::empty({m_blocks, n_blocks}, fp32_meta)};
+    }
+    return {at::empty({B, M, N}, fp8_meta), at::empty({B, m_blocks, n_blocks}, fp32_meta)};
+}
+
 } // namespace primus_turbo::pytorch
