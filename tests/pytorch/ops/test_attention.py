@@ -484,3 +484,97 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dq_snr > 15, "query_grad_snr too low"
     assert dk_snr > 15, "key_grad_snr too low"
     assert dv_snr > 15, "value_grad_snr too low"
+
+
+@pytest.mark.parametrize("qkv_format", ["sbhd", "bhsd"])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_attention_sink_backward_noncontiguous(qkv_format, causal, dtype):
+    """Regression: sink attention backward with non-bshd (sbhd/bhsd) layouts.
+
+    The Triton sink backward kernel does not handle non-contiguous q/k/v or
+    dq/dk/dv strides, so the aiter backend normalizes the sink backward buffers
+    to bshd-contiguous. This exercises that path for the non-bshd layouts and
+    checks gradients against the sink reference implementation.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    batch, seqlen, num_head, head_dim = 2, 256, 16, 128
+    sm_scale = head_dim ** (-0.5)
+    window_size = (-1, -1)
+
+    if qkv_format == "sbhd":
+        layout = (seqlen, batch, num_head, head_dim)
+    else:  # bhsd
+        layout = (batch, num_head, seqlen, head_dim)
+
+    query = torch.randn(layout, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(layout, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(layout, device=device, dtype=dtype, requires_grad=True)
+    grad_out = torch.randn(layout, device=device, dtype=dtype)
+
+    query_ref = query.clone().detach().requires_grad_()
+    key_ref = key.clone().detach().requires_grad_()
+    value_ref = value.clone().detach().requires_grad_()
+    grad_out_ref = grad_out.clone().detach()
+
+    query_orig, key_orig, value_orig = query, key, value
+
+    if qkv_format == "sbhd":
+        query = query.permute(1, 0, 2, 3)
+        key = key.permute(1, 0, 2, 3)
+        value = value.permute(1, 0, 2, 3)
+        grad_out = grad_out.permute(1, 0, 2, 3)
+    else:  # bhsd
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        grad_out = grad_out.transpose(1, 2)
+
+    sink = torch.randn((num_head,), device=device, dtype=torch.float32, requires_grad=True)
+    sink_ref = sink.clone().detach().requires_grad_()
+
+    o_ref = attention_with_sink_ref_impl(
+        query_ref,
+        key_ref,
+        value_ref,
+        sink_ref,
+        sm_scale,
+        causal,
+        window_size=window_size,
+        qkv_format=qkv_format,
+    )
+    o_ref.backward(grad_out_ref)
+
+    o = flash_attn_func(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        deterministic=False,
+        return_lse=False,
+        return_attn_probs=False,
+        sink=sink,
+    )
+    o.backward(grad_out)
+    torch.cuda.synchronize()
+
+    assert query_orig.grad is not None and query_orig.grad.shape == query_ref.grad.shape
+    assert key_orig.grad is not None and key_orig.grad.shape == key_ref.grad.shape
+    assert value_orig.grad is not None and value_orig.grad.shape == value_ref.grad.shape
+    assert sink.grad is not None and sink.grad.shape == sink_ref.grad.shape
+
+    query_grad_snr = compute_snr(query_ref.grad, query_orig.grad)
+    key_grad_snr = compute_snr(key_ref.grad, key_orig.grad)
+    value_grad_snr = compute_snr(value_ref.grad, value_orig.grad)
+    assert query_grad_snr > 40, f"query_grad_snr too low: {query_grad_snr}"
+    assert key_grad_snr > 40, f"key_grad_snr too low: {key_grad_snr}"
+    assert value_grad_snr > 40, f"value_grad_snr too low: {value_grad_snr}"
+    torch.testing.assert_close(sink.grad, sink_ref.grad, atol=5e-2, rtol=5e-2)
