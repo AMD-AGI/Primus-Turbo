@@ -1621,15 +1621,13 @@ def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     return scale.to(dtype=torch.float32, device=device).reshape(1)
 
 
-# NN per-shape autotune: first call benches the candidates, caches best by
-# (M,N,K). AGPR must be nonzero (path-J ds_read_b64_tr_b8 produces nan
-# otherwise). Format: (BLOCK_M, GROUP_M, num_xcd, AGPR). GROUP_M>1 + num_xcd=8
-# (XCD-aware PID remap) gives per-XCD L2 B-reuse on large B-streaming shapes;
-# autotune falls back to GROUP_M=1/num_xcd=1 for L2-resident shapes.
+# NN per-shape autotune. GROUP_M/num_xcd fixed at the analytic L2-optimum
+# (4, 8) for the same reason as NT (L2 effects the hot bench can't measure);
+# only BLOCK_M and AGPR are swept. AGPR must be nonzero (path-J
+# ds_read_b64_tr_b8 produces nan otherwise).
 _NN_CANDIDATES = [
-    (256, 1, 1, 32),
     (256, 4, 8, 32),
-    (256, 4, 1, 32),
+    (256, 4, 8, 64),
     (128, 4, 8, 48),
 ]
 _NN_AUTOTUNE_CACHE: dict = {}
@@ -1699,21 +1697,18 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     return best
 
 
-# NT per-shape autotune: first call benches the candidates, caches best by
-# (M,N,K). Single 8-wave kernel (_compile_dense_nt). Format:
-# (BLOCK_M, GROUP_M, num_xcd, AGPR). GROUP_M>1 + num_xcd=8 (XCD-aware PID
-# remap) clusters same-XCD WGs so each XCD's private L2 reuses B across the
-# grouped M-bands -- the lever for large B-streaming shapes (e.g. ffn_up).
-# Large working sets (> L2) stream from HBM even on the hot-cache bench, so
-# autotune does observe the XCD/grouping win; small (L2-resident) shapes are
-# insensitive and fall back to the plain GROUP_M=1 candidate.
+# NT per-shape autotune. Format: (BLOCK_M, GROUP_M, num_xcd, AGPR).
+# GROUP_M and num_xcd are FIXED at the analytic L2-optimum (4, 8): they are
+# per-XCD L2-reuse effects the hot-cache bench cannot measure, so benching them
+# just picks by noise (and was dropping B-streaming shapes ~5% whenever it
+# mis-picked num_xcd=1). Only BLOCK_M and AGPR are swept -- both are
+# occupancy/compute effects the hot bench measures reliably (BLOCK_M=128 wins
+# tiny grids and loses big-M; AGPR trades occupancy).
 _NT_CANDIDATES = [
-    (256, 1, 1, 64),  # plain (wide-N, grouping/XCD no help)
-    (256, 1, 1, 32),  #   "   alt AGPR budget
-    (256, 4, 8, 64),  # grouped + XCD remap (large B-streaming)
-    (256, 4, 1, 64),  # grouped, no XCD (L2-resident square)
-    (128, 1, 1, 32),  # small grid (tiles < CUs): double M-tiles
-    (128, 4, 8, 32),  #   "   grouped + XCD
+    (256, 4, 8, 64),
+    (256, 4, 8, 32),
+    (128, 4, 8, 48),
+    (128, 4, 8, 32),
 ]
 _NT_AUTOTUNE_CACHE: dict = {}
 
