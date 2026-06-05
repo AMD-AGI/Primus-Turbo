@@ -216,6 +216,25 @@ def _asm_mma_do(a, b, c, mode="2", cbsz=0, blgp=0):
     return Vec(op.result)
 
 
+def _xcd_remap_pid(pid, total_pids, num_xcd):
+    """XCD-aware PID remap (plain-Python expr builder, like _tn_block_mn).
+
+    HW round-robins consecutive workgroups across XCDs (physical XCD =
+    pid % num_xcd), and each XCD owns a private L2. Re-gather all same-XCD
+    WGs into one contiguous logical-pid block so the GROUP_M super-block
+    swizzle's L2 reuse lands within a single XCD. Bijection for any
+    total_pids: XCDs [0,rem) hold per_xcd+1 tiles, [rem,num_xcd) hold per_xcd.
+    """
+    if num_xcd <= 1:
+        return pid
+    per_xcd = total_pids // num_xcd  # floor
+    rem = total_pids - per_xcd * num_xcd
+    xcd = pid % num_xcd
+    local = pid // num_xcd
+    offset = xcd * per_xcd + arith.select(xcd < rem, xcd, rem)
+    return offset + local
+
+
 @functools.lru_cache(maxsize=256)
 def _compile_dense_nt(
     K: int,
@@ -224,9 +243,8 @@ def _compile_dense_nt(
     GROUP_M: int = 1,
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
-    split_barrier: bool = False,
-    sched_mask: int = 0,
     nt_vmcnt: int = 3,  # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
+    num_xcd: int = 8,  # XCD-aware PID remap: cluster same-XCD WGs into contiguous logical tiles for per-XCD L2 reuse (gfx950 MI355X = 8 XCD); 1 disables
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # _StoreCPerTensor out dtype: True -> fp16, else bf16
@@ -295,29 +313,6 @@ def _compile_dense_nt(
         # Output       C is [M, N] row-major bf16.
         F8_IR_t = fx.Float8E4M3FN.ir_type
 
-        # sched_mask uses POSITION within K-iter. Each K-iter emits 7
-        # barriers (B1..B7). Bit N (N in 0..6) → use sched_barrier(0)
-        # for all barriers at position N across the unrolled K-loop.
-        # Prologue/epilog barriers always use HW s_barrier (outside the
-        # 7-cycle). Caller sets _prologue_offset[0] = barrier_idx after
-        # prologue done.
-        _barrier_idx = [0]
-        _prologue_offset = [-1]  # -1 = still in prologue
-
-        def _barrier_inline():
-            idx = _barrier_idx[0]
-            _barrier_idx[0] = idx + 1
-            if _prologue_offset[0] >= 0:
-                pos = (idx - _prologue_offset[0]) % 7
-                if sched_mask & (1 << pos):
-                    rocdl.sched_barrier(0)
-                    return
-            if split_barrier:
-                rocdl.s_barrier_signal(-1)
-                rocdl.s_barrier_wait(-1)
-            else:
-                rocdl.s_barrier()
-
         n_blocks = ceildiv(c_n, BLOCK_N)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -339,7 +334,7 @@ def _compile_dense_nt(
         # GROUP_M ≥ 1 is correct regardless of num_pid_m % GROUP_M.
         # arith.select used since flydsl lacks an integer minimum op.
         num_pid_m = ceildiv(c_m, BLOCK_M)
-        pid = fx.block_idx.x
+        pid = _xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
         num_pid_in_group = GROUP_M * n_blocks
         group_id = pid // num_pid_in_group
         pid_in_group = pid % num_pid_in_group
@@ -387,7 +382,7 @@ def _compile_dense_nt(
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
         if wave_m == 1:
-            _barrier_inline()
+            rocdl.s_barrier()
 
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
@@ -396,8 +391,6 @@ def _compile_dense_nt(
         b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
-        # Mark main-loop start so sched_mask can index barrier position % 7.
-        _prologue_offset[0] = _barrier_idx[0]
 
         # Main K-loop. Each iter: s2r {a0,b0,b1,a1} → 4 mma (c00→c01→c10→c11)
         # interleaved with k+1 (a_next1) and k+2 (a_cur0, b_cur0, b_cur1) prefetches.
@@ -405,30 +398,30 @@ def _compile_dense_nt(
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
             rocdl.s_setprio(0)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             b1_frag = b_s2r.load(b_cur1)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
             rocdl.s_setprio(0)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
             rocdl.s_setprio(0)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
@@ -436,7 +429,7 @@ def _compile_dense_nt(
             rocdl.s_setprio(1)
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
             rocdl.s_setprio(0)
-            _barrier_inline()
+            rocdl.s_barrier()
 
             if nt_vmcnt >= 0:
                 _llvm.inline_asm(
@@ -458,37 +451,37 @@ def _compile_dense_nt(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         b1_frag = b_s2r.load(b_cur1)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         b0_frag = b_s2r.load(b_next0)
         a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)  # stale-a1 fix
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -504,25 +497,25 @@ def _compile_dense_nt(
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         b1_frag = b_s2r.load(b_cur1)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
         a1_frag = _mask_a_tail(a1_frag, lane_id, K_TAIL)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
-        _barrier_inline()
+        rocdl.s_barrier()
 
         # Scale + store.
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -945,10 +938,9 @@ def _compile_dense_nn(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     GROUP_M: int = 4,
+    num_xcd: int = 8,  # XCD-aware PID remap for per-XCD L2 reuse (MI355X = 8 XCD); 1 disables. See _xcd_remap_pid.
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
-    # barrier-mask: NN main loop emits 7 s_barrier() per K-iter; bits 0..6
-    # gate B1..B7. Default 0x7F = all ON (removing any slows latency).
     # path J: emit ds_read_tr8_b64 as inline asm so the backend treats it as
     # opaque and skips the auto vmcnt(0) drain; vmcnt_hint supplies the LDS
     # sync. MUST set agpr_alloc>0 (AGPR=0 + inline-asm =v constraint → nan).
@@ -1041,7 +1033,7 @@ def _compile_dense_nn(
         # tail clamp, GM > num_pid_m emits block_m values past the row tile
         # bound, leaving most valid (m, n) tiles uncovered (SNR ≈ -50 dB).
         num_pid_m = ceildiv(c_m, BLOCK_M)
-        pid = fx.block_idx.x
+        pid = _xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
         num_pid_in_group = GROUP_M * n_blocks
         group_id = pid // num_pid_in_group
         pid_in_group = pid % num_pid_in_group
@@ -1265,6 +1257,7 @@ def _compile_dense_tn(
     waves_per_eu: int = 2,
     vmcnt_hint: int = 3,
     group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D band (width group_n)
+    num_xcd: int = 8,  # XCD-aware PID remap for per-XCD L2 reuse (MI355X = 8 XCD); 1 disables. See _xcd_remap_pid.
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # _StoreCPerTensor out dtype: True -> fp16, else bf16
@@ -1382,7 +1375,7 @@ def _compile_dense_tn(
         wave_n = wave_id % 4
 
         num_pid_m = ceildiv(c_m, BLOCK_M)
-        pid = fx.block_idx.x
+        pid = _xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
         # Swizzle via plain-Python helper (NOT a kernel `if`: @flyc.kernel
         # wraps each if-branch in its own fn so vars defined inside aren't
         # visible after — see prelude note). Helper builds the expr graph
@@ -1628,21 +1621,16 @@ def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     return scale.to(dtype=torch.float32, device=device).reshape(1)
 
 
-def _aspect_group_m(M, N, bm, bn=256):
-    """L2 super-block GROUP_M from the tile aspect ratio: 1 for wide-N (more
-    N-tiles than M-tiles) else 4. It is an L2-reuse effect that hot-cache
-    autotune timing can't measure, so it is computed here, not swept."""
-    num_pid_m = (M + bm - 1) // bm
-    num_pid_n = (N + bn - 1) // bn
-    return 1 if num_pid_n > num_pid_m else 4
-
-
 # NN per-shape autotune: first call benches the candidates, caches best by
-# (M,N,K). GROUP_M comes from _aspect_group_m (not swept). AGPR must be nonzero
-# (path-J ds_read_b64_tr_b8 produces nan otherwise). Format: (BLOCK_M, AGPR).
+# (M,N,K). AGPR must be nonzero (path-J ds_read_b64_tr_b8 produces nan
+# otherwise). Format: (BLOCK_M, GROUP_M, num_xcd, AGPR). GROUP_M>1 + num_xcd=8
+# (XCD-aware PID remap) gives per-XCD L2 B-reuse on large B-streaming shapes;
+# autotune falls back to GROUP_M=1/num_xcd=1 for L2-resident shapes.
 _NN_CANDIDATES = [
-    (256, 32),
-    (128, 48),
+    (256, 1, 1, 32),
+    (256, 4, 8, 32),
+    (256, 4, 1, 32),
+    (128, 4, 8, 48),
 ]
 _NN_AUTOTUNE_CACHE: dict = {}
 
@@ -1650,9 +1638,9 @@ _NN_AUTOTUNE_CACHE: dict = {}
 def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench NN candidates, cache best (launch, cfg) by (M,N,K).
 
-    Runtime micro-benches each (BM,AG) candidate (skipping BM that doesn't
-    divide M), with GROUP_M from _aspect_group_m, finite-checks the output,
-    times 2-warmup + 20-iter, and caches the fastest by shape.
+    Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
+    finite-checks the output, times 2-warmup + 20-iter, and caches the
+    fastest by shape.
     """
     import torch as _torch
 
@@ -1662,11 +1650,10 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     out_view = args[2]
     best_us = float("inf")
     best = None
-    for bm, ag in _NN_CANDIDATES:
+    for bm, gm, xcd, ag in _NN_CANDIDATES:
         # odd-M (M % bm != 0) is fine: the partial last M-tile is
         # bounded by c_m (_StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
-        gm = _aspect_group_m(M, N, bm)
         try:
             # path J: inline-asm ds_read_b64_tr_b8 ON by default. Eliminates
             # 446/447 compiler-auto vmcnt(0) drain per K-iter.
@@ -1675,6 +1662,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
                 BLOCK_M=bm,
                 BLOCK_N=256,
                 GROUP_M=gm,
+                num_xcd=xcd,
                 agpr_alloc=ag,
                 b_inline_asm_load=True,
                 vmcnt_hint=2,
@@ -1702,7 +1690,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = (launch, (bm, gm, ag))
+                best = (launch, (bm, gm, xcd, ag))
         except Exception:
             continue
     if best is None:
@@ -1712,13 +1700,20 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 
 
 # NT per-shape autotune: first call benches the candidates, caches best by
-# (M,N,K). Single 8-wave kernel (_compile_dense_nt). GROUP_M comes from
-# _aspect_group_m (not swept). Format: (BLOCK_M, AGPR).
+# (M,N,K). Single 8-wave kernel (_compile_dense_nt). Format:
+# (BLOCK_M, GROUP_M, num_xcd, AGPR). GROUP_M>1 + num_xcd=8 (XCD-aware PID
+# remap) clusters same-XCD WGs so each XCD's private L2 reuses B across the
+# grouped M-bands -- the lever for large B-streaming shapes (e.g. ffn_up).
+# Large working sets (> L2) stream from HBM even on the hot-cache bench, so
+# autotune does observe the XCD/grouping win; small (L2-resident) shapes are
+# insensitive and fall back to the plain GROUP_M=1 candidate.
 _NT_CANDIDATES = [
-    (256, 0),
-    (256, 32),
-    (256, 64),
-    (128, 32),
+    (256, 1, 1, 64),  # plain (wide-N, grouping/XCD no help)
+    (256, 1, 1, 32),  #   "   alt AGPR budget
+    (256, 4, 8, 64),  # grouped + XCD remap (large B-streaming)
+    (256, 4, 1, 64),  # grouped, no XCD (L2-resident square)
+    (128, 1, 1, 32),  # small grid (tiles < CUs): double M-tiles
+    (128, 4, 8, 32),  #   "   grouped + XCD
 ]
 _NT_AUTOTUNE_CACHE: dict = {}
 
@@ -1726,9 +1721,9 @@ _NT_AUTOTUNE_CACHE: dict = {}
 def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench NT candidates, cache best (launch, cfg) by (M,N,K).
 
-    Runtime micro-benches each (BM,AG) candidate (skipping BM that doesn't
-    divide M), with GROUP_M from _aspect_group_m, finite-checks the output,
-    times 2-warmup + 20-iter, and caches the fastest by shape.
+    Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
+    finite-checks the output, times 2-warmup + 20-iter, and caches the
+    fastest by shape.
     """
     import torch as _torch
 
@@ -1738,11 +1733,10 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     out_view = args[2]
     best_us = float("inf")
     best = None
-    for bm, ag in _NT_CANDIDATES:
+    for bm, gm, xcd, ag in _NT_CANDIDATES:
         # odd-M (M % bm != 0) is fine: the partial last M-tile is
         # bounded by c_m (_StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
-        gm = _aspect_group_m(M, N, bm)
         try:
             launch = _compile_dense_nt(
                 K=K,
@@ -1750,6 +1744,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
                 BLOCK_N=256,
                 GROUP_M=gm,
                 agpr_alloc=ag,
+                num_xcd=xcd,
                 cbsz=cbsz,
                 blgp=blgp,
                 out_fp16=out_fp16,
@@ -1774,7 +1769,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = (launch, (bm, gm, ag))
+                best = (launch, (bm, gm, xcd, ag))
         except Exception:
             continue
     if best is None:
@@ -1785,76 +1780,73 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 
 # TN dispatch: a single inplace-A kernel (inline-asm tr8 on both operands +
 # asm_mma=2 → accumulators aliased into AGPR, spill-free, no per-K-iter A-side
-# vmcnt(0) drain). Both swizzle knobs are analytic, not benched — GROUP_M and
-# group_n are L2-reuse effects hot-cache autotune timing cannot measure (it
-# mis-picks them), and TN has no compute-visible knob left to tune.
-
-
-def _tn_group_n(M, N, K):
-    """2D super-block band width: keeps both operands resident in L2 on big-N /
-    big-K shapes. 0 = plain 1D GROUP_M scan."""
-    num_pid_m = (M + 255) // 256
-    num_pid_n = (N + 255) // 256
-    if num_pid_n >= 32 and num_pid_m >= 16 and num_pid_n >= 2 * num_pid_m:
-        return num_pid_n // 8  # big-N: B re-streams dominate
-    if K >= 28672 and M % 256 == 0 and num_pid_n >= 8:
-        return num_pid_n // 4  # big-K
-    return 0
-
-
-def _tn_group_m(M, N, group_n):
-    """1D super-row width. GM=4 pairs with a 2D band; otherwise GM=1 for wide-N
-    (more N-tiles than M-tiles, cold-best) else GM=2."""
-    if group_n > 0:
-        return 4
-    num_pid_m = (M + 255) // 256
-    num_pid_n = (N + 255) // 256
-    return 1 if num_pid_n > num_pid_m else 2
+# vmcnt(0) drain). Same 1D GROUP_M=4 + XCD-aware PID remap as NT/NN; only the
+# num_xcd on/off is benched per shape (L2-resident shapes pick num_xcd=1).
 
 
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
 def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
-    """Compile the analytic (GROUP_M, group_n) TN config, cached by (M,N,K)."""
+    """First-call bench TN candidates, cache best (launch, cfg) by (M,N,K).
+
+    1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
+    (HBM-streaming) shapes expose the per-XCD L2 reuse on the hot bench,
+    L2-resident shapes pick num_xcd=1.
+    """
+    import torch as _torch
+
     key = (M, N, K, cbsz, blgp, out_fp16)
     if key in _TN_AUTOTUNE_CACHE:
         return _TN_AUTOTUNE_CACHE[key]
-    group_n = _tn_group_n(M, N, K)
-    group_m = _tn_group_m(M, N, group_n)
     # Occupancy routing: BLOCK_M=BLOCK_N=256 yields ceil(M/256)*ceil(N/256)
-    # persistent tiles; when that is below NUM_CUS the grid cannot fill every
-    # CU, so BLOCK_M=128 is used to double the M-tile count. With enough tiles
-    # the smaller block's higher per-tile overhead dominates, so keep BLOCK_M=256.
+    # tiles; below NUM_CUS the grid can't fill every CU, so BLOCK_M=128 doubles
+    # the M-tile count. Above it the smaller block's per-tile overhead dominates.
     NUM_CUS = 256
     tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
-    use_bm128 = tiles_256 < NUM_CUS
-    if use_bm128:
-        launch = _compile_dense_tn(
-            K=K,
-            BLOCK_M=128,
-            BLOCK_N=256,
-            GROUP_M=4,
-            vmcnt_hint=3,
-            group_n=0,
-            cbsz=cbsz,
-            blgp=blgp,
-            out_fp16=out_fp16,
-        )
-        best = (launch, (4, 0))
-    else:
-        launch = _compile_dense_tn(
-            K=K,
-            BLOCK_M=256,
-            BLOCK_N=256,
-            GROUP_M=group_m,
-            vmcnt_hint=3,
-            group_n=group_n,
-            cbsz=cbsz,
-            blgp=blgp,
-            out_fp16=out_fp16,
-        )
-        best = (launch, (group_m, group_n))
+    bm = 128 if tiles_256 < NUM_CUS else 256
+    out_view = args[2]
+    best_us = float("inf")
+    best = None
+    for xcd in (8, 1):
+        try:
+            launch = _compile_dense_tn(
+                K=K,
+                BLOCK_M=bm,
+                BLOCK_N=256,
+                GROUP_M=4,
+                vmcnt_hint=3,
+                group_n=0,
+                num_xcd=xcd,
+                cbsz=cbsz,
+                blgp=blgp,
+                out_fp16=out_fp16,
+            )
+            c = _get_compiled_dense(launch, args)
+            c(*args)
+            _torch.cuda.synchronize()
+            sample = out_view.view(-1)[:1024].float()
+            if not _torch.isfinite(sample).all().item():
+                continue
+            for _ in range(2):
+                c(*args)
+            _torch.cuda.synchronize()
+            e0 = _torch.cuda.Event(enable_timing=True)
+            e1 = _torch.cuda.Event(enable_timing=True)
+            _torch.cuda.synchronize()
+            e0.record()
+            for _ in range(20):
+                c(*args)
+            e1.record()
+            _torch.cuda.synchronize()
+            us = e0.elapsed_time(e1) * 1000.0 / 20
+            if us < best_us:
+                best_us = us
+                best = (launch, (bm, 4, 0, xcd))
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
     _TN_AUTOTUNE_CACHE[key] = best
     return best
 
