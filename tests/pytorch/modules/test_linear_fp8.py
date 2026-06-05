@@ -25,13 +25,16 @@ float8_quant_configs = [
 
 @pytest.mark.parametrize("config", float8_quant_configs)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("M", [128, 4096])
 @pytest.mark.parametrize("N", [256, 4096])
 @pytest.mark.parametrize("K", [512, 2048, 8192])
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("enable_torch_compile", [True, False])
 def test_float8linear(config, dtype, format, M, N, K, bias, enable_torch_compile):
+    if format == Format.HYBRID and config.granularity != ScalingGranularity.TENSORWISE:
+        pytest.skip("Format.HYBRID is only supported for TENSORWISE granularity")
+
     device = "cuda:0"
 
     config.format = format
