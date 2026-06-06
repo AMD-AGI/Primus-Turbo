@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import lru_cache
 from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
@@ -82,9 +81,9 @@ class GlobalBackendManager:
     _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _auto_tune: Optional[bool] = None
+    _env_cache: Dict[str, Dict["PrecisionType", "BackendType"]] = {}
 
     @classmethod
-    @lru_cache(maxsize=32)
     def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendType]:
         """
         Extract the backend from the environment variable.
@@ -95,6 +94,9 @@ class GlobalBackendManager:
 
         Precision types are defined in the _PRECISION_TYPE_MAPPING.
         """
+        if env_value in cls._env_cache:
+            return cls._env_cache[env_value]
+
         precision_backend_dict = {}
 
         # Parse format 2 & 3
@@ -122,7 +124,19 @@ class GlobalBackendManager:
             for value in _PRECISION_TYPE_MAPPING.values():
                 precision_backend_dict[value] = BackendType[env_value.upper()]
 
+        cls._env_cache[env_value] = precision_backend_dict
         return precision_backend_dict
+
+    @classmethod
+    def _clear_env_cache(cls) -> None:
+        """Clear the cached parses of backend env vars.
+
+        Replaces the previous ``_extract_backend_from_env.cache_clear()``
+        contract from when this method was wrapped with ``functools.lru_cache``.
+        Tests and any external callers that need to invalidate the cache
+        should call this instead.
+        """
+        cls._env_cache.clear()
 
     @classmethod
     def set_gemm_backend(
@@ -173,7 +187,9 @@ class GlobalBackendManager:
         if cls._gemm_backend is not None:
             return cls._gemm_backend[precision]
         env_value = os.environ.get(ENV_GEMM_BACKEND, None)
-        if env_value is not None:
+        # Treat an empty / whitespace-only env var as missing (else
+        # _extract_backend_from_env raises KeyError on BackendType['']).
+        if env_value is not None and env_value.strip():
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
@@ -191,7 +207,7 @@ class GlobalBackendManager:
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend[precision]
         env_value = os.environ.get(ENV_GROUPED_GEMM_BACKEND, None)
-        if env_value is not None:
+        if env_value is not None and env_value.strip():
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
@@ -214,7 +230,7 @@ class GlobalBackendManager:
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend[precision]
         env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
-        if env_value is not None:
+        if env_value is not None and env_value.strip():
             try:
                 backend = cls._extract_backend_from_env(env_value).get(precision, None)
             except KeyError:
@@ -248,6 +264,7 @@ class GlobalBackendManager:
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
         cls._auto_tune = None
+        cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
         origami_clear_caches()
 
