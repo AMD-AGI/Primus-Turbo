@@ -141,7 +141,21 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         _, _, num_heads_k, head_dim_k = k.size()
         _, _, num_heads_v, head_dim_v = v.size()
 
-        if qkv_format == "sbhd":
+        # The Triton sink backward kernel (flash_attn_onekernel_backward) does not
+        # currently handle non-contiguous q/k/v or non-contiguous dq/dk/dv strides.
+        # When sink attention is enabled, normalize all bwd buffers to bshd-contiguous
+        # so the kernel's stride math matches eager. dq/dk/dv shapes still match the
+        # original inputs, so PyTorch autograd accumulates correctly regardless of
+        # the original strides.
+        sink_bwd_path = ctx.sink is not None
+        if sink_bwd_path and qkv_format != "bshd":
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            dout_padded = dout_padded.contiguous()
+            out_padded = out_padded.contiguous()
+
+        if qkv_format == "sbhd" and not sink_bwd_path:
             dq = torch.ones(
                 (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(1, 0, 2, 3)
@@ -151,7 +165,7 @@ class AiterFlashAttnFunc(torch.autograd.Function):
             dv_padded = torch.empty(
                 (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
-        elif qkv_format == "bhsd":
+        elif qkv_format == "bhsd" and not sink_bwd_path:
             dq = torch.ones(
                 (batch_size, num_heads_q, seq_len, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(0, 2, 1, 3)
