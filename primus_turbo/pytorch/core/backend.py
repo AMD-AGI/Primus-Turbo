@@ -187,7 +187,9 @@ class GlobalBackendManager:
         if cls._gemm_backend is not None:
             return cls._gemm_backend[precision]
         env_value = os.environ.get(ENV_GEMM_BACKEND, None)
-        if env_value is not None:
+        # Treat an empty / whitespace-only env var as missing (else
+        # _extract_backend_from_env raises KeyError on BackendType['']).
+        if env_value is not None and env_value.strip():
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
@@ -205,7 +207,7 @@ class GlobalBackendManager:
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend[precision]
         env_value = os.environ.get(ENV_GROUPED_GEMM_BACKEND, None)
-        if env_value is not None:
+        if env_value is not None and env_value.strip():
             backend = cls._extract_backend_from_env(env_value).get(precision, None)
             if backend is None:
                 logger.warning(
@@ -228,7 +230,7 @@ class GlobalBackendManager:
         if cls._moe_dispatch_combine_backend is not None:
             return cls._moe_dispatch_combine_backend[precision]
         env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
-        if env_value is not None:
+        if env_value is not None and env_value.strip():
             try:
                 backend = cls._extract_backend_from_env(env_value).get(precision, None)
             except KeyError:
