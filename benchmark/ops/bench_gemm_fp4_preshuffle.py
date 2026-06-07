@@ -41,7 +41,6 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
     enable_preshuffle,
     gemm_fp4_impl,
@@ -117,9 +116,14 @@ def bench_gemm(m, n, k, warmup, repeat):
 
     def call_no_pre():
         return gemm_fp4_impl(
-            qa_data, qa_scale, False,
-            qb_data, qb_scale, True,
-            DTYPE, False,
+            qa_data,
+            qa_scale,
+            False,
+            qb_data,
+            qb_scale,
+            True,
+            DTYPE,
+            False,
             granularity=GRANULARITY.value,
             default_backend=BackendType.AITER.value,
             preshuffled=False,
@@ -127,9 +131,14 @@ def bench_gemm(m, n, k, warmup, repeat):
 
     def call_pre():
         return gemm_fp4_impl(
-            qa_data, qa_scale_pre, False,
-            qb_data_pre, qb_scale_pre, True,
-            DTYPE, False,
+            qa_data,
+            qa_scale_pre,
+            False,
+            qb_data_pre,
+            qb_scale_pre,
+            True,
+            DTYPE,
+            False,
             granularity=GRANULARITY.value,
             default_backend=BackendType.AITER.value,
             preshuffled=True,
@@ -180,9 +189,14 @@ def profile_one_iter(m, n, k):
     # Warm up
     for _ in range(5):
         gemm_fp4_impl(
-            qa_data, qa_scale, False,
-            qb_data, qb_scale, True,
-            DTYPE, False,
+            qa_data,
+            qa_scale,
+            False,
+            qb_data,
+            qb_scale,
+            True,
+            DTYPE,
+            False,
             granularity=GRANULARITY.value,
             default_backend=BackendType.AITER.value,
             preshuffled=True,
@@ -198,9 +212,14 @@ def profile_one_iter(m, n, k):
     ) as prof:
         for _ in range(5):
             gemm_fp4_impl(
-                qa_data, qa_scale, False,
-                qb_data, qb_scale, True,
-                DTYPE, False,
+                qa_data,
+                qa_scale,
+                False,
+                qb_data,
+                qb_scale,
+                True,
+                DTYPE,
+                False,
                 granularity=GRANULARITY.value,
                 default_backend=BackendType.AITER.value,
                 preshuffled=True,
@@ -215,10 +234,7 @@ def profile_one_iter(m, n, k):
         )
     )
 
-    shuffle_kernels = [
-        e for e in prof.key_averages()
-        if "shuffle" in e.key.lower()
-    ]
+    shuffle_kernels = [e for e in prof.key_averages() if "shuffle" in e.key.lower()]
     if shuffle_kernels:
         print(
             f"WARNING: preshuffled=True path saw {len(shuffle_kernels)} shuffle "

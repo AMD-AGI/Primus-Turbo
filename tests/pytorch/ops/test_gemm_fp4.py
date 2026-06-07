@@ -79,13 +79,11 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
 
     if backend == BackendType.AITER and not auto_tune:
-        assert (
-            enable_preshuffle() is True
-        ), "AITER + autotune-off should enable the preshuffle fast path"
+        assert enable_preshuffle() is True, "AITER + autotune-off should enable the preshuffle fast path"
     else:
-        assert enable_preshuffle() is False, (
-            f"Preshuffle must be off for backend={backend}, auto_tune={auto_tune}"
-        )
+        assert (
+            enable_preshuffle() is False
+        ), f"Preshuffle must be off for backend={backend}, auto_tune={auto_tune}"
 
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
@@ -357,9 +355,8 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor_aiter_preshuffled(m, n, k):
     must be supplied (cannot be derived via ``dequantize()`` on a
     preshuffled-scale forward tensor).
     """
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
-
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
 
     mxfp4_supported, reason = check_mxfp4_support()
     if not mxfp4_supported:
@@ -392,38 +389,69 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor_aiter_preshuffled(m, n, k):
 
         # Recipes match FP4GemmMXFunction internal construction.
         qt_a = QuantizedTensor.quantize(
-            a, fp4_dtype, config.granularity, block_size=32, axis=1,
+            a,
+            fp4_dtype,
+            config.granularity,
+            block_size=32,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=False, use_sr=False, use_rht=False,
-                shuffle_scale=True, shuffle_out=False,
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=True,
+                shuffle_out=False,
             ),
         )
         qt_a_t = QuantizedTensor.quantize(
-            a, fp4_dtype, config.granularity, block_size=32, axis=0,
+            a,
+            fp4_dtype,
+            config.granularity,
+            block_size=32,
+            axis=0,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=False, use_sr=False, use_rht=True,
-                shuffle_scale=True, shuffle_out=True,
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+                shuffle_scale=True,
+                shuffle_out=True,
             ),
         )
         qt_b = QuantizedTensor.quantize(
-            b, fp4_dtype, config.granularity, block_size=32, axis=1,
+            b,
+            fp4_dtype,
+            config.granularity,
+            block_size=32,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=True, use_sr=False, use_rht=False,
-                shuffle_scale=True, shuffle_out=True,
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=True,
+                shuffle_out=True,
             ),
         )
         qt_b_t = QuantizedTensor.quantize(
-            b, fp4_dtype, config.granularity, block_size=32, axis=0,
+            b,
+            fp4_dtype,
+            config.granularity,
+            block_size=32,
+            axis=0,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=True, use_sr=False, use_rht=True,
-                shuffle_scale=True, shuffle_out=True,
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=True,
+                shuffle_scale=True,
+                shuffle_out=True,
             ),
         )
 
         c = gemm_fp4(
             QuantizedTensorPair(data=qt_a, data_t=qt_a_t),
             QuantizedTensorPair(data=qt_b, data_t=qt_b_t),
-            False, True, dtype, config,
+            False,
+            True,
+            dtype,
+            config,
         )
         c.backward(torch.ones_like(c))
         torch.cuda.synchronize()
@@ -574,24 +602,43 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         # Vanilla (unshuffled) quantize; AITER's execute will do the
         # 3 shuffles internally.
         qa = QuantizedTensor.quantize(
-            a_hp, fp4_dtype, granularity, block_size=block_size, axis=1,
+            a_hp,
+            fp4_dtype,
+            granularity,
+            block_size=block_size,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=False, use_sr=False, use_rht=False,
-                shuffle_scale=False, shuffle_out=False,
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=False,
+                shuffle_out=False,
             ),
         )
         qb = QuantizedTensor.quantize(
-            b_hp, fp4_dtype, granularity, block_size=block_size, axis=1,
+            b_hp,
+            fp4_dtype,
+            granularity,
+            block_size=block_size,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=True, use_sr=False, use_rht=False,
-                shuffle_scale=False, shuffle_out=False,
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=False,
+                shuffle_out=False,
             ),
         )
 
         out_no_pre = gemm_fp4_impl(
-            qa.qdata, qa.scale_inv, False,
-            qb.qdata, qb.scale_inv, True,
-            dtype, False,
+            qa.qdata,
+            qa.scale_inv,
+            False,
+            qb.qdata,
+            qb.scale_inv,
+            True,
+            dtype,
+            False,
             granularity=granularity.value,
             default_backend=BackendType.AITER.value,
             preshuffled=False,
@@ -604,9 +651,14 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         shuffled_b_data = torch.ops.primus_turbo_cpp_extension.shuffle_weight(qb.qdata, [16, 16])
 
         out_pre = gemm_fp4_impl(
-            qa.qdata, shuffled_a_scale, False,
-            shuffled_b_data, shuffled_b_scale, True,
-            dtype, False,
+            qa.qdata,
+            shuffled_a_scale,
+            False,
+            shuffled_b_data,
+            shuffled_b_scale,
+            True,
+            dtype,
+            False,
             granularity=granularity.value,
             default_backend=BackendType.AITER.value,
             preshuffled=True,
@@ -617,8 +669,7 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         # Both paths converge on the same aiter.gemm_a4w4(bpreshuffle=True)
         # consuming the same byte-identical shuffled inputs -> outputs match.
         assert torch.equal(out_no_pre, out_pre), (
-            "preshuffled=True must match preshuffled=False bit-for-bit "
-            "on the AITER backend"
+            "preshuffled=True must match preshuffled=False bit-for-bit " "on the AITER backend"
         )
     finally:
         GlobalBackendManager.reset()
@@ -653,25 +704,44 @@ def test_gemm_fp4_impl_hipblaslt_preshuffle_opt_out():
         a_hp = torch.randn((m, k), dtype=dtype, device=device)
         b_hp = torch.randn((n, k), dtype=dtype, device=device)
         qa = QuantizedTensor.quantize(
-            a_hp, fp4_dtype, granularity, block_size=32, axis=1,
+            a_hp,
+            fp4_dtype,
+            granularity,
+            block_size=32,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=False, use_sr=False, use_rht=False,
-                shuffle_scale=False, shuffle_out=False,
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=False,
+                shuffle_out=False,
             ),
         )
         qb = QuantizedTensor.quantize(
-            b_hp, fp4_dtype, granularity, block_size=32, axis=1,
+            b_hp,
+            fp4_dtype,
+            granularity,
+            block_size=32,
+            axis=1,
             scaling_recipe=ScalingRecipe(
-                use_2d_block=True, use_sr=False, use_rht=False,
-                shuffle_scale=False, shuffle_out=False,
+                use_2d_block=True,
+                use_sr=False,
+                use_rht=False,
+                shuffle_scale=False,
+                shuffle_out=False,
             ),
         )
 
         with pytest.raises(ValueError, match="cannot handle"):
             gemm_fp4_impl(
-                qa.qdata, qa.scale_inv, False,
-                qb.qdata, qb.scale_inv, True,
-                dtype, False,
+                qa.qdata,
+                qa.scale_inv,
+                False,
+                qb.qdata,
+                qb.scale_inv,
+                True,
+                dtype,
+                False,
                 granularity=granularity.value,
                 default_backend=BackendType.HIPBLASLT.value,
                 preshuffled=True,
