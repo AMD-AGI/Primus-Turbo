@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import sysconfig
 import warnings
 from dataclasses import dataclass
@@ -16,13 +17,18 @@ from typing import List, Optional
 
 import setuptools
 
+# Use the vendored hipify_torch submodule; no separate install needed.
+_HIPIFY_VENDOR_DIR = Path(__file__).resolve().parent.parent / "3rdparty" / "hipify_torch"
+if _HIPIFY_VENDOR_DIR.is_dir() and str(_HIPIFY_VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_HIPIFY_VENDOR_DIR))
+
 try:
     from hipify_torch.hipify_python import hipify
 except ImportError as exc:
     raise RuntimeError(
-        "hipify_torch is required to build primus_turbo.\n"
-        "Please install it first:\n"
-        '  pip3 install "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git"'
+        "hipify_torch is required to build primus_turbo but was not found.\n"
+        "It is vendored as a git submodule; initialize it with:\n"
+        "  git submodule sync && git submodule update --init --recursive"
     ) from exc
 
 try:

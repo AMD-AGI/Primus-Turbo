@@ -9,3 +9,7 @@ recursive-include tools *.py
 recursive-include csrc *
 recursive-include primus_turbo *.py
 recursive-include 3rdparty/composable_kernel/include *
+recursive-include 3rdparty/hipify_torch/hipify_torch *
+
+global-exclude *.py[cod]
+global-exclude __pycache__

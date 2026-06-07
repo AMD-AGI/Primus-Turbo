@@ -60,9 +60,6 @@ rocm/jax-training:maxtext-v26.2
 #### Install from PyPI (Recommended)
 
 ```bash
-# Prerequisite for --no-build-isolation builds
-pip3 install "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git"
-
 # PyTorch backend
 pip3 install --no-build-isolation "primus-turbo[pytorch]"
 ```

@@ -3,7 +3,6 @@ requires = [
     "setuptools==69.5.1",
     "setuptools_scm[toml]>=8",
     "wheel",
-    "hipify_torch @ git+https://github.com/ROCm/hipify_torch.git",
 ]
 build-backend = "setuptools.build_meta"
 
