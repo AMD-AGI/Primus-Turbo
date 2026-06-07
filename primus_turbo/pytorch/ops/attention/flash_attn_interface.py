@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional
 
 import torch
@@ -12,12 +13,17 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    attention_flydsl_varlen_backward_impl,
+    attention_flydsl_varlen_forward_impl,
+    flydsl_attn_varlen_supported,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -584,6 +590,100 @@ class AiterFlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+class FlyDSLFlashAttnVarlenFunc(torch.autograd.Function):
+    """gfx1250 FlyDSL varlen flash-attention (D_qk=192 / D_v=128 bf16).
+
+    Forward uses the vendored FMHA kernel (always emits LSE); backward uses the
+    net-new FlyDSL backward. Plain MHA / GQA only -- dropout, bias, alibi and
+    sliding windows are rejected by the dispatcher (``flydsl_attn_varlen_supported``)
+    and never reach here.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        return_lse,
+        is_grad_enabled,
+    ):
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        out, softmax_lse = attention_flydsl_varlen_forward_impl(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+
+        result = [out]
+        if return_lse:
+            result.append(softmax_lse)
+        return result[0] if len(result) == 1 else tuple(result)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        dq, dk, dv = attention_flydsl_varlen_backward_impl(
+            dout.contiguous(),
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+        )
+        return (dq, dk, dv, None, None, None, None, None, None, None, None)
+
+
+def _use_flydsl_varlen(q, k, v, dropout_p, window_size, bias, alibi_slopes) -> bool:
+    """Decide whether to route varlen attention through the FlyDSL backend.
+
+    PRIMUS_TURBO_ATTN_BACKEND:
+      - "flydsl"        : force FlyDSL (raises later if the config is unsupported).
+      - "auto" / unset  : use FlyDSL when supported on gfx1250, else fall back.
+      - anything else   : never use FlyDSL.
+    """
+    mode = os.environ.get("PRIMUS_TURBO_ATTN_BACKEND", "auto").lower()
+    if mode not in ("flydsl", "auto"):
+        return False
+    supported = flydsl_attn_varlen_supported(q, k, v, dropout_p, window_size, bias, alibi_slopes)
+    if mode == "flydsl":
+        if not supported:
+            raise ValueError(
+                "PRIMUS_TURBO_ATTN_BACKEND=flydsl but the varlen config is unsupported "
+                "(needs gfx1250, bf16, D_qk=192, D_v=128, dropout=0, no bias/alibi/window)."
+            )
+        return True
+    return supported
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -625,6 +725,23 @@ def flash_attn_varlen_func(
         return_lse: also return softmax_lse of shape (nheads, total_q).
         return_attn_probs: testing-only; return the dropout-encoded softmax output.
     """
+    if not return_attn_probs and _use_flydsl_varlen(
+        q, k, v, dropout_p, window_size, bias, alibi_slopes
+    ):
+        return FlyDSLFlashAttnVarlenFunc.apply(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            return_lse,
+            torch.is_grad_enabled(),
+        )
+
     return AiterFlashAttnVarlenFunc.apply(
         q,
         k,
