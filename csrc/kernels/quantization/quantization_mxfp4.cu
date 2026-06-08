@@ -60,9 +60,18 @@ constexpr int THREADS_PER_ROW =
 constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
 
 // Stochastic rounding: per-launch atomic counter provides a unique seed to
-// each kernel invocation.  The per-thread hash (seed + blockDim.x*blockIdx.x
-// + threadIdx.x) ensures uniqueness within a launch.
+// each kernel invocation.  Combined with a Wang hash for avalanche diffusion,
+// this gives decorrelated random bits across threads and launches.
 static std::atomic<uint32_t> global_sr_counter{0};
+
+__device__ __forceinline__ uint32_t sr_hash(uint32_t seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
 
 // ============================================================================
 // HADAMARD TRANSFORM - 16-Point In-Place Transform
@@ -469,7 +478,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
             for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
                 uint16_t fp4x4;
                 if constexpr (USE_SR) {
-                    uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
+                    uint32_t rng = sr_hash(sr_seed ^ (blockDim.x * blockIdx.x + threadIdx.x));
                     fp4x4 = cvt_f32x4_to_fp4x4_sr(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
                                                   r_vals[pass][3], r_scale_native[pass], rng);
                 } else {
@@ -795,7 +804,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                     uint16_t fp4x4;
                     // Convert packed FP32 to FP4
                     if constexpr (ROWWISE_USE_SR) {
-                        uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
+                        uint32_t rng = sr_hash(sr_seed ^ (blockDim.x * blockIdx.x + threadIdx.x));
                         fp4x4 =
                             cvt_f32x4_to_fp4x4_sr(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
                                                   r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
@@ -931,7 +940,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                     uint16_t fp4x4;
                     // Convert packed FP32 to FP4
                     if constexpr (COLWISE_USE_SR) {
-                        uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
+                        uint32_t rng = sr_hash(sr_seed ^ (blockDim.x * blockIdx.x + threadIdx.x));
                         fp4x4 =
                             cvt_f32x4_to_fp4x4_sr(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
                                                   r_colwise_vals[pass][2], r_colwise_vals[pass][3],

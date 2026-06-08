@@ -816,13 +816,6 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     )
 
 
-@pytest.mark.xfail(
-    reason="global_sr_counter increments by 1 per launch; with the same input shape, "
-    "rng = sr_seed + threadIdx differs by only 1 between runs which on AMD "
-    "v_cvt_scalef32_sr_pk_fp4_f32 ISA may not flip any rounding decisions. "
-    "Stochastic-vs-deterministic divergence is covered by test_mxfp4_sr_vs_deterministic.",
-    strict=False,
-)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mxfp4_sr_consecutive_calls_differ():
     """Two quantize_fp4 calls with use_sr=True on the same input should produce different outputs."""
