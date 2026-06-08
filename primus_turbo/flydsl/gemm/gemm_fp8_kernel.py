@@ -24,7 +24,7 @@ ds_read_b64_tr_b8 transpose-load (S2RLoaderTr); NT shares the FlyDSL repo's
 S2RLoader. Includes the c10/c11 "stale a_cur1" pipeline fix in epilog 1.
 
 Constraints:
-  - K_ITERS >= 2 (i.e. K >= 256); arbitrary K via the native K-tail (ceil iters)
+  - K_ITERS = ceil(K/128) >= 2 (i.e. K >= 129); arbitrary K via the native K-tail
   - out_dtype in {bf16, fp16}; E4M3 / E5M2 / hybrid fp8 inputs
   - per-tensor scale  (a_scale / b_scale scalar fp32, broadcast inside wrapper)
   - NT, NN, TN native; TT not supported; trans_c via post-hoc transpose
@@ -46,6 +46,11 @@ import torch
 _flydsl_3p_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "3rdparty", "FlyDSL")
 )
+if not os.path.isdir(os.path.join(_flydsl_3p_root, "kernels")):
+    raise ImportError(
+        f"FlyDSL submodule not found at {_flydsl_3p_root} (missing 'kernels/'). "
+        "Run `git submodule update --init 3rdparty/FlyDSL` to fetch it."
+    )
 if _flydsl_3p_root not in sys.path:
     sys.path.insert(0, _flydsl_3p_root)
 
@@ -270,7 +275,7 @@ def _compile_dense_nt(
     # row clamps to 0 via the buffer SRD num_records bound.
     K_ITERS = (K + BLOCK_K - 1) // BLOCK_K
     K_TAIL = K % BLOCK_K
-    assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= 256"
+    assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= 129 (ceil(K/128) >= 2)"
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
