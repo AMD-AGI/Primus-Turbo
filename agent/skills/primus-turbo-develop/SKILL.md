@@ -12,8 +12,8 @@ Primus-Turbo is a high-performance training-operator library for AMD GPUs (gfx94
 | Goal | Start here |
 |------|-----------|
 | Add or change an operator / module end-to-end | [develop-feature/SKILL.md](develop-feature/SKILL.md) |
-| Verify numerical correctness (精度) | [verify-accuracy/SKILL.md](verify-accuracy/SKILL.md) |
-| Measure latency / throughput (性能) | [verify-performance/SKILL.md](verify-performance/SKILL.md) |
+| Verify numerical correctness | [verify-accuracy/SKILL.md](verify-accuracy/SKILL.md) |
+| Measure latency / throughput | [verify-performance/SKILL.md](verify-performance/SKILL.md) |
 | Drive an autonomous kernel-optimization campaign | [optimize-handoff/SKILL.md](optimize-handoff/SKILL.md) → `kernel-optimize/SKILL.md` |
 | Profile a hot kernel with runtime evidence | [run_profile/tool-rocprof/SKILL.md](run_profile/tool-rocprof/SKILL.md) |
 

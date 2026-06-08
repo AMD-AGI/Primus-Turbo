@@ -3,7 +3,7 @@ name: verify-performance
 description: Primus-Turbo performance verification — run single-operator and suite benchmarks, read the latency/TFLOPS metrics, source real-model shapes, and derive a combined training-step metric. Use when measuring latency or throughput of a Primus-Turbo operator.
 ---
 
-# Verifying Performance (性能验证)
+# Verifying Performance
 
 Measure latency and throughput. Benchmarks live in `benchmark/ops/`; shared shapes and helpers in `benchmark/ops/config.py`. Read the hub [`../SKILL.md`](../SKILL.md) first.
 
