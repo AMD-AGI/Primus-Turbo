@@ -14,6 +14,11 @@ template <typename T>
 void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
                              hipStream_t stream, const float eps = 1e-12);
 
+template <typename InType>
+void reduce_amax_and_compute_scale(const InType *input, float *scale, float *scale_inv,
+                                   const int64_t n, const float fp8_max, const int64_t ws_size,
+                                   void *workspace, hipStream_t stream, const float eps = 1e-12);
+
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
