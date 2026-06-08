@@ -3,7 +3,7 @@ name: verify-accuracy
 description: Primus-Turbo accuracy verification — compare an operator against a higher-precision reference for forward and backward, with the right gate (allclose for bf16/fp16/fp32, SNR for fp8/fp4) and FP8 encoding awareness. Use when validating numerical correctness of a Primus-Turbo operator.
 ---
 
-# Verifying Accuracy (精度验证)
+# Verifying Accuracy
 
 Prove an operator is numerically correct against a higher-precision PyTorch reference, for **both forward and backward**. Read the hub [`../SKILL.md`](../SKILL.md) first.
 
