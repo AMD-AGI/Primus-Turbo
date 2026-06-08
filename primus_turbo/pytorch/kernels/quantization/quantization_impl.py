@@ -285,13 +285,6 @@ def quant_fp8_blockwise_for_weight_impl_meta(
     return w_fp8, w_scales
 
 
-# HIP wins on small surrounding GEMMs (single C++ call → low host overhead) but
-# loses on big ones (vreg pressure → 1 block/CU bottlenecks the next GEMM); pick
-# HIP only below this M_total*N*K threshold. Calibrated across LFM2 / Qwen3 /
-# DeepSeek-V3 / GPT-OSS BLOCKWISE shapes.
-_HIP_SEGMENT_GEMM_FLOPS_THRESHOLD = 70_000_000_000
-
-
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())
 def quant_fp8_blockwise_segment_m_row_col_impl(
     x: torch.Tensor,
@@ -322,13 +315,19 @@ def quant_fp8_blockwise_segment_m_row_col_impl(
     assert x.is_contiguous() and x.dim() == 2
     # HIP fast path: only when the C++ op is built and block_size == 128 (its
     # only supported size); otherwise fall through to the Triton kernel below.
+    # HIP wins on small surrounding GEMMs (single C++ call → low host overhead) but
+    # loses on big ones (vreg pressure → 1 block/CU bottlenecks the next GEMM), so it
+    # is gated by a GEMM-FLOPs threshold. TODO: this empirical threshold (calibrated
+    # across LFM2 / Qwen3 / DeepSeek-V3 / GPT-OSS BLOCKWISE shapes) is a heuristic —
+    # replace with a principled cost model / autotune signal when available.
+    hip_gemm_flops_threshold = 70_000_000_000
     if (
         gemm_other_dim is not None
         and block_size == 128
         and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_segment_m_row_col")
     ):
         gemm_flops = x.size(0) * x.size(1) * gemm_other_dim
-        if gemm_flops <= _HIP_SEGMENT_GEMM_FLOPS_THRESHOLD:
+        if gemm_flops <= hip_gemm_flops_threshold:
             return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_segment_m_row_col(
                 x, dtype, block_size, group_lens, group_offs
             )
