@@ -713,3 +713,81 @@ def test_gemm_fp4_impl_hipblaslt_preshuffle_opt_out():
             )
     finally:
         GlobalBackendManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Stochastic rounding gradient tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_use_gradient_sr_true():
+    """use_gradient_sr=True should select the SR kernel path, producing gradients
+    that differ from the deterministic RTN path."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    device = "cuda:0"
+    m, k, n = 256, 512, 256
+    dtype = torch.bfloat16
+
+    config_sr = Float4QuantConfig(use_gradient_sr=True)
+    config_rtn = Float4QuantConfig(use_gradient_sr=False)
+
+    a = torch.randn(m, k, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(n, k, dtype=dtype, device=device, requires_grad=True)
+    grad_output = torch.randn(m, n, dtype=dtype, device=device)
+
+    out_sr = gemm_fp4(a, b, trans_b=True, config=config_sr)
+    out_sr.backward(grad_output)
+    a_grad_sr = a.grad.clone()
+    b_grad_sr = b.grad.clone()
+    a.grad = None
+    b.grad = None
+
+    out_rtn = gemm_fp4(a, b, trans_b=True, config=config_rtn)
+    out_rtn.backward(grad_output)
+    a_grad_rtn = a.grad.clone()
+    b_grad_rtn = b.grad.clone()
+
+    assert not torch.equal(a_grad_sr, a_grad_rtn) or not torch.equal(
+        b_grad_sr, b_grad_rtn
+    ), "SR gradients should differ from RTN gradients when use_gradient_sr=True selects SR kernel"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_use_gradient_sr_false():
+    """Gradient quantization with use_gradient_sr=False should be deterministic (identical)."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    device = "cuda:0"
+    m, k, n = 256, 512, 256
+    dtype = torch.bfloat16
+
+    config = Float4QuantConfig(use_gradient_sr=False)
+
+    a = torch.randn(m, k, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(n, k, dtype=dtype, device=device, requires_grad=True)
+    grad_output = torch.randn(m, n, dtype=dtype, device=device)
+
+    out1 = gemm_fp4(a, b, trans_b=True, config=config)
+    out1.backward(grad_output)
+    a_grad1 = a.grad.clone()
+    b_grad1 = b.grad.clone()
+    a.grad = None
+    b.grad = None
+
+    out2 = gemm_fp4(a, b, trans_b=True, config=config)
+    out2.backward(grad_output)
+    a_grad2 = a.grad.clone()
+    b_grad2 = b.grad.clone()
+
+    assert torch.equal(a_grad1, a_grad2), "A gradients should be identical without stochastic rounding"
+    assert torch.equal(b_grad1, b_grad2), "B gradients should be identical without stochastic rounding"

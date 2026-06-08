@@ -20,6 +20,8 @@
  *   - Colwise output: FP4 packed (N x M/2) + E8M0 scales (N x M/32)
  */
 
+#include <atomic>
+
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/device/shuffle.cuh"
@@ -57,9 +59,10 @@ constexpr int THREADS_PER_ROW =
 // Shared memory optimization
 constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
 
-// Stochastic rounding parameters
-// NOTE: Hardcode the seed of stochastic rounding to 0 to make it deterministic
-constexpr uint32_t SR_SEED = 0;
+// Stochastic rounding: per-launch atomic counter provides a unique seed to
+// each kernel invocation.  The per-thread hash (seed + blockDim.x*blockIdx.x
+// + threadIdx.x) ensures uniqueness within a launch.
+static std::atomic<uint32_t> global_sr_counter{0};
 
 // ============================================================================
 // HADAMARD TRANSFORM - 16-Point In-Place Transform
@@ -270,7 +273,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
     const DType *__restrict__ input, uint8_t *__restrict__ out_fp4, uint8_t *__restrict__ out_scale,
     const int M, const int N, const int M_pad, const int N_pad, const int scale_stride,
     const int scale_N, const int scale_M_pad, const int scale_N_pad, const bool shuffle_out,
-    const bool shuffle_scale) {
+    const bool shuffle_scale, const uint32_t sr_seed) {
     // ========================================================================
     // Thread and Block Identification
     // ========================================================================
@@ -466,7 +469,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
             for (int pass = 0; pass < PASSES_PER_TILE; pass++) {
                 uint16_t fp4x4;
                 if constexpr (USE_SR) {
-                    uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
+                    uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
                     fp4x4 = cvt_f32x4_to_fp4x4_sr(r_vals[pass][0], r_vals[pass][1], r_vals[pass][2],
                                                   r_vals[pass][3], r_scale_native[pass], rng);
                 } else {
@@ -599,7 +602,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     const int rowwise_scale_M_pad, const int rowwise_scale_N_pad, const int colwise_scale_M,
     const int colwise_scale_N, const int colwise_scale_M_pad, const int colwise_scale_N_pad,
     const bool shuffle_rowwise, const bool shuffle_colwise, const bool shuffle_rowwise_scale,
-    const bool shuffle_colwise_scale) {
+    const bool shuffle_colwise_scale, const uint32_t sr_seed) {
     // ========================================================================
     // Thread and Block Identification
     // ========================================================================
@@ -792,7 +795,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                     uint16_t fp4x4;
                     // Convert packed FP32 to FP4
                     if constexpr (ROWWISE_USE_SR) {
-                        uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
+                        uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
                         fp4x4 =
                             cvt_f32x4_to_fp4x4_sr(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
                                                   r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
@@ -928,7 +931,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
                     uint16_t fp4x4;
                     // Convert packed FP32 to FP4
                     if constexpr (COLWISE_USE_SR) {
-                        uint32_t rng = SR_SEED + blockDim.x * blockIdx.x + threadIdx.x;
+                        uint32_t rng = sr_seed + blockDim.x * blockIdx.x + threadIdx.x;
                         fp4x4 =
                             cvt_f32x4_to_fp4x4_sr(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
                                                   r_colwise_vals[pass][2], r_colwise_vals[pass][3],
@@ -1048,6 +1051,7 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               ScalingRecipe colwise_recipe, hipStream_t stream) {
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
+    const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define QUANTIZE_MXFP4_DUAL                                                                        \
     input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
@@ -1055,7 +1059,7 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
         rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
         rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
         colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
-        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale, sr_seed
 
 #define QUANTIZE_MXFP4_DUAL_LAUNCH_KERNEL(ROWWISE_USE_RHT, COLWISE_USE_RHT, ROWWISE_USE_2D_BLOCK,  \
                                           COLWISE_USE_2D_BLOCK, ROWWISE_USE_SR, COLWISE_USE_SR)    \
@@ -1145,10 +1149,11 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
                          hipStream_t stream) {
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
+    const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define QUANTIZE_MXFP4_KERNEL_ARGS                                                                 \
     input, reinterpret_cast<uint8_t *>(output), scale, M, N, M_pad, N_pad, scale_stride, scale_N,  \
-        scale_M_pad, scale_N_pad, recipe.shuffle_out, recipe.shuffle_scale
+        scale_M_pad, scale_N_pad, recipe.shuffle_out, recipe.shuffle_scale, sr_seed
 
 #define QUANTIZE_MXFP4_LAUNCH_KERNEL(USE_RHT, USE_2D_BLOCK, USE_SR)                                \
     if (mode == QuantizeMode::ROWWISE) {                                                           \

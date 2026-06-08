@@ -193,6 +193,7 @@ class Float4QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.E8M0
     block_size: int = 32
+    use_gradient_sr: bool = False
 
     def __post_init__(self):
         assert (
