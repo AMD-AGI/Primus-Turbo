@@ -213,28 +213,12 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
 
 
 def enable_preshuffle() -> bool:
-    """Return True iff the AITER FP4 preshuffle fast path is safe to take.
+    """True iff the AITER FP4 preshuffle fast path is safe.
 
-    HARD preconditions (both load-bearing):
-      1. User has explicitly pinned the FP4 GEMM backend to AITER, via
-         env (PRIMUS_TURBO_GEMM_BACKEND=FP4:AITER) or
-         ``GlobalBackendManager.set_gemm_backend(BackendType.AITER, PrecisionType.FP4)``.
-         A ``None`` / default user-backend does NOT count: dispatch Path 1
-         is the only path that forwards directly to AITER when the user
-         pinned it, and Path 1 raises ``ValueError`` (it does not fall
-         back) on ``can_handle == False``, so the FP4 backend MUST be
-         AITER before any caller emits pre-shuffled tensors.
-      2. Autotune is disabled. Autotune runs every registered backend
-         through ``profile()`` / ``execute()``, and HipBLASLt's
-         ``can_handle`` returns False for ``preshuffled=True``; emitting
-         pre-shuffled inputs while autotune is on therefore short-circuits
-         the tuner.
-
-    External callers that pre-quantize and pass a ``QuantizedTensor`` to
-    ``gemm_fp4`` MUST build their ``ScalingRecipe`` with
-    ``shuffle_scale=enable_preshuffle()`` and the appropriate
-    ``shuffle_out=``, otherwise ``check_quantized_tensor``'s strict
-    equality assert fires under AITER.
+    Requires: (1) FP4 backend explicitly pinned to AITER (the
+    only backend that understands the shuffled layout), and
+    (2) autotune is disabled (AITER opts out of tuning, so
+    the tuner cannot select a backend for preshuffled inputs).
     """
     return (
         GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.AITER
