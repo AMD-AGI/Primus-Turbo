@@ -99,7 +99,6 @@ def get_extras_require():
             "pybind11>=3.0.1",
         ],
     }
-    extras["all"] = sorted(set(extras["pytorch"] + extras["jax"]))
     return extras
 
 

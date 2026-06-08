@@ -51,18 +51,29 @@ Note: JAX support is under active development. Optim support is planned but not 
 Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm/primus/tags):
 ```bash
 # PyTorch Ecosystem
-rocm/primus:v26.2
+docker pull rocm/primus:v26.2
 
 # JAX Ecosystem
-rocm/jax-training:maxtext-v26.2
+docker pull rocm/jax-training:maxtext-v26.2
 ```
 
-#### Install from PyPI (Recommended)
+You can also use the official ROCm PyTorch image from [Docker Hub](https://hub.docker.com/r/rocm/pytorch).
+
+#### Install from Prebuilt Index
+
+> **Prerequisite:** install inside an environment that already has **ROCm PyTorch** — e.g. the `rocm/primus` image above, or the official [`rocm/pytorch`](https://hub.docker.com/r/rocm/pytorch) image. Primus-Turbo builds against your existing torch and does **not** install torch for you; in a bare environment `pip` would otherwise pull a non-ROCm torch.
 
 ```bash
-# PyTorch backend
-pip3 install --no-build-isolation "primus-turbo[pytorch]"
+# PyTorch backend (latest)
+pip3 install --no-build-isolation "primus-turbo[pytorch]" \
+    --extra-index-url https://amd-agi.github.io/Primus-Turbo/simple/
+
+# Pin a specific version
+pip3 install --no-build-isolation "primus-turbo[pytorch]==0.1.0" \
+    --extra-index-url https://amd-agi.github.io/Primus-Turbo/simple/
 ```
+
+> The index currently serves **source distributions (sdist)**, so install compiles HIP kernels locally (needs the ROCm toolchain; supports gfx942 / gfx950). Prebuilt wheels are planned. Keep `--no-build-isolation` so the build uses your preinstalled torch.
 
 #### Install from Source
 
@@ -78,9 +89,6 @@ pip3 install --no-build-isolation ".[pytorch]"
 
 # JAX backend
 PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation ".[jax]"
-
-# Optional: build both backends
-PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX" pip3 install --no-build-isolation ".[all]"
 ```
 
 #### Install from GitHub URL (without cloning)
@@ -163,12 +171,12 @@ python3 -m build --sdist --no-isolation
 
 #### Verify wheel install
 ```bash
-pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl
+pip3 install --no-build-isolation ./dist/primus_turbo-XXX.whl
 ```
 
 #### Verify source fallback install
 ```bash
-pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.tar.gz
+pip3 install --no-build-isolation ./dist/primus_turbo-XXX.tar.gz
 ```
 
 > Tip:
