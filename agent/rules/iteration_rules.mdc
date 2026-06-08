@@ -1,0 +1,423 @@
+---
+description: Hard constraints for GPU kernel performance-optimization campaigns on AMD GPUs (Triton, HIP, CK, or any backend) — the strictly linear single-variable iteration loop, correctness before performance, benchmarking the full validation set, accept/rollback lineage, per-round snapshots and summaries, and the rule that every accepted gain must transfer to a real LLM training step. Apply when running, planning, or resuming a kernel-optimization iteration or campaign, or when following the kernel-optimize skill; not needed for ordinary code changes.
+alwaysApply: false
+---
+# Kernel Optimization Iteration Rules — Linear Mode
+
+This rule applies when you are iterating on GPU kernel performance (Triton, HIP, CK, or any other backend).
+
+These are **hard constraints**. Violating any of them makes the iteration invalid.
+
+---
+
+## Core Principle: Strictly Linear, Single-Variable Iteration
+
+```
+Round 1 (baseline)
+  │
+  ▼  one change
+Round 2 ── better? ── YES → keep, continue
+  │                    NO  → rollback to Round 1 code, try different change
+  ▼
+Round 3 ── better? ── YES → keep, continue
+  │                    NO  → rollback to Round 2 code, try different change
+  ...
+```
+
+**Every round is a single link in a linear chain.** No branching, no parallel experiments, no multi-variable changes. The codebase at any moment is the cumulative result of all accepted rounds.
+
+These rules assume `SKILL.md` has already created a campaign directory at `agent/workspace/<campaign_name>/`.
+
+- Per-round artifacts live under `<campaign_dir>/rounds/round-N/`
+- The running trend table lives at `<campaign_dir>/logs/performance_trend.md`
+- Before Round 1 starts, read `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` if it exists
+- The **active validation set** depends on the chosen validation level:
+  - **quick validation** → all `representative_shapes`
+  - **full validation** → all `target_shapes`
+
+Once a validation level is chosen for a round, do not cherry-pick a smaller subset inside that level.
+
+---
+
+## Rule 1: One Round = One Change = One Hypothesis
+
+Every round MUST include **exactly one** meaningful change to the kernel code.
+
+- **ONE** optimization technique per round (e.g., add LDS double buffer, OR change MFMA variant, OR add XOR swizzle — NOT all three at once).
+- If a round contains multiple independent changes, it is impossible to attribute the performance delta. **FORBIDDEN.**
+- Config-only sweeps (autotune params, tile sizes) with the same kernel code count as ONE round, not N rounds.
+- State the hypothesis BEFORE making the change: "I expect X to improve because Y."
+
+### What counts as "one change"
+
+| OK (one change) | NOT OK (multiple changes) |
+|---|---|
+| Switch MFMA variant 16x16→32x32 | Switch MFMA + add double buffer |
+| Add LDS double buffer | Add double buffer + change tile size |
+| Add XOR swizzle to LDS layout | Add swizzle + change grid mapping |
+| Change BLOCK_M from 128→256 (with analysis) | Change BLOCK_M + BLOCK_N + BLOCK_K |
+| Add persistent scheduling | Add persistent + XCD remap |
+| Hoist scale multiply out of inner loop | Hoist scale + vectorize loads |
+
+## Rule 2: Every Round Benchmarks the Active Validation Set
+
+Every round MUST benchmark all shapes in the active validation set. No exceptions within that validation level.
+
+- Different shapes in the active validation set stress different bottlenecks. Skipping shapes hides regressions.
+- If a shape fails, record the failure explicitly.
+
+### Rule 2.1: Polling Cap — No Single Sleep/Wait > 15 Minutes
+
+When waiting on a backgrounded benchmark or test command:
+
+- A single `sleep` / `wait` / polling tool call MUST NOT exceed **15 minutes (900 seconds)**.
+- Long-running benchmarks (commonly 30-90 minutes on FP8 GEMM kernels) MUST be polled in repeated `sleep ≤ 900` windows.
+- Between windows, inspect progress via the terminal file and/or output artifact (e.g. grep `TestID:` in the benchmark log, `wc -l` the CSV, check terminal metadata for `exit_code`).
+- If two consecutive poll windows show no progress, treat the command as hung and investigate; do not keep sleeping blindly.
+
+Rationale: keeps the agent responsive to mid-run user corrections, bounds worst-case blocking on shell interrupts, and forces periodic progress verification instead of passive multi-hour waits.
+
+## Rule 3: Accept or Rollback — No Ambiguity
+
+After benchmarking, apply this decision rule **mechanically** using the campaign's **primary accept metric**:
+
+- For forward-only or otherwise single-objective campaigns, this is the primary performance metric directly.
+- For forward+backward GEMM campaigns, this should usually be a derived **combined-step** metric (for example, inverse step time or combined-step throughput), not independent forward/backward aggregates.
+
+```
+IF   (primary aggregate score improved) AND (no core shape regressed ≥5% on the primary metric):
+    ACCEPT → this round's code becomes the new baseline
+    Record: "Round N: ACCEPTED — avg +X.X%, description"
+
+ELIF (primary aggregate score improved) AND (some shapes improved, some regressed <5%):
+    ACCEPT WITH NOTE → document the trade-off
+    Record: "Round N: ACCEPTED (trade-off) — avg +X.X%, shape Y regressed Z%"
+
+ELSE (primary aggregate score did not improve) OR (any core shape regressed ≥5% on the primary metric):
+    ROLLBACK → revert kernel code to previous round's snapshot
+    Record: "Round N: ROLLED BACK — description did not help because ..."
+    The NEXT round starts from the previous accepted code, not this failed attempt.
+```
+
+### Rollback procedure
+
+1. Copy kernel from `<campaign_dir>/rounds/round-(N-1)/kernel_snapshot/` back to the working kernel file
+2. Write `summary.md` explaining WHY the change didn't help (root cause analysis)
+3. The next round (N+1) is based on Round N-1's code, NOT Round N's failed code
+4. The rolled-back round still counts as a round number (no renumbering)
+
+## Rule 4: Every Round Produces `summary.md`
+
+Every round MUST output `<campaign_dir>/rounds/round-N/summary.md` containing:
+
+1. **Hypothesis**: What was changed and why (motivation)
+2. **Single change**: What exact code modification was made
+3. **Results**: Benchmark results for all shapes in the active validation set (table: TFLOPS, latency, delta vs previous accepted round, SNR)
+4. **Decision**: ACCEPTED or ROLLED BACK (with reason)
+5. **Attribution**: Why did this specific change help or not help
+6. **Next direction**: What to try next
+
+### Additional section for rolled-back rounds
+
+```markdown
+## Rollback Analysis
+- Change made: <description>
+- Expected effect: <hypothesis>
+- Actual effect: <what happened>
+- Root cause: <why it didn't work>
+- Lesson learned: <what this tells us about the bottleneck>
+```
+
+### Reusable Technical Tips Capture
+
+After every completed round, whether **ACCEPTED** or **ROLLED BACK**, decide whether the round produced reusable knowledge worth preserving outside the current campaign.
+
+If yes, append a concise entry to:
+
+`agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+If the path does not exist yet, create the missing directories and `tips.md`, then append the new entry.
+
+Record a tip only when the round revealed something that is likely to help future campaigns, such as:
+
+- a hardware- or backend-specific constraint
+- a compiler or autotune quirk
+- a parameter range or config pattern that reliably helps or hurts
+- a recurring failure signature and its root cause
+- a profiler signal that maps cleanly to a useful action
+- a validation or measurement trick that saves future rounds
+
+Do **not** dump the full round summary into `tips.md`. Append only the reusable takeaway.
+
+## Rule 5: Every Round Saves a Kernel Snapshot
+
+Every round MUST copy the kernel source into `<campaign_dir>/rounds/round-N/kernel_snapshot/`, regardless of accept/rollback. This enables:
+
+- Diffing any two rounds
+- Rolling back to any accepted state
+- Post-mortem analysis of failed attempts
+
+## Rule 6: Correctness Before Performance
+
+Every round MUST verify correctness on all shapes in the active validation set BEFORE benchmarking. If correctness fails, fix before proceeding. A round with broken correctness is not a valid round.
+
+## Rule 7: Rollback → MUST Diagnose Before Next Attempt
+
+When a round is rolled back:
+
+- You MUST NOT blindly try another random optimization.
+- You MUST diagnose WHY the change didn't help:
+  - Level 0: Re-read the code — did the change actually affect the hot path?
+  - Level 1: Profile if needed — is the bottleneck where you assumed?
+- You MUST state a NEW hypothesis that is **informed by the failure**.
+
+### Escalation on consecutive rollbacks
+
+| Consecutive rollbacks | Required action |
+|---|---|
+| 1 | Diagnose failure, try different approach to same bottleneck |
+| 2 | Full re-profile (`rocprofv3` + `rocprof-compute`), re-classify bottleneck |
+| 3 | ISA-level inspection (generated assembly), compare against reference |
+| 4+ | Comparative analysis vs SOTA kernel, consider fundamentally different approach |
+
+## Rule 8: Update Performance Trend Every Round
+
+Maintain `<campaign_dir>/logs/performance_trend.md` as a running table. Each
+row records both Forward and Backward TFLOPS, plus the combined-step
+throughput (the primary accept metric), so training-side kernels stay visible:
+
+```markdown
+| Round | Status | Description | Fwd Avg TFLOPS | Fwd Peak TFLOPS | Bwd Avg TFLOPS | Bwd Peak TFLOPS | Combined Step TFLOPS | vs Baseline | Key Finding |
+|-------|--------|-------------|----------------|-----------------|----------------|-----------------|----------------------|-------------|-------------|
+| 1 | BASELINE | Baseline persistent kernel | 500.000 | 800.000 | 250.000 | 420.000 | 300.000 | — | Memory-bound |
+| 2 | ACCEPTED | Add EVEN_K optimization | 520.000 | 850.000 | 258.000 | 430.000 | 310.077 | step +3.359%, fwd +4.000%, bwd +3.200% | K masking was costly |
+| 3 | ROLLBACK | Try 256x256 tiles | 480.000 | 780.000 | 240.000 | 405.000 | 288.000 | step -4.000%, fwd -4.000%, bwd -4.000% | Register spill at 256 |
+| 4 | ACCEPTED | Add XOR swizzle (from R2 code) | 550.000 | 870.000 | 272.000 | 445.000 | 327.116 | step +9.039%, fwd +10.000%, bwd +8.800% | Bank conflicts reduced |
+```
+
+Column notes:
+- `Fwd/Bwd Avg TFLOPS` is the geometric mean across all PASS shapes for the
+  forward or backward direction (diagnostics only).
+- `Fwd/Bwd Peak TFLOPS` is the maximum per-shape TFLOPS in that direction.
+- `Combined Step TFLOPS` is the campaign's primary accept metric for fwd+bwd:
+  per PASS shape `6·M·N·K / ((Forward ms + Backward ms)·1e-3) / 1e12` (read the
+  times from that round's CSV), then the geometric mean across PASS shapes. In
+  TFLOPS terms a single shape equals `6 / (2/Fwd + 4/Bwd)` (e.g. row 1:
+  `6 / (2/500 + 4/250) = 300.000`). If the kernel only has a forward path
+  (inference-only), fill the Bwd columns with `-`, set
+  `Combined Step TFLOPS = Fwd Avg`, and note it once in the first row's Key
+  Finding. This is the **same** metric the accept/rollback decision uses
+  (Rule 3), so the trend column and the decision can never diverge.
+- `vs Baseline` reports three percentages separated by commas, each against
+  the **baseline** row (round-1), not the previous round:
+  - `step ±X%` — change in `Combined Step TFLOPS`
+  - `fwd ±Y%` — change in `Fwd Avg TFLOPS`
+  - `bwd ±Z%` — change in `Bwd Avg TFLOPS` (or `bwd —` when no backward path)
+  Use 3-decimal precision (e.g. `+0.467%`). The baseline row itself renders
+  the entire cell as `—`.
+
+### Append-Only Logging Rule
+
+`<campaign_dir>/logs/optimize.md` and `<campaign_dir>/logs/performance_trend.md` are **append-only**.
+
+- Do **not** delete, truncate, rewrite, or replace existing content in either file.
+- Only append new sections, rows, or correction notes.
+- If an earlier entry is wrong, keep it in place and append a clearly labeled correction instead of editing history away.
+
+## Rule 9: Linear Chain Integrity
+
+The accepted rounds form a strict linear chain:
+
+```
+R1(accepted) → R2(accepted) → R3(rollback, back to R2) → R4(accepted, from R2) → ...
+```
+
+The **working kernel** at any point is the code from the **last accepted round**. Never from a rolled-back round.
+
+To verify chain integrity, the `performance_trend.md` must show monotonically non-decreasing **Combined Step TFLOPS** (the primary accept metric from Rule 3) across ACCEPTED rounds (allowing ≤1% noise). If an accepted round has a lower Combined Step TFLOPS than the previous accepted round, something is wrong — investigate. Individual Fwd/Bwd directions are informational: either one may regress inside a single accepted round (e.g. a bwd-focused change can drop fwd slightly) as long as the combined-step metric still improves and the regression is recorded in `Key Finding`.
+
+## Rule 10: No Premature Termination
+
+- Below 50% of Turbo baseline: keep iterating, low-hanging fruit likely exists
+- 50-80% of Turbo baseline: methodical profiling-driven iteration
+- 80-100% of Turbo baseline: fine-grained ISA-level optimization
+- Above Turbo baseline: continue, document the techniques that worked
+- Only stop at the requested round count, or when hitting theoretical hardware peak
+
+## Rule 11: Every Accepted Gain Must Transfer to Real LLM Training
+
+A round whose only measurable gain comes from exploiting the benchmark idiom is INVALID and MUST be rolled back, even if its aggregate score improved. Every accepted optimization must produce the same gain in a real LLM training step as in `bench_gemm_turbo.py`'s 100-iter inner loop.
+
+### Why the benchmark idiom is not real training
+
+The campaign benchmarks reuse the same Python tensor objects across the timing loop:
+
+```python
+a = torch.randn(M, K, ...)
+grad_out = torch.randn_like(out)
+for _ in range(100):
+    out = turbo.ops.gemm_fp8(a, b, ...)         # same a, b objects
+    out.backward(grad_out, retain_graph=True)   # same grad_out
+```
+
+So `id(a)`, `id(b)`, `id(grad_out)` and their `_version` are stable across all 100 iters. Real training does not have this property — activations and `grad_out` are fresh objects every iteration (allocated by the dataloader and by autograd), and only `weight` keeps stable identity inside one fwd+bwd pair, with `_version` advancing after `optim.step()`.
+
+Two classes of optimization look free in the benchmark but vanish in real training:
+
+1. **Identity-keyed caches** — cache lookups keyed on `id(t)` for any `t` other than a module weight. Covered by the bucket table and forbidden patterns below.
+2. **Uniform workload assumptions** — kernels or schedulers built around the single shape distribution the benchmark happens to use. Covered by "Workload distribution assumptions" below; especially relevant for GroupGemm / MoE.
+
+### Bucket classification (identity-keyed caches)
+
+| Bucket | Examples | Verdict |
+|---|---|---|
+| K1 Kernel-internal | autotune config, mfma variant, tile shape, `EVEN_K`, swizzle, pipelining, `tl.dot_scaled` | Always allowed |
+| K2 Layout duplication | NT-only, NN-only, TN-only kernel variants | Always allowed |
+| K3 Single-launch fusion | `quant_fp8_blockwise_dual_impl`, fused dequant+matmul, fused softmax+drop | Always allowed |
+| K4 Same-call data flow | `ctx.save_for_backward` carrying a forward-side intermediate to backward | Always allowed |
+| W1 Weight quant cache | cache keyed on `id(weight) + _version + shape` | Allowed but bounded; see "Bounding W1" |
+| W2 Activation quant cache | cache keyed on `id(activation)`, `id(grad_out)`, or `id(activation_scale)` | **FORBIDDEN** |
+| W3 Generic wrapper memoization | any `lru_cache`/`dict` wrapping `forward`/`backward` whose key contains a non-weight tensor `id` | **FORBIDDEN** |
+
+Adding `_version`, shape, stride, or dtype to a W2/W3 key does not rescue the pattern — those qualifiers make the cache correctness-safe, not transfer-safe.
+
+### Forbidden code patterns (W2 / W3)
+
+Any wrapper-level cache whose key includes `id(t)` for a `t` other than a module weight is forbidden. The canonical anti-pattern:
+
+```python
+# FORBIDDEN — activation / grad_out / activation_scale cache
+_cache: dict = OrderedDict()
+def forward(ctx, a, ...):
+    key = (id(a), getattr(a, "_version", 0), tuple(a.shape), ...)
+    if key in _cache:
+        a_fp8, a_scale = _cache[key]
+    else:
+        a_fp8, a_scale = quant_fp8_blockwise_impl(a, ...)
+        _cache[key] = (a_fp8, a_scale)
+```
+
+Real-training miss rate is ~100% because `a` is a fresh tensor each iteration; benchmark miss rate is 1/100. The same failure mode applies to caching `grad_out`, caching `scale.T.contiguous()` of activation scales (chained on the activation cache), and any `lru_cache` over `forward`/`backward` keyed on a non-weight tensor.
+
+### Allowed code patterns
+
+| Pattern | Why it is safe |
+|---|---|
+| Single-launch fusion (one read of `a`, multiple outputs — e.g. `quant_fp8_blockwise_dual_impl`) | Kernel-side; no cross-iteration identity assumption |
+| `ctx.save_for_backward` of a forward-side intermediate consumed by its own backward | `ctx` is unique per `apply()` invocation; data flow is per-call |
+| Weight cache keyed on `id(weight) + _version`, invalidated after `optim.step()` | Weights are long-lived; identity is stable inside one fwd+bwd pair; per-step gain is bounded (next section) |
+| `@triton.autotune`'s per-key compiled-kernel cache | Part of Triton itself; unaffected by this rule |
+
+### Bounding W1
+
+W1's per-step real-training gain is bounded by `gain_per_step = quant_time(weight) / step_time`. For a `[N, K] = [4096, 4096]` weight on MI355X this is roughly `30 µs / 1.5-2 ms ≈ +1.5%` per step. A benchmark reporting +5% from a weight cache alone means about +3.5% is benchmark-loop residual that will not transfer. Report the bounded per-step number in the round summary, not the benchmark headline.
+
+### Workload distribution assumptions (GroupGemm / MoE / batched ops)
+
+In Grouped GEMM and other MoE-style ops, benchmarks commonly use a **static, evenly-distributed group layout** — every expert receives `total_tokens / num_experts` tokens, padded to a multiple of 128. Real MoE training does not match this:
+
+- Top-k routing with a capacity factor produces a **skewed `tokens_per_expert` histogram** that varies batch by batch. Some experts may receive 0 tokens; others saturate capacity.
+- `tokens_per_expert` is **not constant** across iterations and generally **not a clean multiple of any tile dimension**.
+- Capacity-factor dropping changes the visible per-expert count from step to step; early-training skew is especially severe.
+
+A kernel or scheduler that monetizes the benchmark's even layout is benchmark over-fitting. **Forbidden assumptions in committed GroupGemm code paths:**
+
+- Compile-time constants for `M_per_group` (e.g. `M_per_group: tl.constexpr`), or `assert M_per_group % BLOCK_M == 0` baked into the kernel.
+- Persistent-kernel or static work partitioning that assumes each expert receives a fixed token count.
+- Padding strategies whose overhead is small only because the benchmark hits a tile boundary.
+- Single-pass schedules that assume every group is non-empty, or that the largest group is bounded by a benchmark-only number.
+
+**Acceptable practice:**
+
+- Treat `tokens_per_expert` as a runtime tensor (host- or device-resident), not a layout constant. Handle the empty-group case explicitly (skip launch or branch on zero rows).
+- The campaign's `representative_shapes` for any GroupGemm-class op MUST include skewed distributions alongside the uniform one. A reasonable starter set: `uniform`, `top_k=2 cf=1.0`, `top_k=1 cf=1.25`, and a near-degenerate case where one expert receives ≥ 50% of all tokens.
+- For each GroupGemm round, the `Real-training transfer check` in `summary.md` must state whether the change holds under skew. If a benchmark gain vanishes or regresses on the skewed shapes, the round is benchmark-over-fit and must be rolled back.
+
+### id(...) audit
+
+Before adding any cache, walk through each component of the proposed key:
+
+| Key component | Stable across real-training iterations? |
+|---|---|
+| `id(weight)` (module parameter) | Yes, until the parameter is reassigned (rare) |
+| `getattr(weight, "_version", 0)` | Bumps once per `optim.step()`; `(id, version)` is stable inside one fwd+bwd |
+| `id(activation)` | **No** — fresh tensor each iteration |
+| `id(grad_out)` | **No** — autograd allocates fresh objects |
+| `id(activation_scale)` | **No** — produced fresh by the quant kernel each call |
+| `tuple(t.shape)`, `tuple(t.stride())`, `t.dtype` | Stable, but they alone do not authorize a cache |
+
+If the cache key relies on any "No" row for its hit rate, the cache will miss in real training. Reject the round at ANALYZE — do not start implementing.
+
+### Required round summary section
+
+Every round's `<campaign_dir>/rounds/round-N/summary.md` MUST include:
+
+```markdown
+## Real-training transfer check
+- Bucket: <K1 / K2 / K3 / K4 / W1 / W2 / W3>
+- Cache key (if any): <(id(t), t._version, …) or "no cache">
+- id(...) audit: <which key components are stable across real-training iterations>
+- 4-step pen-and-paper trace hit rate: <hits/total>
+- Workload distribution robustness (GroupGemm / MoE only): <"holds under skew" with skewed-shape data, or "uniform-only — REJECTED">
+- Benchmark gain on this round: +X.XX% combined-step
+- Estimated real-training gain: +Y.YY% combined-step (with derivation)
+- Decision: ACCEPT-as-real / ACCEPT-with-asterisk / REJECT-as-overfit
+```
+
+`ACCEPT-as-real` is reserved for K1-K4 rounds that pass both the id-audit and (for GroupGemm) the skew check. `ACCEPT-with-asterisk` is reserved for W1 rounds with the bounded gain explicitly documented. `REJECT-as-overfit` is the only valid outcome for W2/W3 and for any GroupGemm round whose gain depends on uniform distribution.
+
+### Mandatory regression check for any candidate cache
+
+If a round adds a cache (even a W1 weight cache), the summary MUST include a mini real-training simulation:
+
+```python
+for step in range(8):
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)   # fresh
+    out = turbo.ops.gemm_fp8(a, weight, trans_b=True, config=cfg)
+    grad_out = torch.randn_like(out)                              # fresh
+    out.backward(grad_out)
+    optim_like_step(weight)  # bumps weight._version
+    record_cache_hit_rate()
+```
+
+Acceptance: weight-cache hit rate ≥ 1 per (fwd + bwd) per step; activation/grad_out cache hit rate must be 0. If the simulation cannot be run (e.g. no GPU available), the round CANNOT add a new cache.
+
+### REPORT-time re-attribution
+
+When the campaign terminates, walk the accepted lineage and sum the round-level numbers:
+
+- `S_real` = K1-K4 accepted rounds (= benchmark gain, transfers 1:1)
+- `W_real` = W1 accepted rounds (capped by `quant_time(weight) / step_time`)
+- `R_real` = 0 (anything in the accepted lineage that cannot defend its transfer — id-keyed cache OR uniform-only GroupGemm gain — must be rolled back before publishing)
+
+The headline real-training improvement is `S_real + W_real`. If `headline_benchmark_gain - (S_real + W_real) > 1%`, that delta is benchmark-only inflation; call it out, do not ship it as the real-training number.
+
+### Tips file hygiene
+
+In `agent/historical_experience/<gpu>/<op>/<backend>/tips.md`:
+
+- Never describe a W2/W3 cache or a uniform-distribution GroupGemm trick as a useful technique. Record it as a known anti-pattern with "benchmark over-fit; do not retry."
+- For W1 tips, state the per-step real-training gain bound, not the benchmark number.
+- Delete any previously-recorded tip that celebrates an `id(activation)` / `id(grad_out)` cache or a "fixed `M_per_group`" GroupGemm shortcut.
+
+When in doubt, prefer kernel-side optimizations (autotune space, mfma variant, tile shape, pipelining, scheduling, dynamic group dispatch) over wrapper-level caches and over schedulers that hardcode a benchmark-specific shape distribution.
+
+## Summary: The Linear Iteration Loop
+
+```
+for round_n in range(1, max_rounds + 1):
+    1. Read previous accepted round's summary → identify next hypothesis
+    2. Make EXACTLY ONE code change (state hypothesis first)
+    3. Verify correctness on all shapes in the active validation set
+       └─ FAIL → fix bug, do NOT count as new round
+    4. Benchmark all shapes in the active validation set
+    5. Compare vs last ACCEPTED round
+    6. Decision: ACCEPT or ROLLBACK
+       ├─ ACCEPT → code becomes new baseline
+       └─ ROLLBACK → revert to last accepted code, diagnose failure
+    7. Write <campaign_dir>/rounds/round-N/summary.md with full analysis
+    8. Save the kernel snapshot to <campaign_dir>/rounds/round-N/kernel_snapshot/
+    9. If this round produced a reusable lesson, append it to
+       agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md
+    10. Update performance_trend.md
+```

@@ -1,0 +1,584 @@
+# Optimization Process Specification
+
+Detailed optimization process for `kernel-optimize`. Enter this file after `../SKILL.md` has finished DEFINE_TARGET, PREPARE_ENVIRONMENT, and READ_HISTORICAL_TIPS — the campaign directory, `manifest.yaml`, and `quick_test_bench.py` are already in place.
+
+Parameter extraction, campaign directory structure, and project-specific build/test/benchmark commands live in `../SKILL.md` and the project skill, not here.
+
+## Iteration Contract
+
+Before running `BASELINE`, read [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc). Treat all 11 rules as hard constraints throughout the loop:
+
+- one hypothesis and one meaningful kernel change per round
+- correctness before performance
+- benchmark the full active validation set
+- accept or roll back cleanly to the previous accepted baseline
+- **every accepted gain must transfer to real LLM training** (Rule 11); the operational layer — when to apply the bucket audit and the per-phase checklists — lives in [`../SKILL.md`](../SKILL.md) under "Avoiding Benchmark Over-Fitting"
+
+## Pre-loop Sanity Check
+
+Before `BASELINE`, confirm the campaign state set up in `../SKILL.md`:
+
+- All `Input Parameters` (see `../SKILL.md`) are populated and recorded in `manifest.yaml`.
+- All `Prerequisite Information` (kernel source path, focused test/benchmark commands, quick command, benchmark output column names, rebuild requirements) is on hand or referenceable.
+- `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md` has been read once if it exists (lowercase the backend directory name).
+
+If anything is missing, return to `../SKILL.md` or the project skill to fill the gap before starting `round-1`.
+
+## Two-Level Validation
+
+The optimization loop uses two levels of validation:
+
+| Level | When to use | Content |
+|-------|------------|---------|
+| **quick** | Default for each VALIDATE round | Run `quick_command`: representative-shape correctness + benchmark in one step |
+| **full** | BASELINE, end of a direction, final acceptance, or when risk/noise requires it | Focused test + focused benchmark on all `target_shapes` |
+
+The quick validation script is generated during PREPARE_ENVIRONMENT while the project API context is still fresh. After BASELINE, fill it with `representative_shapes` and record the invocation in the manifest as `quick_command`. Full validation uses the focused test / benchmark commands from the project skill.
+
+Active validation set by level:
+- **quick** → all `representative_shapes`
+- **full** → all `target_shapes`
+
+Within a chosen validation level, do not cherry-pick a smaller subset.
+
+Quick validation is for small-step iteration within one direction. When a direction completes, when quick results are borderline (improvement < 5%), or when changes are high-risk (control flow, data layout, etc.), upgrade to full validation for confirmation.
+
+## Overall Flow
+
+```text
+BASELINE
+  -> [ANALYZE -> OPTIMIZE -> VALIDATE -> ACCEPT/ROLLBACK] (iteration loop)
+  -> TERMINATION_CHECK (exit only if at least one termination condition is satisfied)
+  -> REPORT
+```
+
+Round numbering is strict: `round-1` is BASELINE; optimization attempts start at `round-2`. ACCEPT and ROLLBACK both return to ANALYZE; do not jump to REPORT unless TERMINATION_CHECK passes.
+
+In `repo-mode`, VALIDATE runs directly in the main repo with no SYNC_BACK step. In `workspace-mode`, VALIDATE is split into a local gate and an integration gate, with SYNC_BACK in between.
+
+## Scoring Operations Specification
+
+### From Benchmark Output to Aggregate Score
+
+**Step 1**: Run benchmark (quick or full), produce output
+
+**Step 2**: Extract each row's `primary_metric` (e.g., `Forward TFLOPS` or `Forward GB/s`, depending on operator type; if multiple metrics, extract each separately) and `Check` column
+
+**Step 3**: Correctness gate
+- Any row with `Check = FAIL` → candidate `aggregate score = 0`, reject immediately
+
+**Step 4**: Compute aggregate score
+- If `target_shapes` has only 1 configuration: `aggregate score = that configuration's primary_metric`
+- If `target_shapes` has multiple configurations: `aggregate score = geometric_mean(all configurations' primary_metric)`
+
+```
+geometric_mean = (x1 * x2 * ... * xn) ^ (1/n)
+```
+
+**Step 5**: Retain the score vector (raw values per shape) to avoid the total score masking localized regressions
+
+**Multi-metric handling**:
+- If `primary_metric` is a forward+backward pair for the same end-to-end workload (for example, GEMM training where benchmark output includes both forward and backward time), derive a **single combined-step primary score** and use that for accept/rollback.
+- Default combined-step derivation:
+  - `Combined Step Time (ms) = Forward Time (ms) + Backward Time (ms)`
+  - `Combined Step Score = 1 / Combined Step Time (ms)` (higher is better)
+- If the project skill defines a workload-specific equivalent throughput metric (for example, `Combined Step TFLOPS`), use that instead of the generic inverse-time score.
+- Keep `Forward TFLOPS`, `Backward TFLOPS`, or other component metrics as **secondary diagnostics** to explain trade-offs, but do not require every component aggregate to improve independently when the campaign's true objective is end-to-end step performance.
+- If no combined-step metric is defined and the metrics are genuinely independent objectives, fall back to the old rule: all metric aggregates must not regress, and at least one must improve.
+
+### Noise Assessment
+
+- When improvement is < 2%, it is considered near the noise range
+- In this case, re-measure at least 3 times, compute mean and standard deviation
+- If mean improvement > 1% and standard deviation < half of the improvement magnitude, consider it a valid improvement
+- Otherwise, treat as noise and do not accept
+
+### Acceptance Rules
+
+- `aggregate score` must not be lower than the current best
+- If it only matches the current best, there must be a clear additional benefit (e.g., broader applicability, more stable results)
+- If any core shape regresses ≥ 5% on the **primary accept metric**, default to rejection (matches `iteration_rules.mdc` Rule 3); unless this round is explicitly a targeted shape optimization
+- When using a combined-step metric, judge per-shape regressions on `Combined Step Time (ms)` (or the project-defined equivalent primary score), not on the sign of individual forward/backward component metrics alone
+
+### Computation Example
+
+Benchmark results (3 shapes):
+
+| M | N | K | Forward TFLOPS | Backward TFLOPS | Check |
+|---|---|---|----------------|-----------------|-------|
+| 4096 | 4096 | 4096 | 320 | 160 | PASS |
+| 2048 | 8192 | 4096 | 305 | 152 | PASS |
+| 1024 | 4096 | 8192 | 290 | 145 | PASS |
+
+The primary accept metric for this fwd+bwd GEMM is `Combined Step TFLOPS` (see
+[`verify-performance/SKILL.md`](../../primus-turbo-develop/verify-performance/SKILL.md)):
+per shape `6*M*N*K / ((Forward Time + Backward Time) * 1e-3) / 1e12`, which in
+TFLOPS terms is `6 / (2/Forward TFLOPS + 4/Backward TFLOPS)`, then the geometric
+mean across PASS shapes.
+
+```
+shape1 combined            = 6 / (2/320 + 4/160)                 = 192.000
+shape2 combined            = 6 / (2/305 + 4/152)                 = 182.515
+shape3 combined            = 6 / (2/290 + 4/145)                 = 174.000
+candidate combined geomean = (192.000 * 182.515 * 174.000)^(1/3) ≈ 182.69
+```
+Forward/backward aggregates are kept as diagnostics only:
+`forward aggregate = (320 * 305 * 290)^(1/3) = 304.8`,
+`backward aggregate = (160 * 152 * 145)^(1/3) = 152.2`.
+
+If the kernel has no backward path, fill the Backward TFLOPS column with `-`
+and let `Combined Step TFLOPS = forward aggregate`.
+
+Baseline combined geomean (same per-shape method) ≈ 168.59 (baseline forward
+aggregate 285.0, backward aggregate 140.0).
+Candidate combined ≈ 182.69 → improvement = (182.69 - 168.59) / 168.59
+≈ +8.363% → accept.
+`vs Baseline` cell on the trend row: `step +8.363%, fwd +6.947%, bwd +8.714%`.
+
+## Phase Descriptions
+
+### 1. BASELINE (`round-1`)
+
+**Goal**: Freeze the starting point and establish a unified comparison baseline.
+
+**What "focused" means**:
+- Focused test = test subset limited to `target_op` + `target_backend` (e.g., `-k "blockwise and TRITON"`)
+- Focused benchmark = benchmark limited to `target_backend`, covering all `target_shapes`
+
+**Steps**:
+1. Confirm the current environment can build and run correctly
+2. Run **full** focused test, confirm all PASS
+3. Run **full** focused benchmark, write the canonical baseline summary to `<campaign_dir>/rounds/round-1/summary.md`, and store any raw command outputs / CSVs under `<campaign_dir>/rounds/round-1/artifacts/`
+4. Compute baseline `score vector` and `aggregate score` per scoring specification
+5. Select 3-5 `representative_shapes` from PASS-only benchmark rows, covering small / medium / large behavior; for GroupGemm / MoE include at least one skewed expert distribution (e.g. `top_k=1 cf=1.25` and a near-degenerate case), not only the uniform layout
+6. Update `quick_test_bench.py` with those `representative_shapes` and record `quick_command` in the manifest
+7. Run `manifest.quick_command` once against the filled `representative_shapes` and save the combined stdout+stderr to `<campaign_dir>/rounds/round-1/artifacts/quick_baseline.log`. This file is the reference quick-validation output for every subsequent round; VALIDATE quick runs compare their own `quick_validation.log` against it when metrics look off
+8. Copy the current kernel into `<campaign_dir>/rounds/round-1/kernel_snapshot/` to establish the rollback root
+9. Record backend configuration and key environment state
+
+BASELINE always uses full validation to ensure the starting data is complete and reliable.
+
+**Baseline record template** (write to `<campaign_dir>/logs/optimize.md`):
+
+```markdown
+## Baseline
+- Time: <YYYY-MM-DD HH:MM>
+- Backend: <target_backend>
+- GPU: <target_gpu>
+- Commit: <git_hash>
+- Validation level: full
+
+- Aggregate score (geomean): 278.0
+- All Check: PASS
+- Detailed data: rounds/round-1/summary.md
+- Quick baseline log: rounds/round-1/artifacts/quick_baseline.log
+```
+
+**Output**:
+- `<campaign_dir>/rounds/round-1/summary.md` + baseline aggregate score
+- `<campaign_dir>/rounds/round-1/kernel_snapshot/` as the baseline rollback root
+- Current best = baseline (`round-1`)
+- The first optimization attempt starts at `round-2`
+
+The baseline round uses the same `summary.md` structure as later rounds. Its "Single change" section must explicitly say that no code change was made, and its "Decision" section must be `BASELINE`.
+
+### 2. ANALYZE
+
+**Goal**: Find the most worthwhile direction for the next round, rather than tuning blindly.
+
+**Required actions**:
+- Consult the in-repo knowledge base before proposing new directions: route by `target_op` into [`../knowledge/ops/`](../knowledge/ops/) (`gemm/`, `attention/`), by `target_gpu` into [`../knowledge/hardware/`](../knowledge/hardware/) (`overview.md` outline first, then `gfx942/`, `gfx950/`), and by `target_lang` into [`../knowledge/backend/`](../knowledge/backend/) (currently `flydsl/`). Read each area's `overview.md` first, then its `optimization-directions.md`. For ops / GPUs / backends not yet covered there, rely on the profiling skill and the agent's own knowledge
+- Read the core implementation of the current best version
+- Review recent accepted versions and failed attempts (from campaign log)
+- Profile or analyze benchmark metrics as needed to identify the current main bottleneck
+- Read the profiling skill as needed; for hardware-specific and backend/language-level tuning, consult [`../knowledge/hardware/`](../knowledge/hardware/) and [`../knowledge/backend/`](../knowledge/backend/), falling back to the agent's own knowledge where a target is not yet covered
+
+**Bottleneck Classification and Optimization Direction Mapping**:
+
+When profiler data is available, use the following framework to classify bottlenecks:
+
+| Bottleneck signal | Classification | Optimization direction |
+|-------------------|---------------|----------------------|
+| Low ALU utilization, low MFMA instruction ratio | Compute bound | Tile size adjustment, instruction selection (e.g., MFMA vs WMMA), algorithm simplification, reduce redundant computation |
+| Memory throughput near hardware peak, many global load/store stalls | Memory bound | Data layout optimization, prefetch / software pipelining, reduce redundant memory access, LDS utilization |
+| Low occupancy, excessive register or LDS usage | Resource bound | Reduce register pressure, adjust LDS allocation, lower tile size to trade for more waves |
+| High kernel launch overhead ratio, small total compute | Launch/overhead bound | Persistent kernel, batch multiple small kernels, reduce dispatch count |
+
+When profiler data is unavailable, infer indirectly from benchmark results:
+- If TFLOPS is far below theoretical peak and efficiency improves significantly with larger shapes → likely launch overhead or occupancy issue
+- If TFLOPS improves significantly as K increases → likely memory bound (higher compute-to-memory ratio improves efficiency)
+- If efficiency difference across shapes is small and overall low → likely compute bound
+
+**Each candidate direction must answer at minimum**:
+- What is the current bottleneck
+- What will be changed this round
+- What is the expected benefit
+- What are the risks
+- What signal will verify success or failure
+- Rule 11 bucket (`K1` / `K2` / `K3` / `K4` / `W1` / `W2` / `W3`) and the expected real-training gain: for `K1`–`K4` it equals the expected benchmark gain; for `W1` cite the bound `quant_time(weight) / step_time` instead of the benchmark headline; `W2` / `W3` directions are ineligible and must be dropped, not advanced
+
+**Output**:
+- Prioritized hypothesis list with the bucket and expected real-training gain on each entry
+- Primary hypothesis for this round (`K1`–`K4` or bounded `W1`; never `W2` / `W3`)
+
+### 3. OPTIMIZE
+
+**Goal**: Implement a single attributable, rollback-able small-step change.
+
+**Required actions**:
+- Advance only one primary hypothesis per round
+- After modification, be able to clearly answer "what exactly was changed this round"
+- If compiled artifacts are involved, rebuild per project skill instructions
+- Record modified files, key parameters, and expected impact for this round
+- If the proposed change is a wrapper-level cache, memoization, or `id(tensor)` lookup: complete the bucket / id-audit / hit-rate trace in [`../SKILL.md`](../SKILL.md) "Avoiding Benchmark Over-Fitting" **before** writing any code. A cache that fails the audit must not be implemented at all.
+
+**Constraints**:
+- Do not mix unrelated cleanup into optimization attempts
+- Do not introduce multiple orthogonal major changes simultaneously
+- Do not break key interface semantics agreed upon with the upstream project
+- Do not introduce caches keyed on `id(activation)`, `id(grad_out)`, or `id(activation_scale)` (Rule 11 W2 / W3 forbidden patterns)
+
+**Output**:
+- Candidate diff
+- Build status
+
+### 4. VALIDATE
+
+**Goal**: Decide whether the candidate passes validation.
+
+**Under `repo-mode`** (common path, no SYNC_BACK):
+
+1. Ensure backend settings are correct if needed (env var or reset)
+2. Run `quick_command` (combined representative-shape correctness + benchmark)
+3. Compute `score vector` and `aggregate score` per scoring specification
+4. Compare against current best
+5. Upgrade to **full** validation when the direction completes, when results are borderline (improvement < 5%), or when changes are high-risk
+
+**Command completion protocol**:
+- A benchmark or test command does **not** count as completed when it has merely been launched. It counts as completed only after the process exits and the expected output artifact (log, CSV, etc.) exists on disk.
+- If the shell tool backgrounds a command because of timeout, the agent MUST poll the process and/or output file until completion before doing anything else in the optimization loop.
+- Do **not** treat partial terminal output, partial CSV content, or an in-progress log file as a finished validation result.
+- Do **not** start the next `ANALYZE`, `OPTIMIZE`, or `VALIDATE` step while the current round's benchmark or test command is still running.
+
+**Polling cap**:
+- A single `sleep` / `wait` / polling call MUST NOT exceed **15 minutes (900 seconds)**. Long-running benchmarks (which commonly take 30-90 minutes on this kernel family) MUST be polled in repeated `sleep <= 900` windows, not in one multi-hour sleep.
+- Between poll windows, the agent MUST re-inspect the backgrounded terminal file and/or the expected output artifact to confirm progress (e.g. grep the latest `TestID:` line, `wc -l` the CSV, check for `exit_code` in the terminal metadata).
+- If a poll window finds no forward progress across two consecutive checks, treat the command as hung and investigate (re-read the terminal, check for OOM / driver errors) instead of continuing to sleep blindly.
+- This bounds worst-case blocking if the shell session is interrupted or if the benchmark deadlocks, and keeps the agent responsive for mid-run corrections from the user.
+
+Write the canonical round record to `<campaign_dir>/rounds/round-N/summary.md` (for `N >= 2`) and place any raw benchmark/test outputs under `<campaign_dir>/rounds/round-N/artifacts/`.
+
+**Hard gates**:
+- Build failure → reject immediately
+- Correctness failure → reject immediately
+- `Check = FAIL` in benchmark → reject immediately
+- Aggregate score regression → default reject
+- Core shape regression ≥ 5% on the primary accept metric → default reject (single threshold; see Acceptance Rules above and `iteration_rules.mdc` Rule 3)
+- Rule 11 violation: new wrapper-level cache keyed on `id(activation)` / `id(grad_out)` / `id(activation_scale)`, OR the round's `Real-training transfer check` decision is `REJECT-as-overfit` → reject immediately regardless of aggregate score
+
+**After passing**:
+1. Write this round's detailed results to `rounds/round-N/summary.md`
+2. Immediately update `logs/optimize.md` (optimization history, current best, directions to try)
+3. Update current best
+4. If `git_commit=true`: git commit (see git integration specification below)
+5. If the round produced a reusable technical lesson, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+`rounds/round-N/summary.md` and `logs/optimize.md` must be updated in the same VALIDATE round. Do not leave placeholders or defer the log update.
+
+Before issuing any command for the next round, the agent MUST have completed **all** of the following for the current round:
+- benchmark/test completion confirmed
+- accept/rollback decision made from finished data
+- `rounds/round-N/summary.md` written
+- `rounds/round-N/kernel_snapshot/` populated
+- `logs/optimize.md` updated
+- `logs/performance_trend.md` updated
+- reusable tip appended when applicable
+
+**Under `workspace-mode`**:
+Validation is split into a local gate (within minimal environment) and an integration gate (after syncing back to main repo).
+Only passing the integration gate counts as a truly accepted version.
+SYNC_BACK step: only sync accepted core changes — do not carry over scaffolding or temporary code.
+
+### 5. ACCEPT / REPORT
+
+**Goal**: Update lineage and leave reusable context for the next round.
+
+**ACCEPT required actions**:
+- Confirm `logs/optimize.md` already reflects the latest accepted round
+- Record cumulative improvement relative to baseline
+- Mark which directions were effective, ineffective, or need revisiting
+- Produce candidate directions for the next round
+- For every accepted round so far, confirm `rounds/round-N/summary.md` carries a `Real-training transfer check` section whose `Decision` is `ACCEPT-as-real` or `ACCEPT-with-asterisk`. Any `REJECT-as-overfit` round sitting in the accepted lineage must be rolled back here — it is not legitimate cumulative gain.
+
+**REPORT** (output when campaign terminates, written to the `## Final Report` section at the end of `logs/optimize.md`):
+- Baseline vs final best comparison (with full validation data)
+- Total cumulative improvement
+- List of key effective optimizations
+- List of verified ineffective directions
+- If continuing optimization, top three recommended next steps
+- Detailed data references to the corresponding `rounds/round-N/summary.md` files
+- **Real-training applicability audit** (mandatory): re-attribute the campaign's `baseline → final best` delta into `S_real` (K1–K4, transfers 1:1), `W_real` (W1, capped by `quant_time(weight) / step_time`), and `R_real` (must be 0 for a clean campaign) per Rule 11's REPORT-time procedure. Report `headline benchmark gain` and `real-training-equivalent gain = S_real + W_real` separately; if the inflation gap exceeds 1%, call it out.
+
+## Rollback Rules
+
+The following situations require rollback of the current round's candidate:
+- Build failure
+- Correctness failure
+- `Check` failure in benchmark
+- Clear regression compared to current best
+- Results are too volatile to confirm whether improvement is real
+
+Rollback operations:
+1. Revert the candidate change (`repo-mode`: `git checkout -- <modified_files>` or `git revert <commit>`; `workspace-mode`: roll back the local candidate without affecting the main repo)
+2. Write `rounds/round-N/summary.md` and mark the round as rollback with the failure reason
+3. Immediately update `logs/optimize.md`, including the optimization history and verified ineffective directions
+4. Return to ANALYZE with a new direction; rollback is not, by itself, a campaign termination signal
+5. If the failed round exposed a reusable pitfall or signal, append a concise tip to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`
+
+## Historical Experience Capture
+
+After every completed round, follow iteration_rules.mdc Rule 4's "Reusable Technical Tips Capture" to decide whether to append a takeaway to `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`. Create missing directories on first use.
+
+Recommended append format:
+
+```markdown
+### <YYYY-MM-DD HH:MM> round-N — ACCEPTED / ROLLED BACK
+- Context: <shape family / kernel path / hardware scope>
+- Signal: <what was observed>
+- Takeaway: <reusable lesson>
+- Applicability: <when this tip should be reused, and when it should not>
+```
+
+## Git Integration Specification
+
+When `git_commit=true`, each accepted version corresponds to a git commit, forming a lineage. When `git_commit=false`, skip the commit but still record the accepted version in the log.
+
+**Commit timing**: After VALIDATE passes, check the `git_commit` flag; if `true`, commit immediately.
+
+**Commit message format**:
+
+```
+[optimize] <target_op> <target_backend> round-<N>: <one-line summary>
+
+Hypothesis: <optimization hypothesis for this round>
+Result: <aggregate score change>
+Details: <campaign_dir>/logs/optimize.md
+```
+
+Example:
+
+```
+[optimize] gemm_fp8_blockwise TRITON round-3: increase num_stages from 2 to 3
+
+Hypothesis: Increase software pipelining depth to hide memory access latency
+Result: geomean 301 -> 319 TFLOPS (+6.0%)
+Details: agent/workspace/gemm_fp8_blockwise_triton_gfx942_20260412/logs/optimize.md
+```
+
+**Rollback**: `git revert <commit>` to roll back a single version.
+
+**Note**: The campaign directory (`agent/workspace/`) is not tracked by git by default. Only kernel code changes enter the git lineage. The `rounds/` summaries and raw artifacts are stored only in the campaign directory.
+
+## Optimization Log Template
+
+Each campaign maintains a `logs/optimize.md`, updated in real-time so humans can check progress at any time. It also maintains `logs/performance_trend.md`, whose row schema (per-round Fwd / Bwd / Step-Geomean TFLOPS and the `vs Baseline` percentages) is defined once in [`../../../rules/iteration_rules.mdc`](../../../rules/iteration_rules.mdc) Rule 8 — use that table as the single source for the trend columns.
+
+`logs/optimize.md` and `logs/performance_trend.md` are append-only history files:
+
+- Never delete, truncate, or rewrite existing content
+- Only append new sections, rows, or correction notes
+- If a prior entry is inaccurate, append a correction instead of erasing the original record
+
+```markdown
+# <target_op> <target_backend> Optimization Log
+
+## Basic Information
+- Target operator: <target_op>
+- Implementation language: <target_lang>
+- Backend: <target_backend>
+- Target GPU: <target_gpu>
+- Campaign: <campaign_dir>
+- Start time: <YYYY-MM-DD HH:MM>
+- Current status: Optimizing (round-N)
+
+## Baseline
+| Shape (MxNxK) | Forward TFLOPS | Backward TFLOPS | Check |
+|---------------|---------------|-----------------|-------|
+| ... | ... | ... | ... |
+- Forward aggregate: <baseline_forward_score>
+- Backward aggregate: <baseline_backward_score_or_->
+- Detailed data: rounds/round-1/summary.md
+
+## Optimization History
+
+### round-2 — <one-line description of changes>
+- Time: <YYYY-MM-DD HH:MM>
+- Validation level: quick / full
+- Hypothesis: <why this change was made>
+- Changes: <which files and parameters were modified>
+- Result: <aggregate score change> ✅/❌
+- Test: PASS/FAIL
+- Decision: accept / rollback
+- Detailed data: rounds/round-2/summary.md
+- Notes: <failure reason or key observations>
+
+### round-3 — ...
+
+## Current Best
+| Shape (MxNxK) | Baseline | Current Best | Improvement |
+|---------------|----------|-------------|-------------|
+| ... | ... | ... | ... |
+- Aggregate score: baseline <X> → current <Y> (+Z%)
+
+## Directions to Try
+- [ ] <Direction 1>
+- [ ] <Direction 2>
+- [x] ~~<Verified ineffective direction>~~ (verified in round-N)
+
+## Verified Ineffective Directions
+| Direction | Version | Failure Reason |
+|-----------|---------|---------------|
+| ... | round-N | ... |
+
+## Final Report
+(Filled in when campaign terminates)
+- Baseline aggregate score: <X>
+- Final best aggregate score: <Y> (+Z%)
+- Total iterations: <N> (accepted: <A>, rollback: <B>)
+- Key effective optimizations: ...
+- Verified ineffective directions: ...
+- If continuing optimization, recommended next three steps: ...
+
+### Real-training applicability audit
+| Source | Buckets | Benchmark gain | Real-training-equivalent gain |
+|--------|---------|----------------|-------------------------------|
+| Structural kernel work | K1 / K2 / K3 / K4 rounds | +<S_bench>% | +<S_real>% (= +<S_bench>%, transfers 1:1) |
+| Bounded weight cache | W1 rounds | +<W_bench>% | +<W_real>% (capped by quant_time(weight) / step_time = <derivation>) |
+| Benchmark-only residual | (must be 0 for a clean campaign) | +<R_bench>% | +0% |
+| **Total** | — | +<Z>% | +<S_real + W_real>% |
+
+- Headline benchmark improvement: +<Z>%
+- Real-training-equivalent improvement: +<S_real + W_real>%
+- Inflation gap (`headline - real-training-equivalent`): <gap>%
+- Verdict: <"clean — gap < 1%, headline transfers" | "inflated — call out residual W_bench" | "rolled-back — see round-N">
+```
+
+## Round Summary Template
+
+The canonical detailed artifact for each round is `<campaign_dir>/rounds/round-N/summary.md`.
+
+- `round-1` is the baseline round
+- `round-2+` are optimization attempts
+- If a round emits raw benchmark CSVs, command captures, or other detailed outputs, store them under `<campaign_dir>/rounds/round-N/artifacts/`
+
+The summary must follow the same round-oriented structure used by the iteration rules:
+
+```markdown
+## Hypothesis
+
+<For round-1: "Baseline round. No optimization change yet; record the starting correctness/performance and choose representative shapes.">
+<For round-N >= 2: optimization hypothesis for this round>
+
+## Single change
+
+<For round-1: "No code change. Freeze the starting kernel and environment state.">
+<For round-N >= 2: exact code/config change>
+
+## Results
+
+### Validation
+- Time: <YYYY-MM-DD HH:MM>
+- Validation level: quick / full
+- Test command: <test command>
+- Benchmark command: <benchmark command>
+- Raw artifacts: `artifacts/<file>` (if any)
+
+| Shape / label | M | N | K | Result | Forward TFLOPS | Backward TFLOPS | Delta vs current best |
+|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | ... |
+
+### Aggregate
+- Forward aggregate (geomean): <score>
+- Backward aggregate (geomean): <score> (if applicable)
+- vs baseline: +X%
+- vs current best: +Y%
+
+## Decision
+
+`BASELINE` / `ACCEPTED` / `ROLLED BACK`
+
+<Why this round was accepted, rolled back, or recorded as the baseline>
+
+## Attribution
+
+<Why this specific round behaved this way>
+
+## Next direction
+
+<What to try next>
+
+## Rollback Analysis
+
+<Only for rolled-back rounds>
+```
+
+## Stagnation Detection and Conditional Intervention
+
+Stagnation is not a stop signal but a trigger for intervention.
+
+Any of the following conditions can trigger intervention:
+- Two consecutive candidates were rolled back
+- Multiple consecutive rounds made only minor adjustments in the same direction with no measurable improvement
+- The profiler-identified bottleneck has remained unchanged for an extended period
+- Recent rounds only show parameter jitter with no structurally new hypotheses
+
+Once triggered, a `stagnation review` must be performed:
+
+1. Review the benefit curve of recent accepted versions
+2. Review failed attempts to identify proven ineffective directions
+3. Re-examine profiler results, reference implementations, and hardware documentation; if profiling has not been done yet, do it now
+4. Generate at least 3 fundamentally different new directions
+5. Prioritize directions that have not been explored recently
+
+Recommended direction-switching categories:
+- Tile / launch parameters
+- Memory layout / data movement
+- Software pipelining / overlap
+- Occupancy / register / LDS resource allocation
+- Backend switching or reference implementation comparison
+- Algorithm-level reordering, branch elimination, kernel fusion
+
+## Termination Conditions
+
+The campaign may terminate only when at least one of the following conditions is satisfied:
+
+| ID | Condition | Notes |
+|----|-----------|-------|
+| `T1` | `performance_target` has been reached | Only applies when `performance_target` is not `null` |
+| `T2` | An acceptable hardware-efficiency range has been reached | For example, a clearly acceptable fraction of peak efficiency |
+| `T3` | `max_iterations` limit has been reached | Only if configured; if set, it must be `< 120` |
+| `T4` | The user explicitly requests stop | Always valid |
+
+Before writing REPORT, add a termination-check block to `logs/optimize.md` and state which condition passed:
+
+```markdown
+### Termination Check
+- T1 performance_target: ❌ / ✅
+- T2 hardware efficiency: ❌ / ✅
+- T3 max_iterations reached: ❌ / ✅
+- T4 user requested stop: ❌ / ✅
+-> Satisfied condition(s): T<N>
+```
+
+If none of the conditions are satisfied, the campaign must return to ANALYZE instead of terminating.
+
+A REPORT must be output upon termination (see ACCEPT / REPORT phase).
+
+## Execution Reminders
+
+Operational guardrails not covered by `iteration_rules.mdc` (read the iteration rules for the per-round contract — single hypothesis, correctness before performance, append-only logs, tips file hygiene):
+
+- All timestamps must be recorded to minute precision in the format `YYYY-MM-DD HH:MM`. **Always obtain the current time by running `date '+%Y-%m-%d %H:%M'`** in the shell; do not rely on the system prompt date.
+- **Never pipe benchmark or test commands through `| tail`, `| head`, `| grep`, or any filter.** Piping forces stdout into fully-buffered mode, hiding intermediate output and making running commands look hung. Redirect to a file (`> out.txt 2>&1`) first, then read/search after the command completes.
+- **Never treat a backgrounded command as a completed round.** If a shell command times out and continues in the background, that is an unfinished round-state, not a result.
+- **Never leave a round half-closed.** If `summary.md`, `kernel_snapshot/`, `logs/optimize.md`, or `logs/performance_trend.md` are missing for the current round, finish that bookkeeping before any new optimization action.
