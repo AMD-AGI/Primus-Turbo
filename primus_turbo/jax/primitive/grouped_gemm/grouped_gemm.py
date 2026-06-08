@@ -108,8 +108,8 @@ from primus_turbo.jax.primitive._batching import (
     make_grouped_gemm_spmd_rule,
 )
 
-
 # ---- compute_group_offs ------------------------------------------------------
+
 
 def _compute_group_offs_batch_rule(args, axes):
     """Batched `cumsum` (prepended with 0).  Computed in pure JAX rather than by
@@ -143,6 +143,7 @@ batching.fancy_primitive_batchers[compute_group_offs_p] = (
 
 # ---- ck_grouped_gemm ---------------------------------------------------------
 
+
 def _ck_grouped_gemm_merge_rule(args, axes, **kwargs):
     """Plain-vmap rule: merge the batch into the leading token dim, run one
     grouped-GEMM, then un-merge.  `group_offs` is recomputed from the merged
@@ -153,22 +154,18 @@ def _ck_grouped_gemm_merge_rule(args, axes, **kwargs):
         return ck_grouped_gemm_p.bind(*args, **kwargs), (None, None)
 
     bs = next(arg.shape[ax] for arg, ax in zip(args, axes) if ax is not None)
-    a_b = broadcast_to_batch(a, a_ax, bs)              # (B, m_total, k)
-    b_b = broadcast_to_batch(b, b_ax, bs)              # (B, G, k, n)
-    gl_b = broadcast_to_batch(group_lens, gl_ax, bs)   # (B, G)
+    a_b = broadcast_to_batch(a, a_ax, bs)  # (B, m_total, k)
+    b_b = broadcast_to_batch(b, b_ax, bs)  # (B, G, k, n)
+    gl_b = broadcast_to_batch(group_lens, gl_ax, bs)  # (B, G)
 
-    a_merged = a_b.reshape((-1,) + a_b.shape[2:])       # (B*m_total, k)
-    b_merged = b_b.reshape((-1,) + b_b.shape[2:])       # (B*G, k, n)
+    a_merged = a_b.reshape((-1,) + a_b.shape[2:])  # (B*m_total, k)
+    b_merged = b_b.reshape((-1,) + b_b.shape[2:])  # (B*G, k, n)
     with jax.experimental.enable_x64():
         gl_merged = gl_b.reshape(-1).astype(jnp.int64)
         zeros = jnp.zeros((1,), dtype=jnp.int64)
-        go_merged = jnp.concatenate(
-            [zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0
-        ).astype(jnp.int64)
+        go_merged = jnp.concatenate([zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0).astype(jnp.int64)
 
-    out_merged, ws = ck_grouped_gemm_p.bind(
-        a_merged, b_merged, gl_merged, go_merged, **kwargs
-    )
+    out_merged, ws = ck_grouped_gemm_p.bind(a_merged, b_merged, gl_merged, go_merged, **kwargs)
     out = out_merged.reshape(a_b.shape[:2] + (out_merged.shape[-1],))
     return (out, ws), (0, None)
 
@@ -181,6 +178,7 @@ batching.fancy_primitive_batchers[ck_grouped_gemm_p] = make_grouped_gemm_spmd_ru
 
 # ---- ck_grouped_gemm_variable_k ---------------------------------------------
 
+
 def _ck_grouped_gemm_variable_k_merge_rule(args, axes, **kwargs):
     """Plain-vmap rule for the variable-K kernel (groups vary along the K axis;
     output is (G, m, n) per call).  Merge the batch into the leading K dim, run
@@ -191,22 +189,18 @@ def _ck_grouped_gemm_variable_k_merge_rule(args, axes, **kwargs):
         return ck_grouped_gemm_variable_k_p.bind(*args, **kwargs), (None, None)
 
     bs = next(arg.shape[ax] for arg, ax in zip(args, axes) if ax is not None)
-    a_b = broadcast_to_batch(a, a_ax, bs)              # (B, k_total, m)
-    b_b = broadcast_to_batch(b, b_ax, bs)              # (B, k_total, n)
-    gl_b = broadcast_to_batch(group_lens, gl_ax, bs)   # (B, G)
+    a_b = broadcast_to_batch(a, a_ax, bs)  # (B, k_total, m)
+    b_b = broadcast_to_batch(b, b_ax, bs)  # (B, k_total, n)
+    gl_b = broadcast_to_batch(group_lens, gl_ax, bs)  # (B, G)
 
-    a_merged = a_b.reshape((-1,) + a_b.shape[2:])       # (B*k_total, m)
-    b_merged = b_b.reshape((-1,) + b_b.shape[2:])       # (B*k_total, n)
+    a_merged = a_b.reshape((-1,) + a_b.shape[2:])  # (B*k_total, m)
+    b_merged = b_b.reshape((-1,) + b_b.shape[2:])  # (B*k_total, n)
     with jax.experimental.enable_x64():
         gl_merged = gl_b.reshape(-1).astype(jnp.int64)
         zeros = jnp.zeros((1,), dtype=jnp.int64)
-        go_merged = jnp.concatenate(
-            [zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0
-        ).astype(jnp.int64)
+        go_merged = jnp.concatenate([zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0).astype(jnp.int64)
 
-    out_merged, ws = ck_grouped_gemm_variable_k_p.bind(
-        a_merged, b_merged, gl_merged, go_merged, **kwargs
-    )
+    out_merged, ws = ck_grouped_gemm_variable_k_p.bind(a_merged, b_merged, gl_merged, go_merged, **kwargs)
     out = out_merged.reshape((bs, -1) + out_merged.shape[1:])
     return (out, ws), (0, None)
 

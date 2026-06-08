@@ -90,9 +90,7 @@ def make_ipc_batchers(prim, num_outputs):
         bs = axis_data.size
         args_b = [broadcast_to_batch(a, ax, bs) for a, ax in zip(args, axes)]
         local_idx = jax.lax.axis_index(spmd_name)
-        args_local = [
-            jax.lax.dynamic_index_in_dim(a, local_idx, axis=0, keepdims=False) for a in args_b
-        ]
+        args_local = [jax.lax.dynamic_index_in_dim(a, local_idx, axis=0, keepdims=False) for a in args_b]
         out_local = prim.bind(*args_local, **kwargs)
         stacked = tuple(jnp.broadcast_to(o[None], (bs,) + o.shape) for o in out_local)
         return stacked, batched_dims
@@ -120,9 +118,7 @@ def make_grouped_gemm_spmd_rule(prim, plain_rule, int64_arg_indices=(2, 3)):
         bs = axis_data.size
         args_b = [broadcast_to_batch(a, ax, bs) for a, ax in zip(args, axes)]
         local_idx = jax.lax.axis_index(spmd_name)
-        args_local = [
-            jax.lax.dynamic_index_in_dim(a, local_idx, axis=0, keepdims=False) for a in args_b
-        ]
+        args_local = [jax.lax.dynamic_index_in_dim(a, local_idx, axis=0, keepdims=False) for a in args_b]
         with jax.experimental.enable_x64():
             for i in int64_arg_indices:
                 args_local[i] = args_local[i].astype(jnp.int64)
