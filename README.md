@@ -84,6 +84,9 @@ GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
 # Supported values: PYTORCH (default), JAX.
 # For example, to compile for JAX:
 PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
+
+# (Optional) Use ccache or sccache to speed up incremental rebuilds.
+PRIMUS_TURBO_COMPILER_LAUNCHER=ccache pip3 install --no-build-isolation -e . -v
 ```
 
 ### 3. Testing
