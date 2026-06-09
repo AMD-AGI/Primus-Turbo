@@ -41,9 +41,7 @@ SHAPES = [
 
 def baseline_quantize_transpose(x, scale, amax_buf):
     """Unfused: C++ quantize_fp8_tensorwise + .t().contiguous()."""
-    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
-        x, FP8_DTYPE, None
-    )
+    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, FP8_DTYPE, None)
     t_out = fp8_out.t().contiguous()
     amax_buf.fill_(x.float().abs().amax().item())
     return fp8_out, t_out, scale_inv
@@ -76,10 +74,7 @@ def run_performance_bench(args):
     fp8_max = torch.finfo(FP8_DTYPE).max
 
     print("\n=== Cast + Transpose + Amax: Unfused Baseline vs Triton Fused ===")
-    print(
-        f"\n{'Shape':>14s}  {'Numel':>10s}  "
-        f"{'Unfused':>10s}  {'Triton':>10s}  {'Speedup':>8s}"
-    )
+    print(f"\n{'Shape':>14s}  {'Numel':>10s}  " f"{'Unfused':>10s}  {'Triton':>10s}  {'Speedup':>8s}")
     print(f"{'':>14s}  {'':>10s}  " f"{'us':>10s}  {'us':>10s}  {'':>8s}")
     print("-" * 70)
 
@@ -106,10 +101,7 @@ def run_gemm_interaction_bench(args):
     fp8_max = torch.finfo(FP8_DTYPE).max
 
     print("\n=== GEMM Interaction Test (quantize+transpose, then matmul) ===")
-    print(
-        f"\n{'Shape':>14s}  "
-        f"{'Unfused':>10s}  {'Triton':>10s}  {'Delta':>10s}"
-    )
+    print(f"\n{'Shape':>14s}  " f"{'Unfused':>10s}  {'Triton':>10s}  {'Delta':>10s}")
     print(f"{'':>14s}  " f"{'us':>10s}  {'us':>10s}  {'us':>10s}")
     print("-" * 55)
 
@@ -144,11 +136,7 @@ def run_gemm_interaction_bench(args):
         tri_med, _ = benchmark_fn(lambda: triton_fn(), args.warmup, args.repeat)
 
         shape_str = f"{M}x{N}"
-        print(
-            f"{shape_str:>14s}  "
-            f"{base_med:>10.1f}  {tri_med:>10.1f}  "
-            f"{tri_med - base_med:>+10.1f}"
-        )
+        print(f"{shape_str:>14s}  " f"{base_med:>10.1f}  {tri_med:>10.1f}  " f"{tri_med - base_med:>+10.1f}")
 
 
 def run_correctness_check():

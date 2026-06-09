@@ -131,9 +131,7 @@ def quantize_fp8_with_trans(
         if scaling_recipe is not None or scaling_recipe_for_trans is not None:
             raise ValueError("scaling_recipe is not used for TENSORWISE")
 
-        cast_out, trans_out, scale_inv = cast_transpose_fp8_triton(
-            x, out_dtype, scale, amax_out
-        )
+        cast_out, trans_out, scale_inv = cast_transpose_fp8_triton(x, out_dtype, scale, amax_out)
         return (cast_out, scale_inv, trans_out, scale_inv)
 
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
