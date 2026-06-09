@@ -11,6 +11,9 @@ on:
 
 env:
   UCCL_WHEEL_DIR: /apps/tas/0_public/primus_turbo_ci/uccl-wheel-v2602
+  # Pinned aiter commit for CI. Keep in sync with EXPECTED_AITER_COMMIT in
+  # primus_turbo/common/aiter_utils.py (used for the runtime version check).
+  AITER_COMMIT: b5e03ed191fca11ee423226537ef8d9435e432a6
 
 jobs:
   code-lint:
@@ -170,7 +173,9 @@ jobs:
           unset AITER_ASM_DIR
           pip3 uninstall -y aiter amd-aiter || true
           pip3 install -r requirements.txt
-          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e . -v
+          # Install the pinned aiter commit (AITER_COMMIT set at workflow env level).
+          pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@${AITER_COMMIT}"
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e ".[pytorch]" -v
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
@@ -250,7 +255,7 @@ jobs:
           fi
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
-          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:

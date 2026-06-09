@@ -1,0 +1,13 @@
+[build-system]
+requires = [
+    "setuptools==69.5.1",
+    "setuptools_scm[toml]>=8",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+write_to = "primus_turbo/_version.py"
+fallback_version = "0.0.0.dev0"
