@@ -64,9 +64,9 @@ jobs:
     steps:
       - name: Change owner
         run: sudo chown -R $(id -u):$(id -g) ${GITHUB_WORKSPACE} || true
+      # No submodules: validate installs the self-contained sdist and only needs
+      # tests/ and requirements.txt from the repo (both live in the main tree).
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive   # provides tests/ and requirements.txt
       - uses: actions/download-artifact@v4
         with:
           name: sdist
