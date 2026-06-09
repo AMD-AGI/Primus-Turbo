@@ -113,8 +113,7 @@ public:
             if (num_stream_used > 1) {
                 PRIMUS_TURBO_CHECK_HIP(hipEventRecord(sync_event_, params.stream));
                 for (size_t s = 1; s < num_stream_used; ++s) {
-                    PRIMUS_TURBO_CHECK_HIP(
-                        hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
+                    PRIMUS_TURBO_CHECK_HIP(hipStreamWaitEvent(compute_streams_[s], sync_event_, 0));
                 }
             }
 
@@ -124,11 +123,9 @@ public:
                 // PyTorch current stream/handle, which is already bound
                 // one-to-one). Extra slots use our internal streams bound via
                 // hipblasSetStream above.
-                auto       stream     = (stream_idx == 0) ? params.stream
-                                                          : compute_streams_[stream_idx];
-                auto       handle     = (stream_idx == 0) ? params.handle
-                                                          : handles_[stream_idx];
-                auto       workspace  = workspaces_[stream_idx];
+                auto stream    = (stream_idx == 0) ? params.stream : compute_streams_[stream_idx];
+                auto handle    = (stream_idx == 0) ? params.handle : handles_[stream_idx];
+                auto workspace = workspaces_[stream_idx];
                 // clang-format off
                 hipblaslt_gemm_impl(
                     gemm_ptrs_[idx].b_ptr, params.b_type, rows_b_[idx], cols_b_[idx], ld_b_[idx],
