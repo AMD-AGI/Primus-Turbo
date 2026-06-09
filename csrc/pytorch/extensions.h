@@ -270,6 +270,12 @@ void unpermute_meta(at::Tensor permuted_tokens, at::Tensor output_tokens,
                     int64_t hidden_size, bool with_probs, int64_t probs_stride);
 
 //==================================================================
+//  Testing Utilities
+//==================================================================
+
+void hipblaslt_algo_cache_clear();
+
+//==================================================================
 //  Runtime
 //==================================================================
 
