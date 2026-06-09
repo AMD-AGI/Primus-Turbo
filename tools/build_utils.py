@@ -18,6 +18,8 @@ from typing import List, Optional
 import setuptools
 from hipify_torch.hipify_python import hipify
 
+from primus_turbo.common.logger import logger
+
 try:
     import torch  # noqa: F401
 
@@ -95,15 +97,18 @@ def find_rocm_home() -> Optional[str]:
         if spec is not None and spec.origin is not None:
             rocm_home = str(Path(spec.origin).parent.resolve())
 
-    hipcc_path = shutil.which("hipcc")
-    if hipcc_path is not None:
-        rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
-        if os.path.basename(rocm_home) == "hip":
-            rocm_home = os.path.dirname(rocm_home)
-    else:
-        fallback_path = TURBO_FALLBACK_LIBRARY_HOME
-        if os.path.exists(fallback_path):
-            rocm_home = fallback_path
+    if rocm_home is None:
+        hipcc_path = shutil.which("hipcc")
+        if hipcc_path is not None:
+            rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
+            if os.path.basename(rocm_home) == "hip":
+                rocm_home = os.path.dirname(rocm_home)
+        else:
+            fallback_path = TURBO_FALLBACK_LIBRARY_HOME
+            if os.path.exists(fallback_path):
+                rocm_home = fallback_path
+    if rocm_home and torch.version.hip is None:
+        logger.warning("No ROCm runtime is found, using ROCM_HOME='%s'", rocm_home)
     return rocm_home
 
 
