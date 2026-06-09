@@ -21,7 +21,10 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
+    enable_preshuffle,
+    gemm_fp4_impl,
+)
 
 __all__ = ["gemm_fp4"]
 
@@ -53,10 +56,14 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
+        preshuffle = enable_preshuffle()
+
         a_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=False,
             use_rht=False,
+            shuffle_scale=preshuffle,
+            shuffle_out=False,
         )
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
@@ -76,6 +83,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_2d_block=True,
             use_sr=False,
             use_rht=False,
+            shuffle_scale=preshuffle,
+            shuffle_out=preshuffle,
         )
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
@@ -102,12 +111,20 @@ class FP4GemmMXFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=(BackendType.AITER if preshuffle else BackendType.HIPBLASLT).value,
+            preshuffled=preshuffle,
         )
 
         # Backward needs a col-wise (axis=0) version of A/B with an RHT recipe.
         # If the caller pre-quantized this and passed it via ``a_t`` / ``b_t``,
-        # reuse it directly; otherwise derive it from the forward fp4 tensor.
+        # reuse it directly; otherwise derive it.
+        #
+        # Caution: do NOT derive from ``a_fp4.dequantize()`` when
+        # ``shuffle_scale=True`` is in the recipe -- ``dequantize_fp4``
+        # treats ``scale_inv`` as canonical-layout and a shuffled scale
+        # gives garbage. When a raw high-precision tensor was passed in,
+        # re-quantize from it directly; this matches what
+        # ``_quantize_mxfp4_dual`` would do under one fused op.
         if a_t is not None:
             quantized_a_t = a_t
         else:
@@ -115,9 +132,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 use_2d_block=False,
                 use_sr=False,
                 use_rht=True,
+                shuffle_scale=preshuffle,
+                shuffle_out=preshuffle,
             )
+            a_for_t = a if not isinstance(a, QuantizedTensor) else a_fp4.dequantize()
             quantized_a_t = QuantizedTensor.quantize(
-                a_fp4.dequantize(),
+                a_for_t,
                 a_fp4.real_dtype,
                 config.granularity,
                 block_size=config.block_size,
@@ -132,9 +152,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 use_2d_block=True,
                 use_sr=False,
                 use_rht=True,
+                shuffle_scale=preshuffle,
+                shuffle_out=preshuffle,
             )
+            b_for_t = b if not isinstance(b, QuantizedTensor) else b_fp4.dequantize()
             quantized_b_t = QuantizedTensor.quantize(
-                b_fp4.dequantize(),
+                b_for_t,
                 b_fp4.real_dtype,
                 config.granularity,
                 block_size=config.block_size,
@@ -161,13 +184,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.format,
         )
 
-        grad_out = grad_out.view(grad_out.shape[0], -1)
+        grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
 
-        grad_out_scaling_recipe = ScalingRecipe(
-            use_2d_block=False,
-            use_sr=False,
-            use_rht=True,
-        )
+        preshuffle = enable_preshuffle()
+        default_backend = (BackendType.AITER if preshuffle else BackendType.HIPBLASLT).value
 
         quantized_grad_out = QuantizedTensor.quantize(
             grad_out,
@@ -175,7 +195,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.config.granularity,
             axis=1,
             block_size=ctx.config.block_size,
-            scaling_recipe=grad_out_scaling_recipe,
+            scaling_recipe=ScalingRecipe(
+                use_2d_block=False,
+                use_sr=False,
+                use_rht=True,
+                shuffle_scale=preshuffle,
+                shuffle_out=False,
+            ),
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
@@ -189,13 +215,16 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=default_backend,
+            preshuffled=preshuffle,
         )
 
         grad_out_t_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=False,
             use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=False,
         )
         quantized_grad_out_t = QuantizedTensor.quantize(
             grad_out,
@@ -217,7 +246,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=default_backend,
+            preshuffled=preshuffle,
         )
 
         # Grads correspond to forward args:
@@ -249,6 +279,27 @@ def gemm_fp4(
     skipping the forward-direction quantization. If a :class:`QuantizedTensorPair`
     wrapper is passed instead, the optional ``data_t`` field is also forwarded
     and reused as the col-wise / RHT transpose cache for backward.
+
+    Pre-quantized input contract:
+        When passing a pre-quantized :class:`QuantizedTensor` (or
+        :class:`QuantizedTensorPair`), the caller's :class:`ScalingRecipe`
+        must match what ``FP4GemmMXFunction`` constructs internally; this
+        is checked by :func:`check_quantized_tensor` via strict equality.
+        Under the AITER backend the recipe includes
+        ``shuffle_scale`` / ``shuffle_out`` flags derived from
+        :func:`primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl.enable_preshuffle`.
+        Recommended pattern::
+
+            from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
+            preshuffle = enable_preshuffle()
+            a_recipe = ScalingRecipe(
+                use_2d_block=False, use_sr=False, use_rht=False,
+                shuffle_scale=preshuffle, shuffle_out=False,
+            )
+            b_recipe = ScalingRecipe(
+                use_2d_block=True, use_sr=False, use_rht=False,
+                shuffle_scale=preshuffle, shuffle_out=preshuffle,
+            )
 
     Args:
         a: Input matrix a with shape (M, K), must be 2D tensor. The A matrix should be activaton.
