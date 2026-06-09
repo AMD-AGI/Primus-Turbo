@@ -25,7 +25,6 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
-    quantize_fp8_tensorwise_fused_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
@@ -33,8 +32,6 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 
 __all__ = [
     "quantize_fp8",
-    "quantize_fp8_fused",
-    "cast_transpose_fp8",
     "dequantize_fp8",
     "quantize_fp4",
     "dequantize_fp4",
@@ -93,50 +90,6 @@ def quantize_fp8(
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
 
-def quantize_fp8_fused(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    granularity: ScalingGranularity,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    FP8 Quantize with fused amax+scale computation (2-kernel path).
-
-    Only supports TENSORWISE granularity. For other granularities, falls
-    back to the standard quantize_fp8 path.
-
-    This variant fuses the abs-max reduction and scale computation into a
-    single kernel launch, reducing total kernel launches from 3 to 2.
-    """
-    if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_fused_impl(x, out_dtype)
-    return quantize_fp8(x, out_dtype, granularity)
-
-
-def cast_transpose_fp8(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    scale: torch.Tensor,
-    amax_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused FP8 cast + transpose + optional amax in a single kernel pass.
-
-    Given a 2D input [M, N] and a pre-computed scale, produces:
-      - cast_out      [M, N]: FP8 quantized (row-major)
-      - transpose_out [N, M]: FP8 quantized transpose (contiguous)
-      - scale_inv     scalar: 1 / scale
-
-    Uses the Triton backend for torch.compile compatibility.
-
-    Args:
-        x: 2D input tensor (bf16, fp16, or fp32), must be contiguous.
-        out_dtype: Target FP8 dtype (e.g. float8_e4m3fn).
-        scale: Pre-computed scalar float32 quantization scale.
-        amax_out: Optional scalar float32 tensor. If provided, the kernel
-                  writes the abs-max of x into it (for delayed scaling).
-    """
-    return cast_transpose_fp8_triton(x, out_dtype, scale, amax_out)
-
-
 def quantize_fp8_with_trans(
     x: torch.Tensor,
     out_dtype: torch.dtype,
@@ -146,18 +99,44 @@ def quantize_fp8_with_trans(
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale: Optional[torch.Tensor] = None,
+    amax_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    FP8 Quantize with trans
+    """Quantize x to FP8 and produce both row-major and transposed outputs.
 
-    NOTE:
-        For MXFP8 quantization:
-            1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
-            3. The block size must be 32.
-            4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
+    Returns:
+        (x_quantized, x_scale_inv, x_transposed, x_trans_scale_inv)
+
+    For TENSORWISE granularity (delayed scaling):
+        Fuses FP8 quantize + contiguous transpose into a single HBM pass.
+        Requires a pre-computed ``scale`` (from previous step's amax).
+        Optionally writes current abs-max into ``amax_out`` (for next step).
+        Both scale_inv outputs are identical (single global scale).
+        x must be 2D [M, N].
+
+    For MX_BLOCKWISE granularity:
+        block_size must be 32, axis selects row (1) or column (0) direction.
+        Returns per-block scale_inv tensors for each direction.
     """
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
+    if granularity == ScalingGranularity.TENSORWISE:
+        if x.ndim != 2:
+            raise ValueError("TENSORWISE cast+transpose requires 2D input")
+        if scale is None:
+            raise ValueError(
+                "scale is required for TENSORWISE (delayed scaling provides "
+                "a pre-computed scale from the previous iteration's amax)"
+            )
+        if block_size is not None or axis is not None:
+            raise ValueError("block_size and axis are not used for TENSORWISE")
+        if scaling_recipe is not None or scaling_recipe_for_trans is not None:
+            raise ValueError("scaling_recipe is not used for TENSORWISE")
+
+        cast_out, trans_out, scale_inv = cast_transpose_fp8_triton(
+            x, out_dtype, scale, amax_out
+        )
+        return (cast_out, scale_inv, trans_out, scale_inv)
+
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert (
             block_size == MXFP8_BLOCK_SIZE
         ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"

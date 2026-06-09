@@ -47,10 +47,6 @@ void quantize_blockwise_for_weight_impl(const FType *w, QType *w_fp8, float *w_s
                                         const float fp8_max, hipStream_t stream);
 
 template <typename FType, typename QType, typename ComputeType = float>
-void quantize_tensorwise_with_amax_impl(const FType *x, const float *scale, QType *y,
-                                        float *amax_out, const int64_t n, hipStream_t stream);
-
-template <typename FType, typename QType, typename ComputeType = float>
 void cast_transpose_with_amax_impl(const FType *input, const float *scale,
                                    QType *cast_out, QType *trans_out,
                                    float *amax_out, const int64_t rows,

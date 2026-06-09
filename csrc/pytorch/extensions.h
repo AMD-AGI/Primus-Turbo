@@ -51,16 +51,6 @@ std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor 
                                                                const at::ScalarType dest_dtype,
                                                                const int64_t        block_size);
 
-std::vector<at::Tensor> quantize_fp8_tensorwise_fused_meta(const at::Tensor          input,
-                                                           const at::ScalarType      dest_dtype,
-                                                           c10::optional<at::Tensor> scale_opt,
-                                                           c10::optional<at::Tensor> amax_out);
-
-std::vector<at::Tensor> quantize_fp8_tensorwise_fused(const at::Tensor          input,
-                                                      const at::ScalarType      dest_dtype,
-                                                      c10::optional<at::Tensor> scale_opt,
-                                                      c10::optional<at::Tensor> amax_out = c10::nullopt);
-
 std::vector<at::Tensor> cast_transpose_fp8_fused(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   c10::optional<at::Tensor> scale_opt,

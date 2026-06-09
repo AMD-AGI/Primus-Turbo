@@ -82,66 +82,6 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     return {output, scale_inv};
 }
 
-std::vector<at::Tensor> quantize_fp8_tensorwise_fused(const at::Tensor          input,
-                                                      const at::ScalarType      dest_dtype,
-                                                      c10::optional<at::Tensor> scale_opt,
-                                                      c10::optional<at::Tensor> amax_out) {
-    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
-                       input.scalar_type() == at::kFloat);
-    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    at::Tensor scale     = torch::empty({}, input.options().dtype(at::kFloat));
-    at::Tensor scale_inv = torch::empty({}, input.options().dtype(at::kFloat));
-
-    if (scale_opt.has_value()) {
-        scale = scale_opt.value();
-        PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
-        scale_inv = 1.0f / scale;
-    } else {
-        const float   fp8_max = get_float8_max(dest_dtype);
-        const int64_t ws_size = get_reduce_row_workspace_sizes<float>(1, input.numel());
-        auto workspace = ws_size > 0 ? torch::empty({ws_size}, input.options().dtype(at::kByte))
-                                     : torch::Tensor();
-        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
-            reduce_amax_and_compute_scale<InT>(
-                reinterpret_cast<const InT *>(input.data_ptr()),
-                reinterpret_cast<float *>(scale.data_ptr()),
-                reinterpret_cast<float *>(scale_inv.data_ptr()), input.numel(), fp8_max, ws_size,
-                ws_size > 0 ? workspace.data_ptr() : nullptr, stream);
-        });
-    }
-
-    // Quantize -- use fused amax kernel when amax_out is requested
-    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
-    if (amax_out.has_value()) {
-        at::Tensor &amax_buf = amax_out.value();
-        PRIMUS_TURBO_CHECK(amax_buf.scalar_type() == at::kFloat && amax_buf.numel() == 1,
-                           "amax_out must be a float32 scalar tensor");
-        amax_buf.zero_();
-        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
-            TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
-                quantize_tensorwise_with_amax_impl<FType, QType>(
-                    reinterpret_cast<const FType *>(input.data_ptr()),
-                    reinterpret_cast<const float *>(scale.data_ptr()),
-                    reinterpret_cast<QType *>(output.data_ptr()),
-                    amax_buf.data_ptr<float>(), input.numel(), stream);
-            });
-        });
-    } else {
-        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
-            TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
-                quantize_tensorwise_impl<FType, QType>(
-                    reinterpret_cast<const FType *>(input.data_ptr()),
-                    reinterpret_cast<const float *>(scale.data_ptr()),
-                    reinterpret_cast<QType *>(output.data_ptr()), input.numel(), stream);
-            });
-        });
-    }
-
-    return {output, scale_inv};
-}
-
 std::vector<at::Tensor> cast_transpose_fp8_fused(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   c10::optional<at::Tensor> scale_opt,

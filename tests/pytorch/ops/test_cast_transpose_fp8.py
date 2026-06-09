@@ -28,8 +28,8 @@ SHAPES = [
 
 
 def _reference_cast_transpose(x, dest_dtype, scale):
-    """Reference: C++ fused quantize with pre-computed scale, then transpose."""
-    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise_fused(
+    """Reference: C++ quantize with pre-computed scale, then transpose."""
+    fp8_out, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
         x.reshape(-1), dest_dtype, scale
     )
     cast_ref = fp8_out.reshape(x.shape)
