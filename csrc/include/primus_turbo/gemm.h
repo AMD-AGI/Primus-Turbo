@@ -4,7 +4,9 @@
 
 #pragma once
 
+#ifdef PRIMUS_TURBO_BUILD_CK_BACKEND
 #include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
+#endif
 #include "primus_turbo/dtype.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -56,6 +58,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 //==================================================================
 //  CK GEMM
 //==================================================================
+#ifdef PRIMUS_TURBO_BUILD_CK_BACKEND
 
 template <typename AType, typename BType, typename CType, typename ACCType = float>
 struct CKGemmFP8Params {
@@ -79,9 +82,12 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           ck_tile::QuantType QuantMode>
 void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
 
+#endif // PRIMUS_TURBO_BUILD_CK_BACKEND
+
 //==================================================================
 //  Turbo GEMM
 //==================================================================
+#ifdef PRIMUS_TURBO_BUILD_TURBO_BACKEND
 
 size_t turbo_gemm_mxfp8_workspace_size(int32_t m, int32_t n, int32_t k);
 
@@ -91,5 +97,7 @@ void turbo_gemm_mxfp8_impl(const AType *a_ptr, const BType *b_ptr,
                            const dtype::float8_e8m0 *b_scale_ptr, CType *c_ptr, int32_t m,
                            int32_t n, int32_t k, void *workspace, size_t workspace_size,
                            hipStream_t stream);
+
+#endif // PRIMUS_TURBO_BUILD_TURBO_BACKEND
 
 } // namespace primus_turbo

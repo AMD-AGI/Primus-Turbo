@@ -10,6 +10,8 @@
 
 namespace primus_turbo::pytorch {
 
+#ifdef PRIMUS_TURBO_BUILD_CK_BACKEND
+
 template <typename AType, typename BType, typename CType>
 inline CKGroupedGemmParams<AType, BType, CType>
 make_ck_groued_gemm_params(void *args_ptr, const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
@@ -58,25 +60,6 @@ inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_groued_gemm_
     params.stream         = stream;
     params.num_cu         = num_cu;
     return params;
-}
-
-at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens) {
-    // Check input tensor type
-    PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong,
-                       "group_lens must be of type Long (int64_t)");
-
-    // Create output tensor with one more element than input
-    at::Tensor group_offs = at::empty({group_lens.numel() + 1}, group_lens.options());
-
-    // Get current CUDA stream
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    // Call the CUDA implementation to compute group offsets
-    compute_group_offs<int64_t>(reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
-                                reinterpret_cast<int64_t *>(group_offs.data_ptr()),
-                                group_lens.numel(), stream);
-
-    return group_offs;
 }
 
 uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
@@ -321,5 +304,41 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
 
     return c;
 }
+
+#else // !PRIMUS_TURBO_BUILD_CK_BACKEND : CK grouped GEMM unsupported (CK backend disabled)
+
+at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                           at::Tensor &group_offs, const bool transA, const bool transB,
+                           c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm is unavailable: CK backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+}
+
+at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                                      at::Tensor &group_offs, const bool transA, const bool transB,
+                                      c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_variable_k is unavailable: CK backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+}
+
+at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                               at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,
+                               const bool transA, const bool transB, at::ScalarType out_dtype,
+                               const std::string &granularity, c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8 is unavailable: CK backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+}
+
+at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                          at::Tensor &b_scales, at::Tensor &group_lens,
+                                          at::Tensor &group_offs, const bool transA,
+                                          const bool transB, at::ScalarType out_dtype,
+                                          const std::string     &granularity,
+                                          c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8_variable_k is unavailable: CK backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+}
+
+#endif // PRIMUS_TURBO_BUILD_CK_BACKEND
 
 } // namespace primus_turbo::pytorch

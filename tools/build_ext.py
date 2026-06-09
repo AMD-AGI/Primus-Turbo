@@ -9,12 +9,7 @@ from typing import Optional
 
 from setuptools.command.build_ext import build_ext
 
-from .build_utils import find_rocm_home
-
-
-def _join_rocm_home(*paths) -> str:
-    return os.path.join(find_rocm_home(), *paths)
-
+from .build_utils import _join_rocm_home
 
 SUBPROCESS_DECODE_ARGS = ()
 

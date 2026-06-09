@@ -10,6 +10,15 @@
 #include "primus_turbo/common.h"
 #include "primus_turbo/deep_ep/configs.h"
 
+// gfx12 (gfx1250 / gfx1251, CDNA5) removed the unified `s_waitcnt`; the combined
+// LDS + VMEM wait is expressed via the split counters.
+#if defined(__gfx1250__)
+#define PRIMUS_TURBO_WAIT_ALL_STR                                                                  \
+    "s_wait_dscnt 0\n\ts_wait_kmcnt 0\n\ts_wait_loadcnt 0\n\ts_wait_storecnt 0"
+#else
+#define PRIMUS_TURBO_WAIT_ALL_STR "s_waitcnt lgkmcnt(0) vmcnt(0)"
+#endif
+
 #define NUM_MAX_BARRIERS 16
 
 #define BARRIER_SYNC_INIT()                                                                        \
@@ -376,7 +385,7 @@ __device__ __forceinline__ void st_release_sys_global(const dtype_t *ptr, dtype_
 
     if constexpr (kUseCheapFence) {
         __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+        asm volatile(PRIMUS_TURBO_WAIT_ALL_STR);
         __hip_atomic_store(const_cast<dtype_t *>(ptr), val, __ATOMIC_RELAXED,
                            __HIP_MEMORY_SCOPE_SYSTEM);
         __atomic_signal_fence(__ATOMIC_SEQ_CST);
@@ -391,7 +400,7 @@ __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t *ptr) {
     dtype_t ret;
     if constexpr (kUseCheapFence) {
         __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+        asm volatile(PRIMUS_TURBO_WAIT_ALL_STR);
         ret = __hip_atomic_load(const_cast<dtype_t *>(ptr), __ATOMIC_RELAXED,
                                 __HIP_MEMORY_SCOPE_SYSTEM);
         __atomic_signal_fence(__ATOMIC_SEQ_CST);

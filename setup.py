@@ -9,7 +9,13 @@ from pathlib import Path
 from setuptools import find_packages, setup
 
 from tools.build_ext import TurboBuildExt, _join_rocm_home
-from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
+from tools.build_utils import (
+    HIPExtension,
+    build_ck_backend,
+    build_turbo_backend,
+    find_rocshmem_library,
+    get_gpu_arch,
+)
 
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 
@@ -22,7 +28,28 @@ BUILD_TORCH = "PYTORCH" in PRIMUS_TURBO_FRAMEWORK
 BUILD_JAX = "JAX" in PRIMUS_TURBO_FRAMEWORK
 
 # -------- Supported GPU ARCHS --------
-SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950"]
+SUPPORTED_GPU_ARCHS = ["gfx942", "gfx950", "gfx1250"]
+
+# -------- Optional GEMM backends --------
+# The CK (ck_tile) and turbo (MFMA) GEMM kernels are optional backends selected via the
+# PRIMUS_TURBO_BUILD_BACKEND env var (comma-separated, e.g. "ck,turbo"). When unset, all
+# known backends are built. Each enabled backend defines a matching guard macro for the
+# host bindings (-DPRIMUS_TURBO_BUILD_CK_BACKEND / -DPRIMUS_TURBO_BUILD_TURBO_BACKEND) and
+# includes its kernel sources; disabled backends are excluded and fall back to stubs.
+
+# csrc/kernels path fragments that depend on CK, skipped when the CK backend is disabled.
+CK_DISABLED_SOURCE_MARKERS = (
+    "/gemm/ck/",
+    "/gemm/ck_gemm.cu",
+    "/grouped_gemm/ck/",
+    "/grouped_gemm/ck_grouped_gemm.cu",
+)
+
+# csrc/kernels path fragments for the turbo (MFMA) GEMM backend, skipped when it is disabled.
+TURBO_DISABLED_SOURCE_MARKERS = (
+    "/gemm/turbo/",
+    "/gemm/turbo_gemm.cu",
+)
 
 # -------- ROCSHMEM LIB ---------------
 # try to found rocshmem in default path or enviorment
@@ -108,10 +135,17 @@ def filter_files_by_arch(files):
     offload_arch_list, _ = get_offload_archs()
     enabled_gfx942 = "--offload-arch=gfx942" in offload_arch_list
     enabled_gfx950 = "--offload-arch=gfx950" in offload_arch_list
+    ck_disabled = not build_ck_backend()
+    turbo_disabled = not build_turbo_backend()
 
     filtered_files = []
     for file in files:
-        file_str = str(file)
+        # Normalize to forward slashes so markers match regardless of platform.
+        file_str = str(file).replace(os.sep, "/")
+        if ck_disabled and any(marker in file_str for marker in CK_DISABLED_SOURCE_MARKERS):
+            continue
+        if turbo_disabled and any(marker in file_str for marker in TURBO_DISABLED_SOURCE_MARKERS):
+            continue
         if file_str.endswith("_gfx942.cu") or file_str.endswith("_gfx942.hip"):
             if enabled_gfx942:
                 filtered_files.append(file)
@@ -253,6 +287,16 @@ def get_common_flags():
     cxx_flags += offload_arch_list  # hipcc needs --offload-arch for CK headers in .cpp files
     nvcc_flags += macro_arch_list
     nvcc_flags += offload_arch_list
+
+    # Composable-Kernel / MFMA backend: define the guard macro only when the backend is built.
+    if build_ck_backend():
+        cxx_flags.append("-DPRIMUS_TURBO_BUILD_CK_BACKEND")
+        nvcc_flags.append("-DPRIMUS_TURBO_BUILD_CK_BACKEND")
+
+    # Turbo (MFMA) GEMM backend: define the guard macro only when the backend is built.
+    if build_turbo_backend():
+        cxx_flags.append("-DPRIMUS_TURBO_BUILD_TURBO_BACKEND")
+        nvcc_flags.append("-DPRIMUS_TURBO_BUILD_TURBO_BACKEND")
 
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
