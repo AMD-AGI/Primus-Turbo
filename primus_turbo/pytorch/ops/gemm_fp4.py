@@ -197,7 +197,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(
                 use_2d_block=False,
-                use_sr=False,
+                use_sr=ctx.config.use_gradient_sr,
                 use_rht=True,
                 shuffle_scale=preshuffle,
                 shuffle_out=False,
@@ -221,7 +221,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         grad_out_t_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
-            use_sr=False,
+            use_sr=ctx.config.use_gradient_sr,
             use_rht=True,
             shuffle_scale=preshuffle,
             shuffle_out=False,
