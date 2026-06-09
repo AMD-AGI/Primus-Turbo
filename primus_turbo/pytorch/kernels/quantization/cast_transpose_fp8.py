@@ -194,7 +194,3 @@ def _cast_transpose_fp8_triton_meta(
         torch.empty((N, M), dtype=fp8_dtype, device=x.device),
         torch.empty((), dtype=torch.float32, device=x.device),
     )
-
-
-# Backward-compat alias for existing benchmark / call sites
-cast_transpose_amax = cast_transpose_fp8_triton

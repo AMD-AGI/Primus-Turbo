@@ -16,15 +16,6 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
     return {input_fp8, scale_inv};
 }
 
-std::vector<at::Tensor> quantize_fp8_tensorwise_fused_meta(const at::Tensor          input,
-                                                           const at::ScalarType      dest_dtype,
-                                                           c10::optional<at::Tensor> scale_opt,
-                                                           c10::optional<at::Tensor> amax_out) {
-    auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
-    auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
-    return {input_fp8, scale_inv};
-}
-
 std::vector<at::Tensor> cast_transpose_fp8_fused_meta(const at::Tensor          input,
                                                        const at::ScalarType      dest_dtype,
                                                        c10::optional<at::Tensor> scale_opt,
