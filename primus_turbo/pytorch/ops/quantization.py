@@ -14,6 +14,9 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
 )
+from primus_turbo.pytorch.kernels.quantization.cast_transpose_fp8 import (
+    cast_transpose_fp8_triton,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
@@ -27,7 +30,12 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_mxfp8_impl,
 )
 
-__all__ = ["quantize_fp8", "dequantize_fp8", "quantize_fp4", "dequantize_fp4"]
+__all__ = [
+    "quantize_fp8",
+    "dequantize_fp8",
+    "quantize_fp4",
+    "dequantize_fp4",
+]
 
 
 def quantize_fp8(
@@ -91,18 +99,42 @@ def quantize_fp8_with_trans(
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale: Optional[torch.Tensor] = None,
+    amax_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    FP8 Quantize with trans
+    """Quantize x to FP8 and produce both row-major and transposed outputs.
 
-    NOTE:
-        For MXFP8 quantization:
-            1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
-            3. The block size must be 32.
-            4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
+    Returns:
+        (x_quantized, x_scale_inv, x_transposed, x_trans_scale_inv)
+
+    For TENSORWISE granularity (delayed scaling):
+        Fuses FP8 quantize + contiguous transpose into a single HBM pass.
+        Requires a pre-computed ``scale`` (from previous step's amax).
+        Optionally writes current abs-max into ``amax_out`` (for next step).
+        Both scale_inv outputs are identical (single global scale).
+        x must be 2D [M, N].
+
+    For MX_BLOCKWISE granularity:
+        block_size must be 32, axis selects row (1) or column (0) direction.
+        Returns per-block scale_inv tensors for each direction.
     """
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
+    if granularity == ScalingGranularity.TENSORWISE:
+        if x.ndim != 2:
+            raise ValueError("TENSORWISE cast+transpose requires 2D input")
+        if scale is None:
+            raise ValueError(
+                "scale is required for TENSORWISE (delayed scaling provides "
+                "a pre-computed scale from the previous iteration's amax)"
+            )
+        if block_size is not None or axis is not None:
+            raise ValueError("block_size and axis are not used for TENSORWISE")
+        if scaling_recipe is not None or scaling_recipe_for_trans is not None:
+            raise ValueError("scaling_recipe is not used for TENSORWISE")
+
+        cast_out, trans_out, scale_inv = cast_transpose_fp8_triton(x, out_dtype, scale, amax_out)
+        return (cast_out, scale_inv, trans_out, scale_inv)
+
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert (
             block_size == MXFP8_BLOCK_SIZE
         ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"

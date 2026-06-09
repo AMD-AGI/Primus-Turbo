@@ -16,6 +16,19 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
     return {input_fp8, scale_inv};
 }
 
+std::vector<at::Tensor> cast_transpose_fp8_fused_meta(const at::Tensor          input,
+                                                       const at::ScalarType      dest_dtype,
+                                                       c10::optional<at::Tensor> scale_opt,
+                                                       c10::optional<at::Tensor> amax_out) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "cast_transpose_fp8_fused requires 2D input");
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    auto cast_fp8 = at::empty({M, N}, at::dtype(dest_dtype).device(at::kMeta));
+    auto trans_fp8 = at::empty({N, M}, at::dtype(dest_dtype).device(at::kMeta));
+    auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
+    return {cast_fp8, trans_fp8, scale_inv};
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   const int64_t             axis,
