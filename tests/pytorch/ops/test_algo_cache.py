@@ -32,6 +32,7 @@ def _set_hipblaslt_backend():
     """Force hipBLASLt for all tests and reset afterwards."""
     GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT)
     GlobalBackendManager.set_auto_tune(False)
+    torch.ops.primus_turbo_cpp_extension.hipblaslt_algo_cache_clear()
     yield
     GlobalBackendManager.reset()
 
@@ -146,3 +147,21 @@ class TestAlgoCacheLayouts:
         c_ref = a_mat @ b_mat
         snr = compute_snr(c_ref, c)
         assert snr > 25, f"SNR {snr:.1f} dB too low for layout {layout}"
+
+
+class TestAlgoCacheOverflow:
+    """Cache overflow (clear) must not break correctness."""
+
+    def test_correctness_after_overflow(self):
+        """Insert >256 unique shapes to trigger cache clear, verify correctness holds."""
+        config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=Format.E4M3)
+        n, k = 512, 1024
+        for m in range(64, 64 + 300):
+            torch.manual_seed(m)
+            a = torch.randn(m, k, dtype=DTYPE, device=DEVICE)
+            b = torch.randn(n, k, dtype=DTYPE, device=DEVICE)
+            c = gemm_fp8(a, b, False, True, DTYPE, config)
+            torch.cuda.synchronize()
+            c_ref = a.float() @ b.float().T
+            snr = compute_snr(c_ref, c)
+            assert snr > 20, f"SNR {snr:.1f} dB at m={m} (post-overflow)"

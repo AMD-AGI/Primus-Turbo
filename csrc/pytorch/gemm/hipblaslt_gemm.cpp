@@ -6,12 +6,15 @@
 
 #include "../extensions.h"
 #include "../type_traits.h"
+#include "kernels/gemm/hipblaslt/hipblaslt_algo_cache.h"
 
 namespace primus_turbo::pytorch {
 
 namespace {
 static thread_local at::Tensor tl_workspace;
 
+// Assumes single HIP stream per CPU thread. If a thread dispatches GEMMs on
+// multiple streams concurrently, the workspace could be concurrently overwritten.
 at::Tensor &get_workspace_tensor(int64_t size, const at::Device &device) {
     if (!tl_workspace.defined() || tl_workspace.numel() < size || tl_workspace.device() != device) {
         tl_workspace = at::empty({size}, at::TensorOptions().dtype(at::kByte).device(device));
@@ -356,6 +359,10 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     // clang-format on
 
     return C;
+}
+
+void hipblaslt_algo_cache_clear() {
+    primus_turbo::HipblasltAlgoCache::instance().clear();
 }
 
 } // namespace primus_turbo::pytorch

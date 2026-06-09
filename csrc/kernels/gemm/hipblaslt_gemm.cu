@@ -2,7 +2,7 @@
 //
 // See LICENSE for license information.
 
-#include "hipblaslt_algo_cache.h"
+#include "hipblaslt/hipblaslt_algo_cache.h"
 #include "primus_turbo/common.h"
 #include "primus_turbo/gemm.h"
 

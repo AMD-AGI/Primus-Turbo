@@ -80,7 +80,17 @@ public:
 
     void store(const Key &key, const CachedAlgo &algo) {
         std::lock_guard<std::mutex> lock(mtx_);
+        // Prevent unbounded growth under dynamic-shape workloads
+        // (e.g. MoE without capacity factor produces near-unique M per expert per step)
+        if (cache_.size() >= kMaxEntries) {
+            cache_.clear();
+        }
         cache_[key] = algo;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        cache_.clear();
     }
 
     static int device_cap() {
@@ -97,6 +107,8 @@ public:
         }();
         return cap;
     }
+
+    static constexpr size_t kMaxEntries = 256;
 
 private:
     HipblasltAlgoCache() = default;
