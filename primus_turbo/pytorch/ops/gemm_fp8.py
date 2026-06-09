@@ -433,6 +433,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
+        # m % 16 == 0 and n % 16 == 0 and k % 128 == 0 and k >= 384
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
 

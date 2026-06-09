@@ -652,3 +652,36 @@ def test_gemm_fp8_blockwise_triton_deterministic(m, n, k, layout, format, dtype,
         backend=backend,
         block_size=128,
     )
+
+
+# MX_BLOCKWISE deterministic — turbo backend only; only runs on gfx950.
+# TURBO MX_BLOCKWISE requires NT layout, m/n%16==0, k%128==0, k>=384, plus
+# the backward-GEMM constraints m,n%128==0 and m,n>=384.
+@pytest.mark.parametrize("m", [255, 257, 512, 1024])
+@pytest.mark.parametrize("n", [256, 512, 1024, 4096])
+@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("layout", ["NT"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [BackendType.TURBO])
+@pytest.mark.deterministic
+def test_gemm_fp8_mx_blockwise_deterministic(m, n, k, layout, format, dtype, backend):
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+    # Match the TURBO MX_BLOCKWISE constraints from test_gemm_fp8_mx_blockwise.
+    if layout != "NT" or m % 16 != 0 or n % 16 != 0 or k % 128 != 0 or k < 384:
+        pytest.skip("TURBO MX_BLOCKWISE requires NT, m/n%16==0, k%128==0, k>=384")
+    if m % 128 != 0 or m < 384 or n % 128 != 0 or n < 384:
+        pytest.skip("TURBO backward GEMMs require m,n%128==0 and m,n>=384")
+    _run_gemm_fp8_deterministic_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        backend=backend,
+        block_size=32,
+    )

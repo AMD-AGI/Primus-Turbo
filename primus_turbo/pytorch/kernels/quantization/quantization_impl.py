@@ -12,9 +12,9 @@ from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
-    MXFP4_PADDING_ALIGN_SIZE,
+    MXFP4_K_DIM_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
-    MXFP8_PADDING_ALIGN_SIZE,
+    MXFP8_K_DIM_PADDING_ALIGN_SIZE,
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
@@ -391,7 +391,7 @@ def quantize_mxfp8_impl(
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
-            MXFP8_PADDING_ALIGN_SIZE,
+            MXFP8_K_DIM_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe_for_trans.use_2d_block,
             scaling_recipe.shuffle_scale,
@@ -404,7 +404,80 @@ def quantize_mxfp8_impl(
             x,
             out_dtype,
             axis,
-            MXFP8_PADDING_ALIGN_SIZE,
+            MXFP8_K_DIM_PADDING_ALIGN_SIZE,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.shuffle_scale,
+            scaling_recipe.shuffle_out,
+        )
+
+
+def grouped_quantize_mxfp8_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: Union[int, None],
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    with_trans: bool = False,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Union[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    """MXFP8 quantization fused with per-group M-axis zero-padding.
+
+    Each per-group region of ``x`` (defined by ``group_lens`` / ``group_offs``)
+    is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
+    padded per-group layouts are computed on GPU (no D2H sync).
+    """
+    mxfp8_support, reason = check_mxfp8_support()
+    assert mxfp8_support, reason
+
+    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    if with_trans:
+        scaling_recipe_for_trans = (
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+    else:
+        scaling_recipe_for_trans = scaling_recipe
+
+    if not with_trans:
+        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+    else:
+        assert axis is None, "The axis must be None when with_trans is True."
+
+    if with_trans:
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            scaling_recipe.use_2d_block,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe.shuffle_scale,
+            scaling_recipe.shuffle_out,
+            scaling_recipe_for_trans.shuffle_scale,
+            scaling_recipe_for_trans.shuffle_out,
+        )
+    else:
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            axis,
             scaling_recipe.use_2d_block,
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
@@ -500,7 +573,7 @@ def quantize_mxfp4_impl(
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
             out_dtype,
-            MXFP4_PADDING_ALIGN_SIZE,
+            MXFP4_K_DIM_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,
@@ -517,7 +590,7 @@ def quantize_mxfp4_impl(
             x,
             out_dtype,
             axis,
-            MXFP4_PADDING_ALIGN_SIZE,
+            MXFP4_K_DIM_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,

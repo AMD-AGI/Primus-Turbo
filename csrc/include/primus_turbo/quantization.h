@@ -39,10 +39,12 @@ constexpr int MXFP4_BLOCK_SIZE = 32;
 constexpr int MXFP8_BLOCK_SIZE = 32;
 
 // Padding alignment expected for the public ``padding_align_size`` op argument.
-// Must stay in sync with ``MXFP4_PADDING_ALIGN_SIZE`` / ``MXFP8_PADDING_ALIGN_SIZE``
+// Must stay in sync with ``MXFP4_K_DIM_PADDING_ALIGN_SIZE`` / ``MXFP8_K_DIM_PADDING_ALIGN_SIZE``
 // declared in ``primus_turbo/pytorch/core/low_precision.py``.
-constexpr int MXFP4_PADDING_ALIGN_SIZE = 128;
-constexpr int MXFP8_PADDING_ALIGN_SIZE = 128;
+constexpr int MXFP4_K_DIM_PADDING_ALIGN_SIZE = 128;
+constexpr int MXFP8_K_DIM_PADDING_ALIGN_SIZE = 128;
+
+constexpr int MXFP8_GROUP_M_PADDING_ALIGN_SIZE = 32;
 
 struct ScalingRecipe {
     bool use_2d_block = false;
@@ -61,9 +63,10 @@ constexpr int FP4_MANTISSA_BITS   = 1;
 constexpr int FP4_EXPONENT_BITS   = 2;
 constexpr int FP4_TARGET_MAX_POW2 = 2;
 
-constexpr int FP8E5M2_MANTISSA_BITS   = 2;
-constexpr int FP8E5M2_EXPONENT_BITS   = 5;
-constexpr int FP8E5M2_TARGET_MAX_POW2 = 15;
+constexpr int   FP8E5M2_MANTISSA_BITS   = 2;
+constexpr int   FP8E5M2_EXPONENT_BITS   = 5;
+constexpr float FP8E5M2_MAX             = 57344.0;
+constexpr int   FP8E5M2_TARGET_MAX_POW2 = 15;
 
 constexpr int FP8E4M3_MANTISSA_BITS = 3;
 constexpr int FP8E4M3_EXPONENT_BITS = 4;
@@ -96,7 +99,7 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
 
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
-                              OType *colwise_output, uint8_t *colwise_scale, int M, int N,
+                              OType *colwise_output, uint8_t *colwise_scale, int G, int M, int N,
                               int M_pad, int N_pad, int rowwise_scale_stride,
                               int colwise_scale_stride, int rowwise_scale_N,
                               int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
@@ -106,9 +109,36 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
 
 template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
-                         detail::QuantizeMode mode, int M, int N, int M_pad, int N_pad,
+                         detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          detail::ScalingRecipe recipe, hipStream_t stream);
+
+template <typename IType, typename OType>
+void quantize_mxfp8_grouped_impl(const IType *input, OType *output, uint8_t *scale,
+                                 const int64_t       *group_offs,
+                                 const int64_t       *group_offs_padded_colwise,
+                                 const int64_t       *group_offs_padded_rowwise,
+                                 detail::QuantizeMode mode, int G, int total_M_padded, int N,
+                                 int N_pad, int scale_stride, int scale_N, int scale_M_pad,
+                                 int scale_N_pad, detail::ScalingRecipe recipe, hipStream_t stream);
+
+template <typename IType, typename OType>
+void grouped_quantize_mxfp8_dual_impl(
+    const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
+    uint8_t *colwise_scale, const int64_t *group_offs, const int64_t *group_offs_padded_colwise,
+    const int64_t *group_offs_padded_rowwise, int G, int total_M_padded, int N, int N_pad,
+    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
+    int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
+    int colwise_scale_M_pad, int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
+    detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+
+// *************** Grouped Padded Layout ***************
+//
+// Computes per-group padded lengths/offsets (rounded up to ``align``) on
+// the GPU; results live in device memory so no D2H sync is required.
+void compute_padded_layout_gpu(const int64_t *group_lens, int64_t *group_lens_padded,
+                               int64_t *group_offs_padded, int G, int64_t align,
+                               hipStream_t stream);
 
 // *************** DeQuantize ***************
 template <typename FType, typename QType, typename ComputeType = float>

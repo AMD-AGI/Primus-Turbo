@@ -12,9 +12,9 @@ import torch
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
-    MXFP4_PADDING_ALIGN_SIZE,
+    MXFP4_K_DIM_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
-    MXFP8_PADDING_ALIGN_SIZE,
+    MXFP8_K_DIM_PADDING_ALIGN_SIZE,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -60,10 +60,10 @@ def _get_padding_align_size(tensor: QuantizedTensor):
         return 0
     else:
         if tensor._dest_dtype == float4_e2m1fn_x2:
-            return MXFP4_PADDING_ALIGN_SIZE
+            return MXFP4_K_DIM_PADDING_ALIGN_SIZE
         else:
             assert tensor._dest_dtype == float8_e4m3 or tensor._dest_dtype == float8_e5m2
-            return MXFP8_PADDING_ALIGN_SIZE
+            return MXFP8_K_DIM_PADDING_ALIGN_SIZE
 
 
 def _get_packing_factor(tensor: QuantizedTensor):
