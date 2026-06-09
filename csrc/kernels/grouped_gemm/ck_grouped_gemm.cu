@@ -86,38 +86,6 @@ __global__ void compute_grouped_gemm_fp8_args(
     args_ptr[group_id].group_karg.k_batch   = k_batch;
 }
 
-template <typename IndexType>
-__global__ void compute_group_offs_device(const IndexType       *group_lens_ptr,
-                                          IndexType             *group_offs_ptr,
-                                          const ck_tile::index_t group_num) {
-    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx == 0) {
-        group_offs_ptr[0] = 0;
-    }
-
-    if (idx < group_num) {
-        // Compute cumulative sum for group offsets
-        IndexType cumsum = 0;
-        for (ck_tile::index_t i = 0; i < idx; i++) {
-            cumsum += group_lens_ptr[i];
-        }
-        group_offs_ptr[idx + 1] = cumsum + group_lens_ptr[idx];
-    }
-}
-
-template <typename IndexType>
-void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
-                        const int64_t group_num, hipStream_t stream) {
-    const ck_tile::index_t total_elements    = group_num;
-    const int              threads_per_block = 256;
-    const int              blocks =
-        static_cast<int>((total_elements + threads_per_block - 1) / threads_per_block);
-
-    compute_group_offs_device<IndexType>
-        <<<blocks, threads_per_block, 0, stream>>>(group_lens_ptr, group_offs_ptr, group_num);
-}
-
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
 void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params) {
     const ck_tile::index_t k_batch = 1;
@@ -665,7 +633,4 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::fp8_t, ck_
                                              float, ck_tile::QuantType::ABQuantGrouped>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
-
-template void compute_group_offs<int64_t>(const int64_t *group_lens_ptr, int64_t *group_offs_ptr,
-                                          const int64_t group_num, hipStream_t stream);
 } // namespace primus_turbo
