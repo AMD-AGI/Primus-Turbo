@@ -43,8 +43,6 @@ def quantize_fp8_tensorwise_impl(
     return x_fp8, scale_inv
 
 
-
-
 def quantize_fp8_rowwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -369,7 +367,10 @@ def quantize_mxfp8_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     # NOTE: quantize fp8 kernel use the ISA which only available on cdna4.
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
@@ -414,7 +415,11 @@ def quantize_mxfp8_impl(
 
 
 def dequantize_mxfp8_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    scale_inv: torch.Tensor,
 ) -> torch.Tensor:
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The x must be 2D tensor."
@@ -478,7 +483,10 @@ def quantize_mxfp4_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     # NOTE: quantize fp4 kernel use the ISA which only available on cdna4.
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
