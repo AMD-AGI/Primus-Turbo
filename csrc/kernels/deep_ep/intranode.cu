@@ -175,7 +175,8 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, bool kUseCheapFence, typename topk_idx_t>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseCheapFence,
+          typename topk_idx_t>
 __global__ void __launch_bounds__(kNumThreads, 1)
     dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
@@ -245,7 +246,15 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales,
                       channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
-    BARRIER_SYNC_INIT();
+    // TDM (gfx1250) staging
+#ifndef DISABLE_GFX1250_FEATURES
+    // Per-warp LDS staging buffer for the async global<->LDS copies below.
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto                                      tma_buffer =
+        reinterpret_cast<int4 *>(smem_buffer + (thread_id / kWarpSize) * kNumTMABytesPerWarp);
+#endif
+
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -361,7 +370,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       cached_channel_tail_idx);
@@ -429,7 +438,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -442,8 +451,21 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
                 auto shifted_recv_x_int4 =
                     recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
+#ifndef DISABLE_GFX1250_FEATURES
+                // gfx1250 TDM: stage channel buffer -> LDS -> recv_x via the async
+                // copy engine. Each lane owns one int4 LDS slot; the warp strides
+                // over the hidden dim. `asynccnt` orders load-before-store.
+                int4 *tdm_slot = tma_buffer + lane_id;
+                for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
+                    tdm_load_async_to_lds(shifted_buffer_x_int4 + i, tdm_slot);
+                    tdm_async_wait<0>();
+                    tdm_store_async_from_lds(shifted_recv_x_int4 + i, tdm_slot);
+                    tdm_async_wait<0>();
+                }
+#else
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4,
                                    shifted_buffer_x_int4, ld_nc_global, st_na_global);
+#endif
             }
 
 // Copy `src_idx`
@@ -486,7 +508,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -517,7 +539,11 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
               int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
               int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 8192;
+#ifndef DISABLE_GFX1250_FEATURES
+    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / kWarpSize);
+#endif
 
     // Make sure never OOB
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
@@ -527,8 +553,11 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
-        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true, topk_idx_t>      \
-                                             : dispatch<ranks, kNumThreads, false, topk_idx_t>;    \
+        auto dispatch_func =                                                                       \
+            use_cheap_fence                                                                        \
+                ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, topk_idx_t>              \
+                : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, topk_idx_t>;            \
+        SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                                  \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
             recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
@@ -615,7 +644,8 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template <typename dtype_t, int kNumRanks, int kNumThreads, bool kUseCheapFence>
+template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+          bool kUseCheapFence>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x, const float *topk_weights,
             const dtype_t *bias_0, const dtype_t *bias_1, const int *src_idx,
@@ -637,7 +667,15 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto          bias_1_int4   = reinterpret_cast<const int4 *>(bias_1);
     auto          recv_int4     = reinterpret_cast<int4 *>(recv_x);
 
-    BARRIER_SYNC_INIT();
+    // TDM (gfx1250) staging
+#ifndef DISABLE_GFX1250_FEATURES
+    // Per-warp LDS staging buffer (multi-stage) for async LDS->global stores.
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto                                      tma_buffer =
+        reinterpret_cast<int4 *>(smem_buffer + (thread_id / kWarpSize) * kNumTMABytesPerWarp);
+#endif
+
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -740,7 +778,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
+            sync_barrier(send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       current_channel_tail_idx);
@@ -867,6 +905,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     }
                 }
 
+                // Drain async stores from the previous token before reusing stages
+#ifndef DISABLE_GFX1250_FEATURES
+                tdm_async_wait<0>();
+                // Pipeline depth is bounded by the per-warp LDS staging buffer:
+                // each stage holds one int4 per lane.
+                constexpr int kNumStages =
+                    kNumTMABytesPerWarp / (kWarpSize * static_cast<int>(sizeof(int4)));
+                PRIMUS_TURBO_STATIC_CHECK(kNumStages >= 1, "TMA buffer too small for one stage");
+#endif
+
 // Reduce data
 #pragma unroll 4
                 for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
@@ -903,7 +951,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     for (int j = 0; j < kDtypePerInt4; ++j)
                         out_dtypes[j] = static_cast<dtype_t>(values[j]);
 
+#ifndef DISABLE_GFX1250_FEATURES
+                    // gfx1250 TDM: stage the reduced value in a rotating LDS slot,
+                    // then async-store LDS->global. `s_wait_asynccnt(kNumStages-1)`
+                    // keeps a software pipeline of up to kNumStages stores in flight
+                    // so the DMA overlaps the next iteration's reduction.
+                    int   tdm_stage = (i / kWarpSize) % kNumStages;
+                    int4 *tdm_slot  = tma_buffer + tdm_stage * kWarpSize + lane_id;
+                    *tdm_slot       = out_int4;
+                    tdm_async_wait<kNumStages - 1>();
+                    tdm_store_async_from_lds(recv_int4 + token_idx * hidden_int4 + i, tdm_slot);
+#else
                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
+#endif
                 }
 
                 // Reduce `topk_weights`
@@ -936,14 +996,20 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
              int rank, int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
              int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 4096;
+#ifndef DISABLE_GFX1250_FEATURES
+    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / kWarpSize);
+#endif
 
     static const bool use_cheap_fence = is_enable_cheap_fence();
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
-        auto combine_func = use_cheap_fence ? combine<dtype, ranks, kNumThreads, true>             \
-                                            : combine<dtype, ranks, kNumThreads, false>;           \
+        auto combine_func = use_cheap_fence                                                        \
+                                ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true>    \
+                                : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>;  \
+        SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                   \
         LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, reinterpret_cast<dtype *>(recv_x),       \
                                       recv_topk_weights, reinterpret_cast<const dtype *>(x),       \
                                       topk_weights, reinterpret_cast<const dtype *>(bias_0),       \

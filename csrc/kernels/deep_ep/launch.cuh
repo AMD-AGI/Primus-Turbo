@@ -60,6 +60,20 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel, Args &&...a
 
 #endif // #ifndef LAUNCH_KERNEL
 
+#ifndef SET_SHARED_MEMORY_FOR_TMA
+#ifndef DISABLE_GFX1250_FEATURES
+// gfx1250 TDM path: raise the kernel's dynamic-LDS cap and request `smem_size`
+// bytes of dynamic shared memory for the launch.
+#define SET_SHARED_MEMORY_FOR_TMA(kernel)                                                          \
+    PRIMUS_TURBO_CHECK_HIP(hipFuncSetAttribute(reinterpret_cast<const void *>(kernel),             \
+                                               hipFuncAttributeMaxDynamicSharedMemorySize,         \
+                                               smem_size));                                        \
+    cfg.shared_mem_bytes = smem_size;
+#else
+#define SET_SHARED_MEMORY_FOR_TMA(kernel) void()
+#endif
+#endif
+
 #define SWITCH_RANKS(case_macro)                                                                   \
     switch (num_ranks) {                                                                           \
     case 2:                                                                                        \

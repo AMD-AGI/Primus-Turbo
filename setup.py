@@ -306,6 +306,13 @@ def get_common_flags():
         cxx_flags.append("-DCK_TILE_USE_OCP_FP8")
         nvcc_flags.append("-DCK_TILE_USE_OCP_FP8")
 
+    # The DeepEP intranode kernels have a gfx1250 (CDNA-next) Tensor Data Movement
+    # (TDM) async-copy path. On any non-gfx1250 target, disable it so the portable
+    # (UNROLLED_WARP_COPY / direct-store) fallback is compiled instead.
+    if not any("gfx1250" in f for f in nvcc_flags):
+        cxx_flags.append("-DDISABLE_GFX1250_FEATURES")
+        nvcc_flags.append("-DDISABLE_GFX1250_FEATURES")
+
     return {
         "extra_link_args": extra_link_args,
         "extra_compile_args": {

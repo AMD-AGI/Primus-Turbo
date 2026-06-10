@@ -19,8 +19,12 @@
 #define PRIMUS_TURBO_WAIT_ALL_STR "s_waitcnt lgkmcnt(0) vmcnt(0)"
 #endif
 
-#define NUM_MAX_BARRIERS 16
+#define NUM_MAX_BARRIERS 32
 
+#ifdef DISABLE_GFX1250_FEATURES
+
+// gfx942 / gfx950: no hardware sub-group barrier — emulate one with an LDS
+// atomic counter + s_sleep.
 #define BARRIER_SYNC_INIT()                                                                        \
     __shared__ int ___bar_sync_wg_state[NUM_MAX_BARRIERS];                                         \
     if (threadIdx.x < NUM_MAX_BARRIERS)                                                            \
@@ -42,6 +46,23 @@
         }                                                                                          \
         __syncwarp();                                                                              \
     }
+
+#define sync_barrier_init() BARRIER_SYNC_INIT()
+#define sync_barrier(bar_id, num_threads) BARRIER_SYNC(__threadfence_block(), bar_id, num_threads)
+
+#else
+
+#define sync_barrier_init()                                                                        \
+    __shared__ __amdgpu_named_workgroup_barrier_t ___named_bar_objs[NUM_MAX_BARRIERS]
+
+#define sync_barrier(bar_id, num_threads)                                                          \
+    {                                                                                              \
+        __builtin_amdgcn_s_barrier_signal_var(&___named_bar_objs[bar_id],                          \
+                                              (num_threads) / kWarpSize);                          \
+        __builtin_amdgcn_s_barrier_wait(-1);                                                       \
+    }
+
+#endif
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                  \
     {                                                                                              \
@@ -410,4 +431,25 @@ __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t *ptr) {
     }
     return ret;
 }
+
+#ifndef DISABLE_GFX1250_FEATURES
+typedef int __attribute__((ext_vector_type(4))) tdm_int4;
+
+__device__ __forceinline__ void tdm_load_async_to_lds(const int4 *gmem, int4 *lds) {
+    __builtin_amdgcn_global_load_async_to_lds_b128(
+        (tdm_int4 __attribute__((address_space(1))) *) gmem,
+        (tdm_int4 __attribute__((address_space(3))) *) lds, 0, 0);
+}
+
+__device__ __forceinline__ void tdm_store_async_from_lds(int4 *gmem, const int4 *lds) {
+    __builtin_amdgcn_global_store_async_from_lds_b128(
+        (tdm_int4 __attribute__((address_space(1))) *) gmem,
+        (tdm_int4 __attribute__((address_space(3))) *) lds, 0, 0);
+}
+
+// Wait until at most `kNumOutstanding` async copies remain in flight.
+template <int kNumOutstanding> __device__ __forceinline__ void tdm_async_wait() {
+    __builtin_amdgcn_s_wait_asynccnt(kNumOutstanding);
+}
+#endif
 } // namespace primus_turbo::deep_ep
