@@ -48,10 +48,11 @@ _HYBRID_SUPPORTED_DTYPES = (
 
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
+    # BLOCKWISE intentionally excluded: the Triton path (with pshuffled scales +
+    # HIP fused quant) is the production blockwise backend; CK adds no value here.
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
-        ScalingGranularity.BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -109,10 +110,10 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
 
 
 class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
+    # BLOCKWISE intentionally excluded: variable-K BLOCKWISE wgrad runs on Triton.
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
-        ScalingGranularity.BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)

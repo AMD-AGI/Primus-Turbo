@@ -195,9 +195,12 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
                 else if (granularity == "ROWWISE")
                     primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
                                                       ck_tile::QuantType::RowColQuant>(params);
-                else // BLOCKWISE
-                primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
-                                                  ck_tile::QuantType::ABQuantGrouped>(params);)))
+                else // BLOCKWISE: CK support dropped; Triton is the production blockwise path.
+                     // primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
+                     //                                   ck_tile::QuantType::ABQuantGrouped>(params);
+                PRIMUS_TURBO_CHECK(
+                    false,
+                    "CK grouped GEMM FP8 does not support BLOCKWISE; use the Triton backend.");)))
 
     return c;
 }
@@ -315,9 +318,12 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
                     primus_turbo::ck_grouped_gemm_fp8_variable_k<AType, BType, CType, float,
                                                                  ck_tile::QuantType::RowColQuant>(
                         params);
-                else // BLOCKWISE
-                primus_turbo::ck_grouped_gemm_fp8_variable_k<
-                    AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(params);)))
+                else // BLOCKWISE: CK support dropped; Triton is the production blockwise path.
+                     // primus_turbo::ck_grouped_gemm_fp8_variable_k<
+                     //     AType, BType, CType, float, ck_tile::QuantType::ABQuantGrouped>(params);
+                PRIMUS_TURBO_CHECK(false,
+                                   "CK grouped GEMM FP8 variable-K does not support BLOCKWISE; "
+                                   "use the Triton backend.");)))
 
     return c;
 }
