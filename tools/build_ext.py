@@ -55,10 +55,10 @@ def get_cxx_compiler():
 
 
 def _get_compiler_launcher():
-    launcher = os.environ.get("PRIMUS_TURBO_COMPILER_LAUNCHER")
-    if launcher:
-        print(f"[Primus-Turbo] Using compiler cache: {launcher}")
-        return launcher
+    for tool in ("sccache", "ccache"):
+        if shutil.which(tool):
+            print(f"[Primus-Turbo] Found {tool}, enabling as compiler launcher")
+            return tool
     return None
 
 
