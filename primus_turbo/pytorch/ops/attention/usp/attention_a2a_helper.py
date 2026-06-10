@@ -277,3 +277,96 @@ class AttentionCPA2AHelper:
 def get_attention_cp_a2a_helper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n):
     attn_helper = AttentionCPA2AHelper(b, s, h_q, h_kv, d_qk, d_v, seq_dim, n)
     return attn_helper
+
+
+class AttentionVarlenCPA2AHelper:
+    """Ulysses A2A reshape helper for packed (THD) sequences.
+
+    Tensors are [t_local, h, d] (no batch dim), where ``t_local = t // n`` is the
+    per-rank token shard and ``t`` is the total packed length across the CP group.
+    Before A2A each rank holds [t//n, h, d] (its token shard, all heads); after A2A
+    each rank holds [t, h//n, d] (the full packed sequence, its head shard).
+    """
+
+    def __init__(self, t, h_q, h_kv, d_qk, d_v, n):
+        assert t % n == 0, f"total packed tokens {t} must be divisible by cp size {n}"
+        assert h_q % n == 0 and h_kv % n == 0
+        self.n = n
+        self.t = t
+        # (t, h, d) traits per tensor for q / k / v.
+        self.qkv_traits = ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v))
+        self.o_traits = (h_q, d_v)
+        self.combine_splits = (
+            t * h_q * d_qk // n // n,
+            t * h_kv * d_qk // n // n,
+            t * h_kv * d_v // n // n,
+        )
+
+    def _combine_before_a2a(self, tensors, traits_iter):
+        n, t = self.n, self.t
+        outs = []
+        for x, (h, d) in zip(tensors, traits_iter):
+            # [t//n, h, d] -> [t//n, n, h//n, d] -> [n, t//n, h//n, d] -> [n, -1]
+            outs.append(x.view(t // n, n, h // n, d).movedim(1, 0).contiguous().view(n, -1))
+        return torch.cat(outs, dim=1).contiguous()
+
+    def combine_qkv_before_a2a(self, q, k, v):
+        return self._combine_before_a2a((q, k, v), self.qkv_traits)
+
+    def splits_qkv_after_a2a(self, qkv):
+        n, t = self.n, self.t
+        q, k, v = torch.split(qkv, self.combine_splits, dim=1)
+        outs = []
+        for x, (h, d) in zip((q, k, v), self.qkv_traits):
+            # [n, t//n, h//n, d] -> [t, h//n, d]  (seq reassembled in global order)
+            outs.append(x.view(n, t // n, h // n, d).contiguous().view(t, h // n, d))
+        return outs[0], outs[1], outs[2]
+
+    def reshape_o_before_a2a(self, o):
+        n, t = self.n, self.t
+        h, d = self.o_traits
+        # [t, h//n, d] -> [n, t//n, h//n, d]
+        return o.view(n, t // n, h // n, d).contiguous()
+
+    def reshape_o_after_a2a(self, o):
+        n, t = self.n, self.t
+        h, d = self.o_traits
+        # [n, t//n, h//n, d] -> [t//n, n, h//n, d] -> [t//n, h, d]
+        return o.movedim(0, 1).contiguous().view(t // n, h, d)
+
+    def reshape_do_before_a2a(self, d_o):
+        n, t = self.n, self.t
+        h, d = self.o_traits
+        # [t//n, h, d] -> [t//n, n, h//n, d] -> [n, t//n, h//n, d]
+        return d_o.view(t // n, n, h // n, d).movedim(1, 0).contiguous()
+
+    def reshape_do_after_a2a(self, d_o):
+        n, t = self.n, self.t
+        h, d = self.o_traits
+        # [n, t//n, h//n, d] -> [t, h//n, d]
+        return d_o.view(n, t // n, h // n, d).contiguous().view(t, h // n, d)
+
+    def combine_dqkv_before_a2a(self, dq, dk, dv):
+        # dq/dk/dv arrive as [t, h//n, d] in global token order (unlike q/k/v
+        # before fwd a2a which are [t//n, h, d]). Split the token dim by rank
+        # (n outer, t//n inner) so row r holds rank r's token shard.
+        n, t = self.n, self.t
+        outs = []
+        for x, (h, d) in zip((dq, dk, dv), self.qkv_traits):
+            # [t, h//n, d] -> [n, t//n, h//n, d] -> [n, -1]
+            outs.append(x.view(n, t // n, h // n, d).contiguous().view(n, -1))
+        return torch.cat(outs, dim=1).contiguous()
+
+    def split_dqkv_after_a2a(self, dqkv):
+        n, t = self.n, self.t
+        dq, dk, dv = torch.split(dqkv, self.combine_splits, dim=1)
+        outs = []
+        for x, (h, d) in zip((dq, dk, dv), self.qkv_traits):
+            # [n, t//n, h//n, d] -> [t//n, n, h//n, d] -> [t//n, h, d]
+            outs.append(x.view(n, t // n, h // n, d).movedim(0, 1).contiguous().view(t // n, h, d))
+        return outs[0], outs[1], outs[2]
+
+
+@lru_cache
+def get_attention_varlen_cp_a2a_helper(t, h_q, h_kv, d_qk, d_v, n):
+    return AttentionVarlenCPA2AHelper(t, h_q, h_kv, d_qk, d_v, n)
