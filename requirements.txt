@@ -2,6 +2,7 @@ pre-commit
 clang-format==18.1.6
 hipify_torch @ git+https://github.com/ROCm/hipify_torch.git
 build
+ninja>=1.10
 scikit-build-core
 # triton==3.7.0  # Temporarily disabled (gfx1250/MI455): the upstream PyPI triton 3.7.0
 # is ABI/LLVM-incompatible with the ROCm-matched triton shipped alongside the image's torch

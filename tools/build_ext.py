@@ -561,6 +561,12 @@ class TurboBuildExt(BaseBuildExtension):
             self.build_temp = str(self.PROJECT_ROOT / "build" / "temp")
             self.build_lib = str(self.PROJECT_ROOT / "build" / "lib")
 
+    def build_extensions(self) -> None:
+        # ninja is required to compile the extensions; fail loudly instead of
+        # silently falling back to the (miscompiling) distutils backend.
+        verify_ninja_availability()
+        super().build_extensions()
+
     def get_ext_filename(self, ext_name: str) -> str:
         filename = super().get_ext_filename(ext_name)
         if ext_name == self.KERNEL_EXT_NAME:
