@@ -6,53 +6,67 @@
 
 """Helpers for the optional ``aiter`` dependency.
 
-aiter is imported lazily (only when an AITER-backed op runs), so it stays out of
-the package metadata while users still get a clear error when it is needed. The
-pinned commit is usually newer than PyPI's, so it is installed from git.
+aiter is imported lazily (only when an AITER-backed op runs). Primus-Turbo
+requires the amd-aiter release below; it is not on PyPI, so install from git tag.
 """
 
 import importlib.metadata
-import re
 from typing import NoReturn
 
 from primus_turbo.common.logger import logger
 
-# Single source of truth for the aiter commit; CI installs this exact commit.
-EXPECTED_AITER_COMMIT = "b5e03ed191fca11ee423226537ef8d9435e432a6"
-_AITER_DIST_NAME = "amd-aiter"  # pip dist name; importable module is ``aiter``
+# Required aiter release. Keep in sync with AITER_VERSION in the ci / benchmark
+# / release workflows.
+AITER_VERSION = "0.1.14.post1"
+AITER_GIT_TAG = "v0.1.14.post1"
+_AITER_DIST_NAME = "amd-aiter"
+_AITER_GIT_URL = "https://github.com/ROCm/aiter.git"
+
+_AITER_PIP_INSTALL = f'pip install "amd-aiter @ git+{_AITER_GIT_URL}@{AITER_GIT_TAG}"'
 
 AITER_INSTALL_HINT = (
-    "Primus-Turbo requires 'aiter' for this operator, but it is not installed. "
-    "Install the pinned commit (not available on PyPI):\n"
-    f'  pip install "amd-aiter @ git+https://github.com/ROCm/aiter.git@{EXPECTED_AITER_COMMIT}"'
+    f"Primus-Turbo requires amd-aiter=={AITER_VERSION} for this operator. Install it with:\n"
+    f"  {_AITER_PIP_INSTALL}"
 )
 
 _version_checked = False
 
 
-def _installed_aiter_commit():
-    # aiter's setuptools_scm version embeds the commit, e.g. "0.1.1.dev1611+gf299f579a".
+def _installed_aiter_version():
     try:
-        version = importlib.metadata.version(_AITER_DIST_NAME)
+        return importlib.metadata.version(_AITER_DIST_NAME)
     except importlib.metadata.PackageNotFoundError:
         return None
-    match = re.search(r"\+g([0-9a-fA-F]+)", version)
-    return match.group(1) if match else None
+
+
+def _versions_match(installed: str, expected: str) -> bool:
+    # Ignore any local/dev suffix (e.g. an editable checkout's "+g1234567").
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            return Version(installed).public == Version(expected).public
+        except InvalidVersion:
+            return False
+    except ImportError:
+        return installed.split("+")[0] == expected
 
 
 def check_aiter_version_once():
-    """Warn once if the installed aiter commit differs from the pin."""
+    """Warn once if the installed aiter version differs from the pin."""
     global _version_checked
     if _version_checked:
         return
     _version_checked = True
 
-    installed = _installed_aiter_commit()
-    if installed and not EXPECTED_AITER_COMMIT.lower().startswith(installed.lower()):
+    installed = _installed_aiter_version()
+    if installed and not _versions_match(installed, AITER_VERSION):
         logger.warning(
-            "aiter commit mismatch: installed=%s, expected=%s; behavior/perf may differ.",
+            "aiter version mismatch: installed=%s, expected=%s; behavior/perf may differ. "
+            "To match, run:\n  %s",
             installed,
-            EXPECTED_AITER_COMMIT,
+            AITER_VERSION,
+            _AITER_PIP_INSTALL,
             once=True,
         )
 
