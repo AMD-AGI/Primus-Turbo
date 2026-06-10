@@ -519,7 +519,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
         BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
-        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
+        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
     }
     _cache = TuneCache(1024)
