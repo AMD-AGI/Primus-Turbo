@@ -151,4 +151,23 @@ void dequantize_rowwise_col_major_impl(const QType *x, const float *scale_inv, F
                                        const int64_t batch, const int64_t m, const int64_t n,
                                        hipStream_t stream);
 
+// *************** MX Block-scaled DeQuantize ***************
+template <typename OType, typename QType>
+void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
+                           const int64_t stride_x_col, const int64_t stride_y_row,
+                           const int64_t stride_y_col, const int n_rows, const int n_cols,
+                           const uint8_t *scale_inv, const int64_t stride_scale_row,
+                           const int64_t stride_scale_col, const int scale_n_rows,
+                           const int scale_n_cols, const int block_size, const bool use_rowwise,
+                           hipStream_t stream);
+
+template <typename OType>
+void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_row,
+                           const int64_t stride_x_col, const int64_t stride_y_row,
+                           const int64_t stride_y_col, const int n_rows, const int n_cols,
+                           const uint8_t *scale_inv, const int64_t stride_scale_row,
+                           const int64_t stride_scale_col, const int scale_n_rows,
+                           const int scale_n_cols, const int block_size, const bool use_rowwise,
+                           hipStream_t stream);
+
 } // namespace primus_turbo

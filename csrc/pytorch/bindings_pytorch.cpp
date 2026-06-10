@@ -53,6 +53,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "int padding_align_size, "
           "bool use_2d_block, bool use_sr, bool use_rht, "
           "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+    m.def("dequantize_mxfp4(Tensor input, Tensor scale_inv, int axis, int block_size, "
+          "ScalarType dest_dtype) -> Tensor");
 
     // ********* MXFP8 Quantization *********
     m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
@@ -63,6 +65,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
           "int padding_align_size, "
           "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+    m.def("dequantize_mxfp8(Tensor input, Tensor scale_inv, int axis, int block_size, "
+          "ScalarType dest_dtype) -> Tensor");
 
     // ********* Shuffle *********
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
@@ -120,10 +124,12 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
+    m.impl("dequantize_mxfp4", dequantize_mxfp4);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
     m.impl("quantize_mxfp8", quantize_mxfp8);
+    m.impl("dequantize_mxfp8", dequantize_mxfp8);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl);
@@ -163,10 +169,12 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
+    m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
     m.impl("quantize_mxfp8", quantize_mxfp8_meta);
+    m.impl("dequantize_mxfp8", dequantize_mxfp8_meta);
 
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);

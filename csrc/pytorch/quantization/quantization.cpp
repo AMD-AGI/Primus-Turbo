@@ -274,6 +274,107 @@ at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale
     return output;
 }
 
+// De-Quantize MXFP8 (block-scaled, E8M0 scales)
+at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()), "Input must be FP8");
+    PRIMUS_TURBO_CHECK(scale_inv.dim() == 2, "scale_inv must be 2D");
+    PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
+    PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat8_e8m0fnu ||
+                           scale_inv.dtype() == at::kByte,
+                       "scale_inv must be Float8_e8m0fnu / uint8 tensor");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                           dest_dtype == at::kFloat,
+                       "Output dtype must be bf16/fp16/fp32");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+
+    const bool    use_rowwise = (axis == 1);
+    const int64_t num_rows    = input.size(0);
+    const int64_t row_length  = input.size(1);
+    PRIMUS_TURBO_CHECK(row_length % block_size == 0,
+                       "The last dimension must be divisible by block_size");
+
+    const int64_t scale_m = scale_inv.size(0);
+    const int64_t scale_n = scale_inv.size(1);
+
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor output = use_rowwise
+                            ? at::empty({num_rows, row_length}, input.options().dtype(dest_dtype))
+                            : at::empty({row_length, num_rows}, input.options().dtype(dest_dtype));
+
+    const uint8_t *scale_ptr = reinterpret_cast<const uint8_t *>(scale_inv.data_ptr());
+
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), OType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            dequantize_mxfp8_impl<OType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<OType *>(output.data_ptr()), input.stride(0), input.stride(1),
+                output.stride(0), output.stride(1), static_cast<int>(num_rows),
+                static_cast<int>(row_length), scale_ptr, scale_inv.stride(0), scale_inv.stride(1),
+                static_cast<int>(scale_m), static_cast<int>(scale_n), static_cast<int>(block_size),
+                use_rowwise, stream);
+        });
+    });
+
+    return output;
+}
+
+// De-Quantize MXFP4 (block-scaled, E8M0 scales). ``input`` is packed FP4
+// (two E2M1 values per byte) viewed as Float4_e2m1fn_x2.
+at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kFloat4_e2m1fn_x2,
+                       "Input must be Float4_e2m1fn_x2");
+    PRIMUS_TURBO_CHECK(scale_inv.dim() == 2, "scale_inv must be 2D");
+    PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
+    PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat8_e8m0fnu ||
+                           scale_inv.dtype() == at::kByte,
+                       "scale_inv must be Float8_e8m0fnu / uint8 tensor");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                           dest_dtype == at::kFloat,
+                       "Output dtype must be bf16/fp16/fp32");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+
+    const bool    use_rowwise = (axis == 1);
+    const int64_t num_rows    = input.size(0);
+    // ``input`` packs 2 FP4 values per byte in the last dim.
+    const int64_t row_length = input.size(1) * 2;
+    PRIMUS_TURBO_CHECK(row_length % block_size == 0,
+                       "The last dimension must be divisible by block_size");
+
+    const int64_t scale_m = scale_inv.size(0);
+    const int64_t scale_n = scale_inv.size(1);
+
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor output = use_rowwise
+                            ? at::empty({num_rows, row_length}, input.options().dtype(dest_dtype))
+                            : at::empty({row_length, num_rows}, input.options().dtype(dest_dtype));
+
+    const uint8_t *x_ptr     = reinterpret_cast<const uint8_t *>(input.data_ptr());
+    const uint8_t *scale_ptr = reinterpret_cast<const uint8_t *>(scale_inv.data_ptr());
+
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), OType, {
+        dequantize_mxfp4_impl<OType>(
+            x_ptr, reinterpret_cast<OType *>(output.data_ptr()), input.stride(0), input.stride(1),
+            output.stride(0), output.stride(1), static_cast<int>(num_rows),
+            static_cast<int>(row_length), scale_ptr, scale_inv.stride(0), scale_inv.stride(1),
+            static_cast<int>(scale_m), static_cast<int>(scale_n), static_cast<int>(block_size),
+            use_rowwise, stream);
+    });
+
+    return output;
+}
+
 // Quantize MXFP4 with dual mode
 std::vector<at::Tensor> quantize_mxfp4_dual(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
