@@ -7,17 +7,17 @@
 """Primus-Turbo dense FP8 GEMM kernel (FlyDSL): NT, NN and TN layouts.
 256x256 tile, BLOCK_K=128, 8-wave (wave_m=2 x wave_n=4), mfma_f32_16x16x128_f8f6f4,
 per-tensor scale, bf16/fp16 out, arbitrary K via native K-tail (TT unsupported).
-Primitives are imported from flydsl.utils.fp8_gemm_helper as module globals."""
+Primitives are imported from flydsl.utils.gemm_helper as module globals."""
 
 import functools
 
 import torch
 
 # isort: off
-# Primitives are vendored in flydsl/utils/fp8_gemm_helper.py (no 3rdparty/FlyDSL
+# Primitives are vendored in flydsl/utils/gemm_helper.py (no 3rdparty/FlyDSL
 # submodule; flydsl, the compiler, is the only FlyDSL dep) and imported as module
 # globals (@flyc.kernel needs its dependencies as globals).
-from primus_turbo.flydsl.utils.fp8_gemm_helper import (
+from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,

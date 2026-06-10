@@ -3,7 +3,6 @@ clang-format==18.1.6
 build
 scikit-build-core
 triton==3.7.0
-flydsl==0.2.0
 expecttest
 pytest
 pytest-xdist
