@@ -533,8 +533,7 @@ def quantize_mxfp4_impl(
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
-    if not x.is_contiguous():
-        x = x.contiguous()
+    assert x.is_contiguous(), "The x tensor must be contiguous."
 
     if with_trans:
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
