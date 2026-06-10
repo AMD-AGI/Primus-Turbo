@@ -372,12 +372,12 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # b is (G, N, K) NT.  group_offs = padded read offsets; c_group_offs
-            # = real write offsets; total_m_out = real output rows (unpad).
+            # b is (G, N, K) NT.  group_offs = padded read offsets; group_offs_out
+            # = real write offsets (output over-allocated to padded rows, sliced
+            # by the caller).
             N = b.shape[-2]
             K = b.shape[-1]
-            c_group_offs = kwargs.get("c_group_offs", None)
-            total_m_out = kwargs.get("total_m_out", 0) or None
+            group_offs_out = kwargs.get("group_offs_out", None)
             return grouped_gemm_mxfp8_forward(
                 a,
                 a_scales,
@@ -386,8 +386,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
                 group_offs,
                 N,
                 K,
-                c_group_offs=c_group_offs,
-                total_m_out=total_m_out,
+                group_offs_out=group_offs_out,
                 out_dtype=out_dtype,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
@@ -620,8 +619,7 @@ def grouped_gemm_fp8_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
-    c_group_offs: torch.Tensor | None = None,
-    total_m_out: int = 0,
+    group_offs_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
@@ -640,8 +638,7 @@ def grouped_gemm_fp8_impl(
         granularity=granularity_enum,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
-        c_group_offs=c_group_offs,
-        total_m_out=total_m_out,
+        group_offs_out=group_offs_out,
     )
 
     return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -704,8 +701,7 @@ def grouped_gemm_fp8_impl_meta(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
-    c_group_offs: torch.Tensor | None = None,
-    total_m_out: int = 0,
+    group_offs_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -717,9 +713,9 @@ def grouped_gemm_fp8_impl_meta(
     ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
     assert trans_a == False, "Only trans_a=False is supported."
 
+    # MX over-allocates to the padded input rows; group_offs_out maps each group
+    # into the tight layout and the caller slices [:total_m].
     m = a.shape[1] if trans_a else a.shape[0]
-    if total_m_out > 0:
-        m = total_m_out  # MX: padded input → real (unpadded) output rows
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=out_dtype)
 

@@ -2153,33 +2153,34 @@ def _grouped_mxfp8_persistent_gemm_kernel(
 
 
 def grouped_gemm_mxfp8_forward(
-    a, a_scale, b, b_scale, group_offs, N, K, c_group_offs=None, total_m_out=None, out_dtype=torch.bfloat16
+    a, a_scale, b, b_scale, group_offs, N, K, group_offs_out=None, out_dtype=torch.bfloat16
 ):
-    """A(M_in,K) @ B(G,N,K)^T → C(total_m_out,N). scales are e8m0 viewed as uint8.
+    """A(M_in,K) @ B(G,N,K)^T → C. scales are e8m0 viewed as uint8.
 
     group_offs: padded per-group offsets to read A/A_scale (M_in layout).
-    c_group_offs: real per-group offsets to write C (defaults to group_offs = no unpad).
-    total_m_out: rows of C (defaults to a.shape[0]).
+    group_offs_out: real per-group offsets to write C (defaults to group_offs).
+    C is over-allocated to a.shape[0] (padded) rows; group_offs_out packs each
+    group tight and the caller slices C[:total_m].
     """
-    if c_group_offs is None:
-        c_group_offs = group_offs
-    if total_m_out is None:
-        total_m_out = a.shape[0]
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if group_offs_out is None:
+        group_offs_out = group_offs
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     G = b.shape[0]
-    c = torch.empty((total_m_out, N), dtype=out_dtype, device=a.device)
-    # scales arrive already transposed from quant: a_scale (K/VEC, M),
-    # b_scale (G, K/VEC, N) — coalesced per-K-iter load, no host copy.
+    c = torch.empty((a.shape[0], N), dtype=out_dtype, device=a.device)
+    # scales come from the grouped MX quant in (free, K/VEC) layout:
+    # a_scale (M, K/VEC), b_scale (G, N, K/VEC). The kernel reads them natively
+    # via strides (no host transpose/copy).
     a_s = a_scale.view(torch.uint8)
     b_s = b_scale.view(torch.uint8)
     fp8_fmt = "e5m2" if a.dtype == torch.float8_e5m2 else "e4m3"
     cu = torch.cuda.get_device_properties(a.device).multi_processor_count
     BM, BN, BK = 256, 256, 128
-    avg_m = max(total_m_out // max(G, 1), 1)
+    m_alloc = a.shape[0]  # padded upper bound on output rows
+    avg_m = max(m_alloc // max(G, 1), 1)
     tiles_n = (N + BN - 1) // BN
     GM = 8 if min((avg_m + BM - 1) // BM, tiles_n) < 16 else 4
-    total_tiles = ((total_m_out + BM - 1) // BM + G) * tiles_n  # padded upper bound
+    total_tiles = ((m_alloc + BM - 1) // BM + G) * tiles_n  # padded upper bound
     num_sms = min(total_tiles, cu)
     chunk = 64 if num_sms >= NUM_XCDS * 64 else 32
     grid = (num_sms,)
@@ -2190,7 +2191,7 @@ def grouped_gemm_mxfp8_forward(
         a_s,
         b_s,
         group_offs,
-        c_group_offs,
+        group_offs_out,
         G,
         N,
         K,
@@ -2201,11 +2202,11 @@ def grouped_gemm_mxfp8_forward(
         b.stride(2),
         c.stride(0),
         c.stride(1),
-        a_s.stride(1),  # stride_asm (M, contiguous)
-        a_s.stride(0),  # stride_ask (K/VEC)
+        a_s.stride(0),  # stride_asm (M);  a_s is (M, K/VEC)
+        a_s.stride(1),  # stride_ask (K/VEC, contiguous)
         b_s.stride(0),  # stride_bsg
-        b_s.stride(2),  # stride_bsn (N, contiguous)
-        b_s.stride(1),  # stride_bsk (K/VEC)
+        b_s.stride(1),  # stride_bsn (N);  b_s is (G, N, K/VEC)
+        b_s.stride(2),  # stride_bsk (K/VEC, contiguous)
         BLOCK_SIZE_M=BM,
         BLOCK_SIZE_N=BN,
         BLOCK_SIZE_K=BK,
@@ -2340,8 +2341,8 @@ def grouped_gemm_mxfp8_variable_k(
     lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16
 ):
     """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
-    if _is_gfx950():
-        _set_knobs_gfx950()
+    if is_gfx950():
+        set_triton_knobs_gfx950()
     c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)
@@ -2374,10 +2375,10 @@ def grouped_gemm_mxfp8_variable_k(
         c.stride(0),
         c.stride(1),
         c.stride(2),
-        ls.stride(1),  # stride_lsm (OUT_M, contiguous)
-        ls.stride(0),  # stride_lsk (M/VEC)
-        rs.stride(1),  # stride_rsm (OUT_N, contiguous)
-        rs.stride(0),  # stride_rsk (M/VEC)
+        ls.stride(0),  # stride_lsm (OUT_M);  ls is (OUT_M, M/VEC)
+        ls.stride(1),  # stride_lsk (M/VEC, contiguous)
+        rs.stride(0),  # stride_rsm (OUT_N);  rs is (OUT_N, M/VEC)
+        rs.stride(1),  # stride_rsk (M/VEC, contiguous)
         BLOCK_SIZE_M=BM,
         BLOCK_SIZE_N=BN,
         BLOCK_SIZE_K=BK,
