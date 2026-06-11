@@ -44,6 +44,37 @@ def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,)])
 @pytest.mark.parametrize("inner_shape", [128, 4096, 8192])
+def test_rmsnorm_zero_centered_ops(dtype, outer_shape, inner_shape):
+    # zero_centered=True applies a (1 + gamma) gain. Reference folds the +1 into the weight.
+    torch.manual_seed(3)
+    device = "cuda:0"
+    eps = 1e-6
+
+    shape = outer_shape + (inner_shape,)
+    x = torch.randn(shape, dtype=dtype, device=device, requires_grad=True)
+    gamma = torch.randn(inner_shape, dtype=dtype, device=device, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    gamma_ref = gamma.detach().clone().requires_grad_()
+
+    # FWD — reference uses (1 + gamma) as the gain.
+    y_ref = F.rms_norm(x_ref, [inner_shape], 1.0 + gamma_ref, eps)
+    y = rmsnorm(x, gamma, eps, zero_centered=True)
+
+    torch.testing.assert_close(y_ref, y, **get_tolerances(dtype))
+
+    # BWD — d(1 + gamma)/d(gamma) = 1, so the gamma grad is unchanged and
+    # flows through (1 + gamma_ref) to the gamma_ref leaf.
+    grad_out = torch.randn_like(y)
+    y.backward(grad_out)
+    y_ref.backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(gamma.grad, gamma_ref.grad, **get_tolerances(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,)])
+@pytest.mark.parametrize("inner_shape", [128, 4096, 8192])
 def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
     torch.manual_seed(2)
     device = "cuda:0"

@@ -54,6 +54,7 @@ def rmsnorm_fwd_kernel(
     H: tl.constexpr,
     eps,
     BLOCK_H: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -66,6 +67,9 @@ def rmsnorm_fwd_kernel(
     var = tl.sum(x * x, axis=0) / H
     rstd = tl.rsqrt(var + eps)
     g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED:
+        # zero-centered gamma: effective gain is (1 + g), computed in fp32.
+        g = g + 1.0
     y = (x * rstd * g).to(Y_ptr.dtype.element_ty)
     tl.store(y_ptrs, y, mask=mask)
     tl.store(RSTD_ptr + row, rstd)
@@ -89,6 +93,7 @@ def rmsnorm_fwd_kernel_multi_row(
     eps,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -105,6 +110,9 @@ def rmsnorm_fwd_kernel_multi_row(
     full_mask = row_mask[:, None] & h_mask[None, :]
     x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED:
+        # zero-centered gamma: effective gain is (1 + g), computed in fp32.
+        g = g + 1.0
 
     var = tl.sum(x * x, axis=1) / H
     rstd = tl.rsqrt(var + eps)
@@ -235,6 +243,7 @@ def rmsnorm_bwd_kernel_multi_row(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -253,6 +262,10 @@ def rmsnorm_bwd_kernel_multi_row(
     x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     dy = tl.load(dy_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED:
+        # zero-centered gamma: dx flows through the effective gain (1 + g).
+        # dgamma is unchanged: d(1 + g)/dg = 1, so it still accumulates dy * x_hat.
+        g = g + 1.0
     rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
 
     x_hat = x * rstd[:, None]
@@ -294,12 +307,17 @@ def rmsnorm_bwd_kernel_grid_stride(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
 
     g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED:
+        # zero-centered gamma: dx flows through the effective gain (1 + g).
+        # dgamma is unchanged: d(1 + g)/dg = 1, so it still accumulates dy * x_hat.
+        g = g + 1.0
     dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
     for row in range(pid, B, num_programs):
