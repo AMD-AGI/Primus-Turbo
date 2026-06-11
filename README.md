@@ -124,6 +124,9 @@ GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e ".[pytorch]" -v
 # Supported values: PYTORCH (default), JAX.
 # For example, to compile for JAX:
 PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
+
+# (Optional) ccache/sccache are auto-detected on PATH to speed up incremental rebuilds.
+# Just install ccache or sccache and the build will use it automatically.
 ```
 
 ### 3. Testing
