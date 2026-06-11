@@ -487,6 +487,8 @@ template void ck_grouped_gemm_fp8<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloa
                                   ck_tile::QuantType::RowColQuant>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
+#if 0  // CK grouped BLOCKWISE (ABQuantGrouped) dropped: Triton is the production blockwise
+       // path. Explicit instantiations kept (not deleted) to cut CK compile time.
 // fp8 * fp8 -> fp16 (ABQuantGrouped/blockwise)
 template void ck_grouped_gemm_fp8<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
                                   ck_tile::QuantType::ABQuantGrouped>(
@@ -523,6 +525,7 @@ template void ck_grouped_gemm_fp8<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloa
                                   ck_tile::QuantType::ABQuantGrouped>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
+#endif // ABQuantGrouped grouped-gemm instantiations disabled
 // ck_grouped_gemm_variable_k explicit instantiation.
 // fp16 * fp16 -> fp16
 template void ck_grouped_gemm_variable_k<ck_tile::half_t, ck_tile::half_t, ck_tile::half_t>(
@@ -597,6 +600,8 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::fp8_t, ck_
                                              float, ck_tile::QuantType::RowColQuant>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
+#if 0 // CK grouped BLOCKWISE (ABQuantGrouped) dropped: Triton is the production blockwise
+      // path. Explicit instantiations kept (not deleted) to cut CK compile time.
 // fp8 * fp8 -> fp16 (ABQuantGrouped/blockwise)
 template void ck_grouped_gemm_fp8_variable_k<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
                                              ck_tile::QuantType::ABQuantGrouped>(

@@ -1,4 +1,7 @@
 # Primus-Turbo
+[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Primus Product Matrix](#-primus-product-matrix) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [License](#-license)
+
+## 🔍 What's Primus-Turbo?
 **Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
@@ -29,9 +32,10 @@ Note: JAX support is under active development. Optim support is planned but not 
 ### Requirements
 
 #### Software
-- ROCm >= 6.4
+- ROCm >= 7.0
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
+- [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.14.post1"`
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
 
 #### Hardware
@@ -48,23 +52,59 @@ Note: JAX support is under active development. Optim support is planned but not 
 Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm/primus/tags):
 ```bash
 # PyTorch Ecosystem
-rocm/primus:v26.2
+docker pull rocm/primus:v26.2
 
 # JAX Ecosystem
-rocm/jax-training:maxtext-v26.2
+docker pull rocm/jax-training:maxtext-v26.2
 ```
 
+You can also use the official ROCm PyTorch image from [Docker Hub](https://hub.docker.com/r/rocm/pytorch).
+
+#### Install from Prebuilt Index
+
+> **Prerequisite:** install inside an environment that already has **ROCm PyTorch** — e.g. the `rocm/primus` image above, or the official [`rocm/pytorch`](https://hub.docker.com/r/rocm/pytorch) image. Primus-Turbo builds against your existing torch and does **not** install torch for you; in a bare environment `pip` would otherwise pull a non-ROCm torch.
+
+```bash
+# PyTorch backend (latest)
+pip3 install --no-build-isolation "primus-turbo[pytorch]" \
+    --extra-index-url https://amd-agi.github.io/Primus-Turbo/simple/
+
+# Pin a specific version
+pip3 install --no-build-isolation "primus-turbo[pytorch]==0.1.0" \
+    --extra-index-url https://amd-agi.github.io/Primus-Turbo/simple/
+```
+
+> The index currently serves **source distributions (sdist)**, so install compiles HIP kernels locally (needs the ROCm toolchain; supports gfx942 / gfx950). Prebuilt wheels are planned. Keep `--no-build-isolation` so the build uses your preinstalled torch.
+
 #### Install from Source
+
 ```bash
 git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
+# Install build/runtime dependencies first
 pip3 install -r requirements.txt
-pip3 install --no-build-isolation .
 
-# (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
-GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation .
+# Default backend: PyTorch
+pip3 install --no-build-isolation ".[pytorch]"
+
+# JAX backend
+PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation ".[jax]"
 ```
+
+#### Install from GitHub URL (without cloning)
+
+```bash
+# Install from default branch
+pip3 install --no-build-isolation "git+https://github.com/AMD-AGI/Primus-Turbo.git"
+
+# Install from a specific branch
+pip3 install --no-build-isolation "git+https://github.com/AMD-AGI/Primus-Turbo.git@main"
+```
+
+> Note:
+> - `".[pytorch]"` / `".[jax]"` means install from current local repo with extras.
+> - Extras select Python dependencies. Source compilation target is controlled by `PRIMUS_TURBO_FRAMEWORK`.
 
 ### 2. Development
 
@@ -75,15 +115,18 @@ git clone https://github.com/AMD-AGI/Primus-Turbo.git
 cd Primus-Turbo
 
 pip3 install -r requirements.txt
-pip3 install --no-build-isolation -e . -v
+pip3 install --no-build-isolation -e ".[pytorch]" -v
 
 # (Optional) Set GPU_ARCHS environment variable to specify target AMD GPU architectures.
-GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e . -v
+GPU_ARCHS="gfx942;gfx950" pip3 install --no-build-isolation -e ".[pytorch]" -v
 
 # (Optional) Set PRIMUS_TURBO_FRAMEWORK to compile for a specific framework.
 # Supported values: PYTORCH (default), JAX.
 # For example, to compile for JAX:
-PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e . -v
+PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
+
+# (Optional) ccache/sccache are auto-detected on PATH to speed up incremental rebuilds.
+# Just install ccache or sccache and the build will use it automatically.
 ```
 
 ### 3. Testing
@@ -113,11 +156,35 @@ pytest tests/jax/ --dist-only
 
 ### 4. Packaging
 
+`pip` installation behavior:
+1. Use a compatible wheel (`.whl`) if available.
+2. Fall back to source distribution (`sdist`, `.tar.gz`) when no wheel matches.
+
+Artifact roles:
+- **wheel**: prebuilt binary package, fast install, no local C++/HIP build.
+- **sdist**: source package, slower install, requires local toolchain, fallback path.
+
+#### Build artifacts
 ```bash
-pip3 install -r requirements.txt
+# Build wheel (binary distribution)
 python3 -m build --wheel --no-isolation
-pip3 install --extra-index-url https://test.pypi.org/simple ./dist/primus_turbo-XXX.whl
+
+# Build sdist (source distribution)
+python3 -m build --sdist --no-isolation
 ```
+
+#### Verify wheel install
+```bash
+pip3 install --no-build-isolation ./dist/primus_turbo-XXX.whl
+```
+
+#### Verify source fallback install
+```bash
+pip3 install --no-build-isolation ./dist/primus_turbo-XXX.tar.gz
+```
+
+> Tip:
+> Run import checks outside the source tree (for example under `/tmp`) to avoid importing local source files by accident.
 
 ### 5. Minimal Example
 ```python

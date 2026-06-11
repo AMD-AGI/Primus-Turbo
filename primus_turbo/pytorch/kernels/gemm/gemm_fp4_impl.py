@@ -6,11 +6,11 @@
 
 from typing import Tuple
 
-import aiter
 import torch
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
+from primus_turbo.common.aiter_utils import get_aiter
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -169,7 +169,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv, [16, 16])
         b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv, [16, 16])
         b_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(b, [16, 16])
-        return aiter.gemm_a4w4(
+        return get_aiter().gemm_a4w4(
             a, b_shuffled, a_scale_inv_shuffled, b_scale_inv_shuffled, dtype=out_dtype, bpreshuffle=True
         )
 

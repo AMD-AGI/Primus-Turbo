@@ -32,6 +32,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
           "scale_opt=None) -> Tensor[]");
+    m.def("quantize_fp8_blockwise_segment_m_row_col(Tensor input, ScalarType dest_dtype, "
+          "int block_size, Tensor group_lens, Tensor group_offs) -> Tensor[]");
+    m.def("quantize_fp8_blockwise_for_weight(Tensor input, ScalarType dest_dtype, int block_size) "
+          "-> Tensor[]");
 
     m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
           "Tensor");
@@ -110,6 +114,8 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise);
+    m.impl("quantize_fp8_blockwise_segment_m_row_col", quantize_fp8_blockwise_segment_m_row_col);
+    m.impl("quantize_fp8_blockwise_for_weight", quantize_fp8_blockwise_for_weight);
 
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
@@ -150,6 +156,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise_meta);
+    m.impl("quantize_fp8_blockwise_segment_m_row_col",
+           quantize_fp8_blockwise_segment_m_row_col_meta);
+    m.impl("quantize_fp8_blockwise_for_weight", quantize_fp8_blockwise_for_weight_meta);
 
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);

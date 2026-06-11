@@ -131,7 +131,18 @@ LOWERING_TABLE[moe_internode_combine_p] = _moe_internode_combine_lowering
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------
-# TODO
+# moe_combine is a cross-rank IPC primitive (same family as moe_dispatch).  Its
+# 2 outputs (recv_x, recv_topk_weights) carry per-rank state that cannot be
+# merged across the batch axis.  See primus_turbo.jax.primitive._batching for
+# the shared factory and the pipeline-parallel rationale.
+from jax.interpreters import batching
+
+from primus_turbo.jax.primitive._batching import make_ipc_batchers
+
+(
+    batching.primitive_batchers[moe_combine_p],
+    batching.fancy_primitive_batchers[moe_combine_p],
+) = make_ipc_batchers(moe_combine_p, num_outputs=2)
 
 
 __all__ = ["moe_combine_p", "moe_internode_combine_p"]

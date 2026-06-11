@@ -6,7 +6,7 @@
 """Triton-backed RMSNorm ops (standard + fused residual variant).
 
 Public API:
-    - ``rmsnorm(x, gamma, eps=1e-6) -> y``
+    - ``rmsnorm(x, gamma, eps=1e-6, zero_centered=False) -> y``
     - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ __all__ = ["rmsnorm", "rmsnorm_residual"]
 
 class _RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
+    def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6, zero_centered: bool = False):
         assert x.is_cuda and gamma.is_cuda, "rmsnorm: x and gamma must be CUDA tensors"
         orig_shape = x.shape
         H = gamma.shape[0]
@@ -35,10 +35,11 @@ class _RMSNormFunction(torch.autograd.Function):
             orig_shape[-1] == H
         ), f"rmsnorm: last dim of x ({orig_shape[-1]}) must equal gamma.shape[0] ({H})"
 
-        y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_impl(x, gamma, eps)
+        y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_impl(x, gamma, eps, zero_centered)
 
         ctx.save_for_backward(x2, gamma, rstd)
         ctx.eps = eps
+        ctx.zero_centered = zero_centered
         ctx.orig_shape = orig_shape
         ctx.BLOCK_H = BLOCK_H
         ctx.ROWS = ROWS
@@ -58,8 +59,9 @@ class _RMSNormFunction(torch.autograd.Function):
             ctx.ROWS,
             ctx.num_warps,
             ctx.num_stages,
+            ctx.zero_centered,
         )
-        return dx.reshape(ctx.orig_shape), dg, None
+        return dx.reshape(ctx.orig_shape), dg, None, None
 
 
 class _RMSNormResidualFunction(torch.autograd.Function):
@@ -108,8 +110,19 @@ class _RMSNormResidualFunction(torch.autograd.Function):
         return dx_out, dx_out, dg, None
 
 
-def rmsnorm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return _RMSNormFunction.apply(x, gamma, eps)
+def rmsnorm(
+    x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6, zero_centered: bool = False
+) -> torch.Tensor:
+    """RMSNorm.
+
+    Args:
+        x: input tensor; normalization is over the last dim.
+        gamma: learnable gain of shape ``[x.shape[-1]]``.
+        eps: variance epsilon.
+        zero_centered: if True, the effective gain is ``(1 + gamma)`` (computed in
+            fp32). Initialize ``gamma`` to zeros in this mode.
+    """
+    return _RMSNormFunction.apply(x, gamma, eps, zero_centered)
 
 
 def rmsnorm_residual(
