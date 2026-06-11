@@ -18,8 +18,8 @@
 #               split the task across N GPUs and merge the parts.
 #
 # Usage:
-#   python3 benchmark/ops/run_suite.py -d output/               # run all
-#   python3 benchmark/ops/run_suite.py -d output/ -g attention  # run one group
+#   python3 benchmark/ops/training/run_suite.py -d output/               # run all
+#   python3 benchmark/ops/training/run_suite.py -d output/ -g attention  # run one group
 ###############################################################################
 
 num_gpus: 8

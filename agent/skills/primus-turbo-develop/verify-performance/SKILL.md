@@ -5,12 +5,12 @@ description: Primus-Turbo performance verification — run single-operator and s
 
 # Verifying Performance
 
-Measure latency and throughput. Benchmarks live in `benchmark/ops/`; shared shapes and helpers in `benchmark/ops/config.py`. Read the hub [`../SKILL.md`](../SKILL.md) first.
+Measure latency and throughput. Benchmarks live in `benchmark/ops/training/`; shared shapes and helpers in `benchmark/ops/training/config.py`. Read the hub [`../SKILL.md`](../SKILL.md) first.
 
 ## Single-operator benchmark
 
 ```bash
-cd benchmark/ops
+cd benchmark/ops/training
 python bench_gemm_turbo.py --dtype bf16
 python bench_gemm_turbo.py --dtype fp8 --granularity blockwise   # tensorwise|rowwise|blockwise|mxfp8
 python bench_gemm_turbo.py --dtype bf16 -o result.csv
@@ -36,7 +36,7 @@ The in-bench check uses SNR for fp8/fp4 (`check_gemm_correctness_by_snr`; thresh
 
 ## Shapes from real model configs
 
-`benchmark/ops/config.py` derives shapes from real models, so numbers reflect training workloads:
+`benchmark/ops/training/config.py` derives shapes from real models, so numbers reflect training workloads:
 - Dense GEMM: 4 shapes/model (attn QKV, attn out, MLP gate+up, MLP down) × `MBS ∈ {1,2,4}` (Llama-2, Llama-3.1, Qwen2.5, Mistral).
 - Grouped GEMM / MoE: `MoEModelConfigs` (DeepSeek-V3/V2, Qwen3-MoE, Mixtral, Kimi-K2, ...) with `gen_grouped_gemm_group_lens(b, m, balance=...)` (`balance=True` → uniform, `balance=False` → skewed) for both token distributions.
 - Attention: `gen_attention_test_cases()` (dedup over dense + MoE/MLA heads).
@@ -46,12 +46,12 @@ Add shapes for a new op by extending `config.py`, not by hardcoding in the bench
 ## Batch suite
 
 ```bash
-python benchmark/ops/run_suite.py -d output/                 # all tasks (benchmark_suite.yaml)
-python benchmark/ops/run_suite.py -d output/ -g gemm_fp8     # one group
-python benchmark/ops/run_suite.py -d output/ -n 4            # 4 GPUs
+python benchmark/ops/training/run_suite.py -d output/                 # all tasks (benchmark_suite.yaml)
+python benchmark/ops/training/run_suite.py -d output/ -g gemm_fp8     # one group
+python benchmark/ops/training/run_suite.py -d output/ -n 4            # 4 GPUs
 ```
 
-Aggregate with `benchmark/ops/summarize_results.py`.
+Aggregate with `benchmark/ops/training/summarize_results.py`.
 
 ## Combined training-step metric
 
