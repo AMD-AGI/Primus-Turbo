@@ -185,7 +185,7 @@ class GEMMFP4AITERBackend(KernelBackend):
             # were already produced in the AITER 16x16-tile layout (e.g. via
             # quantize_mxfp4{,_dual}(shuffle_scale=True, shuffle_out=True)).
             # Skip the 3 standalone shuffle kernel launches.
-            return aiter.gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
+            return get_aiter().gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
 
         # NOTE: AITER FP4 GEMM requires shuffled scale and B
         a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv, [16, 16])
