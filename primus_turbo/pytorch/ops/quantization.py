@@ -19,6 +19,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
+    grouped_quantize_mxfp8_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
@@ -88,7 +89,6 @@ def quantize_fp8_with_trans(
     granularity: ScalingGranularity,
     *,
     block_size: Optional[int] = None,
-    axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -109,8 +109,85 @@ def quantize_fp8_with_trans(
         return quantize_mxfp8_impl(
             x,
             out_dtype,
+            None,
+            block_size,
+            True,
+            scaling_recipe,
+            scaling_recipe_for_trans,
+        )
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def grouped_quantize_fp8(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    *,
+    block_size: Optional[int] = None,
+    axis: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    FP8 Grouped Quantize
+    """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        assert (
+            block_size == MXFP8_BLOCK_SIZE
+        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
+        return grouped_quantize_mxfp8_impl(
+            x,
+            out_dtype,
             axis,
             block_size,
+            group_lens,
+            group_offs,
+            False,
+            scaling_recipe,
+            None,
+        )
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def grouped_quantize_fp8_with_trans(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    *,
+    block_size: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    FP8 Grouped Quantize with trans
+    """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        assert (
+            block_size == MXFP8_BLOCK_SIZE
+        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
+        return grouped_quantize_mxfp8_impl(
+            x,
+            out_dtype,
+            None,
+            block_size,
+            group_lens,
+            group_offs,
             True,
             scaling_recipe,
             scaling_recipe_for_trans,

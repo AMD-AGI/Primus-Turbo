@@ -9,7 +9,7 @@ import torch
 from primus_turbo.pytorch.core.backend import AutoKernelDispatcher
 
 
-def _lb_group_lens(group_lens: torch.Tensor, total: int) -> torch.Tensor:
+def _generate_load_balance_group_lens(group_lens: torch.Tensor, total: int) -> torch.Tensor:
     """Evenly distribute total across num_groups (for tuning only).
 
     NOTE: This is intentionally workload-agnostic; it is used to stabilize
@@ -54,14 +54,16 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
         if cached_backend is not None:
             return cached_backend
 
-        a: torch.Tensor = kwargs["a"]
         group_lens: torch.Tensor = kwargs["group_lens"]
-        lb_group_lens = _lb_group_lens(group_lens, int(a.size(0)))
-        lb_group_offs = group_offs_from_lens(lb_group_lens)
+        load_balance_group_lens = _generate_load_balance_group_lens(group_lens, int(group_lens.sum()))
+        load_balance_group_offs = group_offs_from_lens(load_balance_group_lens)
 
         prof_kwargs = dict(kwargs)
-        prof_kwargs["group_lens"] = lb_group_lens
-        prof_kwargs["group_offs"] = lb_group_offs
+        prof_kwargs["group_lens"] = load_balance_group_lens
+        prof_kwargs["group_offs"] = load_balance_group_offs
+        # Keep the output offsets consistent with the balanced input layout.
+        if prof_kwargs.get("group_offs_out") is not None:
+            prof_kwargs["group_offs_out"] = load_balance_group_offs
 
         best_backend = None
         best_time = float("inf")
@@ -120,12 +122,12 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
             trans_lhs = trans_a
 
         total_k = int(lhs.size(0) if trans_lhs else lhs.size(1))
-        lb_group_lens = _lb_group_lens(group_lens, total_k)
-        lb_group_offs = group_offs_from_lens(lb_group_lens)
+        load_balance_group_lens = _generate_load_balance_group_lens(group_lens, total_k)
+        load_balance_group_offs = group_offs_from_lens(load_balance_group_lens)
 
         prof_kwargs = dict(kwargs)
-        prof_kwargs["group_lens"] = lb_group_lens
-        prof_kwargs["group_offs"] = lb_group_offs
+        prof_kwargs["group_lens"] = load_balance_group_lens
+        prof_kwargs["group_offs"] = load_balance_group_offs
 
         best_backend = None
         best_time = float("inf")

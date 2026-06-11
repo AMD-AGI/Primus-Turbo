@@ -93,11 +93,11 @@ except AttributeError:
 # Block size for MXFP4
 MXFP4_BLOCK_SIZE = 32
 # Padding align size for MXFP4
-MXFP4_PADDING_ALIGN_SIZE = 128
+MXFP4_K_DIM_PADDING_ALIGN_SIZE = 128
 # Block size for MXFP8
 MXFP8_BLOCK_SIZE = 32
 # Padding align size for MXFP8
-MXFP8_PADDING_ALIGN_SIZE = 128
+MXFP8_K_DIM_PADDING_ALIGN_SIZE = 128
 # Block size for BLOCKWISE scaling
 BLOCKWISE_BLOCK_SIZE = 128
 

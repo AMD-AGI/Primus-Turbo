@@ -12,7 +12,9 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
 )
@@ -93,15 +95,26 @@ def _run_grouped_gemm_fp8_test(
     device = "cuda:0"
 
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+
+    # Pad the total row count (sum of group_lens) up to the required M alignment:
+    # 16 in general, 32 for MXFP8. The extra rows are folded into the last group so
+    # that ``sum(group_lens) == a.shape[0]`` stays consistent for both ref and op.
+    total_m = B * M
+    m_align = 32 if granularity == ScalingGranularity.MX_BLOCKWISE else 16
+    total_m_padded = (total_m + m_align - 1) // m_align * m_align
+    if total_m_padded != total_m:
+        group_lens[-1] += total_m_padded - total_m
+
     print(
         f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
         f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, "
-        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}"
+        f"balance={balance}, backend={backend}, auto_tune={auto_tune}, cuda_graph={cuda_graph}, "
+        f"total_m_padded={total_m_padded}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
-    a = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    a = torch.randn((total_m_padded, K), dtype=ori_dtype, device=device, requires_grad=True)
     b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
     a_ref = a.detach().clone().requires_grad_(True)
     b_ref = b.detach().clone().requires_grad_(True)
@@ -113,8 +126,15 @@ def _run_grouped_gemm_fp8_test(
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    # Turbo
-    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
+    # Turbo — MX_BLOCKWISE requires E8M0 scale_dtype (others default to FP32).
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        if block_size is None:
+            block_size = 32
+        config = Float8QuantConfig(
+            format=format, granularity=granularity, block_size=block_size, scale_dtype=ScaleDtype.E8M0
+        )
+    else:
+        config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
 
     if cuda_graph:
         # CUDA graph mode: warmup -> capture -> replay
@@ -190,8 +210,12 @@ def _run_grouped_gemm_fp8_deterministic_test(
     # Skip invalid granularity/block_size combinations
     if granularity == ScalingGranularity.BLOCKWISE and block_size is None:
         pytest.skip("BLOCKWISE granularity requires block_size to be set.")
-    if granularity != ScalingGranularity.BLOCKWISE and block_size is not None:
-        pytest.skip("Only BLOCKWISE granularity supports block_size.")
+    if (
+        granularity != ScalingGranularity.BLOCKWISE
+        and granularity != ScalingGranularity.MX_BLOCKWISE
+        and block_size is not None
+    ):
+        pytest.skip("Only BLOCKWISE / MX_BLOCKWISE granularity supports block_size.")
     if _check_hit_int32_limit(B, M, N, K):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
@@ -232,9 +256,21 @@ def _run_grouped_gemm_fp8_deterministic_test(
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
+    # MX_BLOCKWISE requires E8M0 scale dtype; others use FP32 (default).
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        config = Float8QuantConfig(
+            format=format, granularity=granularity, block_size=block_size, scale_dtype=ScaleDtype.E8M0
+        )
+    else:
+        config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
 
     def _run_once():
+        # Prevent buffer-alias race across pytest cases: the caching allocator
+        # can hand a fresh tensor the same physical GPU memory still being
+        # written by a pending op from a previous test case.  Force full sync
+        # + cache release so each _run_once gets clean memory.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         a = a0.detach().clone().requires_grad_(True)
         b = b0.detach().clone().requires_grad_(True)
         out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
@@ -358,6 +394,39 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
     )
 
 
+# MX_BLOCKWISE deterministic — turbo backend only; only runs on gfx950.
+# Limited to trans_b=True: the TT-layout path routes through a Python-level
+# transpose+pad layer whose downstream allocator non-determinism is out of
+# scope for the kernel determinism test.
+@pytest.mark.parametrize("B", _DET_B_VALUES)
+@pytest.mark.parametrize("M", _DET_M_VALUES)
+@pytest.mark.parametrize("NK", _DET_NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", [True])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.deterministic
+def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance):
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+    N, K = NK
+    _run_grouped_gemm_fp8_deterministic_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        backend=BackendType.TURBO,
+        block_size=32,
+        repeats=10,
+    )
+
+
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
@@ -446,6 +515,40 @@ def test_grouped_gemm_fp8_blockwise(
         trans_b=trans_b,
         balance=balance,
         block_size=block_size,
+        backend=backend,
+        auto_tune=auto_tune,
+    )
+
+
+# MX_BLOCKWISE turbo backend coverage mirrors tensorwise's full parameter
+# sweep (HYBRID format is intentionally excluded — the mxfp8 kernel itself
+# supports it, but turbo's hybrid path is out of scope for this PR).
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", [True])
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+@pytest.mark.parametrize("backend", [None, BackendType.TURBO])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the turbo backend."""
+    N, K = NK
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
         backend=backend,
         auto_tune=auto_tune,
     )
