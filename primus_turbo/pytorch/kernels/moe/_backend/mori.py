@@ -20,6 +20,7 @@ import triton.language as tl
 
 from primus_turbo.common.constants import ENV_MORI_NUM_QP_PER_PE
 from primus_turbo.common.logger import logger
+from primus_turbo.common.mori_utils import get_mori
 
 from ._config import EPBufferConfig
 from .base import (
@@ -429,10 +430,7 @@ class MoriEPBackend:
     @staticmethod
     def is_available() -> bool:
         try:
-            import mori  # noqa: F401
-            import mori.ops  # noqa: F401
-            import mori.shmem  # noqa: F401
-
+            get_mori()
             return True
         except ImportError:
             return False
@@ -495,6 +493,9 @@ class MoriEPBackend:
         kernel cfg override; see :func:`_resolve_mori_dispatch_cfg`.
         """
         assert not fp8_dispatch, "not implemented"
+
+        # Lazily import mori with a clear install hint + version-pin warning.
+        get_mori()
 
         # Must run before any Mori JIT/SHMEM activity (fixes HIP error 500 on ROCm 7.2+).
         _align_mori_hip_with_torch()
@@ -665,6 +666,9 @@ class MoriEPBackend:
             for passing as the ``config=`` argument to
             :meth:`MoriEPBackend.dispatch` / :meth:`MoriEPBackend.combine`.
         """
+        # Lazily import mori with a clear install hint + version-pin warning.
+        get_mori()
+
         if isinstance(x, tuple):
             raise NotImplementedError(
                 "MoriEPBackend.tune_configs: FP8 dispatch (tuple ``x``) is not supported."
