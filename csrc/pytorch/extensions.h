@@ -79,6 +79,20 @@ at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale
 at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                        const int64_t axis, const at::ScalarType dest_dtype);
 
+at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                 const int64_t axis, const int64_t block_size,
+                                 const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp4_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                 const int64_t axis, const int64_t block_size,
+                                 const at::ScalarType dest_dtype);
+
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,

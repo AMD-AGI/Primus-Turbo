@@ -24,8 +24,6 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_row_col_kernel,
 )
-from primus_turbo.triton.quantization.quantization_mxfp4 import dequantize_mxfp4_kernel
-from primus_turbo.triton.quantization.quantization_mxfp8 import dequantize_mxfp8_kernel
 
 
 def ceil_div(a, b):
@@ -461,48 +459,12 @@ def dequantize_mxfp8_impl(
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    use_rowwise = axis == 1
-
-    num_rows, row_length = x.size()
+    _, row_length = x.size()
     assert (
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."
 
-    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
-    scale_inv = scale_inv.view(torch.uint8)
-
-    scale_m, scale_n = scale_inv.size()
-    if use_rowwise:
-        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
-    else:
-        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
-
-    BLOCK_X = 64
-    BLOCK_Y = 64
-    GROUP_Y = 8
-    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
-    dequantize_mxfp8_kernel[grid](
-        x,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        num_rows,
-        row_length,
-        scale_inv,
-        scale_inv.stride(0),
-        scale_inv.stride(1),
-        scale_m,
-        scale_n,
-        BLOCK_X=BLOCK_X,
-        BLOCK_Y=BLOCK_Y,
-        GROUP_Y=GROUP_Y,
-        USE_ROWWISE=use_rowwise,
-        MXFP8_BLOCK_SIZE=block_size,
-    )
-
-    return y
+    return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp8(x, scale_inv, axis, block_size, out_dtype)
 
 
 def quantize_mxfp4_impl(
@@ -584,8 +546,6 @@ def dequantize_mxfp4_impl(
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    use_rowwise = axis == 1
-
     num_rows, row_length = x.size()
     # NOTE: x is packed in last dimension
     row_length = row_length * 2
@@ -593,38 +553,4 @@ def dequantize_mxfp4_impl(
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."
 
-    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
-    scale_inv = scale_inv.view(torch.uint8)
-
-    scale_m, scale_n = scale_inv.size()
-    if use_rowwise:
-        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
-    else:
-        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
-
-    BLOCK_X = 64
-    BLOCK_Y = 64
-    GROUP_Y = 8
-    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
-    dequantize_mxfp4_kernel[grid](
-        x.view(torch.uint8),
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        num_rows,
-        row_length,
-        scale_inv,
-        scale_inv.stride(0),
-        scale_inv.stride(1),
-        scale_m,
-        scale_n,
-        BLOCK_X=BLOCK_X,
-        BLOCK_Y=BLOCK_Y,
-        GROUP_Y=GROUP_Y,
-        USE_ROWWISE=use_rowwise,
-        MXFP4_BLOCK_SIZE=block_size,
-    )
-
-    return y
+    return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp4(x, scale_inv, axis, block_size, out_dtype)
