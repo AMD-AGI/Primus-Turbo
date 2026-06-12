@@ -15,8 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
 
 from primus_turbo.common.constants import ENV_MORI_NUM_QP_PER_PE
 from primus_turbo.common.logger import logger
@@ -27,169 +25,12 @@ from .base import (
     _apply_env_with_nccl_fallback,
     _broadcast_from_rank0_float,
     _broadcast_from_rank0_int,
+    _EPCapabilities,
     call_once,
     detect_group_topology,
     sweep_configs,
 )
-
-# ==========================================================================
-# Per-expert token counting (Mori dispatch post-processing)
-# ==========================================================================
-
-
-def _compute_expert_token_info_configs() -> List[triton.Config]:
-    """Autotune space for :func:`compute_expert_token_info_kernel`."""
-    configs: List[triton.Config] = []
-    for block_m in (64, 128, 256, 512, 1024):
-        for num_warps in (1, 2, 4, 8):
-            # Wave=64, cap threads/CTA to 1024 (HW limit on CDNA).
-            if num_warps * 64 > 1024:
-                continue
-            # Keep at least one element per thread in the M dimension.
-            if block_m < num_warps * 64:
-                continue
-            for num_stages in (1, 2):
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_SIZE_M": block_m},
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                    )
-                )
-    return configs
-
-
-@triton.autotune(
-    configs=_compute_expert_token_info_configs(),
-    key=["num_tokens", "num_topk"],
-    reset_to_zero=["num_recv_tokens_per_expert_ptr"],
-)
-@triton.jit
-def compute_expert_token_info_kernel(
-    recv_topk_idx_ptr,
-    deepep_topk_idx_ptr,
-    num_recv_tokens_per_expert_ptr,
-    total_recv_ptr,
-    num_tokens: tl.int32,
-    num_topk: tl.int32,
-    num_local_experts: tl.int32,
-    expert_base: tl.int32,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    HAS_TOTAL_RECV: tl.constexpr,
-):
-    """Count per-expert received tokens and emit a DeepEP-format topk_idx."""
-    pid = tl.program_id(0)
-    row_offs = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col_offs = tl.arange(0, BLOCK_SIZE_K)
-    bin_offs = tl.arange(0, BLOCK_SIZE_N)
-
-    if HAS_TOTAL_RECV:
-        total_recv = tl.load(total_recv_ptr)
-        row_limit = tl.minimum(total_recv, num_tokens)
-    else:
-        row_limit = num_tokens
-
-    in_footprint = row_offs < num_tokens
-    in_valid_rows = row_offs < row_limit
-    col_mask = col_offs < num_topk
-
-    footprint_mask = in_footprint[:, None] & col_mask[None, :]
-    load_mask = in_valid_rows[:, None] & col_mask[None, :]
-
-    safe_row = tl.where(in_footprint, row_offs, 0)
-    expert_offs = safe_row[:, None] * num_topk + col_offs[None, :]
-
-    topk_experts = tl.load(
-        recv_topk_idx_ptr + expert_offs,
-        mask=load_mask,
-        other=0,
-    )
-
-    local_experts = topk_experts - expert_base
-    valid = load_mask & (local_experts >= 0) & (local_experts < num_local_experts)
-    # Clamp invalid lanes to a legal bin; the histogram mask excludes them.
-    safe_experts = tl.where(valid, local_experts, 0)
-
-    # ``tl.histogram`` requires a flat 1D input; reshape the 2D tile.
-    flat_experts = tl.reshape(safe_experts, [BLOCK_SIZE_M * BLOCK_SIZE_K])
-    flat_mask = tl.reshape(valid, [BLOCK_SIZE_M * BLOCK_SIZE_K])
-    local_counts = tl.histogram(flat_experts, BLOCK_SIZE_N, mask=flat_mask)
-
-    # Flush CTA-local accumulator to global memory with one atomic per bin.
-    bin_mask = (bin_offs < num_local_experts) & (local_counts > 0)
-    tl.atomic_add(
-        num_recv_tokens_per_expert_ptr + bin_offs,
-        local_counts,
-        sem="relaxed",
-        scope="gpu",
-        mask=bin_mask,
-    )
-
-    deepep_experts = tl.where(valid, local_experts, -1).to(topk_experts.dtype)
-    tl.store(deepep_topk_idx_ptr + expert_offs, deepep_experts, mask=footprint_mask)
-
-
-def compute_expert_token_info(
-    recv_topk_idx: torch.Tensor,
-    num_local_experts: int,
-    *,
-    expert_base: int = 0,
-    total_recv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Count per-expert received tokens and emit ``recv_topk_idx`` in DeepEP
-    layout (as a new tensor).
-    """
-    assert recv_topk_idx.is_cuda, "recv_topk_idx must be a CUDA tensor"
-    assert recv_topk_idx.dim() == 2, "recv_topk_idx must be 2D [num_tokens, num_topk]"
-
-    device = recv_topk_idx.device
-    num_tokens, num_topk = recv_topk_idx.shape
-
-    num_recv_tokens_per_expert = torch.zeros(num_local_experts, dtype=recv_topk_idx.dtype, device=device)
-    deepep_like_topk_idx = torch.empty_like(recv_topk_idx)
-
-    if num_tokens == 0 or num_topk == 0 or num_local_experts == 0:
-        # Nothing to count; fill with the DeepEP padding sentinel.
-        if deepep_like_topk_idx.numel() > 0:
-            deepep_like_topk_idx.fill_(-1)
-        return num_recv_tokens_per_expert, deepep_like_topk_idx
-
-    has_total_recv = total_recv is not None
-    if has_total_recv:
-        assert total_recv.is_cuda, "total_recv must be a CUDA tensor"
-        assert total_recv.numel() >= 1, "total_recv must have at least 1 element"
-        # Triton expects an int32 pointer; coerce if needed.
-        if total_recv.dtype != torch.int32:
-            total_recv = total_recv.to(torch.int32)
-        total_recv_ptr = total_recv
-    else:
-        # Dummy pointer; unused when HAS_TOTAL_RECV=False.
-        total_recv_ptr = recv_topk_idx
-
-    # ``tl.histogram`` requires ``num_bins`` to be a power of 2 on AMD Triton.
-    block_size_n = triton.next_power_of_2(num_local_experts)
-
-    # ``BLOCK_SIZE_M`` is picked by the autotuner; the grid size depends on it.
-    def grid(META):
-        return (triton.cdiv(num_tokens, META["BLOCK_SIZE_M"]),)  # noqa: E731
-
-    compute_expert_token_info_kernel[grid](
-        recv_topk_idx,
-        deepep_like_topk_idx,
-        num_recv_tokens_per_expert,
-        total_recv_ptr,
-        num_tokens,
-        num_topk,
-        num_local_experts,
-        expert_base,
-        BLOCK_SIZE_K=triton.next_power_of_2(num_topk),
-        BLOCK_SIZE_N=block_size_n,
-        HAS_TOTAL_RECV=has_total_recv,
-    )
-    return num_recv_tokens_per_expert, deepep_like_topk_idx
-
+from .expert_token_count import compute_expert_token_info
 
 # ==========================================================================
 # Mori EP backend helpers
@@ -217,32 +58,58 @@ def _get_mori_dispatch_configs() -> Dict[_MoriEpMode, _MoriDispatchCfg]:
     """Return per-mode Mori kernel launch configs."""
     import mori.ops
 
+    # Defaults aligned with mori's official gfx950 tuning (used when autotune off).
     return {
         _MoriEpMode.INTRA_NODE: _MoriDispatchCfg(
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
             warp_num_per_block=16,
-            block_num=80,
+            block_num=256,
             rdma_block_num=0,
         ),
         _MoriEpMode.INTER_NODE: _MoriDispatchCfg(
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
             warp_num_per_block=8,
-            block_num=64,
-            rdma_block_num=32,
+            block_num=128,
+            rdma_block_num=64,
         ),
     }
+
+
+def _mori_block_num_candidates(num_sms: int, sm_count: int) -> List[int]:
+    """block_num sweep set: powers of two up to sm_count, plus sm_count and num_sms.
+
+    Mirrors mori's bench; excludes over-subscription (>sm_count, hang risk).
+    block_num does not change op buffer size, so the sweep is memory-free.
+    """
+    cap = int(sm_count) if sm_count and sm_count > 0 else int(num_sms or 64)
+    candidates = {cap}
+    p = 32
+    while p <= cap:
+        candidates.add(p)
+        p *= 2
+    if num_sms and num_sms > 0:
+        candidates.add(min(int(num_sms), cap))
+    return sorted(v for v in candidates if 0 < v <= cap)
+
+
+# mori's native env: AUTO makes the op auto-apply its shipped tuning JSON per-call.
+_MORI_LAUNCH_CONFIG_MODE_ENV = "MORI_EP_LAUNCH_CONFIG_MODE"
+
+
+def _mori_auto_mode() -> bool:
+    """True when mori auto-tunes from its shipped JSON DB (opt-in via env=AUTO).
+
+    Default MANUAL: our benchmark sweep beats the JSON for bf16 (mori's dispatch
+    JSON is fp8-only, so bf16 dispatch falls back to a slower hard-coded cfg).
+    """
+    return os.environ.get(_MORI_LAUNCH_CONFIG_MODE_ENV, "MANUAL").upper() == "AUTO"
 
 
 _MORI_SHMEM_PG_NAME = "mori"
 
 
 def _align_mori_hip_with_torch() -> None:
-    """Make Mori's JIT reuse torch's ``libamdhip64.so``.
-
-    On ROCm 7.2+ Mori's separate ``dlopen`` of system HIP gets a different
-    module table than torch's, causing HIP error 500 in ``hipModuleGetFunction``.
-    Preloading torch's copy into Mori's lazy handle fixes it.
-    """
+    """Make Mori's JIT reuse torch's libamdhip64.so (fixes HIP error 500 on ROCm 7.2+)."""
     try:
         import ctypes
 
@@ -285,11 +152,7 @@ def _register_and_init_mori_shmem(group: dist.ProcessGroup) -> None:
 def _extract_mori_launch_override(
     config: Optional[Any],
 ) -> Tuple[int, int, int]:
-    """Return ``(block_num, warp_per_block, rdma_block_num)`` from ``config``.
-
-    Mori's ``op.dispatch``/``op.combine`` accept ``-1`` as a "use config
-    default" sentinel, so unknown / missing overrides degrade to that.
-    """
+    """Return (block_num, warp_per_block, rdma_block_num); -1 means op default."""
     if isinstance(config, _MoriDispatchCfg):
         return config.block_num, config.warp_num_per_block, config.rdma_block_num
     return -1, -1, -1
@@ -299,9 +162,7 @@ def _resolve_mori_dispatch_cfg(
     group: dist.ProcessGroup,
     config: Optional[EPBufferConfig] = None,
 ) -> _MoriDispatchCfg:
-    """Resolve Mori kernel launch cfg: topology default, overridden by
-    ``config.num_sms`` (``block_num``) and ``config.dispatch_config`` (full).
-    """
+    """Resolve launch cfg: topology default, overridden by num_sms and dispatch_config."""
     _, num_nodes = detect_group_topology(group)
     mode = _MoriEpMode.INTRA_NODE if num_nodes <= 1 else _MoriEpMode.INTER_NODE
     base = _get_mori_dispatch_configs()[mode]
@@ -352,6 +213,8 @@ def _build_mori_op(
     """Build and cache a :class:`mori.ops.EpDispatchCombineOp`."""
     import mori.ops
 
+    # mori reads MORI_EP_LAUNCH_CONFIG_MODE itself (native default MANUAL); set it
+    # to AUTO to make the op auto-apply its shipped tuning JSON per-call.
     num_qp_per_pe = int(os.environ.get(ENV_MORI_NUM_QP_PER_PE, "2"))
 
     common_kwargs = dict(
@@ -404,7 +267,7 @@ def _build_mori_op(
     return mori.ops.EpDispatchCombineOp(config)
 
 
-class MoriEPBackend:
+class MoriEPBackend(_EPCapabilities):
     """ROCm Mori EP backend for MoE dispatch/combine (normal mode)."""
 
     def __init__(self) -> None:
@@ -440,6 +303,11 @@ class MoriEPBackend:
         """not supported"""
         return False
 
+    @classmethod
+    def can_release(cls, *, will_reinit: bool) -> bool:
+        # inter-node free+rebuild hangs: keep if reinit'd, free a dead loser.
+        return not will_reinit
+
     @staticmethod
     def _derive_params_dtype(fp8_dispatch: bool) -> torch.dtype:
         """Pick the Mori ``data_type`` argument from ``fp8_dispatch``."""
@@ -456,14 +324,7 @@ class MoriEPBackend:
         ib_tc: Optional[str] = None,
         ib_sl: Optional[str] = None,
     ) -> None:
-        """Set MORI_* RDMA env vars, falling back to NCCL_* equivalents.
-
-        Mapping: ``MORI_IB_GID_INDEX``/``NCCL_IB_GID_INDEX``,
-        ``MORI_RDMA_DEVICES``/``NCCL_IB_HCA``, ``MORI_SOCKET_IFNAME``/
-        ``NCCL_SOCKET_IFNAME``, ``MORI_RDMA_TC``/``NCCL_IB_TC``,
-        ``MORI_RDMA_SL``/``NCCL_IB_SL``. Each kwarg overrides the
-        corresponding MORI var; ``None`` keeps it unset (Mori auto-detects).
-        """
+        """Set MORI_* RDMA env from NCCL_* fallbacks; None kwargs stay unset (auto-detect)."""
         _apply_env_with_nccl_fallback(
             [
                 ("MORI_IB_GID_INDEX", "NCCL_IB_GID_INDEX", ib_gid_index),
@@ -485,16 +346,14 @@ class MoriEPBackend:
         fp8_dispatch: bool,
         config: EPBufferConfig,
     ) -> None:
-        """Register Mori SHMEM and build/rebuild the Mori op as needed.
+        """Register Mori SHMEM and (re)build the op on shape/kernel-type change.
 
-        Rebuilds when any shape signature field or kernel cfg changes. Reads
-        ``config.num_sms`` as a ``block_num`` override and
-        ``config.dispatch_config`` (if a :class:`_MoriDispatchCfg`) as a full
-        kernel cfg override; see :func:`_resolve_mori_dispatch_cfg`.
+        block/warp/rdma are per-call, so the op is reused (not rebuilt) on cfg
+        change — the autotune winner reuses the tuned op (inter-node rebuild hangs).
         """
         assert not fp8_dispatch, "not implemented"
 
-        # Lazily import mori with a clear install hint + version-pin warning.
+        # Lazy mori import (install hint + version check).
         get_mori()
 
         # Must run before any Mori JIT/SHMEM activity (fixes HIP error 500 on ROCm 7.2+).
@@ -512,7 +371,7 @@ class MoriEPBackend:
         params_dtype = self._derive_params_dtype(fp8_dispatch)
         kernel_cfg = _resolve_mori_dispatch_cfg(group, config)
 
-        # Rebuild on shape-signature or kernel-cfg change (_build_mori_op is cached).
+        # Rebuild on shape/kernel-type change only; block/warp/rdma are per-call.
         needs_rebuild = (
             self._op is None
             or self._hidden_size != hidden_size
@@ -521,7 +380,8 @@ class MoriEPBackend:
             or self._seqlen != seqlen
             or self._fp8_dispatch != fp8_dispatch
             or self._params_dtype != params_dtype
-            or self._kernel_cfg != kernel_cfg
+            or self._kernel_cfg is None
+            or self._kernel_cfg.kernel_type != kernel_cfg.kernel_type
         )
 
         self._hidden_size = hidden_size
@@ -561,7 +421,7 @@ class MoriEPBackend:
     ):
         assert self.is_initialized(), "Backend is not initialized"
 
-        # num_worst_tokens > 0: graph-friendly caller; keep counts on device (no D2H sync).
+        # Graph-friendly caller: keep counts on device (no D2H sync).
         keep_tokens_per_expert_on_device = num_worst_tokens > 0
 
         if handle is None:
@@ -574,7 +434,7 @@ class MoriEPBackend:
         # Autotuner launch override; -1 keeps the op-level default.
         block_num, warp_per_block, rdma_block_num = _extract_mori_launch_override(config)
 
-        # ``scale`` is the FP8 scales arg; Mori path is BF16-only for now.
+        # FP8 scales arg; BF16-only path for now.
         scale = None
         recv_x, recv_topk_weights, _recv_x_scales, recv_topk_idx, total_recv = self._op.dispatch(
             x,
@@ -636,37 +496,12 @@ class MoriEPBackend:
         num_topk: Optional[int] = None,
         uniform_dispatch: bool = True,
     ) -> Tuple[_MoriDispatchCfg, _MoriDispatchCfg, float, float]:
-        """Sweep Mori ``warp_per_block`` and return best per-call cfgs.
+        """Sweep (block_num, warp, rdma) on one op via per-call overrides (mirrors mori's bench).
 
-        Dispatch and combine are tuned independently over the ``warp_per_block``
-        candidates; ``block_num`` is pinned to the configured ``num_sms`` (not
-        swept). RDMA block count is *not* swept; the kernel type's base value is
-        preserved (0 intra-node, 32 inter-node).
-
-        Args:
-            group: EP process group.
-            x: Dispatch input. ``(fp8_tensor, scales)`` tuples are rejected
-                because Mori's BF16-only path is the only one wired up.
-            num_experts: Total expert count.
-            topk_idx: ``[num_tokens, num_topk]`` indices. Required when
-                ``uniform_dispatch=False``; only consulted for ``num_topk``
-                in uniform mode.
-            topk_weights: ``[num_tokens, num_topk]`` weights. Required when
-                ``uniform_dispatch=False``.
-            num_sms: Reserved for API compatibility with other backends;
-                Mori sweeps ``block_num`` directly off the device's SM count.
-            num_tests: Timed iterations per candidate.
-            num_topk: Falls back to ``topk_idx.size(1)`` when unset.
-            uniform_dispatch: If True, resample a uniform topk distribution
-                so tuning is robust to caller-side routing skew.
-
-        Returns:
-            ``(dispatch_cfg, combine_cfg, dispatch_time_s, combine_time_s)``
-            where the cfgs are :class:`_MoriDispatchCfg` instances suitable
-            for passing as the ``config=`` argument to
-            :meth:`MoriEPBackend.dispatch` / :meth:`MoriEPBackend.combine`.
+        Intra pins rdma=0; inter sweeps it. Best dispatch/combine tracked
+        independently. Returns (dispatch_cfg, combine_cfg, dispatch_s, combine_s).
         """
-        # Lazily import mori with a clear install hint + version-pin warning.
+        # Lazy mori import (install hint + version check).
         get_mori()
 
         if isinstance(x, tuple):
@@ -679,26 +514,6 @@ class MoriEPBackend:
         mode = _MoriEpMode.INTRA_NODE if num_nodes <= 1 else _MoriEpMode.INTER_NODE
         base_cfg = _get_mori_dispatch_configs()[mode]
         kernel_type = base_cfg.kernel_type
-        rdma_block_num = base_cfg.rdma_block_num
-
-        # Inter-node mori isn't benchmark-safe (reuse NaNs, op free/rebuild hangs):
-        # skip tuning and return the base config; the live path builds one fresh op.
-        if num_nodes > 1:
-            fixed_block_num = int(num_sms) if num_sms and num_sms > 0 else base_cfg.block_num
-            base_live = _MoriDispatchCfg(
-                kernel_type=kernel_type,
-                warp_num_per_block=base_cfg.warp_num_per_block,
-                block_num=fixed_block_num,
-                rdma_block_num=rdma_block_num,
-            )
-            if group.rank() == 0:
-                logger.info(
-                    f"[Mori tuning] inter-node ({num_nodes} nodes): autotune disabled "
-                    f"(mori inter-node is not benchmark-safe); using base config "
-                    f"block_num={fixed_block_num} warp_per_block={base_cfg.warp_num_per_block}.",
-                    rank=0,
-                )
-            return base_live, base_live, 0.0, 0.0
 
         x_tensor = x
         hidden_size = int(x_tensor.size(1))
@@ -736,17 +551,43 @@ class MoriEPBackend:
         topk_weights_f = topk_weights.float() if topk_weights is not None else None
 
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        # Intra-node warp sweep (inter-node returned the base config above).
-        warp_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
-        fixed_block_num = int(num_sms) if num_sms and num_sms > 0 else base_cfg.block_num
-        block_list = [fixed_block_num]
+
+        if _mori_auto_mode():
+            # mori self-tunes from its JSON per-call; just measure one representative config.
+            warp_list = [base_cfg.warp_num_per_block]
+            block_list = [base_cfg.block_num]
+            candidates = [(base_cfg.block_num, base_cfg.warp_num_per_block, base_cfg.rdma_block_num)]
+        else:
+            block_list = _mori_block_num_candidates(num_sms, sm_count)
+            # Intra pins rdma=0; inter sweeps rdma ~ {block/2, block*2/3} (fewer warps to bound cost).
+            if num_nodes <= 1:
+                warp_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
+
+                def _rdma_candidates(block_num: int) -> List[int]:
+                    return [0]
+
+            else:
+                warp_list = [4, 8, 16]
+
+                def _rdma_candidates(block_num: int) -> List[int]:
+                    cands = sorted(
+                        {v for v in (max(block_num // 2, 1), block_num * 2 // 3) if 1 <= v < block_num}
+                    )
+                    return cands or [max(block_num // 2, 1)]
+
+            candidates = [
+                (block_num, warp_per_block, rdma_block_num)
+                for block_num in block_list
+                for warp_per_block in warp_list
+                for rdma_block_num in _rdma_candidates(block_num)
+            ]
 
         # Size the op for the largest candidate so per-call overrides fit.
         worst_cfg = _MoriDispatchCfg(
             kernel_type=kernel_type,
             warp_num_per_block=max(warp_list),
             block_num=max(block_list),
-            rdma_block_num=rdma_block_num,
+            rdma_block_num=base_cfg.rdma_block_num,
         )
         self.init_buffer(
             group,
@@ -764,21 +605,18 @@ class MoriEPBackend:
 
         num_warmup = max(1, num_tests // 5)
         is_rank0 = group.rank() == 0
-        total_cfgs = len(block_list) * len(warp_list)
         if is_rank0:
+            mode = "AUTO (mori tuning DB)" if _mori_auto_mode() else "MANUAL sweep"
             logger.info(
-                f"[Mori tuning] sm_count={sm_count} "
-                f"kernel={kernel_type} block_num={fixed_block_num} "
-                f"warp_per_block candidates={len(warp_list)} "
-                f"total={total_cfgs}",
+                f"[Mori tuning] mode={mode} sm_count={sm_count} kernel={kernel_type} "
+                f"block candidates={block_list} warp candidates={warp_list} "
+                f"rdma swept={num_nodes > 1 and not _mori_auto_mode()} total={len(candidates)}",
                 rank=0,
             )
 
         # Paired dispatch->combine sweep; _combine matches the live contiguous() prep.
-        candidates = [(block_num, warp_per_block) for block_num in block_list for warp_per_block in warp_list]
-
         def _dispatch(cand):
-            block_num, warp_per_block = cand
+            block_num, warp_per_block, rdma_block_num = cand
             recv_x, recv_weights, _, recv_idx, _ = self._op.dispatch(
                 x_tensor,
                 topk_weights_f,
@@ -788,10 +626,10 @@ class MoriEPBackend:
                 rdma_block_num=rdma_block_num,
                 warp_per_block=warp_per_block,
             )
-            return (recv_x, recv_weights, recv_idx, block_num, warp_per_block)
+            return (recv_x, recv_weights, recv_idx, block_num, warp_per_block, rdma_block_num)
 
         def _combine(cand, recv):
-            recv_x, recv_weights, recv_idx, block_num, warp_per_block = recv
+            recv_x, recv_weights, recv_idx, block_num, warp_per_block, rdma_block_num = recv
             self._op.combine(
                 recv_x.contiguous(),
                 recv_weights,
@@ -820,7 +658,7 @@ class MoriEPBackend:
             raise RuntimeError("MoriEPBackend.tune_configs: no valid combine config in sweep.")
 
         # Broadcast rank 0's pick so every rank agrees on the winners.
-        disp_winner = _broadcast_from_rank0_int(list(best_d), group)
+        disp_winner = _broadcast_from_rank0_int(list(best_d), group)  # [block, warp, rdma]
         comb_winner = _broadcast_from_rank0_int(list(best_c), group)
         best_d_time = _broadcast_from_rank0_float(best_d_time, group)
         best_c_time = _broadcast_from_rank0_float(best_c_time, group)
@@ -829,32 +667,32 @@ class MoriEPBackend:
             kernel_type=kernel_type,
             warp_num_per_block=int(disp_winner[1]),
             block_num=int(disp_winner[0]),
-            rdma_block_num=rdma_block_num,
+            rdma_block_num=int(disp_winner[2]),
         )
         final_c = _MoriDispatchCfg(
             kernel_type=kernel_type,
             warp_num_per_block=int(comb_winner[1]),
             block_num=int(comb_winner[0]),
-            rdma_block_num=rdma_block_num,
+            rdma_block_num=int(comb_winner[2]),
         )
 
         if is_rank0:
             logger.info(
                 f"[Mori tuning] best dispatch block_num={final_d.block_num} "
-                f"warp_per_block={final_d.warp_num_per_block} t={best_d_time * 1e6:.2f} us; "
-                f"best combine block_num={final_c.block_num} "
-                f"warp_per_block={final_c.warp_num_per_block} t={best_c_time * 1e6:.2f} us",
+                f"warp={final_d.warp_num_per_block} rdma={final_d.rdma_block_num} "
+                f"t={best_d_time * 1e6:.2f} us; best combine block_num={final_c.block_num} "
+                f"warp={final_c.warp_num_per_block} rdma={final_c.rdma_block_num} "
+                f"t={best_c_time * 1e6:.2f} us",
                 rank=0,
             )
 
         return final_d, final_c, best_d_time, best_c_time
 
     def release_buffer(self) -> None:
-        """Drop the op and free its Mori SHMEM (kept ``self._group``; SHMEM binding is global).
+        """Drop the op and free its Mori SHMEM (keeps the global SHMEM binding).
 
-        Nulling ``self._op`` alone leaves the op pinned by ``_build_mori_op``'s
-        lru_cache, so its dtor (``ShmemFree``) never runs and autotune leaks the
-        tuning op; ``cache_clear()`` lets the dtor reclaim the static heap.
+        cache_clear() is required: the lru_cache ref otherwise pins the op so its
+        dtor (ShmemFree) never runs and autotune leaks the tuning op.
         """
         # Drain in-flight kernels touching the buffers before they are freed.
         if torch.cuda.is_available() and torch.cuda.is_initialized():

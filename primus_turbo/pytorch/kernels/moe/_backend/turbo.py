@@ -5,7 +5,9 @@
 ###############################################################################
 """In-tree Primus-Turbo DeepEP backend."""
 
-from .base import _DeepEPLikeBackend
+import torch.distributed as dist
+
+from .base import _DeepEPLikeBackend, detect_group_topology
 
 
 class TurboEPBackend(_DeepEPLikeBackend):
@@ -14,6 +16,12 @@ class TurboEPBackend(_DeepEPLikeBackend):
     @staticmethod
     def is_available() -> bool:
         return True
+
+    @classmethod
+    def is_feasible(cls, group: dist.ProcessGroup) -> bool:
+        # rocSHMEM internode is unsupported on AINIC (SIGABRTs); intra-node only.
+        _, num_nodes = detect_group_topology(group)
+        return num_nodes <= 1
 
     @staticmethod
     def _get_module():

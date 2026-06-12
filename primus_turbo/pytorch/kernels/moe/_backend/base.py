@@ -6,6 +6,7 @@
 """``EPBackend`` Protocol + ``_DeepEPLikeBackend`` shared base for DeepEP-style backends."""
 
 import functools
+import inspect
 import os
 import socket
 from typing import (
@@ -248,6 +249,8 @@ class EPBackend(Protocol):
         """
         ...
 
+    # Capability methods are provided by ``_EPCapabilities`` (can_release / is_feasible).
+
     def is_initialized(self) -> bool:
         """Return True if the backend is initialized."""
         ...
@@ -370,6 +373,69 @@ def _apply_env_with_nccl_fallback(
             )
 
 
+# Per-NIC inflight-env defaults; avoid hangs on AINIC (ionic_*) and Thor-2 (bnxt_re_*).
+_UCCL_NIC_INFLIGHT_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "ionic": {
+        "UCCL_IB_MAX_INFLIGHT_NORMAL": "1",
+        "UCCL_IB_MAX_INFLIGHT_LOW_LATENCY": "1",
+        "UCCL_IB_MAX_INFLIGHT_BYTES": "4194304",  # 4MB
+    },
+    "bnxt": {
+        "UCCL_IB_MAX_INFLIGHT_NORMAL": "1",
+        "UCCL_IB_MAX_INFLIGHT_LOW_LATENCY": "1",
+        "UCCL_IB_MAX_INFLIGHT_BYTES": "1572864",  # 1.5MB
+    },
+}
+
+
+def apply_uccl_network_env(
+    *,
+    ib_gid_index: Optional[str] = None,
+    ib_hca: Optional[str] = None,
+    socket_ifname: Optional[str] = None,
+    ib_tc: Optional[str] = None,
+    ib_sl: Optional[str] = None,
+    ib_max_inflight_normal: Optional[str] = None,
+    ib_max_inflight_low_latency: Optional[str] = None,
+    ib_max_inflight_bytes: Optional[str] = None,
+) -> None:
+    """Set UCCL_* RDMA env vars, falling back to ``NCCL_*`` equivalents.
+
+    Shared by the UCCL backend and the uccl-backed deep_ep wrapper. ``None``
+    kwargs inherit from ``NCCL_*`` if set, else per-NIC defaults.
+    """
+    from .nic_detect import detect_nic_type
+
+    _apply_env_with_nccl_fallback(
+        [
+            ("UCCL_IB_GID_INDEX", "NCCL_IB_GID_INDEX", ib_gid_index),
+            ("UCCL_IB_HCA", "NCCL_IB_HCA", ib_hca),
+            ("UCCL_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME", socket_ifname),
+            ("UCCL_IB_TC", "NCCL_IB_TC", ib_tc),
+            ("UCCL_IB_SL", "NCCL_IB_SL", ib_sl),
+        ],
+        backend_name="UCCL",
+    )
+
+    # NIC-specific defaults for inflight envs (run after HCA is resolved).
+    nic_defaults = _UCCL_NIC_INFLIGHT_DEFAULTS.get(detect_nic_type() or "", {})
+    inflight_envs = [
+        ("UCCL_IB_MAX_INFLIGHT_NORMAL", ib_max_inflight_normal),
+        ("UCCL_IB_MAX_INFLIGHT_LOW_LATENCY", ib_max_inflight_low_latency),
+        ("UCCL_IB_MAX_INFLIGHT_BYTES", ib_max_inflight_bytes),
+    ]
+    for env_name, explicit in inflight_envs:
+        if explicit is not None:
+            os.environ[env_name] = str(explicit)
+        elif env_name not in os.environ and env_name in nic_defaults:
+            os.environ[env_name] = nic_defaults[env_name]
+        if env_name in os.environ:
+            logger.info(
+                f"[UCCL Network Settings] {env_name}: {os.environ[env_name]}",
+                rank=0,
+            )
+
+
 def _broadcast_from_rank0_int(values: Sequence[int], group: dist.ProcessGroup) -> List[int]:
     """Return rank-0's ``values`` on every rank (via ``all_gather``)."""
     t = torch.tensor(values, dtype=torch.int32, device="cuda")
@@ -387,11 +453,33 @@ def _broadcast_from_rank0_float(value: float, group: dist.ProcessGroup) -> float
 
 
 # =========================================================================
+# Backend capability defaults (shared by every EP backend)
+# =========================================================================
+
+
+class _EPCapabilities:
+    """Backend capability defaults; each backend overrides the one that differs."""
+
+    @classmethod
+    def can_release(cls, *, will_reinit: bool) -> bool:  # noqa: ARG003
+        """Whether release_buffer() is safe now; ``will_reinit`` = re-init'd afterwards.
+
+        Default always safe. uccl: never (destroy corrupts HIP). mori: only when not reinit.
+        """
+        return True
+
+    @classmethod
+    def is_feasible(cls, group: dist.ProcessGroup) -> bool:  # noqa: ARG003
+        """Can this backend run on ``group``'s topology (e.g. inter-node)?"""
+        return True
+
+
+# =========================================================================
 # _DeepEPLikeBackend — shared implementation for DeepEP-compatible backends
 # =========================================================================
 
 
-class _DeepEPLikeBackend:
+class _DeepEPLikeBackend(_EPCapabilities):
     """Shared base class for backends that follow the DeepEP Buffer protocol."""
 
     def __init__(self) -> None:
@@ -421,7 +509,14 @@ class _DeepEPLikeBackend:
         raise NotImplementedError
 
     def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
-        """Extra kwargs forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
+        """Extra kwargs for ``BufferClass(...)``; pass ``is_intranode`` if it requires one."""
+        BufferClass = self._get_module().Buffer
+        try:
+            param = inspect.signature(BufferClass).parameters.get("is_intranode")
+        except (TypeError, ValueError):
+            param = None
+        if param is not None and param.default is False:
+            return {"is_intranode": group.size() <= 8}
         return {}
 
     def setup_env(self, **overrides: Optional[str]) -> None:  # noqa: ARG002
