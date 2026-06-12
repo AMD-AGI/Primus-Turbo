@@ -513,9 +513,7 @@ def test_grouped_gemm_fp8_blockwise(
 # sweep, including HYBRID: the MX kernels take per-operand fp8 formats via
 # tl.dot_scaled, so HYBRID (e4m3 weights, e5m2 grad_out) works in dgrad/wgrad.
 #
-# Constraints handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
-#   - trans_b=False: b is transposed to NT internally; wgrad output is
-#     transposed back to (G, K, N).
+# Constraint handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
 #   - balance=False (per-group M_g not multiple of 128): a / grad_out are
 #     zero-padded along the M axis so wgrad sees 128-aligned per-group sizes.
 @pytest.mark.parametrize("B", B_VALUES)
@@ -523,7 +521,7 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
 def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
     """MXFP8 grouped GEMM fwd + dgrad + wgrad on the triton backend."""

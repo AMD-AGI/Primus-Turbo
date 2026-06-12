@@ -510,8 +510,8 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert a.ndim == 2 and b.ndim == 3
         assert out_dtype in [torch.float16, torch.bfloat16]
+        assert trans_b, "MXFP8 grouped GEMM only supports trans_b=True (NT layout)."
 
-        b_internal = b if trans_b else b.transpose(-1, -2).contiguous()  # -> (G, N, K)
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
         # A: fused grouped dual-quant + per-group M zero-pad (rowwise 32 / colwise
@@ -537,7 +537,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         )
         # B: per-group dual-quant (rowwise (G,N,K) for fwd, colwise (G,K,N) for dgrad).
         b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
-            b_internal,
+            b,
             b_dtype,
             config.granularity,
             block_size=config.block_size,
@@ -570,7 +570,6 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.trans_b = trans_b
         ctx.total_m = total_m
         return out
 
@@ -634,8 +633,7 @@ class GroupedGemmFP8MXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
         )
-        if not ctx.trans_b:
-            grad_b = grad_b.transpose(-1, -2).contiguous()
+        # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return grad_a, grad_b, None, None, None, None, None, None
 
 
