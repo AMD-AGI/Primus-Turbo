@@ -352,7 +352,11 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         if granularity != ScalingGranularity.MX_BLOCKWISE:
             supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES
         else:
-            # MXFP8: e4m3/e5m2 operands, NT layout only
+            # MXFP8: both operands must be fp8 (e4m3/e5m2) — the kernel infers the
+            # format from a.dtype — and the layout is NT only (trans_b=True).
+            supported &= a.dtype in (float8_e4m3, float8_e5m2)
+            supported &= b.dtype in (float8_e4m3, float8_e5m2)
+            supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= trans_b
         return supported
 
@@ -496,6 +500,13 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 out_dtype,
             ) in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_DTYPES
             supported &= trans_a and not trans_b
+        else:
+            # MXFP8 variable-K wgrad: both operands fp8 (e4m3/e5m2), and the kernel
+            # expects the non-transposed (OUT_M, M_total) / (OUT_N, M_total) layout.
+            supported &= a.dtype in (float8_e4m3, float8_e5m2)
+            supported &= b.dtype in (float8_e4m3, float8_e5m2)
+            supported &= out_dtype in (torch.float16, torch.bfloat16)
+            supported &= not trans_a and not trans_b
         return supported
 
     @staticmethod

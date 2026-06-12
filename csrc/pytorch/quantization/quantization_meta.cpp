@@ -198,11 +198,15 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
                        "padding_align_size must be ", MXFP8_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP8. But got padding_align_size=", padding_align_size);
 
-    int64_t M, N;
+    // Mirror the CUDA impl: 2D keeps ``G == 1`` and the 2D layout; 3D carries a
+    // leading group dim ``G`` on every per-group buffer and returns 3D views.
+    int64_t G, M, N;
     if (input.dim() == 2) {
+        G = 1;
         M = input.size(0);
         N = input.size(1);
     } else if (input.dim() == 3) {
+        G = input.size(0);
         M = input.size(1);
         N = input.size(2);
     } else {
@@ -223,21 +227,24 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
                            " for shuffled colwise FP8");
     }
 
+    const bool    is_batched = (input.dim() == 3);
+    const int64_t Gout       = is_batched ? G : 1;
+
     int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
     int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
     at::Tensor rowwise_scale;
     if (shuffle_rowwise_scale) {
-        rowwise_scale = at::empty({rowwise_scale_M_pad, rowwise_scale_N_pad},
+        rowwise_scale = at::empty({Gout * rowwise_scale_M_pad, rowwise_scale_N_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
-        rowwise_scale =
-            at::empty({M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        rowwise_scale = at::empty({Gout * M, rowwise_scale_N},
+                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     }
 
     at::Tensor rowwise_output =
-        at::empty({M, N_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({Gout * M, N_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
     int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
     int64_t colwise_scale_N     = cdiv(M_pad, MXFP8_BLOCK_SIZE);
@@ -245,15 +252,24 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
 
     at::Tensor colwise_scale;
     if (shuffle_colwise_scale) {
-        colwise_scale = at::empty({colwise_scale_M_pad, colwise_scale_N_pad},
+        colwise_scale = at::empty({Gout * colwise_scale_M_pad, colwise_scale_N_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
-        colwise_scale =
-            at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        colwise_scale = at::empty({Gout * N, colwise_scale_N},
+                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     }
 
     at::Tensor colwise_output =
-        at::empty({N, M_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        at::empty({Gout * N, M_pad}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    if (is_batched) {
+        const int64_t rowwise_scale_rows = shuffle_rowwise_scale ? rowwise_scale_M_pad : M;
+        const int64_t colwise_scale_rows = shuffle_colwise_scale ? colwise_scale_M_pad : N;
+        return {rowwise_output.view({G, M, N_pad}).view(dest_dtype),
+                rowwise_scale.view({G, rowwise_scale_rows, -1}).view(at::kFloat8_e8m0fnu),
+                colwise_output.view({G, N, M_pad}).view(dest_dtype),
+                colwise_scale.view({G, colwise_scale_rows, -1}).view(at::kFloat8_e8m0fnu)};
+    }
 
     return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
             colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu)};
@@ -400,14 +416,19 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
                        "padding_align_size must be ", MXFP8_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP8. But got padding_align_size=", padding_align_size);
 
+    // Mirror the CUDA impl: ``axis`` is locked to {0, 1}. 2D maps axis==0 ->
+    // COLWISE / axis==1 -> ROWWISE; 3D maps axis==1 -> COLWISE, otherwise
+    // ROWWISE, with a leading group dim ``G`` and 3D views on the output.
     bool    is_rowwise;
-    int64_t M, N;
+    int64_t G, M, N;
     if (input.dim() == 2) {
-        is_rowwise = (axis == 1);
+        is_rowwise = (axis != 0); // axis==0 -> COLWISE, axis==1 -> ROWWISE
+        G          = 1;
         M          = input.size(0);
         N          = input.size(1);
     } else if (input.dim() == 3) {
-        is_rowwise = (axis == 2);
+        is_rowwise = (axis != 1); // axis==1 -> COLWISE, otherwise ROWWISE
+        G          = input.size(0);
         M          = input.size(1);
         N          = input.size(2);
     } else {
@@ -429,6 +450,9 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
         }
     }
 
+    const bool    is_batched = (input.dim() == 3);
+    const int64_t Gout       = is_batched ? G : 1;
+
     int64_t scale_outer = is_rowwise ? M : N;
     int64_t scale_N = is_rowwise ? cdiv(N_pad, MXFP8_BLOCK_SIZE) : cdiv(M_pad, MXFP8_BLOCK_SIZE);
     int64_t scale_M_pad = cdiv(scale_outer, 256) * 256;
@@ -436,17 +460,23 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
 
     at::Tensor scale_tensor;
     if (shuffle_scale) {
-        scale_tensor = at::empty({scale_M_pad, scale_N_pad},
+        scale_tensor = at::empty({Gout * scale_M_pad, scale_N_pad},
                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
-        scale_tensor = at::empty({scale_outer, scale_N},
+        scale_tensor = at::empty({Gout * scale_outer, scale_N},
                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     }
 
     int64_t    output_rows = is_rowwise ? M : N;
     int64_t    output_cols = is_rowwise ? N_pad : M_pad;
-    at::Tensor output      = at::empty({output_rows, output_cols},
+    at::Tensor output      = at::empty({Gout * output_rows, output_cols},
                                        at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    if (is_batched) {
+        const int64_t scale_rows = shuffle_scale ? scale_M_pad : scale_outer;
+        return {output.view({G, output_rows, output_cols}).view(dest_dtype),
+                scale_tensor.view({G, scale_rows, -1}).view(at::kFloat8_e8m0fnu)};
+    }
 
     return {output.view(dest_dtype), scale_tensor.view(at::kFloat8_e8m0fnu)};
 }

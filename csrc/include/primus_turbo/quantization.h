@@ -39,7 +39,7 @@ constexpr int MXFP4_BLOCK_SIZE = 32;
 constexpr int MXFP8_BLOCK_SIZE = 32;
 
 // Padding alignment expected for the public ``padding_align_size`` op argument.
-// Must stay in sync with ``MXFP4_K_DIM_PADDING_ALIGN_SIZE`` / ``MXFP8_K_DIM_PADDING_ALIGN_SIZE``
+// Must stay in sync with ``MXFP4_PADDING_ALIGN_SIZE`` / ``MXFP8_PADDING_ALIGN_SIZE``
 // declared in ``primus_turbo/pytorch/core/low_precision.py``.
 constexpr int MXFP4_K_DIM_PADDING_ALIGN_SIZE = 128;
 constexpr int MXFP8_K_DIM_PADDING_ALIGN_SIZE = 128;

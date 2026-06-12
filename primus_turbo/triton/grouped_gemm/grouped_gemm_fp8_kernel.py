@@ -2044,7 +2044,8 @@ def _grouped_mxfp8_persistent_gemm_kernel(
     CACHE_MODIFIER: tl.constexpr,
     VEC: tl.constexpr,
     EVEN_K: tl.constexpr,
-    FP8_FMT: tl.constexpr,  # "e4m3" or "e5m2" (both operands share the format)
+    A_FMT: tl.constexpr,  # "e4m3"/"e5m2" — A and B formats are independent (HYBRID
+    B_FMT: tl.constexpr,  # uses e4m3 weights with e5m2 grad_out in the bwd GEMMs)
 ):
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -2117,7 +2118,7 @@ def _grouped_mxfp8_persistent_gemm_kernel(
             b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK, BN)
             a_s = tl.trans(tl.load(AS_BASE))  # (BK//VEC, BM) -> (BM, BK//VEC)
             b_s = tl.trans(tl.load(BS_BASE))  # (BK//VEC, BN) -> (BN, BK//VEC)
-            acc = tl.dot_scaled(a, a_s, FP8_FMT, b, b_s, FP8_FMT, acc)
+            acc = tl.dot_scaled(a, a_s, A_FMT, b, b_s, B_FMT, acc)
             A_BASE += BLOCK_SIZE_K * stride_ak
             B_BASE += BLOCK_SIZE_K * stride_bk
             AS_BASE += (BLOCK_SIZE_K // VEC) * stride_ask
@@ -2141,7 +2142,7 @@ def _grouped_mxfp8_persistent_gemm_kernel(
             )
             a_s = tl.trans(tl.load(AS_BASE))
             b_s = tl.trans(tl.load(BS_BASE))
-            acc = tl.dot_scaled(a, a_s, FP8_FMT, b, b_s, FP8_FMT, acc)
+            acc = tl.dot_scaled(a, a_s, A_FMT, b, b_s, B_FMT, acc)
 
         c = acc.to(C.type.element_ty)
         rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
@@ -2173,7 +2174,10 @@ def grouped_gemm_mxfp8_forward(
     # via strides (no host transpose/copy).
     a_s = a_scale.view(torch.uint8)
     b_s = b_scale.view(torch.uint8)
-    fp8_fmt = "e5m2" if a.dtype == torch.float8_e5m2 else "e4m3"
+    # Per-operand format (independent): supports E4M3 (both e4m3), E5M2 (both
+    # e5m2) and HYBRID (e5m2 grad_out x e4m3 weight in the bwd GEMMs).
+    a_fmt = "e5m2" if a.dtype == torch.float8_e5m2 else "e4m3"
+    b_fmt = "e5m2" if b.dtype == torch.float8_e5m2 else "e4m3"
     cu = torch.cuda.get_device_properties(a.device).multi_processor_count
     BM, BN, BK = 256, 256, 128
     m_alloc = a.shape[0]  # padded upper bound on output rows
@@ -2217,7 +2221,8 @@ def grouped_gemm_mxfp8_forward(
         CACHE_MODIFIER=".ca",
         VEC=VEC_SIZE,
         EVEN_K=(K % BK == 0),
-        FP8_FMT=fp8_fmt,
+        A_FMT=a_fmt,
+        B_FMT=b_fmt,
         num_warps=8,
         num_stages=2,
         waves_per_eu=0,
@@ -2267,7 +2272,8 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
     VEC: tl.constexpr,
-    FP8_FMT: tl.constexpr,  # "e4m3" or "e5m2"
+    LHS_FMT: tl.constexpr,  # "e4m3"/"e5m2" — independent (HYBRID wgrad is
+    RHS_FMT: tl.constexpr,  # e5m2 grad_out x e4m3 activation)
 ):
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -2323,7 +2329,7 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
             r = tl.load(tl.multiple_of(R_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK, BN)
             ls = tl.trans(tl.load(LS_BASE))  # (BK//VEC, BM) -> (BM, BK//VEC)
             rs = tl.trans(tl.load(RS_BASE))
-            acc = tl.dot_scaled(l, ls, FP8_FMT, r, rs, FP8_FMT, acc)
+            acc = tl.dot_scaled(l, ls, LHS_FMT, r, rs, RHS_FMT, acc)
             L_BASE += BLOCK_SIZE_K * stride_lk
             R_BASE += BLOCK_SIZE_K * stride_rk
             LS_BASE += (BLOCK_SIZE_K // VEC) * stride_lsk
@@ -2346,7 +2352,10 @@ def grouped_gemm_mxfp8_variable_k(
     c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)
-    fp8_fmt = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
+    # Per-operand format (independent) — HYBRID wgrad pairs e5m2 grad_out with
+    # e4m3 activation.
+    lhs_fmt = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
+    rhs_fmt = "e5m2" if rhs.dtype == torch.float8_e5m2 else "e4m3"
     cu = torch.cuda.get_device_properties(lhs.device).multi_processor_count
     # Asymmetric 256x128 tile: with the R operand loaded directly as (BK,BN)
     # (no in-reg transpose) the VGPR budget fits 256x128, matching the
@@ -2388,7 +2397,8 @@ def grouped_gemm_mxfp8_variable_k(
         CHUNK_SIZE=chunk,
         CACHE_MODIFIER=".ca",
         VEC=VEC_SIZE,
-        FP8_FMT=fp8_fmt,
+        LHS_FMT=lhs_fmt,
+        RHS_FMT=rhs_fmt,
         num_warps=8,
         num_stages=3,
         waves_per_eu=2,

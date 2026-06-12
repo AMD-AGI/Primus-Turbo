@@ -510,8 +510,8 @@ def test_grouped_gemm_fp8_blockwise(
 
 
 # MX_BLOCKWISE triton backend coverage mirrors tensorwise's full parameter
-# sweep (HYBRID format is intentionally excluded — the triton MX path
-# supports it, but turbo's hybrid path is out of scope for this PR).
+# sweep, including HYBRID: the MX kernels take per-operand fp8 formats via
+# tl.dot_scaled, so HYBRID (e4m3 weights, e5m2 grad_out) works in dgrad/wgrad.
 #
 # Constraints handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
 #   - trans_b=False: b is transposed to NT internally; wgrad output is
@@ -522,7 +522,7 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("M", M_VALUES)
 @pytest.mark.parametrize("NK", NK_VALUES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
 def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
