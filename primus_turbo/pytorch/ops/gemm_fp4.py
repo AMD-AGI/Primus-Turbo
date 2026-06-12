@@ -73,7 +73,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             )
 
         b_scaling_recipe = ScalingRecipe(
-            use_2d_block=True,
+            use_2d_block=config.use_2d_block_weight_scaling,
             use_sr=False,
             use_rht=False,
         )
@@ -114,7 +114,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             a_t_scaling_recipe = ScalingRecipe(
                 use_2d_block=False,
                 use_sr=False,
-                use_rht=True,
+                use_rht=config.use_gradient_rht,
             )
             quantized_a_t = QuantizedTensor.quantize(
                 a_fp4.dequantize(),
@@ -129,9 +129,9 @@ class FP4GemmMXFunction(torch.autograd.Function):
             quantized_b_t = b_t
         else:
             b_t_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
+                use_2d_block=config.use_2d_block_weight_scaling,
                 use_sr=False,
-                use_rht=True,
+                use_rht=config.use_gradient_rht,
             )
             quantized_b_t = QuantizedTensor.quantize(
                 b_fp4.dequantize(),
@@ -166,7 +166,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
         grad_out_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=ctx.config.use_gradient_sr,
-            use_rht=True,
+            use_rht=ctx.config.use_gradient_rht,
         )
 
         quantized_grad_out = QuantizedTensor.quantize(
@@ -195,7 +195,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
         grad_out_t_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=ctx.config.use_gradient_sr,
-            use_rht=True,
+            use_rht=ctx.config.use_gradient_rht,
         )
         quantized_grad_out_t = QuantizedTensor.quantize(
             grad_out,

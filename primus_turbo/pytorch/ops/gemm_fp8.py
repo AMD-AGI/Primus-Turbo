@@ -468,7 +468,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             assert isinstance(a_t, QuantizedTensor)
             quantized_a_t = a_t
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        b_scaling_recipe = ScalingRecipe(use_2d_block=config.use_2d_block_weight_scaling)
         if isinstance(b, QuantizedTensor):
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
