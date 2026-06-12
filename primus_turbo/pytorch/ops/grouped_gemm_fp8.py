@@ -44,6 +44,19 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Device-initiated offset computation (PRIMUS_DEVICE_INITIATED_GEMM=1)
+# ---------------------------------------------------------------------------
+_DEVICE_INITIATED_GEMM = os.environ.get("PRIMUS_DEVICE_INITIATED_GEMM", "0") == "1"
+
+
+def _compute_expert_offsets_device(group_lens: "torch.Tensor") -> "torch.Tensor":
+    cumsum = torch.cumsum(group_lens.to(torch.int64), dim=0)
+    return torch.cat(
+        [torch.zeros(1, dtype=torch.int64, device=cumsum.device), cumsum]
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Fused MoE wgrad accumulation helpers
 #
@@ -126,6 +139,18 @@ def _get_dummy_wgrad(shape, dtype, device):
     return buf
 
 
+_dgrad_out_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_dgrad_buf(M: int, K: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (M, K, device)
+    buf = _dgrad_out_cache.get(key)
+    if buf is None:
+        buf = torch.empty(M, K, device=device, dtype=dtype)
+        _dgrad_out_cache[key] = buf
+    return buf
+
+
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
     if format == Format.E4M3:
         return float8_e4m3
@@ -198,8 +223,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             b_fp8,
             b_scale_inv,
             group_lens,
-            group_offs,
         )
+        ctx.group_offs = group_offs
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
@@ -218,8 +243,8 @@ class GroupedGemmFP8BlockFunc(torch.autograd.Function):
             b_fp8,
             b_scale_inv,
             group_lens,
-            group_offs,
         ) = ctx.saved_tensors
+        group_offs = ctx.group_offs
         block_size = ctx.config.block_size
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
@@ -320,7 +345,8 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
             b, b_dtype, config.granularity, axis=(-2 if trans_b else -1)
         )
 
-        ctx.save_for_backward(a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens, group_offs)
+        ctx.save_for_backward(a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens)
+        ctx.group_offs = group_offs
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
@@ -331,7 +357,8 @@ class GroupedGemmFP8RowFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
-        a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens, group_offs = ctx.saved_tensors
+        a_fp8_col, b_fp8_col, a_scale_inv_col, b_scale_inv_col, group_lens = ctx.saved_tensors
+        group_offs = ctx.group_offs
 
         # For grad_a
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -390,6 +417,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
         trans_b: bool,
         config: Float8QuantConfig,
         num_cu: int | None,
+        out: torch.Tensor | None = None,
     ):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
@@ -418,23 +446,33 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             b, b_dtype, lambda: quantize_fp8(b, b_dtype, config.granularity)
         )
 
-        out = grouped_gemm_fp8_impl(
-            a_fp8,
-            b_fp8,
-            a_scale_inv,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=trans_b,
-            out_dtype=a.dtype,
-            granularity=config.granularity.value,
-            num_cu=num_cu,
-            default_backend=BackendType.CK.value,
-            maybe_pre_sync=True,
-        )
+        if _DEVICE_INITIATED_GEMM:
+            from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_tensorwise_triton_kernel as _di_fwd_kernel,
+            )
+            out = _di_fwd_kernel(
+                a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_offs,
+                trans_b=trans_b, out_dtype=a.dtype, out=out,
+            )
+        else:
+            out = grouped_gemm_fp8_impl(
+                a_fp8,
+                b_fp8,
+                a_scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=trans_b,
+                out_dtype=a.dtype,
+                granularity=config.granularity.value,
+                num_cu=num_cu,
+                default_backend=BackendType.CK.value,
+                maybe_pre_sync=True,
+            )
 
-        ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs)
+        ctx.save_for_backward(a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens)
+        ctx.group_offs = group_offs
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
@@ -453,7 +491,8 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
-        a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
+        a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens = ctx.saved_tensors
+        group_offs = ctx.group_offs
 
         # For grad_a
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -474,20 +513,34 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             grad_out_dtype,
             lambda: quantize_fp8(grad_out, grad_out_dtype, ctx.config.granularity),
         )
-        grad_a = grouped_gemm_fp8_impl(
-            grad_out_fp8,
-            b_fp8,
-            grad_out_scale_inv,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.CK.value,
-        )
+        if _DEVICE_INITIATED_GEMM:
+            from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_tensorwise_triton_kernel as _di_fwd_kernel,
+            )
+            _dgrad_buf = _get_dgrad_buf(
+                grad_out_fp8.shape[0],
+                b_fp8.shape[1] if not ctx.trans_b else b_fp8.shape[2],
+                grad_out_fp8.device, ctx.out_dtype,
+            )
+            grad_a = _di_fwd_kernel(
+                grad_out_fp8, b_fp8, grad_out_scale_inv, b_scale_inv, group_offs,
+                trans_b=not ctx.trans_b, out_dtype=ctx.out_dtype, out=_dgrad_buf,
+            )
+        else:
+            grad_a = grouped_gemm_fp8_impl(
+                grad_out_fp8,
+                b_fp8,
+                grad_out_scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.CK.value,
+            )
 
         # ── Fused wgrad accumulation path ─────────────────────────────────
         # If the weight has a ``main_grad`` buffer (Megatron-LM main-grad
@@ -553,7 +606,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                         dtype=ctx.out_dtype,
                         device=main_grad_view.device,
                     )
-                    return grad_a, grad_b_dummy, None, None, None, None, None
+                    return grad_a, grad_b_dummy, None, None, None, None, None, None
 
         # ── Fallback: original out-of-place wgrad path ────────────────────
         grad_b = grouped_gemm_fp8_variable_k_impl(
@@ -572,7 +625,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             default_backend=BackendType.CK.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None
 
 
 def grouped_gemm_fp8(
@@ -583,6 +636,7 @@ def grouped_gemm_fp8(
     trans_b: bool = True,
     config: Union[Float8QuantConfig, None] = None,
     num_cu: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ """
     supported_dtypes = [torch.bfloat16, torch.float16]
@@ -590,11 +644,14 @@ def grouped_gemm_fp8(
     assert b.dtype in supported_dtypes, f"Unsupported dtype {b.dtype}, expected one of {supported_dtypes}"
 
     if group_offs is None:
-        group_offs = grouped_gemm_compute_offs(group_lens)
+        if _DEVICE_INITIATED_GEMM:
+            group_offs = _compute_expert_offsets_device(group_lens)
+        else:
+            group_offs = grouped_gemm_compute_offs(group_lens)
     if config is None:
         config = Float8QuantConfig()
 
-    args = (a, b, group_lens, group_offs, trans_b, config, num_cu)
+    args = (a, b, group_lens, group_offs, trans_b, config, num_cu, out)
 
     if config.granularity == ScalingGranularity.TENSORWISE:
         return GroupedGemmFP8TensorFunc.apply(*args)

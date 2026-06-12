@@ -527,6 +527,17 @@ def _grouped_fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+_tile_cumsum_cache: dict[int, torch.Tensor] = {}
+
+
+def _get_tile_cumsum_buf(G: int, device: torch.device) -> torch.Tensor:
+    buf = _tile_cumsum_cache.get(G)
+    if buf is None or buf.device != device:
+        buf = torch.empty(G + 1, device=device, dtype=torch.int32)
+        _tile_cumsum_cache[G] = buf
+    return buf
+
+
 def grouped_gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -535,6 +546,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     group_offs: torch.Tensor,
     trans_b: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Persistent grouped FP8 GEMM (CPU-sync-free, per-tensor scaling) using Triton.
 
@@ -577,7 +589,8 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     stride_ak = a.stride(1)  # =1 for contiguous a
 
     # Output
-    out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
+    if out is None:
+        out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
@@ -606,7 +619,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # same CUDA stream → no host sync). The main kernel can then load this tiny
     # array once into registers and skip the per-tile O(G) scan over group_offs.
     num_pid_n_int = (N + blk_n - 1) // blk_n
-    tile_cumsum = torch.empty(G + 1, device=a.device, dtype=torch.int32)
+    tile_cumsum = _get_tile_cumsum_buf(G, a.device)
     _compute_tile_cumsum_kernel[(1,)](
         group_offs,
         tile_cumsum,

@@ -5,6 +5,7 @@
 ###############################################################################
 
 
+import os
 import warnings
 from abc import abstractmethod
 from typing import Optional, Tuple
@@ -199,6 +200,32 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         return hidden_states, token_probs
 
     def _exec_dispatch(self, hidden_states, token_probs):
+        # Reset per-iteration overflow state.
+        self._overflow_warned = False
+
+        # Pre-compute a static dispatch budget so token_permute uses a fixed num_out_tokens,
+        # enabling CUDA graph capture without device-to-host synchronisation.
+        # MOE_EXPERT_RANK_CAPACITY_FACTOR is set in config_MI355X_1x8x1_... and flows through
+        # gpt_oss_20B-pretrain-fp8.yaml via ${oc.env:MOE_EXPERT_RANK_CAPACITY_FACTOR,null}.
+        _rcf_str = os.environ.get("MOE_EXPERT_RANK_CAPACITY_FACTOR", "")
+        _rank_capacity_factor = float(_rcf_str) if _rcf_str else None
+        if _rank_capacity_factor is not None:
+            _num_tokens = hidden_states.shape[0]         # bs x seq_len (e.g. 4 x 8192 = 32768)
+            _topk = self.router_topk                     # e.g. 4 (includes tp_size factor)
+            _pad = 256                                   # align to 256 tokens
+            budget = int(_num_tokens * _topk * _rank_capacity_factor)
+            budget += (-budget) % _pad                   # round up e.g. to 157440
+            self._num_permuted_tokens = budget
+            if not getattr(self, '_budget_printed', False):
+                print(
+                    f"[DeepEPTokenDispatcher] _exec_dispatch: budget={budget} tokens "
+                    f"(num_tokens={_num_tokens}, topk={_topk}, factor={_rank_capacity_factor})",
+                    flush=True,
+                )
+                self._budget_printed = True
+        else:
+            self._num_permuted_tokens = None
+
         # DeepEP only supports float32 probs
         if token_probs.dtype != torch.float32:
             if token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -220,16 +247,94 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         self.handle = handle
         self.tokens_per_expert = tokens_per_expert
-        self.dispatched_indices = dispatched_indices
 
+        # turbo.ops.moe_dispatch dynamically allocates recv_x, dispatched_indices,
+        # and dispatched_probs.  Inside a captured graph those allocations are
+        # replayed at capture-time addresses with potentially wrong sizes.
+        # Copy into fixed-shape persistent buffers so the graph always sees [budget, H].
+        if self._num_permuted_tokens is not None:
+            hidden_size = hidden_states.shape[-1]
+            if not hasattr(self, '_dispatch_buf') or self._dispatch_buf is None:
+                self._dispatch_buf = torch.zeros(
+                    (self._num_permuted_tokens, hidden_size),
+                    dtype=hidden_states.dtype, device=hidden_states.device,
+                )
+                self._dispatch_indices_buf = torch.full(
+                    (self._num_permuted_tokens,), -1,
+                    dtype=dispatched_indices.dtype, device=hidden_states.device,
+                )
+                self._dispatch_probs_buf = torch.zeros(
+                    (self._num_permuted_tokens,),
+                    dtype=dispatched_probs.dtype, device=hidden_states.device,
+                )
+                print(
+                    f"[DeepEPTokenDispatcher] Persistent dispatch buffers allocated: "
+                    f"({self._num_permuted_tokens}, {hidden_size})",
+                    flush=True,
+                )
+
+            actual = hidden_states.shape[0]
+            self._dispatch_buf[:actual].copy_(hidden_states)
+            self._dispatch_buf[actual:].zero_()
+            self._dispatch_indices_buf[:actual].copy_(dispatched_indices)
+            self._dispatch_indices_buf[actual:].fill_(-1)
+            self._dispatch_probs_buf[:actual].copy_(dispatched_probs)
+            self._dispatch_probs_buf[actual:].zero_()
+
+            self.dispatched_indices = self._dispatch_indices_buf
+            return self._dispatch_buf, self._dispatch_probs_buf
+
+        self.dispatched_indices = dispatched_indices
         return hidden_states, dispatched_probs
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
+        _device_initiated = os.environ.get("PRIMUS_DEVICE_INITIATED_GEMM", "0") == "1"
 
-        if self.tokens_per_expert.numel() > 0:
-            num_out_tokens = self.tokens_per_expert.sum().item()
-        elif self.permute_max_token_num > 0:
+        _rcf_str = os.environ.get("MOE_EXPERT_RANK_CAPACITY_FACTOR", "")
+        _rank_capacity_factor = float(_rcf_str) if _rcf_str else None
+
+        if self.permute_max_token_num > 0:
             num_out_tokens = self.permute_max_token_num
+        elif (
+            _rank_capacity_factor is not None
+            and hasattr(self, '_num_permuted_tokens')
+            and self._num_permuted_tokens is not None
+        ):
+            # Rank-level capacity pre-allocation: static budget, no host-device sync.
+            # self._num_permuted_tokens was computed in _exec_dispatch() before the kernel call.
+            num_out_tokens = self._num_permuted_tokens
+            if not getattr(self, '_budget_post_printed', False):
+                print(
+                    f"[DeepEPTokenDispatcher] _post_dispatch: using budget num_out_tokens={num_out_tokens} "
+                    f"(recv_x.shape[0]={hidden_states.shape[0]}, "
+                    f"factor={_rank_capacity_factor})",
+                    flush=True,
+                )
+                self._budget_post_printed = True
+            if self.handle is not None and len(self.handle) > 0:
+                overflow_flag = self.handle[-1]
+                if overflow_flag is not None:
+                    try:
+                        is_over_budget = bool(overflow_flag.item())
+                    except Exception:
+                        is_over_budget = False
+                    if is_over_budget and not getattr(self, '_overflow_warned', False):
+                        import warnings
+                        warnings.warn(
+                            f"[MoE Rank Capacity Overflow] Actual dispatched tokens exceeded "
+                            f"pre-allocated budget of {self._num_permuted_tokens} tokens "
+                            f"(moe_expert_rank_capacity_factor={_rank_capacity_factor}). "
+                            f"Increase moe_expert_rank_capacity_factor to suppress. "
+                            f"Overflow breaks CUDA graph replay when a graph is active.",
+                            stacklevel=3,
+                        )
+                        self._overflow_warned = True
+        elif _device_initiated and self.tokens_per_expert.numel() > 0:
+            # Device-initiated GEMM without capacity pre-allocation.
+            # Reached only when MOE_EXPERT_RANK_CAPACITY_FACTOR is unset.
+            num_out_tokens = hidden_states.shape[0]
+        elif self.tokens_per_expert.numel() > 0:
+            num_out_tokens = self.tokens_per_expert.sum().item()  # host-device sync (eager mode)
         else:
             # will case cpu sync at permute phase
             num_out_tokens = -1

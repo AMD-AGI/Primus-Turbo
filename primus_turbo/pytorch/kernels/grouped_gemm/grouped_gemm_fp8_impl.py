@@ -392,6 +392,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             group_offs,
             trans_b=trans_b,
             out_dtype=out_dtype,
+            out=kwargs.get("out"),
         )
 
 
@@ -517,6 +518,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             rhs_scales,
             group_offs,
             out_dtype=out_dtype,
+            out=kwargs.get("out"),
         )
 
 
