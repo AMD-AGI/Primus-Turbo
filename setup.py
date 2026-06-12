@@ -431,6 +431,7 @@ if __name__ == "__main__":
     install_requires = [
         "scipy",
         "triton>=3.7.0",
+        "flydsl>=0.2.0",
     ]
 
     if torch_ext is not None:

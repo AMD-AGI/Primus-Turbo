@@ -2,6 +2,7 @@ pre-commit
 clang-format==18.1.6
 build
 scikit-build-core
+triton==3.7.0
 expecttest
 pytest
 pytest-xdist

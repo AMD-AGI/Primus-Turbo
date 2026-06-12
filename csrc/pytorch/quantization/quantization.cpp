@@ -945,4 +945,104 @@ std::vector<at::Tensor> grouped_quantize_mxfp8(const at::Tensor input, const at:
             group_lens_padded_colwise, group_offs_padded_colwise};
 }
 
+// Fused single-pass row + segment-padded col blockwise FP8 quant for grouped GEMM.
+// One bf16/fp16 read of `input` [M, N] emits the row-wise scaled tensor (fwd/dgrad)
+// and the segment-padded col-wise scaled tensor (variable-K wgrad). Row scales are
+// pshuffled [N_blocks, M] to match the persistent GEMM's coalesced scale reads.
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
+                                                                 const at::ScalarType dest_dtype,
+                                                                 const int64_t        block_size,
+                                                                 const at::Tensor     group_lens,
+                                                                 const at::Tensor     group_offs) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2);
+    PRIMUS_TURBO_CHECK(block_size == 128);
+    for (const auto &t : {group_lens, group_offs}) {
+        PRIMUS_TURBO_CHECK(t.is_cuda(), "group_lens / group_offs must be CUDA tensors");
+        PRIMUS_TURBO_CHECK(t.scalar_type() == at::kLong, "group_lens / group_offs must be int64");
+        PRIMUS_TURBO_CHECK(t.is_contiguous(), "group_lens / group_offs must be contiguous");
+    }
+
+    const int64_t M          = input.size(0);
+    const int64_t N          = input.size(1);
+    const int     num_groups = static_cast<int>(group_lens.size(0));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Segment-padded group offsets on-device (avoids div + zeros + cumsum host ops).
+    auto var_k_group_lens = at::empty({num_groups}, group_lens.options());
+    auto var_k_group_offs = at::empty({num_groups + 1}, group_lens.options());
+    compute_padded_group_offs<int64_t>(reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
+                                       reinterpret_cast<int64_t *>(var_k_group_lens.data_ptr()),
+                                       reinterpret_cast<int64_t *>(var_k_group_offs.data_ptr()),
+                                       num_groups, block_size, stream);
+
+    const int64_t M_padded_max = M + num_groups * block_size;
+
+    // Kernel mask-writes cover every position read downstream, so skip zero-init.
+    // Row scales emitted pshuffled [N_blocks, M] to match the fwd GEMM layout.
+    auto x_fp8_row        = at::empty({M, N}, input.options().dtype(dest_dtype));
+    auto x_fp8_col_padded = at::empty({M_padded_max, N}, input.options().dtype(dest_dtype));
+    auto x_scales_row =
+        at::empty({(N + block_size - 1) / block_size, M}, input.options().dtype(at::kFloat));
+    auto x_scales_col_padded = at::empty({(M_padded_max + block_size - 1) / block_size, N},
+                                         input.options().dtype(at::kFloat));
+
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(x_fp8_row.scalar_type(), QType, {
+            quantize_blockwise_segment_m_row_col_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(x_fp8_row.data_ptr()),
+                reinterpret_cast<QType *>(x_fp8_col_padded.data_ptr()),
+                reinterpret_cast<float *>(x_scales_row.data_ptr()),
+                reinterpret_cast<float *>(x_scales_col_padded.data_ptr()),
+                reinterpret_cast<const int64_t *>(group_offs.data_ptr()),
+                reinterpret_cast<const int64_t *>(var_k_group_offs.data_ptr()), M, N, M_padded_max,
+                num_groups, fp8_max, stream);
+        });
+    });
+
+    return {x_fp8_row,           x_fp8_col_padded, x_scales_row,
+            x_scales_col_padded, var_k_group_lens, var_k_group_offs};
+}
+
+// Blockwise FP8 weight quant: 2D [M, N] or 3D [B, M, N], one scalar scale per [128,128] tile.
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype,
+                                                          const int64_t        block_size) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3,
+                       "weight quant requires 2D or 3D input");
+    PRIMUS_TURBO_CHECK(block_size == 128, "only block_size=128 currently supported");
+
+    const bool    is_2d    = (input.dim() == 2);
+    const int64_t B        = is_2d ? 1 : input.size(0);
+    const int64_t M        = is_2d ? input.size(0) : input.size(1);
+    const int64_t N        = is_2d ? input.size(1) : input.size(2);
+    const int64_t m_blocks = (M + block_size - 1) / block_size;
+    const int64_t n_blocks = (N + block_size - 1) / block_size;
+
+    std::vector<int64_t> out_shape =
+        is_2d ? std::vector<int64_t>{M, N} : std::vector<int64_t>{B, M, N};
+    std::vector<int64_t> scale_shape = is_2d ? std::vector<int64_t>{m_blocks, n_blocks}
+                                             : std::vector<int64_t>{B, m_blocks, n_blocks};
+    auto                 output      = at::empty(out_shape, input.options().dtype(dest_dtype));
+    auto                 scale_inv   = at::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    auto        stream  = at::cuda::getCurrentCUDAStream();
+    const float fp8_max = get_float8_max(dest_dtype);
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            quantize_blockwise_for_weight_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()),
+                reinterpret_cast<float *>(scale_inv.data_ptr()), B, M, N, fp8_max, stream);
+        });
+    });
+    return {output, scale_inv};
+}
+
 } // namespace primus_turbo::pytorch

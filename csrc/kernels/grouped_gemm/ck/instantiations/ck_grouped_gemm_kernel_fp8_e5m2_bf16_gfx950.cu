@@ -14,7 +14,9 @@ APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH, GPUA
 APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_256x256x128_16x16x128_2x2x1_padding)
 APPLY_CK_GG_TENSOR_ROW_QUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_32x32x64_2x2x1)
 // For 1x4x1 config: ABQuantGrouped only
-APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
+// CK grouped BLOCKWISE (ABQuantGrouped) dropped: Triton is the production blockwise path.
+// Instantiations kept commented (not deleted) to cut CK compile time; see PR discussion.
+// APPLY_CK_GG_ABQUANT_LAYOUT_WITH_ARCH(DECL_CK_QGG_RUNNER_WITH_ARCH, GPUArch::GFX950, ck_tile::bf8_t, ck_tile::bf8_t, ck_tile::bfloat16_t, GFX950_CKGroupedGemmTileCfg_128x128x128_16x16x128_1x4x1)
 #endif
 // clang-format on
 } // namespace primus_turbo
