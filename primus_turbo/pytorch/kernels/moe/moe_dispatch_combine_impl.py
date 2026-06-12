@@ -184,14 +184,11 @@ def _get_backend_instance(name: str) -> EPBackend:
 
 
 def _release_other_backends(active_name: str) -> None:
-    """Release comm buffers of every EP backend except ``active_name`` (and UCCL,
-    whose destroy() corrupts the HIP context). Only one live EP backend per
-    process: a leftover buffer otherwise deadlocks the active backend's init."""
+    """Release other EP backends' buffers (one live backend per process; skips uccl)."""
     for name, inst in _backend_instances.items():
-        if name in (active_name, "UCCL"):
+        if name == active_name or not inst.can_release(will_reinit=True):
             continue
-        is_init = getattr(inst, "is_initialized", None)
-        if is_init is None or not is_init():
+        if not inst.is_initialized():
             continue
         try:
             inst.release_buffer()
@@ -402,6 +399,22 @@ class MoEDispatchCombineAutoTuner:
         if not names:
             raise RuntimeError("MoE autotune: no EP backends are available.")
 
+        # Drop backends infeasible on this topology (e.g. TURBO inter-node SIGABRTs).
+        feasible: List[str] = []
+        for name in names:
+            impl = _BACKEND_REGISTRY.get(name)
+            if impl is not None and not impl.is_feasible(group):
+                logger.info(
+                    f"MoE autotune: skipping backend '{name}'; not feasible on this topology.",
+                    once=True,
+                    rank=0,
+                )
+                continue
+            feasible.append(name)
+        names = feasible
+        if not names:
+            raise RuntimeError("MoE autotune: no feasible EP backend for this topology.")
+
         tune_start = time.perf_counter()
 
         # Detect multi-node topology once; reused to guard backend candidates
@@ -470,9 +483,8 @@ class MoEDispatchCombineAutoTuner:
                 )
                 continue
             finally:
-                # Free this candidate's tuning buffer before the next one. UCCL
-                # is exempt: its destroy() corrupts the HIP context (TODO: fix).
-                if name != "UCCL":
+                # Free the tuning buffer (winner will re-init); uccl/mori keep it for reuse.
+                if backend.can_release(will_reinit=True):
                     try:
                         backend.release_buffer()
                     except Exception as exc:  # noqa: BLE001 - best-effort cleanup
@@ -495,6 +507,24 @@ class MoEDispatchCombineAutoTuner:
                 f"MoE autotune: all candidate backends failed ({names}). "
                 f"Check logs and EP buffer configuration."
             )
+
+        # Free non-winner buffers so they don't waste HBM (skips uccl, can't free).
+        for name, inst in list(_backend_instances.items()):
+            if name == best.backend_name:
+                continue
+            if not inst.is_initialized():
+                continue
+            if not inst.can_release(will_reinit=False):  # dead loser, never re-init'd
+                continue
+            try:
+                inst.release_buffer()
+                logger.info(
+                    f"MoE autotune: freed non-winner '{name}' buffer " f"(winner={best.backend_name}).",
+                    rank=0,
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(f"MoE autotune: post-sweep release_buffer('{name}') failed: {exc!r}")
+
         best.per_backend = per_backend
         best.tune_duration_s = time.perf_counter() - tune_start
         return best
@@ -619,8 +649,8 @@ def _maybe_tune_config(
     if not GlobalBackendManager.auto_tune_enabled():
         return backend_name, user_cfg, None
 
-    # Autotune on: if a backend is pinned (env/code), tune only that one;
-    # otherwise sweep all available backends.
+    # Candidates: pinned backend (tune only that one), else all available
+    # (infeasible backends are dropped in tune() via is_feasible).
     pinned_bt = GlobalBackendManager.get_ep_backend(PrecisionType.BF16_FP16_FP32)
     pinned_candidates = (
         [_BACKEND_TYPE_TO_NAME[pinned_bt]]

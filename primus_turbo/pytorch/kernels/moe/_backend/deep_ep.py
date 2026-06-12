@@ -5,11 +5,9 @@
 ###############################################################################
 """External ``deep_ep`` package backend (optional)."""
 
-import inspect
+from typing import Optional
 
-import torch.distributed as dist
-
-from .base import _DeepEPLikeBackend
+from .base import _DeepEPLikeBackend, apply_uccl_network_env, call_once
 
 
 class DeepEPBackend(_DeepEPLikeBackend):
@@ -30,12 +28,22 @@ class DeepEPBackend(_DeepEPLikeBackend):
 
         return deep_ep
 
-    def _make_buffer_kwargs(self, group: dist.ProcessGroup) -> dict:
-        BufferClass = self._get_module().Buffer
+    @classmethod
+    def _is_uccl_backed(cls) -> bool:
+        # uccl wrapper re-exports Config from uccl.ep; on import error assume uccl (never free).
         try:
-            param = inspect.signature(BufferClass).parameters.get("is_intranode")
-        except (TypeError, ValueError):
-            param = None
-        if param is not None and param.default is False:
-            return {"is_intranode": group.size() <= 8}
-        return {}
+            config = getattr(cls._get_module(), "Config", None)
+        except Exception:  # noqa: BLE001 - import quirks must not break capability checks
+            return True
+        return getattr(config, "__module__", "").startswith("uccl")
+
+    @classmethod
+    def can_release(cls, *, will_reinit: bool) -> bool:  # noqa: ARG003
+        # uccl destroy() corrupts the HIP context: never release.
+        return not cls._is_uccl_backed()
+
+    @call_once
+    def setup_env(self, **overrides: Optional[str]) -> None:
+        # The uccl-backed wrapper needs the UCCL_* RDMA env like the UCCL backend.
+        if self._is_uccl_backed():
+            apply_uccl_network_env(**overrides)
