@@ -283,6 +283,7 @@ at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, 
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()), "Input must be FP8");
+    PRIMUS_TURBO_CHECK(scale_inv.is_cuda(), "scale_inv must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(scale_inv.dim() == 2, "scale_inv must be 2D");
     PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
     PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat8_e8m0fnu ||
@@ -292,6 +293,7 @@ at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, 
                            dest_dtype == at::kFloat,
                        "Output dtype must be bf16/fp16/fp32");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(block_size == MXFP8_BLOCK_SIZE, "block_size must be ", MXFP8_BLOCK_SIZE);
 
     const bool    use_rowwise = (axis == 1);
     const int64_t num_rows    = input.size(0);
@@ -335,6 +337,7 @@ at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, 
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kFloat4_e2m1fn_x2,
                        "Input must be Float4_e2m1fn_x2");
+    PRIMUS_TURBO_CHECK(scale_inv.is_cuda(), "scale_inv must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(scale_inv.dim() == 2, "scale_inv must be 2D");
     PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
     PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat8_e8m0fnu ||
@@ -344,6 +347,7 @@ at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, 
                            dest_dtype == at::kFloat,
                        "Output dtype must be bf16/fp16/fp32");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(block_size == MXFP4_BLOCK_SIZE, "block_size must be ", MXFP4_BLOCK_SIZE);
 
     const bool    use_rowwise = (axis == 1);
     const int64_t num_rows    = input.size(0);
