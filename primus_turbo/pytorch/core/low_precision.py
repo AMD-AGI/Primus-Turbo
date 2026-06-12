@@ -169,7 +169,7 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
-    use_weight_block_scaling: Optional[bool] = None
+    use_2d_block_weight_scaling: Optional[bool] = None
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
