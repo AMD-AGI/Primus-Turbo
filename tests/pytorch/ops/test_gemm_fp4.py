@@ -103,7 +103,12 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     # Config + FWD + BWD
     # NOTE: scaling recipe reference: https://arxiv.org/pdf/2509.25149
     config = Float4QuantConfig(
-        granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
+        granularity=granularity,
+        format=format,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_2d_block_weight_scaling=True,
+        use_gradient_rht=True,
     )
     print(config)
     c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
@@ -179,11 +184,16 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
     c_ref.backward(grad_c)
     torch.cuda.synchronize()
 
+    use_2d_block_weight_scaling = True
+    use_gradient_rht = True
+
     config = Float4QuantConfig(
         granularity=ScalingGranularity.MX_BLOCKWISE,
         format=format,
         block_size=32,
         scale_dtype=ScaleDtype.E8M0,
+        use_2d_block_weight_scaling=use_2d_block_weight_scaling,
+        use_gradient_rht=use_gradient_rht,
     )
 
     fp4_dtype = FP4GemmMXFunction.get_fp4_dtype(format)
@@ -211,7 +221,7 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
         block_size=config.block_size,
         axis=1,
         scaling_recipe=ScalingRecipe(
-            use_2d_block=True,
+            use_2d_block=use_2d_block_weight_scaling,
             use_sr=False,
             use_rht=False,
         ),
