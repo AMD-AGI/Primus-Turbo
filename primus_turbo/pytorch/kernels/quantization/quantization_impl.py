@@ -451,27 +451,23 @@ def quantize_mxfp8_impl(
 def grouped_quantize_mxfp8_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
-    axis: Union[int, None],
     block_size: int,
     group_lens: torch.Tensor,
     group_offs: torch.Tensor,
-    with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Union[
-    Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ],
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
-    """MXFP8 quantization fused with per-group M-axis zero-padding.
+    """MXFP8 dual (rowwise + colwise) quantization fused with per-group M-axis
+    zero-padding.
 
     Each per-group region of ``x`` (defined by ``group_lens`` / ``group_offs``)
     is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
@@ -483,73 +479,11 @@ def grouped_quantize_mxfp8_impl(
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
-    if with_trans:
-        scaling_recipe_for_trans = (
-            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
-        )
-    else:
-        scaling_recipe_for_trans = scaling_recipe
-
-    if not with_trans:
-        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
-    else:
-        assert axis is None, "The axis must be None when with_trans is True."
-
-    if with_trans:
-        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
-            x,
-            group_lens,
-            group_offs,
-            out_dtype,
-            scaling_recipe.use_2d_block,
-            scaling_recipe_for_trans.use_2d_block,
-            scaling_recipe.shuffle_scale,
-            scaling_recipe.shuffle_out,
-            scaling_recipe_for_trans.shuffle_scale,
-            scaling_recipe_for_trans.shuffle_out,
-        )
-    else:
-        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8(
-            x,
-            group_lens,
-            group_offs,
-            out_dtype,
-            axis,
-            scaling_recipe.use_2d_block,
-            scaling_recipe.shuffle_scale,
-            scaling_recipe.shuffle_out,
-        )
-
-
-def quantize_mxfp8_dual_grouped_impl(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    scaling_recipe: Optional[ScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MXFP8 dual quantization fused with per-group M-axis zero-padding.
-
-    Each per-group region of ``x`` (defined by ``group_lens`` /
-    ``group_offs``) is virtually zero-padded along M to 128.  The padded
-    per-group layout is computed on GPU (no D2H sync); outputs are
-    allocated at the host-known upper bound
-    ``ceil((total_M + G * 128) / 128) * 128`` so the call is fully async.
-
-    Returns ``(rowwise_fp8, rowwise_scale, colwise_fp8, colwise_scale,
-    group_lens_padded, group_offs_padded)``.  Only
-    ``[0, group_offs_padded[-1])`` rows of the outputs hold valid data.
-    """
-    mxfp8_support, reason = check_mxfp8_support()
-    assert mxfp8_support, reason
-
-    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
     scaling_recipe_for_trans = (
         ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
     )
 
-    return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual_grouped(
+    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
         x,
         group_lens,
         group_offs,

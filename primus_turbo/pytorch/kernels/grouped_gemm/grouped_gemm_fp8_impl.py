@@ -30,8 +30,8 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_rowwise_variable_k_triton_kernel,
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
-    grouped_gemm_mxfp8_forward,
-    grouped_gemm_mxfp8_variable_k,
+    grouped_gemm_mxfp8_triton_kernel,
+    grouped_gemm_mxfp8_variable_k_triton_kernel,
 )
 
 _COMMON_SUPPORTED_DTYPES = (
@@ -382,7 +382,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             N = b.shape[-2]
             K = b.shape[-1]
             group_offs_out = kwargs.get("group_offs_out", None)
-            return grouped_gemm_mxfp8_forward(
+            return grouped_gemm_mxfp8_triton_kernel(
                 a,
                 a_scales,
                 b,
@@ -392,6 +392,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
                 K,
                 group_offs_out=group_offs_out,
                 out_dtype=out_dtype,
+                num_cu=num_cu,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_triton_kernel(
@@ -539,7 +540,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             OUT_M = lhs.shape[0]
             OUT_N = rhs.shape[0]
             G = group_lens.shape[0]
-            return grouped_gemm_mxfp8_variable_k(
+            return grouped_gemm_mxfp8_variable_k_triton_kernel(
                 lhs,
                 lhs_scales,
                 rhs,
@@ -549,6 +550,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 OUT_N,
                 G,
                 out_dtype=out_dtype,
+                num_cu=num_cu,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
@@ -756,9 +758,15 @@ def grouped_gemm_fp8_variable_k_impl_meta(
         torch.float16,
         torch.bfloat16,
     ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
-    assert trans_a and not trans_b, "Only trans_a=True and trans_b=False are supported."
 
     bs = group_lens.shape[0]
+    if ScalingGranularity(granularity) == ScalingGranularity.MX_BLOCKWISE:
+        # MX wgrad: C[g] (OUT_M, OUT_N) = lhs[:,g] @ rhs[:,g]^T, lhs/rhs swapped by
+        # trans_c (matches the eager path). Output (G, OUT_M, OUT_N).
+        lhs, rhs = (b, a) if trans_c else (a, b)
+        return torch.empty((bs, lhs.shape[0], rhs.shape[0]), device=a.device, dtype=out_dtype)
+
+    assert trans_a and not trans_b, "Only trans_a=True and trans_b=False are supported."
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
     if trans_c:

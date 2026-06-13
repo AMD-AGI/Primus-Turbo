@@ -19,6 +19,28 @@ template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 
+// Segment-padded group offsets (each segment rounded up to block_size), on-device.
+template <typename IndexType>
+void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padded_lens_ptr,
+                               IndexType *padded_offs_ptr, const int64_t group_num,
+                               const IndexType block_size, hipStream_t stream);
+
+// Fused single-pass row + segment-padded col blockwise FP8 quant (grouped fwd/bwd).
+template <typename FType, typename QType>
+void quantize_blockwise_segment_m_row_col_impl(const FType *x, QType *y_row, QType *y_col_padded,
+                                               float *scales_row, float *scales_col_padded,
+                                               const int64_t *group_offs,
+                                               const int64_t *padded_group_offs, const int64_t M_in,
+                                               const int64_t N, const int64_t M_padded_max,
+                                               const int num_groups, const float fp8_max,
+                                               hipStream_t stream);
+
+// Blockwise FP8 weight quant: [B, M, N] (or [M, N]), one scalar scale per [128,128] tile.
+template <typename FType, typename QType>
+void quantize_blockwise_for_weight_impl(const FType *w, QType *w_fp8, float *w_scales_inv,
+                                        const int64_t B, const int64_t M, const int64_t N,
+                                        const float fp8_max, hipStream_t stream);
+
 template <typename FType, typename QType, typename ComputeType = float,
           bool PreComputeScale = false>
 void quantize_rowwise_row_major_impl(const FType *x, float *scale, float *scale_inv, QType *y,
@@ -112,15 +134,6 @@ void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                          detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          detail::ScalingRecipe recipe, hipStream_t stream);
-
-template <typename IType, typename OType>
-void quantize_mxfp8_grouped_impl(const IType *input, OType *output, uint8_t *scale,
-                                 const int64_t       *group_offs,
-                                 const int64_t       *group_offs_padded_colwise,
-                                 const int64_t       *group_offs_padded_rowwise,
-                                 detail::QuantizeMode mode, int G, int total_M_padded, int N,
-                                 int N_pad, int scale_stride, int scale_N, int scale_M_pad,
-                                 int scale_N_pad, detail::ScalingRecipe recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void grouped_quantize_mxfp8_dual_impl(

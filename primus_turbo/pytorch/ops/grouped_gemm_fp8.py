@@ -492,7 +492,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None, None
 
 
-class GroupedGemmFP8MXFunc(torch.autograd.Function):
+class FP8GroupedGemmMXFunc(torch.autograd.Function):
     """MXFP8 grouped GEMM autograd (MX_BLOCKWISE), Triton backend.
 
     Same interface as the hip path; only the backend differs
@@ -673,7 +673,8 @@ def grouped_gemm_fp8(
         trans_b: Whether B is transposed (default: True)
         out_dtype: Output dtype (default: None, inferred from input dtypes)
         config: FP8 quantization config. If None, uses default (TENSORWISE, E4M3, DYNAMIC)
-        num_cu: Number of compute units. If None, uses default (-1)
+        num_cu: Cap on the number of compute units the grouped GEMM may use
+            (limits the persistent-kernel grid). If None, uses all CUs on the device.
 
     Returns:
         Output tensor with shape [m, n] (same dtype as input)
@@ -721,6 +722,6 @@ def grouped_gemm_fp8(
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
-        return GroupedGemmFP8MXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
+        return FP8GroupedGemmMXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

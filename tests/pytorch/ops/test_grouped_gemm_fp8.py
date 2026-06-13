@@ -513,7 +513,7 @@ def test_grouped_gemm_fp8_blockwise(
 # sweep, including HYBRID: the MX kernels take per-operand fp8 formats via
 # tl.dot_scaled, so HYBRID (e4m3 weights, e5m2 grad_out) works in dgrad/wgrad.
 #
-# Constraint handled by the wrapper (`GroupedGemmFP8MXFunc`), not the test:
+# Constraint handled by the wrapper (`FP8GroupedGemmMXFunc`), not the test:
 #   - balance=False (per-group M_g not multiple of 128): a / grad_out are
 #     zero-padded along the M axis so wgrad sees 128-aligned per-group sizes.
 @pytest.mark.parametrize("B", B_VALUES)

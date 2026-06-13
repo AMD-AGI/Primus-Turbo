@@ -26,6 +26,12 @@ Contains:
     - grouped_gemm_fp8_blockwise_triton_kernel: Forward public API
     - grouped_gemm_fp8_blockwise_variable_k_triton_kernel: Backward public API
 
+  MXFP8 (per-1x32 E8M0 block) scaling, via tl.dot_scaled:
+    - _grouped_mxfp8_persistent_gemm_kernel: Forward
+    - _grouped_mxfp8_variable_k_gemm_kernel: Backward variable-K
+    - grouped_gemm_mxfp8_triton_kernel: Forward public API
+    - grouped_gemm_mxfp8_variable_k_triton_kernel: Backward public API
+
 Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these kernels.
 """
 
@@ -2153,8 +2159,17 @@ def _grouped_mxfp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
-def grouped_gemm_mxfp8_forward(
-    a, a_scale, b, b_scale, group_offs, N, K, group_offs_out=None, out_dtype=torch.bfloat16
+def grouped_gemm_mxfp8_triton_kernel(
+    a,
+    a_scale,
+    b,
+    b_scale,
+    group_offs,
+    N,
+    K,
+    group_offs_out=None,
+    out_dtype=torch.bfloat16,
+    num_cu=None,
 ):
     """A(M_in,K) @ B(G,N,K)^T → C. scales are e8m0 viewed as uint8.
 
@@ -2178,7 +2193,7 @@ def grouped_gemm_mxfp8_forward(
     # e5m2) and HYBRID (e5m2 grad_out x e4m3 weight in the bwd GEMMs).
     a_fmt = "e5m2" if a.dtype == torch.float8_e5m2 else "e4m3"
     b_fmt = "e5m2" if b.dtype == torch.float8_e5m2 else "e4m3"
-    cu = torch.cuda.get_device_properties(a.device).multi_processor_count
+    cu = num_cu if num_cu is not None else torch.cuda.get_device_properties(a.device).multi_processor_count
     BM, BN, BK = 256, 256, 128
     m_alloc = a.shape[0]  # padded upper bound on output rows
     avg_m = max(m_alloc // max(G, 1), 1)
@@ -2343,8 +2358,8 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
         tl.store(C_, c, cmask)
 
 
-def grouped_gemm_mxfp8_variable_k(
-    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16
+def grouped_gemm_mxfp8_variable_k_triton_kernel(
+    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
 ):
     """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
     if is_gfx950():
@@ -2356,7 +2371,7 @@ def grouped_gemm_mxfp8_variable_k(
     # e4m3 activation.
     lhs_fmt = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
     rhs_fmt = "e5m2" if rhs.dtype == torch.float8_e5m2 else "e4m3"
-    cu = torch.cuda.get_device_properties(lhs.device).multi_processor_count
+    cu = num_cu if num_cu is not None else torch.cuda.get_device_properties(lhs.device).multi_processor_count
     # Asymmetric 256x128 tile: with the R operand loaded directly as (BK,BN)
     # (no in-reg transpose) the VGPR budget fits 256x128, matching the
     # tensorwise variable_k throughput (~3.7x over the old 128x128 + r.T).

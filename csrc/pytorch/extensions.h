@@ -33,6 +33,24 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt);
 
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
+                                                                 const at::ScalarType dest_dtype,
+                                                                 const int64_t        block_size,
+                                                                 const at::Tensor     group_lens,
+                                                                 const at::Tensor     group_offs);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t block_size,
+    const at::Tensor group_lens, const at::Tensor group_offs);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype,
+                                                          const int64_t        block_size);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor     input,
+                                                               const at::ScalarType dest_dtype,
+                                                               const int64_t        block_size);
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                              const at::ScalarType dest_dtype, const int64_t axis,
                                              c10::optional<at::Tensor> scale_opt);
@@ -100,25 +118,12 @@ std::vector<at::Tensor> grouped_quantize_mxfp8_dual(
     const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
     const bool shuffle_colwise = false);
 
-std::vector<at::Tensor> quantize_mxfp8_dual_grouped_meta(
+std::vector<at::Tensor> grouped_quantize_mxfp8_dual_meta(
     const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
     const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
     const bool colwise_use_2d_block, const bool shuffle_rowwise_scale = false,
     const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
     const bool shuffle_colwise = false);
-
-std::vector<at::Tensor> grouped_quantize_mxfp8(const at::Tensor input, const at::Tensor group_lens,
-                                               const at::Tensor     group_offs,
-                                               const at::ScalarType dest_dtype, const int64_t axis,
-                                               const bool use_2d_block,
-                                               const bool shuffle_scale = false,
-                                               const bool shuffle_out   = false);
-
-std::vector<at::Tensor>
-grouped_quantize_mxfp8_meta(const at::Tensor input, const at::Tensor group_lens,
-                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
-                            const int64_t axis, const bool use_2d_block,
-                            const bool shuffle_scale = false, const bool shuffle_out = false);
 
 std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
                                        const int64_t axis, const int64_t padding_align_size,
