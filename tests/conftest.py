@@ -45,6 +45,10 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
+    config.addinivalue_line(
+        "markers",
+        "slow: mark test as slow / real-model-size (deselect with -m 'not slow')",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
