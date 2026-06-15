@@ -85,7 +85,15 @@ def quant_fp8_blockwise_dual_kernel(
     x_tile_abs = tl.abs(x_tile)
 
     x_fp8_row_tile, x_scales_row_tile = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX)
-    x_fp8_col_tile, x_scales_col_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
+    # Col-axis (axis=0) reduction routed through tl.trans so the max-reduction runs
+    # along the contiguous axis (axis=1 of the transposed tile). This swizzles the LDS
+    # staging and eliminates the strided cross-lane bank conflicts of the direct axis=0
+    # reduction. Algebraically/byte-identical: same per-column max, scale, and quant.
+    x_tile_t = tl.trans(x_tile)
+    x_tile_abs_t = tl.trans(x_tile_abs)
+    x_fp8_col_tile_t, x_scales_col_tile_t = compute_scale_and_quant(x_tile_t, x_tile_abs_t, 1, FP8_MAX)
+    x_fp8_col_tile = tl.trans(x_fp8_col_tile_t)
+    x_scales_col_tile = tl.trans(x_scales_col_tile_t)
 
     x_fp8_row_ptrs = x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=mask)
