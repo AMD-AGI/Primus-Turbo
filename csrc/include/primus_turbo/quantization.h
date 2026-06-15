@@ -75,6 +75,13 @@ struct ScalingRecipe {
 
     bool shuffle_scale = false;
     bool shuffle_out   = false;
+
+    // FlyDSL mxfp8 GEMM scale pre-shuffle (fused into the quant scale write):
+    // layout 0=none, 1=A (per-wave sub-tiles), 2=B (combined 4 sub-tiles); n_tiles
+    // = BLOCK_M//64 (A only); pack 1=broadcast, 2/4=opsel byte-pack.
+    int preshuffle_layout  = 0;
+    int preshuffle_n_tiles = 0;
+    int preshuffle_pack    = 1;
 };
 
 constexpr int FP32_MANTISSA_BITS     = 23;

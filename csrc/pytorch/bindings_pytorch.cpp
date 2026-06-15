@@ -69,7 +69,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
     m.def("quantize_mxfp8(Tensor input, ScalarType dest_dtype, int axis, "
           "int padding_align_size, "
-          "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+          "bool use_2d_block, bool shuffle_scale=False, bool shuffle_out=False, "
+          "int preshuffle_layout=0, int preshuffle_n_tiles=0) -> Tensor[]");
     m.def("dequantize_mxfp8(Tensor input, Tensor scale_inv, int axis, int block_size, "
           "ScalarType dest_dtype) -> Tensor");
 

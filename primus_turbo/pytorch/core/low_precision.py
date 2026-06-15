@@ -161,6 +161,13 @@ class ScalingRecipe(NamedTuple):
     shuffle_scale: bool = False
     shuffle_out: bool = False
 
+    # FlyDSL mxfp8 GEMM scale pre-shuffle fused into the quant scale write.
+    # layout: 0=none, 1=A broadcast (NT), 2=A byte-pack (NN/TN), 3=B broadcast (NT),
+    # 4=B byte-pack (NN/TN). n_tiles=BLOCK_M//64 (A only). The byte-pack factor is
+    # derived from K inside the op (_mx_pack), so it is not a separate field.
+    preshuffle_layout: int = 0
+    preshuffle_n_tiles: int = 0
+
 
 @dataclass
 class Float8QuantConfig:

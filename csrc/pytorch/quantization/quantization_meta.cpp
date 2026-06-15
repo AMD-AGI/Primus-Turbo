@@ -373,7 +373,8 @@ grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_
 std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
                                             const int64_t axis, const int64_t padding_align_size,
                                             const bool use_2d_block, const bool shuffle_scale,
-                                            const bool shuffle_out) {
+                                            const bool shuffle_out, const int64_t preshuffle_layout,
+                                            const int64_t preshuffle_n_tiles) {
     using namespace primus_turbo::detail;
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
@@ -433,7 +434,20 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
     int64_t scale_N_pad = cdiv(scale_N, 8) * 8;
 
     at::Tensor scale_tensor;
-    if (shuffle_scale) {
+    if (preshuffle_layout != 0) {
+        const int64_t ki    = scale_N / 4;
+        const bool    bc    = (preshuffle_layout == 1 || preshuffle_layout == 3);
+        const int64_t pack  = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        const int64_t K128p = ki / pack;
+        int64_t    dwords   = (preshuffle_layout <= 2) ? (scale_outer / (16 * preshuffle_n_tiles)) *
+                                                        K128p * 64 * preshuffle_n_tiles
+                                                       : (scale_outer / 64) * K128p * 64 * 4;
+        at::Tensor pout     = at::empty({scale_outer, N_pad}, // rowwise 2D fp8 output
+                                        at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        return {pout.view(dest_dtype),
+                at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta))
+                    .view(at::kFloat8_e8m0fnu)};
+    } else if (shuffle_scale) {
         scale_tensor = at::empty({Gout * scale_M_pad, scale_N_pad},
                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {

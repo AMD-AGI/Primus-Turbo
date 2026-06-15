@@ -443,6 +443,8 @@ def quantize_mxfp8_impl(
             scaling_recipe.use_2d_block,
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
+            scaling_recipe.preshuffle_layout,
+            scaling_recipe.preshuffle_n_tiles,
         )
 
 

@@ -699,7 +699,8 @@ quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
 std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
                                        const int64_t axis, const int64_t padding_align_size,
                                        const bool use_2d_block, const bool shuffle_scale,
-                                       const bool shuffle_out) {
+                                       const bool shuffle_out, const int64_t preshuffle_layout,
+                                       const int64_t preshuffle_n_tiles) {
     using namespace primus_turbo::detail;
 
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
@@ -767,9 +768,44 @@ std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarT
     int64_t scale_M_pad = cdiv(scale_outer, 256) * 256;
     int64_t scale_N_pad = cdiv(scale_N, 8) * 8;
 
+    // Public preshuffle_layout (1=A-bc, 2=A-pk, 3=B-bc, 4=B-pk) -> kernel operand
+    // (1=A / 2=B) + derived byte-pack (broadcast => 1, else _mx_pack(K)). Computed
+    // once; used for both the scale buffer size and the kernel recipe.
+    int k_pre_layout = 0, k_pre_pack = 1;
+    if (preshuffle_layout != 0) {
+        const int64_t ki = scale_N / 4; // K // 128
+        const bool    bc = (preshuffle_layout == 1 || preshuffle_layout == 3);
+        k_pre_pack       = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        k_pre_layout     = (preshuffle_layout <= 2) ? 1 : 2;
+    }
+
     int64_t    scale_stride = 1;
     at::Tensor scale_tensor;
-    if (shuffle_scale) {
+    if (preshuffle_layout != 0) {
+        // FlyDSL mxfp8 GEMM preshuffle layout, fused into the scale write. Only the
+        // rowwise (free, K//32) E8M0 scale is preshuffled; the gemm consumes it as a
+        // flat int32 buffer. Requires aligned shapes (gemm constraints already met).
+        PRIMUS_TURBO_CHECK(is_rowwise && !is_batched, "preshuffle: rowwise 2D only");
+        PRIMUS_TURBO_CHECK(!shuffle_scale && !shuffle_out, "preshuffle excludes shuffle_scale/out");
+        const int64_t K128p = (scale_N / 4) / k_pre_pack; // K-iters per i32 group
+        int64_t       dwords;
+        if (k_pre_layout == 1) { // A: (free//(16*nt)) groups x nt sub-tiles
+            PRIMUS_TURBO_CHECK(scale_outer % (16 * preshuffle_n_tiles) == 0,
+                               "preshuffle A: free dim must be a multiple of 16*n_tiles");
+            dwords = (scale_outer / (16 * preshuffle_n_tiles)) * K128p * 64 * preshuffle_n_tiles;
+        } else { // B: combined 4 sub-tiles per 64-row group
+            PRIMUS_TURBO_CHECK(scale_outer % 256 == 0,
+                               "preshuffle B: free dim must be a multiple of 256");
+            dwords = (scale_outer / 64) * K128p * 64 * 4;
+        }
+        // pack==2 leaves bytes 2,3 of each i32 unwritten (opsel never reads them);
+        // zero-init so the buffer is bit-identical to the host preshuffle. pack 1/4
+        // write every read byte, so at::empty (no memset) is enough there.
+        auto opts = at::TensorOptions().dtype(at::kByte).device(device);
+        scale_tensor =
+            (k_pre_pack == 2) ? at::zeros({dwords * 4}, opts) : at::empty({dwords * 4}, opts);
+        scale_stride = scale_N;
+    } else if (shuffle_scale) {
         scale_tensor = at::full({Gout * scale_M_pad, scale_N_pad}, E8M0_EXPONENT_BIAS,
                                 at::TensorOptions().dtype(at::kByte).device(device));
         scale_stride = scale_tensor.stride(0);
@@ -792,7 +828,9 @@ std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarT
                 reinterpret_cast<IType *>(input.data_ptr()),
                 reinterpret_cast<OType *>(output.data_ptr()), scale_tensor.data_ptr<uint8_t>(),
                 mode, G, M, N, M_pad, N_pad, scale_stride, scale_N, scale_M_pad, scale_N_pad,
-                ScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out), stream);
+                ScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out, k_pre_layout,
+                              (int) preshuffle_n_tiles, k_pre_pack),
+                stream);
         })});
 
     if (is_batched) {
