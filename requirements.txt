@@ -1,6 +1,5 @@
 pre-commit
 clang-format==18.1.6
-hipify_torch @ git+https://github.com/ROCm/hipify_torch.git
 build
 ninja>=1.10
 scikit-build-core
@@ -12,5 +11,7 @@ expecttest
 pytest
 pytest-xdist
 setuptools==69.5.1
-scipy
+setuptools_scm[toml]>=8
+wheel
 pyyaml
+twine

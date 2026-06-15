@@ -292,7 +292,23 @@ LOWERING_TABLE[moe_internode_cached_dispatch_p] = _moe_internode_cached_dispatch
 # ----------------------------------------
 # Step-5: batching
 # ----------------------------------------
-# TODO
+# Cross-rank IPC primitives: their per-rank outputs (12 for moe_dispatch, 5 for
+# moe_cached_dispatch) cannot be merged across the batch axis, so the plain rule
+# scans per microbatch.  See primus_turbo.jax.primitive._batching for the shared
+# scan / SPMD-aware factory and the pipeline-parallel rationale.
+from jax.interpreters import batching
+
+from primus_turbo.jax.primitive._batching import make_ipc_batchers
+
+(
+    batching.primitive_batchers[moe_dispatch_p],
+    batching.fancy_primitive_batchers[moe_dispatch_p],
+) = make_ipc_batchers(moe_dispatch_p, num_outputs=12)
+
+(
+    batching.primitive_batchers[moe_cached_dispatch_p],
+    batching.fancy_primitive_batchers[moe_cached_dispatch_p],
+) = make_ipc_batchers(moe_cached_dispatch_p, num_outputs=5)
 
 
 __all__ = [

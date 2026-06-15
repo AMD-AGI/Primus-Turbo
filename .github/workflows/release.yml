@@ -1,0 +1,149 @@
+name: Release
+
+# Tag-driven release: build sdist -> validate on GPU -> publish GitHub Release
+# -> regenerate PEP 503 index -> deploy to GitHub Pages.
+#
+# workflow_dispatch reruns only the index build + deploy (use after editing
+# tools/yanked.txt to yank a bad release, or to repair the index).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create GitHub Releases
+  pages: write      # deploy Pages
+  id-token: write   # Pages OIDC
+
+concurrency:
+  group: release-pages
+  cancel-in-progress: false
+
+env:
+  # Required aiter release. Keep in sync with AITER_GIT_TAG in primus_turbo/common/aiter_utils.py.
+  AITER_VERSION: v0.1.14.post1
+
+jobs:
+  build-sdist:
+    # Built on the ROCm runner: setup.py imports torch/hipcc while configuring
+    # the extensions even for an sdist, so a ROCm + torch environment is needed.
+    # (--no-isolation reuses the container's torch; sdist only packages source,
+    # it does not compile.)
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: turbo-torch-ut-v2602
+    steps:
+      - name: Change owner
+        run: sudo chown -R $(id -u):$(id -g) ${GITHUB_WORKSPACE} || true
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0   # setuptools_scm needs full history + tags
+      - name: Build sdist
+        run: |
+          pip3 install -r requirements.txt
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" \
+            python3 -m build --sdist --no-isolation
+      - name: Show version baked into sdist
+        run: |
+          tar -xzf dist/*.tar.gz -O '*/PKG-INFO' | grep -i '^Version:' || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  validate:
+    # Gate: install the actual sdist (triggers HIP compile) on a real GPU and
+    # run the test suite. Nothing publishes unless this passes.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-sdist
+    runs-on: turbo-torch-ut-v2602
+    env:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - name: Change owner
+        run: sudo chown -R $(id -u):$(id -g) ${GITHUB_WORKSPACE} || true
+      # No submodules: validate installs the self-contained sdist and only needs
+      # tests/ and requirements.txt from the repo (both live in the main tree).
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Install from sdist (compiles) + deps
+        run: |
+          unset AITER_ASM_DIR
+          pip3 uninstall -y aiter amd-aiter primus-turbo || true
+          pip3 install -r requirements.txt
+          pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@${AITER_VERSION}"
+          GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" \
+            pip3 install --no-build-isolation "$(ls dist/primus_turbo-*.tar.gz)[pytorch]" -v
+      - name: Smoke import + version
+        run: |
+          # Remove the source package so we import the INSTALLED sdist build,
+          # not the (uncompiled) ./primus_turbo source tree.
+          rm -rf primus_turbo
+          python3 -c "import primus_turbo; print('primus_turbo', primus_turbo.__version__)"
+      - name: Run PyTorch tests
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 135
+          max_attempts: 2
+          command: >
+            timeout -k 60s 130m bash -lc
+            "exec pytest -v tests/pytorch -n 8 --log-cli-level=INFO"
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Detect prerelease (tag contains rc)
+        id: pre
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *rc* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          prerelease: ${{ steps.pre.outputs.prerelease }}
+          generate_release_notes: true
+
+  build-index:
+    # Runs after a successful publish (tag flow) or on manual dispatch (yank/repair).
+    needs: publish-release
+    if: always() && (needs.publish-release.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate PEP 503 index
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 tools/gen_pep503_index.py --output _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy-pages:
+    needs: build-index
+    if: always() && needs.build-index.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

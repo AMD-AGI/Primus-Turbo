@@ -110,4 +110,13 @@ template <bool IS_half> PRIMUS_TURBO_DEVICE float uint16_to_float(uint16_t val) 
     }
 }
 
+/*
+ * MX block-scaled de-quantization helpers (shared by the MXFP8 / MXFP4 kernels).
+ */
+
+// Decode an E8M0 biased exponent into its FP32 power-of-two scale.
+PRIMUS_TURBO_DEVICE float e8m0_to_scale(uint8_t e8m0) {
+    return uint_as_float(static_cast<uint32_t>(e8m0) << 23);
+}
+
 } // namespace primus_turbo

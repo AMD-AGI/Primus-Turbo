@@ -1,0 +1,5 @@
+# PEP 592 yank list. One entry per line: either an exact dist filename
+#   (primus_turbo-0.3.1.tar.gz) or a version (0.3.1).
+# Matching files stay downloadable for pinned installs but pip skips them for
+# new resolves. Edit this file (or run the Release workflow's manual dispatch)
+# to yank a bad release, then the index is regenerated and redeployed.

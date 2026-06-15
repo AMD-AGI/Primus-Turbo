@@ -49,6 +49,14 @@ def get_cxx_compiler():
     return compiler
 
 
+def _get_compiler_launcher():
+    for tool in ("sccache", "ccache"):
+        if shutil.which(tool):
+            print(f"[Primus-Turbo] Found {tool}, enabling as compiler launcher")
+            return tool
+    return None
+
+
 class BuildExtension(build_ext):
     @classmethod
     def with_options(cls, **options):
@@ -424,13 +432,20 @@ def _write_ninja_file(
         raise AssertionError("At least one source is required to build a library")
 
     compiler = get_cxx_compiler()
+    launcher = _get_compiler_launcher()
 
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
-    config.append(f"cxx = {compiler}")
+    if launcher:
+        config.append(f"cxx = {launcher} {compiler}")
+    else:
+        config.append(f"cxx = {compiler}")
     if with_cuda or cuda_dlink_post_cflags:
         nvcc = _join_rocm_home("bin", "hipcc")
-        config.append(f"nvcc = {nvcc}")
+        if launcher:
+            config.append(f"nvcc = {launcher} {nvcc}")
+        else:
+            config.append(f"nvcc = {nvcc}")
 
     post_cflags = COMMON_HIP_FLAGS + post_cflags
     flags = [f'cflags = {" ".join(cflags)}']

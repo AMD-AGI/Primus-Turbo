@@ -33,6 +33,24 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt);
 
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
+                                                                 const at::ScalarType dest_dtype,
+                                                                 const int64_t        block_size,
+                                                                 const at::Tensor     group_lens,
+                                                                 const at::Tensor     group_offs);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t block_size,
+    const at::Tensor group_lens, const at::Tensor group_offs);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight(const at::Tensor     input,
+                                                          const at::ScalarType dest_dtype,
+                                                          const int64_t        block_size);
+
+std::vector<at::Tensor> quantize_fp8_blockwise_for_weight_meta(const at::Tensor     input,
+                                                               const at::ScalarType dest_dtype,
+                                                               const int64_t        block_size);
+
 std::vector<at::Tensor> quantize_fp8_rowwise(const at::Tensor     input,
                                              const at::ScalarType dest_dtype, const int64_t axis,
                                              c10::optional<at::Tensor> scale_opt);
@@ -60,6 +78,20 @@ at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale
 
 at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                        const int64_t axis, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                 const int64_t axis, const int64_t block_size,
+                                 const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                            const int64_t block_size, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_mxfp4_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                 const int64_t axis, const int64_t block_size,
+                                 const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,

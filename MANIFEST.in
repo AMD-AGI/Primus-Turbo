@@ -1,0 +1,22 @@
+include README.md
+include LICENSE
+include setup.py
+include pyproject.toml
+include requirements.txt
+include .gitmodules
+
+recursive-include tools *.py
+recursive-include csrc *
+recursive-include primus_turbo *.py
+recursive-include 3rdparty/composable_kernel/include *
+recursive-include 3rdparty/hipify_torch/hipify_torch *
+
+# setuptools_scm pulls in every git-tracked file by default; drop dev-only
+# scaffolding (CI / editor / benchmarks / AI-agent docs) from the sdist.
+prune agent
+prune benchmark
+prune .github
+prune .cursor
+
+global-exclude *.py[cod]
+global-exclude __pycache__

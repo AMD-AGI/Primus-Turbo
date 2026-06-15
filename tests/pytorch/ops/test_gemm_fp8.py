@@ -23,6 +23,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorPair,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import gemm_fp8
 from tests.pytorch.test_utils import compute_snr
 
@@ -45,6 +46,9 @@ def _run_gemm_fp8_test(
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
 
     # Set backend and auto_tune config
     GlobalBackendManager.set_gemm_backend(backend)
@@ -128,6 +132,9 @@ def _run_gemm_fp8_deterministic_test(
     """Determinism + correctness check for gemm_fp8 on a small set of configs."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
 
     # Keep deterministic test focused: no autotune (reduces variability).
     GlobalBackendManager.set_gemm_backend(backend)
@@ -256,7 +263,9 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL]
+)
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
     _run_gemm_fp8_test(
@@ -385,6 +394,9 @@ def _run_gemm_fp8_quantized_tensor_test(
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
     GlobalBackendManager.set_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(auto_tune)
 
@@ -495,7 +507,7 @@ def _run_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL])
 def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """TENSORWISE gemm with pre-quantized QuantizedTensor inputs."""
     _run_gemm_fp8_quantized_tensor_test(
@@ -572,7 +584,9 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.deterministic
 def test_gemm_fp8_tensorwise_deterministic(m, n, k, layout, format, dtype, backend):
     _run_gemm_fp8_deterministic_test(

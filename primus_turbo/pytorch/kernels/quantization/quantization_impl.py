@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
-from torch.library import triton_op, wrap_triton
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -23,10 +22,8 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
-    quant_fp8_blockwise_segment_m_kernel,
+    quant_fp8_blockwise_segment_m_row_col_kernel,
 )
-from primus_turbo.triton.quantization.quantization_mxfp4 import dequantize_mxfp4_kernel
-from primus_turbo.triton.quantization.quantization_mxfp8 import dequantize_mxfp8_kernel
 
 
 def ceil_div(a, b):
@@ -202,88 +199,6 @@ def quant_fp8_blockwise_dual_impl_meta(
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
 
-@triton_op("primus_turbo::quant_fp8_blockwise_segment_m_impl", mutates_args=())
-def quant_fp8_blockwise_segment_m_impl(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Quantization for fp8 blockwise with segment-aware padding (axis=0 only).
-
-    Reads from original tensor, writes to padded tensor with segment alignment.
-
-    Args:
-        x: Input tensor to quantize [M, N].
-        dtype: FP8 dtype for output.
-        block_size: Block size for quantization.
-        group_lens: Segment lengths [B].
-        group_offs: Segment offsets [B+1].
-
-    Returns:
-        x_fp8: FP8-quantized tensor [M_padded, N].
-        x_scales: Per-block scale tensor in float32.
-        var_k_group_lens: Padded segment lengths [B].
-        var_k_group_offs: Padded segment offsets [B+1].
-    """
-    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
-
-    M, N = x.shape
-    num_groups = group_lens.size(0)
-
-    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
-    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
-    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
-
-    # Use upper bound for allocation to avoid .item() sync (required for graph capture)
-    # Each segment can have at most block_size padding, so M_padded <= M + num_groups * block_size
-    M_padded_max = M + num_groups * block_size
-
-    # Allocate output tensors with upper bound size
-    x_fp8 = torch.zeros((M_padded_max, N), dtype=dtype, device=x.device)
-    x_scales = torch.zeros((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
-
-    # Launch kernel - out-of-bounds blocks are handled by the kernel's mask logic
-    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_segment_m_kernel)[grid](
-        x,
-        x_fp8,
-        x_scales,
-        group_offs,
-        var_k_group_offs,
-        N,
-        num_groups,
-        block_size,
-        torch.finfo(dtype).max,
-    )
-    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
-
-
-@quant_fp8_blockwise_segment_m_impl.register_fake
-def quant_fp8_blockwise_segment_m_impl_meta(
-    x: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2, "Input must be 2D"
-
-    M, N = x.shape
-    num_groups = group_lens.size(0)
-
-    # Use upper bound for allocation
-    M_padded_max = M + num_groups * block_size
-
-    x_fp8 = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
-    x_scales = torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device)
-    var_k_group_lens = torch.empty(num_groups, dtype=torch.int64, device=x.device)
-    var_k_group_offs = torch.empty(num_groups + 1, dtype=torch.int64, device=x.device)
-    return x_fp8, x_scales, var_k_group_lens, var_k_group_offs
-
-
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_for_weight_impl", mutates_args=())
 def quant_fp8_blockwise_for_weight_impl(
     w: torch.Tensor,
@@ -304,6 +219,15 @@ def quant_fp8_blockwise_for_weight_impl(
     assert w.dim() in (2, 3)
     if not w.is_contiguous():
         w = w.contiguous()
+
+    # HIP fast path (single C++ call → lower host overhead, identical output layout);
+    # only when the C++ op is built and block_size == 128 (its only supported size),
+    # else fall through to the Triton kernel. Benefits both the grouped and
+    # non-grouped blockwise paths that quantize weights through here.
+    if block_size == 128 and hasattr(
+        torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"
+    ):
+        return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(w, dtype, block_size)
 
     ori_dims = w.dim()
     if ori_dims == 2:
@@ -357,6 +281,117 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
+
+
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())
+def quant_fp8_blockwise_segment_m_row_col_impl(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    gemm_other_dim: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused row + segment-padded col quant of a grouped tensor in one pass.
+
+    A single bf16 read of `x` produces the row-wise scaled tensor (fwd/dgrad GEMM)
+    and the segment-padded col-wise scaled tensor (variable-K wgrad). Row scales are
+    pshuffled [N_blocks, M] to match the persistent GEMM's coalesced scale reads.
+
+    Dispatches to the HIP fast path when the surrounding GEMM is small enough that its
+    lower host overhead wins; otherwise launches the Triton kernel. Pass `gemm_other_dim`
+    (the GEMM dim not visible from x.shape) to enable the dispatch; default = Triton.
+
+    Registered as ``torch.library.custom_op`` (opaque to inductor) to sidestep the AMD
+    MI300 / Triton 3.7 ``identify_mutated_tensors`` DCE bug, matching the other blockwise
+    quant impls.
+
+    Returns: (x_fp8_row [M,N], x_fp8_col_padded [M_padded_max,N],
+              x_scales_row [N_blocks,M], x_scales_col_padded [M_padded_blocks,N],
+              var_k_group_lens [B], var_k_group_offs [B+1]).
+    """
+    assert x.is_contiguous() and x.dim() == 2
+    # HIP fast path: only when the C++ op is built and block_size == 128 (its
+    # only supported size); otherwise fall through to the Triton kernel below.
+    # HIP wins on small surrounding GEMMs (single C++ call → low host overhead) but
+    # loses on big ones (vreg pressure → 1 block/CU bottlenecks the next GEMM), so it
+    # is gated by a GEMM-FLOPs threshold. TODO: this empirical threshold (calibrated
+    # across LFM2 / Qwen3 / DeepSeek-V3 / GPT-OSS BLOCKWISE shapes) is a heuristic —
+    # replace with a principled cost model / autotune signal when available.
+    hip_gemm_flops_threshold = 70_000_000_000
+    if (
+        gemm_other_dim is not None
+        and block_size == 128
+        and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_segment_m_row_col")
+    ):
+        gemm_flops = x.size(0) * x.size(1) * gemm_other_dim
+        if gemm_flops <= hip_gemm_flops_threshold:
+            return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_segment_m_row_col(
+                x, dtype, block_size, group_lens, group_offs
+            )
+
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+    # Segment-padded group offsets (each segment rounded up to block_size). Only the
+    # Triton fallback (large GEMMs) reaches here, where this host cost is negligible;
+    # the HIP fast path computes them in-kernel.
+    var_k_group_lens = ((group_lens + block_size - 1) // block_size) * block_size
+    var_k_group_offs = torch.zeros(num_groups + 1, dtype=torch.int64, device=x.device)
+    var_k_group_offs[1:] = torch.cumsum(var_k_group_lens, dim=0)
+    M_padded_max = M + num_groups * block_size
+    # Kernel mask-writes cover all positions read downstream; skip zero-init.
+    # x_scales_row in pshuffled [N_blocks, M] matches the fwd GEMM scale order.
+    x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
+    x_fp8_col_padded = torch.empty((M_padded_max, N), dtype=dtype, device=x.device)
+    x_scales_row = torch.empty((triton.cdiv(N, block_size), M), dtype=torch.float32, device=x.device)
+    x_scales_col_padded = torch.empty(
+        (triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device
+    )
+    grid = (triton.cdiv(M_padded_max, block_size), triton.cdiv(N, block_size))
+    quant_fp8_blockwise_segment_m_row_col_kernel[grid](
+        x,
+        x_fp8_row,
+        x_fp8_col_padded,
+        x_scales_row,
+        x_scales_col_padded,
+        group_offs,
+        var_k_group_offs,
+        M,
+        N,
+        num_groups,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return (
+        x_fp8_row,
+        x_fp8_col_padded,
+        x_scales_row,
+        x_scales_col_padded,
+        var_k_group_lens,
+        var_k_group_offs,
+    )
+
+
+@quant_fp8_blockwise_segment_m_row_col_impl.register_fake
+def quant_fp8_blockwise_segment_m_row_col_impl_meta(
+    x: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    gemm_other_dim: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    num_groups = group_lens.size(0)
+    M_padded_max = M + num_groups * block_size
+    return (
+        torch.empty((M, N), dtype=dtype, device=x.device),
+        torch.empty((M_padded_max, N), dtype=dtype, device=x.device),
+        torch.empty((triton.cdiv(N, block_size), M), dtype=torch.float32, device=x.device),
+        torch.empty((triton.cdiv(M_padded_max, block_size), N), dtype=torch.float32, device=x.device),
+        torch.empty(num_groups, dtype=torch.int64, device=x.device),
+        torch.empty(num_groups + 1, dtype=torch.int64, device=x.device),
+    )
 
 
 def quantize_mxfp8_impl(
@@ -424,48 +459,12 @@ def dequantize_mxfp8_impl(
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    use_rowwise = axis == 1
-
-    num_rows, row_length = x.size()
+    _, row_length = x.size()
     assert (
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."
 
-    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
-    scale_inv = scale_inv.view(torch.uint8)
-
-    scale_m, scale_n = scale_inv.size()
-    if use_rowwise:
-        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
-    else:
-        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
-
-    BLOCK_X = 64
-    BLOCK_Y = 64
-    GROUP_Y = 8
-    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
-    dequantize_mxfp8_kernel[grid](
-        x,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        num_rows,
-        row_length,
-        scale_inv,
-        scale_inv.stride(0),
-        scale_inv.stride(1),
-        scale_m,
-        scale_n,
-        BLOCK_X=BLOCK_X,
-        BLOCK_Y=BLOCK_Y,
-        GROUP_Y=GROUP_Y,
-        USE_ROWWISE=use_rowwise,
-        MXFP8_BLOCK_SIZE=block_size,
-    )
-
-    return y
+    return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp8(x, scale_inv, axis, block_size, out_dtype)
 
 
 def quantize_mxfp4_impl(
@@ -547,8 +546,6 @@ def dequantize_mxfp4_impl(
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    use_rowwise = axis == 1
-
     num_rows, row_length = x.size()
     # NOTE: x is packed in last dimension
     row_length = row_length * 2
@@ -556,38 +553,4 @@ def dequantize_mxfp4_impl(
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."
 
-    # NOTE: triton can't canonicalize torch.float8_e8m0fnu, so we need to reinterpret it to torch.uint8.
-    scale_inv = scale_inv.view(torch.uint8)
-
-    scale_m, scale_n = scale_inv.size()
-    if use_rowwise:
-        y = torch.empty((num_rows, row_length), dtype=out_dtype, device=x.device)
-    else:
-        y = torch.empty((row_length, num_rows), dtype=out_dtype, device=x.device)
-
-    BLOCK_X = 64
-    BLOCK_Y = 64
-    GROUP_Y = 8
-    grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_Y"]) * triton.cdiv(row_length, META["BLOCK_X"]),)
-    dequantize_mxfp4_kernel[grid](
-        x.view(torch.uint8),
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        num_rows,
-        row_length,
-        scale_inv,
-        scale_inv.stride(0),
-        scale_inv.stride(1),
-        scale_m,
-        scale_n,
-        BLOCK_X=BLOCK_X,
-        BLOCK_Y=BLOCK_Y,
-        GROUP_Y=GROUP_Y,
-        USE_ROWWISE=use_rowwise,
-        MXFP4_BLOCK_SIZE=block_size,
-    )
-
-    return y
+    return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp4(x, scale_inv, axis, block_size, out_dtype)

@@ -102,7 +102,7 @@ def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torc
 
 
 def rmsnorm_fwd_impl(
-    x: torch.Tensor, gamma: torch.Tensor, eps: float
+    x: torch.Tensor, gamma: torch.Tensor, eps: float, zero_centered: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
     """Forward launcher.
 
@@ -129,6 +129,7 @@ def rmsnorm_fwd_impl(
             H=H,
             eps=eps,
             BLOCK_H=BLOCK_H,
+            ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -148,6 +149,7 @@ def rmsnorm_fwd_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -163,6 +165,7 @@ def rmsnorm_bwd_impl(
     ROWS: int,
     num_warps: int,
     num_stages: int,
+    zero_centered: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward launcher. Returns (dx [B, H], dgamma [H])."""
     H = gamma.shape[0]
@@ -192,6 +195,7 @@ def rmsnorm_bwd_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -216,6 +220,7 @@ def rmsnorm_bwd_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
+            ZERO_CENTERED=zero_centered,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg

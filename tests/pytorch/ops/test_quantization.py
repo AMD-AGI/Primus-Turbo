@@ -615,5 +615,43 @@ def test_quantize_mxfp4_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
         colwise_out_shuffle.view(torch.uint8), colwise_out_shuffle_ref.view(torch.uint8), atol=0, rtol=0
     )
     torch.testing.assert_close(
-        colwise_scale_shuffle.view(torch.uint8), colwise_scale_shuffle_ref.view(torch.uint8), atol=0, rtol=0
+        colwise_scale_shuffle.view(torch.uint8),
+        colwise_scale_shuffle_ref.view(torch.uint8),
+        atol=0,
+        rtol=0,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mxfp4_sr_consecutive_calls_differ():
+    """Two quantize_fp4 calls with use_sr=True on the same input should produce different outputs."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+    x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+
+    sr_recipe = ScalingRecipe(use_sr=True)
+
+    out1, scale1 = quantize_fp4(
+        x,
+        turbo.float4_e2m1fn_x2,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        axis=1,
+        block_size=MXFP4_BLOCK_SIZE,
+        scaling_recipe=sr_recipe,
+    )
+
+    out2, scale2 = quantize_fp4(
+        x,
+        turbo.float4_e2m1fn_x2,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        axis=1,
+        block_size=MXFP4_BLOCK_SIZE,
+        scaling_recipe=sr_recipe,
+    )
+
+    assert not torch.equal(
+        out1.view(torch.uint8), out2.view(torch.uint8)
+    ), "SR-quantized outputs should differ across consecutive calls"
