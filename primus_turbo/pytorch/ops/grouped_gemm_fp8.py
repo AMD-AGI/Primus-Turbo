@@ -10,7 +10,7 @@ from typing import Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager, PrecisionType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -487,6 +487,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.CK.value,
+            is_bwd=True,
         )
 
         # ── Fused wgrad accumulation path ─────────────────────────────────
@@ -521,22 +522,47 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                     else:
                         lhs_fp8, rhs_fp8 = a_fp8, grad_out_fp8
                         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
-                    # Local import to avoid a top-level dependency on the
-                    # Triton kernel module (matches the pattern used in
-                    # ``grouped_gemm_fp8_impl.py``).
-                    from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
-                        grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
-                    )
-                    grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
-                        lhs_fp8,
-                        rhs_fp8,
-                        lhs_scale,
-                        rhs_scale,
-                        group_offs,
-                        out_dtype=ctx.out_dtype,
-                        out=main_grad_view,
-                        beta=1.0,
-                    )
+
+                    _user_be = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+                    if _user_be == BackendType.ASM_CO:
+                        # ASM_CO kernels have no in-place beta-accumulation
+                        # parameter, so compute wgrad out-of-place then fold
+                        # it into main_grad with add_.  This preserves the
+                        # grad_added_to_main_grad contract for Megatron DDP.
+                        wgrad = grouped_gemm_fp8_variable_k_impl(
+                            a_fp8,
+                            grad_out_fp8,
+                            a_scale_inv,
+                            grad_out_scale_inv,
+                            group_lens,
+                            group_offs,
+                            trans_a=not ctx.trans_a,
+                            trans_b=False,
+                            trans_c=ctx.trans_b,
+                            out_dtype=ctx.out_dtype,
+                            granularity=ctx.config.granularity.value,
+                            num_cu=ctx.num_cu,
+                            default_backend=BackendType.CK.value,
+                            is_bwd=True,
+                        )
+                        main_grad_view.add_(wgrad)
+                    else:
+                        # Local import to avoid a top-level dependency on the
+                        # Triton kernel module (matches the pattern used in
+                        # ``grouped_gemm_fp8_impl.py``).
+                        from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+                            grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+                        )
+                        grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
+                            lhs_fp8,
+                            rhs_fp8,
+                            lhs_scale,
+                            rhs_scale,
+                            group_offs,
+                            out_dtype=ctx.out_dtype,
+                            out=main_grad_view,
+                            beta=1.0,
+                        )
                     # Tell Megatron's DDP post-hook that ``main_grad`` has
                     # already absorbed this step's wgrad — it must NOT re-add
                     # ``param.grad`` (the dummy tensor below).
@@ -570,6 +596,7 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.CK.value,
+            is_bwd=True,
         )
 
         return grad_a, grad_b, None, None, None, None, None

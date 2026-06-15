@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -395,11 +397,98 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         )
 
 
+# (K, N) shapes of the gpt-oss MoE FP8 fwd/dgrad call sites that the
+# hand-tuned combined_v5.co kernel is specialised for.
+# K = a.shape[1], N = b.shape[-2] if trans_b else b.shape[-1]
+_ASM_CO_FWD_SITES = {
+    (2880, 5760),  # gate_up_fwd
+    (2880, 2880),  # down_fwd / down_dgrad
+    (5760, 2880),  # gate_up_dgrad
+}
+
+
+class GroupedGEMMFP8ASMCOBackend(KernelBackend):
+    """Hand-tuned AMDGCN assembly (.co) backend for FP8 grouped GEMM fwd/dgrad.
+
+    Activated when PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO and the call
+    arrives with is_bwd=True (backward/dgrad pass). Tensorwise scaling only,
+    E=32 experts, gpt-oss MoE shapes on MI355X (gfx950).
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+    _first_use: bool = True
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8ASMCOBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8ASMCOBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a and trans_b
+        k = a.shape[1]
+        n = b.shape[-2] if trans_b else b.shape[-1]
+        supported &= (k, n) in _ASM_CO_FWD_SITES
+        supported &= b.shape[0] == 32  # E
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        if GroupedGEMMFP8ASMCOBackend._first_use:
+            GroupedGEMMFP8ASMCOBackend._first_use = False
+            print(
+                f"[ASM_CO] dgrad kernel first use — "
+                f"a={tuple(a.shape)} b={tuple(b.shape)} "
+                f"out_dtype={out_dtype} granularity={granularity.name}",
+                flush=True,
+            )
+        return torch.ops.primus_turbo_cpp_extension.asm_co_grouped_gemm_fp8(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            out_dtype,
+            granularity.name,
+            num_cu,
+        )
+
+
 class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
+        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8ASMCOBackend, autotune=False),
     }
     _cache = TuneCache(1024)
 
@@ -520,11 +609,112 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         )
 
 
+# (OUT_M, OUT_N) shapes of the gpt-oss MoE FP8 wgrad call sites that the
+# hand-tuned variable_k_wgrad_mega.co kernel is specialised for.
+_ASM_CO_WGRAD_SITES = {
+    (2880, 5760),  # gate_up_wgrad
+    (2880, 2880),  # down_wgrad
+}
+
+
+class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
+    """Hand-tuned AMDGCN assembly (.co) backend for FP8 variable-K grouped GEMM (wgrad).
+
+    Activated when PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO and the call
+    arrives with is_bwd=True (wgrad pass). Tensorwise scaling only,
+    E=32 experts, gpt-oss MoE shapes on MI355X (gfx950).
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+    _first_use: bool = True
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= (
+            a.dtype,
+            b.dtype,
+            out_dtype,
+        ) in GroupedGEMMFP8VariableKASMCOBackend.SUPPORTED_DTYPES
+        supported &= granularity in GroupedGEMMFP8VariableKASMCOBackend.SUPPORTED_GRANULARITIES
+        supported &= trans_a and not trans_b
+        out_m = a.shape[1]
+        out_n = b.shape[1]
+        if trans_c:
+            out_m, out_n = out_n, out_m
+        supported &= (out_m, out_n) in _ASM_CO_WGRAD_SITES
+        supported &= group_lens.shape[0] == 32  # E
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+            trans_lhs, trans_rhs = not trans_b, not trans_a
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+            trans_lhs, trans_rhs = trans_a, trans_b
+        if GroupedGEMMFP8VariableKASMCOBackend._first_use:
+            GroupedGEMMFP8VariableKASMCOBackend._first_use = False
+            print(
+                f"[ASM_CO] wgrad kernel first use — "
+                f"a={tuple(a.shape)} b={tuple(b.shape)} "
+                f"out_dtype={out_dtype} granularity={granularity.name}",
+                flush=True,
+            )
+        return torch.ops.primus_turbo_cpp_extension.asm_co_grouped_gemm_fp8_variable_k(
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_lens,
+            group_offs,
+            trans_lhs,
+            trans_rhs,
+            out_dtype,
+            granularity.name,
+            num_cu,
+        )
+
+
 class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
         BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
+        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8VariableKASMCOBackend, autotune=False),
     }
     _cache = TuneCache(1024)
 
@@ -571,11 +761,23 @@ def grouped_gemm_fp8_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
+
+    # ASM_CO hybrid mode: fwd → Triton, bwd → ASM (with graceful shape fallback).
+    # dispatch() raises when user_backend.can_handle()=False, so for bwd we pass
+    # user_backend_enum=None and set ASM_CO as default_backend_enum instead (step 3
+    # tries ASM, step 4 falls back through all backends including Triton).
+    if user_backend_enum == BackendType.ASM_CO:
+        if is_bwd:
+            user_backend_enum = None
+            default_backend_enum = BackendType.ASM_CO
+        else:
+            user_backend_enum = BackendType.TRITON
 
     kwargs = dict(
         a=a,
@@ -612,11 +814,21 @@ def grouped_gemm_fp8_variable_k_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
+
+    # ASM_CO hybrid mode: wgrad is always backward, so use ASM as default
+    # with graceful fallback to Triton when shapes are unsupported.
+    if user_backend_enum == BackendType.ASM_CO:
+        if is_bwd:
+            user_backend_enum = None
+            default_backend_enum = BackendType.ASM_CO
+        else:
+            user_backend_enum = BackendType.TRITON
 
     kwargs = dict(
         a=a,
@@ -656,6 +868,7 @@ def grouped_gemm_fp8_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
@@ -688,6 +901,7 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
