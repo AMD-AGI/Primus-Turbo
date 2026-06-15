@@ -41,18 +41,24 @@ template <typename AType, typename BType> struct mfma_scale_f32_16x16x128_f8f6f4
     template <int PIN_A, int PIN_B, int PIN_ACC, int PIN_SA, int PIN_SB>
     __device__ __forceinline__ static void run_pinned_acc_agpr() {
 #if defined(__gfx950__)
-        if constexpr (cbsz == 0 && blgp == 0)
-            asm volatile("v_mfma_scale_f32_16x16x128_f8f6f4 a[%0:%1], v[%2:%3], v[%4:%5], a[%0:%1], v[%6], v[%7] op_sel_hi:[0,0,0]"
-                : : "n"(PIN_ACC), "n"(PIN_ACC + 3), "n"(PIN_A), "n"(PIN_A + 7), "n"(PIN_B), "n"(PIN_B + 7), "n"(PIN_SA), "n"(PIN_SB));
-        else if constexpr (cbsz == 1 && blgp == 0)
-            asm volatile("v_mfma_scale_f32_16x16x128_f8f6f4 a[%0:%1], v[%2:%3], v[%4:%5], a[%0:%1], v[%6], v[%7] op_sel_hi:[0,0,0] cbsz:1"
-                : : "n"(PIN_ACC), "n"(PIN_ACC + 3), "n"(PIN_A), "n"(PIN_A + 7), "n"(PIN_B), "n"(PIN_B + 7), "n"(PIN_SA), "n"(PIN_SB));
-        else if constexpr (cbsz == 0 && blgp == 1)
-            asm volatile("v_mfma_scale_f32_16x16x128_f8f6f4 a[%0:%1], v[%2:%3], v[%4:%5], a[%0:%1], v[%6], v[%7] op_sel_hi:[0,0,0] blgp:1"
-                : : "n"(PIN_ACC), "n"(PIN_ACC + 3), "n"(PIN_A), "n"(PIN_A + 7), "n"(PIN_B), "n"(PIN_B + 7), "n"(PIN_SA), "n"(PIN_SB));
-        else
-            asm volatile("v_mfma_scale_f32_16x16x128_f8f6f4 a[%0:%1], v[%2:%3], v[%4:%5], a[%0:%1], v[%6], v[%7] op_sel_hi:[0,0,0] cbsz:1 blgp:1"
-                : : "n"(PIN_ACC), "n"(PIN_ACC + 3), "n"(PIN_A), "n"(PIN_A + 7), "n"(PIN_B), "n"(PIN_B + 7), "n"(PIN_SA), "n"(PIN_SB));
+        // cbsz / blgp are emitted as IMMEDIATE template operands (%8 / %9) so the
+        // SAME asm form serves every (cbsz, blgp) combination -- including the
+        // megamoe default path's cbsz=0 (A FP8 e4m3) / blgp=4 (B FP4 e2m1), which
+        // the prior 4-branch form mis-encoded as "cbsz:1 blgp:1".  acc src AND
+        // dst are the same AGPR pair a[PIN_ACC:PIN_ACC+3]; A/B data are fixed
+        // VGPRs v[PIN_A:+7]/v[PIN_B:+7]; scales are fixed VGPRs v[PIN_SA]/v[PIN_SB].
+        // The A/B operand register-tuple size depends on the element format:
+        // f8 (code 0) = 8 VGPR, f6 (codes 2/3) = 6 VGPR, f4 (code 4) = 4 VGPR
+        // (16x128 elems / 64 lanes -> 32/24/16 bytes/lane).  The assembler
+        // rejects a wrong tuple ("wrong register tuple size for blgp value 4"),
+        // so derive the end register from cbsz/blgp instead of hardcoding +7.
+        constexpr int kAEnd = PIN_A + (cbsz == 4 ? 3 : (cbsz == 2 || cbsz == 3 ? 5 : 7));
+        constexpr int kBEnd = PIN_B + (blgp == 4 ? 3 : (blgp == 2 || blgp == 3 ? 5 : 7));
+        asm volatile(
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[%0:%1], v[%2:%3], v[%4:%5], a[%0:%1], v[%6], v[%7] op_sel_hi:[0,0,0] cbsz:%8 blgp:%9"
+            : : "n"(PIN_ACC), "n"(PIN_ACC + 3), "n"(PIN_A), "n"(kAEnd),
+                "n"(PIN_B), "n"(kBEnd), "n"(PIN_SA), "n"(PIN_SB),
+                "n"(cbsz), "n"(blgp));
 #else
         static_assert(false, "mfma_scale_f32_16x16x128_f8f6f4 requires gfx950");
 #endif

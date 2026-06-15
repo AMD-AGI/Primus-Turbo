@@ -91,418 +91,23 @@ def _mega_moe_profile_enabled() -> bool:
     return os.environ.get("MEGAMOE_PROFILE", "") not in ("", "0", "false", "False")
 
 
-def _mega_moe_fp4_act_enabled() -> bool:
-    """True when MEGA_MOE_FP4_ACT=1, which compiles the JIT extension with
-    ``-DMEGA_MOE_FP4_ACT=1`` so the Linear2 activation operand (the SwiGLU
-    intermediate) is MXFP4 e2m1 instead of FP8 e4m3.  The reference path is
-    re-anchored to match (see ``swiglu_apply_weight_to_fp8`` /
-    ``m_grouped_fp8_fp4_gemm_nt_contiguous``).  When unset -> exact r2."""
-    return os.environ.get("MEGA_MOE_FP4_ACT", "0") == "1"
-
-
-def _mega_moe_fp4_dbg_noscale_enabled() -> bool:
-    """DIAG: MEGA_MOE_FP4_DBG_NOSCALE=1 forces sf=1.0 across kernel producer +
-    reader + reference intermediate quant, to isolate the FP4-A data/nibble path
-    from the SF path during gate-3 debugging.  Only meaningful with FP4_ACT=1."""
-    return os.environ.get("MEGA_MOE_FP4_DBG_NOSCALE", "0") == "1"
-
-
-def _mega_moe_fp4_dbg_const_enabled() -> bool:
-    """DIAG: MEGA_MOE_FP4_DBG_CONST=1 makes the kernel L1 epilogue write a
-    CONSTANT intermediate (e2m1 code 2 = +1.0) to every column with sf byte 127,
-    and makes the reference set the SwiGLU intermediate to all +1.0.  Both sides
-    then compute (column-sums of W_down).  cos~=1 => the L2 read / W_down / SF /
-    combine path is correct and any residual bug is in the producer's
-    SwiGLU/quant/pack; cos<1 => the bug is in the read/SF/layout path.  Only
-    meaningful with FP4_ACT=1."""
-    return os.environ.get("MEGA_MOE_FP4_DBG_CONST", "0") == "1"
-
-
-def _mega_moe_bbal_enabled() -> bool:
-    """L4' (PROMOTED r28, default ON): balances the shared-B LDS load across all
-    loader warps (round-robin chunks) instead of warp 0 loading all of B.  Pure
-    load-distribution change -> numerics byte-identical to r2 (reference UNCHANGED);
-    +21% perf (157-159 TF vs r2 130).  Set MEGA_MOE_BBAL=0 to revert to r2."""
-    return os.environ.get("MEGA_MOE_BBAL", "1") != "0"
-
-
-def _mega_moe_effm_enabled() -> bool:
-    """Effective-M: MEGA_MOE_EFFM=1 compiles with ``-DMEGA_MOE_EFFM=1``, skipping
-    the per-sub_m MFMA + A/SFA load for M-tiles entirely beyond valid_m (padding
-    rows of partial blocks).  Numerically lossless (padding rows are masked by the
-    epilogue) -> gate-3 byte-identical to r28; reduces the MFMA-bound wall."""
-    return os.environ.get("MEGA_MOE_EFFM", "0") == "1"
-
-
-def _mega_moe_cheap_bar_enabled() -> bool:
-    """MEGA_MOE_CHEAP_BAR (PROMOTED r30, default ON): cheap-fences the grid_sync
-    barrier spin (relaxed spin + single acquire fence), removing the per-iteration
-    acquire cache-invalidate from the dispatch/combine barriers.  Same ordering ->
-    numerics byte-identical; +12-14% perf.  Set MEGA_MOE_CHEAP_BAR=0 to revert."""
-    return os.environ.get("MEGA_MOE_CHEAP_BAR", "1") != "0"
-
-
-def _mega_moe_cheap_bar_sys_enabled() -> bool:
-    """MEGA_MOE_CHEAP_BAR_SYS=1 cheap-fences the nvlink_barrier cross-rank sys-spin
-    (relaxed system load + single system acquire fence).  Same ordering -> numerics
-    byte-identical; riskier (IPC coherence).  Default off (safe ld_acq_sys path)."""
-    return os.environ.get("MEGA_MOE_CHEAP_BAR_SYS", "0") == "1"
-
-
-def _mega_moe_disp_pipe_enabled() -> bool:
-    """MEGA_MOE_DISP_PIPE=1 software-pipelines the dispatch token-pull copy (all
-    cross-rank loads then all stores) to overlap remote-load latency.  Numerics
-    byte-identical (same copy, reordered)."""
-    return os.environ.get("MEGA_MOE_DISP_PIPE", "0") == "1"
-
-
-def _mega_moe_koverlap_enabled() -> bool:
-    """MEGA_MOE_KOVERLAP=1 fires the kBarMmaB barrier every 2 k_blocks (2 MFMA
-    bursts back-to-back, pipe stays fed across the rendezvous).  Pure scheduling
-    -> numerics byte-identical."""
-    return os.environ.get("MEGA_MOE_KOVERLAP", "1") != "0"  # PROMOTED r36, default ON
-
-
-def _mega_moe_rfl_enabled() -> bool:
-    """MEGA_MOE_RFL=1: readfirstlane warp-uniform addr/offsets into SGPRs + split
-    load soffset (SGPR) -> reduces VGPR pressure (turbo mxfp8 technique).  Numerics
-    byte-identical (same addresses, uniform parts in SGPR)."""
-    return os.environ.get("MEGA_MOE_RFL", "0") == "1"
-
-
-def _mega_moe_agpr_acc_enabled() -> bool:
-    """MEGA_MOE_AGPR_ACC=1: keep the MFMA accumulators (acc + acc_gate) resident
-    in the AGPR file across the whole k-loop (turbo run_pinned_acc_agpr technique),
-    freeing ~256 VGPR to break the occupancy=1 VGPR wall.  Default path only
-    (FP4_ACT=0).  Numerics same MFMA/order -> gate-3 should still pass."""
-    return os.environ.get("MEGA_MOE_AGPR_ACC", "0") == "1"
-
-
-def _mega_moe_dispatch_only_enabled() -> bool:
-    """MEGA_MOE_DISPATCH_ONLY=1 compiles with ``-DMEGA_MOE_DISPATCH_ONLY=1`` so
-    the MMA-loader and epilogue warp roles return immediately and only the
-    dispatch (route + cross-rank pull) stage runs.  Used to measure dispatch
-    bandwidth in isolation -- the kernel produces no valid ``y`` in this mode,
-    so always pair with ``--num-correctness-tests 0``."""
-    return os.environ.get("MEGA_MOE_DISPATCH_ONLY", "0") == "1"
-
-
-def _mega_moe_pp_sched_enabled() -> bool:
-    """MEGA_MOE_PP_SCHED=1 -> -DMEGA_MOE_PP_SCHED=1: T1 ping-pong-style scheduling
-    (B prefetch + sched_barrier(0) + s_setprio in the MFMA grid). Safe, no pinning."""
-    return os.environ.get("MEGA_MOE_PP_SCHED", "0") == "1"
-
-
-def _mega_moe_no_mfma_enabled() -> bool:
-    """MEGA_MOE_NO_MFMA=1 compiles with ``-DMEGA_MOE_NO_MFMA=1`` so the k-loop's
-    scaled-MFMA is replaced by a trivial XOR-fold consume of the A/B/SF operands.
-    The whole global->LDS load chain (HBM traffic) and pipeline are UNCHANGED, so
-    the run measures the loader's achievable HBM bandwidth with compute removed.
-    Output is garbage -- always pair with ``--num-correctness-tests 0``."""
-    return os.environ.get("MEGA_MOE_NO_MFMA", "0") == "1"
-
-
-def _mega_moe_skip_gemm_loads_enabled() -> bool:
-    """MEGA_MOE_SKIP_GEMM_LOADS=1 compiles with ``-DMEGA_MOE_SKIP_GEMM_LOADS=1``
-    so the GEMM A/B/SF global->LDS loads become no-ops while all barriers /
-    arrival-spins / combine / counter-resets stay intact.  Paired with
-    MEGA_MOE_NO_MFMA=1 it isolates dispatch+combine+sync time (Full - this =
-    GEMM-loader contribution).  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_GEMM_LOADS", "0") == "1"
-
-
-def _mega_moe_skip_combine_enabled() -> bool:
-    """MEGA_MOE_SKIP_COMBINE=1 compiles with ``-DMEGA_MOE_SKIP_COMBINE=1`` so the
-    combine top-k reduce loop is skipped (nvlink_barrier + counter resets kept).
-    Full - this = combine contribution.  Garbage output -- use
-    --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_COMBINE", "0") == "1"
-
-
-def _mega_moe_skip_dispatch_pull_enabled() -> bool:
-    """MEGA_MOE_SKIP_DISPATCH_PULL=1 -> -DMEGA_MOE_SKIP_DISPATCH_PULL=1: skip the
-    cross-rank token+SF data copy in dispatch (keep routing/counts/metadata/
-    arrival-signal/barriers).  SKIP_GEMM+SKIP_COMBINE minus this = dispatch-pull
-    XGMI cost.  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_DISPATCH_PULL", "0") == "1"
-
-
-def _mega_moe_loads_only_enabled() -> bool:
-    """MEGA_MOE_LOADS_ONLY=1 -> -DMEGA_MOE_LOADS_ONLY=1: skip the per-block
-    arrival-spins (cross-SM sync) and the epilogue global stores, isolating the
-    pure GEMM A/B/SF buffer_load path.  Pair with NO_MFMA=1 + SKIP_DISPATCH_PULL=1
-    + SKIP_COMBINE=1 to measure the loader's unobstructed HBM bandwidth
-    (FETCH_SIZE/time).  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_LOADS_ONLY", "0") == "1"
-
-
 def _load_mega_moe_jit(shape: dict):
     import hashlib
 
     key = tuple(sorted((k, int(v)) for k, v in shape.items() if k in _JIT_SHAPE_MACROS))
     profile = _mega_moe_profile_enabled()
-    fp4_act = _mega_moe_fp4_act_enabled()
-    dbg_noscale = _mega_moe_fp4_dbg_noscale_enabled()
-    dbg_const = _mega_moe_fp4_dbg_const_enabled()
-    bbal = _mega_moe_bbal_enabled()
-    effm = _mega_moe_effm_enabled()
-    cheap_bar = _mega_moe_cheap_bar_enabled()
-    cheap_bar_sys = _mega_moe_cheap_bar_sys_enabled()
-    disp_pipe = _mega_moe_disp_pipe_enabled()
-    koverlap = _mega_moe_koverlap_enabled()
-    rfl = _mega_moe_rfl_enabled()
-    agpr_acc = _mega_moe_agpr_acc_enabled()
-    occq = os.environ.get("MEGA_MOE_OCCQUERY","0")=="1"
-    minblk = os.environ.get("MEGA_MOE_MIN_BLOCKS_PER_CU","1")
-    disp_only = _mega_moe_dispatch_only_enabled()
-    pp_sched = _mega_moe_pp_sched_enabled()
-    no_mfma = _mega_moe_no_mfma_enabled()
-    skip_gemm_loads = _mega_moe_skip_gemm_loads_enabled()
-    skip_combine = _mega_moe_skip_combine_enabled()
-    skip_dispatch_pull = _mega_moe_skip_dispatch_pull_enabled()
-    skip_epi = os.environ.get("MEGA_MOE_SKIP_EPI", "0") == "1"
-    coalesce_epi = os.environ.get("MEGA_MOE_COALESCE_EPI", "0") == "1"
-    epi_lds_bulk = os.environ.get("MEGA_MOE_EPI_LDS_BULK", "0") == "1"
-    mfma_bpf = os.environ.get("MEGA_MOE_MFMA_BPF", "1") != "0"  # PROMOTED, default ON
-    mfma_bpf2 = os.environ.get("MEGA_MOE_MFMA_BPF2", "0") == "1"
-    mfma_prio = os.environ.get("MEGA_MOE_MFMA_PRIO", "0") == "1"
-    mfma_sched = os.environ.get("MEGA_MOE_MFMA_SCHED", "1") != "0"  # PROMOTED, default ON
-    mfma_sched2 = os.environ.get("MEGA_MOE_MFMA_SCHED2", "0") == "1"
-    mfma_noprio = os.environ.get("MEGA_MOE_MFMA_NOPRIO", "0") == "1"
-    epi_batch_store = os.environ.get("MEGA_MOE_EPI_BATCH_STORE", "0") == "1"
-    epi_contig_probe = os.environ.get("MEGA_MOE_EPI_CONTIG_PROBE", "0") == "1"
-    kloop_sched = os.environ.get("MEGA_MOE_KLOOP_SCHED", "0") == "1"
-    mfma_sched3 = os.environ.get("MEGA_MOE_MFMA_SCHED3", "0") == "1"
-    epi_w16 = os.environ.get("MEGA_MOE_EPI_W16", "0") == "1"
-    skip_epi_l2 = os.environ.get("MEGA_MOE_SKIP_EPI_L2", "0") == "1"
-    skip_silu = os.environ.get("MEGA_MOE_SKIP_SILU", "0") == "1"
-    a_cpol = os.environ.get("MEGA_MOE_A_CPOL", "0")
-    b_cpol = os.environ.get("MEGA_MOE_B_CPOL", "0")
-    vmcnt_keep = os.environ.get("MEGA_MOE_VMCNT_KEEP", "0")
-    vgpr_load = os.environ.get("MEGA_MOE_VGPR_LOAD", "0") == "1"
-    no_kloop_sync = os.environ.get("MEGA_MOE_NO_KLOOP_SYNC", "0") == "1"
-    no_burst = os.environ.get("MEGA_MOE_NO_BURST", "0") == "1"
-    two_stage = os.environ.get("MEGA_MOE_2STAGE", "0") == "1"
-    two_blk = os.environ.get("MEGA_MOE_2BLK", "0") == "1"
-    skip_sf = os.environ.get("MEGA_MOE_SKIP_SF", "0") == "1"
-    sf_bld = os.environ.get("MEGA_MOE_SF_BLD", "0") == "1"
-    scalar_soff = os.environ.get("MEGA_MOE_SCALAR_SOFF", "0") == "1"
-    kloop_repeat = os.environ.get("MEGA_MOE_KLOOP_REPEAT", "1")
-    bdirect_probe = os.environ.get("MEGA_MOE_BDIRECT_PROBE", "0") == "1"
-    numstages = os.environ.get("MEGA_MOE_NUMSTAGES", "0")
-    epi_nt = os.environ.get("MEGA_MOE_EPI_NT", "0") == "1"
-    epi_const = os.environ.get("MEGA_MOE_EPI_CONST", "0") == "1"
-    epi_local = os.environ.get("MEGA_MOE_EPI_LOCAL", "0") == "1"
-    epi_w4 = os.environ.get("MEGA_MOE_EPI_W4", "0") == "1"
-    epi_hot = os.environ.get("MEGA_MOE_EPI_HOT", "0") == "1"
-    defer_epi = os.environ.get("MEGA_MOE_DEFER_EPI", "0") == "1"
-    epi_noinline = os.environ.get("MEGA_MOE_EPI_NOINLINE", "0") == "1"
-    pull_unroll = os.environ.get("MEGA_MOE_PULL_UNROLL", "0")
-    pull_as_push = os.environ.get("MEGA_MOE_PULL_AS_PUSH", "0") == "1"
-    dispatch_push = os.environ.get("MEGA_MOE_DISPATCH_PUSH", "0") == "1"
-    if two_blk:
-        two_stage = True  # 2BLK uses the 2-stage loop
-    loads_only = _mega_moe_loads_only_enabled()
-    # Profiled / FP4-act / SF-LDS / B-balance / EffM / baseline builds must not share a cache entry / .so name.
-    cache_key = (key, profile, fp4_act, dbg_noscale, dbg_const, bbal, effm, cheap_bar, cheap_bar_sys, disp_pipe, koverlap, rfl, agpr_acc, occq, disp_only, pp_sched, no_mfma, skip_gemm_loads, skip_combine, skip_dispatch_pull, skip_epi, coalesce_epi, epi_lds_bulk, mfma_bpf2, mfma_prio, mfma_sched2, mfma_noprio, epi_batch_store, epi_contig_probe, kloop_sched, mfma_sched3, epi_w16, skip_epi_l2, skip_silu, a_cpol, b_cpol, loads_only, vmcnt_keep, vgpr_load, no_kloop_sync, no_burst, two_stage, two_blk, skip_sf, sf_bld, scalar_soff, kloop_repeat)
+    # Profiled and non-profiled builds must not share a cache entry / .so name.
+    cache_key = (key, profile)
     if cache_key in _mega_moe_jit_cache:
         return _mega_moe_jit_cache[cache_key]
 
     shape_defines = [f"-D{_JIT_SHAPE_MACROS[k]}={v}u" for k, v in key]
     if profile:
         shape_defines = shape_defines + ["-DMEGA_MOE_PROFILE=1"]
-    if fp4_act:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_ACT=1"]
-    if dbg_noscale:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_DBG_NOSCALE=1"]
-    if dbg_const:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_DBG_CONST=1"]
-    # BBAL is PROMOTED (default ON in the kernel), so emit an EXPLICIT value:
-    # =1 is the promoted r28 baseline, =0 reverts byte-identically to r2.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_BBAL={1 if bbal else 0}"]
-    if effm:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EFFM=1"]
-    # CHEAP_BAR is PROMOTED (default ON in the kernel) -> emit EXPLICIT value so =0 reverts.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_CHEAP_BAR={1 if cheap_bar else 0}"]
-    if cheap_bar_sys:
-        shape_defines = shape_defines + ["-DMEGA_MOE_CHEAP_BAR_SYS=1"]
-    if disp_pipe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISP_PIPE=1"]
-    # KOVERLAP is PROMOTED (default ON) -> explicit value so =0 reverts to r30.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_KOVERLAP={1 if koverlap else 0}"]
-    if rfl:
-        shape_defines = shape_defines + ["-DMEGA_MOE_RFL=1"]
-    if agpr_acc:
-        shape_defines = shape_defines + ["-DMEGA_MOE_AGPR_ACC=1"]
-    if occq:
-        shape_defines = shape_defines + ["-DMEGA_MOE_OCCQUERY=1"]
-    if minblk != "1":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_MIN_BLOCKS_PER_CU={int(minblk)}"]
-    if disp_only:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_ONLY=1"]
-    if pp_sched:
-        shape_defines = shape_defines + ["-DMEGA_MOE_PP_SCHED=1"]
-    if no_mfma:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_MFMA=1"]
-    if skip_gemm_loads:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_GEMM_LOADS=1"]
-    if skip_combine:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_COMBINE=1"]
-    if skip_dispatch_pull:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_DISPATCH_PULL=1"]
-    if skip_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_EPI=1"]
-    if coalesce_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_COALESCE_EPI=1"]
-    if epi_lds_bulk:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_LDS_BULK=1"]
-    if mfma_bpf2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_BPF2=1"]
-    if mfma_prio:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_PRIO=1"]
-    if mfma_sched2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_SCHED2=1"]
-    if mfma_noprio:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_NOPRIO=1"]
-    if epi_batch_store:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_BATCH_STORE=1"]
-    if epi_contig_probe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_CONTIG_PROBE=1"]
-    if kloop_sched:
-        shape_defines = shape_defines + ["-DMEGA_MOE_KLOOP_SCHED=1"]
-    if mfma_sched3:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_SCHED3=1"]
-    if epi_w16:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_W16=1"]
-    if skip_epi_l2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_EPI_L2=1"]
-    if skip_silu:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_SILU=1"]
-    if a_cpol != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_A_CPOL={int(a_cpol)}"]
-    if b_cpol != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_B_CPOL={int(b_cpol)}"]
-    if loads_only:
-        shape_defines = shape_defines + ["-DMEGA_MOE_LOADS_ONLY=1"]
-    if vmcnt_keep != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_VMCNT_KEEP={int(vmcnt_keep)}"]
-    if vgpr_load:
-        shape_defines = shape_defines + ["-DMEGA_MOE_VGPR_LOAD=1"]
-    if no_kloop_sync:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_KLOOP_SYNC=1"]
-    if no_burst:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_BURST=1"]
-    if two_stage:
-        shape_defines = shape_defines + ["-DMEGA_MOE_2STAGE=1"]
-    if two_blk:
-        shape_defines = shape_defines + ["-DMEGA_MOE_2BLK=1"]
-    if skip_sf:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_SF=1"]
-    if sf_bld:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SF_BLD=1"]
-    if scalar_soff:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SCALAR_SOFF=1"]
-    if kloop_repeat != "1":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_KLOOP_REPEAT={int(kloop_repeat)}"]
-    if bdirect_probe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_BDIRECT_PROBE=1"]
-    if numstages != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_JIT_KNUMSTAGES={int(numstages)}u"]
-    if epi_nt:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_NT=1"]
-    if epi_const:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_CONST=1"]
-    if epi_local:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_LOCAL=1"]
-    if epi_w4:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_W4=1"]
-    if epi_hot:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_HOT=1"]
-    if defer_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DEFER_EPI=1"]
-    if epi_noinline:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_NOINLINE=1"]
-    if pull_unroll != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_PULL_UNROLL={int(pull_unroll)}u"]
-    if pull_as_push:
-        shape_defines = shape_defines + ["-DMEGA_MOE_PULL_AS_PUSH=1"]
-    if dispatch_push:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_PUSH=1"]
-    if os.environ.get("MEGA_MOE_PUSH_GRIDSYNC_PROBE", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_PUSH_GRIDSYNC_PROBE=1"]
-    if os.environ.get("MEGA_MOE_PUSH_SKIP_META", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_PUSH_SKIP_META=1"]
-    if os.environ.get("MEGA_MOE_DISPATCH_PUSH2", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_PUSH2=1"]
     suffix = hashlib.sha1(
-        (
-            ";".join(f"{k}={v}" for k, v in key)
-            + (";prof" if profile else "")
-            + (";fp4act" if fp4_act else "")
-            + (";nosc" if dbg_noscale else "")
-            + (";const" if dbg_const else "")
-            + (";bbal" if bbal else ";nobbal")
-            + (";effm" if effm else "")
-            + (";cbar" if cheap_bar else ";nocbar")
-            + (";cbarsys" if cheap_bar_sys else "")
-            + (";disppipe" if disp_pipe else "")
-            + (";kov" if koverlap else ";nokov")
-            + (";rfl" if rfl else "")
-            + (";agpracc" if agpr_acc else "")
-            + (";occq" if occq else "")
-            + ((";mb"+minblk) if minblk!="1" else "")
-            + (";disponly" if disp_only else "")
-            + ((";bdp") if bdirect_probe else "")
-            + ((";ns"+numstages) if numstages!="0" else "")
-            + ((";epint") if epi_nt else "")
-            + ((";epiconst") if epi_const else "")
-            + ((";epilocal") if epi_local else "")
-            + ((";epiw4") if epi_w4 else "")
-            + ((";epihot") if epi_hot else "")
-            + ((";deferepi") if defer_epi else "")
-            + ((";epinoinl") if epi_noinline else "")
-            + ((";pu"+pull_unroll) if pull_unroll!="0" else "")
-            + ((";p2push") if pull_as_push else "")
-            + ((";dpush") if dispatch_push else "")
-            + (";ppsched" if pp_sched else "")
-            + (";nomfma" if no_mfma else "")
-            + (";skipgemm" if skip_gemm_loads else "")
-            + (";skipcomb" if skip_combine else "")
-            + (";skipdisp" if skip_dispatch_pull else "")
-            + (";skipepi" if skip_epi else "")
-            + (";coalepi" if coalesce_epi else "")
-            + (";epildsbulk" if epi_lds_bulk else "")
-            + (";mfmabpf2" if mfma_bpf2 else "")
-            + (";mfmaprio" if mfma_prio else "")
-            + (";mfmasched2" if mfma_sched2 else "")
-            + (";mfmanoprio" if mfma_noprio else "")
-            + (";epibatchst" if epi_batch_store else "")
-            + (";epicontig" if epi_contig_probe else "")
-            + (";kloopsched" if kloop_sched else "")
-            + (";mfmasched3" if mfma_sched3 else "")
-            + (";epiw16" if epi_w16 else "")
-            + (";skipepil2" if skip_epi_l2 else "")
-            + (";skipsilu" if skip_silu else "")
-            + ((";ac"+a_cpol) if a_cpol!="0" else "")
-            + ((";bc"+b_cpol) if b_cpol!="0" else "")
-            + (";loadsonly" if loads_only else "")
-            + ((";vk"+vmcnt_keep) if vmcnt_keep!="0" else "")
-            + (";vgprld" if vgpr_load else "")
-            + (";noksync" if no_kloop_sync else "")
-            + (";noburst" if no_burst else "")
-            + (";2stage" if two_stage else "")
-            + (";2blk" if two_blk else "")
-            + (";skipsf" if skip_sf else "")
-            + (";sfbld" if sf_bld else "")
-            + (";ssoff" if scalar_soff else "")
-            + ((";kr"+kloop_repeat) if kloop_repeat!="1" else "")
-        ).encode()
+        (";".join(f"{k}={v}" for k, v in key) + (";prof" if profile else "")).encode()
     ).hexdigest()[:12]
-    name = (
-        f"mega_moe_jit_ext_{suffix}"
-        if (key or profile or fp4_act or dbg_noscale or dbg_const or not bbal or effm or not cheap_bar or cheap_bar_sys or disp_pipe or not koverlap or rfl or occq or minblk!="1" or disp_only or pp_sched or no_mfma or skip_gemm_loads or skip_combine or skip_dispatch_pull or skip_epi or coalesce_epi or epi_lds_bulk or mfma_bpf2 or mfma_prio or mfma_sched2 or mfma_noprio or epi_batch_store or epi_contig_probe or kloop_sched or mfma_sched3 or epi_w16 or skip_epi_l2 or skip_silu or a_cpol!="0" or b_cpol!="0" or loads_only or vmcnt_keep!="0" or vgpr_load or no_kloop_sync or no_burst or two_stage or two_blk or skip_sf or sf_bld or scalar_soff or kloop_repeat!="1")
-        else "mega_moe_jit_ext"
-    )
+    name = f"mega_moe_jit_ext_{suffix}" if (key or profile) else "mega_moe_jit_ext"
 
     ext = _torch_jit_load(
         name=name,
@@ -519,30 +124,9 @@ def _load_mega_moe_jit(shape: dict):
             "-fno-gpu-rdc",
         ]
         + _half_undefs
-        + shape_defines
-        + (["-Rpass-analysis=kernel-resource-usage"]
-           if os.environ.get("MEGA_MOE_REGUSAGE", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED=1"]
-           if os.environ.get("MEGA_MOE_RELAXED", "0") == "1" else [])
-        + (["-DMEGA_MOE_NOACQFENCE=1"]
-           if os.environ.get("MEGA_MOE_NOACQFENCE", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED_REL=1"]
-           if os.environ.get("MEGA_MOE_RELAXED_REL", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED_SYS=1"]
-           if os.environ.get("MEGA_MOE_RELAXED_SYS", "0") == "1" else [])
-        + [f"-DMEGA_MOE_DISP_BARRIER={1 if os.environ.get('MEGA_MOE_DISP_BARRIER', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_EPI_BATCH_REL={1 if os.environ.get('MEGA_MOE_EPI_BATCH_REL', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_NOUTER={1 if os.environ.get('MEGA_MOE_NOUTER', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_FAST_QUANT={1 if os.environ.get('MEGA_MOE_FAST_QUANT', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_SFB_KMAJOR={1 if os.environ.get('MEGA_MOE_SFB_KMAJOR', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_MFMA_BPF={1 if os.environ.get('MEGA_MOE_MFMA_BPF', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_MFMA_SCHED={1 if os.environ.get('MEGA_MOE_MFMA_SCHED', '1') != '0' else 0}"]
-        + ([f"-DMEGA_MOE_JIT_KBLOCK_M={int(os.environ['MEGA_MOE_BLOCKM'])}u",
-            f"-DMEGA_MOE_JIT_KSF_BLOCK_M={int(os.environ['MEGA_MOE_BLOCKM'])}u",
-            "-DMEGA_MOE_2STAGE=1"]
-           if os.environ.get("MEGA_MOE_BLOCKM", "0") != "0" else []),
+        + shape_defines,
         with_cuda=True,
-        verbose=os.environ.get("MEGA_MOE_REGUSAGE", "0") == "1",
+        verbose=False,
     )
     _mega_moe_jit_cache[cache_key] = ext
     return ext
@@ -808,8 +392,7 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def per_token_cast_to_fp4(
-    x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m0: bool = False,
-    noscale: bool = False
+    x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m0: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     m, n = x.shape
     assert n % 2 == 0
@@ -819,12 +402,7 @@ def per_token_cast_to_fp4(
     x_padded[:, :n] = x
     x_view = x_padded.view(m, -1, gran_k)
     x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
-    if noscale:
-        # DIAG (MEGA_MOE_FP4_DBG_NOSCALE): sf=1.0 -> raw e2m1(clamp(x,+/-6));
-        # dequant auto-uses 1.0 (packed exp 127). Isolates the data/nibble path.
-        sf = torch.ones_like(x_amax)
-    else:
-        sf = x_amax / 6.0
+    sf = x_amax / 6.0
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = x_view * (1.0 / sf.unsqueeze(2))
     codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
@@ -961,39 +539,26 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     *,
     use_psum_layout: bool = True,
     recipe: Tuple[int, int, int] = (1, 1, 32),
-    a_is_fp4: bool = False,
 ) -> None:
     """Per-expert grouped GEMM ``out[psum[e-1]:psum[e]] = A_e @ B_e.T``.
 
-    ``lhs`` is the activation tuple ``(act_packed, act_sf_packed_int32)``;
-    ``rhs`` is the FP4 weight tuple ``(w_fp4_packed, w_sf_packed_int32)``
-    in natural (n, k/2) nibble-packed layout (i.e. before
-    ``_transpose_sf_for_mfma``).  Weights are FP4 e2m1 nibble-packed --
-    matching the kernel's MFMA path ``<*, dtype::float4x2_e2m1>``.
-
-    When ``a_is_fp4`` is False (default / r2) the activation operand is FP8
-    e4m3 (Linear1's dispatched input, MFMA AType ``__hip_fp8_e4m3``).  When
-    True (MEGA_MOE_FP4_ACT) the activation operand is MXFP4 e2m1
-    nibble-packed (Linear2's SwiGLU intermediate, MFMA AType
-    ``dtype::float4x2_e2m1``); dequant it via ``_dequant_fp4_packed``.
+    ``lhs`` is the FP8 dispatch tuple ``(act_fp8, act_sf_packed_int32)``;
+    ``rhs`` is the FP8 weight tuple ``(w_fp8, w_sf_packed_int32)``
+    in natural (n, k/32) layout (i.e. before ``_transpose_sf_for_mfma``).
+    Both operands are FP8 e4m3 on this scaffold (kernel's MFMA path is
+    instantiated FP8/FP8); production FP4 weights are a follow-up.
     Output is BF16 written in-place into ``out``.
     """
     assert use_psum_layout and recipe == (1, 1, 32)
-    act_packed, act_sf_packed = lhs
-    w_fp4, w_sf_packed = rhs
+    act_fp8, act_sf_packed = lhs
+    w_fp8, w_sf_packed = rhs
     psum = psum_num_recv_tokens_per_expert.tolist()
     prefix = 0
     for e, end in enumerate(psum):
         n_e = end - prefix
         if n_e > 0:
-            if a_is_fp4:
-                # MEGA_MOE_FP4_ACT: activation is FP4 e2m1 nibble-packed
-                # (0.5 B/elt), per-32 UE8M0 SF, exactly like the weight path.
-                a = _dequant_fp4_packed(act_packed[prefix:end], act_sf_packed[prefix:end], gran_k=32)
-            else:
-                a = _dequant_fp8_packed(act_packed[prefix:end], act_sf_packed[prefix:end], gran_k=32)
-            # M3 FP4-B: weight operand is FP4 e2m1 nibble-packed (0.5 B/elt).
-            b = _dequant_fp4_packed(w_fp4[e], w_sf_packed[e], gran_k=32)
+            a = _dequant_fp8_packed(act_fp8[prefix:end], act_sf_packed[prefix:end], gran_k=32)
+            b = _dequant_fp8_packed(w_fp8[e], w_sf_packed[e], gran_k=32)
             out[prefix:end] = (a @ b.T).to(out.dtype)
         prefix = end
 
@@ -1010,7 +575,6 @@ def swiglu_apply_weight_to_fp8(
     output_bf16: bool = False,
     clamp_value: float = 10.0,
     fast_math: bool = True,
-    cast_to_fp4: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU + per-row topk-weight scaling + cast to FP8/UE8M0.
 
@@ -1018,10 +582,6 @@ def swiglu_apply_weight_to_fp8(
     is a 0-D / last-element int tensor with the populated row count;
     trailing rows are zero-padded so the output tuple shape matches the
     input M.
-
-    When ``cast_to_fp4`` is True (MEGA_MOE_FP4_ACT) the SwiGLU intermediate
-    is quantized to MXFP4 e2m1 nibble-packed (0.5 B/elt) with per-32 UE8M0
-    SF instead of FP8 e4m3, matching the kernel's FP4-activation epilogue.
     """
     assert use_col_major_scales and round_scale and ue8m0_scale and not output_bf16
     n_avail = int(avail_tokens.item()) if avail_tokens.dim() == 0 else int(avail_tokens[-1].item())
@@ -1035,24 +595,9 @@ def swiglu_apply_weight_to_fp8(
     else:
         per_row_w = topk_weights[:n_avail].view(-1, 1).float()
     act = act * per_row_w
-    if cast_to_fp4 and _mega_moe_fp4_dbg_const_enabled():
-        # DIAG (MEGA_MOE_FP4_DBG_CONST): force the SwiGLU intermediate to a
-        # constant +1.0 (e2m1 code 2), matching the kernel producer's CONST
-        # path.  With noscale the dequant SF is 1.0, so the L2 GEMM reduces to
-        # (column-sums of W_down); cos isolates the read/SF/layout path from
-        # the producer's SwiGLU/quant/pack.
-        act = torch.ones_like(act)
-    if cast_to_fp4:
-        act_fp8, act_sf = per_token_cast_to_fp4(
-            act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True,
-            noscale=(
-                _mega_moe_fp4_dbg_noscale_enabled() or _mega_moe_fp4_dbg_const_enabled()
-            ),
-        )
-    else:
-        act_fp8, act_sf = per_token_cast_to_fp8(
-            act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True
-        )
+    act_fp8, act_sf = per_token_cast_to_fp8(
+        act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True
+    )
     if n_total > n_avail:
         pad_out = torch.zeros((n_total, intermediate_hidden), dtype=act_fp8.dtype, device=x.device)
         pad_out[:n_avail] = act_fp8
@@ -1115,14 +660,10 @@ class ElasticBuffer:
         do_expand=True,
         use_tma_aligned_col_major_sf=True,
     ):
-        # Reference passes a quantized tuple; convert back to BF16 for the
-        # actual wire transit (see class docstring).  Under MEGA_MOE_FP4_ACT
-        # the input tuple is MXFP4 e2m1, so dequant with the FP4 inverse.
+        # Reference passes an FP8 tuple; convert back to BF16 for the
+        # actual wire transit (see class docstring).
         if isinstance(x, tuple):
-            if _mega_moe_fp4_act_enabled():
-                x_bf16 = _dequant_fp4_packed(x[0], x[1], gran_k=32).bfloat16()
-            else:
-                x_bf16 = _dequant_fp8_packed(x[0], x[1], gran_k=32).bfloat16()
+            x_bf16 = _dequant_fp8_packed(x[0], x[1], gran_k=32).bfloat16()
         else:
             x_bf16 = x.bfloat16()
         (
@@ -1210,19 +751,11 @@ class ElasticBuffer:
         # Permute topk_weights to per-(token, expert) pair layout: keep
         # the weight at (token, k_idx) for each pair.
         recv_topk_weights_perm = recv_topk_weights[permute_token_idx, permute_k_idx].unsqueeze(1)
-        # Re-quantise EXPANDED recv_x with per-32 UE8M0 SF so the L1 GEMM
-        # shim consumes a per-expert-contiguous tuple.  Under MEGA_MOE_FP4_ACT
-        # Linear1's A reference is MXFP4 e2m1 (matching the kernel's FP4 input
-        # path); otherwise FP8.
-        if _mega_moe_fp4_act_enabled():
-            recv_x = per_token_cast_to_fp4(
-                recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True,
-                noscale=_mega_moe_fp4_dbg_noscale_enabled(),
-            )
-        else:
-            recv_x = per_token_cast_to_fp8(
-                recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
-            )
+        # Re-quantise EXPANDED recv_x to FP8 / per-32 UE8M0 SF so the L1
+        # GEMM shim consumes a per-expert-contiguous tuple.
+        recv_x = per_token_cast_to_fp8(
+            recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+        )
         from types import SimpleNamespace
 
         psum = torch.tensor(num_recv_tokens_per_expert_list, dtype=torch.int32, device=device)
@@ -1369,42 +902,32 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert intermediate_hidden % 128 == 0
         assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
 
-        # Cast inputs (Linear1's A) with per-32 UE8M0 SF.  Under
-        # MEGA_MOE_FP4_ACT the dispatched INPUT is MXFP4 e2m1 nibble-packed
-        # (0.5 B/elem) so Linear1's MFMA reads it as ``float4x2_e2m1``; the SF
-        # is still per-32 E8M0 (1 byte/block, same count).  In r2 it is FP8.
-        if _mega_moe_fp4_act_enabled():
-            x = per_token_cast_to_fp4(
-                x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True,
-                noscale=_mega_moe_fp4_dbg_noscale_enabled(),
-            )
-        else:
-            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        # Cast inputs to FP8 with per-32 UE8M0 SF
+        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
-        # M3 FP4-B (m26 layout RESOLVED, m27 SFB confirmed): cast grouped BF16
-        # weights to FP4 e2m1 nibble-packed (0.5 B/elt, ADJ within-byte: byte b
-        # lo=K(2b) hi=K(2b+1)) with per-32-K UE8M0 SF.  The kernel MFMA path is
-        # now templated `<__hip_fp8_e4m3, dtype::float4x2_e2m1>` (cbsz=0/blgp=4)
-        # with halved B K-stride (b_row_stride_bytes = L1_SHAPE_K/2) and a
-        # contiguous 16-byte B reader — it reads these nibble bytes directly.
-        # Activations stay FP8 (A operand unchanged).  per_token_cast_to_fp4
-        # packs ADJ exactly as the kernel/m26 expect; SF is int32-packed UE8M0.
-        def cast_grouped_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Cast grouped BF16 weights to FP8 e4m3 unpacked (1 B/elt) with
+        # per-32-K UE8M0 SF.  The kernel's scaffold MFMA path is templated
+        # `<__hip_fp8_e4m3, __hip_fp8_e4m3>` (cbsz=0/blgp=0) and uses
+        # `b_row_stride_bytes = L1_SHAPE_K = kHidden` — i.e., it expects B
+        # at 1 byte/element matching A.  Packed FP4 (0.5 B/elt) would
+        # halve the K-stride and let the MFMA reinterpret packed nibbles
+        # as FP8 bytes (producing the 10-12x amplitude + NaN observed in
+        # section 9 of project_megamoe_jit_perf_run_state).  Production
+        # FP4 (real `blgp=4` MFMA + nibble-packed loads) is a separate
+        # follow-up; for now keep weights+kernel on the FP8 scaffold.
+        def cast_grouped_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             num_groups, n, k = bf16_weights.shape
-            assert k % 2 == 0
-            w = torch.empty((num_groups, n, k // 2), device="cuda", dtype=torch.uint8)
+            w = torch.empty((num_groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
             w_sf = torch.empty((num_groups, n, k // 32), device="cuda", dtype=torch.float)
             for i in range(num_groups):
-                packed, sf = per_token_cast_to_fp4(
+                w[i], w_sf[i] = per_token_cast_to_fp8(
                     bf16_weights[i], use_ue8m0=True, gran_k=32, use_packed_ue8m0=False
                 )
-                w[i] = packed.view(torch.uint8)
-                w_sf[i] = sf
             w_sf = transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
             return w, w_sf
 
-        l1_weights = cast_grouped_weights_to_fp4(l1_weights)
-        l2_weights = cast_grouped_weights_to_fp4(l2_weights)
+        l1_weights = cast_grouped_weights_to_fp8(l1_weights)
+        l2_weights = cast_grouped_weights_to_fp8(l2_weights)
         transformed_l1_weights, transformed_l2_weights = transform_weights_for_mega_moe(
             l1_weights, l2_weights
         )
@@ -1439,18 +962,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             transformed_l1_weights = (transformed_l1_weights[0], l1_weights[1])
             transformed_l2_weights = (transformed_l2_weights[0], l2_weights[1])
 
-        # K-major weight-SF (applied to the FINAL SF that reaches the kernel, after
-        # the R37 scaffold restores the natural n-major SF).  Transpose packed SF
-        # [E, N, K/128] -> [E, K/128, N] so the kernel's per-k_block SFB load of
-        # BLOCK_N consecutive columns is contiguous (coalesced) instead of scattered
-        # at stride K/32.  Reference uses the untransformed l1/l2_weights -> gate-3
-        # unaffected.  Must match -DMEGA_MOE_SFB_KMAJOR=1 in the kernel build.
-        if os.environ.get("MEGA_MOE_SFB_KMAJOR", "1") != "0":  # PROMOTED default-on
-            _w1, _sf1 = transformed_l1_weights
-            _w2, _sf2 = transformed_l2_weights
-            transformed_l1_weights = (_w1, _sf1.transpose(1, 2).contiguous())
-            transformed_l2_weights = (_w2, _sf2.transpose(1, 2).contiguous())
-
     # Diagnostic globals shared between run_fused (L2 pool snapshot) and
     # run_baseline (per-expert FP8 SwiGLU output candidates), consumed in
     # _check_gate3's L2_POOL_VS_REF cross-check.
@@ -1463,24 +974,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
     def run_fused():
-        if _mega_moe_fp4_act_enabled():
-            # Under MEGA_MOE_FP4_ACT the dispatched INPUT is MXFP4 e2m1
-            # (hidden/2 bytes/token).  ``buffer.x`` is a float8 view sized for
-            # the r2 FP8 input (hidden bytes/token), which (a) shape-mismatches
-            # the packed FP4 tensor and (b) over-extends the now-halved
-            # input_x region.  Write the FP4 nibble bytes through a correctly
-            # sized uint8 view anchored at input_x_offset instead.  The SF
-            # (per-32 E8M0) byte count is unchanged, so buffer.x_sf is fine.
-            x_bytes = x[0].view(torch.uint8).contiguous()[:num_tokens]
-            h_half = x_bytes.shape[1]
-            flat = buffer.buffer.view(torch.uint8)
-            base = int(buffer.layout.input_x_offset)
-            dst = flat[base : base + num_tokens * h_half].view(num_tokens, h_half)
-            dst.copy_(x_bytes)
-            buffer.x_sf[:num_tokens].copy_(x[1])
-        else:
-            buffer.x[:num_tokens].copy_(x[0])
-            buffer.x_sf[:num_tokens].copy_(x[1])
+        buffer.x[:num_tokens].copy_(x[0])
+        buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
@@ -2734,9 +2229,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True,
             recipe=(1, 1, 32),
-            # Under MEGA_MOE_FP4_ACT Linear1's A (recv_x) is MXFP4 e2m1, so the
-            # reference must dequant it from FP4; FP8 in r2.
-            a_is_fp4=_mega_moe_fp4_act_enabled(),
         )
         # L2_POOL_VS_REF: populate per-expert SwiGLU FP8 candidates that
         # mirror the kernel's L2 pool contents (no topk-weight scaling,
@@ -2956,7 +2448,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # exactly as the kernel does.  Bisect: real recv_topk_weights
         # makes baseline amax 2× kernel amax and drops cos_sim 0.75→0.65.
         _ones_weights = torch.ones_like(recv_topk_weights)
-        _fp4_act = _mega_moe_fp4_act_enabled()
         l1_y = swiglu_apply_weight_to_fp8(
             x=l1_y,
             topk_weights=_ones_weights,
@@ -2968,7 +2459,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             output_bf16=False,
             clamp_value=args.activation_clamp,
             fast_math=bool(args.fast_math),
-            cast_to_fp4=_fp4_act,
         )
         # DEBUG: force L2 pool SF=UE8M0(1.0) to mirror the kernel's
         # current pool SF placeholder.  UE8M0 byte for 1.0 = 127 (bias);
@@ -2988,7 +2478,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True,
             recipe=(1, 1, 32),
-            a_is_fp4=_fp4_act,
         )
         # Reduce per-(token, expert) pair l2_y rows back to per-token
         # rows by index-summing pairs of the same source token.  The
@@ -3060,19 +2549,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         | (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)
     ] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
-
-    # NOBENCH: raw kernel launches (no torch.profiler) so external profilers
-    # (rocprofv3) can collect counters cleanly without nested-profiling hang.
-    if os.environ.get("MEGA_MOE_NOBENCH", "0") == "1":
-        for _ in range(int(os.environ.get("MEGA_MOE_NOBENCH_ITERS", "20"))):
-            run_fused()
-        torch.cuda.synchronize()
-        dist.barrier()
-        buffer.destroy()
-        if ep_buffer is not None:
-            ep_buffer.destroy()
-        dist.destroy_process_group()
-        return
 
     # Benchmark
     t_fused = bench_kineto(
@@ -3169,10 +2645,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
             return
 
-        # Per-execution pipeline stages.  Each recorded value is the wall-clock
-        # span of ONE execution of that stage: one L1/L2 MMA or epilogue per
-        # scheduled block per loader warp; one dispatch / combine span per warp.
-        # 'total' (the whole-kernel span) is reported separately below.
         stage_names = [
             "dispatch",
             "L1_mma",
@@ -3180,6 +2652,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "L2_mma",
             "L2_epilogue",
             "combine",
+            "total",
         ]
         n_iters = max(1, int(args.num_profile_iters))
 
@@ -3191,65 +2664,48 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         # ticks -> microseconds: rate is in kHz, so 1 tick = 1e3/khz us.
         tick_to_us = 1.0e3 / float(khz)
-
-        # Pool EVERY individual stage-execution span across all launches, so the
-        # reported mean / p50 / p99 are over single executions -- not over the
-        # per-launch grid-wide envelope (which is what the old min/max profiler
-        # measured and why its numbers were ~whole-kernel-long).  'total'
-        # collects one whole-kernel span per launch.
-        per_exec = [[] for _ in stage_names]
-        truncated = [False] * len(stage_names)
-        total_us = []
+        samples = [[] for _ in stage_names]
         for _ in range(n_iters):
             shaped.prof_reset()
             run_fused()
             torch.cuda.synchronize()
-            counts = shaped.prof_read_counts()
-            for s in range(len(stage_names)):
-                spans = shaped.prof_read_samples(s)  # per-execution spans (ticks)
-                per_exec[s].extend(float(v) * tick_to_us for v in spans)
-                if s < len(counts) and int(counts[s]) > len(spans):
-                    truncated[s] = True  # executions exceeded the sample cap
-            total_us.append(float(shaped.prof_read_total()) * tick_to_us)
+            spans = shaped.prof_read()  # per-stage span in steady-counter ticks
+            for i in range(min(len(spans), len(stage_names))):
+                samples[i].append(float(spans[i]) * tick_to_us)
 
         dist_print(
-            f"Per-stage profile (MEGAMOE_PROFILE, wall_clock={khz / 1e6:.3f} GHz, "
-            f"{n_iters} launches):",
+            f"Per-stage profile (MEGAMOE_PROFILE, wall_clock={khz / 1e6:.3f} GHz, " f"{n_iters} launches):",
             once_in_node=True,
         )
-        # Each per-stage row is the duration of a SINGLE execution of that stage,
-        # pooled over all executions across all launches.  Stage executions run
-        # CONCURRENTLY across warp-roles, so they OVERLAP and do NOT sum to
-        # 'total' (the authoritative whole-kernel span, one per launch).
+        # NOTE: this is a single persistent kernel whose stages are CONCURRENT
+        # warp-roles gated by barriers.  Each value is that stage's wall-clock
+        # span (earliest-start..latest-end across the grid), NOT exclusive busy
+        # time -- the spans OVERLAP and do NOT sum to 'total'.  'total' is the
+        # authoritative whole-kernel time.  At n_iters~50 'p99' is effectively
+        # the tail max, so 'max' is shown too.
         dist_print(
-            " > (per-stage rows are single-execution durations pooled across "
-            "launches; they overlap and do not sum to total)",
+            " > (spans are concurrent wall-clock intervals; they overlap and do " "not sum to total)",
             once_in_node=True,
         )
         dist_print(
-            f" > {'stage':<12} {'n':>9} {'mean(us)':>10} {'p50(us)':>10} "
-            f"{'p99(us)':>10} {'max(us)':>10}",
+            f" > {'stage':<12} {'avg(us)':>10} {'p50(us)':>10} {'p99(us)':>10} {'max(us)':>10}",
             once_in_node=True,
         )
-
-        def _emit(name, arr_us, n_label):
-            # Keep the print count uniform across ranks even for an empty stage
-            # so the dist_print barriers stay in lockstep.
-            arr = np.asarray(arr_us, dtype=np.float64)
+        for i, name in enumerate(stage_names):
+            arr = np.asarray(samples[i], dtype=np.float64)
             if arr.size == 0:
-                dist_print(f" > {name:<12} {'(no samples)':>52}", once_in_node=True)
-                return
+                # Keep the print count uniform across ranks even for an empty
+                # stage so the dist_print barriers stay in lockstep.
+                dist_print(f" > {name:<12} {'(no samples)':>43}", once_in_node=True)
+                continue
+            avg = float(arr.mean())
+            p50 = float(np.percentile(arr, 50))
+            p99 = float(np.percentile(arr, 99))
+            mx = float(arr.max())
             dist_print(
-                f" > {name:<12} {n_label:>9} {float(arr.mean()):10.3f} "
-                f"{float(np.percentile(arr, 50)):10.3f} "
-                f"{float(np.percentile(arr, 99)):10.3f} {float(arr.max()):10.3f}",
+                f" > {name:<12} {avg:10.2f} {p50:10.2f} {p99:10.2f} {mx:10.2f}",
                 once_in_node=True,
             )
-
-        for i, name in enumerate(stage_names):
-            label = f"{len(per_exec[i])}{'+' if truncated[i] else ''}"
-            _emit(name, per_exec[i], label)
-        _emit("total", total_us, str(len(total_us)))
         dist_print(once_in_node=True)
 
     run_stage_profile()

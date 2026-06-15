@@ -158,6 +158,23 @@ template <int VGPR> __device__ __forceinline__ void clobber_vgpr_one() {
     // clang-format on
 }
 
+// ── Single-register write ──
+
+// Move a runtime value into a compile-time fixed VGPR (for landing a scale /
+// small operand in the exact VGPR a pinned MFMA names).  The value is supplied
+// as a "v" input so the compiler materializes it; the asm then copies it to the
+// fixed destination.
+template <int VDST> __device__ __forceinline__ void set_vgpr(uint32_t val) {
+    static_assert(VDST >= 0 && VDST <= 255, "VGPR must be in [0, 255]");
+    asm volatile("v_mov_b32 v[%0], %1" : : "n"(VDST), "v"(val) : "memory");
+}
+
+// Zero a compile-time fixed VGPR.
+template <int VDST> __device__ __forceinline__ void zero_vgpr() {
+    static_assert(VDST >= 0 && VDST <= 255, "VGPR must be in [0, 255]");
+    asm volatile("v_mov_b32 v[%0], 0" : : "n"(VDST) : "memory");
+}
+
 // ── Range operations ──
 
 template <int START, int END> __device__ __forceinline__ void reserve_vgpr_range() {

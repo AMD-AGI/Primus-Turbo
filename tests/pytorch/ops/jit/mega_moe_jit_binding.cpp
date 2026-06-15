@@ -48,12 +48,6 @@ extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int nu
                                          int64_t recv_stats_ptr, float activation_clamp,
                                          int fast_math);
 
-extern "C" int mega_moe_jit_prof_enabled();
-extern "C" int mega_moe_jit_prof_num_stages();
-extern "C" int mega_moe_jit_prof_wallclock_khz();
-extern "C" int mega_moe_jit_prof_reset();
-extern "C" int mega_moe_jit_prof_read(int64_t *out_spans, int max_stages);
-
 namespace {
 
 // (workspace_bytes, num_max_pool_tokens, num_max_pool_blocks)
@@ -140,39 +134,6 @@ int64_t run_mega_moe(std::vector<int64_t> sym_buffer_bases, int64_t rank_idx, in
         static_cast<float>(activation_clamp), fast_math ? 1 : 0));
 }
 
-// --- Per-stage in-kernel profiler hooks (no-ops unless the launch TU was
-// --- compiled with -DMEGA_MOE_PROFILE=1). -----------------------------------
-bool prof_enabled() {
-    return mega_moe_jit_prof_enabled() != 0;
-}
-
-int64_t prof_num_stages() {
-    return static_cast<int64_t>(mega_moe_jit_prof_num_stages());
-}
-
-int64_t prof_wallclock_khz() {
-    return static_cast<int64_t>(mega_moe_jit_prof_wallclock_khz());
-}
-
-int64_t prof_reset() {
-    return static_cast<int64_t>(mega_moe_jit_prof_reset());
-}
-
-// Returns per-stage spans (end - start) in steady-counter ticks.
-std::vector<int64_t> prof_read() {
-    const int            n = mega_moe_jit_prof_num_stages();
-    std::vector<int64_t> spans(n > 0 ? static_cast<size_t>(n) : 0u, 0);
-    if (n > 0) {
-        const int rc = mega_moe_jit_prof_read(spans.data(), n);
-        // rc < 0 signals a real failure (bad buffer size, or a negated
-        // hipError_t offset by 100 from the D2H copy).  Surface it instead of
-        // silently returning an all-zero profile that masquerades as a result.
-        TORCH_CHECK(rc == n, "mega_moe_jit_prof_read failed with code ", rc, " (expected ", n,
-                    " stages)");
-    }
-    return spans;
-}
-
 } // anonymous namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -209,14 +170,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("l1_weights"), py::arg("l1_weights_sf"), py::arg("l2_weights"),
           py::arg("l2_weights_sf"), py::arg("recv_stats"), py::arg("activation_clamp"),
           py::arg("fast_math"));
-    m.def("prof_enabled", &prof_enabled,
-          "True if this extension was built with -DMEGA_MOE_PROFILE=1 (per-stage profiler).");
-    m.def("prof_num_stages", &prof_num_stages,
-          "Number of profiled pipeline stages (0 if profiling is disabled).");
-    m.def("prof_wallclock_khz", &prof_wallclock_khz,
-          "Device wall-clock (steady counter) frequency in kHz for tick->time conversion.");
-    m.def("prof_reset", &prof_reset,
-          "Reset the per-stage [start,end] accumulators before a launch. Returns hipError_t.");
-    m.def("prof_read", &prof_read,
-          "Read back per-stage spans (end - start) in steady-counter ticks.");
 }

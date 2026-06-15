@@ -138,4 +138,19 @@ b_tile_smem_byte_offset(uint32_t stage_buf_lds_byte, uint32_t n, uint32_t k_byte
     return stage_buf_lds_byte + swizzle_offset_128b_64bank<BlockK>(n, k_byte);
 }
 
+// Row-major (un-swizzled) B tile address.  Used for the M3 FP4-B tile whose
+// row is only BLOCK_K/2 = 64 bytes = 4 ds_read_b128 chunks.  The 64-bank
+// swizzle's XOR rotation mask is fixed at 7 (assumes >=8 chunks / >=128 B
+// rows); with only 4 chunks the rotated chunk index spills past the row
+// (k_chunk ^ (m&7) can reach 7 > 3), corrupting cross-row LDS addressing and
+// the R145 linear-write cancellation.  A plain row-major layout is correct
+// (bank-conflict avoidance is a perf-only concern; the FP4 B row is half the
+// width so conflict pressure is already lower).
+template <uint32_t LoadBlockN, uint32_t BlockK>
+__host__ __device__ __forceinline__ constexpr uint32_t
+b_tile_smem_byte_offset_rowmajor(uint32_t stage_buf_lds_byte, uint32_t n, uint32_t k_byte) {
+    static_assert(LoadBlockN <= 128u, "LoadBlockN > 128 unsupported");
+    return stage_buf_lds_byte + n * BlockK + k_byte;
+}
+
 } // namespace primus_turbo::device

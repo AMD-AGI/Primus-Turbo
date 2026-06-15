@@ -177,7 +177,12 @@ def get_mega_moe_config(
         num_experts_per_wave=num_per_wave,
         num_stages=4,
         smem_size=0,
+        # 6-warp layout: 2 dispatch + 4 MFMA (combine folded into the MFMA
+        # warps post-compute).  The old 4 epilogue warps are reclaimed for
+        # MFMA — doubling the matrix-unit feed (2→4 warps) and halving the
+        # per-warp accumulator (kSubTilesPerWave 32→16) so the L1 gate+up
+        # acc[]+acc_gate[] no longer spills.  nwarps must divide BLOCK_M=128.
         num_dispatch_threads=128,
-        num_non_epilogue_threads=128,
-        num_epilogue_threads=256,
+        num_non_epilogue_threads=256,
+        num_epilogue_threads=0,
     )

@@ -28,6 +28,18 @@
 #include "../impls/prims.cuh"
 #include "../layout/mega_moe.cuh"
 
+// Block traversal order within an expert.  Default (m-outer/n-inner) re-reads the
+// FP4 weights (B) ~8x from HBM (once per m_block).  NOUTER (n-outer/m-inner) makes
+// all SMs hit the same B n-tile at once -> loaded once, L2-shared -> cuts weight
+// re-read.  Same blocks, different order.  (Interacts with EPI_BATCH_REL which
+// assumes consecutive gate-blocks per pool block -- test with EPI_BATCH_REL=0.)
+// PROMOTED (default 1): n-outer alone is BYTE-IDENTICAL (cos_sim 0.999991) +7%;
+// stacked with EPI_BATCH_REL -> ~726 TF / 8.94 ms (+16% over 627), gate-3 20/20
+// (worst cos_sim 0.99983, rel_rmse ~0.018 << 0.05).  Set MEGA_MOE_NOUTER=0 to revert.
+#ifndef MEGA_MOE_NOUTER
+#define MEGA_MOE_NOUTER 1
+#endif
+
 namespace primus_turbo {
 namespace mega_moe {
 namespace sched {
@@ -162,10 +174,19 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx             = block_idx / kNumL1BlockNs;
+#if MEGA_MOE_NOUTER
+            // n-outer: m varies fastest within an expert so all SMs hit the SAME
+            // B n-tile at once (loaded once from HBM, L2-shared), cutting the ~8x
+            // weight re-read.  Same blocks, different traversal order.
+            if (block_idx < num_m_blocks * kNumL1BlockNs) {
+                m_block_idx = block_idx % num_m_blocks;
+                return true;
+            }
+#else
+            m_block_idx = block_idx / kNumL1BlockNs;
             if (m_block_idx < num_m_blocks)
                 return true;
-
+#endif
             // Current expert is fully assigned, move to the next.
             block_idx -= num_m_blocks * kNumL1BlockNs;
             advance_expert_idx();
@@ -178,7 +199,11 @@ struct MegaMoEScheduler {
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
+#if MEGA_MOE_NOUTER
+                m_block_idx = block_idx % num_m_blocks;
+#else
                 m_block_idx = block_idx / kNumL2BlockNs;
+#endif
                 return true;
             }
 
@@ -205,7 +230,11 @@ struct MegaMoEScheduler {
 
             if (next_phase == BlockPhase::Linear1) {
                 if (fetch_next_l1_block()) {
+#if MEGA_MOE_NOUTER
+                    n_block_idx = block_idx / get_current_num_m_blocks();
+#else
                     n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+#endif
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx,
                             n_block_idx};
@@ -217,7 +246,11 @@ struct MegaMoEScheduler {
                 set_expert_idx(wave_start);
             } else {
                 if (fetch_next_l2_block()) {
+#if MEGA_MOE_NOUTER
+                    n_block_idx = block_idx / get_current_num_m_blocks();
+#else
                     n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+#endif
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx,
                             n_block_idx};
@@ -259,10 +292,10 @@ struct MegaMoEScheduler {
                 do {
                     if constexpr (kNumRanks == 1u) {
                         value = __hip_atomic_load(reinterpret_cast<unsigned long long *>(ptr),
-                                                  __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+                                                  MEGA_MOE_ACQ_ORDER, __HIP_MEMORY_SCOPE_AGENT);
                     } else {
                         value = __hip_atomic_load(reinterpret_cast<unsigned long long *>(ptr),
-                                                  __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                                                  MEGA_MOE_ACQ_ORDER, __HIP_MEMORY_SCOPE_SYSTEM);
                     }
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
@@ -278,11 +311,14 @@ struct MegaMoEScheduler {
 
         while (true) {
             const NextBlock nb = get_next_block();
-            if (nb.phase == BlockPhase::None)
-                break;
+            // Always invoke func, INCLUDING the terminal None sentinel, so a
+            // software-pipelined callback (MEGA_MOE_DEFER_EPI) can flush its last
+            // pending epilogue in-scope.  Non-pipelined callbacks early-return on None.
             func(nb.phase, nb.expert_idx,
                  nb.phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs, nb.m_block_idx,
                  nb.n_block_idx);
+            if (nb.phase == BlockPhase::None)
+                break;
         }
     }
 };

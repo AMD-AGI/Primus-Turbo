@@ -115,10 +115,20 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
         static_cast<uint32_t>(num_max_tokens_per_rank), static_cast<uint32_t>(num_topk));
     const int64_t workspace_bytes = static_cast<int64_t>(workspace.get_num_bytes());
 
-    const int64_t fp8_token_bytes    = hidden;                           // FP8
-    const int64_t bf16_token_bytes   = static_cast<int64_t>(hidden) * 2; // BF16
-    const int64_t fp8_inter_bytes    = intermediate_hidden;              // FP8
-    const int64_t fp8_sf_bytes       = hidden / mm::kScaleGroupK;
+    const int64_t bf16_token_bytes = static_cast<int64_t>(hidden) * 2; // BF16
+#if MEGA_MOE_FP4_ACT
+    // MEGA_MOE_FP4_ACT: BOTH activations are MXFP4 e2m1 nibble-packed ->
+    // 0.5 B/elem.  The dispatched INPUT (Linear1's A, input_x and l1_pool_x)
+    // and the L2 SwiGLU intermediate (l2_pool_x) are each halved to match the
+    // kernel's halved fp8_token_layout / fp8_intermediate_token_layout so the
+    // symm buffer offsets line up.
+    const int64_t fp8_token_bytes = hidden / 2;              // FP4 e2m1 input
+    const int64_t fp8_inter_bytes = intermediate_hidden / 2; // FP4 e2m1
+#else
+    const int64_t fp8_token_bytes = hidden;              // FP8
+    const int64_t fp8_inter_bytes = intermediate_hidden; // FP8
+#endif
+    const int64_t fp8_sf_bytes = hidden / mm::kScaleGroupK;
     const int64_t fp8_inter_sf_bytes = intermediate_hidden / mm::kScaleGroupK;
     const int64_t topk_idx_bytes     = static_cast<int64_t>(num_topk) * sizeof(int64_t);
     const int64_t topk_weights_bytes = static_cast<int64_t>(num_topk) * sizeof(float);
@@ -204,22 +214,44 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 #ifndef MEGA_MOE_JIT_KSF_BLOCK_N
 #define MEGA_MOE_JIT_KSF_BLOCK_N 128u
 #endif
+// 2 blocks/CU occupancy build: 2-stage loader (halves LDS) + 512 logical SMs
+// (grid=512 on 256 CUs -> 2 resident blocks/CU).  Defined before the #ifndef
+// defaults so these win.
+#if MEGA_MOE_2BLK
+#define MEGA_MOE_JIT_KNUMSTAGES 2u
+#define MEGA_MOE_JIT_KNUMSMS 512u
+#endif
 #ifndef MEGA_MOE_JIT_KNUMSTAGES
 #define MEGA_MOE_JIT_KNUMSTAGES 4u
 #endif
 #ifndef MEGA_MOE_JIT_KNUMDISPATCHTHREADS
-#define MEGA_MOE_JIT_KNUMDISPATCHTHREADS 128u
+// 4-warp DISPATCH-FOLD layout: the dedicated dispatch warp role is removed.
+// The 4 MFMA warps now run the route + cross-rank token pull themselves
+// (PHASE 1 in gfx950_fp8_fp4_mega_moe.cuh) before the compute, so there are
+// no dispatch-only threads.  Block = 0 + 256 + 0 = 256 (4 warps).  Fewer
+// warps/CU at occupancy 1 give each wave ~1.5x the VGPR budget of the 6-warp
+// layout (relieves the spill that tanked the fold to 34 TF); the cost is the
+// loss of the dispatch<->compute overlap.
+#define MEGA_MOE_JIT_KNUMDISPATCHTHREADS 0u
 #endif
 #ifndef MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS
-// N6: 256 (4 MMA warps) instead of 128 (2). With the shared-B LDS refactor in
-// gfx950_fp8_fp4_mega_moe.cuh, 4 MMA warps halve the per-thread accumulator
-// (kSubTilesPerWave 8->4, ~256->128 acc-VGPR) to kill the C1 1627-VGPR spill,
-// 2x the MFMA issue width, and keep a deep (>=2) loader pipeline. Epilogue
-// shrinks to 128 to hold the 512-thread/CU budget.
+// 8 MFMA warps (512 thr, 1 block/CU = 2 waves/SIMD) — latency-hiding experiment:
+// PC sampling showed the 4-warp/1-wave-per-SIMD build is global-load-latency
+// bound (51% of samples park on s_waitcnt vmcnt(0)); a 2nd wave/SIMD covers the
+// vmcnt stall.  8 warps keeps the same per-stage LDS / 4 stages and HALVES the
+// accumulator footprint (kSubTilesPerWave 16->8, ~64 acc-VGPR).  Was 256u (4
+// warps, 245 TF) — revert if this regresses.
+#if MEGA_MOE_AGPR_ACC
+// Pinned-AGPR redesign runs 4 warps (turbo-style single-wave software pipeline:
+// acc resident in AGPR a[0:127], A/B/scale in pinned VGPRs, k-loop hand-scheduled).
 #define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 256u
+#else
+#define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 512u
+#endif
 #endif
 #ifndef MEGA_MOE_JIT_KNUMEPILOGUETHREADS
-#define MEGA_MOE_JIT_KNUMEPILOGUETHREADS 128u
+// epilogue role removed (combine folded into the 4 MFMA warps post-compute).
+#define MEGA_MOE_JIT_KNUMEPILOGUETHREADS 0u
 #endif
 // MI355X exposes 256 CUs (8 XCDs x 32 CUs).  Keep as a multiple of 8 to
 // preserve per-XCD locality of the scheduler state machine.
@@ -337,86 +369,6 @@ extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int nu
     if (sync_err != hipSuccess)
         return static_cast<int>(sync_err);
     return 0;
-}
-
-// ---------------------------------------------------------------------
-//  Per-stage in-kernel profiler host hooks.
-//
-//  Active only when this TU is compiled with ``-DMEGA_MOE_PROFILE=1``
-//  (driven by ``MEGAMOE_PROFILE=1`` in the Python loader).  The kernel
-//  records, per pipeline stage, the earliest start / latest end tick of
-//  the device steady counter into the ``mm::g_mega_moe_prof`` device
-//  global.  These hooks let Python:
-//    * branch on whether the profiling build is active,
-//    * learn the stage count + the wall-clock frequency (kHz) so it can
-//      convert ticks -> microseconds,
-//    * reset the [start,end] pairs before each launch, and
-//    * read back the per-stage span (end - start) ticks afterwards.
-// ---------------------------------------------------------------------
-extern "C" int mega_moe_jit_prof_enabled() {
-#if MEGA_MOE_PROFILE
-    return 1;
-#else
-    return 0;
-#endif
-}
-
-extern "C" int mega_moe_jit_prof_num_stages() {
-#if MEGA_MOE_PROFILE
-    return static_cast<int>(mm::kProfNumStages);
-#else
-    return 0;
-#endif
-}
-
-extern "C" int mega_moe_jit_prof_wallclock_khz() {
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess)
-        return 0;
-    int khz = 0;
-    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess)
-        return 0;
-    return khz;
-}
-
-extern "C" int mega_moe_jit_prof_reset() {
-#if MEGA_MOE_PROFILE
-    unsigned long long host[2u * mm::kProfNumStages];
-    for (uint32_t s = 0u; s < mm::kProfNumStages; ++s) {
-        host[2u * s + 0u] = ~0ull; // earliest start -> +inf
-        host[2u * s + 1u] = 0ull;  // latest end     -> 0
-    }
-    const hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(mm::g_mega_moe_prof), host, sizeof(host));
-    return static_cast<int>(err);
-#else
-    return 0;
-#endif
-}
-
-//  Fills ``out_spans`` with per-stage spans (end - start) in steady-counter
-//  ticks.  Returns the number of stages written, or a negative value on
-//  error / insufficient buffer.
-extern "C" int mega_moe_jit_prof_read(int64_t *out_spans, int max_stages) {
-#if MEGA_MOE_PROFILE
-    const int n = static_cast<int>(mm::kProfNumStages);
-    if (max_stages < n)
-        return -1;
-    unsigned long long host[2u * mm::kProfNumStages];
-    const hipError_t err = hipMemcpyFromSymbol(host, HIP_SYMBOL(mm::g_mega_moe_prof), sizeof(host));
-    if (err != hipSuccess)
-        return -(static_cast<int>(err) + 100);
-    for (int s = 0; s < n; ++s) {
-        const unsigned long long lo = host[2 * s + 0];
-        const unsigned long long hi = host[2 * s + 1];
-        out_spans[s] =
-            (lo != ~0ull && hi > lo) ? static_cast<int64_t>(hi - lo) : static_cast<int64_t>(0);
-    }
-    return n;
-#else
-    (void) out_spans;
-    (void) max_stages;
-    return 0;
-#endif
 }
 
 // ---------------------------------------------------------------------

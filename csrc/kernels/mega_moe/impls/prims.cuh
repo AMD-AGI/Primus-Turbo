@@ -6,7 +6,7 @@
 // gfx950 mega-MoE kernel (and its scheduler).  Names mirror
 // ``deep_gemm/include/deep_gemm/ptx/{utils,ld_st}.cuh`` so a side-by-side
 // diff against the SM100 sources stays readable - the kernel calls
-// ``prims::sync_aligned`` / ``prims::ld_acq`` / ``prims::red_add_rel`` /
+// ``prims::sync_aligned`` / ``prims::ld_acquire_global`` / ``prims::red_add_rel`` /
 // ... at the same call sites where DG calls ``ptx::sync_aligned`` etc.
 //
 // Memory-scope choice rationale:
@@ -28,6 +28,44 @@
 #include <hip/hip_runtime.h>
 
 namespace primus_turbo::mega_moe::prims {
+
+// EXPERIMENT (default 0): MEGA_MOE_RELAXED downgrades ALL acquire/release memory
+// ordering to relaxed (and drops the _sys s_waitcnt + signal fences).  Perf-only
+// probe of the cost of the ordering/fences -- BREAKS correctness, run with
+// --num-correctness-tests 0.
+#ifndef MEGA_MOE_RELAXED
+#define MEGA_MOE_RELAXED 0
+#endif
+// Sub-probe: no-op ONLY the agent acquire fence (buffer_inv L1-invalidate), the
+// per-block one in the compute arrival wait.  Isolates the L1-invalidate cost
+// from the rel atomics / _sys fences.  Correctness-breaking probe.
+#ifndef MEGA_MOE_NOACQFENCE
+#define MEGA_MOE_NOACQFENCE 0
+#endif
+// Sub-probe: relax ONLY the agent-scope RELEASE atomics (-> relaxed).
+#ifndef MEGA_MOE_RELAXED_REL
+#define MEGA_MOE_RELAXED_REL 0
+#endif
+// Sub-probe: drop ONLY the _sys s_waitcnt(vmcnt/lgkmcnt) + signal fences.
+#ifndef MEGA_MOE_RELAXED_SYS
+#define MEGA_MOE_RELAXED_SYS 0
+#endif
+#if MEGA_MOE_RELAXED || MEGA_MOE_RELAXED_REL
+#define MEGA_MOE_REL_ORDER __ATOMIC_RELAXED
+#else
+#define MEGA_MOE_REL_ORDER __ATOMIC_RELEASE
+#endif
+#if MEGA_MOE_RELAXED
+#define MEGA_MOE_ACQ_ORDER __ATOMIC_RELAXED
+#else
+#define MEGA_MOE_ACQ_ORDER __ATOMIC_ACQUIRE
+#endif
+// Combined guard for the _sys drain/signal fences.
+#if MEGA_MOE_RELAXED || MEGA_MOE_RELAXED_SYS
+#define MEGA_MOE_SYS_FENCE 0
+#else
+#define MEGA_MOE_SYS_FENCE 1
+#endif
 
 // Compile-time wave size.  HIP's builtin ``warpSize`` is an ``int``
 // variable (not constexpr), so it cannot appear in template parameters,
@@ -52,27 +90,24 @@ __device__ __forceinline__ uint32_t get_warp_idx() {
     return __builtin_amdgcn_workitem_id_x() / kWarpSize;
 }
 
-// ---------------------------------------------------------------------
-//  Global memory loads.  ``ld_acq`` / ``ld_acq_gpu`` are on-device
-//  (AGENT scope); ``ld_acq_sys`` is the cross-rank IPC variant.
-// ---------------------------------------------------------------------
-__device__ __forceinline__ uint32_t ld_acq(const uint32_t *ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+// AGENT-scope acquire fence.  Lowers to an L1/vector-cache INVALIDATE (buffer_inv)
+// + drain; required after a relaxed spin so the consumer's cached pool reads see
+// the producer's payload.  A bare ``s_waitcnt`` drain does NOT invalidate (it only
+// waits) -> stale reads -> gate-3 fails.  Used cheap-fence-ONCE: one fence after a
+// relaxed ld_volatile spin, not one per iteration.
+__device__ __forceinline__ void acquire_fence_agent() {
+#if !MEGA_MOE_RELAXED && !MEGA_MOE_NOACQFENCE
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 }
-__device__ __forceinline__ uint64_t ld_acq(const uint64_t *ptr) {
-    return __hip_atomic_load(reinterpret_cast<const unsigned long long *>(ptr), __ATOMIC_ACQUIRE,
-                             __HIP_MEMORY_SCOPE_AGENT);
+
+// AGENT-scope release fence: drains outstanding vector stores (s_waitcnt vmcnt(0))
+// so they are visible in L2 before a subsequent (relaxed) signal.  Used ONCE at a
+// phase boundary instead of per-op release ordering.
+__device__ __forceinline__ void release_fence_agent() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 }
-__device__ __forceinline__ uint64_t ld_acq_gpu(const uint64_t *ptr) {
-    return __hip_atomic_load(reinterpret_cast<const unsigned long long *>(ptr), __ATOMIC_ACQUIRE,
-                             __HIP_MEMORY_SCOPE_AGENT);
-}
-__device__ __forceinline__ uint32_t ld_acq_sys(const uint32_t *ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-__device__ __forceinline__ int ld_acq_sys(const int *ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
+
 __device__ __forceinline__ uint32_t ld_volatile(const uint32_t *ptr) {
     return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
@@ -80,12 +115,44 @@ __device__ __forceinline__ uint64_t ld_volatile(const uint64_t *ptr) {
     return __hip_atomic_load(reinterpret_cast<const unsigned long long *>(ptr), __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
 }
+__device__ __forceinline__ uint32_t ld_acquire_global(const uint32_t *ptr) {
+    return __hip_atomic_load(ptr, MEGA_MOE_ACQ_ORDER, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ uint64_t ld_acquire_global(const uint64_t *ptr) {
+    return __hip_atomic_load(reinterpret_cast<const unsigned long long *>(ptr), MEGA_MOE_ACQ_ORDER,
+                             __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ uint32_t ld_acquire_sys(const uint32_t *ptr) {
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+    const uint32_t ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#endif
+    return ret;
+}
+__device__ __forceinline__ int ld_acquire_sys(const int *ptr) {
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+    const int ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#endif
+    return ret;
+}
 
 // ---------------------------------------------------------------------
-//  Atomics / reductions.  ``_sys`` variants are cross-rank IPC.
+//  Atomics / reductions.  Plain (non-``_rel``) ops are RELAXED.  AGENT ``_rel``
+//  variants use native ``__ATOMIC_RELEASE`` (the on-device write-back the
+//  consumer's acquire invalidate pairs with); the SYSTEM ``_rel_sys`` variant
+//  uses the cheap fence above.  ``_sys`` = cross-rank IPC (SYSTEM scope).
 // ---------------------------------------------------------------------
 __device__ __forceinline__ uint32_t atomic_add_rel(uint32_t *ptr, uint32_t value) {
-    return __hip_atomic_fetch_add(ptr, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    return __hip_atomic_fetch_add(ptr, value, MEGA_MOE_REL_ORDER, __HIP_MEMORY_SCOPE_AGENT);
 }
 __device__ __forceinline__ uint64_t atomic_add(uint64_t *ptr, uint64_t value) {
     return __hip_atomic_fetch_add(reinterpret_cast<unsigned long long *>(ptr),
@@ -99,14 +166,21 @@ __device__ __forceinline__ void red_add(int *ptr, int value) {
     __hip_atomic_fetch_add(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 __device__ __forceinline__ void red_add_rel(uint32_t *ptr, uint32_t value) {
-    __hip_atomic_fetch_add(ptr, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_fetch_add(ptr, value, MEGA_MOE_REL_ORDER, __HIP_MEMORY_SCOPE_AGENT);
 }
 __device__ __forceinline__ void red_add_rel_sys(int *ptr, int value) {
-    __hip_atomic_fetch_add(ptr, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+    __hip_atomic_fetch_add(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if MEGA_MOE_SYS_FENCE
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#endif
 }
 __device__ __forceinline__ void red_or_rel_gpu(uint64_t *ptr, uint64_t value) {
     __hip_atomic_fetch_or(reinterpret_cast<unsigned long long *>(ptr),
-                          static_cast<unsigned long long>(value), __ATOMIC_RELEASE,
+                          static_cast<unsigned long long>(value), MEGA_MOE_REL_ORDER,
                           __HIP_MEMORY_SCOPE_AGENT);
 }
 // Release-ordered 64-bit add, AGENT scope.  Used by the L2 arrival COUNT
@@ -115,20 +189,19 @@ __device__ __forceinline__ void red_or_rel_gpu(uint64_t *ptr, uint64_t value) {
 // have written — fixing the read-before-write race that the OR-mask had.
 __device__ __forceinline__ void red_add_rel_gpu(uint64_t *ptr, uint64_t value) {
     __hip_atomic_fetch_add(reinterpret_cast<unsigned long long *>(ptr),
-                           static_cast<unsigned long long>(value), __ATOMIC_RELEASE,
+                           static_cast<unsigned long long>(value), MEGA_MOE_REL_ORDER,
                            __HIP_MEMORY_SCOPE_AGENT);
 }
-// Cross-rank IPC counter update - SYSTEM scope so the remote agent sees it.
-// RELEASE ordering: SM0's preceding plain store of the per-rank token count
-// MUST be observable on the remote agent before the counter increment is,
-// otherwise the dst's consumer can fall through and read 0 for the
-// just-bumped slot - wedging the per-token round-robin in the dispatch
-// fast path.  Empirically observed at EP8 / np=8 (the hang reproduces
-// with RELAXED + plain store and goes away once both writes are
-// SYSTEM-scope ordered).
+// Cross-rank IPC counter update.  Mirrors SM100's ``atom.sys.global.add``:
+// SYSTEM scope so the remote agent sees it (the AMD-mandatory equivalent of
+// SM100 touching peer-mapped memory), RELAXED ordering — the cross-rank
+// happens-before for the dispatch pull loop is established by the
+// ``kBeforeDispatchPull`` ``nvlink_barrier`` (its ``red.release.sys`` /
+// ``ld.acquire.sys`` handshake), which runs after these writes and before
+// the reads, exactly as on SM100.
 __device__ __forceinline__ void atomic_add_sys(uint64_t *ptr, uint64_t value) {
     __hip_atomic_fetch_add(reinterpret_cast<unsigned long long *>(ptr),
-                           static_cast<unsigned long long>(value), __ATOMIC_RELEASE,
+                           static_cast<unsigned long long>(value), __ATOMIC_RELAXED,
                            __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
@@ -294,5 +367,48 @@ __device__ __forceinline__ void sync_unaligned(NamedBarrierWg &bar, uint32_t num
 template <typename T>
 __device__ __forceinline__ void atomicAdd_block(T *ptr, std::type_identity_t<T> val) {
     __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+}
+
+// ---------------------------------------------------------------------
+//  Cooperative warp copy.  The HIP analogue of the bulk-async TMA
+//  transfer the SM100 dispatch uses to pull a token's bytes
+//  (remote-global -> local-pool global): every lane streams 16-byte
+//  (int4) chunks, issuing ``kUnroll`` non-temporal loads before the
+//  matching stores so the loads stay in flight together.  Mirrors the
+//  ``UNROLLED_WARP_COPY`` / ``ld_nc_global`` / ``st_na_global`` pattern
+//  in ``primus_turbo/csrc/kernels/deep_ep/utils.cuh`` (AMD has no TMA, so
+//  there is no shared staging buffer / mbarrier - the copy goes straight
+//  global->global).  ``n_int4`` is the element count in 16-byte units;
+//  the tail handles a final partial batch.
+// ---------------------------------------------------------------------
+template <uint32_t kUnroll = 5u>
+__device__ __forceinline__ void warp_copy_int4(void *dst, const void *src, uint32_t n_int4,
+                                               uint32_t lane_idx) {
+    using vec_t                = int __attribute__((ext_vector_type(4)));
+    auto              *d       = reinterpret_cast<vec_t *>(dst);
+    auto              *s       = reinterpret_cast<const vec_t *>(src);
+    constexpr uint32_t kStride = kWarpSize * kUnroll;
+    vec_t              vals[kUnroll];
+
+    const uint32_t body = (n_int4 / kStride) * kStride;
+    for (uint32_t i = lane_idx; i < body; i += kStride) {
+#pragma unroll
+        for (uint32_t j = 0; j < kUnroll; ++j)
+            vals[j] = __builtin_nontemporal_load(s + i + j * kWarpSize);
+#pragma unroll
+        for (uint32_t j = 0; j < kUnroll; ++j)
+            __builtin_nontemporal_store(vals[j], d + i + j * kWarpSize);
+    }
+
+    // Tail: final partial batch (< kStride elements left).
+    const uint32_t tail = body + lane_idx;
+#pragma unroll
+    for (uint32_t j = 0; j < kUnroll; ++j)
+        if (tail + j * kWarpSize < n_int4)
+            vals[j] = __builtin_nontemporal_load(s + tail + j * kWarpSize);
+#pragma unroll
+    for (uint32_t j = 0; j < kUnroll; ++j)
+        if (tail + j * kWarpSize < n_int4)
+            __builtin_nontemporal_store(vals[j], d + tail + j * kWarpSize);
 }
 } // namespace primus_turbo::mega_moe::prims

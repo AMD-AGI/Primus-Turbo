@@ -146,9 +146,12 @@ MegaMoEConfig get_mega_moe_config(int num_ranks, int /*num_experts*/, int num_ex
     config.num_stages = 4;
     config.smem_size  = 0; // computed once we know per-stage tile sizes
 
-    config.num_dispatch_threads     = 128;
-    config.num_non_epilogue_threads = 128;
-    config.num_epilogue_threads     = 256;
+    // 4-warp DISPATCH-FOLD layout: dispatch + combine both folded into the
+    // 4 MFMA warps (dispatch and epilogue roles removed).  nwarps must divide
+    // BLOCK_M.  Block = 0 + 256 + 0 = 256 (4 warps).
+    config.num_dispatch_threads     = 0;
+    config.num_non_epilogue_threads = 256;
+    config.num_epilogue_threads     = 0;
 
     (void) num_ranks;
     (void) num_tokens;
