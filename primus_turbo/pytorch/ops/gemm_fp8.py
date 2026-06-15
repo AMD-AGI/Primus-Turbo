@@ -8,7 +8,11 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -383,12 +387,32 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
+        # When the FlyDSL backend is active, request the col output in transposed
+        # [N, M] storage: the FlyDSL wgrad GEMM consumes grad_out^T (A =
+        # grad_out^T), so producing the col-quant tile already transposed folds
+        # the standalone elementwise transpose-copy (one full [M, N] fp8 HBM
+        # round-trip + kernel launch per backward step) into the dual-quant
+        # store. We hand the GEMM a logical [M, N] view of that buffer so
+        # dispatch/shape inference are byte-for-byte unchanged; the wgrad
+        # launcher's transpose(0,1).contiguous() then collapses to a zero-cost
+        # view of the producer's contiguous [N, M] output. Other backends (CK,
+        # ...) require a contiguous [M, N] col operand, so the transposed-store
+        # is gated on FlyDSL being the selected GEMM backend.
+        wgrad_col_transposed = (
+            GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        )
         (
             grad_out_fp8_row,
             grad_out_scale_inv_row,
             grad_out_fp8_col,
             grad_out_scale_inv_col,
-        ) = quant_fp8_blockwise_dual_impl(grad_out, grad_out_dtype, ctx.config.block_size)
+        ) = quant_fp8_blockwise_dual_impl(
+            grad_out, grad_out_dtype, ctx.config.block_size, col_transposed=wgrad_col_transposed
+        )
+        if wgrad_col_transposed:
+            # [N, M] -> logical [M, N] view (matches the un-transposed col layout
+            # the downstream GEMM/dispatch expect); re-transposed in the launcher.
+            grad_out_fp8_col = grad_out_fp8_col.transpose(0, 1)
 
         a_grad = gemm_fp8_impl(
             grad_out_fp8_row,

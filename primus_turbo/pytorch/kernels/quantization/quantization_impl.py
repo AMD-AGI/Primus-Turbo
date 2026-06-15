@@ -142,8 +142,16 @@ def quant_fp8_blockwise_dual_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    col_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor in both blockwise row and column modes in one pass.
+
+    When ``col_transposed`` is True the column-quantized FP8 output is stored
+    directly in transposed ``[N, M]`` layout (byte-identical to
+    ``x_fp8_col[M,N].transpose(0,1).contiguous()``) so a downstream TN GEMM that
+    needs ``x^T`` (the FlyDSL wgrad path consuming grad_out) can use it without a
+    separate elementwise transpose-copy. The col-scale shape ``[M//128, N]`` is
+    unchanged. The row output and row scale are unaffected.
 
     NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
     inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
@@ -167,7 +175,9 @@ def quant_fp8_blockwise_dual_impl(
 
     x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
-    x_fp8_col = torch.empty((M, N), dtype=dtype, device=x.device)
+    # Col FP8 buffer: [N, M] when transposed-store is requested, else [M, N].
+    col_fp8_shape = (N, M) if col_transposed else (M, N)
+    x_fp8_col = torch.empty(col_fp8_shape, dtype=dtype, device=x.device)
     x_scales_col = torch.empty(col_scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
@@ -181,6 +191,7 @@ def quant_fp8_blockwise_dual_impl(
         N,
         block_size,
         torch.finfo(dtype).max,
+        COL_TRANSPOSED=col_transposed,
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
@@ -190,6 +201,7 @@ def quant_fp8_blockwise_dual_impl_meta(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    col_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, "Input must be 2D"
     M, N = x.shape
@@ -197,7 +209,8 @@ def quant_fp8_blockwise_dual_impl_meta(
     col_scales_shape = (triton.cdiv(M, block_size), N)
     x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
-    x_fp8_col = torch.empty((M, N), dtype=dtype, device=x.device)
+    col_fp8_shape = (N, M) if col_transposed else (M, N)
+    x_fp8_col = torch.empty(col_fp8_shape, dtype=dtype, device=x.device)
     x_scales_col = torch.empty(col_scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 

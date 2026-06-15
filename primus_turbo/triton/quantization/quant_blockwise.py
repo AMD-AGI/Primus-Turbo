@@ -73,6 +73,7 @@ def quant_fp8_blockwise_dual_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    COL_TRANSPOSED: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -98,7 +99,19 @@ def quant_fp8_blockwise_dual_kernel(
     x_fp8_row_ptrs = x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=mask)
 
-    x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
+    # Col-quant data store. With COL_TRANSPOSED the column-quantized tile is
+    # written directly into an [N, M] output buffer (element (m, n) -> flat
+    # n*M + m) instead of the default [M, N] (element (m, n) -> flat m*N + n).
+    # The [N, M] layout is byte-identical to ``x_fp8_col[M,N].transpose(0,1)
+    # .contiguous()`` and is exactly the operand the FlyDSL wgrad kernel needs
+    # for grad_out (A = grad_out^T), so the separate elementwise transpose-copy
+    # in the wgrad launcher collapses to a zero-cost view. The col-scale layout
+    # ([M//128, N], stored below) is unchanged. Only the grad_out backward path
+    # opts in; the forward a-dual path keeps the default [M, N] col output.
+    if COL_TRANSPOSED:
+        x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] + offs_n[None, :] * M
+    else:
+        x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_col_ptrs, x_fp8_col_tile.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
 
     row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
