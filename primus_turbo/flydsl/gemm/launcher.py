@@ -398,6 +398,7 @@ def gemm_fp8_blockwise_flydsl(
             tile_k=tile_k,
             scale_block_k=_SCALE_BLOCK,
             out_dtype=out_dtype_str,
+            use_async_copy=True,
         )
         compiled = flyc.compile(exe, out, a_fp8, b_shuffled, a_scale_t, b_scale_flat, M, N, stream)
         _compiled_cache[key] = compiled
@@ -476,6 +477,7 @@ def gemm_fp8_blockwise_flydsl_dgrad(
             tile_k=tile_k,
             scale_block_k=_SCALE_BLOCK,
             out_dtype=out_dtype_str,
+            use_async_copy=True,
         )
         compiled = flyc.compile(exe, out, grad_out_fp8, b_shuffled, a_scale_t, b_scale_flat, M, K, stream)
         _compiled_cache[key] = compiled
@@ -549,6 +551,7 @@ def gemm_fp8_blockwise_flydsl_wgrad(
             tile_k=tile_k,
             scale_block_k=_SCALE_BLOCK,
             out_dtype=out_dtype_str,
+            use_async_copy=True,
         )
         compiled = flyc.compile(exe, out, arg_a, arg_b, a_scale_flat, b_scale_flat, N, K, stream)
         _compiled_cache[key] = compiled
