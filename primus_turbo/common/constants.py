@@ -24,9 +24,9 @@ ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 # Default: None (auto-select)
 ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
-# MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
+# MoE dispatch/combine EP backend (TURBO, DEEP_EP, MORI, UCCL).
 # Default: TURBO
-ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
+ENV_EP_BACKEND = "PRIMUS_TURBO_EP_BACKEND"
 
 # Enable auto-tuning across registered kernel backends ("1" to enable).
 # Default: "0" (disabled)
@@ -39,3 +39,7 @@ ENV_ATTN_V3_ATOMIC_FP32 = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
 # When set to "1", EP dispatch/combine kernels run on the caller's current CUDA stream.
 # Default: "0"
 ENV_EP_FORCE_CURRENT_STREAM = "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"
+
+# Number of RDMA queue pairs per PE used by the Mori EP backend.
+# Default: "2"
+ENV_MORI_NUM_QP_PER_PE = "PRIMUS_TURBO_MORI_NUM_QP_PER_PE"

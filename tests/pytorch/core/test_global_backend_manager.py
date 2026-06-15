@@ -21,7 +21,7 @@ def clean_backend_state(monkeypatch):
     for key in (
         "PRIMUS_TURBO_GEMM_BACKEND",
         "PRIMUS_TURBO_GROUPED_GEMM_BACKEND",
-        "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND",
+        "PRIMUS_TURBO_EP_BACKEND",
         "PRIMUS_TURBO_AUTO_TUNE",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -49,9 +49,9 @@ class TestGlobalBackendManagerEnvVar:
         monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_BACKEND", "hipblaslt")
         assert GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) == BackendType.HIPBLASLT
 
-    def test_moe_dispatch_combine_backend_env(self, monkeypatch):
-        monkeypatch.setenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", "triton")
-        assert GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.FP8) == BackendType.TRITON
+    def test_ep_backend_env(self, monkeypatch):
+        monkeypatch.setenv("PRIMUS_TURBO_EP_BACKEND", "triton")
+        assert GlobalBackendManager.get_ep_backend(PrecisionType.FP8) == BackendType.TRITON
 
     def test_auto_tune_env_enabled(self, monkeypatch):
         monkeypatch.setenv("PRIMUS_TURBO_AUTO_TUNE", "1")
@@ -77,7 +77,7 @@ class TestGlobalBackendManagerEnvVar:
     def test_returns_none_when_env_not_set(self):
         assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) is None
         assert GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) is None
-        assert GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.FP8) is None
+        assert GlobalBackendManager.get_ep_backend(PrecisionType.FP8) is None
         assert GlobalBackendManager.auto_tune_enabled() is False
 
 

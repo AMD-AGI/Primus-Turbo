@@ -29,14 +29,45 @@ ROUTER_TOPK = 8
 
 def _get_backends():
     """Return available backend names."""
+    all_backends = ["TURBO"]
     try:
         import deep_ep  # noqa: F401
 
-        # TODO: add backend deepep, temporal disable it since rocm7.2 deepep bug.
+        # TODO: add backend deepep, temporarily disable it since rocm7.2 deepep bug.
         # return ["TURBO", "DEEP_EP"]
-        return ["TURBO"]
+        # all_backends.append("DEEP_EP")
     except ImportError:
-        return ["TURBO"]
+        pass
+
+    try:
+        import mori  # noqa: F401
+
+        all_backends.append("MORI")
+    except ImportError:
+        pass
+    return all_backends
+
+
+def _get_cuda_graph_backends():
+    """Filter ``_get_backends`` down to ones that self-declare graph-safe.
+
+    Done at parametrize time so graph-unsafe backends (e.g. Mori) never enter
+    the worker process: calling ``self.skipTest`` mid-test under
+    ``MultiProcContinuousTest`` re-raises as ``RuntimeError`` and fails the run.
+    """
+    from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+        _BACKEND_REGISTRY,
+    )
+
+    out = []
+    for name in _get_backends():
+        cls = _BACKEND_REGISTRY.get(name)
+        if cls is None:
+            continue
+        supports = getattr(cls, "supports_cuda_graph", None)
+        if supports is None or supports():
+            out.append(name)
+    return out
 
 
 def _build_tp_groups(tp_size):
@@ -152,6 +183,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # -2 tells MultiProcContinuousTest to use torch.cuda.device_count()
     world_size = -2
 
+    @classmethod
+    def backend_str(cls) -> str:
+        return "nccl"
+
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
@@ -178,10 +213,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("expert_capacity_factor", [None, 0.5])
     def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
-                dist.group.WORLD,
+                self.pg,
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 expert_capacity_factor=expert_capacity_factor,
             )
@@ -194,10 +229,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
     def test_worst_tokens(self, backend, permute_max_token_num):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
-                dist.group.WORLD,
+                self.pg,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 permute_max_token_num=permute_max_token_num,
@@ -211,7 +246,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("pad_multiple", [128, 256])
     def test_pad_multiple(self, backend, pad_multiple):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
@@ -223,20 +258,51 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
     # ------------------------------------------------------------------
 
-    @parametrize("backend", _get_backends())
-    def test_autotune(self, backend):
+    def test_autotune(self):
         self._bind_device()
-        with patch.dict(
-            os.environ,
-            {
-                "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
-                "PRIMUS_TURBO_AUTO_TUNE": "1",
-            },
-        ):
-            _run_dispatch_combine(
-                self.rank,
-                dist.group.WORLD,
-            )
+        # ``patch.dict`` snapshots ``os.environ`` and restores it on exit, so
+        # the inner ``pop`` is reverted automatically.
+        with patch.dict(os.environ, {"PRIMUS_TURBO_AUTO_TUNE": "1"}):
+            os.environ.pop("PRIMUS_TURBO_EP_BACKEND", None)
+            _run_dispatch_combine(self.rank, self.pg)
+
+    # ------------------------------------------------------------------
+    # Autotune without an explicit backend override: actually sweep configs
+    # and (when multiple backends exist) select the fastest backend.
+    # ------------------------------------------------------------------
+
+    def test_autotune_sweep(self):
+        """Exercise the real autotune path added to ``_DeepEPLikeBackend``.
+
+        With ``PRIMUS_TURBO_AUTO_TUNE=1`` and **no** backend pinned, the first
+        ``moe_dispatch`` for a given shape triggers a full (dispatch +
+        combine) ``nvl_chunk_size`` sweep, binds the result to the freshly
+        returned ``handle``, and the paired ``moe_combine`` simply looks the
+        result up by ``id(handle)``. A second run on the same shape hits the
+        shape cache without re-measuring.
+        """
+        from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+            MoEDispatchCombineAutoTuner,
+        )
+
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_AUTO_TUNE": "1"}):
+            os.environ.pop("PRIMUS_TURBO_EP_BACKEND", None)
+            MoEDispatchCombineAutoTuner.clear()
+
+            # First run triggers autotune and registers the handle mapping.
+            _run_dispatch_combine(self.rank, self.pg)
+            first = MoEDispatchCombineAutoTuner.current()
+            assert first is not None, "autotune should have populated a result"
+            assert (
+                MoEDispatchCombineAutoTuner.handle_cache_size() > 0
+            ), "moe_dispatch should have bound the tuned result to at least one handle"
+
+            # Second run hits the shape cache (no extra measurements) and
+            # yields the same backend selection.
+            _run_dispatch_combine(self.rank, self.pg)
+            second = MoEDispatchCombineAutoTuner.current()
+            assert second is first or second.backend_name == first.backend_name
 
     # ------------------------------------------------------------------
     # tp_size > 1 coverage
@@ -247,7 +313,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         if dist.get_world_size() < 2:
             self.skipTest("requires world_size >= 2")
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -270,7 +336,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         # for every token (pre-TP-expansion expert id space).
         routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device="cuda")
         routing_map[:, :router_topk] = True
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -294,7 +360,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         # is expected to TP-expand them internally.
         probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / router_topk
         _, token_indices = torch.topk(probs, router_topk, dim=-1)
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with patch.dict(os.environ, {"PRIMUS_TURBO_EP_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -309,29 +375,16 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
 # ----------------------------------------------------------------------
 # CUDA graph compatibility tests
-#
-# The C++ helper ``is_ep_force_current_stream()`` caches the value of
-# ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` in a ``static`` local on first
-# call, so toggling the env var inside a worker process after the first
-# ``Buffer`` has been constructed is a no-op.  Because
-# ``MultiProcContinuousTest`` reuses the same worker processes across every
-# test method in a class, we cannot rely on ``patch.dict(os.environ, ...)``
-# inside a test body to enable current-stream mode.
-#
-# Instead we put the CUDA-graph tests in a dedicated ``MultiProcContinuousTest``
-# subclass.  Each subclass spawns its own worker pool via
-# ``torch.multiprocessing.Process`` with the ``spawn`` start method, which
-# copies the parent's ``os.environ`` at ``process.start()`` time.  By setting
-# the env var in ``setUpClass`` and eagerly spawning the workers before
-# restoring ``os.environ``, the workers for this class inherit the flag and
-# their static cache is initialized to ``1`` on the very first Buffer
-# construction, while other test classes' worker pools remain unaffected.
 # ----------------------------------------------------------------------
 
 
 @instantiate_parametrized_tests
 class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
     world_size = -2
+
+    @classmethod
+    def backend_str(cls) -> str:
+        return "nccl"
 
     @property
     def device(self) -> torch.device:
@@ -345,14 +398,14 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
         os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
         super().setUpClass()
 
-    @parametrize("backend", _get_backends())
+    @parametrize("backend", _get_cuda_graph_backends())
     def test_cuda_graph(self, backend):
         from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
 
         self._bind_device()
         with patch.dict(
             os.environ,
-            {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
+            {"PRIMUS_TURBO_EP_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8
             permute_max_token_num = NUM_TOKENS * 8 * ROUTER_TOPK
@@ -366,7 +419,8 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
             dispatcher = turbo.modules.DeepEPTokenDispatcher(
                 NUM_EXPERTS,
                 ROUTER_TOPK,
-                dist.group.WORLD,
+                self.pg,
+                permute_fusion=True,
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=num_worst_tokens,
                 permute_max_token_num=permute_max_token_num,

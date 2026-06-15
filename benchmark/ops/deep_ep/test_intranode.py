@@ -17,15 +17,28 @@ import time
 import torch
 import torch.distributed as dist
 
-from .utils import (
-    bench,
-    calc_diff,
-    get_deep_ep_backend,
-    init_dist,
-    inplace_unique,
-    per_token_cast_back,
-    per_token_cast_to_fp8,
-)
+try:
+    # Package-relative import (run as a module).
+    from .utils import (
+        bench,
+        calc_diff,
+        get_deep_ep_backend,
+        init_dist,
+        inplace_unique,
+        per_token_cast_back,
+        per_token_cast_to_fp8,
+    )
+except ImportError:
+    # Script-style import (run directly with this dir on sys.path).
+    from utils import (
+        bench,
+        calc_diff,
+        get_deep_ep_backend,
+        init_dist,
+        inplace_unique,
+        per_token_cast_back,
+        per_token_cast_to_fp8,
+    )
 
 
 # noinspection PyShadowingNames
