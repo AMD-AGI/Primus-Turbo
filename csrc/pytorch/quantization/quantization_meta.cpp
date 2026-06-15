@@ -359,10 +359,12 @@ grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_
     at::Tensor colwise_output =
         at::empty({N, M_pad_col}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
 
-    auto group_lens_padded_colwise = at::empty_like(group_lens);
-    auto group_offs_padded_colwise = at::empty({G + 1}, group_offs.options());
-    auto group_lens_padded_rowwise = at::empty_like(group_lens);
-    auto group_offs_padded_rowwise = at::empty({G + 1}, group_offs.options());
+    auto group_lens_padded_colwise =
+        at::empty_like(group_lens, group_lens.options().device(at::kMeta));
+    auto group_offs_padded_colwise = at::empty({G + 1}, group_offs.options().device(at::kMeta));
+    auto group_lens_padded_rowwise =
+        at::empty_like(group_lens, group_lens.options().device(at::kMeta));
+    auto group_offs_padded_rowwise = at::empty({G + 1}, group_offs.options().device(at::kMeta));
 
     return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
             colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu),
