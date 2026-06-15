@@ -23,10 +23,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoader,
     S2RLoaderTr,
     StoreCPerTensor,
+    as_i8_flat,
     asm_mma_do,
+    block_mn,
     ceildiv,
     compute_global_swizzle,
     compute_global_swizzle_nn,
+    get_compiled,
     make_fp8_buffer_tensor,
     make_value_attrs,
     mask_a_tail,
@@ -48,6 +51,7 @@ def _compile_dense_nt(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     GROUP_M: int = 1,
+    group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D N-band (big-N L2 reuse)
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
     nt_vmcnt: int = 3,  # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
@@ -130,18 +134,11 @@ def _compile_dense_nt(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        # Super-block tile swizzle for L2 reuse; group_size_m clamps the last
-        # band so any GROUP_M >= 1 is correct (arith.select = integer min).
+        # Super-block tile swizzle for L2 reuse. group_n=0: 1D GROUP_M (bit-identical
+        # to the prior inline divmod); group_n>0: 2D N-band (big-N B-restream reuse).
         num_pid_m = ceildiv(c_m, BLOCK_M)
         pid = xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
-        num_pid_in_group = GROUP_M * n_blocks
-        group_id = pid // num_pid_in_group
-        pid_in_group = pid % num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        remaining_m = num_pid_m - first_pid_m
-        group_size_m = arith.select(remaining_m < GROUP_M, remaining_m, fx.Int32(GROUP_M))
-        block_m = first_pid_m + (pid_in_group % group_size_m)
-        block_n = pid_in_group // group_size_m
+        block_m, block_n = block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
         A0_gl_offset = (block_m * BLOCK_M) * K
         A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
@@ -362,6 +359,7 @@ def _compile_dense_nn(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     GROUP_M: int = 4,
+    group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D N-band (big-N L2 reuse)
     num_xcd: int = 8,  # XCD-aware PID remap for per-XCD L2 reuse (MI355X = 8 XCD); 1 disables. See xcd_remap_pid.
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
@@ -445,18 +443,11 @@ def _compile_dense_nn(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        # Super-block tile swizzle for L2 reuse; group_size_m clamps the last
-        # band so any GROUP_M >= 1 is correct (same as NT).
+        # Super-block tile swizzle for L2 reuse. group_n=0: 1D GROUP_M (bit-identical
+        # to the prior inline divmod); group_n>0: 2D N-band (big-N B-restream reuse).
         num_pid_m = ceildiv(c_m, BLOCK_M)
         pid = xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
-        num_pid_in_group = GROUP_M * n_blocks
-        group_id = pid // num_pid_in_group
-        pid_in_group = pid % num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        remaining_m = num_pid_m - first_pid_m
-        group_size_m = arith.select(remaining_m < GROUP_M, remaining_m, fx.Int32(GROUP_M))
-        block_m = first_pid_m + (pid_in_group % group_size_m)
-        block_n = pid_in_group // group_size_m
+        block_m, block_n = block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
         # A: same as NT.
         A0_gl_offset = (block_m * BLOCK_M) * K
@@ -990,34 +981,6 @@ def _compile_dense_tn(
 _COMPILED_DENSE_CACHE: dict = {}
 
 
-def _get_compiled_dense(launch, args):
-    """Cache compiled launcher by (shape, dtype, int-arg) tuple."""
-    key_parts = [id(launch)]
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            key_parts.append((tuple(a.shape), a.dtype))
-        elif isinstance(a, int):
-            key_parts.append(a)
-        else:
-            key_parts.append(type(a).__name__)
-    key = tuple(key_parts)
-    cached = _COMPILED_DENSE_CACHE.get(key)
-    if cached is None:
-        cached = flyc.compile(launch, *args)
-        _COMPILED_DENSE_CACHE[key] = cached
-    return cached
-
-
-def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:
-    # Zero-copy flat byte view. Recomputed every call (no id()-keyed cache: a
-    # freed tensor's id + data_ptr can both be reused, and a recycled pair with a
-    # different numel would alias the wrong length). The view ops are ~1us and
-    # allocate nothing.
-    if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
-        return t.contiguous().view(torch.int8).view(-1)
-    return t.contiguous().view(-1)
-
-
 def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Tensorwise scalar -> length-1 fp32 buffer (no broadcast). The kernel reads
     the single value and applies it per-tensor, so only an fp32/device cast is
@@ -1040,63 +1003,91 @@ _NN_AUTOTUNE_CACHE: dict = {}
 def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench NN candidates, cache best (launch, cfg) by (M,N,K).
 
-    Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
-    finite-checks the output, times 2-warmup + 20-iter, and caches the
-    fastest by shape.
+    Stage 1: micro-bench each (BM, GROUP_M, num_xcd, AG) candidate at group_n=0
+    (inline-asm ds_read_b64_tr_b8 on by default), finite-check, time 2-warmup +
+    20-iter, keep the fastest.
+    Stage 2: fix that cfg and sweep the 2D N-band width group_n (NN B is [K,N]
+    N-contig, same big-N re-stream as TN). Adopt a band only when a MIN-of-4 robust
+    timing clears a 1.5% margin over the re-measured group_n=0 baseline ->
+    no-regression by construction. Mirrors the NT/TN autotune.
     """
+    import os
+
     import torch as _torch
 
     key = (M, N, K, cbsz, blgp, out_fp16)
     if key in _NN_AUTOTUNE_CACHE:
         return _NN_AUTOTUNE_CACHE[key]
     out_view = args[2]
-    best_us = float("inf")
-    best = None
-    for bm, gm, xcd, ag in _NN_CANDIDATES:
-        # odd-M (M % bm != 0) is fine: the partial last M-tile is
-        # bounded by c_m (StoreCPerTensor clamp) and the global SRD (HW OOB
-        # clamp on the A G2S load), so no even-tiling filter is needed.
+
+    def _make(bm, gm, xcd, ag, gn):
+        # inline-asm ds_read_b64_tr_b8 on by default (drops the per-K-iter
+        # compiler-auto vmcnt(0) drains).
+        return _compile_dense_nn(
+            K=K,
+            BLOCK_M=bm,
+            BLOCK_N=256,
+            GROUP_M=gm,
+            group_n=gn,
+            num_xcd=xcd,
+            agpr_alloc=ag,
+            b_inline_asm_load=True,
+            vmcnt_hint=2,
+            cbsz=cbsz,
+            blgp=blgp,
+            out_fp16=out_fp16,
+        )
+
+    def _time(launch, reps=1):
+        """(min-of-reps us, compiled) or (inf, None) on failure / non-finite."""
         try:
-            # inline-asm ds_read_b64_tr_b8 on by default (drops the per-K-iter
-            # compiler-auto vmcnt(0) drains).
-            launch = _compile_dense_nn(
-                K=K,
-                BLOCK_M=bm,
-                BLOCK_N=256,
-                GROUP_M=gm,
-                num_xcd=xcd,
-                agpr_alloc=ag,
-                b_inline_asm_load=True,
-                vmcnt_hint=2,
-                cbsz=cbsz,
-                blgp=blgp,
-                out_fp16=out_fp16,
-            )
-            c = _get_compiled_dense(launch, args)
+            c = get_compiled(_COMPILED_DENSE_CACHE, launch, args)
             c(*args)
             _torch.cuda.synchronize()
-            sample = out_view.view(-1)[:1024].float()
-            if not _torch.isfinite(sample).all().item():
-                continue
+            if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                return float("inf"), None
             for _ in range(2):
                 c(*args)
             _torch.cuda.synchronize()
-            e0 = _torch.cuda.Event(enable_timing=True)
-            e1 = _torch.cuda.Event(enable_timing=True)
-            _torch.cuda.synchronize()
-            e0.record()
-            for _ in range(20):
-                c(*args)
-            e1.record()
-            _torch.cuda.synchronize()
-            us = e0.elapsed_time(e1) * 1000.0 / 20
-            if us < best_us:
-                best_us = us
-                best = (launch, (bm, gm, xcd, ag))
+            best_us = float("inf")
+            for _ in range(reps):
+                e0 = _torch.cuda.Event(enable_timing=True)
+                e1 = _torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(20):
+                    c(*args)
+                e1.record()
+                _torch.cuda.synchronize()
+                best_us = min(best_us, e0.elapsed_time(e1) * 1000.0 / 20)
+            return best_us, c
         except Exception:
-            continue
+            return float("inf"), None
+
+    # Stage 1: best (BLOCK_M, GROUP_M, num_xcd, AGPR) at group_n=0. odd-M is fine
+    # (StoreCPerTensor clamp + global SRD HW OOB clamp bound the partial last tile).
+    best_us = float("inf")
+    best = None
+    for bm, gm, xcd, ag in _NN_CANDIDATES:
+        launch = _make(bm, gm, xcd, ag, 0)
+        us, _c = _time(launch)
+        if us < best_us:
+            best_us = us
+            best = (launch, (bm, gm, xcd, ag, 0))
     if best is None:
         raise RuntimeError(f"NN autotune found no working cfg for ({M},{N},{K})")
+    # Stage 2: fix the winning cfg, sweep the 2D N-band width (robust + margin).
+    bm, gm, xcd, ag, _ = best[1]
+    n_blocks = (N + 255) // 256
+    gn_cands = [] if os.environ.get("MX_DISABLE_NT_GN") else [g for g in (4, 8, 16) if n_blocks >= 2 * g]
+    if gn_cands:
+        gn0_us, _ = _time(_make(bm, gm, xcd, ag, 0), reps=4)  # robust gn=0 baseline (margin ref)
+        bus = gn0_us
+        for gn in gn_cands:
+            launch = _make(bm, gm, xcd, ag, gn)
+            us, _c = _time(launch, reps=4)
+            if us < bus and us < gn0_us * 0.985:
+                bus = us
+                best = (launch, (bm, gm, xcd, ag, gn))
     _NN_AUTOTUNE_CACHE[key] = best
     return best
 
@@ -1116,59 +1107,87 @@ _NT_AUTOTUNE_CACHE: dict = {}
 def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench NT candidates, cache best (launch, cfg) by (M,N,K).
 
-    Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
-    finite-checks the output, times 2-warmup + 20-iter, and caches the
-    fastest by shape.
+    Stage 1: micro-bench each (BM, GROUP_M, num_xcd, AG) candidate at group_n=0,
+    finite-check, time 2-warmup + 20-iter, keep the fastest.
+    Stage 2: fix that cfg and sweep the 2D N-band width group_n. Adopt a band only when a MIN-of-4 robust
+    timing clears a 1.5% margin over the re-measured group_n=0 baseline ->
+    no-regression by construction. Measured big-/mid-N wins: 7B_GateUp +4.9%,
+    70B_Down +2.0% (70B_GateUp band hurts -> margin keeps gn=0). Mirrors TN.
     """
+    import os
+
     import torch as _torch
 
     key = (M, N, K, cbsz, blgp, out_fp16)
     if key in _NT_AUTOTUNE_CACHE:
         return _NT_AUTOTUNE_CACHE[key]
     out_view = args[2]
-    best_us = float("inf")
-    best = None
-    for bm, gm, xcd, ag in _NT_CANDIDATES:
-        # odd-M (M % bm != 0) is fine: the partial last M-tile is
-        # bounded by c_m (StoreCPerTensor clamp) and the global SRD (HW OOB
-        # clamp on the A G2S load), so no even-tiling filter is needed.
+
+    def _make(bm, gm, xcd, ag, gn):
+        return _compile_dense_nt(
+            K=K,
+            BLOCK_M=bm,
+            BLOCK_N=256,
+            GROUP_M=gm,
+            group_n=gn,
+            agpr_alloc=ag,
+            num_xcd=xcd,
+            cbsz=cbsz,
+            blgp=blgp,
+            out_fp16=out_fp16,
+        )
+
+    def _time(launch, reps=1):
+        """(min-of-reps us, compiled) or (inf, None) on failure / non-finite."""
         try:
-            launch = _compile_dense_nt(
-                K=K,
-                BLOCK_M=bm,
-                BLOCK_N=256,
-                GROUP_M=gm,
-                agpr_alloc=ag,
-                num_xcd=xcd,
-                cbsz=cbsz,
-                blgp=blgp,
-                out_fp16=out_fp16,
-            )
-            c = _get_compiled_dense(launch, args)
+            c = get_compiled(_COMPILED_DENSE_CACHE, launch, args)
             c(*args)
             _torch.cuda.synchronize()
-            sample = out_view.view(-1)[:1024].float()
-            if not _torch.isfinite(sample).all().item():
-                continue
+            if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                return float("inf"), None
             for _ in range(2):
                 c(*args)
             _torch.cuda.synchronize()
-            e0 = _torch.cuda.Event(enable_timing=True)
-            e1 = _torch.cuda.Event(enable_timing=True)
-            _torch.cuda.synchronize()
-            e0.record()
-            for _ in range(20):
-                c(*args)
-            e1.record()
-            _torch.cuda.synchronize()
-            us = e0.elapsed_time(e1) * 1000.0 / 20
-            if us < best_us:
-                best_us = us
-                best = (launch, (bm, gm, xcd, ag))
+            best_us = float("inf")
+            for _ in range(reps):
+                e0 = _torch.cuda.Event(enable_timing=True)
+                e1 = _torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(20):
+                    c(*args)
+                e1.record()
+                _torch.cuda.synchronize()
+                best_us = min(best_us, e0.elapsed_time(e1) * 1000.0 / 20)
+            return best_us, c
         except Exception:
-            continue
+            return float("inf"), None
+
+    # Stage 1: best (BLOCK_M, GROUP_M, num_xcd, AGPR) at group_n=0. odd-M is fine:
+    # the partial last M-tile is bounded by c_m (StoreCPerTensor clamp) and the
+    # global SRD (HW OOB clamp on the A G2S load).
+    best_us = float("inf")
+    best = None
+    for bm, gm, xcd, ag in _NT_CANDIDATES:
+        launch = _make(bm, gm, xcd, ag, 0)
+        us, _c = _time(launch)
+        if us < best_us:
+            best_us = us
+            best = (launch, (bm, gm, xcd, ag, 0))
     if best is None:
         raise RuntimeError(f"NT autotune found no working cfg for ({M},{N},{K})")
+    # Stage 2: fix the winning cfg, sweep the 2D N-band width (robust + margin).
+    bm, gm, xcd, ag, _ = best[1]
+    n_blocks = (N + 255) // 256
+    gn_cands = [] if os.environ.get("MX_DISABLE_NT_GN") else [g for g in (4, 8, 16) if n_blocks >= 2 * g]
+    if gn_cands:
+        gn0_us, _ = _time(_make(bm, gm, xcd, ag, 0), reps=4)  # robust gn=0 baseline (margin ref)
+        bus = gn0_us
+        for gn in gn_cands:
+            launch = _make(bm, gm, xcd, ag, gn)
+            us, _c = _time(launch, reps=4)
+            if us < bus and us < gn0_us * 0.985:
+                bus = us
+                best = (launch, (bm, gm, xcd, ag, gn))
     _NT_AUTOTUNE_CACHE[key] = best
     return best
 
@@ -1185,9 +1204,15 @@ _TN_AUTOTUNE_CACHE: dict = {}
 def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench TN candidates, cache best (launch, cfg) by (M,N,K).
 
-    1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
+    Stage 1: 1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
     (HBM-streaming) shapes expose the per-XCD L2 reuse on the hot bench,
     L2-resident shapes pick num_xcd=1.
+    Stage 2: fix the winning num_xcd and sweep the 2D N-band width group_n (the
+    kernel already supports it via _tn_block_mn but it shipped unused). Adopt a
+    band only if a MIN-of-reps robust timing clears a 1.5% margin over the
+    re-measured group_n=0 baseline -> no-regression by construction. Measured
+    big-/mid-N wins: 70B_Down +4.3%, 7B_GateUp +2.8%, 70B_KV +2.0%, 70B_QKV +1.2%
+    (70B_GateUp band hurts -> margin keeps gn=0). Mirrors the mxfp8 TN autotune.
     """
     import torch as _torch
 
@@ -1201,47 +1226,73 @@ def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
     bm = 128 if tiles_256 < NUM_CUS else 256
     out_view = args[2]
-    best_us = float("inf")
-    best = None
-    for xcd in (8, 1):
+
+    def _make(gn, xcd):
+        return _compile_dense_tn(
+            K=K,
+            BLOCK_M=bm,
+            BLOCK_N=256,
+            GROUP_M=4,
+            vmcnt_hint=3,
+            group_n=gn,
+            num_xcd=xcd,
+            cbsz=cbsz,
+            blgp=blgp,
+            out_fp16=out_fp16,
+        )
+
+    def _time(launch, reps=1):
+        """(min-of-reps us, compiled) or (inf, None) on failure / non-finite."""
         try:
-            launch = _compile_dense_tn(
-                K=K,
-                BLOCK_M=bm,
-                BLOCK_N=256,
-                GROUP_M=4,
-                vmcnt_hint=3,
-                group_n=0,
-                num_xcd=xcd,
-                cbsz=cbsz,
-                blgp=blgp,
-                out_fp16=out_fp16,
-            )
-            c = _get_compiled_dense(launch, args)
+            c = get_compiled(_COMPILED_DENSE_CACHE, launch, args)
             c(*args)
             _torch.cuda.synchronize()
-            sample = out_view.view(-1)[:1024].float()
-            if not _torch.isfinite(sample).all().item():
-                continue
+            if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                return float("inf"), None
             for _ in range(2):
                 c(*args)
             _torch.cuda.synchronize()
-            e0 = _torch.cuda.Event(enable_timing=True)
-            e1 = _torch.cuda.Event(enable_timing=True)
-            _torch.cuda.synchronize()
-            e0.record()
-            for _ in range(20):
-                c(*args)
-            e1.record()
-            _torch.cuda.synchronize()
-            us = e0.elapsed_time(e1) * 1000.0 / 20
-            if us < best_us:
-                best_us = us
-                best = (launch, (bm, 4, 0, xcd))
+            best_us = float("inf")
+            for _ in range(reps):
+                e0 = _torch.cuda.Event(enable_timing=True)
+                e1 = _torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(20):
+                    c(*args)
+                e1.record()
+                _torch.cuda.synchronize()
+                best_us = min(best_us, e0.elapsed_time(e1) * 1000.0 / 20)
+            return best_us, c
         except Exception:
-            continue
+            return float("inf"), None
+
+    # Stage 1: best num_xcd at group_n=0.
+    best_us = float("inf")
+    best = None
+    for xcd in (8, 1):
+        launch = _make(0, xcd)
+        us, _c = _time(launch)
+        if us < best_us:
+            best_us = us
+            best = (launch, (bm, 4, 0, xcd))
     if best is None:
         raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
+    # Stage 2: fix xcd, sweep the 2D N-band width (robust min-of-4 + 1.5% margin
+    # over a re-measured gn=0 baseline). Env MX_DISABLE_NT_GN forces the 1D swizzle.
+    import os
+
+    xcd = best[1][3]
+    n_blocks = (N + 255) // 256
+    gn_cands = [] if os.environ.get("MX_DISABLE_NT_GN") else [g for g in (4, 8, 16) if n_blocks >= 2 * g]
+    if gn_cands:
+        gn0_us, _ = _time(_make(0, xcd), reps=4)  # robust gn=0 baseline (the margin reference)
+        bus = gn0_us
+        for gn in gn_cands:
+            launch = _make(gn, xcd)
+            us, _c = _time(launch, reps=4)
+            if us < bus and us < gn0_us * 0.985:
+                bus = us
+                best = (launch, (bm, 4, gn, xcd))
     _TN_AUTOTUNE_CACHE[key] = best
     return best
 
@@ -1280,9 +1331,9 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
         # TN: per-shape autotune picks the best candidate cfg, cached by (M,N,K).
         args = (
-            _as_i8_flat(a),
-            _as_i8_flat(b),
-            out.contiguous().view(-1),
+            as_i8_flat(a),
+            as_i8_flat(b),
+            out.contiguous(),  # 2D: shape packs int32; StoreCPerTensor re-bases C via i64
             a_scale_v,
             b_scale_v,
             M,
@@ -1290,7 +1341,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             torch.cuda.current_stream(),
         )
         launch, _cfg = _autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        get_compiled(_COMPILED_DENSE_CACHE, launch, args)(*args)
         if trans_c:
             return out.t().contiguous()
         return out
@@ -1308,9 +1359,9 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # NN: per-shape runtime autotune over the candidate tiles, caches by
         # (M,N,K). Build args before autotune (it benches against them).
         args = (
-            _as_i8_flat(a),
-            _as_i8_flat(b),
-            out.contiguous().view(-1),
+            as_i8_flat(a),
+            as_i8_flat(b),
+            out.contiguous(),  # 2D: shape packs int32; StoreCPerTensor re-bases C via i64
             a_scale_v,
             b_scale_v,
             M,
@@ -1318,7 +1369,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             torch.cuda.current_stream(),
         )
         launch, _cfg = _autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        get_compiled(_COMPILED_DENSE_CACHE, launch, args)(*args)
     elif (not trans_a) and trans_b:
         # NT native: A [M, K], B [N, K] (B^T storage of [K, N]).
         M, K_a = a.shape
@@ -1331,9 +1382,9 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # NT: per-shape runtime autotune over the 8w/v3 candidate tiles, caches
         # by (M,N,K). Build args before autotune (it benches against them).
         args = (
-            _as_i8_flat(a),
-            _as_i8_flat(b),
-            out.contiguous().view(-1),
+            as_i8_flat(a),
+            as_i8_flat(b),
+            out.contiguous(),  # 2D: shape packs int32; StoreCPerTensor re-bases C via i64
             a_scale_v,
             b_scale_v,
             M,
@@ -1341,7 +1392,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             torch.cuda.current_stream(),
         )
         launch, _cfg = _autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        get_compiled(_COMPILED_DENSE_CACHE, launch, args)(*args)
     else:
         raise NotImplementedError(
             f"FlyDSL fp8 GEMM does not support the TT layout " f"(trans_a={trans_a}, trans_b={trans_b})."

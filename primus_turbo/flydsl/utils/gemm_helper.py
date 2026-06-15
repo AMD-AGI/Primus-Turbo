@@ -4,7 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
@@ -20,6 +22,33 @@ from flydsl.expr.utils.arith import ArithValue
 
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def as_i8_flat(t: torch.Tensor) -> torch.Tensor:
+    # Zero-copy flat byte view. Recomputed every call (no id()-keyed cache: a
+    # freed tensor's id + data_ptr can both be reused, and a recycled pair with a
+    # different numel would alias the wrong length). The view ops allocate nothing.
+    if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
+        return t.contiguous().view(torch.int8).view(-1)
+    return t.contiguous().view(-1)
+
+
+def get_compiled(cache: dict, launch, args):
+    """Cache the compiled launcher in ``cache`` by (id(launch), shapes/dtypes/ints)."""
+    key_parts = [id(launch)]
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            key_parts.append((tuple(a.shape), a.dtype))
+        elif isinstance(a, int):
+            key_parts.append(a)
+        else:
+            key_parts.append(type(a).__name__)
+    key = tuple(key_parts)
+    cached = cache.get(key)
+    if cached is None:
+        cached = flyc.compile(launch, *args)
+        cache[key] = cached
+    return cached
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
@@ -184,39 +213,33 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        c_nbytes = c_rows * c_cols * 2  # bf16 / fp16 output = 2 bytes
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        # C addressed via i64 per-tile re-basing (handles M*N > 2^31 / >4GB output);
+        # pass C as 2D so its shape packs within int32. See StoreCPlain (mxfp8).
+        self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
         gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
         self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
-        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
 
     def _load_scalar(self, div):
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
-    def _store_one(self, value, c_index):
-        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
-        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
-
     def store(self, c_frag, base_row, base_col):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
-            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = col < self.c_cols
-                oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     scaled = (vec_f32[i] * scale).to(self.out_ty)
-                    c_index = (row + i) * self.c_cols + col
-                    self._store_one(scaled, arith.select(col_valid, c_index, oob))
+                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
+                    _buffer_ops.buffer_store(scaled, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
 
 def _a_tail_mask_vec(lane_id, r):
@@ -295,6 +318,50 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     local = pid // num_xcd
     offset = xcd * per_xcd + arith.select(xcd < rem, xcd, rem)
     return offset + local
+
+
+def block_mn(pid, num_pid_m, n_blocks, GM, GN):
+    """Tile-id -> (block_m, block_n), resolved at trace time. GN==0: 1D GROUP_M
+    super-row swizzle (block_m inner). GN>0: 2D band — N split into width-GN bands
+    with GROUP_M inside each, keeping both A and B slabs L2-resident. Bijection."""
+    if GN > 0:
+        band_tiles = num_pid_m * GN
+        band = pid // band_tiles
+        pid_in_band = pid % band_tiles
+        band_n0 = band * GN
+        rem_n = n_blocks - band_n0
+        band_w = arith.select(rem_n < GN, rem_n, fx.Int32(GN))
+        nig = GM * band_w
+        gid = pid_in_band // nig
+        pig = pid_in_band % nig
+        fpm = gid * GM
+        rem_m = num_pid_m - fpm
+        gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+        return fpm + (pig % gsm), band_n0 + (pig // gsm)
+    nig = GM * n_blocks
+    gid = pid // nig
+    pig = pid % nig
+    fpm = gid * GM
+    rem_m = num_pid_m - fpm
+    gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+    return fpm + (pig % gsm), pig // gsm
+
+
+def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
+    """Buffer resource re-based at this workgroup's row band [base_row, c_rows), in
+    64-bit ``index`` arith, so a 32-bit offset only spans the band (handles outputs
+    whose flat M*N exceeds 2^31 / 4GB). base_row clamped to [0, c_rows] so a
+    partial/fully-OOB last row tile bases 0 records (its stores drop) rather than
+    past the tensor end; nrec clamped to the 32-bit SRD field."""
+    elem = arith.index(elem_bytes)
+    cols_i = arith.index_cast(T.index, c_cols)
+    row_i = arith.index_cast(T.index, base_row)
+    rows_i = arith.index_cast(T.index, c_rows)
+    row_c = arith.minui(row_i, rows_i)
+    band_base = c_base + row_c * cols_i * elem
+    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0xFFFFFFFF))
+    band_base_i64 = arith.index_cast(T.i64, band_base)
+    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
 
 
 def _inttoptr_lds(byte_addr):

@@ -365,6 +365,64 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
     )
 
 
+# Direct FlyDSL mxfp8 kernel coverage across NT / NN / TN. The dense MX autograd
+# (FP8GemmMXFunction) folds every GEMM to NT, so the multi-backend
+# test_gemm_fp8_mx_blockwise above can only ever exercise NT through FlyDSL. This
+# hits the kernel's three native layouts directly (E4M3, bf16), against a
+# dequantized reference. Per-layout constraints only (no fwd+bwd coupling):
+# M%64, N%256, K%128 & K>=256.
+@pytest.mark.parametrize("m", [256, 512])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("layout", ["NT", "NN", "TN"])
+def test_gemm_fp8_mx_blockwise_flydsl_kernel(m, n, k, layout):
+    from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL mxfp8 GEMM is gfx950-only")
+
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+    dev = "cuda"
+    torch.manual_seed(0)
+
+    def quant(x):  # x [free, K] -> MX e4m3 along K (axis=-1); scale is [free, K//32]
+        return QuantizedTensor.quantize(
+            x,
+            float8_e4m3,
+            ScalingGranularity.MX_BLOCKWISE,
+            axis=-1,
+            block_size=32,
+            scaling_recipe=ScalingRecipe(),
+        )
+
+    # A free = M, B free = N; both block-scaled along the K contraction.
+    qa = quant(torch.randn(m, k, dtype=torch.bfloat16, device=dev))
+    qb = quant(torch.randn(n, k, dtype=torch.bfloat16, device=dev))
+    ref = qa.dequantize().float() @ qb.dequantize().float().t()  # [M, N]
+
+    # Physical operand layout per the kernel: A is [K,M] when trans_a else [M,K];
+    # B is [N,K] when trans_b else [K,N]. The E8M0 scale stays [free, K//32].
+    a_phys = qa.qdata.t().contiguous() if trans_a else qa.qdata
+    b_phys = qb.qdata if trans_b else qb.qdata.t().contiguous()
+    out = gemm_mxfp8_flydsl_kernel(
+        a_phys,
+        qa.scale_inv,
+        b_phys,
+        qb.scale_inv,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        out_dtype=torch.bfloat16,
+    )
+
+    snr = compute_snr(ref, out)
+    print(f"\nMX FlyDSL {layout} M={m} N={n} K={k}: SNR={snr:.2f} dB")
+    assert snr > 22, f"{layout} SNR too low: {snr:.2f} dB"
+
+
 def _get_fp8_dtype(fmt: Format, is_fwd: bool):
     if fmt == Format.E4M3:
         return float8_e4m3
