@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    ScalingRecipe,
     float8_e4m3,
     float8_e5m2,
 )
@@ -30,6 +31,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_segment_m_row_col_impl,
+)
+from primus_turbo.pytorch.ops.quantization import (
+    grouped_quantize_fp8_with_trans,
+    quantize_fp8_with_trans,
 )
 
 __all__ = [
@@ -487,6 +492,151 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None, None
 
 
+class FP8GroupedGemmMXFunc(torch.autograd.Function):
+    """MXFP8 grouped GEMM autograd (MX_BLOCKWISE), Triton backend.
+
+    Same interface as the hip path; only the backend differs
+    (default_backend=TRITON).  A / grad_out use grouped dual-quant (padded
+    per-group M, dense E8M0 scale); B uses per-group dual-quant.  fwd / dgrad
+    read the padded layout (group_offs_padded_rowwise); the output is
+    over-allocated to the padded rows, group_offs_out packs each group tight,
+    and the caller slices [:total_m].  wgrad output (G, N, K) is
+    padding-independent.  When hip MX kernels land, only default_backend
+    needs to flip to TURBO.
+    """
+
+    @staticmethod
+    def forward(ctx, a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu):
+        assert config.granularity == ScalingGranularity.MX_BLOCKWISE
+        assert a.ndim == 2 and b.ndim == 3
+        assert out_dtype in [torch.float16, torch.bfloat16]
+        assert trans_b, "MXFP8 grouped GEMM only supports trans_b=True (NT layout)."
+
+        a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
+
+        # A: fused grouped dual-quant + per-group M zero-pad (rowwise 32 / colwise
+        # 128), padded layouts computed on GPU (no D2H sync).
+        (
+            a_fp8_row,
+            a_scale_row,
+            a_fp8_col,
+            a_scale_col,
+            _,
+            group_offs_padded_rowwise,
+            _,
+            _,
+        ) = grouped_quantize_fp8_with_trans(
+            a,
+            a_dtype,
+            config.granularity,
+            group_lens,
+            group_offs,
+            block_size=config.block_size,
+            scaling_recipe=ScalingRecipe(),
+            scaling_recipe_for_trans=ScalingRecipe(),
+        )
+        # B: per-group dual-quant (rowwise (G,N,K) for fwd, colwise (G,K,N) for dgrad).
+        b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
+            b,
+            b_dtype,
+            config.granularity,
+            block_size=config.block_size,
+            scaling_recipe=ScalingRecipe(use_2d_block=True),
+            scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+        )
+
+        total_m = int(a.size(0))
+        # fwd: read rowwise-padded layout (group_offs_padded_rowwise); the output
+        # is over-allocated to the padded rows, group_offs_out packs each group
+        # tight, then slice [:total_m] back to the user-visible shape.
+        out = grouped_gemm_fp8_impl(
+            a_fp8_row,
+            b_fp8_row,
+            a_scale_row,
+            b_scale_row,
+            group_lens,
+            group_offs_padded_rowwise,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=num_cu,
+            default_backend=BackendType.TRITON.value,
+            group_offs_out=group_offs,
+        )
+        out = out[:total_m]
+
+        ctx.save_for_backward(a_fp8_col, a_scale_col, b_fp8_col, b_scale_col, group_lens, group_offs)
+        ctx.config = config
+        ctx.out_dtype = out_dtype
+        ctx.num_cu = num_cu
+        ctx.total_m = total_m
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
+        (a_fp8_col, a_scale_col, b_fp8_col, b_scale_col, group_lens, group_offs) = ctx.saved_tensors
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+
+        (
+            grad_out_fp8_row,
+            grad_out_scale_row,
+            grad_out_t_fp8,
+            grad_out_t_scale,
+            _,
+            group_offs_padded_rowwise,
+            group_lens_padded_colwise,
+            group_offs_padded_colwise,
+        ) = grouped_quantize_fp8_with_trans(
+            grad_out,
+            grad_out_dtype,
+            ctx.config.granularity,
+            group_lens,
+            group_offs,
+            block_size=ctx.config.block_size,
+            scaling_recipe=ScalingRecipe(),
+            scaling_recipe_for_trans=ScalingRecipe(),
+        )
+
+        # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
+        grad_a = grouped_gemm_fp8_impl(
+            grad_out_fp8_row,
+            b_fp8_col,
+            grad_out_scale_row,
+            b_scale_col,
+            group_lens,
+            group_offs_padded_rowwise,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=ctx.out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+            group_offs_out=group_offs,
+        )
+        grad_a = grad_a[: ctx.total_m]
+
+        # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
+        grad_b = grouped_gemm_fp8_variable_k_impl(
+            grad_out_t_fp8,
+            a_fp8_col,
+            grad_out_t_scale,
+            a_scale_col,
+            group_lens_padded_colwise,
+            group_offs_padded_colwise,
+            trans_a=False,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=ctx.out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+        )
+        # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
+        return grad_a, grad_b, None, None, None, None, None, None
+
+
 @torch._dynamo.disable(
     recursive=True,
     reason=(
@@ -523,7 +673,8 @@ def grouped_gemm_fp8(
         trans_b: Whether B is transposed (default: True)
         out_dtype: Output dtype (default: None, inferred from input dtypes)
         config: FP8 quantization config. If None, uses default (TENSORWISE, E4M3, DYNAMIC)
-        num_cu: Number of compute units. If None, uses default (-1)
+        num_cu: Cap on the number of compute units the grouped GEMM may use
+            (limits the persistent-kernel grid). If None, uses all CUs on the device.
 
     Returns:
         Output tensor with shape [m, n] (same dtype as input)
@@ -569,5 +720,8 @@ def grouped_gemm_fp8(
         # BLOCKWISE only accepts raw tensors today; preserve existing assertion
         # behaviour in ``FP8GroupedGemmBlockFunc.forward``.
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
+    elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
+        # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
+        return FP8GroupedGemmMXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

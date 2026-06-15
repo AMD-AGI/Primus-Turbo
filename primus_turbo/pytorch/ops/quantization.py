@@ -19,6 +19,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
+    grouped_quantize_mxfp8_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
@@ -88,7 +89,6 @@ def quantize_fp8_with_trans(
     granularity: ScalingGranularity,
     *,
     block_size: Optional[int] = None,
-    axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -97,8 +97,11 @@ def quantize_fp8_with_trans(
 
     NOTE:
         For MXFP8 quantization:
-            1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
+            1. The x may be a 2D ``[M, N]`` tensor or a 3D ``[G, M, N]`` batched
+               (per-group) tensor. The MX grouped GEMM weight path calls this with
+               3D ``(G, N, K)`` weights.
+            2. Both row-wise and col-wise outputs are produced in one pass; no
+               ``axis`` argument is taken (it is implied by the dual direction).
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
@@ -109,9 +112,50 @@ def quantize_fp8_with_trans(
         return quantize_mxfp8_impl(
             x,
             out_dtype,
-            axis,
+            None,
             block_size,
             True,
+            scaling_recipe,
+            scaling_recipe_for_trans,
+        )
+    else:
+        raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def grouped_quantize_fp8_with_trans(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    *,
+    block_size: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    FP8 Grouped Quantize with trans
+    """
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        assert (
+            block_size == MXFP8_BLOCK_SIZE
+        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
+        return grouped_quantize_mxfp8_impl(
+            x,
+            out_dtype,
+            block_size,
+            group_lens,
+            group_offs,
             scaling_recipe,
             scaling_recipe_for_trans,
         )

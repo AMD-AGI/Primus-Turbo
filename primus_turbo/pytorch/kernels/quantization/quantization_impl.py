@@ -446,6 +446,55 @@ def quantize_mxfp8_impl(
         )
 
 
+def grouped_quantize_mxfp8_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """MXFP8 dual (rowwise + colwise) quantization fused with per-group M-axis
+    zero-padding.
+
+    Each per-group region of ``x`` (defined by ``group_lens`` / ``group_offs``)
+    is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
+    padded per-group layouts are computed on GPU (no D2H sync).
+    """
+    mxfp8_support, reason = check_mxfp8_support()
+    assert mxfp8_support, reason
+
+    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe_for_trans = (
+        ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+    )
+
+    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
+        x,
+        group_lens,
+        group_offs,
+        out_dtype,
+        scaling_recipe.use_2d_block,
+        scaling_recipe_for_trans.use_2d_block,
+        scaling_recipe.shuffle_scale,
+        scaling_recipe.shuffle_out,
+        scaling_recipe_for_trans.shuffle_scale,
+        scaling_recipe_for_trans.shuffle_out,
+    )
+
+
 def dequantize_mxfp8_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
 ) -> torch.Tensor:
