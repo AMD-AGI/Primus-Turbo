@@ -144,6 +144,7 @@ def filter_files_by_arch(files):
     offload_arch_list, _ = get_offload_archs()
     enabled_gfx942 = "--offload-arch=gfx942" in offload_arch_list
     enabled_gfx950 = "--offload-arch=gfx950" in offload_arch_list
+    enable_gfx1250 = "--offload-arch=gfx1250" in offload_arch_list
     ck_disabled = not build_ck_backend()
     turbo_disabled = not build_turbo_backend()
 
@@ -160,6 +161,9 @@ def filter_files_by_arch(files):
                 filtered_files.append(file)
         elif file_str.endswith("_gfx950.cu") or file_str.endswith("_gfx950.hip"):
             if enabled_gfx950:
+                filtered_files.append(file)
+        elif file_str.endswith("_gfx1250.cu") or file_str.endswith("_gfx1250.hip"):
+            if enable_gfx1250:
                 filtered_files.append(file)
         else:
             filtered_files.append(file)
@@ -481,7 +485,7 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "scipy",
-        "triton>=3.7.0",
+        # "triton>=3.7.0",
         "flydsl>=0.2.0",
     ]
 

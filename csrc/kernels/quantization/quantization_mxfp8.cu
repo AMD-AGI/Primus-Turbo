@@ -37,8 +37,8 @@ using namespace primus_turbo::detail;
 // ============================================================================
 
 // Hardware architecture parameters
-constexpr int WARP_SIZE         = 64;  // AMD wavefront size
-constexpr int THREADS_PER_BLOCK = 256; // 4 warps per block
+constexpr int WARP_SIZE         = THREADS_PER_WARP; // AMD wavefront size
+constexpr int THREADS_PER_BLOCK = 256;              // 4 warps per block
 constexpr int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
 
 // Tile dimensions for main kernel loop

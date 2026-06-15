@@ -14,11 +14,9 @@ using namespace primus_turbo::detail;
 // laid out as blockDim (BLOCK_M, THREADS_PER_BLOCK / BLOCK_M). BLOCK_M == 64 so a
 // full 64-lane wavefront covers one tile row (128B coalesced transposed writes /
 // 64B coalesced reads in the colwise transpose).
-constexpr int WARP_SIZE         = 64;  // AMD wavefront size
 constexpr int THREADS_PER_BLOCK = 512; // 8 warps per block
-constexpr int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
-constexpr int BLOCK_M           = 64; // rows per block (tile height)
-constexpr int BLOCK_N           = 64; // cols per block (tile width)
+constexpr int BLOCK_M           = 64;  // rows per block (tile height)
+constexpr int BLOCK_N           = 64;  // cols per block (tile width)
 
 // ---------------------------------------------------------------------------
 // MXFP8 de-quantization kernel (rowwise + colwise in one entry).
