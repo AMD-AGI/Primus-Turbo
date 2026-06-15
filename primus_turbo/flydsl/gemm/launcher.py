@@ -68,6 +68,12 @@ _TILE_CANDIDATES = (
     (64, 128, 128),
     (64, 128, 256),
     (64, 256, 128),
+    # Round-5: deeper-K wgrad tile. Same (tile_m=64, tile_n=256) as the
+    # default large-shape pick (preserves round-2's A-fragment / scale_a
+    # N-reuse) but doubles tile_k 128->256, halving the wgrad K-loop
+    # iteration count (and its per-iter barrier / prefetch / addr-gen VALU).
+    # Only the direction-aware wgrad path prefers it; fwd/dgrad keep tk=128.
+    (64, 256, 256),
 )
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -200,13 +206,22 @@ def is_flydsl_available() -> bool:
 
 
 def _select_tile(
-    M: int, N: int, K: int, scale_block_k: int = _SCALE_BLOCK
+    M: int, N: int, K: int, scale_block_k: int = _SCALE_BLOCK, direction: str = "fwd"
 ) -> Optional[Tuple[int, int, int]]:
     """Pick a (tile_m, tile_n, tile_k) that the kernel can run for this shape.
 
     Returns ``None`` when no candidate satisfies the kernel's hard divisibility
     constraints, signalling the caller to fall back to another backend.
+
+    ``direction`` is the GEMM axis ("fwd" / "dgrad" / "wgrad"). Round-5: the
+    wgrad (TN) GEMM has a deep contraction (K_kernel = M, e.g. 16384), so its
+    main loop pays per-K-iteration barrier / prefetch / address-gen VALU that
+    depresses MFMA issue density. For wgrad only, prefer the deeper-K tile
+    (tile_k=256) which halves the K-loop iteration count; fwd/dgrad keep
+    tile_k=128 (already efficient). This is a single-variable change on the
+    wgrad tile_k axis: tile_m/tile_n selection is identical across directions.
     """
+    prefer_deep_k = direction == "wgrad"
 
     def _valid(tm: int, tn: int, tk: int) -> bool:
         return (
@@ -243,7 +258,13 @@ def _select_tile(
             # compute-bound backward (wgrad/dgrad) path. tile_n=256 now
             # outscores tile_n=128 by the same margin tile_n=128 led by before.
             s += 8 if tn == 256 else (6 if tn == 128 else (4 if tn == 64 else 0))
-        s += 6 if tk == 128 else 3
+        # tile_k preference. fwd/dgrad favour tk=128 (shallow, already
+        # efficient); the wgrad deep-K path favours tk=256 to halve its K-loop
+        # iteration count and the attendant per-iter barrier/prefetch VALU.
+        if prefer_deep_k:
+            s += 6 if tk == 256 else 3
+        else:
+            s += 6 if tk == 128 else 3
         return s
 
     return max(valid, key=_score)
@@ -517,7 +538,8 @@ def gemm_fp8_blockwise_flydsl_wgrad(
         )
 
     # Kernel dims: rows M_kernel=N, output cols N_kernel=K, contraction K_kernel=M.
-    tile = _select_tile(N, K, M)
+    # direction="wgrad": prefer the deeper-K tile (tile_k=256) for this path.
+    tile = _select_tile(N, K, M, direction="wgrad")
     if tile is None:
         raise ValueError(
             f"No valid FlyDSL wgrad tile for grad_b[N={N}, K={K}] (contract M={M}); "
