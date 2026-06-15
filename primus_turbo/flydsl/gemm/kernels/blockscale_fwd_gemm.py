@@ -217,7 +217,7 @@ def compile_blockscale_fwd_gemm(
         # bit-identical result, only L2 reuse (visitation order) changes.
         # num_pid_m / num_pid_n are compile-time (match the host grid
         # gx=ceil(M/tile_m), gy=N//tile_n).
-        L2_GROUP_M = 8  # tuning knob: super-block height in M-tiles
+        L2_GROUP_M = 16  # tuning knob: super-block height in M-tiles (r22: 8->16, retune for per-XCD L2)
         num_pid_m = (M + tile_m - 1) // tile_m
         num_pid_n = N // tile_n
         if const_expr(L2_GROUP_M > 1 and num_pid_m > 1 and num_pid_n > 1):
