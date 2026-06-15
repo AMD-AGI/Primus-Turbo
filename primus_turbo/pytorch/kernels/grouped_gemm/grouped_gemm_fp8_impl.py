@@ -24,6 +24,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+    _compute_tile_cumsum_kernel,  # noqa: F401 – re-exported for ops layer
     grouped_gemm_fp8_blockwise_triton_kernel,
     grouped_gemm_fp8_blockwise_variable_k_triton_kernel,
     grouped_gemm_fp8_rowwise_triton_kernel,
@@ -31,6 +32,11 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
+from primus_turbo.asm_co.grouped_gemm.backends import (
+    GroupedGEMMFP8ASMCOBackend,
+    GroupedGEMMFP8VariableKASMCOBackend,
+)
+from primus_turbo.asm_co.grouped_gemm.launcher import launch_asm_co_wgrad_variable_k_beta1
 
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
@@ -45,6 +51,21 @@ _HYBRID_SUPPORTED_DTYPES = (
     (float8_e5m2, float8_e4m3, torch.float16),
     (float8_e5m2, float8_e4m3, torch.bfloat16),
 )
+
+_logged_gemm_backends: set[str] = set()
+
+
+def _log_backend_once(pass_name: str, backend: str) -> None:
+    key = f"{pass_name}:{backend}"
+    if key not in _logged_gemm_backends:
+        _logged_gemm_backends.add(key)
+        is_rank0 = (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        )
+        if is_rank0:
+            print(f"[Primus-Turbo] Grouped GEMM FP8 {pass_name}: using {backend} backend")
 
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
@@ -400,6 +421,7 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
+        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8ASMCOBackend, autotune=False),
     }
     _cache = TuneCache(1024)
 
@@ -423,7 +445,6 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         m = a.shape[1] if trans_a else a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[0] if trans_a else a.shape[1]
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
 
 
@@ -525,6 +546,7 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
         BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
+        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8VariableKASMCOBackend, autotune=False),
     }
     _cache = TuneCache(1024)
 
@@ -571,11 +593,15 @@ def grouped_gemm_fp8_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
+
+    _pass = "DGRAD" if trans_b else "FWD"
+    _log_backend_once(_pass, user_backend_enum.name if user_backend_enum else default_backend_enum.name)
 
     kwargs = dict(
         a=a,
@@ -612,11 +638,14 @@ def grouped_gemm_fp8_variable_k_impl(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
+
+    _log_backend_once("WGRAD", user_backend_enum.name if user_backend_enum else default_backend_enum.name)
 
     kwargs = dict(
         a=a,
@@ -656,6 +685,7 @@ def grouped_gemm_fp8_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
@@ -688,6 +718,7 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     granularity: int,
     num_cu: int | None,
     default_backend: int,
+    is_bwd: bool = False,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"

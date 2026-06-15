@@ -15,6 +15,13 @@ from primus_turbo.triton.activation.swiglu_kernel import (
     swiglu_with_mask_bwd_kernel,
     swiglu_with_mask_fwd_kernel,
 )
+from primus_turbo.asm_co.activation.launcher import (
+    USE_ASM_SWIGLU_BWD,
+    ASM_CO_SWIGLU_BWD_EXPECTED_BLOCK_SIZE,
+    ASM_CO_SWIGLU_BWD_EXPECTED_HIDDEN,
+    ASM_CO_SWIGLU_BWD_EXPECTED_TOKENS,
+    launch_asm_co_swiglu_bwd,
+)
 
 
 def swiglu_fwd_with_probs(x: torch.Tensor, probs: torch.Tensor, row_mask: Optional[torch.Tensor] = None):
@@ -89,21 +96,30 @@ def swiglu_bwd_with_probs(
 
         BLOCK_SIZE = 8192
         grid = (BLOCK_SIZE,)
-        swiglu_with_mask_bwd_kernel[grid](
-            grad_out,
-            x,
-            probs,
-            row_mask,
-            grad_x,
-            grad_probs,
-            num_tokens=num_tokens,
-            stride_grad_out_token=grad_out.stride(0),
-            stride_x_token=x.stride(0),
-            stride_probs_token=probs.stride(0),
-            stride_grad_x_token=grad_x.stride(0),
-            stride_grad_probs_token=grad_probs.stride(0),
-            LOAD_WIDTH=triton.next_power_of_2(hidden_size),
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+
+        if (
+            USE_ASM_SWIGLU_BWD
+            and num_tokens  == ASM_CO_SWIGLU_BWD_EXPECTED_TOKENS
+            and hidden_size == ASM_CO_SWIGLU_BWD_EXPECTED_HIDDEN
+            and BLOCK_SIZE  == ASM_CO_SWIGLU_BWD_EXPECTED_BLOCK_SIZE
+        ):
+            launch_asm_co_swiglu_bwd(grad_out, x, probs, row_mask, grad_x, grad_probs)
+        else:
+            swiglu_with_mask_bwd_kernel[grid](
+                grad_out,
+                x,
+                probs,
+                row_mask,
+                grad_x,
+                grad_probs,
+                num_tokens=num_tokens,
+                stride_grad_out_token=grad_out.stride(0),
+                stride_x_token=x.stride(0),
+                stride_probs_token=probs.stride(0),
+                stride_grad_x_token=grad_x.stride(0),
+                stride_grad_probs_token=grad_probs.stride(0),
+                LOAD_WIDTH=triton.next_power_of_2(hidden_size),
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
     return grad_x, grad_probs

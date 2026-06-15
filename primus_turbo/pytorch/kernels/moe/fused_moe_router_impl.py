@@ -14,6 +14,14 @@ from primus_turbo.triton.moe.fused_router_kernel import (
     fused_scaling_group_sum_routing_backward_kernel,
     fused_scaling_group_sum_routing_kernel,
 )
+from primus_turbo.asm_co.moe.launcher import (
+    USE_ASM_ROUTER,
+    ASM_CO_ROUTER_EXPECTED_E,
+    ASM_CO_ROUTER_EXPECTED_G,
+    ASM_CO_ROUTER_EXPECTED_K,
+    ASM_CO_ROUTER_EXPECTED_S,
+    launch_asm_co_router,
+)
 
 
 def fused_moe_router_fwd(
@@ -83,24 +91,37 @@ def fused_moe_router_fwd_triton(
     output_probs = torch.zeros((s, e), device="cuda", dtype=logits.dtype)
     output_routing_map = torch.zeros((s, e), device="cuda", dtype=torch.int32)
 
-    wrap_triton(fused_scaling_group_sum_routing_kernel)[(num_programs,)](
-        logits,
-        output_scores,
-        output_topk_indices,
-        raw_topk_logits,
-        output_probs,
-        output_routing_map,
-        s,
-        e,
-        groups,
-        topk,
-        selected_groups,
-        E_ALIGNED,
-        INNER_GROUP_K_ALIGNED,
-        num_stages,
-        0 if score_function == "sigmoid" else 1,
-        scaling_factor,
-    )
+    if (
+        USE_ASM_ROUTER
+        and s == ASM_CO_ROUTER_EXPECTED_S
+        and e == ASM_CO_ROUTER_EXPECTED_E
+        and groups == ASM_CO_ROUTER_EXPECTED_G
+        and topk == ASM_CO_ROUTER_EXPECTED_K
+        and score_function == "sigmoid"
+    ):
+        launch_asm_co_router(
+            logits, output_scores, output_topk_indices, raw_topk_logits,
+            output_probs, output_routing_map, scaling_factor, num_programs,
+        )
+    else:
+        wrap_triton(fused_scaling_group_sum_routing_kernel)[(num_programs,)](
+            logits,
+            output_scores,
+            output_topk_indices,
+            raw_topk_logits,
+            output_probs,
+            output_routing_map,
+            s,
+            e,
+            groups,
+            topk,
+            selected_groups,
+            E_ALIGNED,
+            INNER_GROUP_K_ALIGNED,
+            num_stages,
+            0 if score_function == "sigmoid" else 1,
+            scaling_factor,
+        )
 
     return output_scores, output_topk_indices, raw_topk_logits, output_probs, output_routing_map
 
