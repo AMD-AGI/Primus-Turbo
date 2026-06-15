@@ -209,8 +209,38 @@ def compile_blockscale_dgrad_gemm(
         b_rsrc = buffer_ops.create_buffer_resource(arg_b, max_size=True)
         scale_b_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
 
-        bx_m = bx * tile_m
-        by_n = by * tile_n
+        # ── L2-aware grouped (super-block) rasterization ──────────────────
+        # Round-9: dgrad on the wide-N regime (huge contraction dim) shows the
+        # lowest L2 hit of any GEMM kernel/shape because the default row-major
+        # block launch makes concurrently-resident CUs touch disjoint output
+        # tiles with no shared-operand L2 reuse. Remap the linear block id so a
+        # cluster of GROUP_M consecutive workgroups stays within a narrow band
+        # of M-tiles (Triton-style grouped ordering), keeping their shared B/A
+        # panels hot in L2. This is a pure permutation of which workgroup
+        # computes which output tile -> bit-identical result, only L2 reuse
+        # (visitation order) changes. num_pid_m / num_pid_n are compile-time
+        # (match the host grid gx=ceil(M/tile_m), gy=N//tile_n).
+        L2_GROUP_M = 8  # tuning knob: super-block height in M-tiles
+        num_pid_m = (M + tile_m - 1) // tile_m
+        num_pid_n = N // tile_n
+        if const_expr(L2_GROUP_M > 1 and num_pid_m > 1 and num_pid_n > 1):
+            num_pid_in_group = L2_GROUP_M * num_pid_n  # compile-time int
+            pid = fx.Index(bx) * num_pid_n + fx.Index(by)
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * L2_GROUP_M
+            # group_size_m = min(num_pid_m - first_pid_m, L2_GROUP_M) (tail-safe)
+            diff_v = fx.Index(num_pid_m) - first_pid_m
+            group_size_m = fx.Index(
+                arith.minsi(diff_v.ir_value(), fx.Index(L2_GROUP_M).ir_value())
+            )
+            pid_in_group = pid % num_pid_in_group
+            pid_m = first_pid_m + (pid_in_group % group_size_m)
+            pid_n = pid_in_group // group_size_m
+            bx_m = pid_m * tile_m
+            by_n = pid_n * tile_n
+        else:
+            bx_m = bx * tile_m
+            by_n = by * tile_n
 
         # ---- Wave / lane decomposition ----
         wave_size = 64
