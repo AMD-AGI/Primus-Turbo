@@ -300,6 +300,45 @@ def shuffle_b(b: torch.Tensor, layout: Tuple[int, int] = (16, 16)) -> torch.Tens
     return v.permute(0, 2, 3, 1, 4).contiguous().view(N, K)
 
 
+def _shuffle_b_transposed(src: torch.Tensor, layout: Tuple[int, int] = (16, 16)) -> torch.Tensor:
+    """Fused ``transpose(0, 1) + shuffle_b`` in a single permuted-contiguous copy.
+
+    Byte-identical to ``shuffle_b(src.transpose(0, 1).contiguous())`` but
+    materializes the kernel operand with ONE HBM round-trip instead of two: the
+    explicit ``.transpose(0, 1).contiguous()`` intermediate is folded into the
+    strided read of the single ``.contiguous()`` below, deleting one full
+    ``P*Q`` fp8 copy + one elementwise-kernel launch per backward GEMM.
+
+    ``src`` is the *un-transposed* source ``[Q, P]`` (row-major / contiguous);
+    the result is the pre-shuffled transpose ``[P, Q]`` in the kernel's (16, 16)
+    MFMA layout.
+
+    Derivation: with ``T = src.transpose(0, 1)`` (shape ``[P, Q]``),
+    ``shuffle_b(T)`` reads ``T[row, col] = src[col, row]`` at 5D view index
+    ``(i0, i1, i2, i3, i4)`` where ``row = i0*BN + i1`` and
+    ``col = i2*BK + i3*K_inner + i4``. Since ``src`` is contiguous ``[Q, P]``,
+    ``src[col, row]`` lives at flat offset ``col*P + row``, giving the element
+    strides below; the ``permute(0, 2, 3, 1, 4)`` is baked directly into the
+    as_strided dim order so the lone ``.contiguous()`` produces the final layout.
+    """
+    if not src.is_contiguous():
+        src = src.contiguous()
+    Q, P = src.shape
+    IN, IK = layout
+    BK = IK * 2
+    K_inner = 16 // src.element_size()
+    BN = IN
+    assert (
+        P % BN == 0 and Q % BK == 0
+    ), f"_shuffle_b_transposed: P={P} Q={Q} not divisible by ({BN}, {BK})"
+    # 5D strided view of `src` reproducing shuffle_b(src.T)'s permuted layout
+    # (permuted dim order i0, i2, i3, i1, i4).
+    sizes = (P // BN, Q // BK, BK // K_inner, BN, K_inner)
+    strides = (BN, BK * P, K_inner * P, 1, P)
+    v = torch.as_strided(src, sizes, strides)
+    return v.contiguous().view(P, Q)
+
+
 def gemm_fp8_blockwise_flydsl(
     a_fp8: torch.Tensor,  # [M, K] fp8 (row-major / row-quant)
     b_fp8: torch.Tensor,  # [N, K] fp8 (weight; NOT pre-shuffled)
@@ -403,7 +442,6 @@ def gemm_fp8_blockwise_flydsl_dgrad(
     assert N == Nb, f"N mismatch: grad_out has N={N}, b has N={Nb}"
 
     # B = b^T = [K, N]; its 2D-block scale transposes to [K // 128, N // 128].
-    b_t = b_fp8.transpose(0, 1).contiguous()
     b_scale_t = b_scale_inv.transpose(0, 1).contiguous()
 
     # Kernel dims: rows M_kernel=M, output cols N_kernel=K, contraction K_kernel=N.
@@ -419,7 +457,9 @@ def gemm_fp8_blockwise_flydsl_dgrad(
 
     a_scale_t = grad_out_scale_inv.transpose(0, 1).contiguous().view(-1)  # [N//128, M]
     b_scale_flat = b_scale_t.contiguous().view(-1)
-    b_shuffled = shuffle_b(b_t)
+    # Fuse b^T (transpose+contiguous) and the pre-shuffle into ONE copy:
+    # _shuffle_b_transposed(b_fp8) == shuffle_b(b_fp8.transpose(0, 1).contiguous()).
+    b_shuffled = _shuffle_b_transposed(b_fp8)
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
     stream = torch.cuda.current_stream()
@@ -487,7 +527,9 @@ def gemm_fp8_blockwise_flydsl_wgrad(
     flyc = _flyc()
 
     arg_a = grad_out_col_fp8.transpose(0, 1).contiguous()  # [N, M]
-    arg_b = shuffle_b(a_col_fp8.transpose(0, 1).contiguous())  # pre-shuffle a^T [K, M]
+    # Fuse a^T (transpose+contiguous) and the pre-shuffle into ONE copy:
+    # _shuffle_b_transposed(a_col_fp8) == shuffle_b(a_col_fp8.transpose(0,1).contiguous()).
+    arg_b = _shuffle_b_transposed(a_col_fp8)  # pre-shuffle a^T [K, M]
     # scale_a already in [scale_con=M//128, rows=N]; scale_b per-output-column [K, M//128].
     a_scale_flat = grad_out_col_scale_inv.contiguous().view(-1)
     b_scale_flat = a_col_scale_inv.transpose(0, 1).contiguous().view(-1)
