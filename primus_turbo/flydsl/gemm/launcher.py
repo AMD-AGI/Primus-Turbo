@@ -237,7 +237,12 @@ def _select_tile(
         if M <= 128:
             s += 6 if tn == 64 else (4 if tn == 128 else (2 if tn == 256 else 0))
         else:
-            s += 8 if tn == 128 else (4 if tn == 64 else (4 if tn == 256 else 0))
+            # Round-2: for large shapes prefer the larger tile_n=256 variant
+            # (num_acc_n=4). It doubles A-fragment / scale_a reuse per MFMA,
+            # cutting per-MFMA LDS/address/scale VALU overhead on the
+            # compute-bound backward (wgrad/dgrad) path. tile_n=256 now
+            # outscores tile_n=128 by the same margin tile_n=128 led by before.
+            s += 8 if tn == 256 else (6 if tn == 128 else (4 if tn == 64 else 0))
         s += 6 if tk == 128 else 3
         return s
 
