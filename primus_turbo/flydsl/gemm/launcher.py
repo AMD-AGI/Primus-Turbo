@@ -305,6 +305,26 @@ def flydsl_blockwise_wgrad_supported(m: int, n: int, k: int) -> bool:
     return _load_wgrad_compile_fn() is not None
 
 
+@functools.lru_cache(maxsize=1)
+def _load_preshuffle_triton():
+    """Lazily import the coalesced Triton pre-shuffle; ``None`` if unavailable.
+
+    Cached on a parameterless call (no tensor key) so the import probe runs at
+    most once. Returns the ``preshuffle_b_transposed_triton`` callable.
+    """
+    try:
+        from primus_turbo.triton.gemm.preshuffle_fp8 import (
+            is_available,
+            preshuffle_b_transposed_triton,
+        )
+
+        if not is_available():
+            return None
+        return preshuffle_b_transposed_triton
+    except Exception:
+        return None
+
+
 def shuffle_b(b: torch.Tensor, layout: Tuple[int, int] = (16, 16)) -> torch.Tensor:
     """Pre-shuffle a ``[N, K]`` FP8 weight into the kernel's MFMA-friendly layout.
 
@@ -352,6 +372,18 @@ def _shuffle_b_transposed(src: torch.Tensor, layout: Tuple[int, int] = (16, 16))
     assert (
         P % BN == 0 and Q % BK == 0
     ), f"_shuffle_b_transposed: P={P} Q={Q} not divisible by ({BN}, {BK})"
+    # Fast path: a coalesced Triton pre-shuffle for the 1-byte (FP8) operand.
+    # The torch strided-contiguous below gathers the inner K_inner dim with
+    # read stride P (uncoalesced -> generic elementwise copy); the Triton
+    # kernel reads coalesced along the contiguous P axis and writes the
+    # permuted layout in contiguous K_inner runs, byte-identical result.
+    if src.element_size() == 1 and src.is_cuda:
+        tri = _load_preshuffle_triton()
+        if tri is not None:
+            try:
+                return tri(src, layout)
+            except Exception:
+                pass  # fall back to the torch strided path below
     # 5D strided view of `src` reproducing shuffle_b(src.T)'s permuted layout
     # (permuted dim order i0, i2, i3, i1, i4).
     sizes = (P // BN, Q // BK, BK // K_inner, BN, K_inner)
