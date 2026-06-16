@@ -4,7 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import ctypes
 import os
+import struct
 
 import torch
 
@@ -407,6 +409,160 @@ _ASM_CO_FWD_SITES = {
 }
 
 
+# ── ASM .co shared HIP launcher infrastructure ────────────────────────────────
+_ASM_CO_THREADS = 512
+_ASM_CO_LDS_BYTES = 65536
+
+_HIP_LIB: ctypes.CDLL | None = None
+
+_HIP_LAUNCH_PARAM_BUFFER_POINTER = ctypes.c_void_p(0x01)
+_HIP_LAUNCH_PARAM_BUFFER_SIZE = ctypes.c_void_p(0x02)
+_HIP_LAUNCH_PARAM_END = ctypes.c_void_p(0x03)
+
+
+def _get_libhip() -> ctypes.CDLL:
+    global _HIP_LIB
+    if _HIP_LIB is None:
+        for name in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+            try:
+                _HIP_LIB = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if _HIP_LIB is None:
+            raise OSError("Cannot load libamdhip64.so — not running inside a ROCm container?")
+    return _HIP_LIB
+
+
+def _asm_co_module_launch(
+    func: ctypes.c_void_p,
+    kernarg_buf: ctypes.Array,
+    num_cu: int | None,
+    device: torch.device,
+    label: str,
+) -> None:
+    hip = _get_libhip()
+    arg_size = ctypes.c_size_t(96)
+    config = (ctypes.c_void_p * 5)(
+        _HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        ctypes.cast(kernarg_buf, ctypes.c_void_p),
+        _HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p),
+        _HIP_LAUNCH_PARAM_END,
+    )
+    grid_cu = (
+        num_cu if num_cu is not None else torch.cuda.get_device_properties(device).multi_processor_count
+    )
+    stream = torch.cuda.current_stream().cuda_stream
+    rc = hip.hipModuleLaunchKernel(
+        func,
+        grid_cu,
+        1,
+        1,
+        _ASM_CO_THREADS,
+        1,
+        1,
+        _ASM_CO_LDS_BYTES,
+        ctypes.c_void_p(stream),
+        None,
+        config,
+    )
+    if rc != 0:
+        hip.hipGetErrorString.restype = ctypes.c_char_p
+        raise RuntimeError(
+            f"hipModuleLaunchKernel ({label}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
+        )
+
+
+# ── ASM .co fwd/dgrad launcher ──────────────────────────────────────────────
+_ASM_CO_FWD_CO_PATH = "/opt/asm_ggemm/combined_v5.co"
+_ASM_CO_FWD_KERNEL_NAME = "_grouped_fp8_persistent_gemm_kernel"
+
+_ASM_CO_FWD_MODULE: ctypes.c_void_p | None = None
+_ASM_CO_FWD_FUNC: ctypes.c_void_p | None = None
+
+
+def _get_asm_co_fwd_func() -> ctypes.c_void_p:
+    """Load and cache the fwd/dgrad .co function handle."""
+    global _ASM_CO_FWD_MODULE, _ASM_CO_FWD_FUNC
+    if _ASM_CO_FWD_FUNC is None:
+        hip = _get_libhip()
+        mod = ctypes.c_void_p()
+        rc = hip.hipModuleLoad(ctypes.byref(mod), _ASM_CO_FWD_CO_PATH.encode())
+        if rc != 0:
+            hip.hipGetErrorString.restype = ctypes.c_char_p
+            raise RuntimeError(
+                f"hipModuleLoad({_ASM_CO_FWD_CO_PATH}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
+            )
+        func = ctypes.c_void_p()
+        rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, _ASM_CO_FWD_KERNEL_NAME.encode())
+        if rc != 0:
+            hip.hipGetErrorString.restype = ctypes.c_char_p
+            raise RuntimeError(
+                f"hipModuleGetFunction({_ASM_CO_FWD_KERNEL_NAME}) failed rc={rc}: "
+                f"{hip.hipGetErrorString(rc)}"
+            )
+        _ASM_CO_FWD_MODULE = mod
+        _ASM_CO_FWD_FUNC = func
+    return _ASM_CO_FWD_FUNC
+
+
+def _launch_asm_co_fwd_dgrad(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+) -> torch.Tensor:
+    """Launch hand-tuned fwd/dgrad .co kernel via HIP module API.
+
+    Kernarg layout (96 bytes) matches ``asm_co_grouped_gemm_fp8`` in asm_co_grouped_gemm.cpp.
+    """
+    m = a.shape[0]
+    k = a.shape[1]
+    e = b.shape[0]
+    n = b.shape[1] if trans_b else b.shape[2]
+    out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+
+    buf = ctypes.create_string_buffer(96)
+    struct.pack_into(
+        "<QQQQQQ",
+        buf,
+        0,
+        a.data_ptr(),
+        b.data_ptr(),
+        out.data_ptr(),
+        a_scales.data_ptr(),
+        b_scales.data_ptr(),
+        group_offs.data_ptr(),
+    )
+    struct.pack_into(
+        "<iiiiiiii",
+        buf,
+        48,
+        e,
+        n,
+        k,
+        k,
+        n * k,
+        k,
+        n,
+        1,
+    )
+
+    _asm_co_module_launch(
+        _get_asm_co_fwd_func(),
+        buf,
+        num_cu,
+        a.device,
+        f"fwd/dgrad K={k}, N={n}",
+    )
+    return out
+
+
 class GroupedGEMMFP8ASMCOBackend(KernelBackend):
     """Hand-tuned AMDGCN assembly (.co) backend for FP8 grouped GEMM fwd/dgrad.
 
@@ -468,17 +624,14 @@ class GroupedGEMMFP8ASMCOBackend(KernelBackend):
                 f"out_dtype={out_dtype} granularity={granularity.name}",
                 flush=True,
             )
-        return torch.ops.primus_turbo_cpp_extension.asm_co_grouped_gemm_fp8(
+        return _launch_asm_co_fwd_dgrad(
             a,
             b,
             a_scales,
             b_scales,
-            group_lens,
             group_offs,
-            trans_a,
             trans_b,
             out_dtype,
-            granularity.name,
             num_cu,
         )
 
@@ -616,6 +769,96 @@ _ASM_CO_WGRAD_SITES = {
     (2880, 2880),  # down_wgrad
 }
 
+# ── ASM .co wgrad launcher (variable-K) ─────────────────────────────────────
+_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/variable_k_wgrad_mega.co"
+_ASM_CO_WGRAD_KERNEL_NAME = "_grouped_variable_k_gemm_kernel"
+
+_ASM_CO_WGRAD_MODULE: ctypes.c_void_p | None = None
+_ASM_CO_WGRAD_FUNC: ctypes.c_void_p | None = None
+
+
+def _get_asm_co_wgrad_func() -> ctypes.c_void_p:
+    """Load and cache the variable-K wgrad .co function handle."""
+    global _ASM_CO_WGRAD_MODULE, _ASM_CO_WGRAD_FUNC
+    if _ASM_CO_WGRAD_FUNC is None:
+        hip = _get_libhip()
+        mod = ctypes.c_void_p()
+        rc = hip.hipModuleLoad(ctypes.byref(mod), _ASM_CO_WGRAD_CO_PATH.encode())
+        if rc != 0:
+            hip.hipGetErrorString.restype = ctypes.c_char_p
+            raise RuntimeError(
+                f"hipModuleLoad({_ASM_CO_WGRAD_CO_PATH}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
+            )
+        func = ctypes.c_void_p()
+        rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, _ASM_CO_WGRAD_KERNEL_NAME.encode())
+        if rc != 0:
+            hip.hipGetErrorString.restype = ctypes.c_char_p
+            raise RuntimeError(
+                f"hipModuleGetFunction({_ASM_CO_WGRAD_KERNEL_NAME}) failed rc={rc}: "
+                f"{hip.hipGetErrorString(rc)}"
+            )
+        _ASM_CO_WGRAD_MODULE = mod
+        _ASM_CO_WGRAD_FUNC = func
+    return _ASM_CO_WGRAD_FUNC
+
+
+def _launch_asm_co_wgrad_variable_k(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    lhs_scale: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+) -> torch.Tensor:
+    """Launch hand-tuned variable-K wgrad .co kernel via HIP module API.
+
+    Kernarg layout (96 bytes) matches ``KernArgs`` in asm_co_grouped_gemm.cpp.
+    """
+    out_m = lhs.shape[1]
+    out_n = rhs.shape[1]
+    g = group_lens.shape[0]
+    out = torch.empty((g, out_m, out_n), device=lhs.device, dtype=out_dtype)
+
+    func = _get_asm_co_wgrad_func()
+
+    # 96-byte flat kernarg buffer (KernArgs in asm_co_grouped_gemm.cpp)
+    buf = ctypes.create_string_buffer(96)
+    struct.pack_into(
+        "<QQQQQQ",
+        buf,
+        0,
+        lhs.data_ptr(),
+        rhs.data_ptr(),
+        out.data_ptr(),
+        lhs_scale.data_ptr(),
+        rhs_scale.data_ptr(),
+        group_offs.data_ptr(),
+    )
+    struct.pack_into(
+        "<iiiiiiii",
+        buf,
+        48,
+        g,
+        out_m,
+        out_n,
+        lhs.stride(0),
+        rhs.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+    )
+
+    _asm_co_module_launch(
+        func,
+        buf,
+        num_cu,
+        lhs.device,
+        f"wgrad OUT_M={out_m}, OUT_N={out_n}",
+    )
+    return out
+
 
 class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
     """Hand-tuned AMDGCN assembly (.co) backend for FP8 variable-K grouped GEMM (wgrad).
@@ -681,11 +924,9 @@ class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
         if trans_c:
             lhs, rhs = b, a
             lhs_scales, rhs_scales = b_scales, a_scales
-            trans_lhs, trans_rhs = not trans_b, not trans_a
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
-            trans_lhs, trans_rhs = trans_a, trans_b
         if GroupedGEMMFP8VariableKASMCOBackend._first_use:
             GroupedGEMMFP8VariableKASMCOBackend._first_use = False
             print(
@@ -694,17 +935,14 @@ class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
                 f"out_dtype={out_dtype} granularity={granularity.name}",
                 flush=True,
             )
-        return torch.ops.primus_turbo_cpp_extension.asm_co_grouped_gemm_fp8_variable_k(
+        return _launch_asm_co_wgrad_variable_k(
             lhs,
             rhs,
             lhs_scales,
             rhs_scales,
             group_lens,
             group_offs,
-            trans_lhs,
-            trans_rhs,
             out_dtype,
-            granularity.name,
             num_cu,
         )
 
