@@ -21,7 +21,6 @@ import random
 import sys
 from typing import Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -91,418 +90,33 @@ def _mega_moe_profile_enabled() -> bool:
     return os.environ.get("MEGAMOE_PROFILE", "") not in ("", "0", "false", "False")
 
 
-def _mega_moe_fp4_act_enabled() -> bool:
-    """True when MEGA_MOE_FP4_ACT=1, which compiles the JIT extension with
-    ``-DMEGA_MOE_FP4_ACT=1`` so the Linear2 activation operand (the SwiGLU
-    intermediate) is MXFP4 e2m1 instead of FP8 e4m3.  The reference path is
-    re-anchored to match (see ``swiglu_apply_weight_to_fp8`` /
-    ``m_grouped_fp8_fp4_gemm_nt_contiguous``).  When unset -> exact r2."""
-    return os.environ.get("MEGA_MOE_FP4_ACT", "0") == "1"
-
-
-def _mega_moe_fp4_dbg_noscale_enabled() -> bool:
-    """DIAG: MEGA_MOE_FP4_DBG_NOSCALE=1 forces sf=1.0 across kernel producer +
-    reader + reference intermediate quant, to isolate the FP4-A data/nibble path
-    from the SF path during gate-3 debugging.  Only meaningful with FP4_ACT=1."""
-    return os.environ.get("MEGA_MOE_FP4_DBG_NOSCALE", "0") == "1"
-
-
-def _mega_moe_fp4_dbg_const_enabled() -> bool:
-    """DIAG: MEGA_MOE_FP4_DBG_CONST=1 makes the kernel L1 epilogue write a
-    CONSTANT intermediate (e2m1 code 2 = +1.0) to every column with sf byte 127,
-    and makes the reference set the SwiGLU intermediate to all +1.0.  Both sides
-    then compute (column-sums of W_down).  cos~=1 => the L2 read / W_down / SF /
-    combine path is correct and any residual bug is in the producer's
-    SwiGLU/quant/pack; cos<1 => the bug is in the read/SF/layout path.  Only
-    meaningful with FP4_ACT=1."""
-    return os.environ.get("MEGA_MOE_FP4_DBG_CONST", "0") == "1"
-
-
-def _mega_moe_bbal_enabled() -> bool:
-    """L4' (PROMOTED r28, default ON): balances the shared-B LDS load across all
-    loader warps (round-robin chunks) instead of warp 0 loading all of B.  Pure
-    load-distribution change -> numerics byte-identical to r2 (reference UNCHANGED);
-    +21% perf (157-159 TF vs r2 130).  Set MEGA_MOE_BBAL=0 to revert to r2."""
-    return os.environ.get("MEGA_MOE_BBAL", "1") != "0"
-
-
-def _mega_moe_effm_enabled() -> bool:
-    """Effective-M: MEGA_MOE_EFFM=1 compiles with ``-DMEGA_MOE_EFFM=1``, skipping
-    the per-sub_m MFMA + A/SFA load for M-tiles entirely beyond valid_m (padding
-    rows of partial blocks).  Numerically lossless (padding rows are masked by the
-    epilogue) -> gate-3 byte-identical to r28; reduces the MFMA-bound wall."""
-    return os.environ.get("MEGA_MOE_EFFM", "0") == "1"
-
-
-def _mega_moe_cheap_bar_enabled() -> bool:
-    """MEGA_MOE_CHEAP_BAR (PROMOTED r30, default ON): cheap-fences the grid_sync
-    barrier spin (relaxed spin + single acquire fence), removing the per-iteration
-    acquire cache-invalidate from the dispatch/combine barriers.  Same ordering ->
-    numerics byte-identical; +12-14% perf.  Set MEGA_MOE_CHEAP_BAR=0 to revert."""
-    return os.environ.get("MEGA_MOE_CHEAP_BAR", "1") != "0"
-
-
-def _mega_moe_cheap_bar_sys_enabled() -> bool:
-    """MEGA_MOE_CHEAP_BAR_SYS=1 cheap-fences the nvlink_barrier cross-rank sys-spin
-    (relaxed system load + single system acquire fence).  Same ordering -> numerics
-    byte-identical; riskier (IPC coherence).  Default off (safe ld_acq_sys path)."""
-    return os.environ.get("MEGA_MOE_CHEAP_BAR_SYS", "0") == "1"
-
-
-def _mega_moe_disp_pipe_enabled() -> bool:
-    """MEGA_MOE_DISP_PIPE=1 software-pipelines the dispatch token-pull copy (all
-    cross-rank loads then all stores) to overlap remote-load latency.  Numerics
-    byte-identical (same copy, reordered)."""
-    return os.environ.get("MEGA_MOE_DISP_PIPE", "0") == "1"
-
-
-def _mega_moe_koverlap_enabled() -> bool:
-    """MEGA_MOE_KOVERLAP=1 fires the kBarMmaB barrier every 2 k_blocks (2 MFMA
-    bursts back-to-back, pipe stays fed across the rendezvous).  Pure scheduling
-    -> numerics byte-identical."""
-    return os.environ.get("MEGA_MOE_KOVERLAP", "1") != "0"  # PROMOTED r36, default ON
-
-
-def _mega_moe_rfl_enabled() -> bool:
-    """MEGA_MOE_RFL=1: readfirstlane warp-uniform addr/offsets into SGPRs + split
-    load soffset (SGPR) -> reduces VGPR pressure (turbo mxfp8 technique).  Numerics
-    byte-identical (same addresses, uniform parts in SGPR)."""
-    return os.environ.get("MEGA_MOE_RFL", "0") == "1"
-
-
-def _mega_moe_agpr_acc_enabled() -> bool:
-    """MEGA_MOE_AGPR_ACC=1: keep the MFMA accumulators (acc + acc_gate) resident
-    in the AGPR file across the whole k-loop (turbo run_pinned_acc_agpr technique),
-    freeing ~256 VGPR to break the occupancy=1 VGPR wall.  Default path only
-    (FP4_ACT=0).  Numerics same MFMA/order -> gate-3 should still pass."""
-    return os.environ.get("MEGA_MOE_AGPR_ACC", "0") == "1"
-
-
-def _mega_moe_dispatch_only_enabled() -> bool:
-    """MEGA_MOE_DISPATCH_ONLY=1 compiles with ``-DMEGA_MOE_DISPATCH_ONLY=1`` so
-    the MMA-loader and epilogue warp roles return immediately and only the
-    dispatch (route + cross-rank pull) stage runs.  Used to measure dispatch
-    bandwidth in isolation -- the kernel produces no valid ``y`` in this mode,
-    so always pair with ``--num-correctness-tests 0``."""
-    return os.environ.get("MEGA_MOE_DISPATCH_ONLY", "0") == "1"
-
-
-def _mega_moe_pp_sched_enabled() -> bool:
-    """MEGA_MOE_PP_SCHED=1 -> -DMEGA_MOE_PP_SCHED=1: T1 ping-pong-style scheduling
-    (B prefetch + sched_barrier(0) + s_setprio in the MFMA grid). Safe, no pinning."""
-    return os.environ.get("MEGA_MOE_PP_SCHED", "0") == "1"
-
-
-def _mega_moe_no_mfma_enabled() -> bool:
-    """MEGA_MOE_NO_MFMA=1 compiles with ``-DMEGA_MOE_NO_MFMA=1`` so the k-loop's
-    scaled-MFMA is replaced by a trivial XOR-fold consume of the A/B/SF operands.
-    The whole global->LDS load chain (HBM traffic) and pipeline are UNCHANGED, so
-    the run measures the loader's achievable HBM bandwidth with compute removed.
-    Output is garbage -- always pair with ``--num-correctness-tests 0``."""
-    return os.environ.get("MEGA_MOE_NO_MFMA", "0") == "1"
-
-
-def _mega_moe_skip_gemm_loads_enabled() -> bool:
-    """MEGA_MOE_SKIP_GEMM_LOADS=1 compiles with ``-DMEGA_MOE_SKIP_GEMM_LOADS=1``
-    so the GEMM A/B/SF global->LDS loads become no-ops while all barriers /
-    arrival-spins / combine / counter-resets stay intact.  Paired with
-    MEGA_MOE_NO_MFMA=1 it isolates dispatch+combine+sync time (Full - this =
-    GEMM-loader contribution).  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_GEMM_LOADS", "0") == "1"
-
-
-def _mega_moe_skip_combine_enabled() -> bool:
-    """MEGA_MOE_SKIP_COMBINE=1 compiles with ``-DMEGA_MOE_SKIP_COMBINE=1`` so the
-    combine top-k reduce loop is skipped (nvlink_barrier + counter resets kept).
-    Full - this = combine contribution.  Garbage output -- use
-    --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_COMBINE", "0") == "1"
-
-
-def _mega_moe_skip_dispatch_pull_enabled() -> bool:
-    """MEGA_MOE_SKIP_DISPATCH_PULL=1 -> -DMEGA_MOE_SKIP_DISPATCH_PULL=1: skip the
-    cross-rank token+SF data copy in dispatch (keep routing/counts/metadata/
-    arrival-signal/barriers).  SKIP_GEMM+SKIP_COMBINE minus this = dispatch-pull
-    XGMI cost.  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_SKIP_DISPATCH_PULL", "0") == "1"
-
-
-def _mega_moe_loads_only_enabled() -> bool:
-    """MEGA_MOE_LOADS_ONLY=1 -> -DMEGA_MOE_LOADS_ONLY=1: skip the per-block
-    arrival-spins (cross-SM sync) and the epilogue global stores, isolating the
-    pure GEMM A/B/SF buffer_load path.  Pair with NO_MFMA=1 + SKIP_DISPATCH_PULL=1
-    + SKIP_COMBINE=1 to measure the loader's unobstructed HBM bandwidth
-    (FETCH_SIZE/time).  Garbage output -- use --num-correctness-tests 0."""
-    return os.environ.get("MEGA_MOE_LOADS_ONLY", "0") == "1"
-
-
 def _load_mega_moe_jit(shape: dict):
     import hashlib
 
     key = tuple(sorted((k, int(v)) for k, v in shape.items() if k in _JIT_SHAPE_MACROS))
     profile = _mega_moe_profile_enabled()
-    fp4_act = _mega_moe_fp4_act_enabled()
-    dbg_noscale = _mega_moe_fp4_dbg_noscale_enabled()
-    dbg_const = _mega_moe_fp4_dbg_const_enabled()
-    bbal = _mega_moe_bbal_enabled()
-    effm = _mega_moe_effm_enabled()
-    cheap_bar = _mega_moe_cheap_bar_enabled()
-    cheap_bar_sys = _mega_moe_cheap_bar_sys_enabled()
-    disp_pipe = _mega_moe_disp_pipe_enabled()
-    koverlap = _mega_moe_koverlap_enabled()
-    rfl = _mega_moe_rfl_enabled()
-    agpr_acc = _mega_moe_agpr_acc_enabled()
-    occq = os.environ.get("MEGA_MOE_OCCQUERY","0")=="1"
-    minblk = os.environ.get("MEGA_MOE_MIN_BLOCKS_PER_CU","1")
-    disp_only = _mega_moe_dispatch_only_enabled()
-    pp_sched = _mega_moe_pp_sched_enabled()
-    no_mfma = _mega_moe_no_mfma_enabled()
-    skip_gemm_loads = _mega_moe_skip_gemm_loads_enabled()
-    skip_combine = _mega_moe_skip_combine_enabled()
-    skip_dispatch_pull = _mega_moe_skip_dispatch_pull_enabled()
-    skip_epi = os.environ.get("MEGA_MOE_SKIP_EPI", "0") == "1"
-    coalesce_epi = os.environ.get("MEGA_MOE_COALESCE_EPI", "0") == "1"
-    epi_lds_bulk = os.environ.get("MEGA_MOE_EPI_LDS_BULK", "0") == "1"
-    mfma_bpf = os.environ.get("MEGA_MOE_MFMA_BPF", "1") != "0"  # PROMOTED, default ON
-    mfma_bpf2 = os.environ.get("MEGA_MOE_MFMA_BPF2", "0") == "1"
-    mfma_prio = os.environ.get("MEGA_MOE_MFMA_PRIO", "0") == "1"
-    mfma_sched = os.environ.get("MEGA_MOE_MFMA_SCHED", "1") != "0"  # PROMOTED, default ON
-    mfma_sched2 = os.environ.get("MEGA_MOE_MFMA_SCHED2", "0") == "1"
-    mfma_noprio = os.environ.get("MEGA_MOE_MFMA_NOPRIO", "0") == "1"
-    epi_batch_store = os.environ.get("MEGA_MOE_EPI_BATCH_STORE", "0") == "1"
-    epi_contig_probe = os.environ.get("MEGA_MOE_EPI_CONTIG_PROBE", "0") == "1"
-    kloop_sched = os.environ.get("MEGA_MOE_KLOOP_SCHED", "0") == "1"
-    mfma_sched3 = os.environ.get("MEGA_MOE_MFMA_SCHED3", "0") == "1"
-    epi_w16 = os.environ.get("MEGA_MOE_EPI_W16", "0") == "1"
-    skip_epi_l2 = os.environ.get("MEGA_MOE_SKIP_EPI_L2", "0") == "1"
-    skip_silu = os.environ.get("MEGA_MOE_SKIP_SILU", "0") == "1"
-    a_cpol = os.environ.get("MEGA_MOE_A_CPOL", "0")
-    b_cpol = os.environ.get("MEGA_MOE_B_CPOL", "0")
-    vmcnt_keep = os.environ.get("MEGA_MOE_VMCNT_KEEP", "0")
-    vgpr_load = os.environ.get("MEGA_MOE_VGPR_LOAD", "0") == "1"
-    no_kloop_sync = os.environ.get("MEGA_MOE_NO_KLOOP_SYNC", "0") == "1"
-    no_burst = os.environ.get("MEGA_MOE_NO_BURST", "0") == "1"
-    two_stage = os.environ.get("MEGA_MOE_2STAGE", "0") == "1"
-    two_blk = os.environ.get("MEGA_MOE_2BLK", "0") == "1"
-    skip_sf = os.environ.get("MEGA_MOE_SKIP_SF", "0") == "1"
-    sf_bld = os.environ.get("MEGA_MOE_SF_BLD", "0") == "1"
-    scalar_soff = os.environ.get("MEGA_MOE_SCALAR_SOFF", "0") == "1"
-    kloop_repeat = os.environ.get("MEGA_MOE_KLOOP_REPEAT", "1")
-    bdirect_probe = os.environ.get("MEGA_MOE_BDIRECT_PROBE", "0") == "1"
-    numstages = os.environ.get("MEGA_MOE_NUMSTAGES", "0")
-    epi_nt = os.environ.get("MEGA_MOE_EPI_NT", "0") == "1"
-    epi_const = os.environ.get("MEGA_MOE_EPI_CONST", "0") == "1"
-    epi_local = os.environ.get("MEGA_MOE_EPI_LOCAL", "0") == "1"
-    epi_w4 = os.environ.get("MEGA_MOE_EPI_W4", "0") == "1"
-    epi_hot = os.environ.get("MEGA_MOE_EPI_HOT", "0") == "1"
-    defer_epi = os.environ.get("MEGA_MOE_DEFER_EPI", "0") == "1"
-    epi_noinline = os.environ.get("MEGA_MOE_EPI_NOINLINE", "0") == "1"
-    pull_unroll = os.environ.get("MEGA_MOE_PULL_UNROLL", "0")
-    pull_as_push = os.environ.get("MEGA_MOE_PULL_AS_PUSH", "0") == "1"
-    dispatch_push = os.environ.get("MEGA_MOE_DISPATCH_PUSH", "0") == "1"
-    if two_blk:
-        two_stage = True  # 2BLK uses the 2-stage loop
-    loads_only = _mega_moe_loads_only_enabled()
-    # Profiled / FP4-act / SF-LDS / B-balance / EffM / baseline builds must not share a cache entry / .so name.
-    cache_key = (key, profile, fp4_act, dbg_noscale, dbg_const, bbal, effm, cheap_bar, cheap_bar_sys, disp_pipe, koverlap, rfl, agpr_acc, occq, disp_only, pp_sched, no_mfma, skip_gemm_loads, skip_combine, skip_dispatch_pull, skip_epi, coalesce_epi, epi_lds_bulk, mfma_bpf2, mfma_prio, mfma_sched2, mfma_noprio, epi_batch_store, epi_contig_probe, kloop_sched, mfma_sched3, epi_w16, skip_epi_l2, skip_silu, a_cpol, b_cpol, loads_only, vmcnt_keep, vgpr_load, no_kloop_sync, no_burst, two_stage, two_blk, skip_sf, sf_bld, scalar_soff, kloop_repeat)
+    cache_key = (key, profile)
     if cache_key in _mega_moe_jit_cache:
         return _mega_moe_jit_cache[cache_key]
 
     shape_defines = [f"-D{_JIT_SHAPE_MACROS[k]}={v}u" for k, v in key]
     if profile:
         shape_defines = shape_defines + ["-DMEGA_MOE_PROFILE=1"]
-    if fp4_act:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_ACT=1"]
-    if dbg_noscale:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_DBG_NOSCALE=1"]
-    if dbg_const:
-        shape_defines = shape_defines + ["-DMEGA_MOE_FP4_DBG_CONST=1"]
-    # BBAL is PROMOTED (default ON in the kernel), so emit an EXPLICIT value:
-    # =1 is the promoted r28 baseline, =0 reverts byte-identically to r2.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_BBAL={1 if bbal else 0}"]
-    if effm:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EFFM=1"]
-    # CHEAP_BAR is PROMOTED (default ON in the kernel) -> emit EXPLICIT value so =0 reverts.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_CHEAP_BAR={1 if cheap_bar else 0}"]
-    if cheap_bar_sys:
-        shape_defines = shape_defines + ["-DMEGA_MOE_CHEAP_BAR_SYS=1"]
-    if disp_pipe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISP_PIPE=1"]
-    # KOVERLAP is PROMOTED (default ON) -> explicit value so =0 reverts to r30.
-    shape_defines = shape_defines + [f"-DMEGA_MOE_KOVERLAP={1 if koverlap else 0}"]
-    if rfl:
-        shape_defines = shape_defines + ["-DMEGA_MOE_RFL=1"]
-    if agpr_acc:
-        shape_defines = shape_defines + ["-DMEGA_MOE_AGPR_ACC=1"]
-    if occq:
-        shape_defines = shape_defines + ["-DMEGA_MOE_OCCQUERY=1"]
-    if minblk != "1":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_MIN_BLOCKS_PER_CU={int(minblk)}"]
-    if disp_only:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_ONLY=1"]
-    if pp_sched:
-        shape_defines = shape_defines + ["-DMEGA_MOE_PP_SCHED=1"]
-    if no_mfma:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_MFMA=1"]
-    if skip_gemm_loads:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_GEMM_LOADS=1"]
-    if skip_combine:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_COMBINE=1"]
-    if skip_dispatch_pull:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_DISPATCH_PULL=1"]
-    if skip_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_EPI=1"]
-    if coalesce_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_COALESCE_EPI=1"]
-    if epi_lds_bulk:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_LDS_BULK=1"]
-    if mfma_bpf2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_BPF2=1"]
-    if mfma_prio:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_PRIO=1"]
-    if mfma_sched2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_SCHED2=1"]
-    if mfma_noprio:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_NOPRIO=1"]
-    if epi_batch_store:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_BATCH_STORE=1"]
-    if epi_contig_probe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_CONTIG_PROBE=1"]
-    if kloop_sched:
-        shape_defines = shape_defines + ["-DMEGA_MOE_KLOOP_SCHED=1"]
-    if mfma_sched3:
-        shape_defines = shape_defines + ["-DMEGA_MOE_MFMA_SCHED3=1"]
-    if epi_w16:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_W16=1"]
-    if skip_epi_l2:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_EPI_L2=1"]
-    if skip_silu:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_SILU=1"]
-    if a_cpol != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_A_CPOL={int(a_cpol)}"]
-    if b_cpol != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_B_CPOL={int(b_cpol)}"]
-    if loads_only:
-        shape_defines = shape_defines + ["-DMEGA_MOE_LOADS_ONLY=1"]
-    if vmcnt_keep != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_VMCNT_KEEP={int(vmcnt_keep)}"]
-    if vgpr_load:
-        shape_defines = shape_defines + ["-DMEGA_MOE_VGPR_LOAD=1"]
-    if no_kloop_sync:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_KLOOP_SYNC=1"]
-    if no_burst:
-        shape_defines = shape_defines + ["-DMEGA_MOE_NO_BURST=1"]
-    if two_stage:
-        shape_defines = shape_defines + ["-DMEGA_MOE_2STAGE=1"]
-    if two_blk:
-        shape_defines = shape_defines + ["-DMEGA_MOE_2BLK=1"]
-    if skip_sf:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SKIP_SF=1"]
-    if sf_bld:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SF_BLD=1"]
-    if scalar_soff:
-        shape_defines = shape_defines + ["-DMEGA_MOE_SCALAR_SOFF=1"]
-    if kloop_repeat != "1":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_KLOOP_REPEAT={int(kloop_repeat)}"]
-    if bdirect_probe:
-        shape_defines = shape_defines + ["-DMEGA_MOE_BDIRECT_PROBE=1"]
-    if numstages != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_JIT_KNUMSTAGES={int(numstages)}u"]
-    if epi_nt:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_NT=1"]
-    if epi_const:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_CONST=1"]
-    if epi_local:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_LOCAL=1"]
-    if epi_w4:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_W4=1"]
-    if epi_hot:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_HOT=1"]
-    if defer_epi:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DEFER_EPI=1"]
-    if epi_noinline:
-        shape_defines = shape_defines + ["-DMEGA_MOE_EPI_NOINLINE=1"]
-    if pull_unroll != "0":
-        shape_defines = shape_defines + [f"-DMEGA_MOE_PULL_UNROLL={int(pull_unroll)}u"]
-    if pull_as_push:
-        shape_defines = shape_defines + ["-DMEGA_MOE_PULL_AS_PUSH=1"]
-    if dispatch_push:
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_PUSH=1"]
-    if os.environ.get("MEGA_MOE_PUSH_GRIDSYNC_PROBE", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_PUSH_GRIDSYNC_PROBE=1"]
-    if os.environ.get("MEGA_MOE_PUSH_SKIP_META", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_PUSH_SKIP_META=1"]
-    if os.environ.get("MEGA_MOE_DISPATCH_PUSH2", "0") == "1":
-        shape_defines = shape_defines + ["-DMEGA_MOE_DISPATCH_PUSH2=1"]
+    # NOUTER (scheduler, promoted default-on): keep it explicit.
+    shape_defines = shape_defines + ["-DMEGA_MOE_NOUTER=1"]
+    # Extra -D probes from env (space-separated), e.g. MEGAMOE_EXTRA_D="-DMEGA_MOE_NO_AHEAD_WAIT=1".
+    _extra_d = os.environ.get("MEGAMOE_EXTRA_D", "").split()
+    if _extra_d:
+        shape_defines = shape_defines + _extra_d
+
     suffix = hashlib.sha1(
         (
             ";".join(f"{k}={v}" for k, v in key)
             + (";prof" if profile else "")
-            + (";fp4act" if fp4_act else "")
-            + (";nosc" if dbg_noscale else "")
-            + (";const" if dbg_const else "")
-            + (";bbal" if bbal else ";nobbal")
-            + (";effm" if effm else "")
-            + (";cbar" if cheap_bar else ";nocbar")
-            + (";cbarsys" if cheap_bar_sys else "")
-            + (";disppipe" if disp_pipe else "")
-            + (";kov" if koverlap else ";nokov")
-            + (";rfl" if rfl else "")
-            + (";agpracc" if agpr_acc else "")
-            + (";occq" if occq else "")
-            + ((";mb"+minblk) if minblk!="1" else "")
-            + (";disponly" if disp_only else "")
-            + ((";bdp") if bdirect_probe else "")
-            + ((";ns"+numstages) if numstages!="0" else "")
-            + ((";epint") if epi_nt else "")
-            + ((";epiconst") if epi_const else "")
-            + ((";epilocal") if epi_local else "")
-            + ((";epiw4") if epi_w4 else "")
-            + ((";epihot") if epi_hot else "")
-            + ((";deferepi") if defer_epi else "")
-            + ((";epinoinl") if epi_noinline else "")
-            + ((";pu"+pull_unroll) if pull_unroll!="0" else "")
-            + ((";p2push") if pull_as_push else "")
-            + ((";dpush") if dispatch_push else "")
-            + (";ppsched" if pp_sched else "")
-            + (";nomfma" if no_mfma else "")
-            + (";skipgemm" if skip_gemm_loads else "")
-            + (";skipcomb" if skip_combine else "")
-            + (";skipdisp" if skip_dispatch_pull else "")
-            + (";skipepi" if skip_epi else "")
-            + (";coalepi" if coalesce_epi else "")
-            + (";epildsbulk" if epi_lds_bulk else "")
-            + (";mfmabpf2" if mfma_bpf2 else "")
-            + (";mfmaprio" if mfma_prio else "")
-            + (";mfmasched2" if mfma_sched2 else "")
-            + (";mfmanoprio" if mfma_noprio else "")
-            + (";epibatchst" if epi_batch_store else "")
-            + (";epicontig" if epi_contig_probe else "")
-            + (";kloopsched" if kloop_sched else "")
-            + (";mfmasched3" if mfma_sched3 else "")
-            + (";epiw16" if epi_w16 else "")
-            + (";skipepil2" if skip_epi_l2 else "")
-            + (";skipsilu" if skip_silu else "")
-            + ((";ac"+a_cpol) if a_cpol!="0" else "")
-            + ((";bc"+b_cpol) if b_cpol!="0" else "")
-            + (";loadsonly" if loads_only else "")
-            + ((";vk"+vmcnt_keep) if vmcnt_keep!="0" else "")
-            + (";vgprld" if vgpr_load else "")
-            + (";noksync" if no_kloop_sync else "")
-            + (";noburst" if no_burst else "")
-            + (";2stage" if two_stage else "")
-            + (";2blk" if two_blk else "")
-            + (";skipsf" if skip_sf else "")
-            + (";sfbld" if sf_bld else "")
-            + (";ssoff" if scalar_soff else "")
-            + ((";kr"+kloop_repeat) if kloop_repeat!="1" else "")
+            + (";" + ";".join(_extra_d) if _extra_d else "")
         ).encode()
     ).hexdigest()[:12]
-    name = (
-        f"mega_moe_jit_ext_{suffix}"
-        if (key or profile or fp4_act or dbg_noscale or dbg_const or not bbal or effm or not cheap_bar or cheap_bar_sys or disp_pipe or not koverlap or rfl or occq or minblk!="1" or disp_only or pp_sched or no_mfma or skip_gemm_loads or skip_combine or skip_dispatch_pull or skip_epi or coalesce_epi or epi_lds_bulk or mfma_bpf2 or mfma_prio or mfma_sched2 or mfma_noprio or epi_batch_store or epi_contig_probe or kloop_sched or mfma_sched3 or epi_w16 or skip_epi_l2 or skip_silu or a_cpol!="0" or b_cpol!="0" or loads_only or vmcnt_keep!="0" or vgpr_load or no_kloop_sync or no_burst or two_stage or two_blk or skip_sf or sf_bld or scalar_soff or kloop_repeat!="1")
-        else "mega_moe_jit_ext"
-    )
+    name = f"mega_moe_jit_ext_{suffix}" if (key or profile) else "mega_moe_jit_ext"
 
     ext = _torch_jit_load(
         name=name,
@@ -519,30 +133,9 @@ def _load_mega_moe_jit(shape: dict):
             "-fno-gpu-rdc",
         ]
         + _half_undefs
-        + shape_defines
-        + (["-Rpass-analysis=kernel-resource-usage"]
-           if os.environ.get("MEGA_MOE_REGUSAGE", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED=1"]
-           if os.environ.get("MEGA_MOE_RELAXED", "0") == "1" else [])
-        + (["-DMEGA_MOE_NOACQFENCE=1"]
-           if os.environ.get("MEGA_MOE_NOACQFENCE", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED_REL=1"]
-           if os.environ.get("MEGA_MOE_RELAXED_REL", "0") == "1" else [])
-        + (["-DMEGA_MOE_RELAXED_SYS=1"]
-           if os.environ.get("MEGA_MOE_RELAXED_SYS", "0") == "1" else [])
-        + [f"-DMEGA_MOE_DISP_BARRIER={1 if os.environ.get('MEGA_MOE_DISP_BARRIER', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_EPI_BATCH_REL={1 if os.environ.get('MEGA_MOE_EPI_BATCH_REL', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_NOUTER={1 if os.environ.get('MEGA_MOE_NOUTER', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_FAST_QUANT={1 if os.environ.get('MEGA_MOE_FAST_QUANT', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_SFB_KMAJOR={1 if os.environ.get('MEGA_MOE_SFB_KMAJOR', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_MFMA_BPF={1 if os.environ.get('MEGA_MOE_MFMA_BPF', '1') != '0' else 0}"]
-        + [f"-DMEGA_MOE_MFMA_SCHED={1 if os.environ.get('MEGA_MOE_MFMA_SCHED', '1') != '0' else 0}"]
-        + ([f"-DMEGA_MOE_JIT_KBLOCK_M={int(os.environ['MEGA_MOE_BLOCKM'])}u",
-            f"-DMEGA_MOE_JIT_KSF_BLOCK_M={int(os.environ['MEGA_MOE_BLOCKM'])}u",
-            "-DMEGA_MOE_2STAGE=1"]
-           if os.environ.get("MEGA_MOE_BLOCKM", "0") != "0" else []),
+        + shape_defines,
         with_cuda=True,
-        verbose=os.environ.get("MEGA_MOE_REGUSAGE", "0") == "1",
+        verbose=False,
     )
     _mega_moe_jit_cache[cache_key] = ext
     return ext
@@ -808,8 +401,7 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def per_token_cast_to_fp4(
-    x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m0: bool = False,
-    noscale: bool = False
+    x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128, use_packed_ue8m0: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     m, n = x.shape
     assert n % 2 == 0
@@ -819,12 +411,7 @@ def per_token_cast_to_fp4(
     x_padded[:, :n] = x
     x_view = x_padded.view(m, -1, gran_k)
     x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
-    if noscale:
-        # DIAG (MEGA_MOE_FP4_DBG_NOSCALE): sf=1.0 -> raw e2m1(clamp(x,+/-6));
-        # dequant auto-uses 1.0 (packed exp 127). Isolates the data/nibble path.
-        sf = torch.ones_like(x_amax)
-    else:
-        sf = x_amax / 6.0
+    sf = x_amax / 6.0
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = x_view * (1.0 / sf.unsqueeze(2))
     codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
@@ -961,7 +548,6 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     *,
     use_psum_layout: bool = True,
     recipe: Tuple[int, int, int] = (1, 1, 32),
-    a_is_fp4: bool = False,
 ) -> None:
     """Per-expert grouped GEMM ``out[psum[e-1]:psum[e]] = A_e @ B_e.T``.
 
@@ -969,14 +555,9 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     ``rhs`` is the FP4 weight tuple ``(w_fp4_packed, w_sf_packed_int32)``
     in natural (n, k/2) nibble-packed layout (i.e. before
     ``_transpose_sf_for_mfma``).  Weights are FP4 e2m1 nibble-packed --
-    matching the kernel's MFMA path ``<*, dtype::float4x2_e2m1>``.
-
-    When ``a_is_fp4`` is False (default / r2) the activation operand is FP8
-    e4m3 (Linear1's dispatched input, MFMA AType ``__hip_fp8_e4m3``).  When
-    True (MEGA_MOE_FP4_ACT) the activation operand is MXFP4 e2m1
-    nibble-packed (Linear2's SwiGLU intermediate, MFMA AType
-    ``dtype::float4x2_e2m1``); dequant it via ``_dequant_fp4_packed``.
-    Output is BF16 written in-place into ``out``.
+    matching the kernel's MFMA path ``<*, dtype::float4x2_e2m1>``.  The
+    activation operand is FP8 e4m3 (Linear1's dispatched input).  Output is
+    BF16 written in-place into ``out``.
     """
     assert use_psum_layout and recipe == (1, 1, 32)
     act_packed, act_sf_packed = lhs
@@ -986,12 +567,7 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     for e, end in enumerate(psum):
         n_e = end - prefix
         if n_e > 0:
-            if a_is_fp4:
-                # MEGA_MOE_FP4_ACT: activation is FP4 e2m1 nibble-packed
-                # (0.5 B/elt), per-32 UE8M0 SF, exactly like the weight path.
-                a = _dequant_fp4_packed(act_packed[prefix:end], act_sf_packed[prefix:end], gran_k=32)
-            else:
-                a = _dequant_fp8_packed(act_packed[prefix:end], act_sf_packed[prefix:end], gran_k=32)
+            a = _dequant_fp8_packed(act_packed[prefix:end], act_sf_packed[prefix:end], gran_k=32)
             # M3 FP4-B: weight operand is FP4 e2m1 nibble-packed (0.5 B/elt).
             b = _dequant_fp4_packed(w_fp4[e], w_sf_packed[e], gran_k=32)
             out[prefix:end] = (a @ b.T).to(out.dtype)
@@ -1010,7 +586,6 @@ def swiglu_apply_weight_to_fp8(
     output_bf16: bool = False,
     clamp_value: float = 10.0,
     fast_math: bool = True,
-    cast_to_fp4: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU + per-row topk-weight scaling + cast to FP8/UE8M0.
 
@@ -1018,10 +593,6 @@ def swiglu_apply_weight_to_fp8(
     is a 0-D / last-element int tensor with the populated row count;
     trailing rows are zero-padded so the output tuple shape matches the
     input M.
-
-    When ``cast_to_fp4`` is True (MEGA_MOE_FP4_ACT) the SwiGLU intermediate
-    is quantized to MXFP4 e2m1 nibble-packed (0.5 B/elt) with per-32 UE8M0
-    SF instead of FP8 e4m3, matching the kernel's FP4-activation epilogue.
     """
     assert use_col_major_scales and round_scale and ue8m0_scale and not output_bf16
     n_avail = int(avail_tokens.item()) if avail_tokens.dim() == 0 else int(avail_tokens[-1].item())
@@ -1035,24 +606,9 @@ def swiglu_apply_weight_to_fp8(
     else:
         per_row_w = topk_weights[:n_avail].view(-1, 1).float()
     act = act * per_row_w
-    if cast_to_fp4 and _mega_moe_fp4_dbg_const_enabled():
-        # DIAG (MEGA_MOE_FP4_DBG_CONST): force the SwiGLU intermediate to a
-        # constant +1.0 (e2m1 code 2), matching the kernel producer's CONST
-        # path.  With noscale the dequant SF is 1.0, so the L2 GEMM reduces to
-        # (column-sums of W_down); cos isolates the read/SF/layout path from
-        # the producer's SwiGLU/quant/pack.
-        act = torch.ones_like(act)
-    if cast_to_fp4:
-        act_fp8, act_sf = per_token_cast_to_fp4(
-            act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True,
-            noscale=(
-                _mega_moe_fp4_dbg_noscale_enabled() or _mega_moe_fp4_dbg_const_enabled()
-            ),
-        )
-    else:
-        act_fp8, act_sf = per_token_cast_to_fp8(
-            act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True
-        )
+    act_fp8, act_sf = per_token_cast_to_fp8(
+        act, use_ue8m0=True, gran_k=num_per_channels, use_packed_ue8m0=True
+    )
     if n_total > n_avail:
         pad_out = torch.zeros((n_total, intermediate_hidden), dtype=act_fp8.dtype, device=x.device)
         pad_out[:n_avail] = act_fp8
@@ -1115,14 +671,10 @@ class ElasticBuffer:
         do_expand=True,
         use_tma_aligned_col_major_sf=True,
     ):
-        # Reference passes a quantized tuple; convert back to BF16 for the
-        # actual wire transit (see class docstring).  Under MEGA_MOE_FP4_ACT
-        # the input tuple is MXFP4 e2m1, so dequant with the FP4 inverse.
+        # Reference passes a quantized FP8 tuple; convert back to BF16 for the
+        # actual wire transit (see class docstring).
         if isinstance(x, tuple):
-            if _mega_moe_fp4_act_enabled():
-                x_bf16 = _dequant_fp4_packed(x[0], x[1], gran_k=32).bfloat16()
-            else:
-                x_bf16 = _dequant_fp8_packed(x[0], x[1], gran_k=32).bfloat16()
+            x_bf16 = _dequant_fp8_packed(x[0], x[1], gran_k=32).bfloat16()
         else:
             x_bf16 = x.bfloat16()
         (
@@ -1210,19 +762,11 @@ class ElasticBuffer:
         # Permute topk_weights to per-(token, expert) pair layout: keep
         # the weight at (token, k_idx) for each pair.
         recv_topk_weights_perm = recv_topk_weights[permute_token_idx, permute_k_idx].unsqueeze(1)
-        # Re-quantise EXPANDED recv_x with per-32 UE8M0 SF so the L1 GEMM
-        # shim consumes a per-expert-contiguous tuple.  Under MEGA_MOE_FP4_ACT
-        # Linear1's A reference is MXFP4 e2m1 (matching the kernel's FP4 input
-        # path); otherwise FP8.
-        if _mega_moe_fp4_act_enabled():
-            recv_x = per_token_cast_to_fp4(
-                recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True,
-                noscale=_mega_moe_fp4_dbg_noscale_enabled(),
-            )
-        else:
-            recv_x = per_token_cast_to_fp8(
-                recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
-            )
+        # Re-quantise EXPANDED recv_x to FP8 with per-32 UE8M0 SF so the L1
+        # GEMM shim consumes a per-expert-contiguous tuple.
+        recv_x = per_token_cast_to_fp8(
+            recv_x_bf16_perm.float(), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+        )
         from types import SimpleNamespace
 
         psum = torch.tensor(num_recv_tokens_per_expert_list, dtype=torch.int32, device=device)
@@ -1369,17 +913,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert intermediate_hidden % 128 == 0
         assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
 
-        # Cast inputs (Linear1's A) with per-32 UE8M0 SF.  Under
-        # MEGA_MOE_FP4_ACT the dispatched INPUT is MXFP4 e2m1 nibble-packed
-        # (0.5 B/elem) so Linear1's MFMA reads it as ``float4x2_e2m1``; the SF
-        # is still per-32 E8M0 (1 byte/block, same count).  In r2 it is FP8.
-        if _mega_moe_fp4_act_enabled():
-            x = per_token_cast_to_fp4(
-                x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True,
-                noscale=_mega_moe_fp4_dbg_noscale_enabled(),
-            )
-        else:
-            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        # Cast inputs (Linear1's A) to FP8 with per-32 UE8M0 SF.
+        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
         # M3 FP4-B (m26 layout RESOLVED, m27 SFB confirmed): cast grouped BF16
         # weights to FP4 e2m1 nibble-packed (0.5 B/elt, ADJ within-byte: byte b
@@ -1418,13 +953,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # SwiGLU about gate/up interleave granularity=8 is a separate
         # follow-up; for now drop the interleave and keep only the SF
         # transpose so the scaffold can be validated.
-        # R36: env-gated bypass of the gate/up interleave override.  Set
-        # MEGAMOE_KEEP_INTERLEAVE=1 to pass the production interleaved
-        # [gate8|up8] weight layout into the kernel instead of the raw
-        # concatenated layout.  Probes whether the kernel's SwiGLU
-        # epilogue actually expects interleaved or concatenated.
-        if os.environ.get("MEGAMOE_KEEP_INTERLEAVE", "") in ("", "0", "false", "False"):
-            transformed_l1_weights = (l1_weights[0], transformed_l1_weights[1])
+        transformed_l1_weights = (l1_weights[0], transformed_l1_weights[1])
         # SCAFFOLD: the kernel ALSO does not honor the SF lane-transpose
         # from ``_transpose_sf_for_mfma`` (the (4,32)→(32,4) permutation
         # within each 128-block).  Bisect at topk=1, H=I=1024:
@@ -1432,55 +961,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # without SF-transpose: cos_sim=0.83, per-token cos max=0.90
         # Drop both L1 and L2 SF transpose; keep weights in natural SF
         # layout (each row N → packed_sf_k cols, no MFMA lane permute).
-        # R37: env-gated bypass of the SF lane-transpose override.  Set
-        # MEGAMOE_KEEP_SF_TRANSPOSE=1 to keep the (4,32)->(32,4) lane
-        # permute of SFs inside each 128-block.
-        if os.environ.get("MEGAMOE_KEEP_SF_TRANSPOSE", "") in ("", "0", "false", "False"):
-            transformed_l1_weights = (transformed_l1_weights[0], l1_weights[1])
-            transformed_l2_weights = (transformed_l2_weights[0], l2_weights[1])
+        transformed_l1_weights = (transformed_l1_weights[0], l1_weights[1])
+        transformed_l2_weights = (transformed_l2_weights[0], l2_weights[1])
 
-        # K-major weight-SF (applied to the FINAL SF that reaches the kernel, after
-        # the R37 scaffold restores the natural n-major SF).  Transpose packed SF
-        # [E, N, K/128] -> [E, K/128, N] so the kernel's per-k_block SFB load of
-        # BLOCK_N consecutive columns is contiguous (coalesced) instead of scattered
-        # at stride K/32.  Reference uses the untransformed l1/l2_weights -> gate-3
-        # unaffected.  Must match -DMEGA_MOE_SFB_KMAJOR=1 in the kernel build.
-        if os.environ.get("MEGA_MOE_SFB_KMAJOR", "1") != "0":  # PROMOTED default-on
-            _w1, _sf1 = transformed_l1_weights
-            _w2, _sf2 = transformed_l2_weights
-            transformed_l1_weights = (_w1, _sf1.transpose(1, 2).contiguous())
-            transformed_l2_weights = (_w2, _sf2.transpose(1, 2).contiguous())
-
-    # Diagnostic globals shared between run_fused (L2 pool snapshot) and
-    # run_baseline (per-expert FP8 SwiGLU output candidates), consumed in
-    # _check_gate3's L2_POOL_VS_REF cross-check.
-    global _l2_pool_snapshot, _baseline_act_fp8_candidates, _l1_pool_snapshot, _l1_pool_sf_snapshot
-    _l2_pool_snapshot = None
-    _l1_pool_snapshot = None
-    _l1_pool_sf_snapshot = None
-    _baseline_act_fp8_candidates = []
+        # K-major weight-SF: transpose packed SF [E, N, K/128] -> [E, K/128, N]
+        # so the kernel's per-k_block SFB load of BLOCK_N consecutive columns is
+        # contiguous (coalesced).  The reference uses the untransposed weights.
+        _w1, _sf1 = transformed_l1_weights
+        _w2, _sf2 = transformed_l2_weights
+        transformed_l1_weights = (_w1, _sf1.transpose(1, 2).contiguous())
+        transformed_l2_weights = (_w2, _sf2.transpose(1, 2).contiguous())
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
     def run_fused():
-        if _mega_moe_fp4_act_enabled():
-            # Under MEGA_MOE_FP4_ACT the dispatched INPUT is MXFP4 e2m1
-            # (hidden/2 bytes/token).  ``buffer.x`` is a float8 view sized for
-            # the r2 FP8 input (hidden bytes/token), which (a) shape-mismatches
-            # the packed FP4 tensor and (b) over-extends the now-halved
-            # input_x region.  Write the FP4 nibble bytes through a correctly
-            # sized uint8 view anchored at input_x_offset instead.  The SF
-            # (per-32 E8M0) byte count is unchanged, so buffer.x_sf is fine.
-            x_bytes = x[0].view(torch.uint8).contiguous()[:num_tokens]
-            h_half = x_bytes.shape[1]
-            flat = buffer.buffer.view(torch.uint8)
-            base = int(buffer.layout.input_x_offset)
-            dst = flat[base : base + num_tokens * h_half].view(num_tokens, h_half)
-            dst.copy_(x_bytes)
-            buffer.x_sf[:num_tokens].copy_(x[1])
-        else:
-            buffer.x[:num_tokens].copy_(x[0])
-            buffer.x_sf[:num_tokens].copy_(x[1])
+        buffer.x[:num_tokens].copy_(x[0])
+        buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
@@ -1496,1109 +992,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             fast_math=bool(args.fast_math),
         )
         return y, cumulative_local_expert_recv_stats_fused
-
-    # STAGE_A3 DIAG: snapshot L2 pool (FP8 dispatched intermediates).
-    # Pulled out of run_fused() so the benchmark timing isn't polluted;
-    # the correctness loop calls this after run_fused() to feed
-    # _check_gate3's L2_POOL_VS_REF cross-check.
-    def _snapshot_l2_pool():
-        try:
-            # L2_SF_DUMP: inspect the L2 SF pool. The kernel writes
-            # UE8M0=0x7F (=2^0=1.0) to each populated token's SF row at
-            # Linear1 epilogue. If we see anything other than 0x7F in
-            # the populated SF slots, the Linear2 K-loop reads garbage
-            # scales → amplified MFMA output → NaN cascade in y.
-            if rank_idx == 0:
-                _sf_bytes = buffer.l2_acts_sf.view(torch.uint8)
-                _sf_flat = _sf_bytes.flatten()
-                _nz_mask = _sf_flat != 0
-                _n_nz = int(_nz_mask.sum().item())
-                _non_7f = int(((_sf_flat != 0x7F) & _nz_mask).sum().item())
-                _uniq = torch.unique(_sf_flat[_nz_mask][:512]).tolist() if _n_nz > 0 else []
-                print(
-                    f"[mega_moe-jit] L2_SF_DUMP n_bytes={_sf_flat.numel()} "
-                    f"n_nonzero={_n_nz} n_nz_not_7f={_non_7f} "
-                    f"sample_uniq_nz={_uniq[:16]}",
-                    flush=True,
-                )
-            global _l2_pool_snapshot, _l1_pool_snapshot
-            _l2_pool_snapshot = buffer.l2_acts.float().clone()
-            # Snapshot L1 pool (FP8 input tokens after kernel's internal
-            # dispatch role).  Used by L1_POOL_VS_RECV cross-check in
-            # run_baseline to verify per-expert token ordering matches
-            # the reference recv_x ordering.
-            try:
-                _l1_pool_snapshot = buffer.l1_acts.float().clone()
-                global _l1_pool_sf_snapshot
-                _l1_pool_sf_snapshot = buffer.l1_acts_sf.view(torch.uint8).clone()
-            except Exception:
-                _l1_pool_snapshot = None
-                _l1_pool_sf_snapshot = None
-            l2_snap = _l2_pool_snapshot
-            if rank_idx == 0:
-                I = l2_snap.size(-1)
-                ramp = torch.arange(I, device=l2_snap.device, dtype=torch.float32)
-                # Search for first few rows that are nonzero (populated by kernel).
-                row_amax = l2_snap.abs().amax(dim=-1)
-                nz_idx = torch.nonzero(row_amax > 0).flatten()
-                n_nonzero = int(nz_idx.numel())
-                print(
-                    f"[mega_moe-jit] L2_POOL: n_pool={l2_snap.size(0)} n_nonzero={n_nonzero} "
-                    f"row_amax min={float(row_amax.min()):.2f} max={float(row_amax.max()):.2f}",
-                    flush=True,
-                )
-                if n_nonzero > 0:
-                    r0 = int(nz_idx[0])
-                    r1 = int(nz_idx[1]) if n_nonzero > 1 else r0
-                    print(
-                        f"[mega_moe-jit] L2_POOL[r={r0}, :16]={l2_snap[r0, :16].tolist()}",
-                        flush=True,
-                    )
-                    print(
-                        f"[mega_moe-jit] L2_POOL[r={r0}, 48:64]={l2_snap[r0, 48:64].tolist()}",
-                        flush=True,
-                    )
-                    print(
-                        f"[mega_moe-jit] L2_POOL[r={r0}, 112:128]={l2_snap[r0, 112:128].tolist()}",
-                        flush=True,
-                    )
-                    if r1 != r0:
-                        print(
-                            f"[mega_moe-jit] L2_POOL[r={r1}, :16]={l2_snap[r1, :16].tolist()}",
-                            flush=True,
-                        )
-                    # FP8-round arange for comparison.
-                    ramp_fp8 = ramp.to(torch.float8_e4m3fn).float()
-                    n_match_per_row = ((l2_snap.float() - ramp_fp8.unsqueeze(0)).abs() < 0.5).sum(dim=-1)
-                    perfect = (n_match_per_row == I).sum().item()
-                    print(
-                        f"[mega_moe-jit] L2_POOL: perfect_arange_rows={int(perfect)}/{n_nonzero}",
-                        flush=True,
-                    )
-                    # STAGE_M_ROW DIAG: each pool_row R should contain value R
-                    # in every K-column (FP8-rounded). Mismatch localises MFMA
-                    # M-axis bug.
-                    row_const_ref = (
-                        torch.arange(l2_snap.size(0), device=l2_snap.device, dtype=torch.float32)
-                        .to(torch.float8_e4m3fn)
-                        .float()
-                    )
-                    n_row_const_match = ((l2_snap.float() - row_const_ref.unsqueeze(-1)).abs() < 0.5).sum(
-                        dim=-1
-                    )
-                    perfect_row = int((n_row_const_match == I).sum())
-                    near_perfect_row = int((n_row_const_match >= I - 4).sum())
-                    print(
-                        f"[mega_moe-jit] L2_POOL: perfect_m_row_rows={perfect_row}/{n_nonzero} "
-                        f"near_perfect={near_perfect_row}",
-                        flush=True,
-                    )
-                    # Per-row uniformity: how many K-columns equal the row's first column
-                    first_col = l2_snap[:, 0:1]
-                    n_uniform = ((l2_snap - first_col).abs() < 0.5).sum(dim=-1)
-                    uniform_rows = int((n_uniform == I).sum())
-                    print(
-                        f"[mega_moe-jit] L2_POOL: uniform_rows={uniform_rows}/{n_nonzero}",
-                        flush=True,
-                    )
-                    # Sample the actual first-col values for first 16 nonzero rows
-                    if n_nonzero >= 1:
-                        sample_rows = nz_idx[:16].tolist()
-                        sample_vals = [int(l2_snap[r, 0]) for r in sample_rows]
-                        print(
-                            f"[mega_moe-jit] L2_POOL: first16 (row,val0)={list(zip(sample_rows, sample_vals))}",
-                            flush=True,
-                        )
-                # R55: under STAGE_A_IDENT, kernel forces A=1.0 and SFA=1.0
-                # but keeps b_vec/sfb real. Predicted pool[m, n] depends only on
-                # n: pool_pred[e, n] = silu(clamp(W1_gate[e, n].sum(K))) *
-                # clamp(W1_up[e, n].sum(K)). Compare to _l2_pool_snapshot.
-                # High cos => B-LOAD reads CORRECT W1 bytes (bug must be in
-                # canonical A-LDS pool->LDS path). Low cos => kernel reads
-                # scrambled W1 bytes.
-                if os.environ.get("MEGAMOE_STAGE_A_IDENT", "") not in ("", "0", "false", "False"):
-                    try:
-                        w_bytes, w_sf_packed = l1_weights
-                        E_, N_tot, H_ = w_bytes.shape
-                        I_half = N_tot // 2
-                        dq_accs = []
-                        for e_ in range(E_):
-                            dq = _dequant_fp8_packed(w_bytes[e_], w_sf_packed[e_], gran_k=32)
-                            dq_accs.append(dq.sum(dim=-1))  # [2*I]
-                        acc_all = torch.stack(dq_accs, dim=0)  # [E, 2*I]
-                        # R58 raw accumulators (no clamp / no swiglu) for direct
-                        # comparison against MEGAMOE_STAGE_DUMP_{GATE,UP}_ACC pool.
-                        raw_gate = acc_all[:, :I_half]
-                        raw_up = acc_all[:, I_half:]
-                        raw_gate_fp8 = raw_gate.to(torch.float8_e4m3fn).float()
-                        raw_up_fp8 = raw_up.to(torch.float8_e4m3fn).float()
-                        g_ = raw_gate.clamp(-10.0, 10.0)
-                        u_ = raw_up.clamp(-10.0, 10.0)
-                        pred_f = g_ * torch.sigmoid(g_) * u_  # [E, I]
-                        pred_fp8 = pred_f.to(torch.float8_e4m3fn).float()
-                        if os.environ.get("MEGAMOE_STAGE_DUMP_GATE_ACC", "") not in (
-                            "",
-                            "0",
-                            "false",
-                            "False",
-                        ):
-                            for e_ in range(E_):
-                                v16 = [round(float(v), 3) for v in raw_gate_fp8[e_, :16].tolist()]
-                                print(
-                                    f"[mega_moe-jit] R58_RAW_GATE e={e_} pred[:16]={v16}",
-                                    flush=True,
-                                )
-                            # R76: cosine compare pool_r0 vs raw_gate for every expert
-                            if n_nonzero >= 1:
-                                r0_dbg = int(nz_idx[0])
-                                pool_row_dbg = l2_snap[r0_dbg].to(raw_gate_fp8.dtype)[:I_half]
-                                # R160: when STAGE_N_COL2 is on, kernel writes
-                                # intermediate_col into the pool.  pool[i] should
-                                # cast back to ~i if writeback is identity.
-                                if os.environ.get("MEGAMOE_STAGE_N_COL2", "") not in (
-                                    "",
-                                    "0",
-                                    "false",
-                                    "False",
-                                ):
-                                    try:
-                                        po160 = pool_row_dbg.float()
-                                        Ihalf_local = po160.numel()
-                                        ident = torch.arange(
-                                            Ihalf_local, device=po160.device, dtype=po160.dtype
-                                        )
-                                        diff160 = (po160 - ident).abs()
-                                        n_identity = int((diff160 < 1.0).sum())
-                                        # Per-row pool index map: what value each pool col holds
-                                        print(
-                                            f"[mega_moe-jit] R160_N_COL2 row={r0_dbg} "
-                                            f"identity_within_1={n_identity}/{Ihalf_local} "
-                                            f"max_diff={float(diff160.max()):.2f} "
-                                            f"mean_diff={float(diff160.mean()):.3f}",
-                                            flush=True,
-                                        )
-                                        # Print pool[0..127] as integer values
-                                        for row_off in range(0, Ihalf_local, 32):
-                                            chunk = [
-                                                int(round(float(v)))
-                                                for v in po160[row_off : row_off + 32].tolist()
-                                            ]
-                                            print(
-                                                f"[mega_moe-jit] R160_POOL[{row_off:3d}..{row_off+31:3d}]={chunk}",
-                                                flush=True,
-                                            )
-                                        # For each (sub_n, m_lane) compute expected col and check
-                                        # Expected per current writeback: lane writes col = n_block_idx*BLOCK_N + sub_n*kMfmaN + m_lane
-                                        # Probe additional rows for cross-check
-                                        max_probe_rows = min(int(n_nonzero), 4)
-                                        for rr in range(max_probe_rows):
-                                            r2 = int(nz_idx[rr])
-                                            po2 = l2_snap[r2].to(raw_gate_fp8.dtype)[:I_half].float()
-                                            diff2 = (po2 - ident).abs()
-                                            n_ident2 = int((diff2 < 1.0).sum())
-                                            print(
-                                                f"[mega_moe-jit] R160_ROW r={r2} identity_within_1={n_ident2}/{Ihalf_local}",
-                                                flush=True,
-                                            )
-                                    except Exception as _e160:
-                                        print(
-                                            f"[mega_moe-jit] R160_N_COL2 probe error: {_e160}",
-                                            flush=True,
-                                        )
-                                best_e = 0
-                                best_cos = -2.0
-                                for e_ in range(E_):
-                                    pred_row = raw_gate_fp8[e_].to(l2_snap.device)
-                                    cos = torch.nn.functional.cosine_similarity(
-                                        pred_row.unsqueeze(0), pool_row_dbg.unsqueeze(0), dim=-1
-                                    ).item()
-                                    print(
-                                        f"[mega_moe-jit] R76_RAW_GATE_COS r={r0_dbg} vs e={e_} cos={cos:.4f}",
-                                        flush=True,
-                                    )
-                                    if cos > best_cos:
-                                        best_cos = cos
-                                        best_e = e_
-                                # R165: emit multiple SF-interpretation predictors
-                                # (no kernel change required) to bisect HW SF model.
-                                # Production kernel uses DUAL_BYTE: per MFMA call
-                                # K=64 elems, byte0=SFB[n, k_block_lo], byte1=SFB[n,
-                                # k_block_hi].  Candidates:
-                                #   • per_kblock (R76): each K-block-of-32 scaled by
-                                #     SFB[n, k//32] — fully per-32-K, MATCHES test
-                                #     _dequant_fp8_packed (currently cos=0.978)
-                                #   • byte0_only:  per MFMA call (K=64), all 64 K
-                                #     scaled by SFB[n, k_block_lo of call] (byte 1
-                                #     ignored)
-                                #   • byte1_only:  per call, all 64 K scaled by
-                                #     SFB[n, k_block_hi of call]
-                                #   • avg_lo_hi:  per call, all 64 K scaled by
-                                #     0.5*(SFB[n, k_block_lo]+SFB[n, k_block_hi])
-                                # Whichever cos→1.0 reveals the HW SF model.
-                                try:
-                                    _w_bytes_r165, _w_sf_packed_r165 = l1_weights
-                                    _E_r165, _N_tot, _H_r165 = _w_bytes_r165.shape
-                                    _I_half_r165 = _N_tot // 2
-                                    # Decode SF once: shape [E, N, K/32]
-                                    _kMfmaK_r165 = 64
-                                    _gran_k_r165 = 32
-                                    _num_kblk = _H_r165 // _gran_k_r165
-                                    _num_mfma_calls = _H_r165 // _kMfmaK_r165
-                                    # Build per-K SFB tables for each model
-                                    pred_models = {
-                                        "per_kblock": [],
-                                        "byte0_only": [],
-                                        "byte1_only": [],
-                                        "avg_lo_hi": [],
-                                    }
-                                    for e_ in range(_E_r165):
-                                        _wb = _w_bytes_r165[e_].float()  # [N, H]
-                                        _sf = _unpack_packed_ue8m0(
-                                            _w_sf_packed_r165[e_],
-                                            _N_tot,
-                                            _num_kblk,
-                                        )  # [N, K/32]
-                                        # Reshape weights to per-K-block: [N, num_kblk, gran_k]
-                                        _wb_v = _wb.view(_N_tot, _num_kblk, _gran_k_r165)
-                                        # per_kblock — same as R76
-                                        _pk = (_wb_v * _sf.unsqueeze(-1)).sum(dim=(1, 2))[:_I_half_r165]
-                                        pred_models["per_kblock"].append(_pk)
-                                        # For byte0/byte1/avg models, group consecutive K-blocks by
-                                        # MFMA call (2 K-blocks per call: lo, hi).
-                                        _sf_calls = _sf.view(
-                                            _N_tot, _num_mfma_calls, 2
-                                        )  # [N, calls, (lo,hi)]
-                                        _sf_lo = _sf_calls[..., 0]  # [N, calls]
-                                        _sf_hi = _sf_calls[..., 1]
-                                        _sf_avg = 0.5 * (_sf_lo + _sf_hi)
-                                        _wb_calls = _wb.view(_N_tot, _num_mfma_calls, _kMfmaK_r165)
-                                        _pb0 = (_wb_calls * _sf_lo.unsqueeze(-1)).sum(dim=(1, 2))[
-                                            :_I_half_r165
-                                        ]
-                                        _pb1 = (_wb_calls * _sf_hi.unsqueeze(-1)).sum(dim=(1, 2))[
-                                            :_I_half_r165
-                                        ]
-                                        _pavg = (_wb_calls * _sf_avg.unsqueeze(-1)).sum(dim=(1, 2))[
-                                            :_I_half_r165
-                                        ]
-                                        pred_models["byte0_only"].append(_pb0)
-                                        pred_models["byte1_only"].append(_pb1)
-                                        pred_models["avg_lo_hi"].append(_pavg)
-                                    _po_full = pool_row_dbg.float()
-                                    for _name, _plist in pred_models.items():
-                                        _ps = torch.stack(_plist, dim=0).to(_po_full.device)
-                                        _ps_c = _ps.clamp(-448.0, 448.0)
-                                        for e_ in range(_E_r165):
-                                            _cos_raw = torch.nn.functional.cosine_similarity(
-                                                _ps[e_].unsqueeze(0), _po_full.unsqueeze(0), dim=-1
-                                            ).item()
-                                            _cos_c = torch.nn.functional.cosine_similarity(
-                                                _ps_c[e_].unsqueeze(0), _po_full.unsqueeze(0), dim=-1
-                                            ).item()
-                                            print(
-                                                f"[mega_moe-jit] R165_PRED model={_name} "
-                                                f"r={r0_dbg} vs e={e_} "
-                                                f"cos_raw={_cos_raw:.4f} cos_clamp={_cos_c:.4f}",
-                                                flush=True,
-                                            )
-                                except Exception as _e165:
-                                    print(
-                                        f"[mega_moe-jit] R165_PRED error: "
-                                        f"{type(_e165).__name__}: {_e165}",
-                                        flush=True,
-                                    )
-                                # R163: when MEGAMOE_AIDENT_NO_SFB is set, kernel
-                                # computes sum_k dq(B[n,k]) (no SFB factor).  Test
-                                # predictor that DOES apply SFB will mismatch — so
-                                # compute a no-SF predictor (W1_fp8.float().sum(K))
-                                # and compare against pool.  If THIS cos > 0.99 →
-                                # R158 residual was kernel-SFB-vs-test-SF mismatch.
-                                # If THIS cos still ~0.978 → bug is in B-byte
-                                # accumulation past K[0..3].
-                                if os.environ.get("MEGAMOE_AIDENT_NO_SFB", "") not in (
-                                    "",
-                                    "0",
-                                    "false",
-                                    "False",
-                                ):
-                                    try:
-                                        # R164: fp32 predictor with clamp to ±448.
-                                        # Kernel writeback saturates fp32→fp8_e4m3fn
-                                        # at ±448; round-tripping the predictor via
-                                        # fp8 produced NaN.  Compare clamp(pred_fp32,
-                                        # ±448) vs pool (already saturated).
-                                        pred_raw = w_bytes.float().sum(dim=-1)[:, :I_half]  # [E, I_half]
-                                        pred_clamp = pred_raw.clamp(-448.0, 448.0)
-                                        po = pool_row_dbg.float()
-                                        # Sample row for visibility
-                                        print(
-                                            f"[mega_moe-jit] R164_POOL r={r0_dbg} "
-                                            f"head16={[float(x) for x in po[:16].tolist()]}",
-                                            flush=True,
-                                        )
-                                        for e_ in range(E_):
-                                            prr_raw = pred_raw[e_].to(po.device)
-                                            prr_c = pred_clamp[e_].to(po.device)
-                                            cos_raw = torch.nn.functional.cosine_similarity(
-                                                prr_raw.unsqueeze(0),
-                                                po.unsqueeze(0),
-                                                dim=-1,
-                                            ).item()
-                                            cos_c = torch.nn.functional.cosine_similarity(
-                                                prr_c.unsqueeze(0),
-                                                po.unsqueeze(0),
-                                                dim=-1,
-                                            ).item()
-                                            print(
-                                                f"[mega_moe-jit] R164_NOSFB_COS "
-                                                f"r={r0_dbg} vs e={e_} "
-                                                f"cos_raw={cos_raw:.4f} cos_clamp={cos_c:.4f} "
-                                                f"pred_head4={[round(float(x),2) for x in prr_raw[:4].tolist()]}",
-                                                flush=True,
-                                            )
-                                        # Sorted (perm-invariant) on clamped pred
-                                        po_sorted = po.sort().values
-                                        for e_ in range(E_):
-                                            pr_sorted = pred_clamp[e_].to(po.device).sort().values
-                                            cs = torch.nn.functional.cosine_similarity(
-                                                pr_sorted.unsqueeze(0),
-                                                po_sorted.unsqueeze(0),
-                                                dim=-1,
-                                            ).item()
-                                            print(
-                                                f"[mega_moe-jit] R164_NOSFB_SORTED "
-                                                f"r={r0_dbg} vs e={e_} sorted_cos={cs:.4f}",
-                                                flush=True,
-                                            )
-                                        # Sign-only agreement on clamped pred
-                                        po_sign = po.sign()
-                                        for e_ in range(E_):
-                                            pr_sign = pred_clamp[e_].to(po.device).sign()
-                                            agree = int((pr_sign == po_sign).sum())
-                                            print(
-                                                f"[mega_moe-jit] R164_SIGN "
-                                                f"r={r0_dbg} vs e={e_} agree={agree}/{po.numel()}",
-                                                flush=True,
-                                            )
-                                    except Exception as _e163:
-                                        print(
-                                            f"[mega_moe-jit] R164_NOSFB error: "
-                                            f"{type(_e163).__name__}: {_e163}",
-                                            flush=True,
-                                        )
-                                # R157: per-element breakdown for best-matching expert
-                                try:
-                                    pr = raw_gate_fp8[best_e].to(l2_snap.device).float()
-                                    po = pool_row_dbg.float()
-                                    diff = (po - pr).abs()
-                                    Ihalf_local = pr.numel()
-                                    nz_mask = (pr.abs() > 1e-6) | (po.abs() > 1e-6)
-                                    n_nz_pred = int(nz_mask.sum())
-                                    top_k = min(16, Ihalf_local)
-                                    topv, topi = torch.topk(diff, top_k)
-                                    print(
-                                        f"[mega_moe-jit] R157_DIFF e={best_e} I={Ihalf_local} n_nz={n_nz_pred} "
-                                        f"max_abs_diff={float(diff.max()):.4f} mean_abs_diff={float(diff.mean()):.4f} "
-                                        f"sum_pred={float(pr.sum()):.3f} sum_pool={float(po.sum()):.3f}",
-                                        flush=True,
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R157_TOP16 idx={topi.tolist()} "
-                                        f"diff={[round(float(v),3) for v in topv.tolist()]}",
-                                        flush=True,
-                                    )
-                                    # pred vs pool at top diff indices
-                                    pr_at = [round(float(pr[i]), 3) for i in topi.tolist()]
-                                    po_at = [round(float(po[i]), 3) for i in topi.tolist()]
-                                    print(
-                                        f"[mega_moe-jit] R157_TOP16 pred={pr_at}",
-                                        flush=True,
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R157_TOP16 pool={po_at}",
-                                        flush=True,
-                                    )
-                                    # Mod-bucket analysis: which n%32, n%8, n%4 dominate
-                                    for mod in (32, 16, 8, 4):
-                                        bucket = torch.zeros(mod, device=diff.device)
-                                        bcnt = torch.zeros(mod, device=diff.device)
-                                        for i in range(Ihalf_local):
-                                            bucket[i % mod] += float(diff[i])
-                                            bcnt[i % mod] += 1.0
-                                        avg = (bucket / bcnt.clamp(min=1.0)).tolist()
-                                        print(
-                                            f"[mega_moe-jit] R157_MOD{mod}_AVG="
-                                            f"{[round(float(v),3) for v in avg]}",
-                                            flush=True,
-                                        )
-                                except Exception as _e2:
-                                    print(
-                                        f"[mega_moe-jit] R157_DIFF probe error: {_e2}",
-                                        flush=True,
-                                    )
-                                # R158: is pool a column-permutation of pred?
-                                try:
-                                    pr = raw_gate_fp8[best_e].to(l2_snap.device).float()
-                                    po = pool_row_dbg.float()
-                                    pr_sorted, _ = torch.sort(pr)
-                                    po_sorted, _ = torch.sort(po)
-                                    perm_diff = (pr_sorted - po_sorted).abs()
-                                    perm_cos = float(
-                                        torch.nn.functional.cosine_similarity(
-                                            pr_sorted.unsqueeze(0),
-                                            po_sorted.unsqueeze(0),
-                                            dim=-1,
-                                        ).item()
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R158_PERM e={best_e} "
-                                        f"sorted_cos={perm_cos:.4f} "
-                                        f"sorted_max_diff={float(perm_diff.max()):.4f} "
-                                        f"sorted_mean_diff={float(perm_diff.mean()):.4f} "
-                                        f"sorted_sum_diff={float(perm_diff.sum()):.4f}",
-                                        flush=True,
-                                    )
-                                    # Greedy match: for each pool element, find closest pred
-                                    Ihalf_local = pr.numel()
-                                    pr_used = torch.zeros(Ihalf_local, dtype=torch.bool, device=pr.device)
-                                    matched = 0
-                                    sum_matched_err = 0.0
-                                    for i in range(Ihalf_local):
-                                        target = float(po[i])
-                                        # find min |pr[j] - target| among unused j
-                                        best_j = -1
-                                        best_d = 1e9
-                                        for j in range(Ihalf_local):
-                                            if pr_used[j]:
-                                                continue
-                                            d = abs(float(pr[j]) - target)
-                                            if d < best_d:
-                                                best_d = d
-                                                best_j = j
-                                        if best_j >= 0:
-                                            pr_used[best_j] = True
-                                            matched += 1
-                                            sum_matched_err += best_d
-                                    avg_match_err = sum_matched_err / max(matched, 1)
-                                    print(
-                                        f"[mega_moe-jit] R158_GREEDY_MATCH matched={matched}/{Ihalf_local} "
-                                        f"avg_err={avg_match_err:.4f} sum_err={sum_matched_err:.4f}",
-                                        flush=True,
-                                    )
-                                    # Sign distribution
-                                    pr_pos = int((pr > 0).sum())
-                                    pr_neg = int((pr < 0).sum())
-                                    po_pos = int((po > 0).sum())
-                                    po_neg = int((po < 0).sum())
-                                    print(
-                                        f"[mega_moe-jit] R158_SIGN pred(+/-)={pr_pos}/{pr_neg} "
-                                        f"pool(+/-)={po_pos}/{po_neg}",
-                                        flush=True,
-                                    )
-                                except Exception as _e3:
-                                    print(
-                                        f"[mega_moe-jit] R158_PERM probe error: {_e3}",
-                                        flush=True,
-                                    )
-                                # R159: identify the permutation pattern
-                                try:
-                                    pr = raw_gate_fp8[best_e].to(l2_snap.device).float()
-                                    po = pool_row_dbg.float()
-                                    Ihalf_local = pr.numel()
-                                    # Greedy: for each pool[i], find unused pred j with smallest |diff|
-                                    pr_used = torch.zeros(Ihalf_local, dtype=torch.bool, device=pr.device)
-                                    perm = [-1] * Ihalf_local
-                                    for i in range(Ihalf_local):
-                                        target = float(po[i])
-                                        best_j = -1
-                                        best_d = 1e9
-                                        for j in range(Ihalf_local):
-                                            if pr_used[j]:
-                                                continue
-                                            d = abs(float(pr[j]) - target)
-                                            if d < best_d:
-                                                best_d = d
-                                                best_j = j
-                                        if best_j >= 0:
-                                            pr_used[best_j] = True
-                                            perm[i] = best_j
-                                    # Print full permutation in 8 rows of 16
-                                    print(
-                                        f"[mega_moe-jit] R159_PERM e={best_e} pool_idx -> pred_idx:",
-                                        flush=True,
-                                    )
-                                    for row in range(0, Ihalf_local, 16):
-                                        chunk = perm[row : row + 16]
-                                        print(
-                                            f"[mega_moe-jit] R159_PERM [{row:3d}..{row+15:3d}] = {chunk}",
-                                            flush=True,
-                                        )
-                                    # Test common permutation patterns
-                                    matches_identity = sum(1 for i in range(Ihalf_local) if perm[i] == i)
-                                    matches_xor_1 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 1))
-                                    matches_xor_2 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 2))
-                                    matches_xor_4 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 4))
-                                    matches_xor_8 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 8))
-                                    matches_xor_16 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 16))
-                                    matches_xor_32 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 32))
-                                    matches_xor_64 = sum(1 for i in range(Ihalf_local) if perm[i] == (i ^ 64))
-                                    print(
-                                        f"[mega_moe-jit] R159_PATTERN identity={matches_identity} "
-                                        f"xor1={matches_xor_1} xor2={matches_xor_2} xor4={matches_xor_4} "
-                                        f"xor8={matches_xor_8} xor16={matches_xor_16} xor32={matches_xor_32} xor64={matches_xor_64}",
-                                        flush=True,
-                                    )
-                                    # Stride patterns
-                                    matches_stride_2 = sum(
-                                        1
-                                        for i in range(Ihalf_local)
-                                        if perm[i] == ((i * 2) % Ihalf_local + (i * 2) // Ihalf_local)
-                                    )
-                                    matches_bit_rev16 = sum(
-                                        1
-                                        for i in range(Ihalf_local)
-                                        if perm[i] == (((i & 0xF) << 4) | ((i >> 4) & 0xF)) % Ihalf_local
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R159_PATTERN2 stride2={matches_stride_2} bit_rev16={matches_bit_rev16}",
-                                        flush=True,
-                                    )
-                                    # Block analysis: how many perm[i] stay within same block of 4, 8, 16, 32?
-                                    for blk in (4, 8, 16, 32):
-                                        same_blk = sum(
-                                            1 for i in range(Ihalf_local) if (perm[i] // blk) == (i // blk)
-                                        )
-                                        print(
-                                            f"[mega_moe-jit] R159_BLOCK{blk}_KEPT={same_blk}/{Ihalf_local}",
-                                            flush=True,
-                                        )
-                                except Exception as _e4:
-                                    print(
-                                        f"[mega_moe-jit] R159 probe error: {_e4}",
-                                        flush=True,
-                                    )
-                        if os.environ.get("MEGAMOE_STAGE_DUMP_UP_ACC", "") not in ("", "0", "false", "False"):
-                            for e_ in range(E_):
-                                v16 = [round(float(v), 3) for v in raw_up_fp8[e_, :16].tolist()]
-                                print(
-                                    f"[mega_moe-jit] R58_RAW_UP e={e_} pred[:16]={v16}",
-                                    flush=True,
-                                )
-                            # R77: per-expert cos pool_r0 vs raw_up
-                            if n_nonzero >= 1:
-                                r0_dbg = int(nz_idx[0])
-                                pool_row_dbg = l2_snap[r0_dbg].to(raw_up_fp8.dtype)[:I_half]
-                                for e_ in range(E_):
-                                    pred_row = raw_up_fp8[e_].to(l2_snap.device)
-                                    cos = torch.nn.functional.cosine_similarity(
-                                        pred_row.unsqueeze(0), pool_row_dbg.unsqueeze(0), dim=-1
-                                    ).item()
-                                    print(
-                                        f"[mega_moe-jit] R77_RAW_UP_COS r={r0_dbg} vs e={e_} cos={cos:.4f}",
-                                        flush=True,
-                                    )
-                        for e_ in range(E_):
-                            v16 = [round(float(v), 3) for v in pred_fp8[e_, :16].tolist()]
-                            print(
-                                f"[mega_moe-jit] R55_AIDENT_PRED e={e_} pred[:16]={v16}",
-                                flush=True,
-                            )
-                    except Exception as _e:
-                        print(f"[mega_moe-jit] R55_AIDENT predictor failed: {_e}", flush=True)
-
-                # R92: under STAGE_SFA_ONE + DUMP_GATE_ACC, kernel keeps real A,
-                # but forces scale_a=1.0. acc[m, n] = sum_k(A[m,k] * W1_dq[e,n,k]).
-                # Predictor uses ACTUAL pool A bytes (_l1_pool_snapshot) so the
-                # comparison is robust to dispatcher slot ordering. For each
-                # nonzero pool row r0, search over (e_, n0_offset) for best cos.
-                # High cos => A-LDS read path is correct; SFA byte assembly is the bug.
-                # Low cos => A-LDS read path itself is corrupted.
-                if (
-                    os.environ.get("MEGAMOE_STAGE_SFA_ONE", "") not in ("", "0", "false", "False")
-                    and os.environ.get("MEGAMOE_STAGE_DUMP_GATE_ACC", "") not in ("", "0", "false", "False")
-                    and _l1_pool_snapshot is not None
-                ):
-                    try:
-                        w_bytes, w_sf_packed = l1_weights
-                        E_, N_tot, H_ = w_bytes.shape
-                        I_half = N_tot // 2
-                        # Dequant W1 per expert using SFB only (SFA forced to 1.0)
-                        w_dq_list = []
-                        for e_ in range(E_):
-                            w_dq_list.append(
-                                _dequant_fp8_packed(w_bytes[e_], w_sf_packed[e_], gran_k=32)
-                            )  # each [2*I, H]
-                        w_dq = torch.stack(w_dq_list, dim=0)  # [E, 2I, H]
-                        w_gate_dq = w_dq[:, :I_half, :]  # [E, I, H]
-                        # Pool A bytes as float (FP8 dequant, no SFA)
-                        a_pool = _l1_pool_snapshot.to(l2_snap.device).float()  # [n_pool, H]
-                        # Predict per (slot, expert): pred[s, e, n] = sum_k(A[s,k] * w_gate_dq[e,n,k])
-                        # = einsum('sk,enk->sen', a_pool, w_gate_dq)
-                        # Limit to first BLOCK_M=128 slots for tractability
-                        nslots = min(a_pool.size(0), 128)
-                        a_slice = a_pool[:nslots].to(torch.float64)
-                        w_gate_dq64 = w_gate_dq.to(torch.float64)
-                        pred_se = torch.einsum("sk,enk->sen", a_slice, w_gate_dq64)  # [s, e, n]
-                        # Replace inf/nan with 0 to avoid NaN cosine
-                        pred_se = torch.where(torch.isfinite(pred_se), pred_se, torch.zeros_like(pred_se))
-                        # Saturate to fp8 e4m3fn range to match kernel pool
-                        pred_se = pred_se.clamp(-448.0, 448.0)
-                        pred_se_fp8 = pred_se.to(torch.float8_e4m3fn).float().to(l2_snap.dtype)
-                        if n_nonzero >= 1:
-                            r0 = int(nz_idx[0])
-                            pool_row = l2_snap[r0, :I_half].float()
-                            # For each (s, e), compute cos
-                            best = (-2.0, -1, -1)
-                            for s_ in range(nslots):
-                                for e_ in range(E_):
-                                    pred_row = pred_se_fp8[s_, e_]
-                                    cos = torch.nn.functional.cosine_similarity(
-                                        pred_row.unsqueeze(0), pool_row.unsqueeze(0), dim=-1
-                                    ).item()
-                                    if cos > best[0]:
-                                        best = (cos, s_, e_)
-                            print(
-                                f"[mega_moe-jit] R92_SFA_ONE_GATE r={r0} best_cos={best[0]:.4f} "
-                                f"best_slot={best[1]} best_expert={best[2]} nslots={nslots}",
-                                flush=True,
-                            )
-                            # Also print top-3 candidates for r0
-                            cos_all = torch.zeros(nslots, E_)
-                            for s_ in range(nslots):
-                                for e_ in range(E_):
-                                    pred_row = pred_se_fp8[s_, e_]
-                                    cos_all[s_, e_] = torch.nn.functional.cosine_similarity(
-                                        pred_row.unsqueeze(0), pool_row.unsqueeze(0), dim=-1
-                                    ).item()
-                            top_vals, top_idx_flat = torch.topk(cos_all.flatten(), 3)
-                            for ti in range(3):
-                                fi = int(top_idx_flat[ti])
-                                s_ti, e_ti = fi // E_, fi % E_
-                                print(
-                                    f"[mega_moe-jit] R92_TOP{ti} cos={float(top_vals[ti]):.4f} "
-                                    f"slot={s_ti} expert={e_ti}",
-                                    flush=True,
-                                )
-                            # Also probe 2nd nonzero row
-                            if n_nonzero >= 2:
-                                r1 = int(nz_idx[1])
-                                pool_row1 = l2_snap[r1, :I_half].float()
-                                best1 = (-2.0, -1, -1)
-                                for s_ in range(nslots):
-                                    for e_ in range(E_):
-                                        pred_row = pred_se_fp8[s_, e_]
-                                        cos = torch.nn.functional.cosine_similarity(
-                                            pred_row.unsqueeze(0), pool_row1.unsqueeze(0), dim=-1
-                                        ).item()
-                                        if cos > best1[0]:
-                                            best1 = (cos, s_, e_)
-                                print(
-                                    f"[mega_moe-jit] R92_SFA_ONE_GATE r={r1} best_cos={best1[0]:.4f} "
-                                    f"best_slot={best1[1]} best_expert={best1[2]}",
-                                    flush=True,
-                                )
-                    except Exception as _e:
-                        print(f"[mega_moe-jit] R92_SFA_ONE predictor failed: {_e}", flush=True)
-
-                # R103: kernel-pool-aligned gate-acc predictor.
-                # Uses ACTUAL kernel inputs: A bytes = _l1_pool_snapshot,
-                # SFA = decoded from _l1_pool_sf_snapshot, B/SFB = w_bytes/w_sf_packed.
-                # expert(pool_row) is deterministic: pool_row // BLOCK_M == expert
-                # (kernel reserves BLOCK_M=128 rows per expert in the L1 pool).
-                # Populated slots detected by row amax > 0. For each populated
-                # (e, s), predict gate acc and compare against l2_snap[e*128+s,:I_half]
-                # row-by-row. This removes the dispatcher slot-ordering artifact
-                # that made R70-R92 predictors uninformative.
-                # Fires under DUMP_GATE_ACC alone (no SFA_ONE, no A_IDENT).
-                if (
-                    os.environ.get("MEGAMOE_STAGE_DUMP_GATE_ACC", "") not in ("", "0", "false", "False")
-                    and os.environ.get("MEGAMOE_STAGE_SFA_ONE", "") in ("", "0", "false", "False")
-                    and os.environ.get("MEGAMOE_STAGE_A_IDENT", "") in ("", "0", "false", "False")
-                    and _l1_pool_snapshot is not None
-                    and _l1_pool_sf_snapshot is not None
-                ):
-                    try:
-                        w_bytes, w_sf_packed = l1_weights
-                        E_, N_tot, H_ = w_bytes.shape
-                        I_half = N_tot // 2
-                        BLOCK_M_R103 = 128
-                        n_pool_rows = _l1_pool_snapshot.size(0)
-                        if n_pool_rows < E_ * BLOCK_M_R103:
-                            print(
-                                f"[mega_moe-jit] R103_PRED skip: pool too small "
-                                f"{n_pool_rows} < {E_*BLOCK_M_R103}",
-                                flush=True,
-                            )
-                        else:
-                            # Dequant W1 per expert (gate half) — applies SFB internally
-                            w_gate_list = []
-                            for e_ in range(E_):
-                                w_dq_e = _dequant_fp8_packed(
-                                    w_bytes[e_], w_sf_packed[e_], gran_k=32
-                                )  # [2I, H]
-                                w_gate_list.append(w_dq_e[:I_half, :])
-                            w_gate_dq = torch.stack(w_gate_list, dim=0).to(torch.float64)  # [E, I, H]
-                            # Decode SFA bytes for every (e, s).
-                            # Kernel layout (line 532 + 537 of impl .cuh):
-                            #   sf_pool_token_idx =
-                            #     expert_pool_block_offset * SF_BLOCK_M + transform_sf_token_idx(s)
-                            #   flat_uint32_idx = j * kNumPaddedSFPoolTokens + sf_pool_token_idx
-                            # With config.sf_block_m = config.block_m = BLOCK_M (=128 here),
-                            # and for smoke shape every expert has <=BLOCK_M tokens so
-                            # expert_pool_block_offset == expert_index.
-                            # NOT _sf_pool.shape[0]//E (that's N_pad/E, the inter-K-block
-                            # padded stride; for e=0 the difference doesn't matter).
-                            _sf_pool = _l1_pool_sf_snapshot
-                            _SF_BLOCK_M_R103 = BLOCK_M_R103  # = 128, kernel template constant
-                            _N_pad_R103 = _sf_pool.shape[0]  # uint32 N_pad, inter-K-block stride
-                            n_kb = H_ // 32  # SF granularity
-                            sfa_bytes = torch.zeros(E_, BLOCK_M_R103, n_kb, dtype=torch.int64)
-                            for e_ in range(E_):
-                                for s_ in range(BLOCK_M_R103):
-                                    phys_in_block = (s_ & ~127) + (s_ & 31) * 4 + ((s_ >> 5) & 3)
-                                    phys_row = e_ * _SF_BLOCK_M_R103 + phys_in_block
-                                    # uint32 #0 = K-blocks 0..3 at flat-idx phys_row
-                                    r0_ = phys_row // 2
-                                    c0_ = (phys_row % 2) * 4
-                                    blk0 = _sf_pool[r0_, c0_ : c0_ + 4].tolist()
-                                    # uint32 #1 = K-blocks 4..7 at flat-idx N_pad + phys_row
-                                    idx1 = _N_pad_R103 + phys_row
-                                    r1_ = idx1 // 2
-                                    c1_ = (idx1 % 2) * 4
-                                    blk1 = _sf_pool[r1_, c1_ : c1_ + 4].tolist()
-                                    all_bytes = (blk0 + blk1)[:n_kb]
-                                    for kb in range(n_kb):
-                                        sfa_bytes[e_, s_, kb] = int(all_bytes[kb])
-                            # UE8M0 byte b → scale = 2^(b-127); b=0 → 0
-                            sfa_scale = torch.where(
-                                sfa_bytes == 0,
-                                torch.zeros_like(sfa_bytes, dtype=torch.float64),
-                                torch.pow(2.0, (sfa_bytes.double() - 127.0)),
-                            )  # [E, BLOCK_M, n_kb]
-                            a_pool_f = _l1_pool_snapshot.to(torch.float64)  # [n_pool, H]
-                            all_cos_chunks = []
-                            for e_ in range(E_):
-                                base = e_ * BLOCK_M_R103
-                                block_A = a_pool_f[base : base + BLOCK_M_R103]  # [128, H]
-                                row_amax = block_A.abs().amax(dim=-1)
-                                pop_idx = torch.nonzero(row_amax > 0).flatten()
-                                n_pop = int(pop_idx.numel())
-                                if n_pop == 0:
-                                    print(
-                                        f"[mega_moe-jit] R103_PRED e={e_} n_pop=0 (skip)",
-                                        flush=True,
-                                    )
-                                    continue
-                                A_e = block_A[pop_idx]  # [n_pop, H]
-                                sfa_e = sfa_scale[e_, pop_idx]  # [n_pop, n_kb]
-                                # Apply per-K-block SFA: A_real[s,k] = A[s,k] * SFA[s, k//32]
-                                A_scaled = (A_e.view(n_pop, n_kb, 32) * sfa_e.unsqueeze(-1)).view(n_pop, H_)
-                                # pred[s, n] = sum_k(A_scaled[s, k] * W_gate_dq[e, n, k])
-                                pred = A_scaled @ w_gate_dq[e_].transpose(0, 1)  # [n_pop, I]
-                                # Saturate to FP8 e4m3fn range (L2 pool is FP8 stored).
-                                pred_f = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred))
-                                pred_fp8 = pred_f.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
-                                pool_slice = l2_snap[base : base + BLOCK_M_R103][pop_idx, :I_half].float()
-                                cos = torch.nn.functional.cosine_similarity(pred_fp8, pool_slice, dim=-1)
-                                cos_mean = float(cos.mean())
-                                cos_min = float(cos.min())
-                                cos_max = float(cos.max())
-                                cos_strong = int((cos >= 0.99).sum())
-                                cos_mid = int(((cos >= 0.7) & (cos < 0.99)).sum())
-                                # Sample first 2 rows for inspection.
-                                head0 = cos[0].item() if n_pop >= 1 else float("nan")
-                                head1 = cos[1].item() if n_pop >= 2 else float("nan")
-                                print(
-                                    f"[mega_moe-jit] R103_PRED e={e_} n_pop={n_pop} "
-                                    f"cos: mean={cos_mean:.4f} min={cos_min:.4f} "
-                                    f"max={cos_max:.4f} strong>=0.99={cos_strong} "
-                                    f"0.7<=mid<0.99={cos_mid} head=[{head0:.3f},{head1:.3f}]",
-                                    flush=True,
-                                )
-                                all_cos_chunks.append(cos)
-                                # Also dump a sample diff for first populated row.
-                                p0 = pred_fp8[0]
-                                q0 = pool_slice[0]
-                                p_top8 = [round(float(v), 2) for v in p0[:8].tolist()]
-                                q_top8 = [round(float(v), 2) for v in q0[:8].tolist()]
-                                print(
-                                    f"[mega_moe-jit] R103_PRED_SAMPLE e={e_} pool_row={base+int(pop_idx[0])} "
-                                    f"pred[:8]={p_top8} pool[:8]={q_top8}",
-                                    flush=True,
-                                )
-                                # R104: column-permutation hunt.
-                                # Hypothesis: kernel writeback uses a permuted
-                                # column-axis vs predictor expectation. If a
-                                # structured permutation P maps pool[:,P]≈pred,
-                                # we've located the bug to writeback's col
-                                # mapping (not GEMM body, not LDS load).
-                                try:
-                                    _N = p0.shape[0]
-                                    _p = p0.float()
-                                    _q = q0.float()
-                                    # 1) sorted-values match strength
-                                    _ps, _ = torch.sort(_p.abs(), descending=True)
-                                    _qs, _ = torch.sort(_q.abs(), descending=True)
-                                    _sort_cos = torch.nn.functional.cosine_similarity(
-                                        _ps.unsqueeze(0), _qs.unsqueeze(0), dim=-1
-                                    ).item()
-                                    # 2) try structured perms — compute cos pool[P] vs pred
-                                    _idx = torch.arange(_N)
-                                    _candidates = {
-                                        "id": _idx,
-                                        "rev": torch.arange(_N - 1, -1, -1),
-                                    }
-                                    for _r in (1, 2, 4, 8, 16, 32, 64):
-                                        if _r < _N:
-                                            _candidates[f"roll{_r}"] = torch.roll(_idx, _r)
-                                    for _m in (1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63):
-                                        if _m < _N:
-                                            _candidates[f"xor{_m}"] = _idx ^ _m
-                                    # 3) swap K-half view: cols [0..N/2) <-> [N/2..N)
-                                    _half = _N // 2
-                                    _swap = torch.cat([torch.arange(_half, _N), torch.arange(0, _half)])
-                                    _candidates["swapH"] = _swap
-                                    # 4) within-32 block reverse / lane->byte mapping
-                                    _blk32 = _idx.clone()
-                                    for b in range(0, _N, 32):
-                                        e = min(b + 32, _N)
-                                        _blk32[b:e] = torch.arange(e - 1, b - 1, -1)
-                                    _candidates["blk32rev"] = _blk32
-                                    # 5) MFMA output-style: lane idx -> 4 cols, m groups of 4
-                                    if _N >= 32:
-                                        # try: col -> (col%4)*8 + col//4 (8-lane × 4-byte transpose)
-                                        _mfma = torch.empty(_N, dtype=torch.long)
-                                        for ci in range(_N):
-                                            _mfma[ci] = ((ci % 4) * 8) + (ci // 4) % 8 + (ci // 32) * 32
-                                        _candidates["mfma_4x8"] = _mfma
-                                    _best_name, _best_cos = "id", -2.0
-                                    for _nm, _pm in _candidates.items():
-                                        _pm = _pm.to(_q.device)
-                                        _qp = _q[_pm]
-                                        _cc = torch.nn.functional.cosine_similarity(
-                                            _p.unsqueeze(0), _qp.unsqueeze(0), dim=-1
-                                        ).item()
-                                        if _cc > _best_cos:
-                                            _best_cos = _cc
-                                            _best_name = _nm
-                                    print(
-                                        f"[mega_moe-jit] R104_PERM e={e_} row={base+int(pop_idx[0])} "
-                                        f"sortedAbsCos={_sort_cos:.4f} "
-                                        f"bestPerm={_best_name} bestCos={_best_cos:.4f} "
-                                        f"idCos={float(torch.nn.functional.cosine_similarity(_p.unsqueeze(0), _q.unsqueeze(0), dim=-1)):.4f}",
-                                        flush=True,
-                                    )
-                                except Exception as _e104:
-                                    print(
-                                        f"[mega_moe-jit] R104_PERM failed e={e_}: {_e104}",
-                                        flush=True,
-                                    )
-                            if all_cos_chunks:
-                                cos_all = torch.cat(all_cos_chunks)
-                                print(
-                                    f"[mega_moe-jit] R103_PRED_OVERALL n_rows={int(cos_all.numel())} "
-                                    f"mean={float(cos_all.mean()):.4f} "
-                                    f"min={float(cos_all.min()):.4f} "
-                                    f"max={float(cos_all.max()):.4f} "
-                                    f"strong>=0.99={int((cos_all>=0.99).sum())} "
-                                    f"mid>=0.7={int((cos_all>=0.7).sum())}",
-                                    flush=True,
-                                )
-                    except Exception as _e103:
-                        import traceback as _tb103
-
-                        print(
-                            f"[mega_moe-jit] R103_PRED failed: {_e103}\n" f"{_tb103.format_exc()}",
-                            flush=True,
-                        )
-
-                if os.environ.get("MEGAMOE_STAGE_A_IDENT", "") not in ("", "0", "false", "False"):
-                    try:
-                        if n_nonzero >= 1:
-                            r0 = int(nz_idx[0])
-                            pr0 = [round(float(v), 3) for v in l2_snap[r0, :16].tolist()]
-                            print(
-                                f"[mega_moe-jit] R55_AIDENT_POOL r={r0} pool[:16]={pr0}",
-                                flush=True,
-                            )
-                            for e_ in range(E_):
-                                pred_row = pred_fp8[e_].to(l2_snap.device)
-                                pool_row = l2_snap[r0].to(pred_row.dtype)
-                                cos = torch.nn.functional.cosine_similarity(
-                                    pred_row.unsqueeze(0), pool_row.unsqueeze(0), dim=-1
-                                ).item()
-                                print(
-                                    f"[mega_moe-jit] R55_AIDENT cos(pool_r={r0} vs pred_e={e_})={cos:.4f}",
-                                    flush=True,
-                                )
-                            # R56: per-K-block partial sums for diverging columns.
-                            # Helps identify if a single K-block's read/scale is
-                            # corrupted vs accumulation precision issue.
-                            try:
-                                e_target = 0
-                                dq0 = _dequant_fp8_packed(
-                                    w_bytes[e_target], w_sf_packed[e_target], gran_k=32
-                                )  # [2*I, H]
-                                Hh = dq0.shape[-1]
-                                num_kb = Hh // 32
-                                diverge_cols = [3, 8, 9, 14, 0, 4]  # incl. 2 matching
-                                for nn in diverge_cols:
-                                    if nn >= I_half:
-                                        continue
-                                    g_row = dq0[nn]  # [H] — gate column
-                                    u_row = dq0[nn + I_half]  # [H] — up column
-                                    g_kb = [
-                                        round(float(g_row[k * 32 : (k + 1) * 32].sum()), 3)
-                                        for k in range(num_kb)
-                                    ]
-                                    u_kb = [
-                                        round(float(u_row[k * 32 : (k + 1) * 32].sum()), 3)
-                                        for k in range(num_kb)
-                                    ]
-                                    g_sum = round(float(g_row.sum()), 4)
-                                    u_sum = round(float(u_row.sum()), 4)
-                                    g_clamp = max(-10.0, min(10.0, g_sum))
-                                    u_clamp = max(-10.0, min(10.0, u_sum))
-                                    import math as _m
-
-                                    silu_g = g_clamp / (1.0 + _m.exp(-g_clamp))
-                                    swiglu = silu_g * u_clamp
-                                    pool_val = round(float(l2_snap[r0, nn]), 4)
-                                    print(
-                                        f"[mega_moe-jit] R56_KB e={e_target} n={nn} "
-                                        f"g_kb={g_kb} g_sum={g_sum} g_clamp={g_clamp:.3f}",
-                                        flush=True,
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R56_KB e={e_target} n={nn} "
-                                        f"u_kb={u_kb} u_sum={u_sum} u_clamp={u_clamp:.3f}",
-                                        flush=True,
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R56_KB e={e_target} n={nn} "
-                                        f"swiglu={swiglu:.4f} pred_fp8={float(pred_fp8[e_target, nn]):.4f} "
-                                        f"pool_actual={pool_val}",
-                                        flush=True,
-                                    )
-                                    # Dump raw SF bytes (UE8M0) for both halves
-                                    sf_g_bytes = [
-                                        int(w_sf_packed[e_target, nn, k].item()) & 0xFFFFFFFF
-                                        for k in range(w_sf_packed.shape[-1])
-                                    ]
-                                    sf_u_bytes = [
-                                        int(w_sf_packed[e_target, nn + I_half, k].item()) & 0xFFFFFFFF
-                                        for k in range(w_sf_packed.shape[-1])
-                                    ]
-                                    print(
-                                        f"[mega_moe-jit] R56_KB e={e_target} n={nn} "
-                                        f"sf_g_pack=[{','.join(f'0x{x:08x}' for x in sf_g_bytes)}] "
-                                        f"sf_u_pack=[{','.join(f'0x{x:08x}' for x in sf_u_bytes)}]",
-                                        flush=True,
-                                    )
-                            except Exception as e2:
-                                print(
-                                    f"[mega_moe-jit] R56_KB exception: {e2}",
-                                    flush=True,
-                                )
-                            # R61: SF uniformity check — for each n in up half
-                            # cols [0..15], dump raw SF bytes per K-block and
-                            # mark pairs (kb_lo, kb_hi) within one MFMA call
-                            # that differ.  If `match` correlates with sf
-                            # uniformity across the lane-0..31 / lane-32..63
-                            # K-blocks, the hardware-reads-byte-0-only quirk
-                            # is the bug (different K-blocks must share SF
-                            # for the current per-lane sfb_byte scheme).
-                            try:
-                                e_target = 0
-                                wsf = w_sf_packed[e_target].view(torch.uint8)  # [2*I, num_kb]
-                                NK = wsf.shape[-1]  # num K-blocks per N
-                                pool_row_top16 = [round(float(v), 3) for v in l2_snap[r0, :16].tolist()]
-                                for nn in range(16):
-                                    n_global_up = nn + I_half
-                                    sfu = [int(wsf[n_global_up, k].item()) for k in range(NK)]
-                                    # MFMA covers K-blocks (kb_lo=2*k_inner+k_block*4, kb_hi=kb_lo+1)
-                                    # k_block in 0..(K/BLOCK_K-1), k_inner in 0..1
-                                    pairs = []
-                                    diff_pairs = 0
-                                    for k_block_ in range(2):  # K/BLOCK_K = 256/128 = 2
-                                        for k_inner_ in range(2):
-                                            lo = k_block_ * 4 + k_inner_ * 2
-                                            hi = lo + 1
-                                            if hi < NK:
-                                                pairs.append((sfu[lo], sfu[hi]))
-                                                if sfu[lo] != sfu[hi]:
-                                                    diff_pairs += 1
-                                    pool_v = pool_row_top16[nn] if nn < len(pool_row_top16) else float("nan")
-                                    pred_v = round(float(raw_up_fp8[e_target, nn]), 3)
-                                    pairs_str = " ".join(f"({a:02x},{b:02x})" for a, b in pairs)
-                                    print(
-                                        f"[mega_moe-jit] R61_SFU n={nn} (n_global={n_global_up}) "
-                                        f"sf_u={[f'{x:02x}' for x in sfu]} "
-                                        f"pairs={pairs_str} ndiff={diff_pairs} "
-                                        f"pool={pool_v} pred_e0={pred_v}",
-                                        flush=True,
-                                    )
-                            except Exception as e3:
-                                print(
-                                    f"[mega_moe-jit] R61_SFU exception: {e3}",
-                                    flush=True,
-                                )
-                            # R57: detect within-BLOCK_N=32 permutation by
-                            # best-matching each pool col to a pred col in same
-                            # block-N. If consistent perm pattern emerges, B-LOAD
-                            # has wrong (K,N) → lane mapping.
-                            try:
-                                BN = 32
-                                e_target = 0
-                                pred_e0 = pred_fp8[e_target].to(l2_snap.device)  # [I]
-                                pool_r0 = l2_snap[r0].to(pred_e0.dtype)  # [I]
-                                I_use = min(int(pred_e0.numel()), int(pool_r0.numel()))
-                                num_bn = I_use // BN
-                                for blk in range(min(num_bn, 4)):
-                                    pool_blk = pool_r0[blk * BN : (blk + 1) * BN]
-                                    pred_blk = pred_e0[blk * BN : (blk + 1) * BN]
-                                    perm_map = []
-                                    for n_pool in range(BN):
-                                        pv = float(pool_blk[n_pool])
-                                        diffs = (pred_blk - pv).abs()
-                                        best_n = int(diffs.argmin())
-                                        best_d = float(diffs[best_n])
-                                        perm_map.append(
-                                            (
-                                                n_pool,
-                                                best_n,
-                                                round(pv, 3),
-                                                round(float(pred_blk[best_n]), 3),
-                                                round(best_d, 3),
-                                            )
-                                        )
-                                    # Pretty-print only mismatches and identity hits
-                                    perm_str = ",".join(f"{n}->{b}" for (n, b, _, _, _) in perm_map)
-                                    print(
-                                        f"[mega_moe-jit] R57_PERM blk={blk} pool_n->best_pred_n: {perm_str}",
-                                        flush=True,
-                                    )
-                                    # Also dump pool vs best pred for first 8 cols
-                                    sample_str = "; ".join(
-                                        f"n={n}:pool={pv},pred={pp},d={dd}"
-                                        for (n, _, pv, pp, dd) in perm_map[:8]
-                                    )
-                                    print(
-                                        f"[mega_moe-jit] R57_PERM blk={blk} sample0-7: {sample_str}",
-                                        flush=True,
-                                    )
-                            except Exception as e3:
-                                print(
-                                    f"[mega_moe-jit] R57_PERM exception: {e3}",
-                                    flush=True,
-                                )
-                    except Exception as e:
-                        print(
-                            f"[mega_moe-jit] R55_AIDENT_PRED exception: {e}",
-                            flush=True,
-                        )
-        except Exception as exc:
-            print(f"[mega_moe-jit] L2_POOL dump exception: {exc}", flush=True)
 
     dist_print("Config:", once_in_node=True)
     dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
@@ -2627,91 +1020,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     alignment = get_theoretical_mk_alignment_for_contiguous_layout()
     set_mk_alignment_for_contiguous_layout(alignment)
 
-    # COMBINE_BUF DIAG: snapshot ``combine_token_buffer`` (the BF16
-    # per-(topk_slot, token) partial-sum buffer that the kernel
-    # writes via ``write_combine`` and reads in the epilogue to
-    # produce ``y``).  Verifies whether the kernel's epilogue sums
-    # correctly: ``y[t, :] ?= sum_k combine_buf[k, t, :]``.
-    def _snapshot_combine_buf(y_fused):
-        try:
-            if rank_idx != 0:
-                return
-            cb = buffer.combine_buf.float().clone()  # [K, N_tok_max, H]
-            K_, N_tok_max, H_ = cb.shape
-            n_to_check = min(num_tokens, N_tok_max)
-            cb_sum = cb[:, :n_to_check, :].sum(dim=0)  # [n_to_check, H]
-            diff = (cb_sum - y_fused[:n_to_check].float()).abs()
-            per_tok_sum_amax = cb.abs().amax(dim=(0, 2))[:n_to_check]
-            per_tok_diff_amax = diff.amax(dim=-1)
-            print(
-                f"[mega_moe-jit] COMBINE_BUF cb.shape={list(cb.shape)} "
-                f"cb_amax={float(cb.abs().max()):.2f} "
-                f"sum_minus_y_amax={float(diff.max()):.4f} "
-                f"sum_minus_y_mean={float(diff.mean()):.6f}",
-                flush=True,
-            )
-            for t in (0, 5, 10, 20):
-                if t >= n_to_check:
-                    continue
-                per_slot_amax = [round(float(cb[k, t].abs().max()), 2) for k in range(K_)]
-                slot0 = [round(float(v), 2) for v in cb[0, t, :8].tolist()]
-                slot1_ = [round(float(v), 2) for v in cb[1, t, :8].tolist()] if K_ > 1 else []
-                ysum = [round(float(v), 2) for v in cb_sum[t, :8].tolist()]
-                yfu = [round(float(v), 2) for v in y_fused[t, :8].float().tolist()]
-                print(
-                    f"[mega_moe-jit] COMBINE_BUF t={t} per_slot_amax={per_slot_amax} "
-                    f"slot0[:8]={slot0} slot1[:8]={slot1_} "
-                    f"sum[:8]={ysum} y[:8]={yfu} "
-                    f"sum_diff_amax={float(per_tok_diff_amax[t]):.4f}",
-                    flush=True,
-                )
-            # ROUTING-BISECT R15: when the kernel write_combine override
-            # is active, each slot [k, t] should be a uniform constant
-            # equal to ``256*k + t``.  Any non-uniformity or wrong
-            # constant exposes a meta-routing bug (wrong dst rank /
-            # wrong dst topk / wrong dst token_idx).
-            try:
-                bad_uniform = 0
-                bad_const = 0
-                examples = []
-                for k in range(K_):
-                    for t in range(n_to_check):
-                        slot = cb[k, t]
-                        smin = float(slot.min())
-                        smax = float(slot.max())
-                        expected = float(256 * k + t)
-                        if smax - smin > 1e-3:
-                            bad_uniform += 1
-                            if len(examples) < 4:
-                                examples.append(
-                                    f"k={k} t={t} min={smin:.2f} max={smax:.2f} " f"expected={expected:.2f}"
-                                )
-                        elif abs(smax - expected) > 1e-3:
-                            bad_const += 1
-                            if len(examples) < 4:
-                                examples.append(f"k={k} t={t} got={smax:.2f} expected={expected:.2f}")
-                total = K_ * n_to_check
-                print(
-                    f"[mega_moe-jit] ROUTING_CHECK total_slots={total} "
-                    f"bad_uniform={bad_uniform} bad_const={bad_const} "
-                    f"examples={examples}",
-                    flush=True,
-                )
-                # ROUTING-BISECT R15B: full per-(k,t) table for visibility
-                for k in range(K_):
-                    got_row = []
-                    for t in range(n_to_check):
-                        slot = cb[k, t]
-                        got_row.append(int(float(slot[0])))
-                    print(
-                        f"[mega_moe-jit] ROUTING_TABLE k={k} got={got_row}",
-                        flush=True,
-                    )
-            except Exception as _exc2:
-                print(f"[mega_moe-jit] ROUTING_CHECK exception: {_exc2}", flush=True)
-        except Exception as _exc:
-            print(f"[mega_moe-jit] COMBINE_BUF exception: {_exc}", flush=True)
-
     def run_baseline():
         recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
             x,
@@ -2734,229 +1042,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True,
             recipe=(1, 1, 32),
-            # Under MEGA_MOE_FP4_ACT Linear1's A (recv_x) is MXFP4 e2m1, so the
-            # reference must dequant it from FP4; FP8 in r2.
-            a_is_fp4=_mega_moe_fp4_act_enabled(),
         )
-        # L2_POOL_VS_REF: populate per-expert SwiGLU FP8 candidates that
-        # mirror the kernel's L2 pool contents (no topk-weight scaling,
-        # UE8M0=1.0).  The kernel writes the same pre-weight SwiGLU
-        # output into l2_acts; the cross-check tries to match each
-        # nonzero pool row to its expected per-expert token.
-        try:
-            global _baseline_act_fp8_candidates, _l1_pool_snapshot
-            _psum = handle.psum_num_recv_tokens_per_expert.tolist()
-            _clamp = float(args.activation_clamp)
-            # R95_AVEC_REF: dump the expected A bytes for block 0's loader_warp_local=0
-            # slot range (= expert 0 slot 0..7 K=0..31).  Direct byte-for-byte
-            # comparison with the kernel's [AVEC] printf output for the same
-            # (sm=0, lwl=0, lane=0..7, k_block=0, k_inner=0) lanes.
-            if os.environ.get("MEGAMOE_STAGE_PRINTF_AVEC", "") not in ("", "0", "false", "False"):
-                try:
-                    _recv_u8 = recv_x[0].view(torch.uint8).cpu().contiguous()
-                    for _s in range(min(8, _recv_u8.size(0))):
-                        _b = _recv_u8[_s, :32].tolist()
-                        _k0_15 = "".join(f"{v:02x}" for v in _b[:16])
-                        _k16_31 = "".join(f"{v:02x}" for v in _b[16:32])
-                        print(
-                            f"[mega_moe-jit] R95_AVEC_REF slot={_s} expert=0 "
-                            f"K0_15={_k0_15} K16_31={_k16_31}",
-                            flush=True,
-                        )
-                except Exception as _exc:
-                    print(f"[mega_moe-jit] R95_AVEC_REF err={_exc}", flush=True)
-            # R25: L1_POOL_VS_RECV — compare kernel's L1 pool per-row
-            # against the test's recv_x reference per-row, per expert.  If
-            # cos_sim is low, the kernel's per-expert token ordering does
-            # not match the test's permute_token_idx ordering.
-            if _l1_pool_snapshot is not None and rank_idx == 0:
-                try:
-                    _BLOCK_M = 128
-                    _pool = _l1_pool_snapshot
-                    _recv_fp8 = recv_x[0].float()  # [P, H] FP8 bytes dequantized
-                    _prefix2 = 0
-                    _per_e_cos = []
-                    _per_e_best = []
-                    for _e, _end in enumerate(_psum):
-                        _n_e = _end - _prefix2
-                        if _n_e > 0:
-                            _pool_e = _pool[_e * _BLOCK_M : _e * _BLOCK_M + _n_e]
-                            _recv_e = _recv_fp8[_prefix2:_end]
-                            _pn = torch.nn.functional.normalize(_pool_e, dim=-1, eps=1e-9)
-                            _rn = torch.nn.functional.normalize(_recv_e, dim=-1, eps=1e-9)
-                            _self = (_pn * _rn).sum(dim=-1)
-                            _sim = _pn @ _rn.T
-                            _best = _sim.max(dim=-1).values
-                            _per_e_cos.append((_e, float(_self.mean()), float(_self.min())))
-                            _per_e_best.append((_e, float(_best.mean()), float(_best.min())))
-                        _prefix2 = _end
-                    print(
-                        f"[mega_moe-jit] L1_POOL_VS_RECV per_expert_self_cos={_per_e_cos}",
-                        flush=True,
-                    )
-                    print(
-                        f"[mega_moe-jit] L1_POOL_VS_RECV per_expert_best_cos={_per_e_best}",
-                        flush=True,
-                    )
-                    # R25 follow-up: build kernel-input-aligned reference
-                    # cands by finding for each kernel pool row the matching
-                    # recv_x row (within the same expert), then taking the
-                    # corresponding l1_y row's SwiGLU output.  Stash as
-                    # _kernel_aligned_cands keyed by pool_row_id so
-                    # _check_gate3 can compare per-row.
-                    global _kernel_aligned_cands
-                    _kernel_aligned_cands = {}
-                    _prefix3 = 0
-                    for _e, _end in enumerate(_psum):
-                        _n_e = _end - _prefix3
-                        if _n_e > 0:
-                            _pool_e = _pool[_e * _BLOCK_M : _e * _BLOCK_M + _n_e]
-                            _recv_e = _recv_fp8[_prefix3:_end]
-                            _pn = torch.nn.functional.normalize(_pool_e, dim=-1, eps=1e-9)
-                            _rn = torch.nn.functional.normalize(_recv_e, dim=-1, eps=1e-9)
-                            _sim = _pn @ _rn.T  # [n_e, n_e]
-                            _best_match = _sim.argmax(dim=-1)  # [n_e]
-                            _gate = l1_y[_prefix3:_end, :intermediate_hidden].float().clamp(-_clamp, _clamp)
-                            _up = l1_y[_prefix3:_end, intermediate_hidden:].float().clamp(-_clamp, _clamp)
-                            _act = torch.nn.functional.silu(_gate) * _up
-                            _act_fp8 = _act.to(torch.float8_e4m3fn).float()
-                            for _k in range(_n_e):
-                                _kernel_aligned_cands[_e * _BLOCK_M + _k] = _act_fp8[int(_best_match[_k])]
-                            # R47: byte-level comparison probe. For each
-                            # kernel pool row, dump its argmax-matched
-                            # recv_x row side-by-side (first 8 bytes) and
-                            # L2-norm ratio.  Distinguishes:
-                            #  - bytes identical → MFMA arithmetic wrong
-                            #  - bytes scaled    → SF interpretation wrong
-                            #  - bytes random    → dispatch wrong (despite cos=0.99)
-                            if _e == 0:
-                                for _k in range(min(_n_e, 4)):
-                                    _j = int(_best_match[_k])
-                                    _pr = _pool_e[_k]
-                                    _rr = _recv_e[_j]
-                                    _pnorm = float(_pr.norm())
-                                    _rnorm = float(_rr.norm())
-                                    _ratio = (_pnorm / _rnorm) if _rnorm > 1e-9 else float("nan")
-                                    _diff = (_pr - _rr).abs().max().item()
-                                    print(
-                                        f"[mega_moe-jit] R47_BYTE_CMP e={_e} k={_k} j={_j} "
-                                        f"pool[:8]={[float(v) for v in _pr[:8]]} "
-                                        f"recv[:8]={[float(v) for v in _rr[:8]]} "
-                                        f"|pool|={_pnorm:.3f} |recv|={_rnorm:.3f} "
-                                        f"ratio={_ratio:.4f} max|diff|={_diff:.4f}",
-                                        flush=True,
-                                    )
-                                # R48 SF byte comparison: compare kernel's
-                                # l1_acts_sf bytes against recv_x[1] SF
-                                # bytes for the same matched (pool_row,
-                                # recv_row) pairs.  If SFs differ even
-                                # though data is byte-identical, the
-                                # dispatcher SF byte placement is wrong.
-                                # If SFs match, MFMA/W1/SwiGLU is the bug.
-                                if _l1_pool_sf_snapshot is not None:
-                                    try:
-                                        _sf_pool = _l1_pool_sf_snapshot
-                                        _sf_recv = recv_x[1].view(torch.uint8)
-                                        print(
-                                            f"[mega_moe-jit] R48_SF_SHAPE "
-                                            f"pool_sf_shape={list(_sf_pool.shape)} "
-                                            f"recv_sf_shape={list(_sf_recv.shape)}",
-                                            flush=True,
-                                        )
-                                        # R49: decode pool SF row using kernel's
-                                        # transform_sf_token_idx permute, then
-                                        # compare to recv_sf for matched token.
-                                        # kernel formula (idx = token_in_block):
-                                        #   phys = expert_block * SF_BLOCK_M
-                                        #          + (idx & ~127) + (idx & 31)*4
-                                        #          + ((idx >> 5) & 3)
-                                        # For BLOCK_M=128 and expert_block=e
-                                        # (assuming single block per expert at
-                                        # smoke shape), SF_BLOCK_M = stride per
-                                        # expert in physical rows.  We infer
-                                        # SF_BLOCK_M from pool_sf shape:
-                                        # rows_per_expert = pool_sf.shape[0] /
-                                        # num_experts_per_rank.
-                                        _n_exp = num_experts_per_rank
-                                        _SF_BLOCK_M = _sf_pool.shape[0] // _n_exp
-                                        print(
-                                            f"[mega_moe-jit] R49_SF_LAYOUT n_experts_per_rank={_n_exp} "
-                                            f"SF_BLOCK_M_inferred={_SF_BLOCK_M}",
-                                            flush=True,
-                                        )
-                                        for _k in range(min(_n_e, 4)):
-                                            _j = int(_best_match[_k])
-                                            _recv_row_in_buf = _prefix3 + _j
-                                            # Decode kernel SF physical row.
-                                            _idx = _k  # token_idx_in_expert
-                                            _phys_in_block = (
-                                                (_idx & ~127) + (_idx & 31) * 4 + ((_idx >> 5) & 3)
-                                            )
-                                            _phys_row = _e * _SF_BLOCK_M + _phys_in_block
-                                            _e * _BLOCK_M + _k
-                                            try:
-                                                # R50: SF storage is col-major
-                                                # over (K-block-uint32, token).
-                                                # uint32 #0 = bytes [0:4] of
-                                                # pytorch[phys_row, 0]; uint32
-                                                # #1 lives at uint32 flat-index
-                                                # N_pad + phys_row, which in
-                                                # pytorch [N_pad, 2] int32 view
-                                                # = row N_pad/2 + phys_row/2.
-                                                _N_pad = _sf_pool.shape[0]
-                                                _uint32_idx_blk0 = _phys_row
-                                                _uint32_idx_blk1 = _N_pad + _phys_row
-
-                                                # In [N_pad, 8] uint8 view,
-                                                # uint32 flat index i lives at
-                                                # pytorch[i // 2, (i % 2) * 4 :
-                                                # (i % 2) * 4 + 4].
-                                                def _read_uint32_as_bytes(i):
-                                                    return _sf_pool[
-                                                        i // 2, (i % 2) * 4 : (i % 2) * 4 + 4
-                                                    ].tolist()
-
-                                                _blk0 = _read_uint32_as_bytes(_uint32_idx_blk0)
-                                                _blk1 = _read_uint32_as_bytes(_uint32_idx_blk1)
-                                                _rrf = _sf_recv[_recv_row_in_buf, :8].tolist()
-                                                print(
-                                                    f"[mega_moe-jit] R50_SF_K e={_e} k={_k} j={_j} "
-                                                    f"phys={_phys_row} N_pad={_N_pad} "
-                                                    f"pool_K0_3={_blk0} pool_K4_7={_blk1} "
-                                                    f"recv_sf[:8]={_rrf}",
-                                                    flush=True,
-                                                )
-                                            except Exception as _sfe:
-                                                print(
-                                                    f"[mega_moe-jit] R50_SF_K slice exception k={_k}: {_sfe}",
-                                                    flush=True,
-                                                )
-                                    except Exception as _r48e:
-                                        print(f"[mega_moe-jit] R48_SF_CMP exception: {_r48e}", flush=True)
-                        _prefix3 = _end
-                except Exception as _exc2:
-                    print(f"[mega_moe-jit] L1_POOL_VS_RECV exception: {_exc2}", flush=True)
-            _prefix = 0
-            for _e, _end in enumerate(_psum):
-                _n_e = _end - _prefix
-                if _n_e > 0:
-                    _gate = l1_y[_prefix:_end, :intermediate_hidden].float().clamp(-_clamp, _clamp)
-                    _up = l1_y[_prefix:_end, intermediate_hidden:].float().clamp(-_clamp, _clamp)
-                    _act = torch.nn.functional.silu(_gate) * _up
-                    _act_fp8 = _act.to(torch.float8_e4m3fn).float()
-                    _baseline_act_fp8_candidates.append((_e, _act_fp8))
-                _prefix = _end
-        except Exception as _exc:
-            print(f"[mega_moe-jit] L2_POOL_VS_REF cand-populate exception: {_exc}", flush=True)
-        # noinspection PyCallingNonCallable
-        # NOTE: the JIT kernel does NOT apply topk-weight scaling — per
-        # CLAUDE.md "the kernel mirrors DG and applies the weight
-        # outside".  Pass ones so the baseline mirrors that convention;
-        # the combine then sums raw L2 outputs across topk experts
-        # exactly as the kernel does.  Bisect: real recv_topk_weights
-        # makes baseline amax 2× kernel amax and drops cos_sim 0.75→0.65.
+        # NOTE: the JIT kernel does NOT apply topk-weight scaling -- it mirrors
+        # DG and applies the weight outside.  Pass ones so the baseline matches;
+        # the combine then sums raw L2 outputs across topk experts as the kernel does.
         _ones_weights = torch.ones_like(recv_topk_weights)
-        _fp4_act = _mega_moe_fp4_act_enabled()
         l1_y = swiglu_apply_weight_to_fp8(
             x=l1_y,
             topk_weights=_ones_weights,
@@ -2968,18 +1058,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             output_bf16=False,
             clamp_value=args.activation_clamp,
             fast_math=bool(args.fast_math),
-            cast_to_fp4=_fp4_act,
         )
-        # DEBUG: force L2 pool SF=UE8M0(1.0) to mirror the kernel's
-        # current pool SF placeholder.  UE8M0 byte for 1.0 = 127 (bias);
-        # packed int32 = 0x7F7F7F7F.  If cos jumps significantly, the
-        # kernel L2 epilogue not computing per-token SF is the cause.
-        import os as _os_dbg3
-
-        if _os_dbg3.environ.get("MEGA_MOE_POOL_SF_ONE", "0") == "1":
-            _act_fp8, _act_sf = l1_y
-            _act_sf = torch.full_like(_act_sf, 0x7F7F7F7F)
-            l1_y = (_act_fp8, _act_sf)
         l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device="cuda")
         m_grouped_fp8_fp4_gemm_nt_contiguous(
             l1_y,
@@ -2988,12 +1067,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True,
             recipe=(1, 1, 32),
-            a_is_fp4=_fp4_act,
         )
-        # Reduce per-(token, expert) pair l2_y rows back to per-token
-        # rows by index-summing pairs of the same source token.  The
-        # primus_turbo combine API expects per-unique-token input
-        # (one row per row of the original recv_x), not per-pair.
+        # Reduce per-(token, expert) pair l2_y rows back to per-token rows by
+        # index-summing pairs of the same source token.  primus_turbo's combine
+        # API expects per-unique-token input (one row per recv_x row), not per-pair.
         l2_y_per_token = torch.zeros(
             (handle.num_unique_recv_tokens, hidden),
             dtype=torch.bfloat16,
@@ -3060,19 +1137,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         | (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)
     ] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
-
-    # NOBENCH: raw kernel launches (no torch.profiler) so external profilers
-    # (rocprofv3) can collect counters cleanly without nested-profiling hang.
-    if os.environ.get("MEGA_MOE_NOBENCH", "0") == "1":
-        for _ in range(int(os.environ.get("MEGA_MOE_NOBENCH_ITERS", "20"))):
-            run_fused()
-        torch.cuda.synchronize()
-        dist.barrier()
-        buffer.destroy()
-        if ep_buffer is not None:
-            ep_buffer.destroy()
-        dist.destroy_process_group()
-        return
 
     # Benchmark
     t_fused = bench_kineto(
@@ -3169,87 +1233,68 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
             return
 
-        # Per-execution pipeline stages.  Each recorded value is the wall-clock
-        # span of ONE execution of that stage: one L1/L2 MMA or epilogue per
-        # scheduled block per loader warp; one dispatch / combine span per warp.
-        # 'total' (the whole-kernel span) is reported separately below.
+        # Stage order MUST match prof::Stage in gfx950_fp8_fp4_mega_moe.cuh.
+        # Each stage's avg = sum(ticks)/sum(count) over all block-executions
+        # across all launches, converted to us.  Stages run concurrently across
+        # blocks/warps, so they overlap and do NOT sum to 'total'.
         stage_names = [
-            "dispatch",
-            "L1_mma",
-            "L1_epilogue",
-            "L2_mma",
-            "L2_epilogue",
-            "combine",
+            "dispatch_pre",  # routing: count + topk route + recv_count + barriers
+            "dispatch_pull",  # cross-rank token pull (warp_copy + SF)
+            "L1_mma",  # Linear1 grouped-GEMM k-loop (gate||up)
+            "swiglu",  # Linear1 epilogue: SwiGLU + FP8 requant
+            "L2_mma",  # Linear2 grouped-GEMM k-loop
+            "L2_epilogue",  # Linear2 epilogue: BF16 write to combine buffer
+            "combine",  # top-k reduce into y
+            "total",  # whole-kernel span
         ]
         n_iters = max(1, int(args.num_profile_iters))
 
-        # Warmup so the steady-state timing isn't polluted by first-launch
-        # effects (caches, page-ins, autotune, etc.).
+        # Warmup so steady-state timing isn't polluted by first-launch effects.
         for _ in range(5):
             run_fused()
         torch.cuda.synchronize()
 
-        # ticks -> microseconds: rate is in kHz, so 1 tick = 1e3/khz us.
-        tick_to_us = 1.0e3 / float(khz)
+        tick_to_us = 1.0e3 / float(khz)  # rate is kHz -> 1 tick = 1e3/khz us
 
-        # Pool EVERY individual stage-execution span across all launches, so the
-        # reported mean / p50 / p99 are over single executions -- not over the
-        # per-launch grid-wide envelope (which is what the old min/max profiler
-        # measured and why its numbers were ~whole-kernel-long).  'total'
-        # collects one whole-kernel span per launch.
-        per_exec = [[] for _ in stage_names]
-        truncated = [False] * len(stage_names)
-        total_us = []
+        acc_sum = [0] * len(stage_names)
+        cnt_sum = [0] * len(stage_names)
         for _ in range(n_iters):
             shaped.prof_reset()
             run_fused()
             torch.cuda.synchronize()
-            counts = shaped.prof_read_counts()
-            for s in range(len(stage_names)):
-                spans = shaped.prof_read_samples(s)  # per-execution spans (ticks)
-                per_exec[s].extend(float(v) * tick_to_us for v in spans)
-                if s < len(counts) and int(counts[s]) > len(spans):
-                    truncated[s] = True  # executions exceeded the sample cap
-            total_us.append(float(shaped.prof_read_total()) * tick_to_us)
+            acc, cnt = shaped.prof_read()
+            for s in range(min(len(stage_names), len(acc))):
+                acc_sum[s] += int(acc[s])
+                cnt_sum[s] += int(cnt[s])
 
+        # n_blocks = block-runs of 'total' (grid blocks x launches).  agg/blk =
+        # stage's aggregate per-block contribution (sums its repeated runs);
+        # %total = acc[s]/acc[total].  Stages with n_exec >> n_blocks (L1/L2/
+        # swiglu) repeat many times per block, so per-run avg is small but the
+        # aggregate is what matters.  Stage %s do not reach 100%; the remainder
+        # is grid_sync / nvlink_barrier / arrival spins.
+        n_blocks = cnt_sum[-1]
+        total_acc = acc_sum[-1]
+        (total_acc / n_blocks * tick_to_us) if n_blocks else 0.0
         dist_print(
-            f"Per-stage profile (MEGAMOE_PROFILE, wall_clock={khz / 1e6:.3f} GHz, "
-            f"{n_iters} launches):",
+            f"Per-stage profile (MEGAMOE_PROFILE, wall_clock={khz / 1e6:.3f} GHz, " f"{n_iters} launches):",
             once_in_node=True,
         )
-        # Each per-stage row is the duration of a SINGLE execution of that stage,
-        # pooled over all executions across all launches.  Stage executions run
-        # CONCURRENTLY across warp-roles, so they OVERLAP and do NOT sum to
-        # 'total' (the authoritative whole-kernel span, one per launch).
         dist_print(
-            " > (per-stage rows are single-execution durations pooled across "
-            "launches; they overlap and do not sum to total)",
+            f" > {'stage':<14} {'n_run':>10} {'avg/run(us)':>13} {'agg/blk(us)':>12} {'%total':>8}",
             once_in_node=True,
         )
-        dist_print(
-            f" > {'stage':<12} {'n':>9} {'mean(us)':>10} {'p50(us)':>10} "
-            f"{'p99(us)':>10} {'max(us)':>10}",
-            once_in_node=True,
-        )
-
-        def _emit(name, arr_us, n_label):
-            # Keep the print count uniform across ranks even for an empty stage
-            # so the dist_print barriers stay in lockstep.
-            arr = np.asarray(arr_us, dtype=np.float64)
-            if arr.size == 0:
-                dist_print(f" > {name:<12} {'(no samples)':>52}", once_in_node=True)
-                return
+        for s, name in enumerate(stage_names):
+            if cnt_sum[s] == 0:
+                dist_print(f" > {name:<14} {'(no samples)':>30}", once_in_node=True)
+                continue
+            avg_run = acc_sum[s] / cnt_sum[s] * tick_to_us
+            agg_blk = (acc_sum[s] / n_blocks * tick_to_us) if n_blocks else 0.0
+            pct = (100.0 * acc_sum[s] / total_acc) if total_acc > 0 else 0.0
             dist_print(
-                f" > {name:<12} {n_label:>9} {float(arr.mean()):10.3f} "
-                f"{float(np.percentile(arr, 50)):10.3f} "
-                f"{float(np.percentile(arr, 99)):10.3f} {float(arr.max()):10.3f}",
+                f" > {name:<14} {cnt_sum[s]:>10} {avg_run:>13.3f} {agg_blk:>12.1f} {pct:>7.1f}%",
                 once_in_node=True,
             )
-
-        for i, name in enumerate(stage_names):
-            label = f"{len(per_exec[i])}{'+' if truncated[i] else ''}"
-            _emit(name, per_exec[i], label)
-        _emit("total", total_us, str(len(total_us)))
         dist_print(once_in_node=True)
 
     run_stage_profile()

@@ -40,6 +40,21 @@
 #define MEGA_MOE_NOUTER 1
 #endif
 
+// XCD-PIN (default 0): pin each wave's expert to ONE XCD so that expert's L1
+// (writes the FP8 intermediate to the L2 pool) and L2 (reads it back) run on the
+// SAME XCD -> the 384KB intermediate stays in that XCD's 4MB L2 instead of
+// round-tripping HBM cross-XCD (~5.6% of runtime).  Requires kNumExpertsPerWave
+// == kNumXCD (=8 on gfx950) and kNumSMs % kNumXCD == 0.  HW places workgroup b on
+// XCD (b % kNumXCD) (round-robin); each XCD's kNumSMs/kNumXCD CUs split the
+// expert's (m,n) blocks.  Trades the round-robin's perfect load balance for L2
+// locality -- experts are partitioned e%kNumXCD across XCDs.
+#ifndef MEGA_MOE_XCD_PIN
+#define MEGA_MOE_XCD_PIN 1
+#endif
+#ifndef MEGA_MOE_NUM_XCD
+#define MEGA_MOE_NUM_XCD 8u
+#endif
+
 namespace primus_turbo {
 namespace mega_moe {
 namespace sched {
@@ -106,9 +121,20 @@ struct MegaMoEScheduler {
     // ``(i * 32 + lane_idx)``'s count.
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
+    // XCD-pin: active only when it cleanly maps (1 expert / XCD / wave); otherwise
+    // falls back to the round-robin scheduler so other shapes still build/run.
+    static constexpr uint32_t kNumXCD    = MEGA_MOE_NUM_XCD;
+    static constexpr uint32_t kCUsPerXCD = kNumSMs / (kNumXCD ? kNumXCD : 1u);
+    static constexpr bool     kXcdPin =
+        (MEGA_MOE_XCD_PIN != 0) && (kNumExpertsPerWave == kNumXCD) && (kNumSMs % kNumXCD == 0u);
+    // HW round-robin places workgroup b on XCD (b % kNumXCD); the (b / kNumXCD)-th
+    // CU within that XCD.
+    __device__ uint32_t my_xcd() const { return blockIdx.x % kNumXCD; }
+    __device__ uint32_t my_cu() const { return blockIdx.x / kNumXCD; }
+
     __device__ explicit MegaMoEScheduler(const layout::Workspace &workspace)
         : workspace(workspace) {
-        block_idx = blockIdx.x;
+        block_idx = kXcdPin ? my_cu() : blockIdx.x;
     }
 
     __device__ uint32_t get_wave_expert_end_idx() const {
@@ -224,44 +250,77 @@ struct MegaMoEScheduler {
     };
 
     __device__ NextBlock get_next_block() {
-        while (true) {
-            if (current_local_expert_idx >= kNumExpertsPerRank)
-                break;
-
-            if (next_phase == BlockPhase::Linear1) {
-                if (fetch_next_l1_block()) {
-#if MEGA_MOE_NOUTER
-                    n_block_idx = block_idx / get_current_num_m_blocks();
-#else
-                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
-#endif
-                    block_idx += kNumSMs;
-                    return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx,
-                            n_block_idx};
+        if constexpr (kXcdPin) {
+            // XCD-pinned: this XCD owns experts {e : e % kNumExpertsPerWave == my_xcd};
+            // its kCUsPerXCD CUs split each owned expert's (m,n) blocks.  L1 then L2 of
+            // the SAME expert run on the SAME XCD -> intermediate stays in its L2.
+            while (current_local_expert_idx < kNumExpertsPerRank) {
+                const uint32_t num_m = get_current_num_m_blocks();
+                if (next_phase == BlockPhase::Linear1) {
+                    if (block_idx < num_m * kNumL1BlockNs) {
+                        m_block_idx = block_idx % num_m;
+                        n_block_idx = block_idx / num_m;
+                        block_idx += kCUsPerXCD;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx,
+                                n_block_idx};
+                    }
+                    next_phase = BlockPhase::Linear2;
+                    block_idx  = my_cu(); // restart for L2 of the same expert
+                } else {
+                    if (block_idx < num_m * kNumL2BlockNs) {
+                        m_block_idx = block_idx % num_m;
+                        n_block_idx = block_idx / num_m;
+                        block_idx += kCUsPerXCD;
+                        return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx,
+                                n_block_idx};
+                    }
+                    next_phase = BlockPhase::Linear1;
+                    block_idx  = my_cu();
+                    set_expert_idx(current_local_expert_idx +
+                                   kNumExpertsPerWave); // next wave's owned expert
                 }
-                // L1 for the current wave is complete, transition to L2.
-                next_phase = BlockPhase::Linear2;
-                const uint32_t wave_start =
-                    (current_local_expert_idx - 1) / kNumExpertsPerWave * kNumExpertsPerWave;
-                set_expert_idx(wave_start);
-            } else {
-                if (fetch_next_l2_block()) {
-#if MEGA_MOE_NOUTER
-                    n_block_idx = block_idx / get_current_num_m_blocks();
-#else
-                    n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
-#endif
-                    block_idx += kNumSMs;
-                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx,
-                            n_block_idx};
-                }
-                // Move to L1 of the next wave.
-                next_phase = BlockPhase::Linear1;
             }
-        }
+            return {BlockPhase::None, 0u, 0u, 0u};
+        } else {
+            while (true) {
+                if (current_local_expert_idx >= kNumExpertsPerRank)
+                    break;
 
-        // All waves and experts are fully processed.
-        return {BlockPhase::None, 0u, 0u, 0u};
+                if (next_phase == BlockPhase::Linear1) {
+                    if (fetch_next_l1_block()) {
+#if MEGA_MOE_NOUTER
+                        n_block_idx = block_idx / get_current_num_m_blocks();
+#else
+                        n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+#endif
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx,
+                                n_block_idx};
+                    }
+                    // L1 for the current wave is complete, transition to L2.
+                    next_phase = BlockPhase::Linear2;
+                    const uint32_t wave_start =
+                        (current_local_expert_idx - 1) / kNumExpertsPerWave * kNumExpertsPerWave;
+                    set_expert_idx(wave_start);
+                } else {
+                    if (fetch_next_l2_block()) {
+#if MEGA_MOE_NOUTER
+                        n_block_idx = block_idx / get_current_num_m_blocks();
+#else
+                        n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+#endif
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx,
+                                n_block_idx};
+                    }
+                    // Move to L1 of the next wave.
+                    next_phase = BlockPhase::Linear1;
+                }
+            }
+
+            // All waves and experts are fully processed.
+            return {BlockPhase::None, 0u, 0u, 0u};
+        }
     }
 
     // Wait for all expert counters to be finalized.  Direct AMD wave64
@@ -307,7 +366,7 @@ struct MegaMoEScheduler {
     template <typename Func> __device__ void for_each_block(Func &&func) {
         fetch_expert_recv_count();
 
-        set_expert_idx(0);
+        set_expert_idx(kXcdPin ? my_xcd() : 0u); // XCD's first owned expert, or 0
 
         while (true) {
             const NextBlock nb = get_next_block();

@@ -48,6 +48,12 @@ extern "C" int mega_moe_jit_run_mega_moe(const int64_t *sym_buffer_bases, int nu
                                          int64_t recv_stats_ptr, float activation_clamp,
                                          int fast_math);
 
+extern "C" int  mega_moe_jit_prof_enabled();
+extern "C" int  mega_moe_jit_prof_num_stages();
+extern "C" void mega_moe_jit_prof_reset();
+extern "C" void mega_moe_jit_prof_read(unsigned long long *acc_out, unsigned long long *cnt_out);
+extern "C" int  mega_moe_jit_prof_wallclock_khz();
+
 namespace {
 
 // (workspace_bytes, num_max_pool_tokens, num_max_pool_blocks)
@@ -134,9 +140,36 @@ int64_t run_mega_moe(std::vector<int64_t> sym_buffer_bases, int64_t rank_idx, in
         static_cast<float>(activation_clamp), fast_math ? 1 : 0));
 }
 
+// ── In-kernel per-stage profiler wrappers (-DMEGA_MOE_PROFILE=1) ──
+bool prof_enabled() {
+    return mega_moe_jit_prof_enabled() != 0;
+}
+int prof_wallclock_khz() {
+    return mega_moe_jit_prof_wallclock_khz();
+}
+void prof_reset() {
+    mega_moe_jit_prof_reset();
+}
+
+// Returns (acc[kNumStages], cnt[kNumStages]) of s_memrealtime ticks / counts.
+std::pair<std::vector<int64_t>, std::vector<int64_t>> prof_read() {
+    const int                       n = mega_moe_jit_prof_num_stages();
+    std::vector<unsigned long long> acc(n), cnt(n);
+    if (n > 0)
+        mega_moe_jit_prof_read(acc.data(), cnt.data());
+    std::vector<int64_t> acc_i(acc.begin(), acc.end()), cnt_i(cnt.begin(), cnt.end());
+    return {acc_i, cnt_i};
+}
+
 } // anonymous namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("prof_enabled", &prof_enabled, "True if built with -DMEGA_MOE_PROFILE=1");
+    m.def("prof_wallclock_khz", &prof_wallclock_khz,
+          "s_memrealtime rate in kHz (0 if unavailable)");
+    m.def("prof_reset", &prof_reset, "Zero the per-stage tick/count accumulators");
+    m.def("prof_read", &prof_read,
+          "Returns (acc_ticks[NSTAGES], counts[NSTAGES]) for the per-stage profiler");
     m.def("workspace_probe", &workspace_probe,
           "Returns (workspace_bytes, num_max_pool_tokens, num_max_pool_blocks)",
           py::arg("num_ranks"), py::arg("num_experts"), py::arg("num_max_tokens_per_rank"),

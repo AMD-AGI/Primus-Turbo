@@ -128,7 +128,7 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
     const int64_t fp8_token_bytes = hidden;              // FP8
     const int64_t fp8_inter_bytes = intermediate_hidden; // FP8
 #endif
-    const int64_t fp8_sf_bytes = hidden / mm::kScaleGroupK;
+    const int64_t fp8_sf_bytes       = hidden / mm::kScaleGroupK;
     const int64_t fp8_inter_sf_bytes = intermediate_hidden / mm::kScaleGroupK;
     const int64_t topk_idx_bytes     = static_cast<int64_t>(num_topk) * sizeof(int64_t);
     const int64_t topk_weights_bytes = static_cast<int64_t>(num_topk) * sizeof(float);
@@ -235,19 +235,10 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 #define MEGA_MOE_JIT_KNUMDISPATCHTHREADS 0u
 #endif
 #ifndef MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS
-// 8 MFMA warps (512 thr, 1 block/CU = 2 waves/SIMD) — latency-hiding experiment:
-// PC sampling showed the 4-warp/1-wave-per-SIMD build is global-load-latency
-// bound (51% of samples park on s_waitcnt vmcnt(0)); a 2nd wave/SIMD covers the
-// vmcnt stall.  8 warps keeps the same per-stage LDS / 4 stages and HALVES the
-// accumulator footprint (kSubTilesPerWave 16->8, ~64 acc-VGPR).  Was 256u (4
-// warps, 245 TF) — revert if this regresses.
-#if MEGA_MOE_AGPR_ACC
-// Pinned-AGPR redesign runs 4 warps (turbo-style single-wave software pipeline:
-// acc resident in AGPR a[0:127], A/B/scale in pinned VGPRs, k-loop hand-scheduled).
+// 4 MFMA warps (256 thr, 1 block/CU): the pinned-AGPR turbo software pipeline
+// (acc resident in AGPR a[0:127], A/B/scale in pinned VGPRs, k-loop
+// hand-scheduled with interleaved ds_read / buffer_load_lds prefetch).
 #define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 256u
-#else
-#define MEGA_MOE_JIT_KNUMNONEPILOGUETHREADS 512u
-#endif
 #endif
 #ifndef MEGA_MOE_JIT_KNUMEPILOGUETHREADS
 // epilogue role removed (combine folded into the 4 MFMA warps post-compute).
@@ -481,3 +472,54 @@ extern "C" int mega_moe_jit_run_stub() {
         return static_cast<int>(sync_err);
     return 0;
 }
+
+// ---------------------------------------------------------------------
+//  Optional in-kernel per-stage profiler (-DMEGA_MOE_PROFILE=1).  Reads
+//  back the device accumulators populated by the kernel (thread 0 of every
+//  block timestamps each stage with s_memrealtime).  acc[s]/cnt[s] -> avg
+//  ticks per stage execution; tick->us via the wall-clock rate (kHz).
+// ---------------------------------------------------------------------
+#if defined(MEGA_MOE_PROFILE) && (MEGA_MOE_PROFILE + 0)
+namespace pf = primus_turbo::mega_moe::prof;
+
+extern "C" int mega_moe_jit_prof_enabled() {
+    return 1;
+}
+
+extern "C" int mega_moe_jit_prof_num_stages() {
+    return pf::kNumStages;
+}
+
+extern "C" void mega_moe_jit_prof_reset() {
+    unsigned long long zero[pf::kNumStages] = {};
+    (void) hipMemcpyToSymbol(HIP_SYMBOL(pf::g_acc), zero, sizeof(zero));
+    (void) hipMemcpyToSymbol(HIP_SYMBOL(pf::g_cnt), zero, sizeof(zero));
+}
+
+extern "C" void mega_moe_jit_prof_read(unsigned long long *acc_out, unsigned long long *cnt_out) {
+    (void) hipDeviceSynchronize();
+    (void) hipMemcpyFromSymbol(acc_out, HIP_SYMBOL(pf::g_acc),
+                               sizeof(unsigned long long) * pf::kNumStages);
+    (void) hipMemcpyFromSymbol(cnt_out, HIP_SYMBOL(pf::g_cnt),
+                               sizeof(unsigned long long) * pf::kNumStages);
+}
+
+extern "C" int mega_moe_jit_prof_wallclock_khz() {
+    int khz = 0;
+    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, 0) != hipSuccess)
+        return 0;
+    return khz;
+}
+#else
+extern "C" int mega_moe_jit_prof_enabled() {
+    return 0;
+}
+extern "C" int mega_moe_jit_prof_num_stages() {
+    return 0;
+}
+extern "C" void mega_moe_jit_prof_reset() {}
+extern "C" void mega_moe_jit_prof_read(unsigned long long *, unsigned long long *) {}
+extern "C" int  mega_moe_jit_prof_wallclock_khz() {
+    return 0;
+}
+#endif

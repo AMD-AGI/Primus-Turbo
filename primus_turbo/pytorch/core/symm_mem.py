@@ -108,7 +108,11 @@ class SymmetricMemory:
     """
 
     def __init__(
-        self, group: dist.ProcessGroup, alloc_size: int, signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE
+        self,
+        group: dist.ProcessGroup,
+        alloc_size: int,
+        signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE,
+        uncached=False,
     ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
