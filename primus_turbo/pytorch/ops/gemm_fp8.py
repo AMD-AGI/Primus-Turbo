@@ -327,13 +327,42 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # twice) and does NOT depend on tensor identity across iterations.
         fuse_a_dual = a_dtype == a_dtype_bwd and a.is_contiguous()
 
+        # When the FlyDSL backend is active, emit a's column-quant result already
+        # in the (16, 16) MFMA preshuffled+transposed operand layout the wgrad
+        # GEMM consumes. This folds the launcher's standalone preshuffle copy (a
+        # full a_col fp8 HBM round-trip + a dedicated kernel launch per backward
+        # step) into the dual-quant store. Gated on FlyDSL actually handling this
+        # shape's wgrad (so a non-FlyDSL fallback never receives the scrambled
+        # operand) and on the preshuffle layout / scale-shape-signal constraints.
+        a_col_preshuffled = False
+        if fuse_a_dual and (
+            GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            try:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+
+                M_w, K_w = a.shape
+                N_w = b.shape[0]
+                num_m_blocks = (M_w + config.block_size - 1) // config.block_size
+                if (
+                    K_w % 16 == 0
+                    and M_w % 32 == 0
+                    and K_w != num_m_blocks
+                    and flydsl_blockwise_wgrad_supported(K_w, N_w, M_w)
+                ):
+                    a_col_preshuffled = True
+            except Exception:
+                a_col_preshuffled = False
+
         if fuse_a_dual:
             (
                 a_fp8_row,
                 a_scale_inv_row,
                 a_fp8_col,
                 a_scale_inv_col,
-            ) = quant_fp8_blockwise_dual_impl(a, a_dtype, config.block_size)
+            ) = quant_fp8_blockwise_dual_impl(
+                a, a_dtype, config.block_size, col_preshuffled=a_col_preshuffled
+            )
         else:
             a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
                 a, a_dtype, axis=1, block_size=config.block_size

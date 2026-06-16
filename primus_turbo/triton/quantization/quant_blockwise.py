@@ -74,6 +74,7 @@ def quant_fp8_blockwise_dual_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     COL_TRANSPOSED: tl.constexpr = False,
+    COL_PRESHUFFLED: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -113,7 +114,34 @@ def quant_fp8_blockwise_dual_kernel(
     # launcher collapses to a zero-cost view. The default [M, N] col path keeps
     # the output transpose. The col-scale layout ([M//128, N], stored below) is
     # unchanged.
-    if COL_TRANSPOSED:
+    if COL_PRESHUFFLED:
+        # Write the column-quantized tile DIRECTLY in the FlyDSL (16, 16) MFMA
+        # preshuffled+transposed operand layout, byte-identical to
+        # shuffle_b(x_col[M, N].transpose(0, 1).contiguous()) consumed by the
+        # wgrad GEMM. This folds the launcher's standalone preshuffle copy (a
+        # full M*N fp8 HBM round-trip + a dedicated kernel launch per backward
+        # step) into this store. The index math mirrors
+        # preshuffle_fp8._preshuffle_b_transposed_kernel exactly with (p=n, q=m)
+        # (here the operand is the transpose, so P=N, Q=M; BN=16, BK=32,
+        # K_inner=16 for the (16, 16) fp8 layout). Output is contiguous in runs
+        # of K_inner along m (last dim), so the store coalesces. The col results
+        # are already in [n, m] orientation (x_fp8_col_tile_t), so they store
+        # straight out at the permuted offset.
+        BN_PS: tl.constexpr = 16
+        BK_PS: tl.constexpr = 32
+        KIN_PS: tl.constexpr = 16
+        i0 = offs_n // BN_PS
+        i1 = offs_n % BN_PS
+        i2 = offs_m // BK_PS
+        i3 = (offs_m % BK_PS) // KIN_PS
+        i4 = offs_m % KIN_PS
+        ps_off = i4[None, :] + KIN_PS * (
+            i1[:, None]
+            + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (M // BK_PS) * i0[:, None]))
+        )
+        col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+        tl.store(x_fp8_col_ptr + ps_off, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
+    elif COL_TRANSPOSED:
         x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
         col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
         tl.store(x_fp8_col_ptrs, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
@@ -131,8 +159,17 @@ def quant_fp8_blockwise_dual_kernel(
         mask=row_scale_mask,
     )
 
-    col_scale_offs = pid_m * N + offs_n
-    col_scale_mask = offs_n < N
+    if COL_PRESHUFFLED:
+        # Matching transposed scale layout [N, M // BLOCK_SIZE] (byte-identical to
+        # the wgrad launcher's a_col_scale_inv.transpose(0, 1).contiguous()), so
+        # the launcher's scale transpose is also dropped. Element (n, pid_m) at
+        # flat n * num_m_blocks + pid_m.
+        num_m_blocks = tl.cdiv(M, BLOCK_SIZE)
+        col_scale_offs = offs_n * num_m_blocks + pid_m
+        col_scale_mask = offs_n < N
+    else:
+        col_scale_offs = pid_m * N + offs_n
+        col_scale_mask = offs_n < N
     # x_scales_col_tile_t is [n, 1]; flattening it yields the per-column scales in
     # the same n-order as flattening the previously-transposed [1, n] tile, so the
     # output scale layout is unchanged while the transpose is dropped.

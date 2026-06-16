@@ -583,12 +583,31 @@ def gemm_fp8_blockwise_flydsl_wgrad(
     flyc = _flyc()
 
     arg_a = grad_out_col_fp8.transpose(0, 1).contiguous()  # [N, M]
-    # Fuse a^T (transpose+contiguous) and the pre-shuffle into ONE copy:
-    # _shuffle_b_transposed(a_col_fp8) == shuffle_b(a_col_fp8.transpose(0,1).contiguous()).
-    arg_b = _shuffle_b_transposed(a_col_fp8)  # pre-shuffle a^T [K, M]
+    # Detect the dual-quant-produced preshuffled operand: when a's column-quant
+    # was emitted directly in the (16, 16) MFMA preshuffled+transposed layout, its
+    # col-scale arrives transposed to [K, M // 128] (vs the normal [M // 128, K]).
+    # That shape carries the signal (GEMM dispatch ignores scale shape), so we can
+    # consume the operand with zero extra launches. The [K != M//128] guard keeps
+    # the shape signal unambiguous (matches the producer-side gate).
+    num_m_blocks = (M + _SCALE_BLOCK - 1) // _SCALE_BLOCK
+    a_preshuffled = (
+        a_col_scale_inv.dim() == 2
+        and a_col_scale_inv.shape[0] == K
+        and a_col_scale_inv.shape[1] == num_m_blocks
+        and K != num_m_blocks
+    )
+    if a_preshuffled:
+        # a_col_fp8 is the [M, K]-shaped buffer holding the [K, M] preshuffled
+        # operand bytes; reinterpret it and skip the standalone preshuffle copy.
+        arg_b = a_col_fp8.reshape(K, M)
+        b_scale_flat = a_col_scale_inv.contiguous().view(-1)  # already [K, M // 128]
+    else:
+        # Fuse a^T (transpose+contiguous) and the pre-shuffle into ONE copy:
+        # _shuffle_b_transposed(a_col_fp8) == shuffle_b(a_col_fp8.transpose(0,1).contiguous()).
+        arg_b = _shuffle_b_transposed(a_col_fp8)  # pre-shuffle a^T [K, M]
+        b_scale_flat = a_col_scale_inv.transpose(0, 1).contiguous().view(-1)
     # scale_a already in [scale_con=M//128, rows=N]; scale_b per-output-column [K, M//128].
     a_scale_flat = grad_out_col_scale_inv.contiguous().view(-1)
-    b_scale_flat = a_col_scale_inv.transpose(0, 1).contiguous().view(-1)
 
     out = torch.empty((N, K), dtype=out_dtype, device=a_col_fp8.device)
     stream = torch.cuda.current_stream()
