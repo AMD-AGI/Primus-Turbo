@@ -1036,6 +1036,50 @@ def _grouped_block_mn(local, m_start, m_end, n_blocks, block_m_size, group_m, gr
     return lm_r, bn_r
 
 
+def _wgrad_block_mn(idx, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, interleave):
+    """idx -> (group_idx, block_m, block_n) for the wgrad output grid. interleave=True
+    (masked one-tile/WG): band-cyclic group interleave (one group_m M-band per group ->
+    skew load-balance, group_m B-stripe L2 reuse kept; one-M-row fallback when group_m
+    doesn't tile N_BLOCKS_M). interleave=False (persist strided): group_n band / group_m
+    cluster / row-major."""
+    if const_expr(interleave and group_m > 0 and N_BLOCKS_M > group_m and N_BLOCKS_M % group_m == 0):
+        BAND = const_expr(group_m * N_BLOCKS_N)
+        bg = idx // BAND
+        in_band = idx % BAND
+        return bg % G, (bg // G) * group_m + (in_band % group_m), in_band // group_m
+    if const_expr(interleave):
+        cl = idx // N_BLOCKS_N
+        return cl % G, cl // G, idx % N_BLOCKS_N
+    group_idx = idx // TILES_PER_GROUP
+    local = idx % TILES_PER_GROUP
+    if const_expr(group_n > 0 and group_m > 0 and N_BLOCKS_N > group_n):
+        block_m, block_n = _band_block_mn(local, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n)
+    elif const_expr(group_m > 0 and N_BLOCKS_M > group_m):
+        GM_c = fx.Int32(group_m)
+        npg = group_m * N_BLOCKS_N
+        first_m = (local // npg) * GM_c
+        rem_m = fx.Int32(N_BLOCKS_M) - first_m
+        gsize_m = arith.select(rem_m < GM_c, rem_m, GM_c)
+        in_grp = local % npg
+        block_m = first_m + (in_grp % gsize_m)
+        block_n = in_grp // gsize_m
+    else:
+        block_m = local // N_BLOCKS_N
+        block_n = local % N_BLOCKS_N
+    return group_idx, block_m, block_n
+
+
+def _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t):
+    """Fold m_start*OUT into the i64 SRD base + per-group num_records (cumulative m_end*OUT
+    overflows int32 for large-G MoE); per-group offset/stride stay i32. -> (a_div, b_div)."""
+    a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
+    b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
+    mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
+    gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
+    gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
+    return fx.logical_divide(gA, fx.make_layout(1, 1)), fx.logical_divide(gB, fx.make_layout(1, 1))
+
+
 def _compile_grouped_tn_wgrad_masked(
     *,
     OUT_M: int,
@@ -1120,41 +1164,9 @@ def _compile_grouped_tn_wgrad_masked(
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
 
         pid = xcd_remap_pid(fx.block_idx.x, G * TILES_PER_GROUP, num_xcd)
-        if const_expr(_WG_INTERLEAVE and group_m > 0 and N_BLOCKS_M > group_m and N_BLOCKS_M % group_m == 0):
-            # Band-cyclic: cluster = one group_m M-band, groups alternate at band
-            # granularity -> skew load-balance, group_m B-stripe L2 reuse kept (balanced-neutral).
-            BAND = const_expr(group_m * N_BLOCKS_N)
-            bg = pid // BAND
-            group_idx = bg % G
-            band = bg // G
-            in_band = pid % BAND
-            block_m = band * group_m + (in_band % group_m)
-            block_n = in_band // group_m
-        elif const_expr(_WG_INTERLEAVE):
-            # Fallback (group_m == 0 or doesn't evenly tile N_BLOCKS_M): one-M-row cluster
-            # (N_BLOCKS_N divides TILES_PER_GROUP) -> A-row reuse + group alternation.
-            cl = pid // N_BLOCKS_N
-            group_idx = cl % G
-            block_m = cl // G
-            block_n = pid % N_BLOCKS_N
-        elif const_expr(group_m > 0 and N_BLOCKS_M > group_m):
-            group_idx = pid // TILES_PER_GROUP
-            local = pid % TILES_PER_GROUP
-            GM_c = fx.Int32(group_m)
-            npg = group_m * N_BLOCKS_N
-            grp = local // npg
-            first_m = grp * GM_c
-            rem_m = fx.Int32(N_BLOCKS_M) - first_m
-            gsize_m = arith.select(rem_m < GM_c, rem_m, GM_c)
-            in_grp = local % npg
-            block_m = first_m + (in_grp % gsize_m)
-            block_n = in_grp // gsize_m
-        else:
-            group_idx = pid // TILES_PER_GROUP
-            local = pid % TILES_PER_GROUP
-            block_m = local // N_BLOCKS_N
-            block_n = local % N_BLOCKS_N
-
+        group_idx, block_m, block_n = _wgrad_block_mn(
+            pid, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, 0, _WG_INTERLEAVE
+        )
         m_start = _load_go(go_div, group_idx)
         m_end = _load_go(go_div, group_idx + 1)
 
@@ -1173,15 +1185,7 @@ def _compile_grouped_tn_wgrad_masked(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        # Fold m_start*OUT_{M,N} into the i64 SRD base (A/B > 2^31 / > 4GB across groups);
-        # num_records = M_g*OUT clamps the over-run, per-group contraction stays int32.
-        a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
-        b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
-        mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
-        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
-        gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        a_div, b_div = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
 
         gl_off_a = compute_global_swizzle_nn(lane_id, wave_id, OUT_M, N_LDS_ROUNDS)
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, OUT_N, N_LDS_ROUNDS)
@@ -1831,38 +1835,14 @@ def _compile_grouped_tn_wgrad_persistent(
             # all per-tile addressing/loaders; pure function of the (runtime) tile index
             # so it can be evaluated for both the current tile and the prefetched next one.
             tt = xcd_remap_pid(tidx, TOTAL, num_xcd)
-            group_idx = tt // TILES_PER_GROUP
-            local = tt % TILES_PER_GROUP
-            if const_expr(group_n > 0 and group_m > 0 and N_BLOCKS_N > group_n):
-                block_m, block_n = _band_block_mn(local, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n)
-            elif const_expr(group_m > 0 and N_BLOCKS_M > group_m):
-                GM_c = fx.Int32(group_m)
-                npg = group_m * N_BLOCKS_N
-                grp = local // npg
-                first_m = grp * GM_c
-                rem_m = fx.Int32(N_BLOCKS_M) - first_m
-                gsize_m = arith.select(rem_m < GM_c, rem_m, GM_c)
-                in_grp = local % npg
-                block_m = first_m + (in_grp % gsize_m)
-                block_n = in_grp // gsize_m
-            else:
-                block_m = local // N_BLOCKS_N
-                block_n = local % N_BLOCKS_N
-
+            group_idx, block_m, block_n = _wgrad_block_mn(
+                tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False
+            )
             m_start = _load_go(go_div, group_idx)
             m_end = _load_go(go_div, group_idx + 1)
-            m_g = m_end - m_start
-            k_iters = (m_g + (BLOCK_K - 1)) // BLOCK_K
+            k_iters = (m_end - m_start + (BLOCK_K - 1)) // BLOCK_K
 
-            # Fold m_start*OUT into the i64 SRD base + per-group num_records (cumulative
-            # m_end*OUT overflows int32 for large-G MoE); per-group offset/stride stay i32.
-            a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
-            b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
-            mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
-            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
-            gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
-            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+            a_div, b_div = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
 
