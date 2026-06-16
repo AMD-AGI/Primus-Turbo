@@ -90,7 +90,8 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
 }
 
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens) {
-    at::Tensor group_offs = at::empty({group_lens.numel() + 1}, group_lens.options());
+    at::Tensor group_offs =
+        at::empty({group_lens.numel() + 1}, group_lens.options().device(at::kMeta));
     return group_offs;
 }
 
