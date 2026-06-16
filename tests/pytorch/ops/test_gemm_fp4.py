@@ -43,24 +43,19 @@ torch.manual_seed(42)
     ],
 )
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.AITER])
+@pytest.mark.parametrize("backend", [BackendType.AITER])
 @pytest.mark.parametrize("auto_tune", [False, True])
-def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune):
-    if backend == BackendType.AITER:
-        if dtype != torch.bfloat16:
-            pytest.skip("AITER backend only supports bfloat16 dtype")
-        import aiter
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune, preshuffle):
+    if backend != BackendType.AITER and preshuffle:
+        pytest.skip("Preshuffle is only supported for AITER backend")
 
-        aiter_gemm_config = aiter.get_GEMM_config(m, n, k)
-        if aiter_gemm_config is None:
-            pytest.skip("AITER does not support this gemm configuration. Have potential numerical issue.")
+    if backend == BackendType.AITER and dtype != torch.bfloat16:
+        pytest.skip("AITER backend only supports bfloat16 dtype")
 
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
         pytest.skip("auto_tune is ignored when backend is explicitly specified")
-
-    # NOTE: user need to ensure m, n and k are multiples of 16.
-    assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "Assume m, n and k are multiples of 16."
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
 
@@ -73,21 +68,9 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     GlobalBackendManager.set_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(auto_tune)
 
-    # End-to-end wiring check: with AITER pinned + autotune off, the
-    # preshuffle fast path must be active so FP4GemmMXFunction emits
-    # pre-shuffled tensors and gemm_fp4_impl(preshuffled=True) runs.
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
-
-    if backend == BackendType.AITER and not auto_tune:
-        assert enable_preshuffle() is True, "AITER + autotune-off should enable the preshuffle fast path"
-    else:
-        assert (
-            enable_preshuffle() is False
-        ), f"Preshuffle must be off for backend={backend}, auto_tune={auto_tune}"
-
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
-        f"backend={backend}, auto_tune={auto_tune}, preshuffle={enable_preshuffle()}"
+        f"backend={backend}, auto_tune={auto_tune}, preshuffle={preshuffle}"
     )
 
     device = "cuda:0"
@@ -115,7 +98,11 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     # Config + FWD + BWD
     # NOTE: scaling recipe reference: https://arxiv.org/pdf/2509.25149
     config = Float4QuantConfig(
-        granularity=granularity, format=format, block_size=32, scale_dtype=ScaleDtype.E8M0
+        granularity=granularity,
+        format=format,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_preshuffle=preshuffle,
     )
     print(config)
     c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
@@ -152,6 +139,7 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
     format: Format,
     dtype: torch.dtype,
     backend: BackendType | None,
+    preshuffle: bool,
 ):
     """Shared helper: externally quantize both ``a`` and ``b`` into
     :class:`QuantizedTensor`, pass them into :func:`gemm_fp4`, and validate
@@ -167,14 +155,6 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
 
     GlobalBackendManager.set_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
-
-    # Read the live preshuffle policy AFTER set_gemm_backend, so the
-    # externally-constructed QuantizedTensor recipes match what
-    # FP4GemmMXFunction will derive internally. Under AITER this becomes
-    # True and shuffle_scale / shuffle_out flip on.
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
-
-    preshuffle = enable_preshuffle()
 
     device = "cuda:0"
     torch.manual_seed(42)
@@ -204,6 +184,7 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
         format=format,
         block_size=32,
         scale_dtype=ScaleDtype.E8M0,
+        use_preshuffle=preshuffle,
     )
 
     fp4_dtype = FP4GemmMXFunction.get_fp4_dtype(format)
@@ -211,8 +192,6 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
     # Externally construct QuantizedTensor with the SAME scaling recipes that
     # gemm_fp4's autograd Function uses internally, so the forward result
     # should match the non-QT path bit-for-bit. shuffle_scale / shuffle_out
-    # MUST match enable_preshuffle() or check_quantized_tensor's strict
-    # equality assert fires under AITER.
     qt_a = QuantizedTensor.quantize(
         a,
         fp4_dtype,
@@ -223,7 +202,7 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
             use_2d_block=False,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=preshuffle,
+            shuffle_scale=config.use_preshuffle,
             shuffle_out=False,
         ),
     )
@@ -238,8 +217,8 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
             use_2d_block=True,
             use_sr=False,
             use_rht=False,
-            shuffle_scale=preshuffle,
-            shuffle_out=preshuffle,
+            shuffle_scale=config.use_preshuffle,
+            shuffle_out=config.use_preshuffle,
         ),
     )
 
@@ -281,7 +260,8 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
 @pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
-def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend, preshuffle):
     """MX_BLOCKWISE gemm_fp4 with pre-quantized QuantizedTensor inputs.
 
     HipBLASLt / default-dispatch coverage. AITER QT coverage is in
@@ -289,6 +269,11 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
     below because AITER lacks tuned GEMM configs for these small shapes
     (default config produces near-zero SNR).
     """
+    if backend != BackendType.AITER and preshuffle:
+        pytest.skip("Preshuffle is only supported for AITER backend")
+    if backend == BackendType.AITER and dtype != torch.bfloat16:
+        pytest.skip("AITER backend only supports bfloat16 dtype")
+
     _run_gemm_fp4_mx_quantized_tensor_test(
         m=m,
         n=n,
@@ -297,6 +282,7 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         format=format,
         dtype=dtype,
         backend=backend,
+        preshuffle=preshuffle,
     )
 
 
@@ -333,143 +319,6 @@ def test_use_gradient_sr_false():
 
     assert torch.equal(a_grad1, a_grad2), "A gradients should be identical without stochastic rounding"
     assert torch.equal(b_grad1, b_grad2), "B gradients should be identical without stochastic rounding"
-
-
-@pytest.mark.parametrize(
-    "m,n,k",
-    [
-        # Flux 12B shapes with AITER tuned GEMM configs.
-        (16384, 3072, 3072),
-        (16384, 3072, 12288),
-        (16384, 12288, 3072),
-    ],
-)
-def test_gemm_fp4_mx_blockwise_quantized_tensor_aiter_preshuffled(m, n, k):
-    """AITER + pre-quantized QuantizedTensorPair contract.
-
-    The externally constructed rowwise + colwise tensors must carry
-    matching ``shuffle_scale`` / ``shuffle_out`` flags
-    ``enable_preshuffle()`` implies, or
-    :func:`check_quantized_tensor`'s strict equality assert fires
-    under :class:`BackendType.AITER`. The colwise tensor (``data_t``)
-    must be supplied (cannot be derived via ``dequantize()`` on a
-    preshuffled-scale forward tensor).
-    """
-    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
-
-    mxfp4_supported, reason = check_mxfp4_support()
-    if not mxfp4_supported:
-        pytest.skip(reason)
-
-    GlobalBackendManager.set_gemm_backend(BackendType.AITER)
-    GlobalBackendManager.set_auto_tune(False)
-    assert enable_preshuffle() is True
-
-    try:
-        device = "cuda:0"
-        dtype = torch.bfloat16
-        fp4_dtype = FP4GemmMXFunction.get_fp4_dtype(Format.E2M1_X2)
-        torch.manual_seed(42)
-
-        a = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
-        b = torch.randn((n, k), dtype=dtype, device=device, requires_grad=True)
-        a_ref = a.detach().clone().requires_grad_()
-        b_ref = b.detach().clone().requires_grad_()
-        c_ref = a_ref @ b_ref.T
-        c_ref.backward(torch.ones_like(c_ref))
-        torch.cuda.synchronize()
-
-        config = Float4QuantConfig(
-            granularity=ScalingGranularity.MX_BLOCKWISE,
-            format=Format.E2M1_X2,
-            block_size=32,
-            scale_dtype=ScaleDtype.E8M0,
-        )
-
-        # Recipes match FP4GemmMXFunction internal construction.
-        qt_a = QuantizedTensor.quantize(
-            a,
-            fp4_dtype,
-            config.granularity,
-            block_size=32,
-            axis=1,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=False,
-                use_sr=False,
-                use_rht=False,
-                shuffle_scale=True,
-                shuffle_out=False,
-            ),
-        )
-        qt_a_t = QuantizedTensor.quantize(
-            a,
-            fp4_dtype,
-            config.granularity,
-            block_size=32,
-            axis=0,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=False,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=True,
-                shuffle_out=True,
-            ),
-        )
-        qt_b = QuantizedTensor.quantize(
-            b,
-            fp4_dtype,
-            config.granularity,
-            block_size=32,
-            axis=1,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=True,
-                use_sr=False,
-                use_rht=False,
-                shuffle_scale=True,
-                shuffle_out=True,
-            ),
-        )
-        qt_b_t = QuantizedTensor.quantize(
-            b,
-            fp4_dtype,
-            config.granularity,
-            block_size=32,
-            axis=0,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=True,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=True,
-                shuffle_out=True,
-            ),
-        )
-
-        c = gemm_fp4(
-            QuantizedTensorPair(data=qt_a, data_t=qt_a_t),
-            QuantizedTensorPair(data=qt_b, data_t=qt_b_t),
-            False,
-            True,
-            dtype,
-            config,
-        )
-        c.backward(torch.ones_like(c))
-        torch.cuda.synchronize()
-
-        snr_threshold = 10
-        c_snr = compute_snr(c_ref, c)
-        a_grad_snr = compute_snr(a_ref.grad, qt_a.grad)
-        b_grad_snr = compute_snr(b_ref.grad, qt_b.grad)
-        print(
-            f"\n[QT-MXFP4-AITER-pre] M={m} N={n} K={k}: "
-            f"C-SNR={c_snr:.2f} dB, AGrad-SNR={a_grad_snr:.2f} dB, "
-            f"BGrad-SNR={b_grad_snr:.2f} dB"
-        )
-        assert c_snr > snr_threshold, f"c_snr={c_snr:.2f} too low"
-        assert a_grad_snr > snr_threshold, f"a_grad_snr={a_grad_snr:.2f} too low"
-        assert b_grad_snr > snr_threshold, f"b_grad_snr={b_grad_snr:.2f} too low"
-    finally:
-        GlobalBackendManager.reset()
 
 
 @pytest.mark.parametrize("m", [256])

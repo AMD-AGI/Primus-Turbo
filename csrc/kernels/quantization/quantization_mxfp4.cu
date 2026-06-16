@@ -515,7 +515,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                                         global_row, scale_col, scale_N_pad);
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
@@ -532,7 +532,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                         if (scale_col < scale_N_pad) {
                             int scale_index =
                                 compute_shuffle_scale_index(global_row, scale_col, scale_N_pad);
-                            out_scale[scale_index] = E8M0_EXPONENT_BIAS;
+                            out_scale[scale_index] = static_cast<uint8_t>(0);
                         }
                     }
 
@@ -565,7 +565,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                                         global_col, scale_col, scale_N_pad);
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
@@ -582,7 +582,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                         if (scale_col < scale_N_pad) {
                             int scale_index =
                                 compute_shuffle_scale_index(global_col, scale_col, scale_N_pad);
-                            out_scale[scale_index] = E8M0_EXPONENT_BIAS;
+                            out_scale[scale_index] = static_cast<uint8_t>(0);
                         }
                     }
                 }
@@ -1058,8 +1058,8 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
                               int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
                               ScalingRecipe colwise_recipe, hipStream_t stream) {
-    dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
-    dim3 block(THREADS_PER_BLOCK);
+    dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
+    dim3           block(THREADS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define QUANTIZE_MXFP4_DUAL                                                                        \
@@ -1156,8 +1156,8 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
                          QuantizeMode mode, int M, int N, int M_pad, int N_pad, int scale_stride,
                          int scale_N, int scale_M_pad, int scale_N_pad, ScalingRecipe recipe,
                          hipStream_t stream) {
-    dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
-    dim3 block(THREADS_PER_BLOCK);
+    dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
+    dim3           block(THREADS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define QUANTIZE_MXFP4_KERNEL_ARGS                                                                 \
