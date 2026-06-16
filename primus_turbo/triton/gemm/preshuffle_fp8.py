@@ -111,7 +111,13 @@ def preshuffle_b_transposed_triton(
     src_u8 = src.view(torch.uint8)
     out_u8 = out.view(torch.uint8)
 
-    TP = 64
+    # Bandwidth retune (round-26, K1 kernel-internal): widen the contiguous-p
+    # load tile to a full 128-byte cache line (TP=128) and give the copy an
+    # explicit 8-warp launch so more 16-byte vector loads/stores are in flight
+    # per block to hide HBM latency. TP is a multiple of BN(16) and TQ a
+    # multiple of both BK(32) and K_inner(16), so the i0..i4 permutation math is
+    # untouched and the output stays byte-identical to the torch reference.
+    TP = 128
     TQ = 64
     grid = (triton.cdiv(P, TP), triton.cdiv(Q, TQ))
     _preshuffle_b_transposed_kernel[grid](
@@ -124,6 +130,7 @@ def preshuffle_b_transposed_triton(
         K_inner=K_inner,
         TP=TP,
         TQ=TQ,
+        num_warps=8,
     )
     return out
 
