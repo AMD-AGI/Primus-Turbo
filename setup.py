@@ -430,7 +430,7 @@ if __name__ == "__main__":
     entry_points = {}
     install_requires = [
         "scipy",
-        "triton>=3.7.0",
+        "triton==3.7.0",
         "flydsl>=0.2.0",
     ]
 
