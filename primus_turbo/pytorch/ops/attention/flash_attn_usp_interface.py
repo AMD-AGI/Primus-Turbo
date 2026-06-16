@@ -17,6 +17,8 @@ from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
+    attention_aiter_varlen_backward_impl,
+    attention_aiter_varlen_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -29,7 +31,10 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
     get_p_scale,
 )
 
-from .usp.attention_a2a_helper import get_attention_cp_a2a_helper
+from .usp.attention_a2a_helper import (
+    get_attention_cp_a2a_helper,
+    get_attention_varlen_cp_a2a_helper,
+)
 from .usp.attention_ring import ring_attn_bwd, ring_attn_fwd
 
 
@@ -397,8 +402,8 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             ctx.p_scale = p_scale
             ctx.causal = causal
             ctx.use_fp8 = use_fp8
-            ctx.cu_seqlens_q = torch.tensor(0, device="cuda")
-            ctx.cu_seqlens_k = torch.tensor(0, device="cuda")
+            ctx.cu_seqlens_q = None
+            ctx.cu_seqlens_k = None
             ctx.max_seqlens_q = q_local_heads.shape[1]
             ctx.max_seqlens_k = k_local_heads.shape[1]
             ctx.attn_helper = attn_helper
@@ -492,6 +497,236 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
         )
 
 
+class AttentionVarlenCKFunctionCPA2A(torch.autograd.Function):
+    """Variable-length (THD / cu_seqlens) Ulysses A2A context-parallel attention.
+
+    Packed inputs are [t_local, h, d] (no batch dim); A2A redistributes so each
+    rank attends over the full packed sequence with a head shard, then scatters
+    the output back.
+
+    The caller passes the GLOBAL cu_seqlens for the full t = t_local * n sequence.
+    The shard is contiguous-by-rank and splits_qkv_after_a2a reassembles the n
+    source-rank slices in rank order, so post-A2A tokens are in global order and
+    the global cu_seqlens / max_seqlen apply unchanged (no per-shard offset).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_softmax,
+        is_grad,
+        ulysses_group,
+        ring_group,
+    ):
+        assert bias is None
+        if ring_group is not None and dist.get_world_size(ring_group) > 1:
+            raise NotImplementedError("varlen USP supports Ulysses A2A only; ring is not supported")
+        assert dropout_p == 0.0, "varlen USP does not support dropout"
+        assert q.dim() == 3 and k.dim() == 3, "varlen USP expects packed [t, h, d] (thd) inputs"
+        assert (
+            q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16 and v.dtype is torch.bfloat16
+        ), "varlen USP (aiter) only supports bfloat16 q/k/v"
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
+        # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
+        how_v3_bf16_cvt = 0 if get_device_compute_capability() >= (9, 5) else 1
+
+        n = ulysses_group.size()
+        t_local, h_q, d_qk = q.shape
+        _, h_kv, d_v = v.shape
+        # Ulysses shards the head dim across the CP group, so head counts must divide n.
+        assert h_q % n == 0, f"num query heads {h_q} must be divisible by ulysses degree {n}"
+        assert h_kv % n == 0, f"num kv heads {h_kv} must be divisible by ulysses degree {n}"
+        t = t_local * n
+        attn_helper = get_attention_varlen_cp_a2a_helper(t, h_q, h_kv, d_qk, d_v, n)
+
+        qkv = attn_helper.combine_qkv_before_a2a(q, k, v)
+        qkv_out = torch.empty_like(qkv)
+        torch.distributed.all_to_all_single(qkv_out, qkv, group=ulysses_group, async_op=False)
+        q_local_heads, k_local_heads, v_local_heads = attn_helper.splits_qkv_after_a2a(qkv_out)
+
+        # Post-A2A each rank holds the full packed sequence [t, h//n, d] in GLOBAL
+        # token order, so the GLOBAL cu_seqlens / max_seqlen apply directly.
+        head_size_q_og = q_local_heads.size(-1)
+        head_size_v_og = v_local_heads.size(-1)
+        if head_size_q_og % 8 != 0:
+            q_local_heads = torch.nn.functional.pad(q_local_heads, [0, 8 - head_size_q_og % 8])
+            k_local_heads = torch.nn.functional.pad(k_local_heads, [0, 8 - head_size_q_og % 8])
+        if head_size_v_og % 8 != 0:
+            v_local_heads = torch.nn.functional.pad(v_local_heads, [0, 8 - head_size_v_og % 8])
+
+        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_varlen_forward_impl(
+            q=q_local_heads,
+            k=k_local_heads,
+            v=v_local_heads,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+            return_softmax=return_softmax and dropout_p > 0,
+        )
+
+        if is_grad:
+            ctx.save_for_backward(
+                q_local_heads,
+                k_local_heads,
+                v_local_heads,
+                out_padded,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                rng_state,
+            )
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+            ctx.dropout_p = dropout_p
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.head_size_q_og = head_size_q_og
+            ctx.head_size_v_og = head_size_v_og
+            ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
+            ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
+            ctx.attn_helper = attn_helper
+            ctx.ulysses_group = ulysses_group
+
+        # Strip head-dim padding before the output A2A. Slicing the last dim can
+        # make the tensor non-contiguous, so force contiguous before the view.
+        output_local_heads = out_padded[..., :head_size_v_og].contiguous()
+        output_local_heads = attn_helper.reshape_o_before_a2a(output_local_heads)
+        output_local_tokens = torch.empty_like(output_local_heads)
+        torch.distributed.all_to_all_single(
+            output_local_tokens, output_local_heads, group=ulysses_group, async_op=False
+        )
+        output_local_tokens = attn_helper.reshape_o_after_a2a(output_local_tokens)
+
+        result = [output_local_tokens]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(S_dmask)
+        return result[0] if len(result) == 1 else tuple(result)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        (
+            q_local_heads,
+            k_local_heads,
+            v_local_heads,
+            out_padded,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            rng_state,
+        ) = ctx.saved_tensors
+        assert dout.dtype is torch.bfloat16, f"dout should be bfloat16 but get {dout.dtype}"
+        attn_helper = ctx.attn_helper
+        head_size_q_og = ctx.head_size_q_og
+        head_size_v_og = ctx.head_size_v_og
+
+        # Output-grad A2A: per-rank token shard [t//n, h, d] -> full-seq head shard
+        # [t, h//n, d] in GLOBAL token order (matches the saved q/k/v/out layout).
+        dout = attn_helper.reshape_do_before_a2a(dout)
+        dout_local_heads = torch.empty_like(dout)
+        torch.distributed.all_to_all_single(dout_local_heads, dout, group=ctx.ulysses_group)
+        dout_local_heads = attn_helper.reshape_do_after_a2a(dout_local_heads)
+
+        # Pad head dim to match the (possibly padded) saved q/k/v/out.
+        dout_padded = dout_local_heads
+        if head_size_v_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout_local_heads, [0, 8 - head_size_v_og % 8])
+
+        dq_local_heads = torch.empty_like(q_local_heads)
+        dk_local_heads = torch.empty_like(k_local_heads)
+        dv_local_heads = torch.empty_like(v_local_heads)
+
+        attention_aiter_varlen_backward_impl(
+            dout=dout_padded,
+            q=q_local_heads,
+            k=k_local_heads,
+            v=v_local_heads,
+            out=out_padded,
+            softmax_lse=softmax_lse,
+            dq=dq_local_heads,
+            dk=dk_local_heads,
+            dv=dv_local_heads,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            dropout_p=ctx.dropout_p,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            alibi_slopes=ctx.alibi_slopes,
+            deterministic=ctx.deterministic,
+            rng_state=rng_state,
+            is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
+            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+        )
+
+        # Strip head-dim padding before the gradient A2A. Slicing the last dim can
+        # make the tensor non-contiguous, so force contiguous before the view.
+        dq_local_heads = dq_local_heads[..., :head_size_q_og].contiguous()
+        dk_local_heads = dk_local_heads[..., :head_size_q_og].contiguous()
+        dv_local_heads = dv_local_heads[..., :head_size_v_og].contiguous()
+
+        dqkv = attn_helper.combine_dqkv_before_a2a(dq_local_heads, dk_local_heads, dv_local_heads)
+        dqkv_out = torch.empty_like(dqkv)
+        torch.distributed.all_to_all_single(dqkv_out, dqkv, group=ctx.ulysses_group)
+        dq_local_tokens, dk_local_tokens, dv_local_tokens = attn_helper.split_dqkv_after_a2a(dqkv_out)
+
+        return (
+            dq_local_tokens,
+            dk_local_tokens,
+            dv_local_tokens,
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_k
+            None,  # max_seqlen_q
+            None,  # max_seqlen_k
+            None,  # dropout_p
+            None,  # softmax_scale
+            None,  # causal
+            None,  # window_size
+            None,  # bias
+            None,  # alibi_slopes
+            None,  # deterministic
+            None,  # return_lse
+            None,  # return_softmax
+            None,  # is_grad
+            None,  # ulysses_group
+            None,  # ring_group
+        )
+
+
 def flash_attn_usp_func(
     q,
     k,
@@ -530,6 +765,58 @@ def flash_attn_usp_func(
         ring_group,
         1,
         qkv_format,
+    )
+
+
+def flash_attn_varlen_usp_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    return_attn_probs=False,
+    ulysses_group=None,
+    ring_group=None,
+):
+    """Variable-length (THD / cu_seqlens) Ulysses A2A context-parallel attention.
+
+    Mirrors ``flash_attn_varlen_func`` but runs under a context-parallel group.
+    Packs sequences back-to-back along dim 0; each rank passes its local token
+    shard q/k/v of shape (t_local, nheads, headdim) together with the GLOBAL
+    cu_seqlens / max_seqlen describing the full t = t_local * cp_size sequence.
+
+    Ulysses A2A only -- ``ring_group`` must be unset or size 1.
+    """
+    return AttentionVarlenCKFunctionCPA2A.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        torch.is_grad_enabled(),
+        ulysses_group,
+        ring_group,
     )
 
 
