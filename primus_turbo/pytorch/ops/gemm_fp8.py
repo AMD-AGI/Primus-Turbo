@@ -26,6 +26,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
+    quantize_mxfp8_impl,
 )
 
 __all__ = ["gemm_fp8"]
@@ -438,71 +439,41 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
-        a_scaling_recipe = ScalingRecipe()
-        if isinstance(a, QuantizedTensor):
-            quantized_a = a
-            check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
-        else:
-            a_dtype = _get_fp8_dtype(config.format, True)
-            quantized_a = QuantizedTensor.quantize(
-                a,
-                a_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
-            )
+        fp8_dtype = _get_fp8_dtype(config.format, True)
+        a_recipe = ScalingRecipe()
+        b_recipe = ScalingRecipe(use_2d_block=True)
 
-        if a_t is None:
-            # MX_BLOCKWISE requires a scaling_recipe; reuse the forward recipe
-            # for A's col-wise direction (same recipe as forward).
-            quantized_a_t = QuantizedTensor.quantize(
-                quantized_a.dequantize(),
-                quantized_a.real_dtype,
-                config.granularity,
-                axis=-2,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
-            )
-        else:
-            assert isinstance(a_t, QuantizedTensor)
-            quantized_a_t = a_t
+        # TE-style dual cast: produce the row-wise (forward) AND col-wise (transposed,
+        # saved for backward) MXFP8 tensors directly from the high-precision input in
+        # ONE pass, instead of dequantize() + requantize(axis=-2). This drops the extra
+        # dequant/quant kernels and the double-quantization error. The col-wise output
+        # orientation matches the old axis=-2 quant, so the NT-fold backward is unchanged.
+        def _row_col(x, x_t, recipe):
+            if isinstance(x, QuantizedTensor):
+                check_quantized_tensor(x, config, axis=-1, scaling_recipe=recipe)
+                if x_t is not None:
+                    return x.qdata, x.scale_inv, x_t.qdata, x_t.scale_inv
+                qt = QuantizedTensor.quantize(
+                    x.dequantize(),
+                    x.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=recipe,
+                )
+                return x.qdata, x.scale_inv, qt.qdata, qt.scale_inv
+            return quantize_mxfp8_impl(x, fp8_dtype, None, config.block_size, True, recipe, recipe)
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
-        if isinstance(b, QuantizedTensor):
-            quantized_b = b
-            check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
-        else:
-            b_dtype = _get_fp8_dtype(config.format, True)
-            quantized_b = QuantizedTensor.quantize(
-                b,
-                b_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-            )
-
-        if b_t is None:
-            quantized_b_t = QuantizedTensor.quantize(
-                quantized_b.dequantize(),
-                quantized_b.real_dtype,
-                config.granularity,
-                axis=-2,
-                block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-            )
-        else:
-            assert isinstance(b_t, QuantizedTensor)
-            quantized_b_t = b_t
+        a_qd, a_sc, at_qd, at_sc = _row_col(a, a_t, a_recipe)
+        b_qd, b_sc, bt_qd, bt_sc = _row_col(b, b_t, b_recipe)
 
         # NT layout
         out = gemm_fp8_impl(
-            quantized_a.qdata,
-            quantized_a.scale_inv,
+            a_qd,
+            a_sc,
             False,
-            quantized_b.qdata,
-            quantized_b.scale_inv,
+            b_qd,
+            b_sc,
             True,
             out_dtype,
             False,
@@ -510,9 +481,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.TURBO.value,
         )
 
-        ctx.save_for_backward(
-            quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
-        )
+        ctx.save_for_backward(at_qd, at_sc, bt_qd, bt_sc)
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -528,20 +497,17 @@ class FP8GemmMXFunction(torch.autograd.Function):
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         grad_out = grad_out.view(grad_out.shape[0], -1)
 
-        grad_out_scaling_recipe = ScalingRecipe()
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=-1,
-            scaling_recipe=grad_out_scaling_recipe,
+        # TE-style dual cast of grad_out: row-wise (for grad_a) + col-wise (for grad_b)
+        # MXFP8 in ONE pass from the high-precision grad, instead of two separate quants.
+        recipe = ScalingRecipe()
+        go_row, go_row_sc, go_col, go_col_sc = quantize_mxfp8_impl(
+            grad_out, grad_out_dtype, None, ctx.config.block_size, True, recipe, recipe
         )
 
-        # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
+        # NT-fold (MXFP8 dense is NT-only): grad_a = NN->NT, grad_b = TN->NT.
         grad_a = gemm_fp8_impl(
-            quantized_grad_out.qdata,
-            quantized_grad_out.scale_inv,
+            go_row,
+            go_row_sc,
             False,
             b_fp8_t,
             b_t_scale_inv,
@@ -552,20 +518,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.TURBO.value,
         )
 
-        grad_out_t_scaling_recipe = ScalingRecipe()
-        quantized_grad_out_t = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=-2,
-            scaling_recipe=grad_out_t_scaling_recipe,
-        )
-
-        # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout.
         grad_b = gemm_fp8_impl(
-            quantized_grad_out_t.qdata,
-            quantized_grad_out_t.scale_inv,
+            go_col,
+            go_col_sc,
             False,
             a_fp8_t,
             a_t_scale_inv,
