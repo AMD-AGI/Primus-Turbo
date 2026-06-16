@@ -49,9 +49,8 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     inputs > 2^31 elems / > 4GB that the flat-shape pack and 32-bit voffset cannot.
     ``num_records_bytes`` bounds the SRD from the shifted base (HW OOB clamp)."""
     base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg_i8))
-    # Pin the (wave-uniform) shifted base + num_records to SGPRs: the per-tile base from
-    # the group scan reads as VGPR to divergence analysis -> a VGPR SRD -> a readfirstlane
-    # waterfall on every K-loop buffer_load. readfirstlane keeps the SRD scalar.
+    # Pin the wave-uniform shifted base + num_records to SGPRs: the group-scan base reads
+    # as VGPR -> VGPR SRD -> readfirstlane waterfall per K-loop load. Pin keeps it scalar.
     base = _readfirstlane_i32(base + arith.index_cast(T.i64, base_elems))
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
@@ -257,9 +256,8 @@ class StoreCPerTensor:
 
     def store(self, c_frag, base_row, base_col):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
-        # Re-base output at this row band (64-bit index) so the per-store byte offset stays
-        # a small int32; clamp band base to [0, c_rows] (row_c==c_rows -> 0 records -> OOB
-        # drop) and num_records to the 32-bit SRD field.
+        # Re-base output at this row band (i64) so the per-store byte offset stays int32;
+        # clamp band base to [0, c_rows] and num_records to the 32-bit SRD field.
         out_b = 2  # bf16/fp16 = 2 bytes
         cols_i = _as_index(self.c_cols)
         row_i = _as_index(base_row)
@@ -283,21 +281,12 @@ class StoreCPerTensor:
 
 
 class StoreCPerTensorCShuffle:
-    """CShuffle output store (env GROUPED_DGRAD_CSHUFFLE milestone track).
-
-    Same value->global-address mapping as StoreCPerTensor (byte-identical
-    results), but instead of 128 column-strided scalar ``buffer_store_short``
-    (R18: ~22% of dgrad-up body, the gate-binding store cost), it stages each
-    16-row sub-tile through per-wave LDS row-major, then re-reads it N-contiguous
-    (one row-segment per lane) and emits one vectorized 128b global store per
-    lane. Per-ti staging keeps LDS small (8 waves x 16 x Cc out_ty).
-
-    Assumes BLOCK_N=256 (Cc = n_tiles_b*16 = 32 -> EPL = 8 out_ty/lane = 128b)
-    and c_cols % Cc == 0, base_col % Cc == 0 (true for transformer FFN N dims;
-    no straddle). Full-run column validity is then per-lane uniform-in-regime;
-    invalid runs clamp to an OOB element index (HW SRD drop), as the scalar
-    path does. M1 milestone: correctness-first; perf tuning is M2.
-    """
+    """CShuffle output store: same value->global-address mapping as StoreCPerTensor
+    (byte-identical) but stages each 16-row sub-tile through per-wave LDS row-major,
+    re-reads it N-contiguous, and emits one vectorized 128b global store per lane
+    (vs 128 column-strided scalar buffer_store_short). Assumes BLOCK_N=256 (EPL=8
+    out_ty/lane=128b) and c_cols % Cc == 0, base_col % Cc == 0 (true for FFN N dims);
+    invalid runs clamp to an OOB element index (HW SRD drop), as the scalar path does."""
 
     def __init__(
         self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, c_lds, wave_id
@@ -356,9 +345,8 @@ class StoreCPerTensorCShuffle:
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(val)
             S2RLoaderTr._wait_lgkmcnt(0)
-            # --- re-base output at this 16-row band (i64), then re-read N-contiguous (one
-            # EPL-col run per lane) + one vectorized 128b store at a small in-band i32 byte
-            # offset. Row validity is enforced by the band num_records (HW OOB drop). ---
+            # Re-base output at this 16-row band (i64), re-read N-contiguous (one EPL-col
+            # run/lane) + one 128b store at a small in-band i32 offset; band num_records OOB-drops.
             band_row = arith.index_cast(T.index, base_row + ti * 16)
             row_c = arith.minui(band_row, rows_i)
             band_base = self.c_base + row_c * cols_i * arith.index(out_b)

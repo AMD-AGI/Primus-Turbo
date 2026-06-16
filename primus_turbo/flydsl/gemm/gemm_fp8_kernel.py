@@ -469,9 +469,8 @@ def _compile_dense_nn(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
-        # i64 input re-base. A[M,K]: fold the row base (m_row*K) into the SRD.
-        # B[K,N]: contraction over K -> k*BLOCK_K*c_n is i64 per B load (cn_i),
-        # capped at 4GB via num_records.
+        # i64 input re-base. A[M,K]: fold row base (m_row*K) into SRD. B[K,N]: the
+        # k*BLOCK_K*c_n contraction is i64 per load (cn_i), capped at 4GB by num_records.
         m_row = block_m * BLOCK_M
         cn_i = arith.index_cast(T.index, c_n)
         a_base = arith.index_cast(T.index, m_row) * arith.index(K)
@@ -806,9 +805,8 @@ def _compile_dense_tn(
         # for one Python-selected path (1D GROUP_M or 2D band).
         block_m, block_n = _tn_block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
-        # i64 input re-base. A[K,M]/B[K,N] K-row-major: fold the column base into
-        # the SRD; the k*BLOCK_K*c_{m,n} traversal is i64 per load (int32 wraps
-        # > 2^31), capped at 4GB.
+        # i64 input re-base. A[K,M]/B[K,N] K-row-major: fold column base into SRD; the
+        # k*BLOCK_K*c_{m,n} traversal is i64 per load (int32 wraps > 2^31), capped at 4GB.
         cm_i = arith.index_cast(T.index, c_m)
         cn_i = arith.index_cast(T.index, c_n)
         a_base = arith.index_cast(T.index, block_m) * arith.index(BLOCK_M)

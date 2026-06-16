@@ -30,6 +30,8 @@ Built on the dense kernel's primitives; see gemm_fp8_kernel.py for the K-loop /
 K-tail / barrier rationale (identical here).
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -60,6 +62,9 @@ from primus_turbo.flydsl.utils.fp8_gemm_helper import (
 # Baked NT super-block tile swizzle width (0 = row-major; the autotune sweeps group_m
 # per shape for B[g] N-stripe L2 reuse).
 _GROUPED_NT_GROUPM = 0
+_WG_INTERLEAVE = bool(
+    int(os.environ.get("WG_INTERLEAVE", "1"))
+)  # band-cyclic group interleave: skew load-balance, balanced-neutral (env=0 to disable)
 
 
 def _load_i32(div, idx):
@@ -268,8 +273,7 @@ def _compile_grouped_nn(
 
             m_row = m_start + local_block_m * BLOCK_M
             # Fold each tile's huge element base (m_row*K for A, group/N-block for B) into
-            # the i64 SRD base so the in-tile buffer offsets stay small int32 (handles A/B
-            # > 2^31 elems / > 4GB); num_records clamps the SRD to the rest of the group.
+            # the i64 SRD base; in-tile offsets stay int32, num_records clamps to the group.
             cn_i = arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row) * arith.index(K)
             b_base = arith.index_cast(T.index, group_idx) * arith.index(K) * cn_i + arith.index_cast(
@@ -661,9 +665,8 @@ def _compile_grouped_nt(
             wave_n = wave_id % 4
 
             m_row = m_start + local_block_m * BLOCK_M
-            # Fold each tile's huge element base into the i64 SRD base so the in-tile
-            # buffer offsets stay small int32 (handles A/B > 2^31 elems / > 4GB). B_T is
-            # [G, N, K]: group base group_idx*c_n*K, N-row block_n*BLOCK_N, K-contiguous.
+            # Fold each tile's huge element base into the i64 SRD base (in-tile offsets stay
+            # int32, A/B > 2^31 / > 4GB). B_T=[G,N,K]: base group_idx*c_n*K + block_n*BLOCK_N.
             cn_i = arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row) * arith.index(K)
             b_base = (
@@ -1117,9 +1120,26 @@ def _compile_grouped_tn_wgrad_masked(
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
 
         pid = xcd_remap_pid(fx.block_idx.x, G * TILES_PER_GROUP, num_xcd)
-        group_idx = pid // TILES_PER_GROUP
-        local = pid % TILES_PER_GROUP
-        if const_expr(group_m > 0 and N_BLOCKS_M > group_m):
+        if const_expr(_WG_INTERLEAVE and group_m > 0 and N_BLOCKS_M > group_m and N_BLOCKS_M % group_m == 0):
+            # Band-cyclic: cluster = one group_m M-band, groups alternate at band
+            # granularity -> skew load-balance, group_m B-stripe L2 reuse kept (balanced-neutral).
+            BAND = const_expr(group_m * N_BLOCKS_N)
+            bg = pid // BAND
+            group_idx = bg % G
+            band = bg // G
+            in_band = pid % BAND
+            block_m = band * group_m + (in_band % group_m)
+            block_n = in_band // group_m
+        elif const_expr(_WG_INTERLEAVE):
+            # Fallback (group_m == 0 or doesn't evenly tile N_BLOCKS_M): one-M-row cluster
+            # (N_BLOCKS_N divides TILES_PER_GROUP) -> A-row reuse + group alternation.
+            cl = pid // N_BLOCKS_N
+            group_idx = cl % G
+            block_m = cl // G
+            block_n = pid % N_BLOCKS_N
+        elif const_expr(group_m > 0 and N_BLOCKS_M > group_m):
+            group_idx = pid // TILES_PER_GROUP
+            local = pid % TILES_PER_GROUP
             GM_c = fx.Int32(group_m)
             npg = group_m * N_BLOCKS_N
             grp = local // npg
@@ -1130,6 +1150,8 @@ def _compile_grouped_tn_wgrad_masked(
             block_m = first_m + (in_grp % gsize_m)
             block_n = in_grp // gsize_m
         else:
+            group_idx = pid // TILES_PER_GROUP
+            local = pid % TILES_PER_GROUP
             block_m = local // N_BLOCKS_N
             block_n = local % N_BLOCKS_N
 
@@ -1151,9 +1173,8 @@ def _compile_grouped_tn_wgrad_masked(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        # Fold m_start*OUT_{M,N} into the i64 SRD base (handles A/B > 2^31 elems / > 4GB
-        # across stacked groups); num_records = M_g*OUT_{M,N} keeps the masked over-run
-        # SRD-clamp. The per-group contraction (m_end-m_start) stays in int32 offsets.
+        # Fold m_start*OUT_{M,N} into the i64 SRD base (A/B > 2^31 / > 4GB across groups);
+        # num_records = M_g*OUT clamps the over-run, per-group contraction stays int32.
         a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
         b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
         mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
@@ -1443,23 +1464,20 @@ def _robust_time(launch, targs, warmup=250, reps=5, iters=50):
 
 
 def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
-    """num_cu<=0 (full device): per-shape autotune the NON-PERSISTENT kernel's L2-reuse
-    swizzle, timed on a BALANCED token distribution (see _balanced_group_offs) so the
-    pick is distribution-independent. 3 candidates (band dropped — never adopted under
-    balanced timing): base (8,4,0) = common winner + correctness reference; (1,0,0)
-    row-major (num_xcd=1 wins some down-proj shapes); (8,8,0) wide M-cluster.
-    >=1.5% hysteresis. Cached per shape."""
+    """Per-shape autotune of the non-persistent NT/NN kernel, balanced-timed (1.5% hysteresis,
+    cached per static shape). NN small-M (G*ceil(pm/128)*ceil(N/256)<=num_cus, underfilled):
+    single BLOCK_M=128; else 3 bm256 swizzles (8,4,0)/(1,0,0)/(8,8,0), cand[0] = ref."""
     out_view = args[2]
     # time on a balanced group_offs (args[6] = M_total) so a skewed first call cannot
     # bias the config pick.
     targs = _balanced_targs(args, args[6], G)
 
-    def mk(xcd, gm, gn):
+    def mk(bm, xcd, gm, gn):
         if trans_b:  # NT: merged factory, non-persistent mode (intrinsic MMA, scalar store)
             return _compile_grouped_nt(
                 K=K,
                 G=G,
-                BLOCK_M=256,
+                BLOCK_M=bm,
                 BLOCK_N=256,
                 out_fp16=out_fp16,
                 cbsz=cbsz,
@@ -1477,7 +1495,7 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
         return _compile_grouped_nn(
             K=K,
             G=G,
-            BLOCK_M=256,
+            BLOCK_M=bm,
             BLOCK_N=256,
             out_fp16=out_fp16,
             cbsz=cbsz,
@@ -1492,7 +1510,15 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
             nt_vmcnt=-1,
         )
 
-    base = mk(8, 4, 0)
+    pm = args[6] // G
+    bm128_tiles = G * ((pm + 127) // 128) * ((args[7] + 255) // 256)
+    if not trans_b and bm128_tiles <= _num_cus():
+        # small-M dgrad: BLOCK_M=128 doubles M-tiles, beats every bm256 swizzle here
+        # (boundary sweep +5..31%, never loses) -> single config, no autotune.
+        return mk(128, 1, 0, 0)
+
+    cands = [(256, 8, 4, 0), (256, 1, 0, 0), (256, 8, 8, 0)]  # large-M / NT swizzles
+    base = mk(*cands[0])
     base(*targs)
     torch.cuda.synchronize()
     _r = out_view.detach().clone().float()
@@ -1504,8 +1530,8 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
         return (e / _rn) < (2e-2**2) and torch.isfinite(o.view(-1)[:1024]).all().item()
 
     best, bt = base, _robust_time(base, targs)
-    for xcd, gm, gn in ((1, 0, 0), (8, 8, 0)):
-        l = mk(xcd, gm, gn)
+    for cand in cands[1:]:
+        l = mk(*cand)
         l(*targs)
         torch.cuda.synchronize()
         if not _ok():  # numeric guard: never adopt a config that drifts from the base
@@ -1622,6 +1648,445 @@ _GROUPED_WGRAD_LAUNCH_CACHE: dict = {}
 _GROUPED_WGRAD_AT_CACHE: dict = {}
 
 
+def _wgrad_loop_body_pipe(
+    k,
+    a_g2s,
+    b_g2s,
+    a_s2r,
+    b_s2r,
+    mfma,
+    a_cur0,
+    a_cur1,
+    b_cur0,
+    b_cur1,
+    acc00,
+    acc01,
+    acc10,
+    acc11,
+    A0_off,
+    A1_off,
+    B0_off,
+    B1_off,
+    out_m,
+    out_n,
+    stage_bytes,
+    parity=None,
+):
+    """One K-tile of the 2-stage prefetch-overlap loop: reads THIS tile from LDS stage
+    (k%2) and issues the NEXT tile's G2S into stage ((k+1)%2) so its global->LDS vmem
+    latency overlaps THIS tile's mma. One wait_barrier(0)/iter (trailing s_barrier
+    unneeded: stage[k%2] is only overwritten by iter k+1's G2S, after its top barrier).
+    K-tail over-read SRD-clamped to 0. Caller's prologue must G2S K-tile 0 into stage 0."""
+    BLOCK_K = 128
+    if parity is not None:
+        # UNROLL mode: compile-time parity (j%2 in range_constexpr(N)) -> constant read/write
+        # offsets; the backend overlaps fully-unrolled blocks like dense full-unroll.
+        read_off = fx.Int32(parity * stage_bytes)
+        write_off = fx.Int32((1 - parity) * stage_bytes)
+        kn = (k + 1) * BLOCK_K
+        kna = kn * out_m
+        knb = kn * out_n
+        # the ds_read below reads stage[read_off] filled by the previous block's G2S;
+        # vmcnt(0) drains it before the read (a coop-only barrier alone would race).
+        wait_barrier(0)
+    else:
+        k_mod = k % 2
+        read_off = fx.Int32(k_mod * stage_bytes)
+        write_off = fx.Int32(((k + 1) % 2) * stage_bytes)
+        kn = (k + 1) * BLOCK_K
+        kna = kn * out_m
+        knb = kn * out_n
+        wait_barrier(0)  # drain this tile's G2S (issued prev iter/prologue) + barrier
+    # read this tile first, then spread the 4 next-tile G2S across the 4 MFMA so the
+    # backend overlaps vmem latency with matrix issue.
+    a0 = a_s2r.load(a_cur0, base_off=read_off)
+    a1 = a_s2r.load(a_cur1, base_off=read_off)
+    b0 = b_s2r.load(b_cur0, base_off=read_off)
+    b1 = b_s2r.load(b_cur1, base_off=read_off)
+    a_g2s.load(a_cur0, A0_off + kna, base_off=write_off)
+    _wgrad_accum(mfma, a0, b0, acc00)
+    a_g2s.load(a_cur1, A1_off + kna, base_off=write_off)
+    _wgrad_accum(mfma, a0, b1, acc01)
+    b_g2s.load(b_cur0, B0_off + knb, base_off=write_off)
+    _wgrad_accum(mfma, a1, b0, acc10)
+    b_g2s.load(b_cur1, B1_off + knb, base_off=write_off)
+    _wgrad_accum(mfma, a1, b1, acc11)
+
+
+def _compile_grouped_tn_wgrad_persistent(
+    *,
+    OUT_M: int,
+    OUT_N: int,
+    G: int,
+    BLOCK_M: int = 256,
+    BLOCK_N: int = 256,
+    waves_per_eu: int = 2,
+    num_xcd: int = 8,
+    cbsz: int = 0,
+    blgp: int = 0,
+    out_fp16: bool = False,
+    group_m: int = 0,
+    group_n: int = 0,
+    store_cshuffle: bool = True,
+    asm_mma: bool = True,
+    asm_acc_mode: str = "vgpr",
+    s2r_inline: bool = False,
+    nt_vmcnt: int = 3,
+    grid_mul: int = 1,  # grid = grid_mul * num_cus (more WGs -> HW hides per-tile prologue latency)
+    unroll_n: int = -1,  # >=2: continuous-N chunk-unroll (dense-pipeline, capacity-free); -1 = use module env default
+    persistent: bool = True,  # False = TRUE non-persistent: NO outer scf.for tile loop (one tile/WG, grid=TOTAL, straight-line outer; the runtime K-loop stays). Avoids the outer tile-loop scheduling penalty.
+    cap_cu: int = -1,  # persistent only: >0 caps grid to this many WGs (reserve CUs for comm overlap)
+):
+    """PERSISTENT grouped TN wgrad (the production wgrad; fwd/dgrad are persistent
+    so wgrad must be too). grid = min(G*TILES_PER_GROUP, grid_mul*num_cus); each WG
+    strides `for t in range(pid, TOTAL, nsms)` over the tile space in XCD-remapped +
+    band order. TOTAL is compile-time (OUT dims fixed) -> no device scan. Per-group
+    SRD num_records clamp handles the K-tail; rmem accs reset per tile."""
+    BLOCK_K = 128
+    # unroll_n<0 -> plain scf.for (no continuous-N unroll); else the explicit unroll
+    # factor (the autotune carries it as a per-shape config knob).
+    _un = 0 if unroll_n < 0 else unroll_n
+    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert G >= 1
+    N_TILES_A = BLOCK_M // 64
+    N_TILES_B = BLOCK_N // 128
+    N_ACCUMS = N_TILES_A * N_TILES_B
+    LDS_BLOCK_M = BLOCK_M // 2
+    LDS_BLOCK_N = BLOCK_N // 2
+    N_LDS_STEPS_A = max(LDS_BLOCK_M // 64, 2)
+    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+    _LDS_CS = 1056
+    a_lds_size = max(LDS_BLOCK_M * BLOCK_K, 2 * 8 * 1024) // 1024 * _LDS_CS
+    b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _LDS_CS
+    assert a_lds_size == b_lds_size
+    _WG_STAGE_BYTES = a_lds_size
+    N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
+    N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
+    TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
+    TOTAL = G * TILES_PER_GROUP
+    _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
+    _cshuf_n = 8 * 16 * (N_TILES_B * 16)
+
+    @fx.struct
+    class SharedStorage:
+        A_lds_0: fx.Array[fx.Float8E4M3FN, 2 * a_lds_size, 16]
+        A_lds_1: fx.Array[fx.Float8E4M3FN, 2 * a_lds_size, 16]
+        B_lds_0: fx.Array[fx.Float8E4M3FN, 2 * b_lds_size, 16]
+        B_lds_1: fx.Array[fx.Float8E4M3FN, 2 * b_lds_size, 16]
+        C_lds_shuffle: fx.Array[_cshuf_ty, _cshuf_n, 16]
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def kernel_grouped_tn_persist(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        group_offs: fx.Tensor,
+    ):
+        _ = str(fx.thread_idx.x)
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        a_cur0 = lds.A_lds_0
+        a_cur1 = lds.A_lds_1
+        b_cur0 = lds.B_lds_0
+        b_cur1 = lds.B_lds_1
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        gl_off_a = compute_global_swizzle_nn(lane_id, wave_id, OUT_M, N_LDS_ROUNDS)
+        gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, OUT_N, N_LDS_ROUNDS)
+        mfma = _build_mfma(
+            N_TILES_A,
+            N_TILES_B,
+            cbsz,
+            blgp,
+            asm_mode=("2" if asm_acc_mode == "agpr" else "3") if asm_mma else None,
+        )
+        a_s2r = S2RLoaderTr(
+            wave_m,
+            N_TILES_A,
+            LDS_BLOCK_M // 2,
+            inline_asm=s2r_inline,
+            vmcnt_hint=nt_vmcnt,
+            chunk_stride=_LDS_CS,
+        )
+        b_s2r = S2RLoaderTr(
+            wave_n, N_TILES_B, 32, inline_asm=s2r_inline, vmcnt_hint=nt_vmcnt, chunk_stride=_LDS_CS
+        )
+        acc00 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
+        acc01 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
+        acc10 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
+        acc11 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+
+        def _tile_meta(tidx):
+            # all per-tile addressing/loaders; pure function of the (runtime) tile index
+            # so it can be evaluated for both the current tile and the prefetched next one.
+            tt = xcd_remap_pid(tidx, TOTAL, num_xcd)
+            group_idx = tt // TILES_PER_GROUP
+            local = tt % TILES_PER_GROUP
+            if const_expr(group_n > 0 and group_m > 0 and N_BLOCKS_N > group_n):
+                block_m, block_n = _band_block_mn(local, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n)
+            elif const_expr(group_m > 0 and N_BLOCKS_M > group_m):
+                GM_c = fx.Int32(group_m)
+                npg = group_m * N_BLOCKS_N
+                grp = local // npg
+                first_m = grp * GM_c
+                rem_m = fx.Int32(N_BLOCKS_M) - first_m
+                gsize_m = arith.select(rem_m < GM_c, rem_m, GM_c)
+                in_grp = local % npg
+                block_m = first_m + (in_grp % gsize_m)
+                block_n = in_grp // gsize_m
+            else:
+                block_m = local // N_BLOCKS_N
+                block_n = local % N_BLOCKS_N
+
+            m_start = _load_go(go_div, group_idx)
+            m_end = _load_go(go_div, group_idx + 1)
+            m_g = m_end - m_start
+            k_iters = (m_g + (BLOCK_K - 1)) // BLOCK_K
+
+            # Fold m_start*OUT into the i64 SRD base + per-group num_records (cumulative
+            # m_end*OUT overflows int32 for large-G MoE); per-group offset/stride stay i32.
+            a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
+            b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
+            mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
+            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
+            gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
+            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+
+            A0_off = block_m * BLOCK_M  # relative to the m_start-folded i64 SRD base
+            A1_off = A0_off + LDS_BLOCK_M
+            B0_off = block_n * BLOCK_N
+            B1_off = B0_off + LDS_BLOCK_N
+            return (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off)
+
+        def _wgrad_prologue(meta):
+            # load K-block 0 into LDS stage 0; the s_barrier is the WAR guard between the
+            # previous tile's last stage reads and these stage-0 writes.
+            a_g2s, b_g2s = meta[4], meta[5]
+            A0_off, A1_off, B0_off, B1_off = meta[6], meta[7], meta[8], meta[9]
+            _z = fx.Int32(0)
+            rocdl.s_barrier()
+            a_g2s.load(a_cur0, A0_off, base_off=_z)
+            a_g2s.load(a_cur1, A1_off, base_off=_z)
+            b_g2s.load(b_cur0, B0_off, base_off=_z)
+            b_g2s.load(b_cur1, B1_off, base_off=_z)
+
+        pid = fx.block_idx.x
+        nsms = fx.grid_dim.x
+
+        # top-prologue per tile (no inter-tile prefetch: a 2nd per-tile SRD calc spills past
+        # the 8-wave cap, and TN is LDS-transpose/MFMA-util bound, not prologue-bound).
+        def _do_tile(t):  # per-tile body (the runtime K-loop stays inside)
+            (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off) = _tile_meta(
+                t
+            )
+
+            for q in (acc00, acc01, acc10, acc11):
+                for r in q:
+                    fx.memref_store_vec(mfma.zero_value, r)
+
+            _wgrad_prologue(
+                (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off)
+            )
+            if const_expr(_un >= 2):
+                # continuous-N-unroll: outer runtime chunk x inner range_constexpr(N),
+                # compile-time parity; over-run -> 0, no capacity bound.
+                _N = _un
+                n_outer = (k_iters + (_N - 1)) // _N
+                for c in range(n_outer):
+                    base = c * _N
+                    for j in range_constexpr(_N):
+                        _wgrad_loop_body_pipe(
+                            base + j,
+                            a_g2s,
+                            b_g2s,
+                            a_s2r,
+                            b_s2r,
+                            mfma,
+                            a_cur0,
+                            a_cur1,
+                            b_cur0,
+                            b_cur1,
+                            acc00,
+                            acc01,
+                            acc10,
+                            acc11,
+                            A0_off,
+                            A1_off,
+                            B0_off,
+                            B1_off,
+                            OUT_M,
+                            OUT_N,
+                            _WG_STAGE_BYTES,
+                            parity=(j % 2),
+                        )
+            else:
+                for k in range(k_iters):
+                    _wgrad_loop_body_pipe(
+                        k,
+                        a_g2s,
+                        b_g2s,
+                        a_s2r,
+                        b_s2r,
+                        mfma,
+                        a_cur0,
+                        a_cur1,
+                        b_cur0,
+                        b_cur1,
+                        acc00,
+                        acc01,
+                        acc10,
+                        acc11,
+                        A0_off,
+                        A1_off,
+                        B0_off,
+                        B1_off,
+                        OUT_M,
+                        OUT_N,
+                        _WG_STAGE_BYTES,
+                    )
+
+            if const_expr(store_cshuffle):
+                store_c = StoreCPerTensorCShuffle(
+                    A_scale,
+                    B_scale,
+                    C,
+                    (group_idx + 1) * OUT_M,
+                    OUT_N,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
+                    lds.C_lds_shuffle,
+                    wave_id,
+                )
+            else:
+                store_c = StoreCPerTensor(
+                    A_scale,
+                    B_scale,
+                    C,
+                    (group_idx + 1) * OUT_M,
+                    OUT_N,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
+                )
+            c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
+            c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
+            c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
+            c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
+            base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m_offset
+            base_col = block_n * BLOCK_N + wave_n_offset
+            _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N)
+
+        if const_expr(persistent):
+            # persistent: fixed grid strides over the tile space (scf.for).
+            for t in range(pid, TOTAL, nsms):
+                _do_tile(t)
+        else:
+            # TRUE non-persistent: one tile per WG, NO outer scf.for. grid=TOTAL
+            # (compile-time, so block_idx is always a valid tile -> no scan/guard).
+            _do_tile(pid)
+
+    @flyc.jit
+    def launch_grouped_tn_persist(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        group_offs: fx.Tensor,
+        stream: fx.Stream,
+    ):
+        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        # persistent: cap to grid_mul*ncus (or cap_cu for comm overlap); non-persistent:
+        # exactly TOTAL WGs. Python-ternary (@flyc.jit rewrites if-statements into scf.if).
+        cap = (grid_mul * ncus) if cap_cu <= 0 else min(int(cap_cu), ncus)
+        _capg = arith.select(fx.Int32(TOTAL) < cap, fx.Int32(TOTAL), fx.Int32(cap))
+        grid_x = _capg if persistent else fx.Int32(TOTAL)
+        _ag = 128 if (asm_mma and asm_acc_mode == "agpr") else 0
+        attrs = make_value_attrs(waves_per_eu, _ag, "512,512")
+        kernel_grouped_tn_persist(
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            group_offs,
+            value_attrs=attrs,
+        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+    return launch_grouped_tn_persist
+
+
+def _wgrad_compile_cfg(
+    OUT_M,
+    OUT_N,
+    G,
+    out_fp16,
+    cbsz,
+    blgp,
+    num_xcd,
+    group_m,
+    group_n=0,
+    unroll_n=-1,
+    persistent=True,
+    cap_cu=-1,
+):
+    """Compile (or cache-hit) an asm_mma wgrad for one config. persistent=False ->
+    TRUE non-persistent (no outer scf.for tile loop)."""
+    ck = (
+        OUT_M,
+        OUT_N,
+        G,
+        out_fp16,
+        cbsz,
+        blgp,
+        num_xcd,
+        "persist" if persistent else "nonpersist",
+        group_m,
+        group_n,
+        unroll_n,
+        cap_cu,
+    )
+    l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
+    if l is None:
+        l = _compile_grouped_tn_wgrad_persistent(
+            OUT_M=OUT_M,
+            OUT_N=OUT_N,
+            G=G,
+            num_xcd=num_xcd,
+            out_fp16=out_fp16,
+            cbsz=cbsz,
+            blgp=blgp,
+            group_m=group_m,
+            group_n=group_n,
+            store_cshuffle=True,
+            asm_mma=True,  # mode-3 VGPR in-place accumulate (avoids the intrinsic accvgpr shuffle)
+            asm_acc_mode="vgpr",
+            s2r_inline=False,
+            unroll_n=unroll_n,
+            persistent=persistent,
+            cap_cu=cap_cu,
+        )
+        _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
+    return l
+
+
 def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd):
     """Compile (or cache-hit) the masked chunked wgrad for one (chunk, group_m, num_xcd)."""
     ck = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd)
@@ -1646,26 +2111,32 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
 
 
 def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_total):
-    """Per-shape wgrad config select over the masked chunked kernel only, timed on a
-    BALANCED token distribution (>=1.5% hysteresis). 3 candidates as (chunk, group_m,
-    num_xcd): (8,4,8) = prod / most frequent winner; (8,0,8) wins big-OUT_M / square
-    shapes; (4,4,8) wins short-contraction. The masked kernel matches/beats the old
-    persistent scf.for kernel on every MoE shape (2026-06-14 sweep, worst 1.0%)."""
+    """Per-shape wgrad autotune, balanced-timed (1.5% hysteresis). Branched on per-group
+    contraction m_total/G (not m_total, so high-G MoE keeps persist): <=1536 -> 2 persistent
+    candidates; else 3 masked chunked (8,4,8)/(8,0,8)/(4,4,8)."""
     out_view = args[2]
     # time on a balanced group_offs (m_total split over G) so a skewed call can't bias it.
     targs = _balanced_targs(args, m_total, G)
 
-    def _M(chunk, group_m, num_xcd):
-        return _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd)
+    if m_total // G <= 1536:
+        cands = [
+            _wgrad_compile_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 0, unroll_n=4),
+            _wgrad_compile_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, unroll_n=4),
+        ]
+    else:
+        cands = [
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8),
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 0, 8),
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 4, 4, 8),
+        ]
 
-    prod = _M(8, 4, 8)  # most frequent per-shape winner + correctness reference
+    prod = cands[0]  # correctness reference + fallback
     prod(*targs)
     torch.cuda.synchronize()
     if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
         return prod  # numeric guard: prod produced NaN/Inf -> don't time alts
     best_l, best_t = prod, _robust_time(prod, targs)
-    for chunk, group_m, num_xcd in ((8, 0, 8), (4, 4, 8)):
-        l = _M(chunk, group_m, num_xcd)
+    for l in cands[1:]:
         t = _robust_time(l, targs)
         if t < best_t * 0.985:  # hysteresis: adopt only if >=1.5% faster (robust timing)
             best_l, best_t = l, t
