@@ -370,6 +370,14 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         # StoreC clamp + the global SRD.)
         k = a.shape[0] if trans_a else a.shape[1]
         supported &= k >= 129
+        # i64 SRD re-base: foldable operands (NT both, NN-A) unbounded; traversal
+        # operands (NN-B k*n, TN k*m & k*n) cap at < 2^32 (4GB fp8) -> oversized
+        # declines to fallback. Output unbounded (StoreCPerTensor i64).
+        CAP = 2**32
+        if trans_a:  # TN: a[K,M] b[K,N] -- both traversal-spanning
+            supported &= (k * a.shape[1] < CAP) and (k * b.shape[1] < CAP)
+        elif not trans_b:  # NN: a[M,K] foldable, b[K,N] traversal-spanning
+            supported &= k * b.shape[1] < CAP
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
