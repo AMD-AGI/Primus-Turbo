@@ -400,7 +400,8 @@ class StoreCPerTensor:
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
     """
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty,
+                 elem_fn=None):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -408,6 +409,9 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        # Optional f32->f32 epilogue node chain (bias/act), applied post-scale
+        # pre-cast. None -> plain scaled store (identical IR).
+        self.elem_fn = elem_fn
         self.scaled = A_scale is not None
         self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
         if self.scaled:
@@ -433,7 +437,10 @@ class StoreCPerTensor:
                 col_valid = col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
+                    v = vec_f32[i] * scale if self.scaled else vec_f32[i]
+                    if self.elem_fn is not None:
+                        v = self.elem_fn(v)  # bias/act epilogue node chain
+                    val = v.to(self.out_ty)
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
                     _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
