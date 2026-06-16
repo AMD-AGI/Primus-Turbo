@@ -176,7 +176,8 @@ class StoreCPerTensor:
     out_ty is bf16 or fp16. Columns past c_cols clamp to an OOB index.
     """
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty,
+                 elem_fn=None):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -184,6 +185,9 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        # Optional f32->f32 epilogue node chain (bias/act), applied post-scale
+        # pre-cast. None -> plain scaled store (identical IR).
+        self.elem_fn = elem_fn
         c_nbytes = c_rows * c_cols * 2  # bf16 / fp16 output = 2 bytes
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
@@ -214,7 +218,10 @@ class StoreCPerTensor:
                 oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * scale).to(self.out_ty)
+                    val = vec_f32[i] * scale
+                    if self.elem_fn is not None:
+                        val = self.elem_fn(val)  # bias/act epilogue node chain
+                    scaled = val.to(self.out_ty)
                     c_index = (row + i) * self.c_cols + col
                     self._store_one(scaled, arith.select(col_valid, c_index, oob))
 
