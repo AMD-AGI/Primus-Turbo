@@ -237,7 +237,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
     uint8_t *__restrict__ out_scale_base, const int M, const int N, const int M_pad,
     const int N_pad, const int scale_stride, const int scale_N, const int scale_M_pad,
     const int scale_N_pad, const bool shuffle_out, const bool shuffle_scale,
-    const int preshuffle_layout, const int preshuffle_n_tiles, const int preshuffle_pack,
     const int64_t input_per_group_stride = 0, const int64_t out_fp8_per_group_stride = 0,
     const int64_t out_scale_per_group_stride = 0) {
     // Per-group (batched) offsets along blockIdx.z; no-op when launched with
@@ -450,21 +449,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
 
                         if (thread_in_row == 0) {
                             int scale_col = block_n * NUM_CHUNKS_N + chunk_n;
-                            if (preshuffle_layout != 0) {
-                                if (scale_col < scale_N) {
-                                    int dword, jbyte;
-                                    compute_preshuffle_scale_index(
-                                        global_row, scale_col, scale_N, preshuffle_layout,
-                                        preshuffle_n_tiles, preshuffle_pack, dword, jbyte);
-                                    if (preshuffle_pack == 1) {
-                                        *reinterpret_cast<uint32_t *>(out_scale +
-                                                                      (int64_t) dword * 4) =
-                                            (uint32_t) r_scale_e8m0[pass] * 0x01010101u;
-                                    } else {
-                                        out_scale[(int64_t) dword * 4 + jbyte] = r_scale_e8m0[pass];
-                                    }
-                                }
-                            } else if (shuffle_scale) {
+                            if (shuffle_scale) {
                                 if (global_row < scale_M_pad && scale_col < scale_N_pad) {
                                     int scale_index = compute_shuffle_scale_index(
                                         global_row, scale_col, scale_N_pad);
@@ -571,7 +556,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
     const int rowwise_scale_N, const int rowwise_scale_M_pad, const int rowwise_scale_N_pad,
     const int colwise_scale_M, const int colwise_scale_N, const int colwise_scale_M_pad,
     const int colwise_scale_N_pad, const bool shuffle_rowwise, const bool shuffle_colwise,
-    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale,
+    const bool shuffle_rowwise_scale, const bool shuffle_colwise_scale, const int preshuffle_layout,
+    const int preshuffle_n_tiles, const int preshuffle_pack, const int col_preshuffle_layout,
+    const int col_preshuffle_n_tiles, const int col_preshuffle_pack,
     const int64_t input_per_group_stride = 0, const int64_t rowwise_fp8_per_group_stride = 0,
     const int64_t rowwise_scale_per_group_stride = 0,
     const int64_t colwise_fp8_per_group_stride   = 0,
@@ -772,7 +759,22 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
 
                     if (thread_in_row == 0) {
                         int scale_col = block_n * NUM_CHUNKS_N + chunk_n;
-                        if (shuffle_rowwise_scale) {
+                        if (preshuffle_layout != 0) {
+                            if (scale_col < rowwise_scale_N) {
+                                int dword, jbyte;
+                                compute_preshuffle_scale_index(
+                                    global_row, scale_col, rowwise_scale_N, preshuffle_layout,
+                                    preshuffle_n_tiles, preshuffle_pack, dword, jbyte);
+                                if (preshuffle_pack == 1) {
+                                    *reinterpret_cast<uint32_t *>(rowwise_scale +
+                                                                  (int64_t) dword * 4) =
+                                        (uint32_t) r_rowwise_scale_e8m0[pass] * 0x01010101u;
+                                } else {
+                                    rowwise_scale[(int64_t) dword * 4 + jbyte] =
+                                        r_rowwise_scale_e8m0[pass];
+                                }
+                            }
+                        } else if (shuffle_rowwise_scale) {
                             if (scale_col < rowwise_scale_N && global_row < rowwise_scale_M_pad &&
                                 scale_col < rowwise_scale_N_pad) {
                                 int idx = compute_shuffle_scale_index(global_row, scale_col,
@@ -918,7 +920,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
             __syncthreads();
         }
 
-        if (!shuffle_colwise_scale) {
+        if (col_preshuffle_layout != 0 || !shuffle_colwise_scale) {
             constexpr int SCALE_ITEMS = NUM_CHUNKS_N * MXFP8_BLOCK_SIZE * NUM_CHUNKS_M;
             static_assert(SCALE_ITEMS <= THREADS_PER_BLOCK,
                           "Scale write mapping expects <= one item per thread");
@@ -933,7 +935,23 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
 
                 if (scale_col < colwise_scale_N && global_col < N) {
                     const uint8_t scale_val = s_colwise_scale[n_chunk][col_in_chunk][m_chunk];
-                    colwise_scale[global_col * colwise_scale_stride + scale_col] = scale_val;
+                    if (col_preshuffle_layout != 0) {
+                        // FlyDSL preshuffle fused into the colwise scale write. The
+                        // colwise scale is [free=N, M//32] -- same [free, K//32] form as
+                        // rowwise -- so reuse the index map with global_col as the row.
+                        int dword, jbyte;
+                        compute_preshuffle_scale_index(
+                            global_col, scale_col, colwise_scale_N, col_preshuffle_layout,
+                            col_preshuffle_n_tiles, col_preshuffle_pack, dword, jbyte);
+                        if (col_preshuffle_pack == 1) {
+                            *reinterpret_cast<uint32_t *>(colwise_scale + (int64_t) dword * 4) =
+                                (uint32_t) scale_val * 0x01010101u;
+                        } else {
+                            colwise_scale[(int64_t) dword * 4 + jbyte] = scale_val;
+                        }
+                    } else {
+                        colwise_scale[global_col * colwise_scale_stride + scale_col] = scale_val;
+                    }
                 }
             }
         }
@@ -1506,7 +1524,10 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
         rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,          \
         rowwise_scale_N_pad, colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,                \
         colwise_scale_N_pad, rowwise_recipe.shuffle_out, colwise_recipe.shuffle_out,               \
-        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale, input_per_group_stride,        \
+        rowwise_recipe.shuffle_scale, colwise_recipe.shuffle_scale,                                \
+        rowwise_recipe.preshuffle_layout, rowwise_recipe.preshuffle_n_tiles,                       \
+        rowwise_recipe.preshuffle_pack, colwise_recipe.preshuffle_layout,                          \
+        colwise_recipe.preshuffle_n_tiles, colwise_recipe.preshuffle_pack, input_per_group_stride, \
         rowwise_fp8_per_group_stride, rowwise_scale_per_group_stride,                              \
         colwise_fp8_per_group_stride, colwise_scale_per_group_stride
 
@@ -1590,8 +1611,7 @@ void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale, Quan
 
 #define QUANTIZE_MXFP8_KERNEL_ARGS                                                                 \
     input, output, scale, M, N, M_pad, N_pad, scale_stride, scale_N, scale_M_pad, scale_N_pad,     \
-        recipe.shuffle_out, recipe.shuffle_scale, recipe.preshuffle_layout,                        \
-        recipe.preshuffle_n_tiles, recipe.preshuffle_pack, input_per_group_stride,                 \
+        recipe.shuffle_out, recipe.shuffle_scale, input_per_group_stride,                          \
         out_fp8_per_group_stride, out_scale_per_group_stride
 
 #define QUANTIZE_MXFP8_LAUNCH_KERNEL(USE_2D_BLOCK)                                                 \

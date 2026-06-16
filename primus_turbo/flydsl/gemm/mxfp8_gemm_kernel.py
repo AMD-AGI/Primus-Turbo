@@ -353,6 +353,7 @@ def _compile_mxfp8_nt(
     group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D N-band (big-N L2 reuse)
     num_xcd: int = 8,
     waves_per_eu: int = 2,
+    scale_pack: int = 1,  # 1 = broadcast scale (1-deep prefetch); >1 = opsel byte-pack
 ):
     BLOCK_K = 128
     assert GROUP_M >= 1
@@ -445,8 +446,8 @@ def _compile_mxfp8_nt(
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
 
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K)  # one dwordx4 = b0+b1 scales
+        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES, pack=scale_pack)
+        sb_s2r = ScaleBComb(B_scale, c_n, K, pack=scale_pack)  # one dwordx4 = b0+b1 scales
         store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         # Global row/col bases for the two M / N regions (region1 = +LDS half).
@@ -478,16 +479,26 @@ def _compile_mxfp8_nt(
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
-        # 1-deep scale prefetch (2-deep spills: V=256 maxed, register pressure
-        # dominated the latency-hiding benefit). Pre-load k=0, prefetch k+1, scale
-        # loads distributed across barrier sections.
-        sa0 = sa_s2r.load(sa_base0, 0)
-        sa1 = sa_s2r.load(sa_base1, 0)
-        sb_all = sb_s2r.load(sb_base0, 0)
-        sb0, sb1 = sb_all[0:2], sb_all[2:4]
+        # scale_pack==1: 1-deep broadcast prefetch (2-deep spills: V=256 maxed). Pre-
+        # load k=0, prefetch k+1, distributed across barrier sections.
+        # scale_pack>1: opsel byte-pack -> load one i32 per `scale_pack` K-iters at the
+        # loop top (held across them), pick this iter's byte via mfma.opsel.
+        if const_expr(scale_pack == 1):
+            sa0 = sa_s2r.load(sa_base0, 0)
+            sa1 = sa_s2r.load(sa_base1, 0)
+            sb_all = sb_s2r.load(sb_base0, 0)
+            sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         for k in range_constexpr(K_ITERS - 2):
-            sa0n = sa_s2r.load(sa_base0, k + 1)
+            if const_expr(scale_pack > 1):
+                mfma.opsel = k % scale_pack
+                if const_expr(k % scale_pack == 0):
+                    sa0 = sa_s2r.load(sa_base0, k // scale_pack)
+                    sa1 = sa_s2r.load(sa_base1, k // scale_pack)
+                    sb_all = sb_s2r.load(sb_base0, k // scale_pack)
+                    sb0, sb1 = sb_all[0:2], sb_all[2:4]
+            else:
+                sa0n = sa_s2r.load(sa_base0, k + 1)
 
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
@@ -501,7 +512,8 @@ def _compile_mxfp8_nt(
 
             b1_frag = b_s2r.load(b_cur1)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
-            sb_alln = sb_s2r.load(sb_base0, k + 1)  # one dwordx4 = both B regions
+            if const_expr(scale_pack == 1):
+                sb_alln = sb_s2r.load(sb_base0, k + 1)  # one dwordx4 = both B regions
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -511,7 +523,8 @@ def _compile_mxfp8_nt(
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-            sa1n = sa_s2r.load(sa_base1, k + 1)
+            if const_expr(scale_pack == 1):
+                sa1n = sa_s2r.load(sa_base1, k + 1)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -531,15 +544,24 @@ def _compile_mxfp8_nt(
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
-            sa0, sa1 = sa0n, sa1n
-            sb_all = sb_alln
-            sb0, sb1 = sb_all[0:2], sb_all[2:4]
+            if const_expr(scale_pack == 1):
+                sa0, sa1 = sa0n, sa1n
+                sb_all = sb_alln
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         # Step k = K_ITERS - 2 (sa*/sb* hold scales[K_ITERS-2]; prefetch last iter)
         k = K_ITERS - 2
-        sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
-        sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
-        sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1)
+        if const_expr(scale_pack > 1):
+            mfma.opsel = (K_ITERS - 2) % scale_pack
+            if const_expr((K_ITERS - 2) % scale_pack == 0):
+                sa0 = sa_s2r.load(sa_base0, (K_ITERS - 2) // scale_pack)
+                sa1 = sa_s2r.load(sa_base1, (K_ITERS - 2) // scale_pack)
+                sb_all = sb_s2r.load(sb_base0, (K_ITERS - 2) // scale_pack)
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
+        else:
+            sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
+            sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
+            sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1)
 
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
@@ -579,12 +601,20 @@ def _compile_mxfp8_nt(
         a_cur1, a_next1 = a_next1, a_cur1
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
-        sa0, sa1 = sa0n, sa1n
-        sb_all = sb_alln
-        sb0, sb1 = sb_all[0:2], sb_all[2:4]
+        if const_expr(scale_pack == 1):
+            sa0, sa1 = sa0n, sa1n
+            sb_all = sb_alln
+            sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         # Step k = K_ITERS - 1 (sa*/sb* already hold scales[K_ITERS-1])
         k = K_ITERS - 1
+        if const_expr(scale_pack > 1):
+            mfma.opsel = (K_ITERS - 1) % scale_pack
+            if const_expr((K_ITERS - 1) % scale_pack == 0):
+                sa0 = sa_s2r.load(sa_base0, (K_ITERS - 1) // scale_pack)
+                sa1 = sa_s2r.load(sa_base1, (K_ITERS - 1) // scale_pack)
+                sb_all = sb_s2r.load(sb_base0, (K_ITERS - 1) // scale_pack)
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -1391,6 +1421,13 @@ _MX_VMCNT = 3
 _MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,layout) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
 
+def peek_mxfp8_cfg(M, N, K, out_dtype, layout="nt"):
+    """Cached (BLOCK_M, GROUP_M, num_xcd, group_n) for this shape, or None if not
+    yet benched. Lets the quant layer fuse the A-scale preshuffle (fanout
+    n_tiles = BLOCK_M//64) only once the BLOCK_M has been picked by autotune."""
+    return _MXFP8_AUTOTUNE_CACHE.get((M, N, K, out_dtype, layout))
+
+
 # Layout -> compile factory. All three share the (BLOCK_M, GROUP_M, num_xcd)
 # candidate space and the same A-scale (ScaleS2R) / B-scale (ScaleBComb) loaders;
 # only the data path (G2S offsets / swizzle / transpose loaders / MMA form)
@@ -1444,9 +1481,15 @@ def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0):
     lk = (K, bm, gm, xcd, layout, gn)
     launch = _MXFP8_LAUNCH_CACHE.get(lk)
     if launch is None:
-        if layout == "nt":  # plain-load path, no scale-pack / asm knobs
+        if layout == "nt":  # plain-load path; opsel scale byte-pack (no asm knobs)
             launch = _LAYOUT_COMPILE[layout](
-                K=K, BLOCK_M=bm, BLOCK_N=_BLOCK_N, GROUP_M=gm, group_n=gn, num_xcd=xcd
+                K=K,
+                BLOCK_M=bm,
+                BLOCK_N=_BLOCK_N,
+                GROUP_M=gm,
+                group_n=gn,
+                num_xcd=xcd,
+                scale_pack=_mx_pack(K),
             )
         else:  # nn/tn: opsel scale byte-pack + asm B tr8 + agpr
             kwargs = dict(
@@ -1490,7 +1533,7 @@ def _autotune_mxfp8(a8, b8, out_view, a_sc_u8, b_sp, M, N, K, out_dtype, layout=
         return cached
     cands = _MXFP8_NT_CANDIDATES if layout == "nt" else _MXFP8_NN_TN_CANDIDATES
     stream = torch.cuda.current_stream()
-    pack = _mx_pack(K) if layout in ("nn", "tn") else 1  # NN/TN use opsel scale byte-pack
+    pack = _mx_pack(K)  # all layouts use opsel scale byte-pack
 
     def _time_cfg(bm, gm, xcd, gn):
         try:
@@ -1566,6 +1609,8 @@ def gemm_mxfp8_flydsl_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    scales_preshuffled: bool = False,
+    b_scales_preshuffled: bool = False,  # b already preshuffled (B-comb), a still raw
 ) -> torch.Tensor:
     """MXFP8 (per-1x32 E8M0 block-scaled) dense GEMM, gfx950.
 
@@ -1619,15 +1664,34 @@ def gemm_mxfp8_flydsl_kernel(
     assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
     assert N % 256 == 0, f"N must be a multiple of 256 (combined-B scale preshuffle), got {N}"
 
+    # Fused-preshuffle fast path: the quant kernel already emitted the scales in
+    # the FlyDSL preshuffled int32 layout, so skip the host preshuffle entirely.
+    # The per-shape cfg must already be cached (the quant layer looked it up to
+    # pick the A-scale fanout n_tiles = BLOCK_M//64), so reuse it directly.
+    if scales_preshuffled:
+        bm, gm, xcd, gn = _MXFP8_AUTOTUNE_CACHE[(M, N, K, out_dtype, layout)]
+        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+        a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
+        b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
+        launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
+        args = (as_i8_flat(a), as_i8_flat(b), out, a_sp, b_sp, M, N, torch.cuda.current_stream())
+        get_compiled(_COMPILED_MXFP8_CACHE, launch, args)(*args)
+        return out.t().contiguous() if trans_c else out
+
     # E8M0 raw bytes -> uint8 [free, K//32]; host pre-shuffle to packed int32.
-    # NN uses opsel scale byte-pack (_mx_pack); NT/TN use the broadcast preshuffle.
-    pack = _mx_pack(K) if layout in ("nn", "tn") else 1
+    # All layouts use the opsel scale byte-pack (_mx_pack).
+    pack = _mx_pack(K)
     a_sc_u8 = a_scale.contiguous().view(torch.uint8).reshape(M, K // 32)
-    b_sc_u8 = b_scale.contiguous().view(torch.uint8).reshape(N, K // 32)
-    if pack > 1:
-        b_sp = preshuffle_scale_b_comb_pack(b_sc_u8, K, pack).reshape(-1)  # BLOCK_M-independent
+    if b_scales_preshuffled:
+        # b's B-comb preshuffle is BLOCK_M-independent and was already fused into the
+        # quant (bwd path); skip the host preshuffle, A still host-preshuffled below.
+        b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
     else:
-        b_sp = preshuffle_scale_b_comb(b_sc_u8, K).reshape(-1)
+        b_sc_u8 = b_scale.contiguous().view(torch.uint8).reshape(N, K // 32)
+        if pack > 1:
+            b_sp = preshuffle_scale_b_comb_pack(b_sc_u8, K, pack).reshape(-1)
+        else:
+            b_sp = preshuffle_scale_b_comb(b_sc_u8, K).reshape(-1)
 
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     a8 = as_i8_flat(a)

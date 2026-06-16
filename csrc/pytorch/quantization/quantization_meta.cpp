@@ -202,12 +202,12 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
 }
 
-std::vector<at::Tensor>
-quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                         const int64_t padding_align_size, const bool rowwise_use_2d_block,
-                         const bool colwise_use_2d_block, const bool shuffle_rowwise_scale,
-                         const bool shuffle_rowwise, const bool shuffle_colwise_scale,
-                         const bool shuffle_colwise) {
+std::vector<at::Tensor> quantize_mxfp8_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
+    const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
+    const bool shuffle_colwise, const int64_t preshuffle_layout, const int64_t preshuffle_n_tiles,
+    const int64_t col_preshuffle_layout, const int64_t col_preshuffle_n_tiles) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
@@ -262,7 +262,17 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
     at::Tensor rowwise_scale;
-    if (shuffle_rowwise_scale) {
+    if (preshuffle_layout != 0) {
+        const int64_t ki     = rowwise_scale_N / 4;
+        const bool    bc     = (preshuffle_layout == 1 || preshuffle_layout == 3);
+        const int64_t pack   = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        const int64_t K128p  = ki / pack;
+        int64_t       dwords = (preshuffle_layout <= 2)
+                                   ? (M / (16 * preshuffle_n_tiles)) * K128p * 64 * preshuffle_n_tiles
+                                   : (M / 64) * K128p * 64 * 4;
+        rowwise_scale =
+            at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else if (shuffle_rowwise_scale) {
         rowwise_scale = at::empty({Gout * rowwise_scale_M_pad, rowwise_scale_N_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
@@ -278,7 +288,17 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
     int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
 
     at::Tensor colwise_scale;
-    if (shuffle_colwise_scale) {
+    if (col_preshuffle_layout != 0) {
+        const int64_t ki     = colwise_scale_N / 4;
+        const bool    bc     = (col_preshuffle_layout == 1 || col_preshuffle_layout == 3);
+        const int64_t pack   = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        const int64_t K128p  = ki / pack;
+        int64_t       dwords = (col_preshuffle_layout <= 2) ? (N / (16 * col_preshuffle_n_tiles)) *
+                                                            K128p * 64 * col_preshuffle_n_tiles
+                                                            : (N / 64) * K128p * 64 * 4;
+        colwise_scale =
+            at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else if (shuffle_colwise_scale) {
         colwise_scale = at::empty({Gout * colwise_scale_M_pad, colwise_scale_N_pad},
                                   at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
@@ -373,8 +393,7 @@ grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_
 std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
                                             const int64_t axis, const int64_t padding_align_size,
                                             const bool use_2d_block, const bool shuffle_scale,
-                                            const bool shuffle_out, const int64_t preshuffle_layout,
-                                            const int64_t preshuffle_n_tiles) {
+                                            const bool shuffle_out) {
     using namespace primus_turbo::detail;
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
@@ -434,20 +453,7 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
     int64_t scale_N_pad = cdiv(scale_N, 8) * 8;
 
     at::Tensor scale_tensor;
-    if (preshuffle_layout != 0) {
-        const int64_t ki    = scale_N / 4;
-        const bool    bc    = (preshuffle_layout == 1 || preshuffle_layout == 3);
-        const int64_t pack  = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
-        const int64_t K128p = ki / pack;
-        int64_t    dwords   = (preshuffle_layout <= 2) ? (scale_outer / (16 * preshuffle_n_tiles)) *
-                                                        K128p * 64 * preshuffle_n_tiles
-                                                       : (scale_outer / 64) * K128p * 64 * 4;
-        at::Tensor pout     = at::empty({scale_outer, N_pad}, // rowwise 2D fp8 output
-                                        at::TensorOptions().dtype(at::kByte).device(at::kMeta));
-        return {pout.view(dest_dtype),
-                at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta))
-                    .view(at::kFloat8_e8m0fnu)};
-    } else if (shuffle_scale) {
+    if (shuffle_scale) {
         scale_tensor = at::empty({Gout * scale_M_pad, scale_N_pad},
                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else {
