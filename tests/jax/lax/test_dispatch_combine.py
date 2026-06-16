@@ -16,6 +16,15 @@ from tests.jax.test_utils import skip_if_lt_x_gpu
 key = jax.random.PRNGKey(123)
 num_ranks = jax.local_device_count()
 
+# ---------------------------------------------------------------------------
+# NOTE: Temporarily disabled: INPROC (single-process pmap) DeepEP dispatch/combine
+# intermittently deadlocks on this XLA/ROCm stack.
+pytestmark = pytest.mark.skip(
+    reason="INPROC (single-process pmap) DeepEP dispatch/combine intermittently "
+    "deadlocks; covered by per_process tests in test_mp_dispatch_combine.py. "
+    "See module docstring/comment for the cross-device circular-wait root cause."
+)
+
 
 # ============================================================================
 # Fixtures
