@@ -34,8 +34,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.fp8_gemm_helper import (
@@ -50,7 +50,7 @@ from primus_turbo.flydsl.utils.fp8_gemm_helper import (
     ceildiv,
     compute_global_swizzle,
     compute_global_swizzle_nn,
-    make_fp8_buffer_tensor,
+    make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     mask_a_tail,
     wait_barrier,
@@ -267,14 +267,26 @@ def _compile_grouped_nn(
             wave_n = wave_id % 4
 
             m_row = m_start + local_block_m * BLOCK_M
-            A0_gl_offset = m_row * K
-            A1_gl_offset = (m_row + LDS_BLOCK_M) * K
-            b_grp = group_idx * K * c_n
-            B0_gl_offset = b_grp + block_n * BLOCK_N
-            B1_gl_offset = b_grp + block_n * BLOCK_N + LDS_BLOCK_N
+            # Fold each tile's huge element base (m_row*K for A, group/N-block for B) into
+            # the i64 SRD base so the in-tile buffer offsets stay small int32 (handles A/B
+            # > 2^31 elems / > 4GB); num_records clamps the SRD to the rest of the group.
+            cn_i = arith.index_cast(T.index, c_n)
+            a_base = arith.index_cast(T.index, m_row) * arith.index(K)
+            b_base = arith.index_cast(T.index, group_idx) * arith.index(K) * cn_i + arith.index_cast(
+                T.index, block_n * BLOCK_N
+            )
+            m_total = _load_go(go_div, G)
+            a_nrec = (arith.index_cast(T.index, m_total) - arith.index_cast(T.index, m_row)) * arith.index(K)
+            b_nrec = (arith.index(G) - arith.index_cast(T.index, group_idx)) * arith.index(
+                K
+            ) * cn_i - arith.index_cast(T.index, block_n * BLOCK_N)
+            A0_gl_offset = 0
+            A1_gl_offset = LDS_BLOCK_M * K
+            B0_gl_offset = 0
+            B1_gl_offset = LDS_BLOCK_N
 
-            gA = make_fp8_buffer_tensor(A, F8_IR_t)
-            gB = make_fp8_buffer_tensor(B, F8_IR_t)
+            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+            gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -649,15 +661,24 @@ def _compile_grouped_nt(
             wave_n = wave_id % 4
 
             m_row = m_start + local_block_m * BLOCK_M
-            A0_gl_offset = m_row * K
-            A1_gl_offset = (m_row + LDS_BLOCK_M) * K
-            # B_T is [G, N, K]; group base = group_idx*c_n*K, N-row = block_n*BLOCK_N,
-            # each N-row is K-contiguous.
-            B0_gl_offset = (group_idx * c_n + block_n * BLOCK_N) * K
-            B1_gl_offset = (group_idx * c_n + block_n * BLOCK_N + LDS_BLOCK_N) * K
+            # Fold each tile's huge element base into the i64 SRD base so the in-tile
+            # buffer offsets stay small int32 (handles A/B > 2^31 elems / > 4GB). B_T is
+            # [G, N, K]: group base group_idx*c_n*K, N-row block_n*BLOCK_N, K-contiguous.
+            cn_i = arith.index_cast(T.index, c_n)
+            a_base = arith.index_cast(T.index, m_row) * arith.index(K)
+            b_base = (
+                arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
+            ) * arith.index(K)
+            m_total = _load_go(go_div, G)
+            a_nrec = (arith.index_cast(T.index, m_total) - arith.index_cast(T.index, m_row)) * arith.index(K)
+            b_nrec = arith.index(G) * cn_i * arith.index(K) - b_base
+            A0_gl_offset = 0
+            A1_gl_offset = LDS_BLOCK_M * K
+            B0_gl_offset = 0
+            B1_gl_offset = LDS_BLOCK_N * K
 
-            gA = make_fp8_buffer_tensor(A, F8_IR_t)
-            gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+            gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -880,27 +901,6 @@ def _compile_grouped_nt(
 # ── wgrad: variable-K grouped GEMM (TN). C[g]=lhs_g^T@rhs_g; contraction m_g is
 #    per-group runtime (scf.for K-loop). Accumulators in rmem (the loop carries no
 #    objects); per-group K-tail clamp via the SRD num_records bound (over-read -> 0).
-
-
-def _make_fp8_buf_nr(arg_i8, fp8_ir_t, num_records_bytes):
-    """make_fp8_buffer_tensor with an explicit (runtime) num_records bound, so the
-    buffer SRD clamps reads past the bound to 0 — used for the per-group A/B
-    K-tail clamp (bound = m_end * OUT_{M,N}).
-
-    num_records (= m_end*OUT_{M,N}) is wave-uniform in value, but the compiler treats
-    m_end (from the per-lane group scan) as VGPR -> the SRD lands in VGPRs and every
-    K-loop buffer_load gets a readfirstlane/saveexec waterfall. readfirstlane pins
-    num_records to an SGPR so the SRD stays scalar."""
-    num_records_bytes = _readfirstlane_i32(num_records_bytes)
-    t_i8 = fx.rocdl.make_buffer_tensor(arg_i8, max_size=False, num_records_bytes=num_records_bytes)
-    iter_i8 = fx.get_iter(t_i8)
-    f8_buf_ptr_ty = fx.PointerType.get(
-        elem_ty=fp8_ir_t,
-        address_space=TargetAddressSpace.BufferDesc,
-        alignment=fx.PointerType(iter_i8.type).alignment,
-    )
-    iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
-    return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
 
 
 def _wgrad_accum(mfma, a_frags, b_frags, acc_regs):
@@ -1151,10 +1151,14 @@ def _compile_grouped_tn_wgrad_masked(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        a_nr = m_end * OUT_M
-        b_nr = m_end * OUT_N
-        gA = _make_fp8_buf_nr(A, F8_IR_t, a_nr)
-        gB = _make_fp8_buf_nr(B, F8_IR_t, b_nr)
+        # Fold m_start*OUT_{M,N} into the i64 SRD base (handles A/B > 2^31 elems / > 4GB
+        # across stacked groups); num_records = M_g*OUT_{M,N} keeps the masked over-run
+        # SRD-clamp. The per-group contraction (m_end-m_start) stays in int32 offsets.
+        a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
+        b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
+        mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
+        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
+        gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -1195,9 +1199,9 @@ def _compile_grouped_tn_wgrad_masked(
                 A_scale, B_scale, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
             )
 
-        A0_off = m_start * OUT_M + block_m * BLOCK_M
+        A0_off = block_m * BLOCK_M  # relative to the m_start-folded SRD base
         A1_off = A0_off + LDS_BLOCK_M
-        B0_off = m_start * OUT_N + block_n * BLOCK_N
+        B0_off = block_n * BLOCK_N
         B1_off = B0_off + LDS_BLOCK_N
         AM = BLOCK_K * OUT_M
         BNs = BLOCK_K * OUT_N
@@ -1554,12 +1558,14 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     capped = num_cu is not None and num_cu > 0
     nonpersist = not capped
     at_key = (op, N, K, G, out_fp16, cbsz, blgp, M_total, nonpersist, num_cu if capped else 0)
-    a_i8 = a.view(torch.int8).reshape(-1)
-    b_i8 = b.view(torch.int8).reshape(-1)
+    # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack
+    # when M_total*K / G*N*K > 2^31; the kernel re-bases A/B via i64 base.
+    a_i8 = a.view(torch.int8)
+    b_i8 = b.view(torch.int8)
     args = (
         a_i8,
         b_i8,
-        out.view(-1),
+        out,
         a_scale.float().reshape(1),
         b_scale.float().reshape(1),
         go32,
@@ -1697,8 +1703,10 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     cbsz = 1 if lhs.dtype == torch.float8_e5m2 else 0
     blgp = 1 if rhs.dtype == torch.float8_e5m2 else 0
 
-    lhs_i8 = lhs.view(torch.int8).reshape(-1)
-    rhs_i8 = rhs.view(torch.int8).reshape(-1)
+    # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack
+    # when M_total*OUT_{M,N} > 2^31.
+    lhs_i8 = lhs.view(torch.int8)
+    rhs_i8 = rhs.view(torch.int8)
     lsf = lhs_scale.float().reshape(1)
     rsf = rhs_scale.float().reshape(1)
     stream = torch.cuda.current_stream()
@@ -1714,7 +1722,8 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     #    persistent-strided), so it can't reserve CUs for comm-overlap.
     M_total = lhs.shape[0]
     at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, M_total)
-    wargs = (lhs_i8, rhs_i8, out.view(-1), lsf, rsf, go32, stream)
+    # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view).
+    wargs = (lhs_i8, rhs_i8, out.view(G * OUT_M, OUT_N), lsf, rsf, go32, stream)
     launch = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if launch is None:
         launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, M_total)

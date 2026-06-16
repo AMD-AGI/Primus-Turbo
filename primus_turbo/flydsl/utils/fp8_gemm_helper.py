@@ -22,6 +22,12 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _as_index(v):
+    # c_rows/c_cols may be a runtime value (dense/grouped NT/NN: N, m_end) or a
+    # compile-time int (wgrad CShuffle: OUT_N). Coerce both to an MLIR index.
+    return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
+
+
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     # max_size=False (no num_records_bytes): the buffer descriptor adapts to the
     # actual tensor extent instead of baking the first call's shape into IR.
@@ -34,6 +40,37 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     )
     iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
     return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
+
+
+def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
+    """make_fp8_buffer_tensor with the SRD base advanced by ``base_elems`` (fp8/int8
+    = 1 byte/elem), in 64-bit. Folds a per-tile huge element offset into the
+    descriptor base so the buffer voffset/soffset stay small int32 -> addresses
+    inputs > 2^31 elems / > 4GB that the flat-shape pack and 32-bit voffset cannot.
+    ``num_records_bytes`` bounds the SRD from the shifted base (HW OOB clamp)."""
+    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg_i8))
+    # Pin the (wave-uniform) shifted base + num_records to SGPRs: the per-tile base from
+    # the group scan reads as VGPR to divergence analysis -> a VGPR SRD -> a readfirstlane
+    # waterfall on every K-loop buffer_load. readfirstlane keeps the SRD scalar.
+    base = _readfirstlane_i32(base + arith.index_cast(T.i64, base_elems))
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    flags = _buffer_ops._get_buffer_flags()
+    # global int8 ptr at the shifted addr -> int8 BufferDesc fat ptr -> recast fp8.
+    base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
+    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
+    buf_ptr = fx.make_ptr(
+        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
+    )
+    lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
+    iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
+    f8_buf_ptr_ty = fx.PointerType.get(
+        elem_ty=fp8_ir_t,
+        address_space=TargetAddressSpace.BufferDesc,
+        alignment=fx.PointerType(iter_i8.type).alignment,
+    )
+    iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
+    return fx.Tensor(fx.make_view(iter_f8, lay))
 
 
 def swizzle_128(row, col):
@@ -204,43 +241,45 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        c_nbytes = c_rows * c_cols * 2  # bf16 / fp16 output = 2 bytes
-        # Pin num_records to SGPR: m_end (from the per-tile group scan) is uniform across
-        # the wave but divergence-analyzed as VGPR, forcing a per-store waterfall; a
-        # uniform SRD avoids it.
-        c_nbytes = _readfirstlane_i32(c_nbytes)
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        # C addressed via i64 per-tile re-basing (handles M*N > 2^31 / >4GB output);
+        # pass C as 2D so its shape packs within int32.
+        self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
         gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
         self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
-        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
 
     def _load_scalar(self, div):
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
-    def _store_one(self, value, c_index):
-        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
-        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
-
     def store(self, c_frag, base_row, base_col):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
+        # Re-base output at this row band (64-bit index) so the per-store byte offset stays
+        # a small int32; clamp band base to [0, c_rows] (row_c==c_rows -> 0 records -> OOB
+        # drop) and num_records to the 32-bit SRD field.
+        out_b = 2  # bf16/fp16 = 2 bytes
+        cols_i = _as_index(self.c_cols)
+        row_i = _as_index(base_row)
+        rows_i = _as_index(self.c_rows)
+        row_c = arith.minui(row_i, rows_i)
+        band_base = self.c_base + row_c * cols_i * arith.index(out_b)
+        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0xFFFFFFFF))
+        rsrc = _buffer_ops.create_buffer_resource_from_addr(
+            arith.index_cast(T.i64, band_base), num_records_bytes=nrec
+        )
         for ti in range_constexpr(self.n_tiles_a):
-            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = col < self.c_cols
-                oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     scaled = (vec_f32[i] * scale).to(self.out_ty)
-                    c_index = (row + i) * self.c_cols + col
-                    self._store_one(scaled, arith.select(col_valid, c_index, oob))
+                    off = ((row_local + i) * self.c_cols + col) * out_b  # i32-small within band
+                    _buffer_ops.buffer_store(scaled, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
 
 class StoreCPerTensorCShuffle:
@@ -280,17 +319,15 @@ class StoreCPerTensorCShuffle:
         self.row_stride = self.Cc  # logical == physical (no anti-conflict padding)
         self.wave_lds_elems = 16 * self.row_stride  # per-wave staging (one 16-row tile)
         self.c_lds = c_lds
-        c_nbytes = _readfirstlane_i32(c_rows * c_cols * 2)  # bf16/fp16 = 2 bytes
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
+        # the final 128b store re-bases at each 16-row sub-tile band (see store()).
+        self.c_base = _buffer_ops.extract_base_index(C)
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
         gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
-        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
         self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-        self.out_atom_v = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_ty)
-        self.reg_out_v = fx.make_rmem_tensor(fx.make_layout(self.EPL, 1), out_ty)
         # addr-space 2 (LDS), mirroring G2SLoader.LdsPtr_t. Separate scalar-store
         # (align 2) and vector-read (align 16) pointer types.
         self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
@@ -304,7 +341,9 @@ class StoreCPerTensorCShuffle:
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
         wave_off = self.wave_id * self.wave_lds_elems  # element offset of this wave's region
-        oob = fx.Int32(self.c_rows * self.c_cols)
+        out_b = 2  # bf16/fp16 = 2 bytes
+        cols_i = _as_index(self.c_cols)
+        rows_i = _as_index(self.c_rows)
         for ti in range_constexpr(self.n_tiles_a):
             # --- stage this 16-row sub-tile row-major into the per-wave LDS region ---
             for tj in range_constexpr(self.n_tiles_b):
@@ -317,20 +356,25 @@ class StoreCPerTensorCShuffle:
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(val)
             S2RLoaderTr._wait_lgkmcnt(0)
-            # --- re-read N-contiguous (one EPL-col run per lane) + vectorized store ---
-            # (row,col)-aware so row_pad (anti-bank-conflict padding) is skipped;
-            # logical layout is Cc-wide, physical row stride is self.row_stride.
+            # --- re-base output at this 16-row band (i64), then re-read N-contiguous (one
+            # EPL-col run per lane) + one vectorized 128b store at a small in-band i32 byte
+            # offset. Row validity is enforced by the band num_records (HW OOB drop). ---
+            band_row = arith.index_cast(T.index, base_row + ti * 16)
+            row_c = arith.minui(band_row, rows_i)
+            band_base = self.c_base + row_c * cols_i * arith.index(out_b)
+            nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0xFFFFFFFF))
+            rsrc = _buffer_ops.create_buffer_resource_from_addr(
+                arith.index_cast(T.i64, band_base), num_records_bytes=nrec
+            )
             row_in = (self.lane_id * self.EPL) // self.Cc
             col_in = (self.lane_id * self.EPL) % self.Cc
             lane_e = wave_off + row_in * self.row_stride + col_in
             rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
             vec = fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load()
-            fx.memref_store_vec(vec, self.reg_out_v)
-            grow = base_row + ti * 16 + row_in
             gcol = base_col + col_in
             valid = (gcol + fx.Int32(self.EPL)) <= self.c_cols
-            g_idx = arith.select(valid, grow * self.c_cols + gcol, oob)
-            fx.copy(self.out_atom_v, self.reg_out_v, fx.slice(self.c_div, (None, g_idx)))
+            off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
+            _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
