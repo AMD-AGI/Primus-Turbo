@@ -40,6 +40,16 @@ namespace mega_moe {
 #define MEGA_MOE_XOP_B0_PREFETCH 0
 #endif
 
+// PROBE (default 0): turbo-tile k-loop -- a 2-stage cur/next LDS double buffer
+// (kNumStages=2) with shifted-LDG (issue k+2's tile back into the just-read
+// `cur` slot) + partial wait_vmcnt to keep k+1 in flight, mirroring
+// GEMM_Tile_MXFP8_NT_256x256x128's pipeline.  Keeps FP8xFP4 + Is2B + the
+// persistent megakernel; replaces the >=4-stage full-drain loop.  When on,
+// jit_launch.cu forces KNUMSTAGES=2.
+#ifndef MEGA_MOE_TURBO_PIPE
+#define MEGA_MOE_TURBO_PIPE 0
+#endif
+
 enum class MegaMoEArch : uint32_t {
     Unknown = 0,
     Gfx942  = 942,
@@ -912,17 +922,37 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                         const uint32_t sfb_op_n_base =
                             sfb_n_global_base + b_op * kIntermediateHidden;
                         uint32_t *sfb_lds_op = sfb_lds + b_op * BLOCK_N;
+                        // K-major weight-SF: [E][k_block][N] -> consecutive n
+                        // (lanes) are CONTIGUOUS -> coalesced 4B load (vs the
+                        // n-major scatter at stride K/32).  Offline transpose
+                        // in the test matches this layout.
+                        const uint32_t sfb_N =
+                            (phase == sched::BlockPhase::Linear1) ? L1_SHAPE_N : L2_SHAPE_N;
+#if MEGA_MOE_TURBO_PIPE
+                        // Warp-uniform SFB: each warp loads BLOCK_N/nwarps
+                        // contiguous cols (identical LDS result) so every wave
+                        // issues the SAME vmem count -> a single compile-time
+                        // wait_vmcnt drains one k_block in the 2-stage loop.
+                        constexpr uint32_t kSfbColsPerWarp = BLOCK_N / kNumMMANonEpilogueWarps;
+                        static_assert(BLOCK_N % kNumMMANonEpilogueWarps == 0u,
+                                      "BLOCK_N must split evenly across warps for SFB");
+#pragma unroll
+                        for (uint32_t cc = lane_idx; cc < kSfbColsPerWarp; cc += kWarpSize) {
+                            const uint32_t c        = loader_warp_local * kSfbColsPerWarp + cc;
+                            const uint32_t n_global = sfb_op_n_base + c;
+                            const uint32_t off      = local_expert_idx * sfb_expert_stride_bytes +
+                                                 k_block * (sfb_N * 4u) + n_global * 4u;
+                            device::load_gmem_to_smem_srd<4>(
+                                srd_sfb, off,
+                                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sfb_lds_op + c)),
+                                0);
+                        }
+#else
 #pragma unroll
                         for (uint32_t c = loader_warp_local * kWarpSize + lane_idx; c < BLOCK_N;
                              c += kNumMMANonEpilogueWarps * kWarpSize) {
                             const uint32_t n_global = sfb_op_n_base + c;
-                            // K-major weight-SF: [E][k_block][N] -> consecutive n
-                            // (lanes) are CONTIGUOUS -> coalesced 4B load (vs the
-                            // n-major scatter at stride K/32).  Offline transpose
-                            // in the test matches this layout.
-                            const uint32_t sfb_N =
-                                (phase == sched::BlockPhase::Linear1) ? L1_SHAPE_N : L2_SHAPE_N;
-                            const uint32_t off = local_expert_idx * sfb_expert_stride_bytes +
+                            const uint32_t off      = local_expert_idx * sfb_expert_stride_bytes +
                                                  k_block * (sfb_N * 4u) + n_global * 4u;
                             // global->LDS direct (vmcnt), same dest sfb_lds_op[c].
                             device::load_gmem_to_smem_srd<4>(
@@ -930,6 +960,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                                 static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sfb_lds_op + c)),
                                 0);
                         }
+#endif
                     }
                 }
             };
@@ -1159,6 +1190,59 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                     }
                 }; // do_burst
 
+#if MEGA_MOE_TURBO_PIPE
+                // ── turbo 2-stage shifted-LDG pipeline (GEMM_Tile_MXFP8 style) ──
+                // One k_block per iteration into a cur/next LDS double buffer.  After
+                // reading stage `cur`, the next-but-one k_block's tile is issued back
+                // into `cur` (shifted-LDG) so its load overlaps the following MFMA; a
+                // partial wait_vmcnt<kVmem*> drains ONLY the oldest stage, keeping the
+                // next k_block in flight.  This relies on in-order buffer_load_lds
+                // completion (the old >=4-stage loop avoided partial vmcnt for that
+                // reason -- gate-3 cos is the correctness check).
+                static_assert(kLoaderStages == 2u,
+                              "turbo pipe is a cur/next double buffer -- set kNumStages=2");
+                static_assert(kBTileLoadsPerWave % kNumMMANonEpilogueWarps == 0u,
+                              "B loads must split evenly across warps for a uniform vmcnt");
+                constexpr uint32_t kWarpBLoads = kBTileLoadsPerWave / kNumMMANonEpilogueWarps;
+                constexpr uint32_t kSfaLoadsPerWarp =
+                    (kRowsPerLoaderWave + kWarpSize - 1u) / kWarpSize;
+                constexpr uint32_t kSfbColsPerWarp = BLOCK_N / kNumMMANonEpilogueWarps;
+                constexpr uint32_t kSfbLoadsPerWarp =
+                    (kSfbColsPerWarp + kWarpSize - 1u) / kWarpSize;
+                // per-wave vmem ops issued for ONE k_block's tile (A + B + SF):
+                constexpr uint32_t kVmemL2 = kATileLoadsPerWave + kWarpBLoads + kSfbLoadsPerWarp;
+                constexpr uint32_t kVmemL1 = kATileLoadsPerWave + 2u * kWarpBLoads +
+                                             kSfaLoadsPerWarp + 2u * kSfbLoadsPerWarp;
+
+                // stage-0/1 prologue loads (k0->stage0, k1->stage1) by kloop_prologue.
+                for (uint32_t k_block = 0u; k_block < num_k_blocks; ++k_block) {
+                    const uint32_t cur = k_block & 1u;
+
+                    // RAW: drain stage `cur` (this k_block).  Steady state leaves the
+                    // next k_block's loads in flight; the last two tiles drain fully.
+                    if (k_block + 2u < num_k_blocks) {
+                        if (phase == sched::BlockPhase::Linear1)
+                            device::wait_vmcnt<kVmemL1>();
+                        else
+                            device::wait_vmcnt<kVmemL2>();
+                    } else {
+                        device::wait_vmcnt<0>();
+                    }
+                    device::wait_lgkmcnt<0>();
+                    __syncthreads(); // publish shared-B for stage cur
+
+                    // MFMA burst over stage cur (no drip; loads issued explicitly below).
+                    do_burst(k_block, cur, 0u, 0u, false);
+
+                    // WAR: stage cur fully consumed -> safe to overwrite with k_block+2.
+                    device::wait_lgkmcnt<0>();
+                    __syncthreads();
+                    if (k_block + 2u < num_k_blocks) {
+                        issue_ab(cur, k_block + 2u);
+                        issue_sf(cur, k_block + 2u);
+                    }
+                }
+#else
                 // k_block overlap: load two B-stages (k, k+1), drain with a
                 // single full wait_vmcnt<0>, publish with ONE __syncthreads(), then
                 // issue BOTH MFMA bursts back-to-back so the matrix pipe stays fed.
@@ -1195,6 +1279,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void gfx950_fp8_fp4_mega_moe_kernel
                         do_burst(k_block + 1u, s1, (k_block + 3u) % kLoaderStages, k_block + 3u,
                                  k_block + 3u < num_k_blocks);
                 }
+#endif
             };
 
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;

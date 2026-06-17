@@ -221,6 +221,12 @@ extern "C" void mega_moe_jit_compute_layout(int num_ranks, int num_experts,
 #define MEGA_MOE_JIT_KNUMSTAGES 2u
 #define MEGA_MOE_JIT_KNUMSMS 512u
 #endif
+// turbo shifted-LDG pipe is a cur/next double buffer -> 2 stages.
+#if defined(MEGA_MOE_TURBO_PIPE) && (MEGA_MOE_TURBO_PIPE + 0)
+#ifndef MEGA_MOE_JIT_KNUMSTAGES
+#define MEGA_MOE_JIT_KNUMSTAGES 2u
+#endif
+#endif
 #ifndef MEGA_MOE_JIT_KNUMSTAGES
 #define MEGA_MOE_JIT_KNUMSTAGES 4u
 #endif
