@@ -9,7 +9,7 @@
 Covers the forward (NT: out = a @ b^T) and dgrad (NN: grad_a = grad_out @ b)
 of grouped/MoE GEMM, where A is [M_total, K] (groups concatenated along M),
 B is [G, N, K] (per-group weights), out is [M_total, N], and
-``group_offs`` [G+1] int32 splits M_total into G groups.
+``group_offs`` [G+1] int64 splits M_total into G groups (passed as an int32 view; see _load_go).
 
 Design (CPU-sync-free, reuses the dense kernel body verbatim):
   * Grid is over-launched to a host upper bound
@@ -191,7 +191,7 @@ def _compile_grouped_nn(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        group_offs: fx.Tensor,  # int32 [G+1]
+        group_offs: fx.Tensor,  # int32 view of int64 [G+1]; _load_go reads low word at i32[2*idx]
         c_n: fx.Int32,
     ):
         _ = str(fx.thread_idx.x)  # materialize before S2RLoaderTr (dense NN note)
@@ -584,7 +584,7 @@ def _compile_grouped_nt(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        group_offs: fx.Tensor,  # int32 [G+1]
+        group_offs: fx.Tensor,  # int32 view of int64 [G+1]; _load_go reads low word at i32[2*idx]
         c_n: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
