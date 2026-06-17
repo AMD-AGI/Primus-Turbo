@@ -40,7 +40,7 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.utils.fp8_gemm_helper import (
+from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,
