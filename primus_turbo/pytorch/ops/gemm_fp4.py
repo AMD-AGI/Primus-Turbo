@@ -21,10 +21,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
-    enable_preshuffle,
-    gemm_fp4_impl,
-)
+from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
 
 __all__ = ["gemm_fp4"]
 
@@ -56,7 +53,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
-        preshuffle = enable_preshuffle()
+        preshuffle = config.use_preshuffle
 
         a_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
@@ -186,7 +183,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
 
-        preshuffle = enable_preshuffle()
+        preshuffle = ctx.config.use_preshuffle
         default_backend = (BackendType.AITER if preshuffle else BackendType.HIPBLASLT).value
 
         quantized_grad_out = QuantizedTensor.quantize(
@@ -287,11 +284,8 @@ def gemm_fp4(
         is checked by :func:`check_quantized_tensor` via strict equality.
         Under the AITER backend the recipe includes
         ``shuffle_scale`` / ``shuffle_out`` flags derived from
-        :func:`primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl.enable_preshuffle`.
         Recommended pattern::
 
-            from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import enable_preshuffle
-            preshuffle = enable_preshuffle()
             a_recipe = ScalingRecipe(
                 use_2d_block=False, use_sr=False, use_rht=False,
                 shuffle_scale=preshuffle, shuffle_out=False,

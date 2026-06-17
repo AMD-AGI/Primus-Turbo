@@ -137,6 +137,7 @@ class GEMMFP4AITERBackend(KernelBackend):
 
     AITER_FP4GEMM_M_MULTIPLE = 16
     AITER_FP4GEMM_N_MULTIPLE = 16
+    AITER_FP4GEMM_K_MULTIPLE = 32
 
     @staticmethod
     def can_handle(
@@ -163,6 +164,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         supported &= (
             a.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_M_MULTIPLE == 0
             and b.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_N_MULTIPLE == 0
+            and a.size(1) * 2 % GEMMFP4AITERBackend.AITER_FP4GEMM_K_MULTIPLE == 0
         )
 
         return supported
@@ -210,20 +212,6 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, preshuffled=False, **kwargs):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
         return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, preshuffled)
-
-
-def enable_preshuffle() -> bool:
-    """True iff the AITER FP4 preshuffle fast path is safe.
-
-    Requires: (1) FP4 backend explicitly pinned to AITER (the
-    only backend that understands the shuffled layout), and
-    (2) autotune is disabled (AITER opts out of tuning, so
-    the tuner cannot select a backend for preshuffled inputs).
-    """
-    return (
-        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.AITER
-        and not GlobalBackendManager.auto_tune_enabled()
-    )
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")

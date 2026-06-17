@@ -58,7 +58,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void shuffle_e8m0_scale_16x16_ke
     const int64_t r0_base = static_cast<int64_t>(row0) * N;
     const int64_t r1_base = static_cast<int64_t>(row1) * N;
 
-    const uint8_t pad = E8M0_EXPONENT_BIAS;
+    const uint8_t pad = 0;
     uint8_t       b0  = (r0_ok && c0_ok) ? x[r0_base + col0] : pad; // i1=0, i4=0
     uint8_t       b1  = (r1_ok && c0_ok) ? x[r1_base + col0] : pad; // i1=1, i4=0
     uint8_t       b2  = (r0_ok && c1_ok) ? x[r0_base + col1] : pad; // i1=0, i4=1
