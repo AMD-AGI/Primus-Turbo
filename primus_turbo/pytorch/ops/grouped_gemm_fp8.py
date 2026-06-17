@@ -530,36 +530,23 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                         # it into main_grad with add_.  This preserves the
                         # grad_added_to_main_grad contract for Megatron DDP.
 
-                        # wgrad = grouped_gemm_fp8_variable_k_impl(
-                        #     a_fp8,
-                        #     grad_out_fp8,
-                        #     a_scale_inv,
-                        #     grad_out_scale_inv,
-                        #     group_lens,
-                        #     group_offs,
-                        #     trans_a=not ctx.trans_a,
-                        #     trans_b=False,
-                        #     trans_c=ctx.trans_b,
-                        #     out_dtype=ctx.out_dtype,
-                        #     granularity=ctx.config.granularity.value,
-                        #     num_cu=ctx.num_cu,
-                        #     default_backend=BackendType.CK.value,
-                        #     is_bwd=True,
-                        # )
-                        # main_grad_view.add_(wgrad)
-                        from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
-                            grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
-                        )
-                        grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
-                            lhs_fp8,
-                            rhs_fp8,
-                            lhs_scale,
-                            rhs_scale,
+                        wgrad = grouped_gemm_fp8_variable_k_impl(
+                            a_fp8,
+                            grad_out_fp8,
+                            a_scale_inv,
+                            grad_out_scale_inv,
+                            group_lens,
                             group_offs,
+                            trans_a=not ctx.trans_a,
+                            trans_b=False,
+                            trans_c=ctx.trans_b,
                             out_dtype=ctx.out_dtype,
-                            out=main_grad_view,
-                            beta=1.0,
+                            granularity=ctx.config.granularity.value,
+                            num_cu=ctx.num_cu,
+                            default_backend=BackendType.CK.value,
+                            is_bwd=True,
                         )
+                        main_grad_view.add_(wgrad)
                     else:
                         # Local import to avoid a top-level dependency on the
                         # Triton kernel module (matches the pattern used in

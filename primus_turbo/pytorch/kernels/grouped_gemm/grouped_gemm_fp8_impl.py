@@ -442,6 +442,7 @@ def _asm_co_module_launch(
     device: torch.device,
     label: str,
     lds_bytes: int = _ASM_CO_LDS_BYTES,
+    threads: int = _ASM_CO_THREADS,
 ) -> None:
     hip = _get_libhip()
     arg_size = ctypes.c_size_t(96)
@@ -461,7 +462,7 @@ def _asm_co_module_launch(
         grid_cu,
         1,
         1,
-        _ASM_CO_THREADS,
+        threads,
         1,
         1,
         lds_bytes,
@@ -919,9 +920,10 @@ _ASM_CO_WGRAD_SITES = {
     (2880, 2880),  # down_wgrad
 }
 
-# ── ASM .co wgrad launcher (variable-K) ─────────────────────────────────────
-_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/variable_k_wgrad_mega.co"
-_ASM_CO_WGRAD_KERNEL_NAME = "_grouped_variable_k_gemm_kernel"
+# ── ASM .co wgrad launcher (variable-K, dot_scaled MFMA 32x32x64) ───────────
+_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2.co"
+_ASM_CO_WGRAD_KERNEL_NAME = "grouped_variable_k_dot_scaled_kernel"
+_ASM_CO_WGRAD_THREADS = 1024
 
 _ASM_CO_WGRAD_MODULE: ctypes.c_void_p | None = None
 _ASM_CO_WGRAD_FUNC: ctypes.c_void_p | None = None
@@ -1006,6 +1008,7 @@ def _launch_asm_co_wgrad_variable_k(
         num_cu,
         lhs.device,
         f"wgrad OUT_M={out_m}, OUT_N={out_n}",
+        threads=_ASM_CO_WGRAD_THREADS,
     )
     return out
 
