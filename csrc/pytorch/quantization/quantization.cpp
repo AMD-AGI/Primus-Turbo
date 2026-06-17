@@ -654,9 +654,14 @@ std::vector<at::Tensor> quantize_mxfp8_dual(
             PRIMUS_TURBO_CHECK(M % (16 * preshuffle_n_tiles) == 0,
                                "preshuffle A: free dim must be a multiple of 16*n_tiles");
             dwords = (M / (16 * preshuffle_n_tiles)) * K128p * 64 * preshuffle_n_tiles;
-        } else { // B: combined 4 sub-tiles per 64-row group
-            PRIMUS_TURBO_CHECK(M % 256 == 0, "preshuffle B: free dim must be a multiple of 256");
-            dwords = (M / 64) * K128p * 64 * 4;
+        } else { // B: combined 4 sub-tiles per 64-row group; grp = (free/256)*4 + wn.
+            // The grp index is block-strided (jumps by 4 every 256), so the buffer must
+            // be sized by the *block count* cdiv(free,256)*4 groups, not free/64. A
+            // partial last 256-block (free%256!=0) writes only its valid wn groups; the
+            // gemm's ScaleBComb mirrors this size and StoreC clamps the OOB-col output.
+            // free%256==0 -> cdiv(free,256)*4 == free/64, so no change for aligned shapes.
+            PRIMUS_TURBO_CHECK(M % 64 == 0, "preshuffle B: free dim must be a multiple of 64");
+            dwords = cdiv(M, 256) * 4 * K128p * 64 * 4;
         }
         // pack==2 leaves bytes 2,3 of each i32 unwritten, but the gemm samples only
         // the opsel-selected byte (pack==2 reads bytes 0,1), so the high bytes are
@@ -705,10 +710,10 @@ std::vector<at::Tensor> quantize_mxfp8_dual(
             PRIMUS_TURBO_CHECK(N % (16 * col_preshuffle_n_tiles) == 0,
                                "col preshuffle A: free dim must be a multiple of 16*n_tiles");
             dwords = (N / (16 * col_preshuffle_n_tiles)) * K128p * 64 * col_preshuffle_n_tiles;
-        } else { // B: combined 4 sub-tiles per 64-row group
-            PRIMUS_TURBO_CHECK(N % 256 == 0,
-                               "col preshuffle B: free dim must be a multiple of 256");
-            dwords = (N / 64) * K128p * 64 * 4;
+        } else { // B: combined 4 sub-tiles per 64-row group; grp = (free/256)*4 + wn.
+            // Block-strided grp -> size by block count cdiv(free,256)*4 (see rowwise B).
+            PRIMUS_TURBO_CHECK(N % 64 == 0, "col preshuffle B: free dim must be a multiple of 64");
+            dwords = cdiv(N, 256) * 4 * K128p * 64 * 4;
         }
         // gemm reads only the opsel-selected byte; high bytes never sampled -> empty.
         colwise_scale =

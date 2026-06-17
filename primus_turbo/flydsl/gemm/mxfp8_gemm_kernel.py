@@ -87,108 +87,6 @@ def _asm_mma_scale_do(a, b, c, sa, sb, opsel):
     return Vec(op.result)
 
 
-def preshuffle_scale(e8m0_u8, K, n_tiles):
-    """Host-side E8M0 scale pre-shuffle for the mxfp8 8-wave kernel.
-
-    ``n_tiles`` = the per-wave sub-tile fan-out the kernel loads together in one
-    vectorized dword{n_tiles} (A: BLOCK_M//64, B: BLOCK_N//128).
-
-    Input : uint8 [DIM, K//32] row-major E8M0 (DIM multiple of 16*n_tiles).
-    Output: int32 [DIM//(16*n_tiles), K//128, 64, n_tiles] where
-        SP[grp, k, lane, s] = broadcast( scale[grp*16*n_tiles + s*16 + lane%16,
-                                               4k + lane//16] )
-    so a wave reads its ``n_tiles`` sub-tile scales for (grp, k) as one coalesced
-    vector load of ``n_tiles`` contiguous dwords per lane, directly usable as the
-    MFMA scale operand (opsel==0 reads byte 0; broadcast => byte-position safe).
-    """
-    DIM, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0
-    assert DIM % (16 * n_tiles) == 0, f"DIM={DIM} must be multiple of {16 * n_tiles}"
-    K128 = K // 128
-    G = DIM // (16 * n_tiles)
-    s = e8m0_u8.reshape(G, n_tiles, 16, K128, 4)  # [grp, s, r, k, g]
-    s = s.permute(0, 3, 4, 2, 1).reshape(G, K128, 64, n_tiles)  # [grp,k,g,r,s] -> one copy
-    # broadcast each E8M0 byte into all 4 bytes of the dword (s*0x01010101)
-    return s.to(torch.int32).mul_(0x01010101)
-
-
-_B_COMB_COLIDX_CACHE: dict = {}  # device -> [256] gather index (col256 = wn*32 + OFF[si] + r)
-
-
-def _b_comb_colidx(device):
-    """Cached column-gather index for preshuffle_scale_b_comb. Constant (shape-
-    independent: always the 256-col bijection), so build once per device on the
-    GPU instead of materializing torch.arange on CPU + syncing every call."""
-    ci = _B_COMB_COLIDX_CACHE.get(device)
-    if ci is None:
-        wn = torch.arange(4, device=device).view(4, 1, 1)
-        r = torch.arange(16, device=device).view(1, 1, 16)
-        off = torch.tensor([0, 16, 128, 144], device=device).view(1, 4, 1)
-        ci = (wn * 32 + off + r).reshape(-1)  # [wn, si, r] flattened
-        _B_COMB_COLIDX_CACHE[device] = ci
-    return ci
-
-
-def preshuffle_scale_b_comb(e8m0_u8, K):
-    """Combined-B E8M0 pre-shuffle: pack BOTH N-regions' (b0,b1) 4 sub-tiles for a
-    wave into one dword{4}, so the kernel issues a single dwordx4 for all B scales
-    per K-iter (vs two loads). Requires N % 256 == 0.
-
-    A wave's 4 B sub-tiles sit at cols c+{0,16,128,144} (b0: 0,16; b1: 128,144),
-    c = block_n*256 + wave_n*32. Output int32 [N//64, K//128, 64, 4]:
-        SP[grp, k, lane, s] = broadcast( scale[c + OFF[s] + lane%16, 4k + lane//16] )
-    grp = block_n*4 + wave_n;  OFF = [0,16,128,144].
-    """
-    N, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0 and N % 256 == 0
-    K128 = K // 128
-    colidx = _b_comb_colidx(e8m0_u8.device)  # cached GPU index (no per-call CPU arange/sync)
-    s = e8m0_u8.reshape(N // 256, 256, K128, 4)  # [nblk, col256, k, g]
-    g = s[:, colidx, :, :].reshape(N // 256, 4, 4, 16, K128, 4)  # [nblk, wn, si, r, k, g]
-    g = g.permute(0, 1, 4, 5, 3, 2).reshape(N // 64, K128, 64, 4)  # grp=nblk*4+wn, lane=g*16+r
-    # broadcast E8M0 byte into the dword (see preshuffle_scale).
-    return g.to(torch.int32).mul_(0x01010101)
-
-
-def preshuffle_scale_pack(e8m0_u8, K, n_tiles, pack):
-    """Byte-PACKED A-scale preshuffle: identical lane layout to ``preshuffle_scale``
-    but instead of broadcasting one E8M0 byte into all 4 dword bytes, pack ``pack``
-    consecutive K-iters' scales into bytes 0..pack-1 of the i32. The kernel then
-    loads one i32 per ``pack`` K-iters and the MMA at K-iter k uses opsel=k%pack to
-    select byte (k%pack) -> pack-fold fewer scale VMEM transactions. Output int32
-    [DIM//(16*n_tiles), K//(128*pack), 64, n_tiles]. pack in {1,2,4}; pack=1 ==
-    broadcast (preshuffle_scale). Requires (K//128) % pack == 0."""
-    DIM, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0
-    K128 = K // 128
-    assert K128 % pack == 0, f"K_ITERS={K128} must be a multiple of pack={pack}"
-    G = DIM // (16 * n_tiles)
-    s = e8m0_u8.reshape(G, n_tiles, 16, K128, 4).permute(0, 3, 4, 2, 1)  # [grp,k,g,r,s]
-    s = s.reshape(G, K128 // pack, pack, 64, n_tiles)  # [grp, kg, j, lane, s]
-    out = torch.zeros(G, K128 // pack, 64, n_tiles, dtype=torch.int32, device=e8m0_u8.device)
-    for j in range(pack):  # byte j = K-iter kg*pack + j (read via opsel=j)
-        out |= s[:, :, j].to(torch.int32) << (8 * j)
-    return out
-
-
-def preshuffle_scale_b_comb_pack(e8m0_u8, K, pack):
-    """Byte-PACKED combined-B scale preshuffle (see preshuffle_scale_pack +
-    preshuffle_scale_b_comb). Output int32 [N//64, K//(128*pack), 64, 4]."""
-    N, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0 and N % 256 == 0
-    K128 = K // 128
-    assert K128 % pack == 0, f"K_ITERS={K128} must be a multiple of pack={pack}"
-    colidx = _b_comb_colidx(e8m0_u8.device)
-    s = e8m0_u8.reshape(N // 256, 256, K128, 4)
-    g = s[:, colidx, :, :].reshape(N // 256, 4, 4, 16, K128, 4)  # [nblk,wn,si,r,k,g]
-    g = g.permute(0, 1, 4, 5, 3, 2).reshape(N // 64, K128, 64, 4)  # [grp,k,lane,s]
-    g = g.reshape(N // 64, K128 // pack, pack, 64, 4)  # [grp, kg, j, lane, s]
-    out = torch.zeros(N // 64, K128 // pack, 64, 4, dtype=torch.int32, device=e8m0_u8.device)
-    for j in range(pack):
-        out |= g[:, :, j].to(torch.int32) << (8 * j)
-    return out
-
-
 class ScaleBComb:
     """Combined B scale loader (pairs with ``preshuffle_scale_b_comb``).
 
@@ -198,7 +96,11 @@ class ScaleBComb:
     def __init__(self, sp_tensor, dim, K, pack=1):
         self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
         self.lane = fx.thread_idx.x % 64
-        nbytes = (dim // 64) * self.K128 * 64 * 4 * 4  # int32 records
+        # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
+        # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
+        # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
+        # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
+        nbytes = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4 * 4  # int32 records
         self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k):
@@ -1398,19 +1300,19 @@ _COMPILED_MXFP8_CACHE: dict = {}  # (id(launch), shapes/dtypes/ints) -> compiled
 # Per-shape NT autotune candidates (BLOCK_M, GROUP_M, num_xcd); BLOCK_N fixed 256.
 # BLOCK_M=128 doubles the tiles (fills the CUs on skinny/small shapes), 256 wins big
 # square / B-streaming; GROUP_M is the per-XCD L2-reuse super-block depth.
+# BLOCK_M fixed at 256 (n_tiles_a = 256//64 = 4): the A-scale preshuffle layout is
+# bm-dependent, and scales are now emitted preshuffled by the quant (no host repack),
+# so the gemm cannot re-pack per candidate -> BLOCK_M must be constant. autotune sweeps
+# only GROUP_M / num_xcd / group_n (none of which change the scale layout).
 _MXFP8_NT_CANDIDATES = [
     (256, 4, 8),
     (256, 8, 8),
-    (128, 4, 8),
-    (128, 16, 8),
 ]
 # The NN/TN scale-delivery combo (asm tr8 + agpr + opsel byte-pack) is set
 # per-layout in _get_mxfp8_launch; candidates vary only the tile.
 _MXFP8_NN_TN_CANDIDATES = [
     (256, 4, 8),
     (256, 8, 8),
-    (128, 8, 8),
-    (128, 16, 8),
 ]
 # AGPR budget for the asm tr8 + scale-prefetch spill; 32-128 within bench noise.
 _MX_NN_TN_AGPR = 64
@@ -1515,13 +1417,12 @@ def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0):
     return launch
 
 
-def _autotune_mxfp8(a8, b8, out_view, a_sc_u8, b_sp, M, N, K, out_dtype, layout="nt"):
+def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt"):
     """First-call micro-bench of the candidates for (M,N,K,layout); cache the
-    fastest cfg by shape. Returns (BLOCK_M, GROUP_M, num_xcd, group_n). Each
-    candidate is compiled, finite-checked, then timed (2 warmup + 20 iter); the
-    A-scale preshuffle fanout (n_tiles_a = BLOCK_M//64) differs per candidate so
-    a_sp is rebuilt for each. NN/TN candidates fold the fixed scale-delivery combo
-    into _get_mxfp8_launch, so only the tile (BM/GM/XCD) is swept.
+    fastest cfg by shape. Returns (BLOCK_M, GROUP_M, num_xcd, group_n). Scales are
+    pre-shuffled by the quant (BLOCK_M fixed at 256), so the same a_sp/b_sp feed
+    every candidate -- autotune sweeps only GROUP_M / num_xcd / group_n. NN/TN fold
+    the fixed scale-delivery combo into _get_mxfp8_launch.
 
     Two-stage for NT: stage 1 picks (BM,GM,XCD) at group_n=0 (1D swizzle); stage 2
     fixes that tile and sweeps the 2D N-band width group_n. gn=0 is measured in
@@ -1533,14 +1434,9 @@ def _autotune_mxfp8(a8, b8, out_view, a_sc_u8, b_sp, M, N, K, out_dtype, layout=
         return cached
     cands = _MXFP8_NT_CANDIDATES if layout == "nt" else _MXFP8_NN_TN_CANDIDATES
     stream = torch.cuda.current_stream()
-    pack = _mx_pack(K)  # all layouts use opsel scale byte-pack
 
     def _time_cfg(bm, gm, xcd, gn):
         try:
-            if pack > 1:
-                a_sp = preshuffle_scale_pack(a_sc_u8, K, bm // 64, pack).reshape(-1)
-            else:
-                a_sp = preshuffle_scale(a_sc_u8, K, bm // 64).reshape(-1)
             launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
             args = (a8, b8, out_view, a_sp, b_sp, M, N, stream)
             c = get_compiled(_COMPILED_MXFP8_CACHE, launch, args)
@@ -1609,8 +1505,6 @@ def gemm_mxfp8_flydsl_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
-    scales_preshuffled: bool = False,
-    b_scales_preshuffled: bool = False,  # b already preshuffled (B-comb), a still raw
 ) -> torch.Tensor:
     """MXFP8 (per-1x32 E8M0 block-scaled) dense GEMM, gfx950.
 
@@ -1625,17 +1519,16 @@ def gemm_mxfp8_flydsl_kernel(
       - TN (T, F): A [K,M], B [K,N],                C = a^T @ b.
       - TT (T, T): unsupported (raises).
 
-    The E8M0 scales are ALWAYS passed in the operand's natural [free, K//32]
-    layout — ``a_scale`` is [M, K//32] (free = M) and ``b_scale`` is [N, K//32]
-    (free = N) for every layout, because the MFMA distributes each operand's
-    scale by lane independent of how the data tile was loaded (the transpose
-    loaders reproduce the plain-load mfma operand byte layout). So the A-scale
-    (ScaleS2R) and B-scale (ScaleBComb) loaders + preshuffles are layout-invariant.
+    The E8M0 scales are PRE-SHUFFLED by the quant (no host repack): ``a_scale`` is
+    the A-operand preshuffle (layout 1/2, n_tiles = BLOCK_M//64 = 4) and ``b_scale``
+    the combined-B preshuffle (layout 3/4), both flat int32 buffers consumed straight
+    by the kernel's ScaleS2R / ScaleBComb loaders. BLOCK_M is fixed at 256 so the
+    A-scale fanout is constant; autotune sweeps only GROUP_M / num_xcd / group_n.
 
     Args:
       a, b:     float8_e4m3fn, shapes per the layout above.
-      a_scale:  E8M0 [M, K // 32] (raw bytes, free = M).
-      b_scale:  E8M0 [N, K // 32] (raw bytes, free = N).
+      a_scale:  pre-shuffled A-scale (flat int32 / e8m0 bytes), from the quant.
+      b_scale:  pre-shuffled combined-B scale (flat int32 / e8m0 bytes), from the quant.
       out_dtype: bf16 (the kernel epilogue stores bf16).
 
     Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 256 == 0.
@@ -1661,56 +1554,25 @@ def gemm_mxfp8_flydsl_kernel(
         )
     assert K == Kb, f"K mismatch: a {a.shape}, b {b.shape} (layout {layout})"
     assert K % 128 == 0 and K >= 256, f"K must be a multiple of 128 and >= 256, got {K}"
+    # M (BLOCK_M=256) / N (BLOCK_N=256) need only be 64-multiples: partial output tiles
+    # are handled in-kernel by buffer/SRD clamping (data + pre-shuffled scale reads bound
+    # by num_records, StoreC bounds rows/cols), so non-256 shapes run without host repack.
     assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
-    assert N % 256 == 0, f"N must be a multiple of 256 (combined-B scale preshuffle), got {N}"
+    assert N % 64 == 0, f"N must be a multiple of 64 (combined-B scale preshuffle), got {N}"
 
-    # Fused-preshuffle fast path: the quant kernel already emitted the scales in
-    # the FlyDSL preshuffled int32 layout, so skip the host preshuffle entirely.
-    # The per-shape cfg must already be cached (the quant layer looked it up to
-    # pick the A-scale fanout n_tiles = BLOCK_M//64), so reuse it directly.
-    if scales_preshuffled:
-        bm, gm, xcd, gn = _MXFP8_AUTOTUNE_CACHE[(M, N, K, out_dtype, layout)]
-        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-        a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
-        b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
-        launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
-        args = (as_i8_flat(a), as_i8_flat(b), out, a_sp, b_sp, M, N, torch.cuda.current_stream())
-        get_compiled(_COMPILED_MXFP8_CACHE, launch, args)(*args)
-        return out.t().contiguous() if trans_c else out
-
-    # E8M0 raw bytes -> uint8 [free, K//32]; host pre-shuffle to packed int32.
-    # All layouts use the opsel scale byte-pack (_mx_pack).
-    pack = _mx_pack(K)
-    a_sc_u8 = a_scale.contiguous().view(torch.uint8).reshape(M, K // 32)
-    if b_scales_preshuffled:
-        # b's B-comb preshuffle is BLOCK_M-independent and was already fused into the
-        # quant (bwd path); skip the host preshuffle, A still host-preshuffled below.
-        b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
-    else:
-        b_sc_u8 = b_scale.contiguous().view(torch.uint8).reshape(N, K // 32)
-        if pack > 1:
-            b_sp = preshuffle_scale_b_comb_pack(b_sc_u8, K, pack).reshape(-1)
-        else:
-            b_sp = preshuffle_scale_b_comb(b_sc_u8, K).reshape(-1)
-
+    # Scales are pre-shuffled by the quant (no host repack). They feed the kernel as
+    # flat int32 buffers directly. C is passed as 2D [M, N] (NOT flat): FlyDSL packs
+    # each shape dim as int32, so a 1D [M*N] view overflows when M*N > 2^31; StoreCPlain
+    # addresses C via its i64 per-tile re-basing, so the 2D shape is only metadata.
+    a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
+    b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     a8 = as_i8_flat(a)
     b8 = as_i8_flat(b)
-    # Pass C as 2D [M, N] (NOT flat): FlyDSL packs each shape dim as int32, so a 1D
-    # [M*N] view overflows when M*N > 2^31. StoreCPlain addresses C via its i64 base
-    # (extract_base_index) + per-tile re-basing, so the 2D shape is only metadata.
-    out_view = out
-
-    # Per-shape cfg: first call benches the candidates (rebuilding a_sp per
-    # BLOCK_M), caches the winner by (M,N,K,layout). The A-scale preshuffle fanout
-    # (n_tiles_a = BLOCK_M//64) depends on the chosen BLOCK_M, so a_sp is built
-    # AFTER the cfg is known.
-    bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out_view, a_sc_u8, b_sp, M, N, K, out_dtype, layout)
-    if pack > 1:
-        a_sp = preshuffle_scale_pack(a_sc_u8, K, bm // 64, pack).reshape(-1)
-    else:
-        a_sp = preshuffle_scale(a_sc_u8, K, bm // 64).reshape(-1)
+    # Per-shape cfg: first call benches GROUP_M/num_xcd/group_n (BLOCK_M fixed 256),
+    # caches the winner by (M,N,K,layout); the same pre-shuffled a_sp feeds all candidates.
+    bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout)
     launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
-    args = (a8, b8, out_view, a_sp, b_sp, M, N, torch.cuda.current_stream())
+    args = (a8, b8, out, a_sp, b_sp, M, N, torch.cuda.current_stream())
     get_compiled(_COMPILED_MXFP8_CACHE, launch, args)(*args)
     return out.t().contiguous() if trans_c else out

@@ -269,7 +269,7 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
         const int64_t K128p  = ki / pack;
         int64_t       dwords = (preshuffle_layout <= 2)
                                    ? (M / (16 * preshuffle_n_tiles)) * K128p * 64 * preshuffle_n_tiles
-                                   : (M / 64) * K128p * 64 * 4;
+                                   : cdiv(M, 256) * 4 * K128p * 64 * 4; // B: block-strided grp
         rowwise_scale =
             at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else if (shuffle_rowwise_scale) {
@@ -289,13 +289,14 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
 
     at::Tensor colwise_scale;
     if (col_preshuffle_layout != 0) {
-        const int64_t ki     = colwise_scale_N / 4;
-        const bool    bc     = (col_preshuffle_layout == 1 || col_preshuffle_layout == 3);
-        const int64_t pack   = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
-        const int64_t K128p  = ki / pack;
-        int64_t       dwords = (col_preshuffle_layout <= 2) ? (N / (16 * col_preshuffle_n_tiles)) *
-                                                            K128p * 64 * col_preshuffle_n_tiles
-                                                            : (N / 64) * K128p * 64 * 4;
+        const int64_t ki    = colwise_scale_N / 4;
+        const bool    bc    = (col_preshuffle_layout == 1 || col_preshuffle_layout == 3);
+        const int64_t pack  = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        const int64_t K128p = ki / pack;
+        int64_t       dwords =
+            (col_preshuffle_layout <= 2)
+                      ? (N / (16 * col_preshuffle_n_tiles)) * K128p * 64 * col_preshuffle_n_tiles
+                      : cdiv(N, 256) * 4 * K128p * 64 * 4; // B: block-strided grp
         colwise_scale =
             at::empty({dwords * 4}, at::TensorOptions().dtype(at::kByte).device(at::kMeta));
     } else if (shuffle_colwise_scale) {

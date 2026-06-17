@@ -333,7 +333,7 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO, BackendType.FLYDSL])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tune):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
@@ -350,6 +350,19 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
         # Backward GEMMs use m and n as their k dimension; they must also satisfy TURBO constraints
         if m % 128 != 0 or m < 384 or n % 128 != 0 or n < 384:
             pytest.skip("TURBO backward GEMMs require m,n%128==0 and m,n>=384")
+
+    if backend == BackendType.FLYDSL:
+        if get_device_compute_capability() < (9, 5):
+            pytest.skip("FlyDSL mxfp8 GEMM is gfx950-only")
+        # E4M3 operands + bf16 epilogue only (the kernel hardcodes both).
+        if format != Format.E4M3 or dtype != torch.bfloat16:
+            pytest.skip("FlyDSL mxfp8 is E4M3-operand / bf16-out only")
+        # Every dim acts as a contract dim in some fwd/bwd GEMM (NT-fold), and the
+        # K-loop has no K-tail (K_ITERS = dim//128 >= 2): require m,n,k %128==0 and
+        # >=256. Non-256 multiples (e.g. 384) DO run -- partial output tiles are
+        # tail-clamped in-kernel -- so this gate is %128, not %256.
+        if not (m % 128 == 0 and n % 128 == 0 and k % 128 == 0 and m >= 256 and n >= 256 and k >= 256):
+            pytest.skip("FlyDSL mxfp8 needs m,n,k %128==0 and >=256")
 
     _run_gemm_fp8_test(
         m=m,
@@ -370,9 +383,10 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
 # test_gemm_fp8_mx_blockwise above can only ever exercise NT through FlyDSL. This
 # hits the kernel's three native layouts directly (E4M3, bf16), against a
 # dequantized reference. Per-layout constraints only (no fwd+bwd coupling):
-# M%64, N%256, K%128 & K>=256.
-@pytest.mark.parametrize("m", [256, 512])
-@pytest.mark.parametrize("n", [256, 512])
+# M%64, N%64, K%128 & K>=256. The 384 cases exercise the partial-output-tile tail
+# (M/N not a 256-multiple) -- clamped in-kernel, no host repack.
+@pytest.mark.parametrize("m", [256, 384, 512])
+@pytest.mark.parametrize("n", [256, 384, 512])
 @pytest.mark.parametrize("k", [256, 512])
 @pytest.mark.parametrize("layout", ["NT", "NN", "TN"])
 def test_gemm_fp8_mx_blockwise_flydsl_kernel(m, n, k, layout):
@@ -389,30 +403,64 @@ def test_gemm_fp8_mx_blockwise_flydsl_kernel(m, n, k, layout):
     dev = "cuda"
     torch.manual_seed(0)
 
-    def quant(x):  # x [free, K] -> MX e4m3 along K (axis=-1); scale is [free, K//32]
-        return QuantizedTensor.quantize(
-            x,
-            float8_e4m3,
-            ScalingGranularity.MX_BLOCKWISE,
-            axis=-1,
-            block_size=32,
-            scaling_recipe=ScalingRecipe(),
-        )
+    from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import _mx_pack
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quantize_mxfp8_impl,
+    )
 
-    # A free = M, B free = N; both block-scaled along the K contraction.
-    qa = quant(torch.randn(m, k, dtype=torch.bfloat16, device=dev))
-    qb = quant(torch.randn(n, k, dtype=torch.bfloat16, device=dev))
+    a_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+    b_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
+
+    # Reference from raw-scale quant (same fp8 values; only the scale LAYOUT differs).
+    qa = QuantizedTensor.quantize(
+        a_bf16,
+        float8_e4m3,
+        ScalingGranularity.MX_BLOCKWISE,
+        axis=-1,
+        block_size=32,
+        scaling_recipe=ScalingRecipe(),
+    )
+    qb = QuantizedTensor.quantize(
+        b_bf16,
+        float8_e4m3,
+        ScalingGranularity.MX_BLOCKWISE,
+        axis=-1,
+        block_size=32,
+        scaling_recipe=ScalingRecipe(),
+    )
     ref = qa.dequantize().float() @ qb.dequantize().float().t()  # [M, N]
 
+    # The gemm consumes PRE-SHUFFLED scales (no host repack): A = layout 2/1 (n_tiles=4
+    # for the fixed BLOCK_M=256), B = layout 4/3 (b-comb). Emitted by the quant's row path.
+    packed = _mx_pack(k) > 1
+    dummy = ScalingRecipe()
+    a_qd, a_sc, _, _ = quantize_mxfp8_impl(
+        a_bf16,
+        float8_e4m3,
+        None,
+        32,
+        True,
+        ScalingRecipe(preshuffle_layout=(2 if packed else 1), preshuffle_n_tiles=4),
+        dummy,
+    )
+    b_qd, b_sc, _, _ = quantize_mxfp8_impl(
+        b_bf16,
+        float8_e4m3,
+        None,
+        32,
+        True,
+        ScalingRecipe(preshuffle_layout=(4 if packed else 3)),
+        dummy,
+    )
     # Physical operand layout per the kernel: A is [K,M] when trans_a else [M,K];
-    # B is [N,K] when trans_b else [K,N]. The E8M0 scale stays [free, K//32].
-    a_phys = qa.qdata.t().contiguous() if trans_a else qa.qdata
-    b_phys = qb.qdata if trans_b else qb.qdata.t().contiguous()
+    # B is [N,K] when trans_b else [K,N].
+    a_phys = a_qd.t().contiguous() if trans_a else a_qd
+    b_phys = b_qd if trans_b else b_qd.t().contiguous()
     out = gemm_mxfp8_flydsl_kernel(
         a_phys,
-        qa.scale_inv,
+        a_sc,
         b_phys,
-        qb.scale_inv,
+        b_sc,
         trans_a=trans_a,
         trans_b=trans_b,
         out_dtype=torch.bfloat16,

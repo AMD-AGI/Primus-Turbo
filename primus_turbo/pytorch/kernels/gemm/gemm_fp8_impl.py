@@ -365,32 +365,18 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # MXFP8 kernel: NT/NN/TN (TT unsupported), E4M3 operands, bf16 out,
-            # per-1x32 E8M0 block scales (a_scale/b_scale are [free,K//32] tensors,
-            # NOT scalar). Host scale preshuffle needs M%64 and N%256; the SW
-            # pipeline needs K%128==0 and K_ITERS>=2 (K>=256). Layout dispatch
-            # (trans_a/trans_b) is threaded through to the kernel in execute().
-            supported &= not (trans_a and trans_b)  # TT unsupported
-            supported &= a.dtype == float8_e4m3 and b.dtype == float8_e4m3
-            supported &= out_dtype == torch.bfloat16
-            # Layout-aware M/N/K (mirror gemm_mxfp8_flydsl_kernel):
-            #   NT a[M,K] b[N,K] | NN a[M,K] b[K,N] | TN a[K,M] b[K,N]
-            if trans_a:  # TN
-                k, m = a.shape[0], a.shape[1]
-                n = b.shape[1]
-            else:  # NT / NN
-                m, k = a.shape[0], a.shape[1]
-                n = b.shape[0] if trans_b else b.shape[1]
-            supported &= (k % 128 == 0) and (k >= 256)
-            supported &= (m % 64 == 0) and (n % 256 == 0)
-            # The output C is addressed via StoreCPlain's i64 per-tile re-basing, so
-            # M*N may exceed 2^31 / 4GB. Inputs a/b are still passed as flat 1D
-            # buffers (G2SLoader), so their numel must stay < 2^31 until G2SLoader is
-            # also int64-rebased; oversized inputs decline here -> dispatcher falls
-            # back. (TODO: drop entirely once G2SLoader is int64-rebased.)
-            INT32_MAX = 2**31
-            supported &= (m * k < INT32_MAX) and (n * k < INT32_MAX)
-            return supported
+            # MXFP8 is NOT served through this generic dispatcher anymore. The FlyDSL
+            # mxfp8 GEMM now consumes scales that are ALREADY pre-shuffled into the
+            # kernel's layout (no host repack), but this dispatcher is fed raw
+            # [free, K//32] E8M0 scales straight off the QuantizedTensor -- it has no
+            # way to produce the pre-shuffled layout without a host repack (vetoed).
+            #
+            # The only correct entry point is FP8GemmMXFunction (primus_turbo.pytorch.
+            # ops.gemm_fp8), whose dual-cast quant emits pre-shuffled scales and calls
+            # gemm_mxfp8_flydsl_kernel directly. So decline here: auto-tune will never
+            # pick this broken raw-scale path, and an explicit FLYDSL request for a
+            # raw-scale mxfp8 gemm gets a clear "cannot handle" instead of a fault.
+            return False
 
         # TENSORWISE
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES

@@ -6,13 +6,18 @@
 
 from typing import Optional, Union
 
+import flydsl.compiler as _flyc
 import torch
 
 from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import (
     _mx_pack,
     gemm_mxfp8_flydsl_kernel,
-    peek_mxfp8_cfg,
 )
+from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import BK as _QDUAL_BK
+from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import compile_qdual as _compile_qdual
+
+# (M,K) -> compiled callable; avoids per-call JIT overhead.
+_QDUAL_CACHE: dict = {}
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -42,8 +47,31 @@ __all__ = ["gemm_fp8"]
 
 
 def _flydsl_mxfp8_nt_ok(M: int, N: int, K: int) -> bool:
-    """FlyDSL MXFP8 NT kernel shape constraints (mirror GEMMFP8FlyDSLBackend)."""
-    return K % 128 == 0 and K >= 256 and M % 64 == 0 and N % 256 == 0 and M * K < 2**31 and N * K < 2**31
+    """FlyDSL MXFP8 shape gate. BLOCK_M/BLOCK_N are fixed at 256 (pre-shuffled scales,
+    no host repack) but the kernel handles partial output tiles via tail clamping:
+    A/B data reads go through buffer resources (OOB -> 0), the pre-shuffled scale reads
+    are bounded by num_records (OOB -> 0), and StoreC bounds rows by the row-band
+    resource and cols by ``col < c_cols``. So M/N need only be 64-multiples (clean
+    16-row MFMA sub-tiles + 64-row scale groups), NOT 256-multiples.
+
+    The only hard constraint is the contract dim: the K-loop trip count is the
+    compile-time ``K_ITERS = K // 128`` with no K-tail and a 2-deep software prefetch
+    (so K_ITERS >= 2, i.e. the contract dim >= 256). The NT-fold backward permutes
+    (M, N, K) -- grad_a contracts N, grad_b contracts M, fwd contracts K -- so every
+    one of M, N, K acts as a contract dim in some gemm. Requiring all three to be
+    128-multiples and >= 256 therefore covers every gemm. (128-multiples are also
+    64-multiples, so the partial-output-tile tail constraint is subsumed; the tail is
+    handled in-kernel by buffer/SRD clamping, no turbo fallback for non-256 shapes.)"""
+    return (
+        M % 128 == 0
+        and N % 128 == 0
+        and K % 128 == 0
+        and M >= 256
+        and N >= 256
+        and K >= 256
+        and M * K < 2**31
+        and N * K < 2**31
+    )
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -478,84 +506,64 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 return x.qdata, x.scale_inv, qt.qdata, qt.scale_inv
             return quantize_mxfp8_impl(x, fp8_dtype, None, config.block_size, True, recipe, recipe)
 
-        # FLYDSL fused-preshuffle fast path: the dual-cast quant emits the scale already
-        # in the gemm's preshuffled layout (opsel byte-pack: A=layout 2, B=layout 4;
-        # pack==1 -> broadcast 1/3), skipping the host preshuffle that otherwise eats
-        # FlyDSL's kernel edge over turbo. Row path -> fwd gemm (cfg-gated for the A
-        # fanout); col path (at/bt) -> bwd B-operands (no bm dep) preshuffled here so
-        # the backward also skips its (much larger) host preshuffle. Only when the user
-        # selects FlyDSL, for dynamic torch.Tensor inputs with supported shapes.
+        # FLYDSL path: the dual-cast quant emits scales ALREADY in the gemm's preshuffled
+        # layout for BOTH the fwd (row) and bwd (col = at/bt) operands -- no host repack
+        # anywhere. BLOCK_M is fixed at 256 so the A-scale fanout n_tiles = 4 is constant
+        # (no cfg peek). opsel byte-pack: A=layout 2 / B=layout 4 (pack==1 -> broadcast
+        # 1/3). Only when the user selects FlyDSL, for dynamic torch.Tensor e4m3 inputs.
         use_flydsl = (
             GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
             and not isinstance(a, QuantizedTensor)
             and not isinstance(b, QuantizedTensor)
             and a.dim() == 2
             and b.dim() == 2
+            # E4M3 operands + bf16 epilogue only: the kernel hardcodes E4M3 G2S and a
+            # bf16 StoreC (fp16 / e5m2 would be silently mis-cast).
+            and _get_fp8_dtype(config.format, True) == float8_e4m3
+            and _get_fp8_dtype(config.format, False) == float8_e4m3
+            and out_dtype == torch.bfloat16
             and _flydsl_mxfp8_nt_ok(a.shape[0], b.shape[0], a.shape[1])
         )
-        # bwd FlyDSL needs e4m3 grads (the mxfp8 kernel is e4m3-only); HYBRID grads stay
-        # turbo, so their col operands (at/bt) must NOT be preshuffled.
-        flydsl_bwd = use_flydsl and _get_fp8_dtype(config.format, False) == float8_e4m3
 
         if use_flydsl:
             M_, K_ = a.shape
             N_ = b.shape[0]
-            cfg = peek_mxfp8_cfg(M_, N_, K_, out_dtype, "nt")
-            if flydsl_bwd:
-                # at = a-col = grad_b's B (contract M); bt = b-col = grad_a's B (contract N)
-                at_recipe = ScalingRecipe(preshuffle_layout=(4 if _mx_pack(M_) > 1 else 3))
-                bt_recipe = ScalingRecipe(use_2d_block=True, preshuffle_layout=(4 if _mx_pack(N_) > 1 else 3))
-            else:
-                at_recipe, bt_recipe = a_recipe, b_recipe
-            if cfg is not None:
-                packed = _mx_pack(K_) > 1
-                a_row_layout, b_row_layout = (2, 4) if packed else (1, 3)
-                a_qd, a_sc, at_qd, at_sc = quantize_mxfp8_impl(
-                    a,
-                    fp8_dtype,
-                    None,
-                    config.block_size,
-                    True,
-                    ScalingRecipe(preshuffle_layout=a_row_layout, preshuffle_n_tiles=cfg[0] // 64),
-                    at_recipe,
-                )
-                b_qd, b_sc, bt_qd, bt_sc = quantize_mxfp8_impl(
-                    b,
-                    fp8_dtype,
-                    None,
-                    config.block_size,
-                    True,
-                    ScalingRecipe(use_2d_block=True, preshuffle_layout=b_row_layout),
-                    bt_recipe,
-                )
-                out = gemm_mxfp8_flydsl_kernel(
-                    a_qd,
-                    a_sc,
-                    b_qd,
-                    b_sc,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=out_dtype,
-                    scales_preshuffled=True,
-                )
-            else:
-                # First call: raw row scale (gemm host-preshuffles + autotunes, caching
-                # the cfg) while the col operands are already fused for the backward.
-                a_qd, a_sc, at_qd, at_sc = quantize_mxfp8_impl(
-                    a, fp8_dtype, None, config.block_size, True, a_recipe, at_recipe
-                )
-                b_qd, b_sc, bt_qd, bt_sc = quantize_mxfp8_impl(
-                    b, fp8_dtype, None, config.block_size, True, b_recipe, bt_recipe
-                )
-                out = gemm_mxfp8_flydsl_kernel(
-                    a_qd,
-                    a_sc,
-                    b_qd,
-                    b_sc,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=out_dtype,
-                )
+
+            # FlyDSL single-pass dual-cast quant (REPLACES C++ dual-cast entirely):
+            # one kernel produces row fp8 + layout-1 A-preshuffled row scale (for fwd
+            # gemm) AND col fp8 + b-comb preshuffled col scale (for bwd at/bt gemms).
+            # No host repack, no second quantize call.
+            def _qdual(x_bf16, M, K):
+                key = (M, K)
+                comp = _QDUAL_CACHE.get(key)
+                SP_A = (M // 64) * (K // 128) * 64 * 4
+                SP_AT = (K // _QDUAL_BK) * 4 * (M // 128) * 64 * 4
+                xq = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x_bf16.device)
+                asp = torch.empty(SP_A, dtype=torch.int32, device=x_bf16.device)
+                atqd = torch.empty(K, M, dtype=torch.float8_e4m3fn, device=x_bf16.device)
+                atsp = torch.empty(SP_AT, dtype=torch.int32, device=x_bf16.device)
+                st = torch.cuda.current_stream()
+                if comp is None:
+                    launch = _compile_qdual(M, K)
+                    comp = _flyc.compile(launch, x_bf16, xq, asp, atqd, atsp, st)
+                    _QDUAL_CACHE[key] = comp
+                comp(x_bf16, xq, asp, atqd, atsp, st)
+                return xq, asp, atqd, atsp
+
+            a_qd, a_sc, at_qd, at_sc = _qdual(a, M_, K_)
+            b_qd, b_sc, bt_qd, bt_sc = _qdual(b, N_, K_)
+
+            # a_sc / b_sc: int32 flat layout-1 preshuffled (ScaleS2R reads element-offset).
+            # at_sc / bt_sc: int32 flat b-comb preshuffled (ScaleBComb reads element-offset).
+            out = gemm_mxfp8_flydsl_kernel(
+                a_qd,
+                a_sc,
+                b_qd,
+                b_sc,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=out_dtype,
+            )
         else:
             a_qd, a_sc, at_qd, at_sc = _row_col(a, a_t, a_recipe)
             b_qd, b_sc, bt_qd, bt_sc = _row_col(b, b_t, b_recipe)
@@ -573,7 +581,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             )
 
         ctx.save_for_backward(at_qd, at_sc, bt_qd, bt_sc)
-        ctx.flydsl_bwd = flydsl_bwd
+        ctx.flydsl_bwd = use_flydsl
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -598,73 +606,38 @@ class FP8GemmMXFunction(torch.autograd.Function):
         if getattr(ctx, "flydsl_bwd", False):
             M = grad_out.shape[0]
             N = grad_out.shape[1]
-            K = b_fp8_t.shape[0]
-            cfg_a = peek_mxfp8_cfg(M, K, N, ctx.out_dtype, "nt")
-            cfg_b = peek_mxfp8_cfg(N, K, M, ctx.out_dtype, "nt")
-            if cfg_a is not None and cfg_b is not None:
-                # go_row = grad_a's A (contract N); go_col = grad_b's A (contract M)
-                go_row, go_row_sc, go_col, go_col_sc = quantize_mxfp8_impl(
-                    grad_out,
-                    grad_out_dtype,
-                    None,
-                    ctx.config.block_size,
-                    True,
-                    ScalingRecipe(
-                        preshuffle_layout=(2 if _mx_pack(N) > 1 else 1),
-                        preshuffle_n_tiles=cfg_a[0] // 64,
-                    ),
-                    ScalingRecipe(
-                        preshuffle_layout=(2 if _mx_pack(M) > 1 else 1),
-                        preshuffle_n_tiles=cfg_b[0] // 64,
-                    ),
-                )
-                grad_a = gemm_mxfp8_flydsl_kernel(
-                    go_row,
-                    go_row_sc,
-                    b_fp8_t,
-                    b_t_scale_inv,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=ctx.out_dtype,
-                    scales_preshuffled=True,
-                )
-                grad_b = gemm_mxfp8_flydsl_kernel(
-                    go_col,
-                    go_col_sc,
-                    a_fp8_t,
-                    a_t_scale_inv,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=ctx.out_dtype,
-                    scales_preshuffled=True,
-                )
-            else:
-                # First bwd: raw grad_out (gemm host-preshuffles A + autotunes -> caches
-                # cfg) with the already-preshuffled B operands (at/bt).
-                recipe = ScalingRecipe()
-                go_row, go_row_sc, go_col, go_col_sc = quantize_mxfp8_impl(
-                    grad_out, grad_out_dtype, None, ctx.config.block_size, True, recipe, recipe
-                )
-                grad_a = gemm_mxfp8_flydsl_kernel(
-                    go_row,
-                    go_row_sc,
-                    b_fp8_t,
-                    b_t_scale_inv,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=ctx.out_dtype,
-                    b_scales_preshuffled=True,
-                )
-                grad_b = gemm_mxfp8_flydsl_kernel(
-                    go_col,
-                    go_col_sc,
-                    a_fp8_t,
-                    a_t_scale_inv,
-                    trans_a=False,
-                    trans_b=True,
-                    out_dtype=ctx.out_dtype,
-                    b_scales_preshuffled=True,
-                )
+            NT_A = 256 // 64  # BLOCK_M fixed at 256 -> A-scale fanout n_tiles = 4
+            # grad_a = NT(go_row[M,N], bt[K,N]); grad_b = NT(go_col[N,M], at[K,M]).
+            # go_row = grad_a's A (contract N); go_col = grad_b's A (contract M). at/bt
+            # (B-operands) were already preshuffled at fwd-time. All scales preshuffled
+            # -> no host repack; the gemm autotunes GROUP_M/xcd/gn on first call.
+            go_row, go_row_sc, go_col, go_col_sc = quantize_mxfp8_impl(
+                grad_out,
+                grad_out_dtype,
+                None,
+                ctx.config.block_size,
+                True,
+                ScalingRecipe(preshuffle_layout=(2 if _mx_pack(N) > 1 else 1), preshuffle_n_tiles=NT_A),
+                ScalingRecipe(preshuffle_layout=(2 if _mx_pack(M) > 1 else 1), preshuffle_n_tiles=NT_A),
+            )
+            grad_a = gemm_mxfp8_flydsl_kernel(
+                go_row,
+                go_row_sc,
+                b_fp8_t,
+                b_t_scale_inv,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=ctx.out_dtype,
+            )
+            grad_b = gemm_mxfp8_flydsl_kernel(
+                go_col,
+                go_col_sc,
+                a_fp8_t,
+                a_t_scale_inv,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=ctx.out_dtype,
+            )
             return grad_a, grad_b, None, None, None, None, None, None
 
         # TE-style dual cast of grad_out: row-wise (for grad_a) + col-wise (for grad_b)
