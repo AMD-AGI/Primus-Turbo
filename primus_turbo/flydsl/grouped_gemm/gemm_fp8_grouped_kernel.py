@@ -1493,7 +1493,7 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
                 agpr_inplace=False,
                 store_cshuffle=False,
                 sched_schedbar=False,
-                nt_vmcnt=-1,
+                nt_vmcnt=3,
             )
         # NN: merged factory, non-persistent mode (AGPR in-place, scalar store).
         return _compile_grouped_nn(
@@ -1511,7 +1511,7 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
             agpr_inplace=True,
             store_cshuffle=False,
             sched_schedbar=False,
-            nt_vmcnt=-1,
+            nt_vmcnt=3,
         )
 
     pm = args[6] // G
