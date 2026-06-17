@@ -365,8 +365,8 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend", [BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
 
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.

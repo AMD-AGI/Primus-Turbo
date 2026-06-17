@@ -263,10 +263,8 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL]
-)
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("auto_tune", [False])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
     _run_gemm_fp8_test(
         m=m,

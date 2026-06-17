@@ -169,6 +169,8 @@ class Float8QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+    # NOTE: experimental always apply NT-layout GEMM for backward calculation
+    use_nt_layout_gemm_for_bwd: bool = True
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
@@ -194,6 +196,8 @@ class Float4QuantConfig:
     scale_dtype: ScaleDtype = ScaleDtype.E8M0
     block_size: int = 32
     use_gradient_sr: bool = False
+    # NOTE: experimental always apply NT-layout GEMM for backward calculation
+    use_nt_layout_gemm_for_bwd: bool = True
 
     def __post_init__(self):
         assert (

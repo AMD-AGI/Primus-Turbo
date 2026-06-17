@@ -68,6 +68,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         config: Float8QuantConfig,
         num_cu: int | None,
     ):
+        assert config.use_nt_layout_gemm_for_bwd, "use_nt_layout_gemm_for_bwd must be True"
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
         assert a.ndim == 2, "Input tensor must be 2-dimensional."
@@ -375,8 +376,6 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     ):
         assert config.granularity == ScalingGranularity.TENSORWISE
 
-        # TENSORWISE has a single scalar scale, so the same buffers feed both
-        # forward and backward (no separate trans cache needed).
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
@@ -407,6 +406,18 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
+        if config.use_nt_layout_gemm_for_bwd:
+            if trans_b:
+                quantized_b_t = QuantizedTensor.quantize(
+                    quantized_b.dequantize().transpose(-1, -2).contiguous(),
+                    quantized_b.real_dtype,
+                    config.granularity,
+                    axis=-1,
+                    block_size=config.block_size,
+                )
+            else:
+                quantized_b_t = quantized_b
+
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
             quantized_b.qdata,
@@ -423,14 +434,24 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             maybe_pre_sync=True,
         )
 
-        ctx.save_for_backward(
-            quantized_a.qdata,
-            quantized_b.qdata,
-            quantized_a.scale_inv,
-            quantized_b.scale_inv,
-            group_lens,
-            group_offs,
-        )
+        if config.use_nt_layout_gemm_for_bwd:
+            ctx.save_for_backward(
+                quantized_a.qdata,
+                quantized_b_t.qdata,
+                quantized_a.scale_inv,
+                quantized_b_t.scale_inv,
+                group_lens,
+                group_offs,
+            )
+        else:
+            ctx.save_for_backward(
+                quantized_a.qdata,
+                quantized_b.qdata,
+                quantized_a.scale_inv,
+                quantized_b.scale_inv,
+                group_lens,
+                group_offs,
+            )
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.config = config
@@ -453,20 +474,37 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             group_lens=group_lens,
         )
 
-        grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.qdata,
-            b_fp8,
-            quantized_grad_out.scale_inv,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-        )
+        if ctx.config.use_nt_layout_gemm_for_bwd:
+            # b_fp8 is the per-group (K, N) transpose cache; grad_a runs as NT.
+            grad_a = grouped_gemm_fp8_impl(
+                quantized_grad_out.qdata,
+                b_fp8,
+                quantized_grad_out.scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
+        else:
+            grad_a = grouped_gemm_fp8_impl(
+                quantized_grad_out.qdata,
+                b_fp8,
+                quantized_grad_out.scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8,
