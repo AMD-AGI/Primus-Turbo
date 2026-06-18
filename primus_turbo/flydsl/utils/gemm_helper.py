@@ -4,7 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
@@ -634,3 +636,74 @@ class S2RLoaderTr:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
+
+
+def as_i8_flat(t: torch.Tensor) -> torch.Tensor:
+    """Zero-copy flat (1D) byte view of a tensor. fp8 is reinterpreted as int8.
+    Recomputed every call (no id()-keyed cache: a freed tensor's id + data_ptr can
+    both be reused, and a recycled pair with a different numel would alias the wrong
+    length). The view ops allocate nothing."""
+    if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
+        return t.contiguous().view(torch.int8).view(-1)
+    return t.contiguous().view(-1)
+
+
+def get_compiled(cache: dict, launch, args):
+    """Cache the compiled launcher in ``cache`` by (id(launch), shapes/dtypes/ints)."""
+    key_parts = [id(launch)]
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            key_parts.append((tuple(a.shape), a.dtype))
+        elif isinstance(a, int):
+            key_parts.append(a)
+        else:
+            key_parts.append(type(a).__name__)
+    key = tuple(key_parts)
+    cached = cache.get(key)
+    if cached is None:
+        cached = flyc.compile(launch, *args)
+        cache[key] = cached
+    return cached
+
+
+def block_mn(pid, num_pid_m, n_blocks, GM, GN):
+    """Tile-id -> (block_m, block_n), resolved at trace time. GN==0: 1D GROUP_M
+    super-row swizzle (block_m inner). GN>0: 2D band — N split into width-GN bands
+    with GROUP_M inside each, keeping both A and B slabs L2-resident. Bijection."""
+    if GN > 0:
+        band_tiles = num_pid_m * GN
+        band = pid // band_tiles
+        pid_in_band = pid % band_tiles
+        band_n0 = band * GN
+        rem_n = n_blocks - band_n0
+        band_w = arith.select(rem_n < GN, rem_n, fx.Int32(GN))
+        nig = GM * band_w
+        gid = pid_in_band // nig
+        pig = pid_in_band % nig
+        fpm = gid * GM
+        rem_m = num_pid_m - fpm
+        gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+        return fpm + (pig % gsm), band_n0 + (pig // gsm)
+    nig = GM * n_blocks
+    gid = pid // nig
+    pig = pid % nig
+    fpm = gid * GM
+    rem_m = num_pid_m - fpm
+    gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+    return fpm + (pig % gsm), pig // gsm
+
+
+def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
+    """Buffer resource re-based at this workgroup's row band [base_row, c_rows), in
+    64-bit ``index`` arith, so a 32-bit offset only spans the band (handles outputs
+    whose flat M*N exceeds 2^31 / 4GB). base_row clamped to [0, c_rows] so a
+    partial/fully-OOB last row tile bases 0 records (its stores drop)."""
+    elem = arith.index(elem_bytes)
+    cols_i = arith.index_cast(T.index, c_cols)
+    row_i = arith.index_cast(T.index, base_row)
+    rows_i = arith.index_cast(T.index, c_rows)
+    row_c = arith.minui(row_i, rows_i)
+    band_base = c_base + row_c * cols_i * elem
+    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0xFFFFFFFF))
+    band_base_i64 = arith.index_cast(T.i64, band_base)
+    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
