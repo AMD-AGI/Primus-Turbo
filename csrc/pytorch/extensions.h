@@ -25,12 +25,13 @@ namespace primus_turbo::pytorch {
 //  Quantization
 //==================================================================
 
-std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
-                                                const at::ScalarType      dest_dtype,
+std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor     input,
+                                                const at::ScalarType dest_dtype, const int64_t axis,
                                                 c10::optional<at::Tensor> scale_opt);
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
+                                                     const int64_t             axis,
                                                      c10::optional<at::Tensor> scale_opt);
 
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
@@ -61,10 +62,10 @@ std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          inpu
                                                   c10::optional<at::Tensor> scale_opt);
 
 at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
-                                     const at::ScalarType dest_dtype);
+                                     const at::ScalarType dest_dtype, const int64_t axis);
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
-                                          const at::ScalarType dest_dtype);
+                                          const at::ScalarType dest_dtype, const int64_t axis);
 
 std::vector<at::Tensor> quantize_mxfp4_dual(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,

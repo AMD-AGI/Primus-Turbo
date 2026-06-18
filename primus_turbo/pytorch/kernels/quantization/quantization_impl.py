@@ -31,12 +31,15 @@ def ceil_div(a, b):
 
 
 def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize FP8 Tensor-Wise
+    Quantize FP8 Tensor-Wise. Single global scalar scale; axis=-1 keeps the
+    [M, N] layout, axis=-2 transposes it to [N, M].
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, axis, None)
     return x_fp8, scale_inv
 
 
@@ -52,11 +55,14 @@ def quantize_fp8_rowwise_impl(
     return x_fp8, scale_inv
 
 
-def dequantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype, scale_inv: torch.Tensor):
+def dequantize_fp8_tensorwise_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, scale_inv: torch.Tensor, axis: int = -1
+):
     """
-    DeQuantize FP8 Tensor-Wise
+    DeQuantize FP8 Tensor-Wise. axis=-1 keeps the [M, N] layout, axis=-2
+    transposes it to [N, M]; scale_inv is a single global scalar.
     """
-    return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
+    return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype, axis)
 
 
 def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale_inv: torch.Tensor):

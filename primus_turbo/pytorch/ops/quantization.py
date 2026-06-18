@@ -53,7 +53,9 @@ def quantize_fp8(
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_impl(x, out_dtype)
+        # axis=-1 keeps the [M, N] layout; axis=-2 transposes it to [N, M] (used to
+        # build the backward weight-transpose cache). scale stays a global scalar.
+        return quantize_fp8_tensorwise_impl(x, out_dtype, axis=(-1 if axis is None else axis))
 
     elif granularity == ScalingGranularity.ROWWISE:
 
@@ -186,7 +188,7 @@ def dequantize_fp8(
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return dequantize_fp8_tensorwise_impl(x, out_dtype, scale_inv)
+        return dequantize_fp8_tensorwise_impl(x, out_dtype, scale_inv, axis=(-1 if axis is None else axis))
     elif granularity == ScalingGranularity.ROWWISE:
         if axis is None:
             raise ValueError("axis must be specified for rowwise FP8 de-quantization")

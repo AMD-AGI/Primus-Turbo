@@ -29,26 +29,37 @@ from tests.pytorch.test_utils import get_tolerances
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
-@pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
+@pytest.mark.parametrize("G,M,N", [(1, 6 * 7168, 8192), (1, 256, 512), (4, 128, 256)])
+@pytest.mark.parametrize("axis", [-1, -2])
 @pytest.mark.parametrize("torch_compile", [True, False])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
-def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, granularity):
+def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, G, M, N, axis, torch_compile, granularity):
     torch.manual_seed(42)
 
-    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    shape = (M, N) if G == 1 else (G, M, N)
+    x = torch.rand(shape, device="cuda", dtype=orig_dtype)
     x_ref = x.detach().clone()
+
     x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
+    if axis == -2:
+        x_fp8_ref = x_fp8_ref.transpose(-1, -2).contiguous()
 
     if torch_compile is True:
         torch._dynamo.reset()
         compiled_func = torch.compile(
-            lambda t: quantize_fp8(t, dest_dtype, granularity=granularity),
+            lambda t: quantize_fp8(t, dest_dtype, granularity=granularity, axis=axis),
             fullgraph=True,
             mode="max-autotune",
         )
         x_fp8, x_scale_inv = compiled_func(x)
     else:
-        x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
+        x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity, axis=axis)
+
+    expected_out_shape = list(shape)
+    if axis == -2:
+        expected_out_shape[-1], expected_out_shape[-2] = expected_out_shape[-2], expected_out_shape[-1]
+    assert list(x_fp8.shape) == expected_out_shape
+    assert x_scale_inv.numel() == 1
 
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(
@@ -57,9 +68,9 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
         **get_tolerances(dest_dtype),
     )
 
-    # DeQuantize
-    x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, scale_inv=x_scale_inv)
-    x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, scale_inv=x_scale_inv_ref)
+    # DeQuantize with the same axis.
+    x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv)
+    x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv_ref)
     torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
 
 

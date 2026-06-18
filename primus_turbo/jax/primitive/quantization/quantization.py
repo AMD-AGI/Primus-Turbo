@@ -47,13 +47,20 @@ IMPL_TABLE[quantize_fp8_rowwise_p] = partial(xla.apply_primitive, quantize_fp8_r
 # ----------------------------------------
 # Step-3: Abstract eval
 # ----------------------------------------
-def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype):
+def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, *, out_dtype, axis):
     n = 1
     for dim in input_aval.shape:
         n *= dim
     ws_size = get_quantize_fp8_tensorwise_workspace_size(n)
+
+    ndim = len(input_aval.shape)
+    valid_axis = axis if axis >= 0 else ndim + axis
+    out_shape = list(input_aval.shape)
+    if valid_axis == ndim - 2:  # transpose inner [M, N] -> [N, M]
+        out_shape[-1], out_shape[-2] = out_shape[-2], out_shape[-1]
+
     return (
-        ShapedArray(input_aval.shape, out_dtype),
+        ShapedArray(tuple(out_shape), out_dtype),
         ShapedArray((1,), jnp.float32),
         ShapedArray((ws_size,), jnp.uint8),
     )
@@ -62,8 +69,13 @@ def _quantize_fp8_tensorwise_abstract_eval(input_aval, scale_opt_aval, *, out_dt
 ABSTRACT_EVAL_TABLE[quantize_fp8_tensorwise_p] = _quantize_fp8_tensorwise_abstract_eval
 
 
-def _dequantize_fp8_tensorwise_abstract_eval(input_aval, scale_inv_aval, *, out_dtype):
-    return ShapedArray(input_aval.shape, out_dtype)
+def _dequantize_fp8_tensorwise_abstract_eval(input_aval, scale_inv_aval, *, out_dtype, axis):
+    ndim = len(input_aval.shape)
+    valid_axis = axis if axis >= 0 else ndim + axis
+    out_shape = list(input_aval.shape)
+    if valid_axis == ndim - 2:  # transpose inner [M, N] -> [N, M]
+        out_shape[-1], out_shape[-2] = out_shape[-2], out_shape[-1]
+    return ShapedArray(tuple(out_shape), out_dtype)
 
 
 ABSTRACT_EVAL_TABLE[dequantize_fp8_tensorwise_p] = _dequantize_fp8_tensorwise_abstract_eval

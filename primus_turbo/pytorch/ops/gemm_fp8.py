@@ -51,11 +51,15 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         b: Union[torch.Tensor, QuantizedTensor],
         a_t: Optional[QuantizedTensor],
         b_t: Optional[QuantizedTensor],
-        trans_a: bool,  # trans_a has to be False
+        trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
+        use_nt_layout_gemm_in_bwd = False
+        if trans_a == False and trans_b == True:
+            use_nt_layout_gemm_in_bwd = True
+
         if isinstance(a, QuantizedTensor):
             quantized_a = a
             check_quantized_tensor(quantized_a, config)
@@ -69,19 +73,17 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if config.use_nt_layout_gemm_for_bwd:
-            # NT-only backward: the b_grad GEMM needs A = a^T in (K, M) layout.
-            # For tensorwise, axis=-2 quantization does NOT physically transpose
-            # qdata, so we transpose explicitly before quantizing.
-            quantized_a_t = QuantizedTensor.quantize(
-                quantized_a.dequantize().t().contiguous(),
-                quantized_a.real_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-            )
-        else:
-            quantized_a_t = a_t
+        if use_nt_layout_gemm_in_bwd:
+            if a_t is not None and isinstance(a_t, QuantizedTensor):
+                quantized_a_t = a_t
+            else:
+                quantized_a_t = QuantizedTensor.quantize(
+                    quantized_a.dequantize().t().contiguous(),
+                    quantized_a.real_dtype,
+                    config.granularity,
+                    axis=-1,
+                    block_size=config.block_size,
+                )
 
         if isinstance(b, QuantizedTensor):
             quantized_b = b
@@ -96,13 +98,10 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if config.use_nt_layout_gemm_for_bwd:
-            # a_grad runs as NT and needs B in (K, N) layout. quantized_b is
-            # already (K, N) for NN; for NT (b is (N, K)) we transpose it.
-            # NOTE: the caller-provided b_t is ignored here because its layout
-            # is not guaranteed to be the (K, N) physical transpose this path
-            # requires.
-            if trans_b:
+        if use_nt_layout_gemm_in_bwd:
+            if b_t is not None and isinstance(b_t, QuantizedTensor):
+                quantized_b_t = b_t
+            else:
                 quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize().t().contiguous(),
                     quantized_b.real_dtype,
@@ -110,8 +109,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                     axis=-1,
                     block_size=config.block_size,
                 )
-            else:
-                quantized_b_t = quantized_b
 
         out = gemm_fp8_impl(
             quantized_a.qdata,
@@ -126,7 +123,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
         )
 
-        if config.use_nt_layout_gemm_for_bwd:
+        if use_nt_layout_gemm_in_bwd:
             ctx.save_for_backward(
                 quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
             )
@@ -139,6 +136,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
+        ctx.use_nt_layout_gemm_in_bwd = use_nt_layout_gemm_in_bwd
 
         return out
 
@@ -147,7 +145,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        if ctx.config.use_nt_layout_gemm_for_bwd:
+        if ctx.use_nt_layout_gemm_in_bwd:
             a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
         else:
             a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
@@ -161,7 +159,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             axis=-1,
         )
 
-        if ctx.config.use_nt_layout_gemm_for_bwd:
+        if ctx.use_nt_layout_gemm_in_bwd:
             a_grad = gemm_fp8_impl(
                 quantized_grad_out.qdata,
                 quantized_grad_out.scale_inv,
@@ -188,9 +186,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 default_backend=BackendType.HIPBLASLT.value,
             )
 
-        if ctx.config.use_nt_layout_gemm_for_bwd:
-            # b_grad as NT: gemm(a^T (K, M), grad_out^T (N, M)) contracts over M.
-            # grad_out^T must be physically transposed for tensorwise.
+        if ctx.use_nt_layout_gemm_in_bwd:
             quantized_grad_out_t = QuantizedTensor.quantize(
                 grad_out.t().contiguous(),
                 grad_out_dtype,
@@ -198,7 +194,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 axis=-1,
             )
 
-            # transC = ctx.trans_b orients the output: (K, N) for NN, (N, K) for NT.
             b_grad = gemm_fp8_impl(
                 a_fp8_t,
                 a_t_scale_inv,
@@ -225,8 +220,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 default_backend=BackendType.HIPBLASLT.value,
             )
 
-        # Grads correspond to forward args:
-        #   (a, b, a_t, b_t, trans_a, trans_b, out_dtype, config)
         return (a_grad, b_grad, None, None, None, None, None, None)
 
 
@@ -394,7 +387,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             quant_fp8_blockwise_impl,
         )
 
-        assert config.use_nt_layout_gemm_for_bwd, "use_nt_layout_gemm_for_bwd must be True"
         assert isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor), "a and b must be torch.Tensor"
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
@@ -522,7 +514,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
 
-        assert config.use_nt_layout_gemm_for_bwd, "use_nt_layout_gemm_for_bwd must be True"
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
         a_scaling_recipe = ScalingRecipe()

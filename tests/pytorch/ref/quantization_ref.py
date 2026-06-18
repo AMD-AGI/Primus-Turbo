@@ -65,4 +65,8 @@ def dequantize_fp8_ref(
     scale_inv: torch.Tensor,
 ):
     y = x.to(torch.float32) * scale_inv.to(torch.float32)
+    if granularity == ScalingGranularity.TENSORWISE and axis is not None:
+        valid_axis = axis if axis >= 0 else x.dim() + axis
+        if valid_axis == x.dim() - 2:
+            y = y.transpose(-1, -2).contiguous()
     return y.to(out_dtype)

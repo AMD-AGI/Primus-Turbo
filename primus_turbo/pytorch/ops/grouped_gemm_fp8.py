@@ -73,7 +73,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         config: Float8QuantConfig,
         num_cu: int | None,
     ):
-        assert config.use_nt_layout_gemm_for_bwd, "use_nt_layout_gemm_for_bwd must be True"
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
         assert a.ndim == 2, "Input tensor must be 2-dimensional."
@@ -372,6 +371,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -379,6 +380,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         config: Float8QuantConfig,
         num_cu: int | None,
     ):
+        use_nt_layout_gemm_in_bwd = False
+        if trans_b == True:
+            use_nt_layout_gemm_in_bwd = True
+
         assert config.granularity == ScalingGranularity.TENSORWISE
 
         if isinstance(a, QuantizedTensor):
@@ -411,8 +416,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if config.use_nt_layout_gemm_for_bwd:
-            if trans_b:
+        if use_nt_layout_gemm_in_bwd:
+            if b_t is not None and isinstance(b_t, QuantizedTensor):
+                quantized_b_t = b_t
+            else:
                 quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize().transpose(-1, -2).contiguous(),
                     quantized_b.real_dtype,
@@ -420,8 +427,6 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                     axis=-1,
                     block_size=config.block_size,
                 )
-            else:
-                quantized_b_t = quantized_b
 
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
@@ -439,7 +444,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             maybe_pre_sync=True,
         )
 
-        if config.use_nt_layout_gemm_for_bwd:
+        if use_nt_layout_gemm_in_bwd:
             ctx.save_for_backward(
                 quantized_a.qdata,
                 quantized_b_t.qdata,
@@ -459,9 +464,11 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             )
         ctx.trans_a = False
         ctx.trans_b = trans_b
+        ctx.use_nt_layout_gemm_in_bwd = use_nt_layout_gemm_in_bwd
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+
         return out
 
     @staticmethod
@@ -479,7 +486,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             group_lens=group_lens,
         )
 
-        if ctx.config.use_nt_layout_gemm_for_bwd:
+        if ctx.use_nt_layout_gemm_in_bwd:
             # b_fp8 is the per-group (K, N) transpose cache; grad_a runs as NT.
             grad_a = grouped_gemm_fp8_impl(
                 quantized_grad_out.qdata,
@@ -527,7 +534,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None, None, None
 
 
 class FP8GroupedGemmMXFunc(torch.autograd.Function):
@@ -739,7 +746,7 @@ def grouped_gemm_fp8(
         # TENSORWISE has a single scalar scale (no col-wise trans cache needed);
         # the inner ``data_t`` is ignored if provided.
         return FP8GroupedGemmTensorFunc.apply(
-            a_data, b_data, group_lens, group_offs, trans_b, out_dtype, config, num_cu
+            a_data, b_data, a_data_t, b_data_t, group_lens, group_offs, trans_b, out_dtype, config, num_cu
         )
     elif config.granularity == ScalingGranularity.ROWWISE:
         return FP8GroupedGemmRowFunc.apply(

@@ -28,7 +28,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
         "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
 
     // ********* Quantization *********
-    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None) -> "
+    m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, int axis=-1, Tensor? "
+          "scale_opt=None) -> "
           "Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
           "scale_opt=None) -> Tensor[]");
@@ -37,7 +38,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_fp8_blockwise_for_weight(Tensor input, ScalarType dest_dtype, int block_size) "
           "-> Tensor[]");
 
-    m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
+    m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype, int "
+          "axis=-1) -> "
           "Tensor");
     m.def("dequantize_fp8_rowwise(Tensor input, Tensor scale_inv, int axis, "
           "ScalarType dest_dtype) -> Tensor");

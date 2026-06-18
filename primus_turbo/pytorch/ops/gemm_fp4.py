@@ -53,8 +53,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
-        assert config.use_nt_layout_gemm_for_bwd, "use_nt_layout_gemm_for_bwd must be True"
-
         preshuffle = config.use_preshuffle
 
         a_scaling_recipe = ScalingRecipe(

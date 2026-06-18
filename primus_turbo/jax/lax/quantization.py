@@ -32,7 +32,9 @@ def quantize_fp8(
     scale_opt = jnp.empty((0,), dtype=jnp.float32) if scale is None else scale
 
     if granularity == ScalingGranularity.TENSORWISE:
-        x_q, scale_inv, _ = quantize_fp8_tensorwise_p.bind(x, scale_opt, out_dtype=out_dtype)
+        # axis: -1 keeps the [M, N] layout, -2 transposes it to [N, M].
+        tw_axis = -1 if axis is None else axis
+        x_q, scale_inv, _ = quantize_fp8_tensorwise_p.bind(x, scale_opt, out_dtype=out_dtype, axis=tw_axis)
         return x_q, scale_inv
 
     elif granularity == ScalingGranularity.ROWWISE:
@@ -55,7 +57,9 @@ def dequantize_fp8(
 ) -> jax.Array:
     """FP8 DeQuantize. Returns: x_dq"""
     if granularity == ScalingGranularity.TENSORWISE:
-        return dequantize_fp8_tensorwise_p.bind(x, scale_inv, out_dtype=out_dtype)
+        # axis: -1 keeps the [M, N] layout, -2 transposes it to [N, M].
+        tw_axis = -1 if axis is None else axis
+        return dequantize_fp8_tensorwise_p.bind(x, scale_inv, out_dtype=out_dtype, axis=tw_axis)
     elif granularity == ScalingGranularity.ROWWISE:
         if axis is None:
             raise ValueError("axis must be specified for rowwise FP8 de-quantization")
