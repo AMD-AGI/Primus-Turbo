@@ -73,7 +73,14 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        preshuffled: bool = False,
     ) -> bool:
+        # HipBLASLt vendor wrapper has no preshuffle plumbing (see
+        # csrc/kernels/gemm/hipblaslt_gemm.cu) and would silently produce
+        # garbage on AITER-preshuffled inputs. Refuse the layout cleanly.
+        if preshuffled:
+            return False
+
         supported = True
         # check ScalingGranularity
         supported &= granularity in GEMMFP4HipBLASLtBackend.SUPPORTED_GRANULARITIES
@@ -105,7 +112,12 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        preshuffled: bool = False,
     ):
+        # preshuffled is accepted only so the dispatcher's uniform
+        # execute(**kwargs) call works; can_handle already rejected the
+        # preshuffled=True case.
+        del preshuffled
         # TODO(ruibin): Add padding
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
             a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
@@ -125,6 +137,7 @@ class GEMMFP4AITERBackend(KernelBackend):
 
     AITER_FP4GEMM_M_MULTIPLE = 16
     AITER_FP4GEMM_N_MULTIPLE = 16
+    AITER_FP4GEMM_K_MULTIPLE = 32
 
     @staticmethod
     def can_handle(
@@ -137,7 +150,9 @@ class GEMMFP4AITERBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        preshuffled: bool = False,
     ) -> bool:
+        del preshuffled  # AITER handles both layouts
         supported = True
         # check ScalingGranularity
         supported &= granularity in GEMMFP4AITERBackend.SUPPORTED_GRANULARITIES
@@ -149,6 +164,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         supported &= (
             a.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_M_MULTIPLE == 0
             and b.size(0) % GEMMFP4AITERBackend.AITER_FP4GEMM_N_MULTIPLE == 0
+            and a.size(1) * 2 % GEMMFP4AITERBackend.AITER_FP4GEMM_K_MULTIPLE == 0
         )
 
         return supported
@@ -164,7 +180,15 @@ class GEMMFP4AITERBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        preshuffled: bool = False,
     ):
+        if preshuffled:
+            # Fast path: caller guarantees a_scale_inv, b_scale_inv, and b
+            # were already produced in the AITER 16x16-tile layout (e.g. via
+            # quantize_mxfp4{,_dual}(shuffle_scale=True, shuffle_out=True)).
+            # Skip the 3 standalone shuffle kernel launches.
+            return get_aiter().gemm_a4w4(a, b, a_scale_inv, b_scale_inv, dtype=out_dtype, bpreshuffle=True)
+
         # NOTE: AITER FP4 GEMM requires shuffled scale and B
         a_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(a_scale_inv, [16, 16])
         b_scale_inv_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_scale(b_scale_inv, [16, 16])
@@ -185,9 +209,9 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
+    def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, preshuffled=False, **kwargs):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, preshuffled)
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")
@@ -202,6 +226,7 @@ def gemm_fp4_impl(
     trans_c: bool,
     granularity: int,
     default_backend: int,
+    preshuffled: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
@@ -217,6 +242,7 @@ def gemm_fp4_impl(
         trans_b=trans_b,
         trans_c=trans_c,
         granularity=granularity_enum,
+        preshuffled=preshuffled,
     )
 
     return GEMMFP4KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -234,6 +260,7 @@ def gemm_fp4_impl_meta(
     trans_c: bool,
     granularity: int,
     default_backend: int,
+    preshuffled: bool = False,
 ) -> torch.Tensor:
     m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
     if trans_c:

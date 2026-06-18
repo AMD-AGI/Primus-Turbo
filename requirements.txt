@@ -1,12 +1,7 @@
 pre-commit
-clang-format==18.1.6
+clang-format==20.1.6
 build
-ninja>=1.10
-scikit-build-core
-# triton==3.7.0  # Temporarily disabled (gfx1250/MI455): the upstream PyPI triton 3.7.0
-# is ABI/LLVM-incompatible with the ROCm-matched triton shipped alongside the image's torch
-# (2.11.0+rocm7.14, TheRock nightly); importing triton after torch segfaults. Use the
-# rocm-matched triton bundled in the image instead of this PyPI build.
+ninja
 expecttest
 pytest
 pytest-xdist

@@ -516,7 +516,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                                         global_row, scale_col, scale_N_pad);
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
@@ -533,7 +533,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                         if (scale_col < scale_N_pad) {
                             int scale_index =
                                 compute_shuffle_scale_index(global_row, scale_col, scale_N_pad);
-                            out_scale[scale_index] = E8M0_EXPONENT_BIAS;
+                            out_scale[scale_index] = static_cast<uint8_t>(0);
                         }
                     }
 
@@ -566,7 +566,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                                         global_col, scale_col, scale_N_pad);
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
@@ -583,7 +583,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_kernel(
                         if (scale_col < scale_N_pad) {
                             int scale_index =
                                 compute_shuffle_scale_index(global_col, scale_col, scale_N_pad);
-                            out_scale[scale_index] = E8M0_EXPONENT_BIAS;
+                            out_scale[scale_index] = static_cast<uint8_t>(0);
                         }
                     }
                 }
