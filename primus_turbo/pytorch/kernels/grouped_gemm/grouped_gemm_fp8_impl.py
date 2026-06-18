@@ -944,7 +944,7 @@ _ASM_CO_WGRAD_SITES = {
 }
 
 # ── ASM .co wgrad launcher (variable-K, dot_scaled MFMA 32x32x64) ───────────
-_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2.co"
+_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2_fixed.co"
 _ASM_CO_WGRAD_KERNEL_NAME = "grouped_variable_k_dot_scaled_kernel"
 _ASM_CO_WGRAD_THREADS = 1024
 
@@ -998,6 +998,12 @@ def _launch_asm_co_wgrad_variable_k(
 
     func = _get_asm_co_wgrad_func()
 
+    # The v_mfma_f32_32x32x64_f8f6f4 instruction on gfx950 applies an implicit
+    # 0.25x (2^-1 per operand) to OCP E4M3 data. Compensate by scaling each
+    # operand's scale factor by 2x (total 4x correction).
+    lhs_scale_adj = lhs_scale * 2.0
+    rhs_scale_adj = rhs_scale * 2.0
+
     # 96-byte flat kernarg buffer (KernArgs in asm_co_grouped_gemm.cpp)
     buf = ctypes.create_string_buffer(96)
     struct.pack_into(
@@ -1007,8 +1013,8 @@ def _launch_asm_co_wgrad_variable_k(
         lhs.data_ptr(),
         rhs.data_ptr(),
         out.data_ptr(),
-        lhs_scale.data_ptr(),
-        rhs_scale.data_ptr(),
+        lhs_scale_adj.data_ptr(),
+        rhs_scale_adj.data_ptr(),
         group_offs.data_ptr(),
     )
     struct.pack_into(
