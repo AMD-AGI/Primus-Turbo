@@ -8,20 +8,15 @@
 
 Same kernel vLLM/SGLang call on ROCm: ``aiter.fused_moe.fused_moe``. Supports
 bf16 / fp8 (block, per-channel) / mxfp4 weights via --quant. Simulates one rank
-under TP (shard intermediate) or EP (shard experts).
+under TP (shard intermediate) or EP (shard experts). Without --balanced, EP
+ranks are imbalanced, so all ep_size ranks are swept and Time/TFLOPS/BW are
+reported as a min~max range.
 
---variance (>=0) sets expert-load imbalance: the variance of per-expert load
-normalized to mean 1 (squared coefficient of variation). 0=perfectly balanced;
-larger=more hot experts (saturates at E/topk - 1). Under EP all ranks are swept
-and the bottleneck (slowest) rank's Time/TFLOPS/BW are reported, with an Imbal
-column = slowest/fastest rank time (1.0 = balanced; >1 = EP load imbalance).
-
-    python bench_moe_aiter.py [--model M] [--quant Q] [--tp-size N | --ep-size N] [--variance V] [--check]
+    python bench_moe_aiter.py [--model M] [--quant Q] [--tp-size N | --ep-size N] [--balanced] [--check]
 """
 
 import argparse
 import contextlib
-import math
 import os
 from datetime import datetime
 
@@ -45,8 +40,6 @@ MODELS = {
     "glm-5.1": {"hidden_size": 6144, "moe_intermediate_size": 2048, "n_routed_experts": 256, "topk": 8},
     # https://huggingface.co/MiniMaxAI/MiniMax-M2.7  (229B total)
     "minimax-m2.7": {"hidden_size": 3072, "moe_intermediate_size": 1536, "n_routed_experts": 256, "topk": 8},
-    # https://huggingface.co/MiniMaxAI/MiniMax-M3  (428B total / 23B active; SwiGLU-OAI, top-4, MSA sparse attn)
-    "minimax-m3": {"hidden_size": 6144, "moe_intermediate_size": 3072, "n_routed_experts": 128, "topk": 4},
     # https://huggingface.co/openai/gpt-oss-120b  (117B total / 5.1B active; SwiGLU, top-4)
     "gpt-oss-120b": {"hidden_size": 2880, "moe_intermediate_size": 2880, "n_routed_experts": 128, "topk": 4},
     # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  (1.02T total / 42B active)
@@ -56,8 +49,6 @@ MODELS = {
 }
 
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-
-_USE_CUDAGRAPH = True  # time via CUDA-graph replay (matches SGLang/vLLM decode); set by main().
 
 
 @contextlib.contextmanager
@@ -89,44 +80,25 @@ def compute_snr(ref: torch.Tensor, actual: torch.Tensor) -> float:
     return 10 * torch.log10(signal / (noise + 1e-12)).item()
 
 
-def make_routing(num_tokens, num_experts, topk, device, variance):
-    """Routing whose load imbalance is set by ``variance``: the variance of the
-    per-expert token count normalized to mean 1 (squared coefficient of
-    variation). Load balance is defined per expert (each expert gets the same
-    number of tokens), the standard MoE definition.
+def make_routing(num_tokens, num_experts, topk, device):
+    """Standard softmax top-k routing with renormalized weights.
 
-    variance == 0  -> *exact* per-expert balance: each token takes topk experts
-        evenly spaced across the expert range (stride = E // topk), so every
-        expert receives an identical token count (up to the unavoidable residue
-        when num_tokens * topk < E, e.g. tiny batches) and the picks fan out
-        across all EP ranks. This is deterministic -> no sampling jitter.
-
-    variance > 0   -> per-expert popularity is a uniform/hot-set mix
-        p_i = b/E + (1-b)/topk * [i in hot], whose load variance is exactly
-        (1-b)^2 * (E/topk - 1); we invert that to hit the requested variance,
-        saturating at var_max = E/topk - 1. The hot set is *fixed* (seed 1234,
-        independent of num_tokens) so every batch size sees the same skew and
-        rows are comparable. Per-token picks are sampled without replacement.
-
-    Weights are uniform (combine weights don't affect cost).
+    Done outside the timed region; only the routing *outputs* feed fused_moe.
+    Returns (topk_weights[fp32], topk_ids[int32]).
     """
+    logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    probs = torch.softmax(logits, dim=-1)
+    topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def make_balanced_routing(num_tokens, num_experts, topk, device):
+    """Deterministic perfectly-balanced routing: each expert receives an equal
+    token share, so every EP rank has identical load. Weights are uniform.
+    """
+    ids = (torch.arange(num_tokens * topk, device=device) % num_experts).reshape(num_tokens, topk)
     weights = torch.full((num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32)
-    var_max = num_experts / topk - 1.0
-    balance = 1.0 if (variance <= 0.0 or var_max <= 0.0) else 1.0 - math.sqrt(min(variance, var_max) / var_max)
-
-    if balance >= 1.0:
-        stride = max(1, num_experts // topk)
-        offs = (torch.arange(num_tokens, device=device) % stride).unsqueeze(1)
-        base = (torch.arange(topk, device=device) * stride).unsqueeze(0)
-        ids = (offs + base) % num_experts  # topk distinct, evenly spaced
-        return weights, ids.to(torch.int32)
-
-    gen = torch.Generator(device=device).manual_seed(1234)
-    hot = torch.randperm(num_experts, generator=gen, device=device)[:topk]
-    pop = torch.full((num_experts,), balance / num_experts, device=device, dtype=torch.float32)
-    pop[hot] += (1.0 - balance) / topk
-    probs = pop.unsqueeze(0).expand(num_tokens, -1).contiguous()
-    ids = torch.multinomial(probs, topk, replacement=False, generator=gen)
     return weights, ids.to(torch.int32)
 
 
@@ -274,47 +246,13 @@ def _per_expert_nbytes(t):
     return t[0].numel() * t.element_size()
 
 
-def _time_ms(fn, warmup=10, iters=50, use_graph=None):
+def _time_ms(fn, warmup=10, iters=50):
     """GPU time per call via CUDA events (excludes host/Python launch overhead).
 
-    With use_graph (default, controlled by --cudagraph) fn is captured into a
-    CUDA graph and timed via replay, removing per-launch dispatch overhead and
-    matching how SGLang/vLLM run decode. Falls back to eager launches if the
-    kernel cannot be captured (e.g. an internal device->host sync).
+    Launches `iters` calls back-to-back between two events so the elapsed GPU
+    stream time reflects steady-state per-call cost.
     """
-    if use_graph is None:
-        use_graph = _USE_CUDAGRAPH
     with suppress_output():
-        if use_graph:
-            try:
-                # Warmup on a side stream (required before capture; also triggers
-                # any first-call JIT so it is not captured into the graph).
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(warmup):
-                        fn()
-                torch.cuda.current_stream().wait_stream(s)
-                torch.cuda.synchronize()
-
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    fn()
-                for _ in range(3):  # warm the replay
-                    graph.replay()
-                torch.cuda.synchronize()
-
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(iters):
-                    graph.replay()
-                end.record()
-                torch.cuda.synchronize()
-                return start.elapsed_time(end) / iters
-            except Exception:
-                pass  # capture unsupported for this kernel -> eager timing below
-
         for _ in range(warmup):
             fn()
         torch.cuda.synchronize()
@@ -328,7 +266,7 @@ def _time_ms(fn, warmup=10, iters=50, use_graph=None):
     return start.elapsed_time(end) / iters
 
 
-def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, variance, quant, check):
+def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, balanced, quant, check):
     K = cfg["hidden_size"]
     I = cfg["moe_intermediate_size"]
     E = cfg["n_routed_experts"]
@@ -347,72 +285,55 @@ def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, variance, qu
     # (bf16, un-shuffled) weights, so fp8 modes show their quantization SNR.
     w1_k, w2_k, w1_scale, w2_scale, quant_type = quantize_weights(w1, w2, quant)
 
-    topk_weights, topk_ids = make_routing(num_tokens, E, topk, device, variance)
+    routing = make_balanced_routing if balanced else make_routing
+    topk_weights, topk_ids = routing(num_tokens, E, topk, device)
 
-    # In EP each rank owns a different expert window; under load imbalance the
-    # ranks get different token counts. We first measure each rank's *load*
-    # (token-expert pairs = grouped-GEMM M, noise-free), then report the
-    # bottleneck = heaviest rank, since a decode step waits for the slowest one.
-    # Imbalance = max/min load over active ranks (1.00 = perfectly balanced).
-    # Under TP a single rank owns all experts, so one rank is the whole picture.
-    ranks = range(ep_size) if ep_size > 1 else [0]
-
-    per_expert_bytes = _per_expert_nbytes(w1_k) + _per_expert_nbytes(w2_k)
-    if w1_scale is not None:
-        per_expert_bytes += _per_expert_nbytes(w1_scale) + _per_expert_nbytes(w2_scale)
+    # EP without balancing: every rank sees a different token load, so sweep all
+    # ranks and report the spread. Otherwise a single rank is representative.
+    ranks = range(ep_size) if (ep_size > 1 and not balanced) else [0]
 
     elem = torch.finfo(dtype).bits // 8
-
-    # Per-rank load (no timing): (r, lo, local_m, local_tokens, active_experts).
-    loads = []
+    times, tflops_list, bw_list = [], [], []
+    snr = None
     for r in ranks:
         lo = r * local_E
+        expert_mask = make_expert_mask(E, lo, local_E, device) if ep_size > 1 else None
+        fn = lambda: aiter_fused_moe(
+            hidden, w1_k, w2_k, topk_weights, topk_ids, quant_type, w1_scale, w2_scale, expert_mask
+        )
+
+        # Check every rank and keep the worst (min) SNR: one wrong rank
+        # corrupts the whole MoE output. Empty windows (ref all zeros) skip.
+        if check:
+            with suppress_output():
+                out = fn()
+            ref = torch_moe_ref(hidden, w1, w2, topk_weights, topk_ids, lo)
+            if ref.abs().any():
+                s = compute_snr(ref, out.float())
+                snr = s if snr is None else min(snr, s)
+
+        time_ms = _time_ms(fn)
+
+        # Token-expert pairs and activated experts in this rank's window.
         in_win = (topk_ids >= lo) & (topk_ids < lo + local_E)
-        local_m = int(in_win.sum().item())
-        if local_m == 0:
-            continue  # idle rank (no tokens routed here) -> never the bottleneck
-        local_tokens = int(in_win.any(dim=1).sum().item())
+        n = int(in_win.sum().item())
         active_experts = int(torch.unique(topk_ids[in_win]).numel())
-        loads.append((r, lo, local_m, local_tokens, active_experts))
 
-    if not loads:
-        return None
+        # FC1: [n,K]x[K,2*local_I], FC2: [n,local_I]x[local_I,K]
+        flops = 2 * n * K * (2 * local_I) + 2 * n * local_I * K
+        # Effective HBM traffic: activated-expert weights (read once, actual
+        # stored bytes incl. scales) + bf16 activations in/out.
+        per_expert_bytes = _per_expert_nbytes(w1_k) + _per_expert_nbytes(w2_k)
+        if w1_scale is not None:
+            per_expert_bytes += _per_expert_nbytes(w1_scale) + _per_expert_nbytes(w2_scale)
+        weight_bytes = active_experts * per_expert_bytes
+        act_bytes = 2 * num_tokens * K * elem  # hidden in + out
 
-    ms = [l[2] for l in loads]
-    imbalance = max(ms) / min(ms)
-    # Bottleneck = heaviest-load rank; that rank's consistent triple is reported.
-    r, lo, local_m, local_tokens, active_experts = max(loads, key=lambda l: l[2])
+        times.append(time_ms)
+        tflops_list.append(flops / (time_ms * 1e-3) / 1e12)
+        bw_list.append((weight_bytes + act_bytes) / (time_ms * 1e-3) / 1e9)
 
-    weight_bytes = active_experts * per_expert_bytes  # activated-expert weights
-    expert_mask = make_expert_mask(E, lo, local_E, device) if ep_size > 1 else None
-    fn = lambda: aiter_fused_moe(
-        hidden, w1_k, w2_k, topk_weights, topk_ids, quant_type, w1_scale, w2_scale, expert_mask
-    )
-
-    snr = None
-    if check:
-        with suppress_output():
-            out = fn()
-        ref = torch_moe_ref(hidden, w1, w2, topk_weights, topk_ids, lo)
-        if ref.abs().any():
-            snr = compute_snr(ref, out.float())
-
-    time_ms = _time_ms(fn)
-
-    # FC1: [local_m,K]x[K,2*local_I], FC2: [local_m,local_I]x[local_I,K]
-    flops = 2 * local_m * K * (2 * local_I) + 2 * local_m * local_I * K
-    # Effective HBM traffic: activated-expert weights + bf16 activations. Only
-    # the tokens routed to this rank are read/written (EP touches a subset; TP
-    # touches all of them).
-    act_bytes = 2 * local_tokens * K * elem  # hidden in + out
-
-    return {
-        "time_ms": time_ms,
-        "tflops": flops / (time_ms * 1e-3) / 1e12,
-        "bw": (weight_bytes + act_bytes) / (time_ms * 1e-3) / 1e9,
-        "imbalance": imbalance,
-        "snr": snr,
-    }
+    return times, tflops_list, bw_list, snr
 
 
 def save_excel(path, args, cfg, tp_size, ep_size, rows):
@@ -426,8 +347,7 @@ def save_excel(path, args, cfg, tp_size, ep_size, rows):
         "moe_intermediate_size": cfg["moe_intermediate_size"],
         "n_routed_experts": cfg["n_routed_experts"],
         "topk": cfg["topk"],
-        "variance": args.variance,
-        "cudagraph": args.cudagraph,
+        "balanced": args.balanced,
         "seed": args.seed,
         "gpu": torch.cuda.get_device_name(0),
     }
@@ -471,12 +391,9 @@ def main():
         help="Expert-parallel size (shards experts). Mutually exclusive with --tp-size.",
     )
     parser.add_argument(
-        "--variance",
-        type=float,
-        default=0.0,
-        help="Expert-load imbalance: variance of per-expert load normalized to "
-        "mean 1 (squared coefficient of variation). 0=perfectly balanced; larger "
-        "= more hot experts. Saturates at E/topk - 1 (all tokens on the same topk).",
+        "--balanced",
+        action="store_true",
+        help="Use balanced routing (all EP ranks identical). Default: imbalanced, sweep all ranks.",
     )
     # Sweep range
     parser.add_argument(
@@ -493,13 +410,6 @@ def main():
         help="Run the SNR correctness check vs the torch reference (default: off).",
     )
     parser.add_argument(
-        "--no-cudagraph",
-        dest="cudagraph",
-        action="store_false",
-        help="Time with eager launches instead of CUDA-graph replay (default: cudagraph on).",
-    )
-    parser.set_defaults(cudagraph=True)
-    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -513,12 +423,9 @@ def main():
         help="Save results to this .xlsx file. If omitted, an auto-named file is used.",
     )
     args = parser.parse_args()
-    assert args.variance >= 0.0, "--variance must be >= 0"
 
     assert torch.cuda.is_available(), "This benchmark requires a GPU."
     torch.manual_seed(args.seed)
-    global _USE_CUDAGRAPH
-    _USE_CUDAGRAPH = args.cudagraph
     tp_size, ep_size = args.tp_size, args.ep_size
     assert tp_size >= 1 and ep_size >= 1, "tp/ep size must be >= 1"
     assert not (tp_size > 1 and ep_size > 1), "Enable either TP or EP, not both."
@@ -529,16 +436,20 @@ def main():
     assert cfg["moe_intermediate_size"] % tp_size == 0, "intermediate not divisible by tp_size"
     assert cfg["n_routed_experts"] % ep_size == 0, "experts not divisible by ep_size"
 
-    report = "bottleneck rank" if ep_size > 1 else "single rank"
     print()
     print(f"  Model     : {args.model} (hidden={cfg['hidden_size']}, inter={cfg['moe_intermediate_size']}, "
           f"experts={cfg['n_routed_experts']}, topk={cfg['topk']})")
-    print(f"  Precision : {args.quant}        Parallel : tp={tp_size} ep={ep_size}  variance={args.variance}")
-    print(f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}  ({report}; Imbal = slowest/fastest rank)")
+    print(f"  Precision : {args.quant}        Parallel : tp={tp_size} ep={ep_size}  balanced={args.balanced}")
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
     print()
 
-    cols = (("Tokens", 8), ("Time (ms)", 11), ("TFLOPS", 9), ("BW (GB/s)", 10), ("Imbal", 6), ("SNR (dB)", 8))
+    def fmt(xs, prec, w):
+        lo, hi = min(xs), max(xs)
+        if lo == hi:
+            return f"{lo:.{prec}f}"
+        return f"{lo:>{w}.{prec}f} ~ {hi:<{w}.{prec}f}"
+
+    cols = (("Tokens", 8), ("Time (ms)", 17), ("TFLOPS", 15), ("BW (GB/s)", 15), ("SNR (dB)", 8))
     header = " | ".join(f"{name:^{w}}" for name, w in cols)
     sep = "-+-".join("-" * w for _, w in cols)
     print(header)
@@ -547,25 +458,20 @@ def main():
     rows = []
     for num_tokens in args.tokens:
         try:
-            res = benchmark_one(
-                num_tokens, cfg, dtype, device, tp_size, ep_size, args.variance, args.quant, args.check
+            times, tflops_list, bw_list, snr = benchmark_one(
+                num_tokens, cfg, dtype, device, tp_size, ep_size, args.balanced, args.quant, args.check
             )
-            if res is None:
-                print(f"{num_tokens:>8} | (no active ranks)")
-                rows.append({"Tokens": num_tokens, "Time (ms)": None})
-                continue
-            snr_str = "-" if res["snr"] is None else f"{res['snr']:.1f}"
+            snr_str = "-" if snr is None else f"{snr:.1f}"
             print(
-                f"{num_tokens:>8} | {res['time_ms']:>11.3f} | {res['tflops']:>9.1f} | "
-                f"{res['bw']:>10.0f} | {res['imbalance']:>6.2f} | {snr_str:>8}"
+                f"{num_tokens:>8} | {fmt(times, 3, 7):>17} | {fmt(tflops_list, 1, 6):>15} | "
+                f"{fmt(bw_list, 0, 6):>15} | {snr_str:>8}"
             )
             rows.append(
                 {
                     "Tokens": num_tokens,
-                    "Time (ms)": round(res["time_ms"], 3),
-                    "TFLOPS": round(res["tflops"], 1),
-                    "BW (GB/s)": round(res["bw"], 0),
-                    "Imbal": round(res["imbalance"], 2),
+                    "Time (ms)": fmt(times, 3, 0),
+                    "TFLOPS": fmt(tflops_list, 1, 0),
+                    "BW (GB/s)": fmt(bw_list, 0, 0),
                     "SNR (dB)": snr_str,
                 }
             )
