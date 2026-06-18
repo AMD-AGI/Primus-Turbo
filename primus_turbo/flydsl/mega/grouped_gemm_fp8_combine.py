@@ -17,13 +17,13 @@ all done, push its finished L2Y rows back to their origin ranks' combine buffers
 under the MFMA-bound GEMM.
 
 This is packaged as ``CombineGroupFP8TileSpec(GroupFp8TileSpec)`` (the K2 mirror of
-``DispatchGroupFP8TileSpec``): its ``build_launch`` emits BOTH roles -- the GEMM
-tile (the GEMM role reuses the parent ``spec.emit(...)`` unchanged, then signals the
+``DispatchGroupFP8TileSpec``): the fused launcher in ``_compile`` emits BOTH roles --
+the GEMM tile (the GEMM role reuses ``spec.emit(...)`` unchanged, then signals the
 local L2 scoreboard) and the combine push (the ``combine_tile`` closure, the ONLY
 kernel-specific code). The base ``GroupFp8TileSpec`` supplies the grouped seam
-(``schedule`` tile-id map + per-expert ``base_offsets`` slab) over ``gemm_tile_spec``.
+(LINEAR no-sync scheduler + per-expert ``group_base`` slab) over ``common.tile_spec``.
 
-``combine_tile`` stays a closure inside ``build_launch``'s ``@flyc.kernel`` body
+``combine_tile`` stays a closure inside the fused kernel body in ``_compile``
 (not a spec method): its dynamic ``while``-spin / ``for`` / ``if`` only lower under
 the kernel AST rewriter. The push moves bf16 L2Y rows (16-byte vec, legal), so no
 i32 repack is needed."""
@@ -34,6 +34,8 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -41,12 +43,13 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.mega.group_tile_spec import (
+from primus_turbo.flydsl.mega.mega_group_tile_spec import (
     _LAYOUT_AGPR,
     _atomic_add,
     _fence_acquire,
     _fence_release,
     _ld_relaxed,
+    BLOCK_K,
     GroupFp8TileSpec,
     as_i8_flat as _as_i8_flat,
     scalar_f32 as _scalar,
@@ -62,13 +65,110 @@ _PUSH_LANES = 256       # combine push lanes per row
 _BLOCK_THREADS = 512    # 8 waves — the tile-spec block size
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Fused scatter epilogue (Phase 2): the GEMM tile's accumulator is scattered
+# straight into the per-row peer combine buffer, removing the L2Y round-trip.
+# A row's destination = comb_addrs[origin_rank[row]] at slot origin_slot[row].
+# ──────────────────────────────────────────────────────────────────────
+class ScatterStoreC:
+    """Scatter the scaled output tile into the per-row peer combine buffer instead
+    of a local C store. Mirrors ``StoreCPerTensor.store``'s (ti,tj,i) lane->row map
+    (row = base_row + ti*16 + (lane//16)*4 + i); the destination is resolved per row
+    via the origin/slot/peer-addr buffers. No control flow: an OOB index drops the
+    no-origin / column-tail elements (hardware num-records clamp)."""
+
+    def __init__(self, *, A_scale, B_scale, c_idx_fn, n_tiles_a, n_tiles_b, out_ty,
+                 out_features, comb_records, n_slots,
+                 origin_rank_res, origin_slot_res, comb_addr_res, elem_fn=None):
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.out_ty = out_ty
+        self.out_features = out_features
+        self.comb_records = comb_records
+        self.oob = n_slots * out_features        # one past the buffer -> dropped
+        self.origin_rank_res = origin_rank_res
+        self.origin_slot_res = origin_slot_res
+        self.comb_addr_res = comb_addr_res
+        self.elem_fn = elem_fn
+        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
+        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+
+    def _load_scalar(self, div):
+        fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
+        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+
+    def store(self, c_frag, base_row, base_col):
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
+        out_features = fx.Int32(self.out_features)
+        oob = fx.Int32(self.oob)
+        for ti in range_constexpr(self.n_tiles_a):
+            row_base = base_row + ti * 16 + (self.lane_id // 16) * 4
+            for i in range_constexpr(4):
+                row = row_base + i
+                origin = buffer_load(self.origin_rank_res, row, vec_width=1, dtype=fx.T.i32())
+                slot = buffer_load(self.origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
+                origin_ok = origin >= fx.Int32(0)
+                addr_idx = arith.select(origin_ok, origin, fx.Int32(0))
+                addr = buffer_load(self.comb_addr_res, addr_idx, vec_width=1, dtype=fx.T.i64())
+                peer = create_buffer_resource_from_addr(addr, num_records_bytes=self.comb_records)
+                slot_base = slot * out_features
+                for tj in range_constexpr(self.n_tiles_b):
+                    col = base_col + tj * 16 + self.lane_id % 16
+                    val = Vec(c_frag[self.c_idx_fn(ti, tj)])[i] * scale
+                    if self.elem_fn is not None:
+                        val = self.elem_fn(val)
+                    scaled = val.to(self.out_ty)
+                    idx_ok = arith.select(col < out_features, slot_base + col, oob)
+                    idx = arith.select(origin_ok, idx_ok, oob)
+                    buffer_store(scaled, peer, idx)
+
+
+class ScatterCombineEpilogue:
+    """``EpilogueSpec`` that scatters the tile to peer combine buffers (no local C /
+    L2Y). ``epilogue_ctx`` carries the runtime scatter buffers (built in the kernel
+    body). ``consume`` reuses the per-quadrant base-offset map of PerTensorEpilogue."""
+
+    cache_key = ("scatter_combine",)
+
+    def __init__(self, *, out_fp16=False):
+        self.out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+
+    def build(self, geom, *, A_scale, B_scale, C, c_m, c_n, mfma, epilogue_ctx=None):
+        ctx = epilogue_ctx
+        return ScatterStoreC(
+            A_scale=A_scale, B_scale=B_scale, c_idx_fn=mfma.idx,
+            n_tiles_a=geom.N_TILES_A, n_tiles_b=geom.N_TILES_B, out_ty=self.out_ty,
+            out_features=ctx["out_features"], comb_records=ctx["comb_records"],
+            n_slots=ctx["n_slots"], origin_rank_res=ctx["origin_rank_res"],
+            origin_slot_res=ctx["origin_slot_res"], comb_addr_res=ctx["comb_addr_res"],
+        )
+
+    def consume(self, geom, *, store_c, accum, epilogue_ctx=None):
+        N_TILES_A, N_TILES_B = geom.N_TILES_A, geom.N_TILES_B
+        LDS_BLOCK_M, LDS_BLOCK_N = geom.LDS_BLOCK_M, geom.LDS_BLOCK_N
+        wave_n_offset = accum.wave_n * (N_TILES_B * 16)
+        wave_m_offset = accum.wave_m * (N_TILES_A * 16)
+        base_row = accum.block_m * geom.BLOCK_M + wave_m_offset
+        base_col = accum.block_n * geom.BLOCK_N + wave_n_offset
+        store_c.store(accum.c00, base_row + 0, base_col + 0)
+        store_c.store(accum.c01, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(accum.c10, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(accum.c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+
 class CombineGroupFP8TileSpec(GroupFp8TileSpec):
     """Fused grouped FP8 GEMM + combine PUSH, expressed as a ``GroupFp8TileSpec``
     subclass. The GEMM tile reuses the parent ``emit``/``schedule``/``base_offsets``
-    UNCHANGED; ``build_launch`` emits BOTH roles in one kernel -- the GEMM tile
-    (gemm_tile, which signals the local L2 scoreboard when done) and the combine
-    push (``combine_tile``, which spins then pushes finished rows cross-rank). Only
-    ``combine_tile`` is kernel-specific.
+    UNCHANGED; the fused launcher (in ``_compile``) emits BOTH roles in one kernel --
+    the GEMM tile (via ``spec.emit``, which signals the local L2 scoreboard when done)
+    and the combine push (``combine_tile``, which spins then pushes finished rows
+    cross-rank). Only ``combine_tile`` is kernel-specific.
 
     Extra construction config (vs the base): ``out_features`` (-> n_blocks / push
     geometry / grid), ``pool_capacity`` (-> the no-sync over-launch bound),
@@ -80,119 +180,11 @@ class CombineGroupFP8TileSpec(GroupFp8TileSpec):
         self.pool_capacity = pool_capacity
         self.combine_slots = combine_slots
         self.kernel_name = "combine_grouped_" + self.layout
-        self.cache_tag = self.cache_tag + (out_features, pool_capacity, combine_slots)
-
-    def build_launch(self, *, waves_per_eu=2, agpr_alloc=None):
-        """Build the fused ``@flyc.kernel`` + ``@flyc.jit`` launcher: the front
-        ``num_comm_blocks`` blocks run ``combine_tile`` (spin + cross-rank push), the
-        rest each compute one GEMM tile via the stock ``self.emit`` then signal the
-        local L2 scoreboard. Decorator form (NOT the base's functional form): the
-        combine push has dynamic while/if that need the @flyc.kernel AST rewriter."""
-        spec = self
-        layout = self.layout
-        BLOCK_M, BLOCK_N = self.BLOCK_M, self.BLOCK_N
-        out_features = self.out_features
-        pool_capacity = self.pool_capacity
-        combine_slots = self.combine_slots
-        num_comb_blocks = self.num_comm_blocks
-        if agpr_alloc is None:
-            agpr_alloc = _LAYOUT_AGPR[layout]
-        assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
-        assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
-        n_blocks = out_features // BLOCK_N
-        worst_case_tiles = pool_capacity // BLOCK_M
-
-        # combine push geometry (bf16 L2Y rows): n_wg rows in flight per block
-        push_lanes = min(_PUSH_LANES, _BLOCK_THREADS)
-        n_wg = _BLOCK_THREADS // push_lanes
-        cols_per_step = push_lanes * _VEC
-        n_full = out_features // cols_per_step
-        n_tail = out_features % cols_per_step
-        comb_records = combine_slots * out_features * 2   # bf16 combine buffer bound (bytes)
-
-        @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-        def combine_grouped(ACT: fx.Tensor, WEIGHTS: fx.Tensor, L2Y: fx.Tensor, A_SCALE: fx.Tensor, B_SCALE: fx.Tensor,
-               TILE_TO_GROUP: fx.Tensor, SB_L2: fx.Tensor, ORIGIN_RANK: fx.Tensor, ORIGIN_SLOT: fx.Tensor,
-               COMB_ADDRS: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor, c_n: fx.Int32):
-            _ = spec.cache_tag  # JIT cache-key discriminator; emits no IR
-            thread_index = fx.thread_idx.x
-            block_index, _b, _c = fx.block_idx
-            comb_block_count = fx.Int32(num_comb_blocks)
-            # NT/TN: LDS at the top (unconditional); NN: lds=None -> emit allocs it
-            # inside the guard. Ternary (not an if-statement). Opposite codegen
-            # sensitivity per layout; see dispatch_grouped_gemm_fp8.
-            lds = fx.SharedAllocator().allocate(spec.shared_storage).peek() if layout != "nn" else None
-
-            group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-            num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-            l2y_resource = create_buffer_resource(L2Y, max_size=True)
-            origin_rank_resource = create_buffer_resource(ORIGIN_RANK, max_size=True)
-            origin_slot_resource = create_buffer_resource(ORIGIN_SLOT, max_size=True)
-            combine_address_resource = create_buffer_resource(COMB_ADDRS, max_size=True)
-            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
-
-            def combine_tile(m):
-                # CONSUMER: spin on the GEMM signal, then push finished rows cross-rank
-                if thread_index == fx.Int32(0):
-                    signal = _ld_relaxed(SB_L2, m)
-                    while signal < fx.Int32(n_blocks):
-                        fx.rocdl.s_sleep(fx.Int32(2))
-                        signal = _ld_relaxed(SB_L2, m)
-                fx.gpu.barrier()
-                # _fence_acquire()   # invalidate L1 so the push reads the freshly-written L2Y
-                base_row = m * fx.Int32(BLOCK_M)
-                lane = thread_index % fx.Int32(push_lanes)
-                workgroup = thread_index // fx.Int32(push_lanes)
-                if thread_index < fx.Int32(push_lanes * n_wg):
-                    for row_offset in range(0, BLOCK_M, n_wg):
-                        row = base_row + fx.Int32(row_offset) + workgroup
-                        origin = buffer_load(origin_rank_resource, row, vec_width=1, dtype=fx.T.i32())
-                        if origin >= fx.Int32(0):
-                            slot = buffer_load(origin_slot_resource, row, vec_width=1, dtype=fx.T.i32())
-                            combine_address = buffer_load(combine_address_resource, origin, vec_width=1, dtype=fx.T.i64())
-                            peer_combine = create_buffer_resource_from_addr(combine_address, num_records_bytes=comb_records)
-                            for chunk_index in fx.range_constexpr(n_full):
-                                col = fx.Int32(chunk_index * cols_per_step) + lane * fx.Int32(_VEC)
-                                value = buffer_load(l2y_resource, row * fx.Int32(out_features) + col, vec_width=_VEC, dtype=fx.T.bf16())
-                                buffer_store(value, peer_combine, slot * fx.Int32(out_features) + col)
-                            if n_tail:
-                                col = fx.Int32(n_full * cols_per_step) + lane * fx.Int32(_VEC)
-                                if col < fx.Int32(out_features):
-                                    value = buffer_load(l2y_resource, row * fx.Int32(out_features) + col, vec_width=_VEC, dtype=fx.T.bf16())
-                                    buffer_store(value, peer_combine, slot * fx.Int32(out_features) + col)
-
-            if block_index < comb_block_count:
-                # COMBINE role: grid-stride over this block's pool blocks
-                local_count = (real_tiles - block_index + comb_block_count - fx.Int32(1)) // comb_block_count
-                for iteration in range(local_count):
-                    combine_tile(block_index + iteration * comb_block_count)
-            else:
-                # GEMM role: custom LINEAR tile-id map + stock spec.emit, then signal
-                # the local L2 scoreboard so the combine role above can push the tile.
-                tile_index = block_index - comb_block_count
-                block_m = tile_index // fx.Int32(n_blocks)
-                if block_m < real_tiles:
-                    c_m_real = real_tiles * fx.Int32(BLOCK_M)
-                    # per-expert B slab via the stock emit scalar seam
-                    gbase = spec.group_base(group_resource, block_m, spec.K, c_n)
-                    spec.emit(A=ACT, B=WEIGHTS, C=L2Y, A_scale=A_SCALE, B_scale=B_SCALE,
-                              c_m=c_m_real, c_n=c_n, lds=lds, group_base=gbase)
-                    fx.rocdl.s_waitcnt(0)
-                    # _fence_release()                 # ALL waves flush their L2Y stores to L2
-                    fx.gpu.barrier()                 # all stores landed before signal
-                    if thread_index == fx.Int32(0):
-                        _atomic_add(SB_L2, block_m, fx.Int32(1))
-
-        @flyc.jit
-        def launch(ACT, WEIGHTS, L2Y, A_SCALE, B_SCALE, TILE_TO_GROUP, SB_L2, ORIGIN_RANK, ORIGIN_SLOT,
-                   COMB_ADDRS, NUM_TILE_BLOCKS, c_n: int, stream: fx.Stream = fx.Stream(None)):
-            grid_size = num_comb_blocks + worst_case_tiles * n_blocks
-            combine_grouped(ACT, WEIGHTS, L2Y, A_SCALE, B_SCALE, TILE_TO_GROUP, SB_L2, ORIGIN_RANK, ORIGIN_SLOT,
-               COMB_ADDRS, NUM_TILE_BLOCKS, c_n,
-               value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512")).launch(
-                grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
-
-        return launch
+        # Swap the local-C epilogue for the fused scatter-to-peer epilogue (the GEMM
+        # tile writes straight into the peers' combine buffers -> no L2Y round-trip).
+        self.epilogue_spec = ScatterCombineEpilogue(out_fp16=False)
+        # rebuild cache_tag (scatter epilogue's cache_key folds in) + combine config
+        self.cache_tag = self._assemble_cache_tag() + (out_features, pool_capacity, combine_slots)
 
 
 @functools.lru_cache(maxsize=256)
@@ -204,7 +196,9 @@ def make_combine_tile_spec(*, layout, K, out_features, pool_capacity, combine_sl
     vh = 3 if layout == "tn" else vmcnt_hint
     return CombineGroupFP8TileSpec(
         out_features=out_features, pool_capacity=pool_capacity, combine_slots=combine_slots,
-        num_comm_blocks=num_comm_blocks, layout=layout, K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_comm_blocks=num_comm_blocks, layout=layout, K=K,
+        block_tile=(BLOCK_M, BLOCK_N, BLOCK_K),
+        warp_tile=(BLOCK_M // 4, BLOCK_N // 8, BLOCK_K),
         GROUP_M=1, num_xcd=1, group_n=0, nt_vmcnt=nt_vmcnt, vmcnt_hint=vh,
         b_inline_asm_load=False, cbsz=0, blgp=0, out_fp16=False)
 
@@ -212,11 +206,70 @@ def make_combine_tile_spec(*, layout, K, out_features, pool_capacity, combine_sl
 @functools.lru_cache(maxsize=256)
 def _compile(layout, out_features, hidden_size, pool_capacity, BLOCK_M, BLOCK_N, comb_blocks,
              combine_slots, nt_vmcnt=3, waves_per_eu=2, agpr_alloc=0):
+    # num_comm_blocks=0: the fused scatter epilogue has NO separate COMBINE role, so
+    # the LINEAR scheduler must not offset past any comm blocks (block_m = pid//n_blocks).
     spec = make_combine_tile_spec(layout=layout, K=hidden_size, out_features=out_features,
                                   pool_capacity=pool_capacity, combine_slots=combine_slots,
                                   BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, nt_vmcnt=nt_vmcnt,
-                                  num_comm_blocks=int(comb_blocks))
-    return spec.build_launch(waves_per_eu=waves_per_eu, agpr_alloc=agpr_alloc)
+                                  num_comm_blocks=0)
+    layout = spec.layout
+    BLOCK_M, BLOCK_N, _ = spec.block_tile
+    out_features = spec.out_features
+    pool_capacity = spec.pool_capacity
+    combine_slots = spec.combine_slots
+    if agpr_alloc is None:
+        agpr_alloc = _LAYOUT_AGPR[layout]
+    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
+    n_blocks = out_features // BLOCK_N
+    worst_case_tiles = pool_capacity // BLOCK_M
+    comb_records = combine_slots * out_features * 2   # bf16 peer combine-buffer bound (bytes)
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def combine_grouped(ACT: fx.Tensor, WEIGHTS: fx.Tensor, L2Y: fx.Tensor, A_SCALE: fx.Tensor, B_SCALE: fx.Tensor,
+           TILE_TO_GROUP: fx.Tensor, SB_L2: fx.Tensor, ORIGIN_RANK: fx.Tensor, ORIGIN_SLOT: fx.Tensor,
+           COMB_ADDRS: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor, c_n: fx.Int32):
+        # Phase 2: each GEMM tile scatters its result straight into the peers' combine
+        # buffers via ScatterCombineEpilogue -- no L2Y round-trip, no separate COMBINE
+        # role, no SB_L2 scoreboard. L2Y / SB_L2 args kept for API compat (unused).
+        _ = spec.cache_tag  # JIT cache-key discriminator; emits no IR
+        thread_index = fx.thread_idx.x
+        block_index, _b, _c = fx.block_idx
+        # NT/TN: LDS at the top; NN: lds=None -> emit allocs it inside the guard.
+        lds = fx.SharedAllocator().allocate(spec.shared_storage).peek() if layout != "nn" else None
+
+        group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
+        num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+        origin_rank_resource = create_buffer_resource(ORIGIN_RANK, max_size=True)
+        origin_slot_resource = create_buffer_resource(ORIGIN_SLOT, max_size=True)
+        combine_address_resource = create_buffer_resource(COMB_ADDRS, max_size=True)
+        real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        # runtime scatter buffers handed to the fused epilogue (ScatterCombineEpilogue).
+        epi_ctx = {
+            "out_features": out_features, "comb_records": comb_records, "n_slots": combine_slots,
+            "origin_rank_res": origin_rank_resource, "origin_slot_res": origin_slot_resource,
+            "comb_addr_res": combine_address_resource,
+        }
+
+        block_m = block_index // fx.Int32(n_blocks)   # LinearNoSync map (num_comm_blocks==0)
+        if block_m < real_tiles:
+            c_m_real = real_tiles * fx.Int32(BLOCK_M)
+            gbase = spec.group_base(group_resource, block_m, spec.K, c_n)
+            spec.emit(A=ACT, B=WEIGHTS, C=L2Y, A_scale=A_SCALE, B_scale=B_SCALE,
+                      c_m=c_m_real, c_n=c_n, lds=lds, group_base=gbase, epilogue_ctx=epi_ctx)
+            fx.rocdl.s_waitcnt(0)
+            # _fence_release()   # multi-rank: publish the scattered rows to peers
+
+    @flyc.jit
+    def launch(ACT, WEIGHTS, L2Y, A_SCALE, B_SCALE, TILE_TO_GROUP, SB_L2, ORIGIN_RANK, ORIGIN_SLOT,
+               COMB_ADDRS, NUM_TILE_BLOCKS, c_n: int, stream: fx.Stream = fx.Stream(None)):
+        grid_size = worst_case_tiles * n_blocks
+        combine_grouped(ACT, WEIGHTS, L2Y, A_SCALE, B_SCALE, TILE_TO_GROUP, SB_L2, ORIGIN_RANK, ORIGIN_SLOT,
+           COMB_ADDRS, NUM_TILE_BLOCKS, c_n,
+           value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512")).launch(
+            grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch
 
 
 def grouped_gemm_fp8_combine(act_fp8, weight_fp8, l2y, tile_to_group, sb_l2, origin_rank,
