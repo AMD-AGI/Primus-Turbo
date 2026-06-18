@@ -37,6 +37,10 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
 
+# Set to "triton" to force the Triton tensorwise kernel for the ASM_CO fwd path.
+# Any other value (or unset) keeps the default ASM_CO kernel.
+_ASM_CO_FWD_BACKEND_OVERRIDE = os.environ.get("GROUPED_GEMM_FWD_BACKEND", "asm_co").lower()
+
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
     (float8_e4m3, float8_e4m3, torch.bfloat16),
@@ -648,23 +652,42 @@ class GroupedGEMMFP8ASMCOBackend(KernelBackend):
                 num_cu,
             )
         else:
-            if GroupedGEMMFP8ASMCOBackend._first_use_fwd:
-                GroupedGEMMFP8ASMCOBackend._first_use_fwd = False
-                print(
-                    f"[ASM_CO] fwd kernel first use — "
-                    f"a={tuple(a.shape)} b={tuple(b.shape)} "
-                    f"out_dtype={out_dtype} granularity={granularity.name}",
-                    flush=True,
+            if _ASM_CO_FWD_BACKEND_OVERRIDE == "triton":
+                if GroupedGEMMFP8ASMCOBackend._first_use_fwd:
+                    GroupedGEMMFP8ASMCOBackend._first_use_fwd = False
+                    print(
+                        f"[ASM_CO→Triton] fwd kernel first use (GROUPED_GEMM_FWD_BACKEND=triton) — "
+                        f"a={tuple(a.shape)} b={tuple(b.shape)} "
+                        f"out_dtype={out_dtype} granularity={granularity.name}",
+                        flush=True,
+                    )
+                return grouped_gemm_fp8_tensorwise_triton_kernel(
+                    a,
+                    b,
+                    a_scales,
+                    b_scales,
+                    group_offs,
+                    trans_b=trans_b,
+                    out_dtype=out_dtype,
                 )
-            return _launch_asm_co_fwd(
-                a,
-                b,
-                a_scales,
-                b_scales,
-                group_offs,
-                out_dtype,
-                num_cu,
-            )
+            else:
+                if GroupedGEMMFP8ASMCOBackend._first_use_fwd:
+                    GroupedGEMMFP8ASMCOBackend._first_use_fwd = False
+                    print(
+                        f"[ASM_CO] fwd kernel first use — "
+                        f"a={tuple(a.shape)} b={tuple(b.shape)} "
+                        f"out_dtype={out_dtype} granularity={granularity.name}",
+                        flush=True,
+                    )
+                return _launch_asm_co_fwd(
+                    a,
+                    b,
+                    a_scales,
+                    b_scales,
+                    group_offs,
+                    out_dtype,
+                    num_cu,
+                )
 
 
 # ── ASM .hsaco FWD launcher (uses tile_cumsum, trans_b=False) ────────────────
