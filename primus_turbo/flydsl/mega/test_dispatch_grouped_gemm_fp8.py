@@ -33,7 +33,7 @@ from primus_turbo.flydsl.mega.dispatch_grouped_gemm_fp8 import (
     dispatch_grouped_gemm_fp8,
     grouped_gemm_fp8_only,
 )
-from primus_turbo.flydsl.gemm.gemm_tile_spec import compile_dense_nt_tiled
+from primus_turbo.flydsl.gemm.gemm_fp8_kernel_v2 import compile_dense_nt_tiled
 
 
 class _Comm:
