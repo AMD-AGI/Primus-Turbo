@@ -151,6 +151,10 @@ class Mfma16x16x128:
     def idx(self, i, j):
         return i * self.n_tiles_b + j
 
+    def set_inplace_asm(self, cbsz, blgp):
+        # inplace MFMA: accum in AGPR; cbsz/blgp select srcA/srcB fmt
+        self._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode="2", cbsz=cbsz, blgp=blgp)
+
     def _do_mma(self, a, b, c):
         return fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a, b, c)
 
