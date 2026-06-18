@@ -37,7 +37,8 @@ python bench_moe_aiter.py --model deepseek-r1 --quant fp8_block --ep-size 8
 python bench_decode_attn_aiter.py --model minimax-m2.7 --ctx-spread 0.2 --check
 
 # NVIDIA equivalents (on a B200 box)
-python bench_moe_flashinfer.py --model deepseek-r1 --quant fp4
+python bench_moe_flashinfer.py --model deepseek-r1 --quant fp4      # nvfp4 (flagship)
+python bench_moe_flashinfer.py --model deepseek-r1 --quant mxfp4    # mxfp4 (vs aiter)
 python bench_decode_attn_flashinfer.py --model deepseek-r1 --check
 ```
 
@@ -129,19 +130,46 @@ real serving batch. Physical KV pages are deliberately scattered
 | MoE bf16 | `fused_moe` QuantType.No | `trtllm_bf16_moe` |
 | MoE fp8 block | `fused_moe` per_128x128 | `trtllm_fp8_block_scale_moe` |
 | MoE fp8 per-tensor/token | `fused_moe` per_Token | `trtllm_fp8_per_tensor_scale_moe` |
-| MoE fp4 | `fused_moe` per_1x32 (mxfp4) | `trtllm_fp4_block_scale_moe` (nvfp4) |
+| MoE fp4 (mxfp4) | `fused_moe` per_1x32 (mxfp4) | `trtllm_fp4_block_scale_moe` (`--quant mxfp4`) |
+| MoE fp4 (nvfp4) | — (AMD has no nvfp4) | `trtllm_fp4_block_scale_moe` (`--quant fp4`) |
 | Attn GQA | `paged_attention_ragged` | `trtllm_batch_decode_with_kv_cache` |
 | Attn MLA | `mla_decode_fwd` | `trtllm_batch_decode_with_kv_cache_mla` |
 | Attn SWA | `unified_attention` | `trtllm_batch_decode_with_kv_cache` (`window_left`, `sinks`) |
 | Attn DSA | indexer + sparse MLA | `trtllm_batch_decode_with_kv_cache_mla` (`sparse_mla_top_k`) |
 
+**fp4 has two flavors on NVIDIA** (validated on B200 / FlashInfer 0.6.12):
+- `--quant fp4` = **nvfp4** (Blackwell flagship): 16-elt blocks, fp8-e4m3 block
+  scales, *activations also nvfp4*. No AMD equivalent — use it for the NVIDIA
+  perf ceiling, not for cross-vendor comparison.
+- `--quant mxfp4` = **OCP micro-scaling**: 32-elt blocks, e8m0 block scales,
+  bf16 activations. This is the apples-to-apples match for aiter's `--quant fp4`
+  (per_1x32 mxfp4). Many models ship mxfp4 before any nvfp4 checkpoint exists.
+
 > **Note on weight layouts:** the trtllm-gen MoE kernels require intricate,
-> kernel-specific weight pre-processing (row reorder for gated activation,
-> `shuffle_matrix_a`, block-scale interleave, `BlockMajorK` block layout, nvfp4
-> packing). The benchmark reuses FlashInfer's own public helpers
+> kernel-specific weight pre-processing. Two points that bit us and are now
+> handled: (1) the kernels apply SwiGLU to the **second** half of `w1`, i.e. they
+> expect `[up||gate]`, while the torch reference (and aiter) use `[gate||up]` — so
+> `w1` is reordered (`_swap_gate_up`) for the kernel only, keeping `torch_moe_ref`
+> identical to the aiter bench. (2) fp4/fp8 block scales must be handed to the
+> kernel in an **fp8-e4m3 container** (`.view(torch.float8_e4m3fn)`), and fp8/fp4
+> activations are quantized **outside** the timed region (the kernels do not
+> accept bf16 activations). The benchmark reuses FlashInfer's own public helpers
 > (`reorder_rows_for_gated_act_gemm`, `shuffle_matrix_a`, `shuffle_matrix_sf_a`,
 > `fp4_quantize`, `block_scale_interleave`, `convert_to_block_layout`) so the
-> layout always matches the kernel. This prep is done **outside** the timed region.
+> layout always matches the kernel.
+
+> **Known kernel-coverage gaps on FlashInfer 0.6.12 / B200:**
+> - **MoE fp8_block / fp4 on gpt-oss-120b**: `intermediate=2880` is not a multiple
+>   of 128, which the trtllm-gen weight-scale shuffle requires — these cells raise
+>   a clean `AssertionError` (sglang pads the intermediate in production; the bench
+>   does not, to stay structurally identical to the aiter bench).
+> - **Decode SWA on mimo-v2.5-pro (`qk_head_dim=192`)**: trtllm-gen only ships
+>   decode kernels for head_dim in {32,64,128,256}; there is no 192 variant, so the
+>   cell raises "Missing TRTLLM-GEN kernel". aiter falls back to triton
+>   `unified_attention`; there is no NVIDIA fallback.
+> - **Decode DSA (sparse MLA)**: implemented against the kernel's documented
+>   `(num_seqs, 1, top_k)` page-table contract but **not yet HW-validated** (the
+>   test box was released first). Validate before trusting those rows.
 
 ---
 

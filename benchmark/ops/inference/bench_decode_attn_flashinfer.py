@@ -265,7 +265,11 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
     Dv = cfg["v_head_dim"]
     window = cfg["window"]
     scale = 1.0 / (D**0.5)
-    asym = D != Dv  # trtllm-gen decode expects symmetric qk/v; pad v then slice.
+    # trtllm-gen decode expects symmetric qk/v; pad v then slice. NOTE: trtllm-gen
+    # only ships decode kernels for head_dim in {32,64,128,256} -- there is no
+    # D=192 variant, so mimo-v2.5-pro (qk=192) raises "Missing TRTLLM-GEN kernel"
+    # (no NVIDIA fallback; aiter uses the triton unified_attention path instead).
+    asym = D != Dv
 
     perm_pages = (ctx_lens_cpu + page_size - 1) // page_size
     num_pages = int(perm_pages.sum())
@@ -293,7 +297,8 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
 
     workspace = torch.zeros(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     out_kernel = torch.empty(batch, Hq, Dk, device=device, dtype=dtype)
-    sinks = [torch.randn(Hq, dtype=torch.float32, device=device)] if cfg["sinks"] else None
+    # trtllm decode expects sinks as a single [Hq] tensor (not a list).
+    sinks = torch.randn(Hq, dtype=torch.float32, device=device) if cfg["sinks"] else None
 
     def fn():
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -308,8 +313,7 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
     if check:
         with suppress_output():
             fn()
-        sink_t = sinks[0] if sinks is not None else None
-        ref = swa_ref(q, k_ref, v_ref, ctx_lens_cpu, page_off, perm, page_size, scale, Hq, Hkv, window, sink_t)
+        ref = swa_ref(q, k_ref, v_ref, ctx_lens_cpu, page_off, perm, page_size, scale, Hq, Hkv, window, sinks)
         snr = compute_snr(ref, out.float())
 
     time_ms = _time_ms(fn)
@@ -341,7 +345,7 @@ def mla_ref(q, kv_cache, ctx_lens, page_off, perm, page_size, kv_lora_rank, scal
     return out
 
 
-def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, device, check, sparse_topk=None):
+def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, device, check):
     nhead = cfg["num_heads"] // attn_tp  # TP shards q heads; latent KV is replicated
     lora = cfg["kv_lora_rank"]
     rope = cfg["qk_rope_head_dim"]
@@ -349,12 +353,7 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
     qk = lora + rope
     scale = 1.0 / ((nope + rope) ** 0.5)
     page_size = _MLA_PAGE_SIZE
-
-    # Sparse decode (DSA) reads <= topk tokens/seq; dense MLA reads the full ctx.
-    read_lens = ctx_lens_cpu if sparse_topk is None else torch.minimum(
-        ctx_lens_cpu, torch.tensor(sparse_topk, dtype=torch.int64)
-    )
-    total_read = int(read_lens.sum())
+    total_read = int(ctx_lens_cpu.sum())  # dense MLA reads the full ctx
 
     perm_pages = (ctx_lens_cpu + page_size - 1) // page_size
     num_blocks = int(perm_pages.sum())
@@ -372,10 +371,6 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
         q_in, kv_cache = q, kv_ref
     workspace = torch.zeros(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
 
-    mla_kwargs = {}
-    if sparse_topk is not None:
-        mla_kwargs["sparse_mla_top_k"] = int(sparse_topk)
-
     def fn():
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q_in.unsqueeze(1),  # [B, q_len=1, nhead, qk]
@@ -383,11 +378,11 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
             workspace_buffer=workspace,
             qk_nope_head_dim=nope, kv_lora_rank=lora, qk_rope_head_dim=rope,
             block_tables=block_tables, seq_lens=seq_lens, max_seq_len=max_ctx,
-            bmm1_scale=scale, bmm2_scale=1.0, **mla_kwargs,
+            bmm1_scale=scale, bmm2_scale=1.0,
         )
 
     snr = None
-    if check and sparse_topk is None:  # exact ref only for dense MLA
+    if check:
         with suppress_output():
             out = fn()
         out_t = out[0] if isinstance(out, (tuple, list)) else out
@@ -403,10 +398,69 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
 
 
 def bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, device, check):
-    # Sparse absorbed-MLA decode over <= index_topk tokens. The fp8 indexer
-    # (scoring + top-k selection) stage is not separately modeled here.
-    return bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, device, check,
-                     sparse_topk=cfg["index_topk"])
+    """Sparse absorbed-MLA decode (DeepSeek sparse attention). Unlike dense MLA,
+    the sparse trtllm kernel takes the *selected* token indices directly: with
+    sparse_mla_top_k > 0 the page_table must be shaped (num_seqs, 1, top_k) and
+    holds indices into a page_size=1 latent cache (see flashinfer mla/_core.py
+    _check_trtllm_gen_mla_shape). The fp8 indexer (scoring + top-k selection) that
+    aiter's bench times separately is NOT modeled here -- only the sparse decode.
+
+    NOTE: this sparse path is written against the kernel's documented shape check
+    but was NOT yet validated on B200 hardware (the test box was released before
+    the sparse run completed). Validate the SNR/shape on real HW before relying on
+    the numbers; the dense GQA/MLA/SWA paths above are HW-verified."""
+    nhead = cfg["num_heads"] // attn_tp  # TP shards q heads; latent KV replicated
+    lora = cfg["kv_lora_rank"]
+    rope = cfg["qk_rope_head_dim"]
+    nope = cfg["qk_nope_head_dim"]
+    qk = lora + rope
+    scale = 1.0 / ((nope + rope) ** 0.5)
+    topk = cfg["index_topk"]
+
+    # Per-seq selected-token count (all of ctx when ctx <= topk); top_k is the
+    # fixed page-table width, seq_lens carries the per-seq valid count.
+    sel_lens = torch.minimum(ctx_lens_cpu, torch.tensor(topk, dtype=torch.int64))
+    top_k = int(sel_lens.max())
+    total_sel = int(sel_lens.sum())
+
+    # Latent KV pool at token granularity (page_size=1); each seq owns a region
+    # [off[b], off[b]+ctx_len[b]) and its selected tokens scatter across it.
+    off = torch.cat([torch.zeros(1, dtype=torch.int64), ctx_lens_cpu.cumsum(0)])
+    pool = int(off[-1])
+    g = torch.Generator().manual_seed(int(seed))
+    page_table = torch.zeros(batch, 1, top_k, device=device, dtype=torch.int32)
+    for b in range(batch):
+        c = int(ctx_lens_cpu[b])
+        k = int(sel_lens[b])
+        chosen = torch.randperm(c, generator=g)[:k] + int(off[b])
+        page_table[b, 0, :k] = chosen.to(device=device, dtype=torch.int32)
+
+    seq_lens = sel_lens.to(device=device, dtype=torch.int32)
+    q = torch.randn(batch, nhead, qk, device=device, dtype=dtype)
+    kv_ref = torch.randn(pool, 1, 1, qk, device=device, dtype=dtype)  # [blocks, 1, page=1, qk]
+    if kv_dtype == "fp8":
+        cdt = fp8_dtype()
+        q_in, kv_cache = q.to(cdt), kv_ref.to(cdt)
+    else:
+        q_in, kv_cache = q, kv_ref
+    workspace = torch.zeros(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+
+    def fn():
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q_in.unsqueeze(1),  # [B, q_len=1, nhead, qk]
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=nope, kv_lora_rank=lora, qk_rope_head_dim=rope,
+            block_tables=page_table, seq_lens=seq_lens, max_seq_len=top_k,
+            bmm1_scale=scale, bmm2_scale=1.0, sparse_mla_top_k=top_k,
+        )
+
+    time_ms = _time_ms(fn)
+    elem = kv_cache.element_size()
+    kv_bytes = total_sel * qk * elem  # latent read once over selected tokens
+    bw_gbps = kv_bytes / (time_ms * 1e-3) / 1e9
+    tflops = (2 * nhead * total_sel * (qk + lora)) / (time_ms * 1e-3) / 1e12
+    return time_ms, bw_gbps, tflops, None  # data-dependent top-k: SNR not checked
 
 
 def benchmark_one(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_spread, base_seed, device, check):

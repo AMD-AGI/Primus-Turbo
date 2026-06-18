@@ -164,6 +164,16 @@ def torch_moe_ref(hidden, w1, w2, topk_weights, topk_ids, expert_offset=0):
 # --------------------------------------------------------------------------- #
 
 
+def _swap_gate_up(w1):
+    """Reorder w1 from [gate||up] (the torch_moe_ref / aiter convention, SiLU on
+    the first half) to [up||gate], which is what the trtllm-gen MoE kernels expect
+    (they apply SiLU to the *second* half; see sglang align_*_moe_weights_for_
+    flashinfer_trtllm swap_w13_halves). Done on the bf16 weights before any
+    quant/shuffle, so torch_moe_ref stays identical to the aiter benchmark."""
+    E, two_I, K = w1.shape
+    return w1.reshape(E, 2, two_I // 2, K).flip(dims=[1]).reshape(E, two_I, K).contiguous()
+
+
 def _shuffle_bf16(w1, w2, num_experts):
     """bf16 BlockMajorK shuffle for trtllm_bf16_moe (gated-activation reorder +
     shuffle_matrix_a + convert_to_block_layout)."""
@@ -182,22 +192,30 @@ def _shuffle_bf16(w1, w2, num_experts):
     return torch.stack(g1).contiguous(), torch.stack(g2).contiguous()
 
 
-def _quant_fp4(w, num_experts, sf_vec_size=16):
-    """nvfp4 quantize a weight stack [E, N, K] -> (packed uint8 [E, N, K//2],
-    fp8 block scales [E, N, K//sf_vec_size], per-expert global scale)."""
+# fp4 flavors: nvfp4 (Blackwell flagship, fp8-e4m3 block scales over 16-elt
+# blocks, fp4 activations) and mxfp4 (OCP micro-scaling, e8m0 scales over 32-elt
+# blocks, bf16 activations -- the format directly comparable to aiter's mxfp4).
+_FP4_PARAMS = {"fp4": dict(sf_vec=16, ue8m0=False), "mxfp4": dict(sf_vec=32, ue8m0=True)}
+
+
+def _quant_fp4(w, num_experts, sf_vec_size, ue8m0):
+    """fp4 quantize a weight stack [E, N, K] -> (packed uint8 [E, N, K//2],
+    fp8-container block scales [E, N, K//sf_vec_size], per-expert global scale).
+    nvfp4: sf_vec=16, ue8m0=False (e4m3 scales); mxfp4: sf_vec=32, ue8m0=True (e8m0)."""
     qs, ss, gs = [], [], []
     for i in range(num_experts):
         amax = w[i].abs().amax().clamp(min=1e-6)
-        gscale = (448.0 * 6.0) / amax.float()  # nvfp4 e2m1 global scale convention
-        q, s = fp4_quantize(w[i], gscale, sf_vec_size, sf_use_ue8m0=False, is_sf_swizzled_layout=False)
+        gscale = (448.0 * 6.0) / amax.float()  # fp4 e2m1 global scale convention
+        q, s = fp4_quantize(w[i], gscale, sf_vec_size, sf_use_ue8m0=ue8m0, is_sf_swizzled_layout=False)
         qs.append(q)
         ss.append(s)
         gs.append(gscale)
     return torch.stack(qs), torch.stack(ss), torch.stack(gs)
 
 
-def _shuffle_fp4(wq, ws, num_experts, gated):
-    """Shuffle nvfp4 packed weights + interleave block scales to kernel layout."""
+def _shuffle_fp4(wq, ws, num_experts, gated, num_elts_per_sf):
+    """Shuffle fp4 packed weights + interleave block scales to kernel layout.
+    Block scales are returned in the fp8-e4m3 container the kernel requires."""
     g1w, g1s = [], []
     for i in range(num_experts):
         pi = _maybe_get_cached_w3_w1_permute_indices(
@@ -205,22 +223,24 @@ def _shuffle_fp4(wq, ws, num_experts, gated):
         )
         g1w.append(wq[i].view(torch.uint8)[pi.to(wq.device)].contiguous())
         psf = _maybe_get_cached_w3_w1_permute_indices(
-            _PERMUTE_CACHE, ws[i].view(torch.uint8), _EPILOGUE_TILE_M, num_elts_per_sf=16,
+            _PERMUTE_CACHE, ws[i].view(torch.uint8), _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf,
             is_gated_act_gemm=gated,
         )
-        g1s.append(block_scale_interleave(ws[i].view(torch.uint8)[psf.to(ws.device)].contiguous()))
+        si = block_scale_interleave(ws[i].view(torch.uint8)[psf.to(ws.device)].contiguous())
+        g1s.append(si.view(torch.float8_e4m3fn))
     return torch.stack(g1w), torch.stack(g1s)
 
 
-def _shuffle_fp4_w2(wq, ws, num_experts):
+def _shuffle_fp4_w2(wq, ws, num_experts, num_elts_per_sf):
     g2w, g2s = [], []
     for i in range(num_experts):
         pi = get_w2_permute_indices_with_cache(_PERMUTE_CACHE, wq[i].view(torch.uint8), _EPILOGUE_TILE_M)
         g2w.append(wq[i].view(torch.uint8)[pi.to(wq.device)].contiguous())
         psf = get_w2_permute_indices_with_cache(
-            _PERMUTE_CACHE, ws[i].view(torch.uint8), _EPILOGUE_TILE_M, num_elts_per_sf=16
+            _PERMUTE_CACHE, ws[i].view(torch.uint8), _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
         )
-        g2s.append(block_scale_interleave(ws[i].view(torch.uint8)[psf.to(ws.device)].contiguous()))
+        si = block_scale_interleave(ws[i].view(torch.uint8)[psf.to(ws.device)].contiguous())
+        g2s.append(si.view(torch.float8_e4m3fn))
     return torch.stack(g2w), torch.stack(g2s)
 
 
@@ -238,6 +258,27 @@ def _block_quant_fp8(w, dt, block=128):
 
 def fp8_dtype():
     return torch.float8_e4m3fn
+
+
+def _quant_block_act_fp8(hidden, dt, block=128):
+    """Per-(128-group, token) fp8 activation quant for fp8_block MoE. Returns
+    (hidden_fp8 [T, K], scale[fp32] of shape [K//128, T])."""
+    T, K = hidden.shape
+    fmax = torch.finfo(dt).max
+    hb = hidden.view(T, K // block, block).float()
+    s = (hb.abs().amax(-1) / fmax).clamp(min=1e-12)  # [T, K//128]
+    hq = (hb / s[:, :, None]).to(dt).view(T, K)
+    return hq, s.t().contiguous()
+
+
+def _estimate_inter_amax(hidden, w1_upgate):
+    """Amax of the SwiGLU intermediate (expert 0), used to set the per-tensor fp8
+    scale of the FC1 output. w1_upgate is [up||gate] (kernel order)."""
+    with torch.no_grad():
+        gu = hidden.float() @ w1_upgate[0].float().t()
+        up, gate = gu.chunk(2, dim=-1)  # kernel order: up first, gate second
+        inter = torch.nn.functional.silu(gate) * up
+    return inter.abs().amax().clamp(min=1e-12).float()
 
 
 def _time_ms(fn, warmup=10, iters=50):
@@ -265,6 +306,9 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
     """Quantize/shuffle weights and return (fn, per_expert_weight_bytes). All
     quantization/shuffle happens here, outside the timed region."""
     K = hidden.shape[1]
+    # trtllm-gen kernels gate on the 2nd half of w1; the torch reference (and the
+    # caller's w1) use [gate||up]. Reorder to [up||gate] for the kernel only.
+    w1 = _swap_gate_up(w1)
     common = dict(
         routing_logits=logits, routing_bias=None, hidden_states=hidden,
         num_experts=num_experts, top_k=topk, n_group=None, topk_group=None,
@@ -283,22 +327,39 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
             )
         return fn, _per_expert_nbytes(g1) + _per_expert_nbytes(g2)
 
-    if quant == "fp4":
+    if quant in _FP4_PARAMS:
         gated = True
-        w1q, w1s, _ = _quant_fp4(w1, local_E)
-        w2q, w2s, _ = _quant_fp4(w2, local_E)
-        g1w, g1s = _shuffle_fp4(w1q, w1s, local_E, gated)
-        g2w, g2s = _shuffle_fp4_w2(w2q, w2s, local_E)
-        ones = torch.ones(local_E, dtype=torch.float32, device=device)
+        p = _FP4_PARAMS[quant]
+        sf_vec, ue8m0, n_sf = p["sf_vec"], p["ue8m0"], p["sf_vec"]
+        w1q, w1s, w1g = _quant_fp4(w1, local_E, sf_vec, ue8m0)
+        w2q, w2s, w2g = _quant_fp4(w2, local_E, sf_vec, ue8m0)
+        g1w, g1s = _shuffle_fp4(w1q, w1s, local_E, gated, n_sf)
+        g2w, g2s = _shuffle_fp4_w2(w2q, w2s, local_E, n_sf)
+
+        if quant == "mxfp4":
+            # mxfp4: bf16 activations (no hidden scale); per-expert global-scale
+            # corrections recover the e2m1 dequant (1/gscale).
+            hs, hs_scale = hidden, None
+            out1 = (1.0 / w1g).to(torch.float32)
+            out2 = (1.0 / w2g).to(torch.float32)
+        else:
+            # nvfp4: activations are also nvfp4 (packed uint8 + per-token e4m3
+            # block scale). FC1 dequant folds in the activation global scale.
+            a_gscale = (448.0 * 6.0) / hidden.abs().amax().clamp(min=1e-6).float()
+            hq, hsf = fp4_quantize(hidden, a_gscale, 16, sf_use_ue8m0=False, is_sf_swizzled_layout=False)
+            hs = hq
+            hs_scale = hsf.view(torch.float8_e4m3fn).reshape(hidden.shape[0], K // 16)
+            out1 = (1.0 / (w1g * a_gscale)).to(torch.float32)
+            out2 = (1.0 / w2g).to(torch.float32)
 
         def fn():
             return trtllm_fp4_block_scale_moe(
-                hidden_states_scale=None,
+                hidden_states=hs, hidden_states_scale=hs_scale,
                 gemm1_weights=g1w, gemm1_weights_scale=g1s,
                 gemm1_bias=None, gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None,
                 gemm2_weights=g2w, gemm2_weights_scale=g2s, gemm2_bias=None,
-                output1_scale_scalar=ones, output1_scale_gate_scalar=ones, output2_scale_scalar=ones,
-                **common,
+                output1_scale_scalar=out1, output1_scale_gate_scalar=out1, output2_scale_scalar=out2,
+                **{k: v for k, v in common.items() if k != "hidden_states"},
             )[0]
         return fn, (_per_expert_nbytes(g1w) + _per_expert_nbytes(g2w)
                     + _per_expert_nbytes(g1s) + _per_expert_nbytes(g2s))
@@ -307,36 +368,49 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
         dt = fp8_dtype()
         w1q, w1s = _block_quant_fp8(w1, dt)
         w2q, w2s = _block_quant_fp8(w2, dt)
-        # hidden_states_scale: [hidden//128, num_tokens]; activations quantized
-        # dynamically inside the kernel -> pass ones (DeepSeek fp8 block convention).
-        hs_scale = torch.ones(K // 128, hidden.shape[0], dtype=torch.float32, device=device)
+        # Activations must be fp8: per-(128-group, token) quant, scale [K//128, T].
+        hq, hs_scale = _quant_block_act_fp8(hidden, dt)
 
         def fn():
             return trtllm_fp8_block_scale_moe(
-                hidden_states_scale=hs_scale,
+                hidden_states=hq, hidden_states_scale=hs_scale,
                 gemm1_weights=w1q, gemm1_weights_scale=w1s,
                 gemm2_weights=w2q, gemm2_weights_scale=w2s,
-                use_shuffled_weight=False, weight_layout=int(WeightLayout.MajorK), **common,
+                use_shuffled_weight=False, weight_layout=int(WeightLayout.MajorK),
+                **{k: v for k, v in common.items() if k != "hidden_states"},
             )
         return fn, (_per_expert_nbytes(w1q) + _per_expert_nbytes(w2q)
                     + _per_expert_nbytes(w1s) + _per_expert_nbytes(w2s))
 
-    if quant == "fp8_token":  # per-tensor fp8
+    if quant == "fp8_token":  # per-tensor fp8 (dynamic per-tensor activations)
         dt = fp8_dtype()
         fmax = torch.finfo(dt).max
-        s1 = (w1.abs().amax(dim=(1, 2), keepdim=True) / fmax).clamp(min=1e-12)
-        s2 = (w2.abs().amax(dim=(1, 2), keepdim=True) / fmax).clamp(min=1e-12)
+        s1 = (w1.abs().amax() / fmax).clamp(min=1e-12).float()
+        s2 = (w2.abs().amax() / fmax).clamp(min=1e-12).float()
         w1q = (w1 / s1).to(dt).contiguous()
         w2q = (w2 / s2).to(dt).contiguous()
-        out1 = s1.reshape(local_E).to(torch.float32)
-        out2 = s2.reshape(local_E).to(torch.float32)
-        ones = torch.ones(local_E, dtype=torch.float32, device=device)
+        # Per-tensor kernel needs the same gated-act reorder + shuffle_matrix_a as bf16.
+        w1q = torch.stack([
+            shuffle_matrix_a(reorder_rows_for_gated_act_gemm(w1q[i]).view(torch.uint8), _EPILOGUE_TILE_M)
+            for i in range(local_E)]).view(dt)
+        w2q = torch.stack([
+            shuffle_matrix_a(w2q[i].view(torch.uint8), _EPILOGUE_TILE_M) for i in range(local_E)]).view(dt)
+        # Per-tensor activation scales (a1 = FC1 input, a2 = FC1-output fp8 scale).
+        a1 = (hidden.abs().amax() / fmax).clamp(min=1e-12).float()
+        hq = (hidden / a1).to(dt).contiguous()
+        a2 = _estimate_inter_amax(hidden, w1) / fmax
+        # sglang convention: out1 = s1*a1/a2, gate = s1*a1, out2 = a2*s2.
+        out1 = (s1 * a1 / a2).reshape(1).expand(local_E).contiguous()
+        out1g = (s1 * a1).reshape(1).expand(local_E).contiguous()
+        out2 = (a2 * s2).reshape(1).expand(local_E).contiguous()
 
         def fn():
             return trtllm_fp8_per_tensor_scale_moe(
-                gemm1_weights=w1q, output1_scales_scalar=out1, output1_scales_gate_scalar=ones,
+                hidden_states=hq, gemm1_weights=w1q,
+                output1_scales_scalar=out1, output1_scales_gate_scalar=out1g,
                 gemm2_weights=w2q, output2_scales_scalar=out2,
-                use_routing_scales_on_input=False, **common,
+                use_routing_scales_on_input=False,
+                **{k: v for k, v in common.items() if k != "hidden_states"},
             )
         return fn, (_per_expert_nbytes(w1q) + _per_expert_nbytes(w2q))
 
@@ -427,8 +501,9 @@ def main():
         help="MoE model whose routed-expert shapes to benchmark.",
     )
     parser.add_argument(
-        "--quant", choices=["none", "fp8_block", "fp8_token", "fp4"], default="none",
-        help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-tensor), fp4 (nvfp4).",
+        "--quant", choices=["none", "fp8_block", "fp8_token", "fp4", "mxfp4"], default="none",
+        help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-tensor), "
+             "fp4 (nvfp4, Blackwell flagship), mxfp4 (OCP micro-scaling, aiter-comparable).",
     )
     parser.add_argument(
         "--tp-size", type=int, default=1,
@@ -500,8 +575,9 @@ def main():
                 }
             )
         except Exception as e:
-            print(f"{num_tokens:>8} | ERROR: {e}")
-            rows.append({"Tokens": num_tokens, "Time (ms)": f"ERROR: {e}"})
+            msg = str(e).strip() or type(e).__name__
+            print(f"{num_tokens:>8} | ERROR: {msg}")
+            rows.append({"Tokens": num_tokens, "Time (ms)": f"ERROR: {msg}"})
 
     output = args.output
     if output is None:
