@@ -458,3 +458,114 @@ class S2RLoaderTr:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
         return [self._assemble(self._issue_one(lds_src, t)) for t in range_constexpr(self.n_tiles)]
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Blockwise (per-block scaled) fp8 GEMM primitives.
+#
+# These extend the dense per-tensor path above to BLOCKWISE scaling, where the
+# scale varies per 128-element contraction block. The hardware mfma still runs
+# unscaled (scale=1); the per-block scale is folded into a running f32
+# accumulator AFTER each block's mfma:
+#
+#     block_k = A_k @ B_k                       (one 128-contraction-block mfma)
+#     C      += block_k * (a_scale_k * b_scale_k)
+#
+# Since mfma_f32_16x16x128 consumes exactly 128 contraction elements per call,
+# one mfma == one scale block, so the fold happens once per K-iteration. The
+# output store is then a plain cast (StoreCCast) — the scale is already applied.
+#
+# Scale-buffer index convention (the launcher prepares these layouts):
+#   A-scale: [scale_con, c_rows] flat, output-row minor  -> idx = kb*c_rows + row
+#            (identical for the forward / dgrad / wgrad directions).
+#   B-scale: direction-specific (a 2-D weight block grid for fwd/dgrad, a 1-D
+#            per-output-column grid for wgrad); supplied as an index closure.
+# ───────────────────────────────────────────────────────────────────────
+class StoreCCast:
+    """Cast-only output store: out = acc.to(out_ty).
+
+    Used by the blockwise GEMM, where the per-block a_scale*b_scale is already
+    folded into the f32 accumulator, so the store only casts and writes (the
+    bf16/fp16 path mirrors StoreCPerTensor minus the scalar multiply). Columns
+    past c_cols clamp to an OOB index."""
+
+    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.out_ty = out_ty
+        c_nbytes = c_rows * c_cols * 2  # bf16 / fp16 output = 2 bytes
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
+        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
+
+    def _store_one(self, value, c_index):
+        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
+        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+
+    def store(self, c_frag, base_row, base_col):
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            for tj in range_constexpr(self.n_tiles_b):
+                col = base_col + tj * 16 + self.lane_id % 16
+                col_valid = col < self.c_cols
+                oob = fx.Int32(self.c_rows * self.c_cols)
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for i in range_constexpr(4):
+                    out_val = vec_f32[i].to(self.out_ty)
+                    c_index = (row + i) * self.c_cols + col
+                    self._store_one(out_val, arith.select(col_valid, c_index, oob))
+
+
+class BlockScaleReader:
+    """Reads fp32 per-block scales from a flat 1-D buffer at runtime indices.
+
+    Uses the same BufferCopy32b scalar-load path StoreCPerTensor uses for its
+    per-tensor scales, generalised to an arbitrary runtime index so the same
+    reader serves the activation (A) and weight (B) scale grids."""
+
+    def __init__(self, scale_buf, num_records_bytes):
+        g = fx.rocdl.make_buffer_tensor(scale_buf, max_size=False, num_records_bytes=num_records_bytes)
+        self.div = fx.logical_divide(g, fx.make_layout(1, 1))
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+
+    def load1(self, idx):
+        fx.copy(self.atom, fx.slice(self.div, (None, fx.Int32(idx))), self.reg)
+        return Vec(fx.memref_load_vec(self.reg))[0]
+
+    def load4(self, idx):
+        """4 consecutive fp32 (the 4 output rows a lane owns) as one v4f32."""
+        return Vec.from_elements([self.load1(idx + j) for j in range_constexpr(4)], fx.Float32)
+
+
+def combine_block_scales(a_vecs, b_scalars, n_tiles_a, n_tiles_b):
+    """combined[ti][ni] = a_vec4[ti] * broadcast(b_scalar[ni]).
+
+    a_vecs: list[n_tiles_a] of v4f32 (the lane's 4 output-row a_scales);
+    b_scalars: list[n_tiles_b] of scalar f32 (the b_scale for each output col /
+    col-block). Result is the per-output-element v4f32 scale for each tile."""
+    b_vecs = [Vec.filled(4, s, fx.Float32) for s in b_scalars]
+    return [
+        [a_vecs[ti] * b_vecs[ni] for ni in range_constexpr(n_tiles_b)]
+        for ti in range_constexpr(n_tiles_a)
+    ]
+
+
+def mfma_scaled_accumulate(mfma, a_frag, b_frag, global_frag, combined):
+    """Fold one 128-contraction-block mfma into the running scaled accumulator.
+
+    ``block = mfma(a_frag, b_frag)`` runs scale-1 from a fresh zero, then
+    ``global_frag += block * combined`` applies this block's a_scale*b_scale.
+    Returns the updated ``global_frag`` (the persistent f32 accumulator)."""
+    zero = [mfma.zero_value] * (mfma.n_tiles_a * mfma.n_tiles_b)
+    block = mfma.call(a_frag, b_frag, zero)
+    for ti in range_constexpr(mfma.n_tiles_a):
+        for ni in range_constexpr(mfma.n_tiles_b):
+            idx = mfma.idx(ti, ni)
+            global_frag[idx] = Vec(block[idx]) * combined[ti][ni] + Vec(global_frag[idx])
+    return global_frag

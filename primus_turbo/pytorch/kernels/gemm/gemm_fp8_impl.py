@@ -10,6 +10,9 @@ import torch
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
+from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+    gemm_fp8_blockwise_flydsl_kernel,
+)
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
@@ -330,17 +333,25 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
       - TT:           trans_a=T, trans_b=T   (not supported)
 
     Constraints:
-      - TENSORWISE per-tensor scaling (a_scale / b_scale scalar)
+      - TENSORWISE per-tensor scaling (a_scale / b_scale scalar), or
+        BLOCKWISE per-128-block scaling (E4M3 only; contraction % 128 == 0)
       - out_dtype in {bf16, fp16}
-      - arbitrary contraction K, M and N
+      - arbitrary contraction K, M and N (TENSORWISE); contraction divisible by
+        128 and >= 256 (BLOCKWISE)
       (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.BLOCKWISE}
     # E4M3 / E5M2 / hybrid, bf16 or fp16 output. Per-operand fp8 format is threaded
     # into the MFMA via cbsz(srcA)/blgp(srcB) (0=E4M3, 1=E5M2) and the FlyDSL
     # MFMA_Scale atom dtype; fp16 output is produced from the f32 accumulator.
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+    # BLOCKWISE folds the per-block scale into the f32 accumulator (no MFMA scale
+    # atom), so the operands must both be E4M3.
+    SUPPORTED_DTYPES_BLOCKWISE = {
+        (float8_e4m3, float8_e4m3, torch.float16),
+        (float8_e4m3, float8_e4m3, torch.bfloat16),
+    }
 
     @staticmethod
     def can_handle(
@@ -354,25 +365,41 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
-        supported = True
         # gfx950 (CDNA4) only: the kernel uses mfma_f32_16x16x128_f8f6f4, absent
         # on gfx942 and below. Gate here so the dispatcher never picks FlyDSL off
         # gfx950 (the backend still imports fine on other archs).
-        supported &= get_device_compute_capability() >= (9, 5)
-        supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
-        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
-        supported &= out_dtype in (torch.bfloat16, torch.float16)
+        if not (get_device_compute_capability() >= (9, 5)):
+            return False
+        if granularity not in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES:
+            return False
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            return False
         # NT / NN / TN native; TT (trans_a and trans_b) is not supported.
-        supported &= not (trans_a and trans_b)
-        # Contraction K: any value handled by the native K-tail, but the software
-        # pipeline needs K_ITERS = ceil(K/128) >= 2, i.e. K >= 129. (M / N are
-        # arbitrary: the partial last output tile is bounded by the c_m / c_n
-        # StoreC clamp + the global SRD.)
+        if trans_a and trans_b:
+            return False
+        # logical contraction (same for both granularities).
         k = a.shape[0] if trans_a else a.shape[1]
-        supported &= k >= 129
+
+        if granularity == ScalingGranularity.BLOCKWISE:
+            if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE:
+                return False
+            # The pipeline needs K_ITERS = K/128 >= 2 and one 128-block per MFMA,
+            # so the contraction must be a multiple of 128 and at least 256.
+            if k < 256 or k % 128 != 0:
+                return False
+            # Per-block (not scalar) scales.
+            return a_scale_inv.numel() > 1 and b_scale_inv.numel() > 1
+
+        # TENSORWISE: any contraction handled by the native K-tail, but the
+        # software pipeline needs K_ITERS = ceil(K/128) >= 2, i.e. K >= 129.
+        # (M / N are arbitrary: the partial last output tile is bounded by the
+        # c_m / c_n StoreC clamp + the global SRD.)
+        if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES:
+            return False
+        if k < 129:
+            return False
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
-        supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
-        return supported
+        return a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
 
     @staticmethod
     def execute(
@@ -386,6 +413,17 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
+        if granularity == ScalingGranularity.BLOCKWISE:
+            return gemm_fp8_blockwise_flydsl_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+            )
         return gemm_fp8_tensorwise_flydsl_kernel(
             a,
             a_scale_inv,

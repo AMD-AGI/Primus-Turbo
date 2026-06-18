@@ -327,6 +327,56 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
     )
 
 
+# FlyDSL blockwise covers the full fwd/dgrad/wgrad autograd path (NT/NN/TN), so
+# every one of m, n, k is a contraction for one of the three GEMMs and must be a
+# multiple of 128 and >= 256; the kernel folds the per-block scale into the f32
+# accumulator (no MFMA scale atom) so only E4M3 is supported.
+@pytest.mark.parametrize("m", [256, 512, 1024])
+@pytest.mark.parametrize("n", [256, 1024, 4096])
+@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.parametrize("auto_tune", [False])
+def test_gemm_fp8_blockwise_flydsl(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+    _run_gemm_fp8_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        auto_tune=auto_tune,
+        block_size=block_size,
+    )
+
+
+@pytest.mark.parametrize("m", [256, 512])
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.deterministic
+def test_gemm_fp8_blockwise_flydsl_deterministic(m, n, k, layout, format, dtype, backend):
+    _run_gemm_fp8_deterministic_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        block_size=128,
+    )
+
+
 @pytest.mark.parametrize("m", [256, 512, 1024])
 @pytest.mark.parametrize("n", [256, 352, 1024, 2048])
 @pytest.mark.parametrize("k", [128, 160, 512, 1024])
