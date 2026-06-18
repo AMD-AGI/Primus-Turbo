@@ -15,6 +15,7 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 import torch
 
 from primus_turbo.common.constants import (
+    ENV_ATTENTION_BACKEND,
     ENV_AUTO_TUNE,
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
@@ -81,6 +82,7 @@ class GlobalBackendManager:
 
     _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
+    _attention_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
     _auto_tune: Optional[bool] = None
 
@@ -164,6 +166,28 @@ class GlobalBackendManager:
             cls._grouped_gemm_backend[precision] = backend
 
     @classmethod
+    def set_attention_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
+        """Set the Attention backend in code (DeepSeek-V4 dense / HCA / CSA).
+
+        Mirrors :meth:`set_gemm_backend`: ``backend=None`` clears the code
+        override (falling back to env / default); ``precision=None`` applies the
+        backend to every precision.
+        """
+        if backend is None:
+            cls._attention_backend = None
+            return
+
+        if cls._attention_backend is None:
+            cls._attention_backend = {}
+
+        if precision is None:
+            cls._attention_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._attention_backend[precision] = backend
+
+    @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:
         """Set whether auto-tune is enabled in code."""
         cls._auto_tune = enabled
@@ -198,6 +222,24 @@ class GlobalBackendManager:
                 logger.warning(
                     f"Precision {precision.name} not found in the environment variable "
                     f"{ENV_GROUPED_GEMM_BACKEND}. Using default backend.",
+                    once=True,
+                )
+            return backend
+
+        return None
+
+    @classmethod
+    def get_attention_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+        """Get the Attention backend configuration. Returns None if not set."""
+        if cls._attention_backend is not None:
+            return cls._attention_backend[precision]
+        env_value = os.environ.get(ENV_ATTENTION_BACKEND, None)
+        if env_value is not None:
+            backend = cls._extract_backend_from_env(env_value).get(precision, None)
+            if backend is None:
+                logger.warning(
+                    f"Precision {precision.name} not found in the environment variable "
+                    f"{ENV_ATTENTION_BACKEND}. Using default backend.",
                     once=True,
                 )
             return backend
@@ -248,6 +290,7 @@ class GlobalBackendManager:
         """Reset all backend settings and clear all dispatcher caches."""
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
+        cls._attention_backend = None
         cls._auto_tune = None
         AutoKernelDispatcher.clear_all_caches()
         origami_clear_caches()

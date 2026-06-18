@@ -50,6 +50,7 @@ def _is_gfx950():
 if torch.cuda.is_available() and _is_gfx950():
     os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "0"
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.ops.attention import (
     eager_hca_attention,
     eager_csa_attention,
@@ -57,6 +58,11 @@ from primus_turbo.pytorch.ops.attention import (
     hca_attention,
     csa_attention_from_pool,
 )
+
+# Backend selection for the A/B comparison (design §7.2). ``None`` keeps the
+# dispatcher default (Triton). The FlyDSL forward is gfx950 + D=512 only and
+# falls back to Triton elsewhere / for the CSA paths.
+_BACKEND_MAP = {"triton": BackendType.TRITON, "flydsl": BackendType.FLYDSL}
 
 # DeepSeek-V4 production defaults shared by both Flash and Pro.
 V4_HEAD_DIM = 512
@@ -90,7 +96,7 @@ def _bench_ms(fn) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _setup_dense(B, S, H, D, dtype, dev, index_topk=512):
+def _setup_dense(B, S, H, D, dtype, dev, index_topk=512, backend=None):
     scale = D**-0.5
     q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
     k = torch.randn(B, 1, S, D, device=dev, dtype=dtype, requires_grad=True)
@@ -99,7 +105,7 @@ def _setup_dense(B, S, H, D, dtype, dev, index_topk=512):
     def fwd():
         return hca_attention(
             q, k, v, sink=None, swa_window=V4_SWA_WINDOW, additive_mask=None,
-            attn_dropout=0.0, training=True, scale=scale,
+            attn_dropout=0.0, training=True, scale=scale, backend=backend,
         )
 
     def ref():
@@ -115,7 +121,7 @@ def _setup_dense(B, S, H, D, dtype, dev, index_topk=512):
     return (q, k, v), fwd(), fwd, ref, fwd_flops
 
 
-def _setup_hca(B, S, H, D, dtype, dev, index_topk=512):
+def _setup_hca(B, S, H, D, dtype, dev, index_topk=512, backend=None):
     scale = D**-0.5
     P = S // V4_HCA_RATIO
     q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
@@ -130,7 +136,7 @@ def _setup_hca(B, S, H, D, dtype, dev, index_topk=512):
     def fwd():
         return hca_attention(
             q, k_cat, v_cat, sink=None, swa_window=V4_SWA_WINDOW, additive_mask=pool_mask,
-            attn_dropout=0.0, training=True, scale=scale, hca_local_seqlen=S,
+            attn_dropout=0.0, training=True, scale=scale, hca_local_seqlen=S, backend=backend,
         )
 
     def ref():
@@ -148,7 +154,7 @@ def _setup_hca(B, S, H, D, dtype, dev, index_topk=512):
     return (q, k_cat, v_cat), fwd(), fwd, ref, fwd_flops
 
 
-def _setup_csa(B, S, H, D, dtype, dev, index_topk=512):
+def _setup_csa(B, S, H, D, dtype, dev, index_topk=512, backend=None):
     scale = D**-0.5
     P = S // V4_CSA_RATIO
     K = min(index_topk, P)
@@ -161,7 +167,7 @@ def _setup_csa(B, S, H, D, dtype, dev, index_topk=512):
     def fwd():
         return csa_attention_from_pool(
             q, k_local, v_local, pool, topk_idxs=topk, sink=None,
-            swa_window=V4_SWA_WINDOW, attn_dropout=0.0, training=True, scale=scale,
+            swa_window=V4_SWA_WINDOW, attn_dropout=0.0, training=True, scale=scale, backend=backend,
         )
 
     def ref():
@@ -183,8 +189,8 @@ def _setup_csa(B, S, H, D, dtype, dev, index_topk=512):
 _SETUP = {"dense": _setup_dense, "hca": _setup_hca, "csa": _setup_csa}
 
 
-def profile_one(kind, B, S, H, D, dtype, dev, index_topk=512):
-    tensors, out0, fwd, ref, fwd_flops = _SETUP[kind](B, S, H, D, dtype, dev, index_topk)
+def profile_one(kind, B, S, H, D, dtype, dev, index_topk=512, backend=None):
+    tensors, out0, fwd, ref, fwd_flops = _SETUP[kind](B, S, H, D, dtype, dev, index_topk, backend)
     bwd_flops = fwd_flops * 2.5
 
     # Correctness vs eager reference.
@@ -213,6 +219,7 @@ def profile_one(kind, B, S, H, D, dtype, dev, index_topk=512):
 
     return {
         "kind": kind, "B": B, "S": S, "H": H, "D": D,
+        "backend": "default" if backend is None else backend.name.lower(),
         "fwd_ms": fwd_ms, "fwdbwd_ms": fwdbwd_ms,
         "fwd_TFLOPs": fwd_tflops, "total_TFLOPs": total_tflops,
         "snr_dB": snr,
@@ -234,6 +241,9 @@ def main():
     parser.add_argument("--kinds", type=str, nargs="+", default=["dense", "hca", "csa"],
                         choices=["dense", "hca", "csa"])
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("--backends", type=str, nargs="+", default=["triton"],
+                        choices=["triton", "flydsl"],
+                        help="Attention backend(s) to compare (Triton vs FlyDSL; design §7.2).")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -243,10 +253,12 @@ def main():
     dev = "cuda"
     D = args.head_dim
 
+    backends = [_BACKEND_MAP[b] for b in args.backends]
+
     print(f"Device: {torch.cuda.get_device_name(0)}")
     header = (
-        f"{'model':6} {'kind':6} {'B':>2} {'S':>6} {'H':>4} {'fwd_ms':>9} {'fwdbwd_ms':>11} "
-        f"{'fwd_TFLOPs':>11} {'tot_TFLOPs':>11} {'SNR_dB':>8}"
+        f"{'model':6} {'kind':6} {'backend':8} {'B':>2} {'S':>6} {'H':>4} {'fwd_ms':>9} "
+        f"{'fwdbwd_ms':>11} {'fwd_TFLOPs':>11} {'tot_TFLOPs':>11} {'SNR_dB':>8}"
     )
 
     rows = []
@@ -262,22 +274,23 @@ def main():
         print(header)
         print("-" * len(header))
         for kind in args.kinds:
-            for B in args.batch:
-                for S in args.seqlen:
-                    try:
-                        r = profile_one(kind, B, S, H, D, dtype, dev, index_topk)
-                    except torch.cuda.OutOfMemoryError:
-                        print(f"{model:6} {kind:6} {B:>2} {S:>6}  OOM")
+            for backend in backends:
+                for B in args.batch:
+                    for S in args.seqlen:
+                        try:
+                            r = profile_one(kind, B, S, H, D, dtype, dev, index_topk, backend)
+                        except torch.cuda.OutOfMemoryError:
+                            print(f"{model:6} {kind:6} {backend.name.lower():8} {B:>2} {S:>6}  OOM")
+                            torch.cuda.empty_cache()
+                            continue
+                        r["model"] = model
+                        rows.append(r)
+                        print(
+                            f"{model:6} {r['kind']:6} {r['backend']:8} {r['B']:>2} {r['S']:>6} "
+                            f"{r['H']:>4} {r['fwd_ms']:>9.3f} {r['fwdbwd_ms']:>11.3f} "
+                            f"{r['fwd_TFLOPs']:>11.1f} {r['total_TFLOPs']:>11.1f} {r['snr_dB']:>8.1f}"
+                        )
                         torch.cuda.empty_cache()
-                        continue
-                    r["model"] = model
-                    rows.append(r)
-                    print(
-                        f"{model:6} {r['kind']:6} {r['B']:>2} {r['S']:>6} {r['H']:>4} "
-                        f"{r['fwd_ms']:>9.3f} {r['fwdbwd_ms']:>11.3f} {r['fwd_TFLOPs']:>11.1f} "
-                        f"{r['total_TFLOPs']:>11.1f} {r['snr_dB']:>8.1f}"
-                    )
-                    torch.cuda.empty_cache()
     return rows
 
 

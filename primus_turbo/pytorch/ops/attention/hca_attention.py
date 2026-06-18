@@ -27,15 +27,23 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.triton.attention.deepseek import (
-    _launch_hca_attention_bwd,
-    _launch_hca_attention_fwd,
-)
+# Importing the dispatcher registers the ``primus_turbo::deepseek_attn_fwd``
+# custom_op (Triton + FlyDSL backends) used by the forward below.
+import primus_turbo.pytorch.kernels.attention.deepseek_attn_impl  # noqa: F401
+from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.kernels.attention.deepseek_attn_impl import deepseek_attn_bwd
 
 __all__ = [
     "HCAAttentionFn",
     "hca_attention",
 ]
+
+# Sentinel for "no per-call backend override" passed into the custom_op.
+_NO_BACKEND_OVERRIDE = 0
+
+
+def _backend_to_int(backend: Optional[BackendType]) -> int:
+    return _NO_BACKEND_OVERRIDE if backend is None else int(backend.value)
 
 
 class HCAAttentionFn(torch.autograd.Function):
@@ -54,6 +62,7 @@ class HCAAttentionFn(torch.autograd.Function):
         training: bool,
         scale: float,
         hca_local_seqlen: int,
+        backend_override: int,
     ) -> torch.Tensor:
         if attn_dropout > 0.0 and training:
             raise NotImplementedError(
@@ -62,15 +71,19 @@ class HCAAttentionFn(torch.autograd.Function):
                 f"attn_dropout={attn_dropout}, training={training}."
             )
 
-        out, lse = _launch_hca_attention_fwd(
+        # Forward dispatch (Triton default; FlyDSL when selected and supported).
+        # register_fake mirrors (out like q, lse [B, H, Sq] fp32) for torch.compile.
+        out, lse = torch.ops.primus_turbo.deepseek_attn_fwd(
             q,
             k,
             v,
-            sink=sink,
-            swa_window=swa_window,
-            additive_mask=additive_mask,
-            scale=scale,
-            hca_local_seqlen=hca_local_seqlen,
+            sink,
+            additive_mask,
+            int(swa_window),
+            float(scale),
+            int(hca_local_seqlen),
+            BackendType.TRITON.value,
+            int(backend_override),
         )
         ctx.save_for_backward(q, k, v, out, lse, sink, additive_mask)
         ctx.swa_window = int(swa_window)
@@ -80,6 +93,7 @@ class HCAAttentionFn(torch.autograd.Function):
         ctx.hca_local_seqlen = int(hca_local_seqlen)
         ctx.sink_was_none = sink is None
         ctx.mask_was_none = additive_mask is None
+        ctx.backend_override = int(backend_override)
         return out
 
     @staticmethod
@@ -92,7 +106,7 @@ class HCAAttentionFn(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        dq, dk, dv, dsink = _launch_hca_attention_bwd(
+        dq, dk, dv, dsink = deepseek_attn_bwd(
             q,
             k,
             v,
@@ -100,10 +114,11 @@ class HCAAttentionFn(torch.autograd.Function):
             grad_out,
             lse,
             sink=sink_arg,
-            swa_window=ctx.swa_window,
             additive_mask=mask_arg,
+            swa_window=ctx.swa_window,
             scale=ctx.scale,
             hca_local_seqlen=ctx.hca_local_seqlen,
+            backend_override=ctx.backend_override,
         )
 
         if not ctx.needs_input_grad[0]:
@@ -116,8 +131,8 @@ class HCAAttentionFn(torch.autograd.Function):
             dsink = None
 
         # Forward signature: (q, k, v, sink, additive_mask, swa_window,
-        # attn_dropout, training, scale, hca_local_seqlen)
-        return dq, dk, dv, dsink, None, None, None, None, None, None
+        # attn_dropout, training, scale, hca_local_seqlen, backend_override)
+        return dq, dk, dv, dsink, None, None, None, None, None, None, None
 
 
 def hca_attention(
@@ -132,8 +147,9 @@ def hca_attention(
     training: bool,
     scale: float,
     hca_local_seqlen: int = 0,
+    backend: Optional[BackendType] = None,
 ) -> torch.Tensor:
-    """Triton-backed DeepSeek-V4 dense / HCA attention.
+    """DeepSeek-V4 dense / HCA attention (Triton or FlyDSL backend).
 
     Drop-in replacement for :func:`eager_hca_attention`. The MQA case
     (``K_H == 1``) is detected from ``k.shape[1]``; the kernel broadcasts
@@ -146,6 +162,13 @@ def hca_attention(
     * ``compress_ratio == 128`` (HCA): pre-concatenate pool keys after
       local keys, pass the pool-only ``[Sq, P]`` additive mask, set
       ``hca_local_seqlen=Sq``, and keep ``swa_window > 0``.
+
+    The forward kernel is selected by the attention dispatcher: the default
+    backend is ``TRITON``; pass ``backend=BackendType.FLYDSL`` (or set
+    ``set_attention_backend`` / ``PRIMUS_TURBO_ATTENTION_BACKEND``) to force
+    FlyDSL where it is supported (gfx950, ``D == 512``, structured SWA / HCA
+    masks). When FlyDSL cannot handle the inputs the dispatcher falls back to
+    Triton. The backward stays on Triton in this version (design §5.4).
 
     Returns ``[B, H, Sq, D]`` in ``v.dtype``.
     """
@@ -160,4 +183,5 @@ def hca_attention(
         training,
         scale,
         hca_local_seqlen,
+        _backend_to_int(backend),
     )

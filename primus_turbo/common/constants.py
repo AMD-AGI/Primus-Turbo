@@ -24,6 +24,12 @@ ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 # Default: None (auto-select)
 ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
+# Attention backend selection (e.g. TRITON, FLYDSL) for the DeepSeek-V4
+# dense / HCA / CSA attention dispatcher. Same per-precision format as
+# ENV_GEMM_BACKEND. Default: None (auto-select; the dispatcher default is
+# TRITON, and FLYDSL falls back to TRITON when can_handle is False).
+ENV_ATTENTION_BACKEND = "PRIMUS_TURBO_ATTENTION_BACKEND"
+
 # MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
 # Default: TURBO
 ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"

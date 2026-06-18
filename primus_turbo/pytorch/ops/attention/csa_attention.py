@@ -31,12 +31,14 @@ from typing import Optional
 
 import torch
 
+# Importing the dispatcher registers the CSA forward custom_ops
+# (``deepseek_csa_attn_fwd`` / ``deepseek_csa_pool_attn_fwd``).
+import primus_turbo.pytorch.kernels.attention.deepseek_attn_impl  # noqa: F401
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.ops.attention.hca_attention import hca_attention
 from primus_turbo.triton.attention.deepseek import (
     _launch_csa_attention_bwd,
-    _launch_csa_attention_fwd,
     _launch_csa_attention_pool_bwd,
-    _launch_csa_attention_pool_fwd,
 )
 
 __all__ = [
@@ -45,6 +47,13 @@ __all__ = [
     "csa_attention",
     "csa_attention_from_pool",
 ]
+
+# Sentinel for "no per-call backend override" passed into the custom_op.
+_NO_BACKEND_OVERRIDE = 0
+
+
+def _backend_to_int(backend: Optional[BackendType]) -> int:
+    return _NO_BACKEND_OVERRIDE if backend is None else int(backend.value)
 
 
 class CSAAttentionFn(torch.autograd.Function):
@@ -63,6 +72,7 @@ class CSAAttentionFn(torch.autograd.Function):
         attn_dropout: float,
         training: bool,
         scale: float,
+        backend_override: int,
     ) -> torch.Tensor:
         if attn_dropout > 0.0 and training:
             raise NotImplementedError(
@@ -71,15 +81,17 @@ class CSAAttentionFn(torch.autograd.Function):
                 f"attn_dropout={attn_dropout}, training={training}."
             )
 
-        out, lse = _launch_csa_attention_fwd(
+        out, lse = torch.ops.primus_turbo.deepseek_csa_attn_fwd(
             q,
             k_local,
             v_local,
             gathered,
             sparse_mask,
-            sink=sink,
-            swa_window=swa_window,
-            scale=scale,
+            sink,
+            int(swa_window),
+            float(scale),
+            BackendType.TRITON.value,
+            int(backend_override),
         )
         ctx.save_for_backward(q, k_local, v_local, gathered, sparse_mask, out, lse, sink)
         ctx.swa_window = int(swa_window)
@@ -125,8 +137,8 @@ class CSAAttentionFn(torch.autograd.Function):
             dsink = None
 
         # Forward signature: (q, k_local, v_local, gathered, sparse_mask,
-        # sink, swa_window, attn_dropout, training, scale).
-        return dq, dk_local, dv_local, dgathered, None, dsink, None, None, None, None
+        # sink, swa_window, attn_dropout, training, scale, backend_override).
+        return dq, dk_local, dv_local, dgathered, None, dsink, None, None, None, None, None
 
 
 class CSAPoolAttentionFn(torch.autograd.Function):
@@ -145,6 +157,7 @@ class CSAPoolAttentionFn(torch.autograd.Function):
         attn_dropout: float,
         training: bool,
         scale: float,
+        backend_override: int,
     ) -> torch.Tensor:
         if attn_dropout > 0.0 and training:
             raise NotImplementedError(
@@ -153,15 +166,17 @@ class CSAPoolAttentionFn(torch.autograd.Function):
                 f"attn_dropout={attn_dropout}, training={training}."
             )
 
-        out, lse = _launch_csa_attention_pool_fwd(
+        out, lse = torch.ops.primus_turbo.deepseek_csa_pool_attn_fwd(
             q,
             k_local,
             v_local,
             pool,
             topk_idxs,
-            sink=sink,
-            swa_window=swa_window,
-            scale=scale,
+            sink,
+            int(swa_window),
+            float(scale),
+            BackendType.TRITON.value,
+            int(backend_override),
         )
         ctx.save_for_backward(q, k_local, v_local, pool, topk_idxs, out, lse, sink)
         ctx.swa_window = int(swa_window)
@@ -205,8 +220,8 @@ class CSAPoolAttentionFn(torch.autograd.Function):
             dsink = None
 
         # Forward signature: (q, k_local, v_local, pool, topk_idxs, sink,
-        # swa_window, attn_dropout, training, scale).
-        return dq, dk_local, dv_local, dpool, None, dsink, None, None, None, None
+        # swa_window, attn_dropout, training, scale, backend_override).
+        return dq, dk_local, dv_local, dpool, None, dsink, None, None, None, None, None
 
 
 def csa_attention(
@@ -221,15 +236,19 @@ def csa_attention(
     attn_dropout: float,
     training: bool,
     scale: float,
+    backend: Optional[BackendType] = None,
 ) -> torch.Tensor:
-    """Triton-backed DeepSeek-V4 CSA fused attention (pre-gathered top-K).
+    """DeepSeek-V4 CSA fused attention, pre-gathered top-K (Triton or FlyDSL).
 
     Drop-in replacement for :func:`eager_csa_attention`. When
     ``gathered.shape[2] == 0`` (degenerate Indexer state) the wrapper
     short-circuits to :func:`hca_attention`: CSA's local SWA branch is
     bit-identical to dense+SWA+sink in that limit.
 
-    Returns ``[B, H, Sq, D]`` in ``v_local.dtype``.
+    ``backend`` selects the forward kernel (default Triton; the CSA FlyDSL
+    two-pass sparse branch is a later optimization round, design §4.7, so
+    FlyDSL currently falls back to Triton). Returns ``[B, H, Sq, D]`` in
+    ``v_local.dtype``.
     """
     K_topk = gathered.shape[2]
     if K_topk == 0:
@@ -243,6 +262,7 @@ def csa_attention(
             attn_dropout=attn_dropout,
             training=training,
             scale=scale,
+            backend=backend,
         )
 
     return CSAAttentionFn.apply(
@@ -256,6 +276,7 @@ def csa_attention(
         attn_dropout,
         training,
         scale,
+        _backend_to_int(backend),
     )
 
 
@@ -271,14 +292,17 @@ def csa_attention_from_pool(
     attn_dropout: float,
     training: bool,
     scale: float,
+    backend: Optional[BackendType] = None,
 ) -> torch.Tensor:
-    """Triton-backed CSA attention that gathers sparse keys in-kernel.
+    """CSA attention that gathers sparse keys in-kernel (Triton or FlyDSL).
 
     ``pool`` is the compressed-pool tensor before per-query top-K gather.
     ``topk_idxs`` drives the sparse branch directly; negative entries are
     masked. The backward kernel emits ``dpool`` via atomic scatter-add,
     avoiding the materialised ``[B, Sq, K_topk, D]`` gathered tensor.
 
+    ``backend`` selects the forward kernel (default Triton; the CSA FlyDSL
+    two-pass sparse branch is a later optimization round, design §4.7).
     Returns ``[B, H, Sq, D]`` in ``v_local.dtype``.
     """
     K_topk = topk_idxs.shape[2]
@@ -293,6 +317,7 @@ def csa_attention_from_pool(
             attn_dropout=attn_dropout,
             training=training,
             scale=scale,
+            backend=backend,
         )
 
     return CSAPoolAttentionFn.apply(
@@ -306,4 +331,5 @@ def csa_attention_from_pool(
         attn_dropout,
         training,
         scale,
+        _backend_to_int(backend),
     )

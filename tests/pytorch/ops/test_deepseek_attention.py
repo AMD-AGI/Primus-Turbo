@@ -33,6 +33,8 @@ Pro indexer regime is covered. Real per-model values are recorded here:
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops.attention import (
     eager_hca_attention,
     eager_csa_attention,
@@ -46,6 +48,24 @@ from tests.pytorch.test_utils import compute_snr
 # bf16 SNR threshold (matches the existing flash-attn test bar).
 SNR_FWD = 40.0
 SNR_BWD = 35.0
+
+# Attention backends exercised in the same process (Triton vs FlyDSL A/B,
+# design §3.2 / §7.1). ``None`` keeps the default (Triton). The FlyDSL forward
+# is gfx950 + D=512 only; it falls back to Triton elsewhere and for the CSA
+# paths (the CSA FlyDSL sparse branch is a later round, design §4.7), so these
+# parametrisations also cover the dispatch fallback contract.
+_BACKENDS = [None, BackendType.FLYDSL]
+_BACKEND_IDS = ["triton", "flydsl"]
+
+
+def _skip_if_flydsl_unsupported(backend, D):
+    """FlyDSL attention forward needs gfx950 (ds_read_*_tr / 16 B G2S) and the
+    D = 512 specialisation (design §3.3). Off-support, ``backend=FLYDSL`` falls
+    back to Triton in the dispatcher, so the run is still valid — we only skip
+    when the FlyDSL kernel cannot be reached at all to avoid a misleading pass."""
+    if backend is BackendType.FLYDSL:
+        if get_device_compute_capability() < (9, 5):
+            pytest.skip("FlyDSL attention forward requires gfx950 (CDNA4).")
 
 # Real per-model attention envelope (HuggingFace config.json), for reference.
 # Only num_heads and index_topk differ at the attention-op level.
@@ -71,7 +91,9 @@ def _clone_leaf(t):
 @pytest.mark.parametrize("swa_window", [128, 0])
 @pytest.mark.parametrize("mqa", [True, False])
 @pytest.mark.parametrize("enable_sink", [True, False])
-def test_v4_dense_attention(dtype, B, H, S, D, swa_window, mqa, enable_sink):
+@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
+def test_v4_dense_attention(dtype, B, H, S, D, swa_window, mqa, enable_sink, backend):
+    _skip_if_flydsl_unsupported(backend, D)
     torch.manual_seed(0)
     dev = "cuda"
     scale = D**-0.5
@@ -90,7 +112,7 @@ def test_v4_dense_attention(dtype, B, H, S, D, swa_window, mqa, enable_sink):
 
     out = hca_attention(
         q, k, v, sink=sink, swa_window=swa_window, additive_mask=None,
-        attn_dropout=0.0, training=True, scale=scale,
+        attn_dropout=0.0, training=True, scale=scale, backend=backend,
     )
     out_ref = eager_hca_attention(
         qr, kr.expand(B, H, S, D), vr.expand(B, H, S, D), sink=sinkr,
@@ -114,7 +136,9 @@ def test_v4_dense_attention(dtype, B, H, S, D, swa_window, mqa, enable_sink):
 @pytest.mark.parametrize("B,H,S,D", [(1, 8, 256, 512)])
 @pytest.mark.parametrize("swa_window", [128])
 @pytest.mark.parametrize("enable_sink", [True, False])
-def test_v4_hca_attention(dtype, B, H, S, D, swa_window, enable_sink):
+@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
+def test_v4_hca_attention(dtype, B, H, S, D, swa_window, enable_sink, backend):
+    _skip_if_flydsl_unsupported(backend, D)
     torch.manual_seed(0)
     dev = "cuda"
     scale = D**-0.5
@@ -136,7 +160,7 @@ def test_v4_hca_attention(dtype, B, H, S, D, swa_window, enable_sink):
 
     out = hca_attention(
         q, k_cat, v_cat, sink=sink, swa_window=swa_window, additive_mask=pool_mask,
-        attn_dropout=0.0, training=True, scale=scale, hca_local_seqlen=S,
+        attn_dropout=0.0, training=True, scale=scale, hca_local_seqlen=S, backend=backend,
     )
 
     # Reference: joint mask [S, S+P] = cat([local_swa_mask, pool_mask]).
@@ -164,7 +188,9 @@ def test_v4_hca_attention(dtype, B, H, S, D, swa_window, enable_sink):
 )
 @pytest.mark.parametrize("K_topk", [16, 64, 128])  # 128 covers the larger V4-Pro top-k regime
 @pytest.mark.parametrize("enable_sink", [True, False])
-def test_v4_csa_gathered(dtype, B, H, S, D, K_topk, enable_sink):
+@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
+def test_v4_csa_gathered(dtype, B, H, S, D, K_topk, enable_sink, backend):
+    _skip_if_flydsl_unsupported(backend, D)
     torch.manual_seed(0)
     dev = "cuda"
     scale = D**-0.5
@@ -184,7 +210,7 @@ def test_v4_csa_gathered(dtype, B, H, S, D, K_topk, enable_sink):
 
     out = csa_attention(
         q, k_local, v_local, gathered, sink=sink, swa_window=swa_window,
-        sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale,
+        sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale, backend=backend,
     )
     out_ref = eager_csa_attention(
         qr, kr, vr, gr, sink=sinkr, swa_window=swa_window,
@@ -217,7 +243,9 @@ def test_v4_csa_gathered(dtype, B, H, S, D, K_topk, enable_sink):
     [(16, 64), (32, 128), (64, 256)],  # (64, 256) covers the larger V4-Pro top-k regime
 )
 @pytest.mark.parametrize("enable_sink", [True, False])
-def test_v4_csa_from_pool(dtype, B, H, S, D, K_topk, P, enable_sink):
+@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
+def test_v4_csa_from_pool(dtype, B, H, S, D, K_topk, P, enable_sink, backend):
+    _skip_if_flydsl_unsupported(backend, D)
     torch.manual_seed(0)
     dev = "cuda"
     scale = D**-0.5
@@ -237,7 +265,7 @@ def test_v4_csa_from_pool(dtype, B, H, S, D, K_topk, P, enable_sink):
 
     out = csa_attention_from_pool(
         q, k_local, v_local, pool, topk_idxs=topk, sink=sink, swa_window=swa_window,
-        attn_dropout=0.0, training=True, scale=scale,
+        attn_dropout=0.0, training=True, scale=scale, backend=backend,
     )
 
     # Reference: gather pool by topk into [B, S, K, D].
@@ -286,6 +314,36 @@ def test_v4_csa_ktopk_zero_falls_back_to_dense():
         attn_dropout=0.0, training=True, scale=scale,
     )
     torch.testing.assert_close(out, out_dense, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_v4_dense_attention_flydsl_all_swa_masked():
+    """Degenerate FlyDSL forward edge (design §7.1): the first query rows under
+    SWA see an empty window for some K-tiles; the NEG_INF / 0-guards must keep
+    the output finite and match the Triton backend. Skips unless the FlyDSL
+    forward is reachable (gfx950)."""
+    _skip_if_flydsl_unsupported(BackendType.FLYDSL, 512)
+    torch.manual_seed(0)
+    dev = "cuda"
+    dtype = torch.bfloat16
+    B, H, S, D = 1, 8, 256, 512
+    scale = D**-0.5
+    swa_window = 128
+
+    q = torch.randn(B, H, S, D, device=dev, dtype=dtype)
+    k = torch.randn(B, 1, S, D, device=dev, dtype=dtype)
+    v = torch.randn(B, 1, S, D, device=dev, dtype=dtype)
+
+    out_fly = hca_attention(
+        q, k, v, sink=None, swa_window=swa_window, additive_mask=None,
+        attn_dropout=0.0, training=False, scale=scale, backend=BackendType.FLYDSL,
+    )
+    out_tri = hca_attention(
+        q, k, v, sink=None, swa_window=swa_window, additive_mask=None,
+        attn_dropout=0.0, training=False, scale=scale, backend=BackendType.TRITON,
+    )
+    assert torch.isfinite(out_fly).all()
+    assert compute_snr(out_tri, out_fly) > SNR_FWD
 
 
 # ---------------------------------------------------------------------------
