@@ -54,7 +54,10 @@ inline void LAUNCH_KERNEL(T &&config, Kern &&kernel, Args &&...args) {
 
 template <typename T, typename Kern, typename... Args>
 inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel, Args &&...args) {
-    *kernel<<<config->num_sms, config->num_threads, config->shared_mem_bytes, config->stream>>>(
+    // NOTE: `<<<>>>` binds tighter than unary `*`, so `*kernel<<<...>>>(...)`
+    // parses as `*(kernel<<<...>>>(...))` — dereferencing the void launch result
+    // (a hard compile error). Launch the kernel directly.
+    kernel<<<config->num_sms, config->num_threads, config->shared_mem_bytes, config->stream>>>(
         std::forward<Args>(args)...);
 }
 

@@ -38,10 +38,21 @@
 #define DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS 6
 #define DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS 256
 
-static constexpr int32_t kWarpSize = 64;
-// For ROCm equals to half the wave size or Nvidia warp size
+// ---------------------------------------------------------------------------
+#if defined(PRIMUS_TURBO_GFX1250) && (defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950))
+#error                                                                                             \
+    "DeepEP: gfx1250 (wave32) cannot be combined with gfx942/gfx950 (wave64) in one build (kWarpSize is a single global). Build deep_ep for a single arch."
+#endif
+
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
+static constexpr int32_t  kWarpSize     = 64; // gfx942/gfx950 (CDNA3/4) wave64
+static constexpr uint64_t kFullWarpMask = 0xffffffffffffffffULL;
+#else
+static constexpr int32_t  kWarpSize     = 32;                    // gfx1250 (CDNA-next) wave32-only
+static constexpr uint64_t kFullWarpMask = 0x00000000ffffffffULL; // only 32 valid lanes
+#endif
+
 static constexpr int32_t  kEmulatedWarpSize = kWarpSize / 2;
-static constexpr uint64_t kFullWarpMask     = 0xffffffffffffffff;
 static constexpr uint64_t kFirstHalfMask    = 0x00000000ffffffff;
 static constexpr uint64_t kSecondHalfMask   = 0xffffffff00000000;
 

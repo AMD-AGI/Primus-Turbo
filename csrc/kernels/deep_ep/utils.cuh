@@ -10,8 +10,7 @@
 #include "primus_turbo/common.h"
 #include "primus_turbo/deep_ep/configs.h"
 
-// gfx12 (gfx1250 / gfx1251, CDNA5) removed the unified `s_waitcnt`; the combined
-// LDS + VMEM wait is expressed via the split counters.
+// gfx12 (gfx1250/gfx1251, CDNA5) split the unified `s_waitcnt` into LDS/VMEM counters.
 #if defined(__gfx1250__)
 #define PRIMUS_TURBO_WAIT_ALL_STR                                                                  \
     "s_wait_dscnt 0\n\ts_wait_kmcnt 0\n\ts_wait_loadcnt 0\n\ts_wait_storecnt 0"
@@ -19,50 +18,8 @@
 #define PRIMUS_TURBO_WAIT_ALL_STR "s_waitcnt lgkmcnt(0) vmcnt(0)"
 #endif
 
-#define NUM_MAX_BARRIERS 32
-
-#ifdef DISABLE_GFX1250_FEATURES
-
-// gfx942 / gfx950: no hardware sub-group barrier — emulate one with an LDS
-// atomic counter + s_sleep.
-#define BARRIER_SYNC_INIT()                                                                        \
-    __shared__ int ___bar_sync_wg_state[NUM_MAX_BARRIERS];                                         \
-    if (threadIdx.x < NUM_MAX_BARRIERS)                                                            \
-        ___bar_sync_wg_state[threadIdx.x] = 0;                                                     \
-    int ___bar_sync_wg_expected_reg = 0;                                                           \
-    __syncthreads();
-
-#define BARRIER_SYNC(__fence, ___bar_id, ___num_threads_per_group)                                 \
-    {                                                                                              \
-        auto ___num_wave_per_group = ___num_threads_per_group / kWarpSize;                         \
-        ___bar_sync_wg_expected_reg += ___num_wave_per_group;                                      \
-        __fence;                                                                                   \
-        if (__lane_id() == 0) {                                                                    \
-            __hip_atomic_fetch_add(___bar_sync_wg_state + ___bar_id, 1, __ATOMIC_RELAXED,          \
-                                   __HIP_MEMORY_SCOPE_WORKGROUP);                                  \
-            while (__hip_atomic_load(___bar_sync_wg_state + ___bar_id, __ATOMIC_RELAXED,           \
-                                     __HIP_MEMORY_SCOPE_WORKGROUP) < ___bar_sync_wg_expected_reg)  \
-                __builtin_amdgcn_s_sleep(1);                                                       \
-        }                                                                                          \
-        __syncwarp();                                                                              \
-    }
-
-#define sync_barrier_init() BARRIER_SYNC_INIT()
-#define sync_barrier(bar_id, num_threads) BARRIER_SYNC(__threadfence_block(), bar_id, num_threads)
-
-#else
-
-#define sync_barrier_init()                                                                        \
-    __shared__ __amdgpu_named_workgroup_barrier_t ___named_bar_objs[NUM_MAX_BARRIERS]
-
-#define sync_barrier(bar_id, num_threads)                                                          \
-    {                                                                                              \
-        __builtin_amdgcn_s_barrier_signal_var(&___named_bar_objs[bar_id],                          \
-                                              (num_threads) / kWarpSize);                          \
-        __builtin_amdgcn_s_barrier_wait(-1);                                                       \
-    }
-
-#endif
+// sync_barrier_init / sync_barrier and the gfx1250 TDM helpers are defined near the end of this
+// header.
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                  \
     {                                                                                              \
@@ -110,7 +67,6 @@
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                            \
     }
 // HELPER FUNCTIONS
-// #####################################################################################
 
 template <typename T>
 __device__ __forceinline__ T shfl_xor(const T val, int laneMask, int width = kWarpSize,
@@ -123,23 +79,6 @@ shfl_sync(const int val, int srcLane = 0, int width = kWarpSize,
           uint64_t shfl_sync_mask = kFullWarpMask) { // Let compiler deduce type
     return __shfl(val, srcLane, width);
 }
-
-__device__ __forceinline__ int __any_sync(uint64_t mask, int predicate) {
-    uint64_t predicate_bit_pattern = __ballot(predicate);
-    return (predicate_bit_pattern & mask) > 0;
-}
-
-__device__ __forceinline__ int __all_sync(uint64_t mask, int predicate) {
-    uint64_t predicate_bit_pattern = __ballot(predicate);
-    return (~predicate_bit_pattern & mask) == 0;
-}
-
-__device__ __forceinline__ void syncwarp() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-}
-// ######################################################################################################
 
 namespace primus_turbo::deep_ep {
 
@@ -166,7 +105,6 @@ __device__ __forceinline__ void trap() {
 }
 
 __device__ __forceinline__ void memory_fence() {
-
     __threadfence_system();
 }
 
@@ -370,8 +308,7 @@ template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);
 
-    // For non-sync-only cases, the memory operations by other threads in the block must be visible
-    // to the `sys` scope
+    // Non-sync-only: make other threads' block memory ops visible at `sys` scope.
     if constexpr (not kSyncOnly) {
         memory_fence();
         __syncthreads();
@@ -432,7 +369,28 @@ __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t *ptr) {
     return ret;
 }
 
+#define NUM_MAX_BARRIERS 16
+
 #ifndef DISABLE_GFX1250_FEATURES
+
+namespace named_barrier_detail {
+[[maybe_unused]] static __device__ __shared__ __amdgpu_named_workgroup_barrier_t
+    named_bars[NUM_MAX_BARRIERS];
+} // namespace named_barrier_detail
+
+// Named barriers self-arm on signal; no per-kernel setup needed.
+__device__ __forceinline__ void sync_barrier_init() {}
+
+// Runtime bar_id: signal_var packs id+count into m0; wait(1) = named-barrier wait (-1 would hang);
+// fence publishes LDS writes.
+__device__ __forceinline__ void sync_barrier(int bar_id, int num_threads) {
+    __threadfence_block();
+    __builtin_amdgcn_s_barrier_signal_var(&named_barrier_detail::named_bars[bar_id],
+                                          num_threads / kWarpSize);
+    __builtin_amdgcn_s_barrier_wait(1);
+}
+
+// TDM async copy (global <-> LDS, bypassing VGPRs).
 typedef int __attribute__((ext_vector_type(4))) tdm_int4;
 
 __device__ __forceinline__ void tdm_load_async_to_lds(const int4 *gmem, int4 *lds) {
@@ -451,5 +409,35 @@ __device__ __forceinline__ void tdm_store_async_from_lds(int4 *gmem, const int4 
 template <int kNumOutstanding> __device__ __forceinline__ void tdm_async_wait() {
     __builtin_amdgcn_s_wait_asynccnt(kNumOutstanding);
 }
+
+#else
+
+namespace named_barrier_detail {
+[[maybe_unused]] static __device__ __shared__ unsigned bar_arrived[NUM_MAX_BARRIERS];
+} // namespace named_barrier_detail
+
+// gfx942 / gfx950: zero the monotonic arrival counters once per kernel.
+__device__ __forceinline__ void sync_barrier_init() {
+    if (threadIdx.x < NUM_MAX_BARRIERS)
+        named_barrier_detail::bar_arrived[threadIdx.x] = 0u;
+    __syncthreads();
+}
+
+// gfx942/gfx950 emulated barrier: stateless ticket over a monotonic LDS counter (fixed num_threads
+// per bar_id).
+__device__ __forceinline__ void sync_barrier(int bar_id, int num_threads) {
+    const int nwaves = num_threads / kWarpSize;
+    __threadfence_block();
+    if (__lane_id() == 0) {
+        unsigned old    = __hip_atomic_fetch_add(&named_barrier_detail::bar_arrived[bar_id], 1u,
+                                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        unsigned target = (old / nwaves + 1u) * nwaves;
+        while (__hip_atomic_load(&named_barrier_detail::bar_arrived[bar_id], __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_WORKGROUP) < target)
+            __builtin_amdgcn_s_sleep(1);
+    }
+    __syncwarp();
+}
+
 #endif
 } // namespace primus_turbo::deep_ep

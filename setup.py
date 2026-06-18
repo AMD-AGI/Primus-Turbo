@@ -213,6 +213,20 @@ def get_offload_archs():
         else:
             print(f"[WARNING] Ignoring unsupported GPU_ARCHS entry: {arch}")
     assert len(offload_arch_list) >= 1, "Primus Turbo: expected at least one --offload-arch."
+
+    # The DeepEP kernels use a single global `kWarpSize` (also referenced by host
+    # launch code), selected by the build-level `-DPRIMUS_TURBO_<ARCH>` macro. It
+    # therefore cannot serve a wave32 arch (gfx1250) and a wave64 arch
+    # (gfx942/gfx950) in the same build. Mirror the compile-time `#error` in
+    # configs.h with a fast, clear configure-time failure. Build deep_ep per-arch.
+    enabled = {f"--offload-arch={a}" for a in ("gfx942", "gfx950", "gfx1250")} & set(offload_arch_list)
+    if "--offload-arch=gfx1250" in enabled and len(enabled) > 1:
+        raise RuntimeError(
+            "Primus Turbo: gfx1250 (wave32) cannot be combined with gfx942/gfx950 "
+            "(wave64) in one build because DeepEP's kWarpSize is a single global. "
+            f"Got GPU_ARCHS -> {sorted(offload_arch_list)}. Build for a single arch."
+        )
+
     return offload_arch_list, macro_arch_list
 
 
