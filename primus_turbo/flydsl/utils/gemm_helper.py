@@ -649,7 +649,9 @@ def as_i8_flat(t: torch.Tensor) -> torch.Tensor:
 
 
 def get_compiled(cache: dict, launch, args):
-    """Cache the compiled launcher in ``cache`` by (id(launch), shapes/dtypes/ints)."""
+    """Cache compiled launcher by (id(launch), shapes/dtypes/ints).
+    Caller must keep ``launch`` alive (e.g. in _MXFP8_LAUNCH_CACHE): Python recycles
+    id() after GC, so a freed+reallocated launch at the same address returns a stale hit."""
     key_parts = [id(launch)]
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -707,3 +709,23 @@ def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
     nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0xFFFFFFFF))
     band_base_i64 = arith.index_cast(T.i64, band_base)
     return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
+
+
+def _robust_time(launch, args, warmup=250, reps=5, iters=50):
+    """Median-of-`reps` timing of launch(*args) after `warmup` iters.
+    The long warmup reaches boost clock; short-K kernels mis-pick configs otherwise."""
+    for _ in range(warmup):
+        launch(*args)
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(reps):
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(iters):
+            launch(*args)
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) / iters)
+    ts.sort()
+    return ts[len(ts) // 2]

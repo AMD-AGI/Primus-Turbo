@@ -37,11 +37,11 @@ import torch
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     S2RLoader,
+    _robust_time,
     as_i8_flat,
     block_mn,
     ceildiv,
     compute_global_swizzle,
-    get_compiled,
     make_fp8_buffer_tensor,
     make_row_band_resource,
     make_value_attrs,
@@ -626,7 +626,7 @@ _BLOCK_M = 256
 _BLOCK_N = 256
 
 _MXFP8_LAUNCH_CACHE: dict = {}  # (K, BLOCK_M, GROUP_M, num_xcd, layout, group_n) -> launch_mxfp8_nt
-_COMPILED_MXFP8_CACHE: dict = {}  # (id(launch), shapes/dtypes/ints) -> compiled
+_MXFP8_AT_CACHE: dict = {}  # (M, N, K, bm, gm, xcd, layout, gn) -> [raw_launch, compiled_or_None]
 
 # Per-shape NT autotune candidates (BLOCK_M, GROUP_M, num_xcd); BLOCK_N fixed 256.
 # BLOCK_M=128 doubles the tiles (fills the CUs on skinny/small shapes), 256 wins big
@@ -657,14 +657,6 @@ def peek_mxfp8_cfg(M, N, K, out_dtype, layout="nt"):
 _LAYOUT_COMPILE = {
     "nt": _compile_mxfp8_nt,
 }
-
-
-def _mx_pack(K):
-    """opsel scale byte-pack factor: pack consecutive K-iters' E8M0 into one i32
-    (read via opsel) -> pack-fold fewer scale VMEM loads. 4 if K_ITERS % 4 == 0,
-    else 2 if even, else 1 (off). Requires the matching packed host preshuffle."""
-    ki = K // 128
-    return 4 if ki % 4 == 0 else (2 if ki % 2 == 0 else 1)
 
 
 def _mx_nt_gn_cands(N):
@@ -730,22 +722,11 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
         try:
             launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
             args = (a8, b8, out_view, a_sp, b_sp, M, N, stream)
-            c = get_compiled(_COMPILED_MXFP8_CACHE, launch, args)
-            c(*args)
+            launch(*args)
             torch.cuda.synchronize()
             if not torch.isfinite(out_view.reshape(-1)[:1024].float()).all().item():
                 return float("inf")
-            for _ in range(2):
-                c(*args)
-            torch.cuda.synchronize()
-            e0 = torch.cuda.Event(enable_timing=True)
-            e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
-            for _ in range(20):
-                c(*args)
-            e1.record()
-            torch.cuda.synchronize()
-            return e0.elapsed_time(e1) * 1000.0 / 20
+            return _robust_time(launch, args, warmup=2, reps=3, iters=20)
         except Exception:
             return float("inf")
 
@@ -760,11 +741,12 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
             best_us = us
             best = (bm, gm, xcd, seed_gn)
     if best is None:
-        best = (_BLOCK_M, 4, 8, seed_gn)  # fall back to the always-valid 256/g4/x8
-    # Stage 2: fix the winning tile, sweep the 2D N-band width via robust min-of-4
-    # timing, re-measuring the seed the same way; adopt a band only past a 1.5%
-    # margin over the re-measured seed -> no regression by construction. gn=0 stays
-    # a candidate so an over-applied band can be dropped.
+        raise RuntimeError(
+            f"mxfp8 autotune: all candidates failed for M={M} N={N} K={K} "
+            f"layout={layout}. Check FlyDSL compilation (MLIR dialect, gfx target, OOM)."
+        )
+    # Stage 2: sweep 2D N-band width; adopt only if it beats re-measured seed by >1.5%.
+    # gn=0 wins by default (bgn=seed_gn); sweep only visits non-seed bands.
     gn_cands = _mx_nt_gn_cands(N)
     if gn_cands:
         bm, gm, xcd, _ = best
@@ -847,6 +829,12 @@ def gemm_mxfp8_flydsl_kernel(
     # host-preshuffled here into the kernel's broadcast layout (scale_pack=1). The fused
     # quant-emitted preshuffle (no host repack) is deferred to the quant PR.
     n_tiles_a = _BLOCK_M // 64
+    assert (
+        a_scale.element_size() == 1
+    ), f"a_scale must be 1-byte E8M0 (uint8/float8_e8m0fnu), got {a_scale.dtype}"
+    assert (
+        b_scale.element_size() == 1
+    ), f"b_scale must be 1-byte E8M0 (uint8/float8_e8m0fnu), got {b_scale.dtype}"
     a_e8 = a_scale.contiguous().view(torch.uint8)
     b_e8 = b_scale.contiguous().view(torch.uint8)
     a_sp = preshuffle_scale(a_e8, K, n_tiles_a).view(torch.int32).reshape(-1)
@@ -859,5 +847,19 @@ def gemm_mxfp8_flydsl_kernel(
     bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout)
     launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
     args = (a8, b8, out, a_sp, b_sp, M, N, torch.cuda.current_stream())
-    get_compiled(_COMPILED_MXFP8_CACHE, launch, args)(*args)
+    # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
+    # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
+    at_key = (M, N, K, bm, gm, xcd, layout, gn)
+    entry = _MXFP8_AT_CACHE.get(at_key)
+    if entry is None:
+        entry = [launch, None]
+        _MXFP8_AT_CACHE[at_key] = entry
+    raw, compiled = entry
+    if torch.cuda.is_current_stream_capturing():
+        raw(*args)
+    else:
+        if compiled is None:
+            compiled = flyc.compile(raw, *args)
+            entry[1] = compiled
+        compiled(*args)
     return out.t().contiguous() if trans_c else out

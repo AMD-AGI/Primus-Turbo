@@ -373,12 +373,19 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             # [N,K//32] tensors -- NOT scalar). The host preshuffle handles M % 64 and
             # N % 64 (partial 256-block B-scale zero-padded; in-kernel buffer/SRD clamp
             # drops OOB rows/cols). SW pipeline needs K % 128 == 0 and K_ITERS >= 2 (K >= 256).
+            supported &= a.ndim == 2 and b.ndim == 2
             supported &= (not trans_a) and trans_b
             supported &= a.dtype == float8_e4m3 and b.dtype == float8_e4m3
             supported &= out_dtype == torch.bfloat16
+            if not supported:
+                return supported
             m, k, n = a.shape[0], a.shape[1], b.shape[0]
             supported &= (k % 128 == 0) and (k >= 256)
             supported &= m % 64 == 0 and n % 64 == 0
+            # Block scales: [M, K//32] / [N, K//32], 1-byte E8M0 (uint8 or float8_e8m0fnu).
+            supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
+            supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
+            supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
             return supported
 
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
@@ -413,15 +420,15 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only: a [M,K], b [N,K]; raw E8M0 block scales [M,K//32]/[N,K//32]
-            # (host-preshuffled inside the kernel). trans_c via post-hoc transpose.
-            out = gemm_mxfp8_flydsl_kernel(
+            # (host-preshuffled inside the kernel). trans_c forwarded to the kernel.
+            return gemm_mxfp8_flydsl_kernel(
                 a,
                 a_scale_inv,
                 b,
                 b_scale_inv,
                 out_dtype=out_dtype,
+                trans_c=trans_c,
             )
-            return out.t().contiguous() if trans_c else out
         return gemm_fp8_tensorwise_flydsl_kernel(
             a,
             a_scale_inv,

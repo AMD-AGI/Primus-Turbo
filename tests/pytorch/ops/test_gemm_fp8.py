@@ -430,12 +430,11 @@ def test_gemm_fp8_mx_flydsl(m, n, k, format, dtype):
     )
 
 
-# Direct FlyDSL MXFP8 kernel test (NT only; compute-only PR dropped NN/TN). Scales
-# are passed RAW [free=M, K//32] (A) / [free=N, K//32] (B); the kernel host-preshuffles.
+# Direct FlyDSL MXFP8 kernel test (NT only; compute-only PR). Scales are passed RAW
+# [free=M, K//32] (A) / [free=N, K//32] (B); the kernel host-preshuffles internally.
 # Covers aligned + partial-tile tail (320/384). compute-only: scale_pack=1.
-@pytest.mark.parametrize("layout", ["nt"])
 @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (320, 384, 512)])
-def test_gemm_fp8_mx_flydsl_direct(layout, m, n, k):
+def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
 
     mxfp8_supported, reason = check_mxfp8_support()
@@ -447,11 +446,6 @@ def test_gemm_fp8_mx_flydsl_direct(layout, m, n, k):
     device = "cuda:0"
     torch.manual_seed(0)
 
-    # Quantize logical A [M,K] and B [N,K] along K (last axis) -> qdata [free,K],
-    # scale_inv [free, K//32] (raw E8M0; K % 128 == 0 so no scale-col padding). The
-    # gemm math C[M,N] = A_logical @ B_logical^T is identical for all three layouts;
-    # only the operand STORAGE differs (transpose qdata + trans flags). Scales stay
-    # [M,K//32] / [N,K//32] regardless of layout (the kernel is scale-layout-invariant).
     def mxq(x):
         return QuantizedTensor.quantize(
             x,
@@ -464,22 +458,13 @@ def test_gemm_fp8_mx_flydsl_direct(layout, m, n, k):
 
     aq = mxq(torch.randn(m, k, device=device, dtype=torch.bfloat16))  # qdata[M,K], sc[M,K//32]
     bq = mxq(torch.randn(n, k, device=device, dtype=torch.bfloat16))  # qdata[N,K], sc[N,K//32]
-    a_sc, b_sc = aq.scale_inv, bq.scale_inv
-    ref = aq.dequantize() @ bq.dequantize().t()  # [M,N], same math for nt/nn/tn
+    ref = aq.dequantize() @ bq.dequantize().t()  # [M,N] reference
 
-    if layout == "nt":  # a[M,K], b[N,K]
-        A, B, trans_a, trans_b = aq.qdata, bq.qdata, False, True
-    elif layout == "nn":  # a[M,K], b[K,N]
-        A, B, trans_a, trans_b = aq.qdata, bq.qdata.t().contiguous(), False, False
-    else:  # tn: a[K,M], b[K,N]
-        A, B, trans_a, trans_b = aq.qdata.t().contiguous(), bq.qdata.t().contiguous(), True, False
-
-    out = gemm_mxfp8_flydsl_kernel(
-        A, a_sc, B, b_sc, trans_a=trans_a, trans_b=trans_b, out_dtype=torch.bfloat16
-    )
+    # NT: a[M,K], b[N,K] (B stored transposed)
+    out = gemm_mxfp8_flydsl_kernel(aq.qdata, aq.scale_inv, bq.qdata, bq.scale_inv, out_dtype=torch.bfloat16)
     snr = compute_snr(ref, out)
-    print(f"\n[mx_flydsl_direct {layout}] M={m} N={n} K={k} SNR={snr:.2f} dB")
-    assert snr > 25, f"{layout} SNR too low: {snr:.2f}"
+    print(f"\n[mx_flydsl_direct nt] M={m} N={n} K={k} SNR={snr:.2f} dB")
+    assert snr > 25, f"SNR too low: {snr:.2f}"
 
 
 def _get_fp8_dtype(fmt: Format, is_fwd: bool):
