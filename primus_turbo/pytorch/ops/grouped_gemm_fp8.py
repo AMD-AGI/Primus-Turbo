@@ -526,12 +526,14 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                     _user_be = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
                     _asm_wgrad = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_WGRAD", "0") == "1"
                     if _user_be == BackendType.ASM_CO and _asm_wgrad:
-                        # ASM_CO kernels have no in-place beta-accumulation
-                        # parameter, so compute wgrad out-of-place then fold
-                        # it into main_grad with add_.  This preserves the
-                        # grad_added_to_main_grad contract for Megatron DDP.
+                        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+                            GroupedGEMMFP8VariableKASMCOBackend,
+                            ScalingGranularity,
+                            _log_backend_once,
+                        )
 
-                        wgrad = grouped_gemm_fp8_variable_k_impl(
+                        _log_backend_once("WGRAD", "ASM_CO (beta=1)")
+                        GroupedGEMMFP8VariableKASMCOBackend.execute_beta1(
                             a_fp8,
                             grad_out_fp8,
                             a_scale_inv,
@@ -542,12 +544,10 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                             trans_b=False,
                             trans_c=ctx.trans_b,
                             out_dtype=ctx.out_dtype,
-                            granularity=ctx.config.granularity.value,
+                            granularity=ScalingGranularity.TENSORWISE,
                             num_cu=ctx.num_cu,
-                            default_backend=BackendType.CK.value,
-                            is_bwd=True,
+                            out=main_grad_view,
                         )
-                        main_grad_view.add_(wgrad)
                     else:
                         # Local import to avoid a top-level dependency on the
                         # Triton kernel module (matches the pattern used in

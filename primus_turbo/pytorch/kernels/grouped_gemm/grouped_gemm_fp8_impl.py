@@ -959,36 +959,55 @@ _ASM_CO_WGRAD_SITES = {
 
 # ── ASM .co wgrad launcher (variable-K, dot_scaled MFMA 32x32x64) ───────────
 _ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2_fixed.co"
+_ASM_CO_WGRAD_BETA1_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2_beta1.co"
 _ASM_CO_WGRAD_KERNEL_NAME = "grouped_variable_k_dot_scaled_kernel"
 _ASM_CO_WGRAD_THREADS = 1024
 
 _ASM_CO_WGRAD_MODULE: ctypes.c_void_p | None = None
 _ASM_CO_WGRAD_FUNC: ctypes.c_void_p | None = None
+_ASM_CO_WGRAD_BETA1_MODULE: ctypes.c_void_p | None = None
+_ASM_CO_WGRAD_BETA1_FUNC: ctypes.c_void_p | None = None
+
+
+def _load_co_func(co_path: str, kernel_name: str) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
+    """Load a .co module and return (module, function) handles."""
+    hip = _get_libhip()
+    mod = ctypes.c_void_p()
+    rc = hip.hipModuleLoad(ctypes.byref(mod), co_path.encode())
+    if rc != 0:
+        hip.hipGetErrorString.restype = ctypes.c_char_p
+        raise RuntimeError(
+            f"hipModuleLoad({co_path}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
+        )
+    func = ctypes.c_void_p()
+    rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, kernel_name.encode())
+    if rc != 0:
+        hip.hipGetErrorString.restype = ctypes.c_char_p
+        raise RuntimeError(
+            f"hipModuleGetFunction({kernel_name}) from {co_path} "
+            f"failed rc={rc}: {hip.hipGetErrorString(rc)}"
+        )
+    return mod, func
 
 
 def _get_asm_co_wgrad_func() -> ctypes.c_void_p:
-    """Load and cache the variable-K wgrad .co function handle."""
+    """Load and cache the variable-K wgrad .co function handle (beta=0)."""
     global _ASM_CO_WGRAD_MODULE, _ASM_CO_WGRAD_FUNC
     if _ASM_CO_WGRAD_FUNC is None:
-        hip = _get_libhip()
-        mod = ctypes.c_void_p()
-        rc = hip.hipModuleLoad(ctypes.byref(mod), _ASM_CO_WGRAD_CO_PATH.encode())
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleLoad({_ASM_CO_WGRAD_CO_PATH}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
-            )
-        func = ctypes.c_void_p()
-        rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, _ASM_CO_WGRAD_KERNEL_NAME.encode())
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleGetFunction({_ASM_CO_WGRAD_KERNEL_NAME}) failed rc={rc}: "
-                f"{hip.hipGetErrorString(rc)}"
-            )
-        _ASM_CO_WGRAD_MODULE = mod
-        _ASM_CO_WGRAD_FUNC = func
+        _ASM_CO_WGRAD_MODULE, _ASM_CO_WGRAD_FUNC = _load_co_func(
+            _ASM_CO_WGRAD_CO_PATH, _ASM_CO_WGRAD_KERNEL_NAME
+        )
     return _ASM_CO_WGRAD_FUNC
+
+
+def _get_asm_co_wgrad_beta1_func() -> ctypes.c_void_p:
+    """Load and cache the variable-K wgrad .co function handle (beta=1)."""
+    global _ASM_CO_WGRAD_BETA1_MODULE, _ASM_CO_WGRAD_BETA1_FUNC
+    if _ASM_CO_WGRAD_BETA1_FUNC is None:
+        _ASM_CO_WGRAD_BETA1_MODULE, _ASM_CO_WGRAD_BETA1_FUNC = _load_co_func(
+            _ASM_CO_WGRAD_BETA1_CO_PATH, _ASM_CO_WGRAD_KERNEL_NAME
+        )
+    return _ASM_CO_WGRAD_BETA1_FUNC
 
 
 def _launch_asm_co_wgrad_variable_k(
@@ -1054,6 +1073,65 @@ def _launch_asm_co_wgrad_variable_k(
         threads=_ASM_CO_WGRAD_THREADS,
     )
     return out
+
+
+def _launch_asm_co_wgrad_variable_k_beta1(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    lhs_scale: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    out: torch.Tensor,
+    num_cu: int | None,
+) -> None:
+    """Launch beta=1 wgrad .co: out += A^T @ B * scale (fused accumulation).
+
+    The beta=1 kernel always loads the previous C tile and adds to the scaled
+    MFMA output before storing.  ``out`` is modified in-place.
+    """
+    out_m = lhs.shape[1]
+    out_n = rhs.shape[1]
+
+    func = _get_asm_co_wgrad_beta1_func()
+
+    lhs_scale_adj = lhs_scale * 2.0
+    rhs_scale_adj = rhs_scale * 2.0
+
+    buf = ctypes.create_string_buffer(96)
+    struct.pack_into(
+        "<QQQQQQ",
+        buf,
+        0,
+        lhs.data_ptr(),
+        rhs.data_ptr(),
+        out.data_ptr(),
+        lhs_scale_adj.data_ptr(),
+        rhs_scale_adj.data_ptr(),
+        group_offs.data_ptr(),
+    )
+    struct.pack_into(
+        "<iiiiiiii",
+        buf,
+        48,
+        group_lens.shape[0],
+        out_m,
+        out_n,
+        lhs.stride(0),
+        rhs.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+    )
+
+    _asm_co_module_launch(
+        func,
+        buf,
+        num_cu,
+        lhs.device,
+        f"wgrad_beta1 OUT_M={out_m}, OUT_N={out_n}",
+        threads=_ASM_CO_WGRAD_THREADS,
+    )
 
 
 class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
@@ -1139,6 +1217,42 @@ class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
             group_lens,
             group_offs,
             out_dtype,
+            num_cu,
+        )
+
+
+    @staticmethod
+    def execute_beta1(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        out: torch.Tensor,
+        **kwargs,
+    ):
+        """In-place fused accumulation: out += A^T @ B * scale."""
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+        _launch_asm_co_wgrad_variable_k_beta1(
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_lens,
+            group_offs,
+            out,
             num_cu,
         )
 
