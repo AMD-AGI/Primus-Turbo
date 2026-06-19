@@ -259,24 +259,24 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
 
 # Regression: MXFP8 backward must accept a NON-CONTIGUOUS grad_out.
 #
-#   ``FP8GemmMXFunction.backward`` quantizes ``grad_out`` column-wise
-#   (``axis=-2``) via ``quantize_mxfp8_dual``, whose HIP kernel asserts
-#   ``input.is_contiguous()``. When the downstream graph produces a strided
-#   gradient (e.g. a transpose/slice before the reduction — common in real
-#   attention/MLP backward), the incoming ``grad_out`` is non-contiguous and
-#   the assertion fired:
+#   ``FP8GemmMXFunction.backward`` quantizes ``grad_out`` with MXFP8 in
+#   single-direction mode (``QuantizedTensor.quantize`` along ``axis=-1`` then
+#   ``axis=-2``), whose HIP kernel asserts ``input.is_contiguous()``. When the
+#   downstream graph produces a strided gradient (e.g. a transpose/slice before
+#   the reduction — common in real attention/MLP backward), the incoming
+#   ``grad_out`` is non-contiguous and the assertion fired:
 #       quantization_hip.cpp: Assertion failed: input.is_contiguous().
 #                             Input must be contiguous
-#   Fixed by ``grad_out = grad_out.reshape(...).contiguous()`` before the dual
+#   Fixed by ``grad_out = grad_out.reshape(...).contiguous()`` before the
 #   quant. This test reproduces the strided-grad backward; it must run without
 #   raising and produce finite gradients.
 @pytest.mark.parametrize("m,n,k", [(4096, 512, 7168), (4096, 8192, 1536)])
 def test_gemm_fp8_mxfp8_noncontiguous_grad_regression(m, n, k):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    cc = get_device_compute_capability()
-    if cc != (9, 5) and cc[0] < 10:
-        pytest.skip("MXFP8 requires gfx950 or compute capability >= 10.0")
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
     torch.manual_seed(0)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
