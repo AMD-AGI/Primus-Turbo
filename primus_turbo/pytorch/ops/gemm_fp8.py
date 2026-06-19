@@ -526,7 +526,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
         a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        grad_out = grad_out.view(grad_out.shape[0], -1)
+        # MXFP8 dual (row+column) quant asserts a contiguous input; a strided grad_out
+        # (e.g. from a transpose upstream) trips quantize_mxfp8_dual. reshape+contiguous.
+        grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
 
         grad_out_scaling_recipe = ScalingRecipe()
         quantized_grad_out = QuantizedTensor.quantize(

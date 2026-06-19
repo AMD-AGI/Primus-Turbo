@@ -257,6 +257,44 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
     )
 
 
+# Regression: MXFP8 backward must accept a NON-CONTIGUOUS grad_out.
+#
+#   ``FP8GemmMXFunction.backward`` quantizes ``grad_out`` column-wise
+#   (``axis=-2``) via ``quantize_mxfp8_dual``, whose HIP kernel asserts
+#   ``input.is_contiguous()``. When the downstream graph produces a strided
+#   gradient (e.g. a transpose/slice before the reduction — common in real
+#   attention/MLP backward), the incoming ``grad_out`` is non-contiguous and
+#   the assertion fired:
+#       quantization_hip.cpp: Assertion failed: input.is_contiguous().
+#                             Input must be contiguous
+#   Fixed by ``grad_out = grad_out.reshape(...).contiguous()`` before the dual
+#   quant. This test reproduces the strided-grad backward; it must run without
+#   raising and produce finite gradients.
+@pytest.mark.parametrize("m,n,k", [(4096, 512, 7168), (4096, 8192, 1536)])
+def test_gemm_fp8_mxfp8_noncontiguous_grad_regression(m, n, k):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    cc = get_device_compute_capability()
+    if cc != (9, 5) and cc[0] < 10:
+        pytest.skip("MXFP8 requires gfx950 or compute capability >= 10.0")
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    config = Float8QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E4M3,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+    # NT layout: c = a @ b^T -> [m, n]
+    c = gemm_fp8(a, b, False, True, torch.bfloat16, config)
+    # Route the output through a transpose so the gradient that reaches
+    # FP8GemmMXFunction.backward is a strided (non-contiguous) tensor.
+    c.t().reshape(-1).sum().backward()
+    assert a.grad is not None and torch.isfinite(a.grad).all()
+    assert b.grad is not None and torch.isfinite(b.grad).all()
+
+
 @pytest.mark.parametrize("m", [255, 507, 1032, 2056])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
