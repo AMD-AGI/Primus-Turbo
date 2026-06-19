@@ -524,7 +524,8 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
 
                     _user_be = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-                    if _user_be == BackendType.ASM_CO:
+                    _asm_wgrad = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_WGRAD", "0") == "1"
+                    if _user_be == BackendType.ASM_CO and _asm_wgrad:
                         # ASM_CO kernels have no in-place beta-accumulation
                         # parameter, so compute wgrad out-of-place then fold
                         # it into main_grad with add_.  This preserves the

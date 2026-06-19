@@ -37,6 +37,43 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
 
+# ---------------------------------------------------------------------------
+# Per-pass ASM opt-in env vars.  When PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO
+# is set, each pass still runs Triton by default.  Set the corresponding var
+# to "1" to enable ASM for that specific pass.
+# ---------------------------------------------------------------------------
+
+
+def _asm_fwd_enabled() -> bool:
+    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_FWD", "0") == "1"
+
+
+def _asm_dgrad_enabled() -> bool:
+    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_DGRAD", "0") == "1"
+
+
+def _asm_wgrad_enabled() -> bool:
+    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_WGRAD", "0") == "1"
+
+
+_logged_gemm_backends: set[str] = set()
+
+
+def _log_backend_once(pass_name: str, backend: str) -> None:
+    key = f"{pass_name}:{backend}"
+    if key not in _logged_gemm_backends:
+        _logged_gemm_backends.add(key)
+        is_rank0 = (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        )
+        if is_rank0:
+            print(f"[Primus-Turbo] Grouped GEMM FP8 {pass_name}: using {backend} backend")
+
+
+# ---------------------------------------------------------------------------
+
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
     (float8_e4m3, float8_e4m3, torch.bfloat16),
@@ -1165,11 +1202,18 @@ def grouped_gemm_fp8_impl(
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
-    # ASM_CO mode: both fwd and bwd use ASM .co/.hsaco kernels where shapes match,
-    # with graceful fallback to Triton for unsupported shapes.
+    # ASM_CO mode: route FWD/DGRAD to ASM only when the corresponding per-pass
+    # env var is set; otherwise fall back to Triton.
     if user_backend_enum == BackendType.ASM_CO:
-        user_backend_enum = None
-        default_backend_enum = BackendType.ASM_CO
+        _pass = "DGRAD" if trans_b else "FWD"
+        use_asm = (not trans_b and _asm_fwd_enabled()) or (trans_b and _asm_dgrad_enabled())
+        if use_asm:
+            _log_backend_once(_pass, "ASM_CO")
+            user_backend_enum = None
+            default_backend_enum = BackendType.ASM_CO
+        else:
+            _log_backend_once(_pass, "Triton")
+            user_backend_enum = BackendType.TRITON
 
     kwargs = dict(
         a=a,
@@ -1213,13 +1257,16 @@ def grouped_gemm_fp8_variable_k_impl(
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
-    # ASM_CO hybrid mode: wgrad is always backward, so use ASM as default
-    # with graceful fallback to Triton when shapes are unsupported.
+    # ASM_CO mode: route WGRAD to ASM only when is_bwd=True AND the per-pass
+    # env var is set; all other paths (inference variable-K, or wgrad without
+    # the env var) use Triton.
     if user_backend_enum == BackendType.ASM_CO:
-        if is_bwd:
+        if is_bwd and _asm_wgrad_enabled():
+            _log_backend_once("WGRAD", "ASM_CO")
             user_backend_enum = None
             default_backend_enum = BackendType.ASM_CO
         else:
+            _log_backend_once("WGRAD", "Triton")
             user_backend_enum = BackendType.TRITON
 
     kwargs = dict(
