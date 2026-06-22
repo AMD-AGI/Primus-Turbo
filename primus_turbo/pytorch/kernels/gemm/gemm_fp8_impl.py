@@ -370,6 +370,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         # StoreC clamp + the global SRD.)
         k = a.shape[0] if trans_a else a.shape[1]
         supported &= k >= 129
+        # No size cap: foldable operands (NT both, NN-A) fold their per-tile base into
+        # the i64 SRD; the traversal operands (NN-B k*n, TN k*m & k*n) that would wrap a
+        # 32-bit soffset past 2^32 fp8 are re-based per load in i64 by the wrapper (it
+        # auto-selects i64 at/above 2^32, keeping the cheaper int32 path below).
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
