@@ -23,7 +23,7 @@ Before the loop starts, read [`../../../rules/iteration_rules.mdc`](../../../rul
 |-------------|-----------------|
 | Kernel source file path | hub `SKILL.md` → Code Map |
 | Focused test command | hub `SKILL.md` → Test & Bench; e.g. `pytest tests/pytorch/ops/test_gemm_fp8.py -v -k "blockwise and TRITON"` |
-| Focused benchmark command | [`../verify-performance/SKILL.md`](../verify-performance/SKILL.md); e.g. `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
+| Focused benchmark command | [`../verify-performance/SKILL.md`](../verify-performance/SKILL.md); e.g. `PRIMUS_TURBO_GEMM_BACKEND=TRITON python benchmark/ops/training/bench_gemm_turbo.py --dtype fp8 --granularity blockwise` |
 | Benchmark output format / metrics | [`../verify-performance/SKILL.md`](../verify-performance/SKILL.md) (`Forward/Backward TFLOPS`, `Check` gate) |
 | Quick validation harness | "Quick validation" below |
 | Scoring rules | "Optimization scoring" below |

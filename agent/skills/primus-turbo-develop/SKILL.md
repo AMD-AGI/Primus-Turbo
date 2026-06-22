@@ -144,8 +144,8 @@ pytest tests/pytorch/ -n 8 --deterministic-only                          # bitwi
 pytest tests/pytorch/ --dist-only                                        # multi-GPU tests
 
 # Performance
-python benchmark/ops/bench_gemm_turbo.py --dtype fp8 --granularity blockwise
-python benchmark/ops/run_suite.py -d output/ -g gemm_fp8                  # batch suite
+python benchmark/ops/training/bench_gemm_turbo.py --dtype fp8 --granularity blockwise
+python benchmark/ops/training/run_suite.py -d output/ -g gemm_fp8                  # batch suite
 ```
 
 Correctness gates: bf16/fp16 `rtol=atol=1e-2`, fp32 `1e-4` (allclose tolerances from `get_tolerances` in `tests/pytorch/test_utils.py`); FP8 SNR ≥ 25 dB (E4M3) / 20 dB (E5M2), FP4 SNR ≥ 10 dB (SNR via `compute_snr`; thresholds are hardcoded in the test/bench files, **not** in `get_tolerances`); determinism `rtol=atol=0`. Details and patterns: [verify-accuracy/SKILL.md](verify-accuracy/SKILL.md).
