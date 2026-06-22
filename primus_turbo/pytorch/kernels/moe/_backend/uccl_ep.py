@@ -13,17 +13,18 @@ from .base import _DeepEPLikeBackend, apply_uccl_network_env, call_once
 
 
 class UCCLEPBackend(_DeepEPLikeBackend):
-    """UCCL-EP backend (optional)."""
+    """UCCL-EP backend via uccl's deep_ep-compatible wrapper ``Buffer``."""
 
     @staticmethod
     def is_available() -> bool:
-        # Check the API surface, not just the import (some UCCL builds lack ``Buffer``).
+        # Needs uccl and its deep_ep wrapper (raw uccl.ep lacks the high-level API).
         try:
-            get_uccl()
+            import deep_ep  # noqa: F401
             import uccl.ep  # noqa: F401
         except ImportError:
             return False
-        return hasattr(uccl.ep, "Buffer")
+        # Only the uccl-backed wrapper (Config re-exported from uccl.ep) is ours.
+        return getattr(getattr(deep_ep, "Config", None), "__module__", "").startswith("uccl")
 
     @classmethod
     def can_release(cls, *, will_reinit: bool) -> bool:  # noqa: ARG003
@@ -33,9 +34,9 @@ class UCCLEPBackend(_DeepEPLikeBackend):
     @staticmethod
     def _get_module():
         get_uccl()
-        import uccl.ep as uccl_ep
+        import deep_ep
 
-        return uccl_ep
+        return deep_ep
 
     @call_once
     def setup_env(self, **overrides: Optional[str]) -> None:

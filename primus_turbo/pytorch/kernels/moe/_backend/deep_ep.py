@@ -13,14 +13,14 @@ from .base import _DeepEPLikeBackend, apply_uccl_network_env, call_once
 class DeepEPBackend(_DeepEPLikeBackend):
     """External ``deep_ep`` package backend (optional)."""
 
-    @staticmethod
-    def is_available() -> bool:
+    @classmethod
+    def is_available(cls) -> bool:
         try:
             import deep_ep  # noqa: F401
-
-            return True
         except ImportError:
             return False
+        # uccl-backed deep_ep is owned by the UCCL backend.
+        return not cls._is_uccl_backed()
 
     @staticmethod
     def _get_module():
