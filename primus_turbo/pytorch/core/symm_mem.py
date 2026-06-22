@@ -135,7 +135,10 @@ class SymmetricMemory:
         signal_pad_ptr = None
         try:
             buffer_ptr = self.lib.hipMalloc(alloc_size)
-            signal_pad_ptr = self.lib.hipMalloc(self.signal_pad_size)
+            # signal_pad holds cross-rank flags/scoreboards: allocate UNCACHED so every
+            # atomic load/store/add bypasses L1/L2 and is always fresh -> the spin-wait
+            # scoreboard handshake can't read a stale cached value and deadlock.
+            signal_pad_ptr = self.lib.hipMallocUncached(self.signal_pad_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
 
